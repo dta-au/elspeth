@@ -12,7 +12,11 @@ from uuid import uuid4
 import pytest
 
 from elspeth.web.composer.pipeline_proposal import OWNED_COMPOSITION_STATE_AUTHORITY
-from elspeth.web.sessions.proposal_blob_refs import ProposalResourceUnavailableError, proposal_blob_reference_ids
+from elspeth.web.sessions.proposal_blob_refs import (
+    MalformedProposalBlobReferenceError,
+    ProposalResourceUnavailableError,
+    proposal_blob_reference_ids,
+)
 from tests.fixtures.resource_identity import BLOB_UUID, UUID_SPELLINGS, uuid_spelling
 
 
@@ -70,6 +74,40 @@ def test_alias_reference_validation_preserves_ownership_status_and_corruption(sp
 def test_conservative_projection_never_relaxes_strict_sentinel_grammar(spelling):
     with pytest.raises(ValueError, match="non-canonical"):
         proposal_blob_reference_ids("set_pipeline", {"source": {"options": {"path": "blob:" + uuid_spelling(BLOB_UUID, spelling)}}})
+
+
+def test_persisted_pending_row_with_malformed_blob_ref_stays_a_tier1_integrity_error():
+    """Negative control for the Tier-3 admission refusal: our own persisted row is not repairable by the planner."""
+    from sqlalchemy import JSON, Column, MetaData, String, Table, create_engine
+
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.sessions.proposal_blob_refs import pending_proposal_reference_id
+
+    engine = create_engine("sqlite://")
+    metadata = MetaData()
+    proposals = Table(
+        "composition_proposals",
+        metadata,
+        Column("id", String),
+        Column("session_id", String),
+        Column("status", String),
+        Column("tool_name", String),
+        Column("arguments_json", JSON),
+    )
+    metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(
+            proposals.insert().values(
+                id="corrupt",
+                session_id="owned",
+                status="pending",
+                tool_name="set_output",
+                arguments_json={"options": {"schema": {"blob_ref": 5}}},
+            )
+        )
+        with pytest.raises(AuditIntegrityError, match="malformed blob authority"):
+            pending_proposal_reference_id(conn, session_id="owned", blob_id=BLOB_UUID)
+    engine.dispose()
 
 
 @pytest.mark.parametrize("spelling", UUID_SPELLINGS)
@@ -169,23 +207,26 @@ def test_final_reference_check_distinguishes_resource_refusal_from_owned_corrupt
 
 
 @pytest.mark.parametrize(
-    "arguments",
+    ("arguments", "expected"),
     [
-        {"source": {"options": {"blob_ref": 7}}},
-        {"source": {"options": {"path": "blob:malformed"}}},
-        {"authority_kind": OWNED_COMPOSITION_STATE_AUTHORITY, "sources": []},
+        # Model-supplied (Tier 3): a repairable, typed admission refusal.
+        ({"source": {"options": {"blob_ref": 7}}}, MalformedProposalBlobReferenceError),
+        ({"source": {"options": {"path": "blob:malformed"}}}, MalformedProposalBlobReferenceError),
+        # Server-owned authority (Tier 1): corruption stays a loud plain ValueError.
+        ({"authority_kind": OWNED_COMPOSITION_STATE_AUTHORITY, "sources": []}, ValueError),
     ],
 )
-def test_malformed_authority_is_not_an_expected_resource_refusal(arguments: dict) -> None:
+def test_malformed_authority_is_not_an_expected_resource_refusal(arguments: dict, expected: type[Exception]) -> None:
     from sqlalchemy import create_engine
 
     from elspeth.web.sessions.proposal_blob_refs import validate_proposal_blob_references
 
     engine = create_engine("sqlite://")
     # No table exists: a malformed authority must fail before any resource query.
-    with engine.connect() as conn, pytest.raises(ValueError) as caught:
+    with engine.connect() as conn, pytest.raises(expected) as caught:
         validate_proposal_blob_references(conn, session_id="owned", tool_name="set_pipeline", arguments=arguments)
-    assert type(caught.value) is ValueError
+    assert type(caught.value) is expected
+    assert not isinstance(caught.value, ProposalResourceUnavailableError)
     engine.dispose()
 
 
