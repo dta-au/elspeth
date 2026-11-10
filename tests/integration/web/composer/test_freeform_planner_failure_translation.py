@@ -1043,7 +1043,8 @@ def test_send_message_planner_context_budget_refusal_names_its_cause_on_the_oper
 
     status, body = settled.error()
     detail = body["detail"]
-    assert status == 500, settled.final.text
+    # The same status as the compose loop's refusal of the same condition: the request, not the server, is at fault.
+    assert status == 422, settled.final.text
     assert detail["error_type"] == "composer_planner_failure"
     assert detail["failure_code"] == "context_budget_exceeded"
     assert detail["planner_code"] == "CONTEXT_BUDGET_EXHAUSTED"
@@ -1102,10 +1103,8 @@ def test_planner_context_budget_refusals_translate_to_context_budget_exceeded(co
     exc = PipelinePlannerError("planner context budget refusal", code=code, detail_codes=detail_codes)
 
     assert _freeform_planner_failure_code(exc) == "context_budget_exceeded"
-    assert _FREEFORM_PLANNER_FAILURE_HTTP["context_budget_exceeded"] == (
-        _FREEFORM_PLANNER_FAILURE_HTTP["planner_repair_exhausted"][0],
-        _CONTEXT_BUDGET_DETAIL,
-    )
+    # 422, the status of the compose loop's refusal of the same condition.
+    assert _FREEFORM_PLANNER_FAILURE_HTTP["context_budget_exceeded"] == (422, _CONTEXT_BUDGET_DETAIL)
     assert freeform_planner_progress_reason(code) == "context_budget_exceeded"
 
 
