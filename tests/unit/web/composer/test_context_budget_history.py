@@ -15,6 +15,7 @@ from elspeth.contracts.composer_llm_audit import ComposerContextBudgetRecord, Co
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.context_budget import CONTEXT_BUDGET_MAX_BYTES_PER_TOKEN, CONTEXT_BUDGET_MIN_BYTES_PER_TOKEN
+from elspeth.web.composer.context_budget_apply import request_wire_bytes
 from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
 from elspeth.web.sessions.protocol import ChatMessageRecord
@@ -27,8 +28,8 @@ _COMPOSER = "openrouter/openai/gpt-5.5"
 _ADVISOR = "anthropic/claude-sonnet-4-6"
 
 
-def _budget(shed: list[int] | Any) -> dict[str, Any]:
-    return {
+def _budget(shed: list[int] | Any, wire_bytes: int | None) -> dict[str, Any]:
+    budget = {
         "policy_hash": "h",
         "bytes_per_token": "3.0",
         "estimated_tokens_before": 10,
@@ -37,6 +38,9 @@ def _budget(shed: list[int] | Any) -> dict[str, Any]:
         "stubbed_tool_call_ids": [],
         "shed_hatch_event_indices": [],
     }
+    if wire_bytes is not None:
+        budget["request_wire_bytes"] = wire_bytes
+    return budget
 
 
 def _call(
@@ -49,20 +53,22 @@ def _call(
 ) -> dict[str, Any]:
     """A stored call. By default a budgeted composer call that shed nothing.
 
-    ``shed=None`` stores a null ``context_budget`` (an advisor or auto-title
-    call); ``shed=_NO_KEY`` omits the key (a call from before context
-    budgeting).
+    ``total_bytes`` is the wire size the call's context-budget record stores
+    (``request_wire_bytes``); ``None`` omits the field, as a pre-release
+    build's record does. ``shed=None`` stores a null ``context_budget`` (an
+    advisor or auto-title call); ``shed=_NO_KEY`` omits the key (a call from
+    before context budgeting). The content split is stored on every call and
+    is never what the ratio is read from: it is set to a size that would
+    give a different ratio.
     """
     call: dict[str, Any] = {
         "model_requested": model,
         "status": status,
         "prompt_tokens": prompt_tokens,
-        "request_byte_split": (
-            None if total_bytes is None else {"message_bytes": [total_bytes], "tools_bytes": None, "total_bytes": total_bytes}
-        ),
+        "request_byte_split": {"message_bytes": [777], "tools_bytes": None, "total_bytes": 777},
     }
     if shed is not _NO_KEY:
-        call["context_budget"] = None if shed is None else _budget(list(shed))
+        call["context_budget"] = None if shed is None else _budget(list(shed), total_bytes)
     return call
 
 
@@ -100,6 +106,19 @@ def test_empty_has_no_ratio_and_no_shed_set() -> None:
 def test_records_without_audit_rows_give_empty() -> None:
     assert ContextBudgetHistory.from_records([_user_row(1)]) == ContextBudgetHistory.empty()
     assert ContextBudgetHistory.from_records([]) == ContextBudgetHistory.empty()
+
+
+def test_the_ratio_is_the_recorded_wire_bytes_over_the_prompt_tokens() -> None:
+    history = ContextBudgetHistory.from_records([_audit_row(1, _call(total_bytes=4321, prompt_tokens=1000))])
+    assert history.bytes_per_token == 4321 / 1000
+    assert history.ratio_for(_COMPOSER) == 4.321
+
+
+def test_a_budgeted_record_without_wire_bytes_gives_no_ratio_so_the_fallback_applies() -> None:
+    history = ContextBudgetHistory.from_records([_audit_row(1, _call(total_bytes=None, shed=[2]))])
+    assert history.bytes_per_token is None and history.ratio_for(_COMPOSER) is None
+    # Its shed set is still read.
+    assert history.previously_shed_history == frozenset({"history:2"})
 
 
 def test_newest_successful_budgeted_call_wins_for_the_ratio() -> None:
@@ -171,7 +190,8 @@ def test_the_ratio_prefers_the_newest_budgeted_call_of_the_same_model() -> None:
     ("total_bytes", "prompt_tokens", "expected"),
     [
         (12_000, 1000, CONTEXT_BUDGET_MAX_BYTES_PER_TOKEN),  # e.g. prompt_tokens reported without cached tokens
-        (5_001, 1000, CONTEXT_BUDGET_MAX_BYTES_PER_TOKEN),
+        (6_001, 1000, CONTEXT_BUDGET_MAX_BYTES_PER_TOKEN),
+        (6_000, 1000, 6.0),
         (5_000, 1000, 5.0),
         (2_000, 1000, 2.0),
         (1_999, 1000, CONTEXT_BUDGET_MIN_BYTES_PER_TOKEN),
@@ -179,7 +199,7 @@ def test_the_ratio_prefers_the_newest_budgeted_call_of_the_same_model() -> None:
     ],
 )
 def test_a_ratio_outside_the_sane_range_is_clamped_not_rejected(total_bytes: int, prompt_tokens: int, expected: float) -> None:
-    assert (CONTEXT_BUDGET_MIN_BYTES_PER_TOKEN, CONTEXT_BUDGET_MAX_BYTES_PER_TOKEN) == (2.0, 5.0)
+    assert (CONTEXT_BUDGET_MIN_BYTES_PER_TOKEN, CONTEXT_BUDGET_MAX_BYTES_PER_TOKEN) == (2.0, 6.0)
     history = ContextBudgetHistory.from_records([_audit_row(1, _call(total_bytes=total_bytes, prompt_tokens=prompt_tokens))])
     assert history.ratio_for(_COMPOSER) == expected
     assert history.bytes_per_token == expected
@@ -222,9 +242,9 @@ def _without(call: dict[str, Any], key: str) -> dict[str, Any]:
 @pytest.mark.parametrize(
     "bad_call",
     [
-        {**_call(), "request_byte_split": "x"},
-        {**_call(), "request_byte_split": {"total_bytes": "3"}},
-        {**_call(), "request_byte_split": {}},
+        {**_call(), "context_budget": _budget([], "3")},
+        {**_call(), "context_budget": _budget([], -1)},
+        {**_call(), "context_budget": _budget([], True)},
         {**_call(), "prompt_tokens": "1"},
         {**_call(), "status": 7},
         {**_call(), "model_requested": ""},
@@ -235,7 +255,6 @@ def _without(call: dict[str, Any], key: str) -> dict[str, Any]:
         {**_call(), "context_budget": {}},
         # A budgeted call always stores these keys; their absence is corruption, not an older shape.
         _without(_call(), "status"),
-        _without(_call(), "request_byte_split"),
         _without(_call(), "prompt_tokens"),
         _without(_call(), "model_requested"),
     ],
@@ -263,6 +282,7 @@ def test_envelopes_of_another_kind_or_none_are_not_call_audits() -> None:
 def test_a_real_stored_call_envelope_gives_its_model_the_ratio() -> None:
     """Control for the required-key reads: the envelope the product writes carries every key the reader demands."""
     messages = [{"role": "system", "content": "s" * 900}, {"role": "user", "content": "u" * 300}]
+    wire_bytes = request_wire_bytes(messages, None)
     call = build_llm_call_record(
         model_requested=_COMPOSER,
         messages=messages,
@@ -274,7 +294,12 @@ def test_a_real_stored_call_envelope_gives_its_model_the_ratio() -> None:
         seed=None,
         response=SimpleNamespace(usage=SimpleNamespace(prompt_tokens=300, completion_tokens=1, total_tokens=301)),
         context_budget=ComposerContextBudgetRecord.from_shed_keys(
-            policy_hash="a" * 64, bytes_per_token=3.0, estimated_tokens_before=400, estimated_tokens_after=400, shed_keys=("history:3",)
+            policy_hash="a" * 64,
+            bytes_per_token=3.0,
+            estimated_tokens_before=400,
+            estimated_tokens_after=400,
+            request_wire_bytes=wire_bytes,
+            shed_keys=("history:3",),
         ),
     )
     assert call.prompt_tokens == 300
@@ -282,5 +307,7 @@ def test_a_real_stored_call_envelope_gives_its_model_the_ratio() -> None:
 
     history = ContextBudgetHistory.from_records([row])
 
-    assert history.ratio_for(_COMPOSER) == 4.0
+    # Wire bytes over prompt tokens, not the content split (1200 bytes) over them.
+    assert call.request_byte_split is not None and call.request_byte_split.total_bytes == 1200 < wire_bytes
+    assert history.ratio_for(_COMPOSER) == wire_bytes / 300
     assert history.previously_shed_history == frozenset({"history:3"})

@@ -8,8 +8,10 @@ prefix stays stable). Both live in the public ``llm_call_audit`` envelopes on
 present-but-malformed envelope raises, it is never skipped.
 
 Both facts are read only from calls that carry a non-null ``context_budget``:
-the budgeted composer calls (compose loop, planner, escape hatch), whose byte
-split and prompt tokens describe a composer request. An advisor or auto-title
+the budgeted composer calls (compose loop, planner, escape hatch). The ratio
+is the record's ``request_wire_bytes`` (the size of the request that call
+sent, on the measure the budget is judged on) over the call's reported
+prompt tokens. An advisor or auto-title
 call stores the same envelope with a null ``context_budget``; it is a
 differently shaped request, often on another model, and gives neither fact.
 
@@ -17,7 +19,8 @@ An absent ``context_budget`` key means the call predates context budgeting and
 is read exactly like a null value: no shedding was recorded and no ratio is
 taken. The first budgeted turn of a session written before the upgrade
 therefore runs on the policy's fallback ratio, which over-estimates tokens:
-the conservative direction.
+the conservative direction. A budgeted record without ``request_wire_bytes``
+(written only by pre-release builds) likewise gives no ratio.
 """
 
 from __future__ import annotations
@@ -92,7 +95,7 @@ class ContextBudgetHistory:
                     continue
                 if shed is None:
                     shed = _shed_history_keys(budget)
-                ratio = _bytes_per_token(call)
+                ratio = _bytes_per_token(call, budget)
                 if ratio is None:
                     continue
                 model = _model_requested(call)
@@ -132,28 +135,25 @@ def _model_requested(call: Mapping[str, Any]) -> str:
     return model
 
 
-def _bytes_per_token(call: Mapping[str, Any]) -> float | None:
+def _bytes_per_token(call: Mapping[str, Any], budget: Mapping[str, Any]) -> float | None:
     """The clamped ratio a budgeted call measured, or ``None`` when it failed or reported no usable counts."""
     status = _required(call, "status")
     if type(status) is not str:
         raise AuditIntegrityError("Stored composer call audit has a non-string status")
-    split = _required(call, "request_byte_split")
     prompt_tokens = _required(call, "prompt_tokens")
-    if split is not None:
-        if not isinstance(split, Mapping):
-            raise AuditIntegrityError("Stored composer call request_byte_split is not a mapping")
-        if "total_bytes" not in split or type(split["total_bytes"]) is not int or split["total_bytes"] < 0:
-            raise AuditIntegrityError("Stored composer call request_byte_split.total_bytes is not a non-negative integer")
     if prompt_tokens is not None and (type(prompt_tokens) is not int or prompt_tokens < 0):
         raise AuditIntegrityError("Stored composer call prompt_tokens is not a non-negative integer")
-    if status != ComposerLLMCallStatus.SUCCESS.value or split is None or prompt_tokens is None:
+    # Absent only on records written by pre-release builds: no ratio, so the fallback applies.
+    if "request_wire_bytes" not in budget:
         return None
-    total_bytes: int = split["total_bytes"]
-    if total_bytes == 0 or prompt_tokens == 0:
+    wire_bytes = budget["request_wire_bytes"]
+    if type(wire_bytes) is not int or wire_bytes < 0:
+        raise AuditIntegrityError("Stored composer call context_budget.request_wire_bytes is not a non-negative integer")
+    if status != ComposerLLMCallStatus.SUCCESS.value or prompt_tokens is None or prompt_tokens == 0 or wire_bytes == 0:
         return None
     # Positive integers divide to a finite positive float; the clamp bounds
     # what provider-reported token counts can do to the estimate.
-    return min(max(total_bytes / prompt_tokens, CONTEXT_BUDGET_MIN_BYTES_PER_TOKEN), CONTEXT_BUDGET_MAX_BYTES_PER_TOKEN)
+    return min(max(wire_bytes / prompt_tokens, CONTEXT_BUDGET_MIN_BYTES_PER_TOKEN), CONTEXT_BUDGET_MAX_BYTES_PER_TOKEN)
 
 
 def _shed_history_keys(budget: Mapping[str, Any]) -> frozenset[str]:

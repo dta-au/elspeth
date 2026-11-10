@@ -30,6 +30,7 @@ def _record(shed_keys: tuple[str, ...] = ()) -> ComposerContextBudgetRecord:
         bytes_per_token=3.0,
         estimated_tokens_before=900,
         estimated_tokens_after=500,
+        request_wire_bytes=1500,
         shed_keys=shed_keys,
     )
 
@@ -88,6 +89,8 @@ class TestClosedShape:
             ("bytes_per_token", 3.0),
             ("estimated_tokens_before", True),
             ("estimated_tokens_after", "5"),
+            ("request_wire_bytes", 1.5),
+            ("request_wire_bytes", True),
             ("shed_history_indices", [1]),
             ("stubbed_tool_call_ids", ["a"]),
             ("shed_hatch_event_indices", (True,)),
@@ -99,6 +102,7 @@ class TestClosedShape:
             "bytes_per_token": "3.0",
             "estimated_tokens_before": 1,
             "estimated_tokens_after": 1,
+            "request_wire_bytes": 3,
             "shed_history_indices": (),
             "stubbed_tool_call_ids": (),
             "shed_hatch_event_indices": (),
@@ -126,6 +130,7 @@ class TestPublicEnvelope:
             "bytes_per_token": "3.0",
             "estimated_tokens_before": 900,
             "estimated_tokens_after": 500,
+            "request_wire_bytes": 1500,
             "shed_history_indices": [],
             "stubbed_tool_call_ids": [],
             "shed_hatch_event_indices": [],

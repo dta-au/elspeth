@@ -1603,19 +1603,21 @@ class ComposerServiceImpl:
         if supports_anthropic_prompt_cache_markers(self._model):
             marked_messages, marked_tools_or_none = apply_anthropic_cache_markers(selected_messages, selected_tools, mark_history_tail=True)
             marked_tools = marked_tools_or_none if marked_tools_or_none is not None else selected_tools
-        # The final guard, on the bytes that will be sent. The decision was fed
-        # this wire measure, so it is reached only if applying the decision
-        # grew the request past what the decision's allowances cover.
+        # The wire bytes of the request that will be sent: recorded on the
+        # call, where a later call's bytes-per-token ratio is read from, and
+        # checked by the final guard. The decision was fed this measure, so
+        # the guard is reached only if applying the decision grew the request
+        # past what the decision's allowances cover.
         marked_wire_bytes = request_wire_bytes(marked_messages, marked_tools or None)
+        budget_record = replace(budget_record, request_wire_bytes=marked_wire_bytes)
         if marked_wire_bytes > self._context_budget_policy.max_request_bytes:
             marked_split = message_bytes(marked_messages, marked_tools or None)
             kept_history = len(budget_frame.history_entries) - len(budget_record.shed_history_indices)
             raise self._context_budget_refusal(
                 ContextBudgetRefusal(
                     ceiling="bytes",
-                    estimated_tokens=math.ceil(marked_split.total_bytes / bytes_per_token),
-                    content_bytes=marked_split.total_bytes,
-                    wire_bytes=marked_wire_bytes,
+                    estimated_tokens=math.ceil(marked_wire_bytes / bytes_per_token),
+                    request_bytes=marked_wire_bytes,
                 ),
                 _context_budget_component_bytes(
                     marked_split,
@@ -1653,11 +1655,11 @@ class ComposerServiceImpl:
         bytes-per-token ratio it used.
 
         Segments are always labelled on the loop's messages. With
-        ``reply_instruction`` the two sizes the decision is fed are those of
-        the reply-stage request built from them. Quoting a tool record as
-        JSON text only adds bytes to its content, so stubbing a result saves
-        at least its labelled saving in the reply-stage request too: the
-        decision's sizes after shedding remain upper bounds.
+        ``reply_instruction`` the size the decision is fed is that of the
+        reply-stage request built from them. Quoting a tool record as JSON
+        text only adds bytes, so stubbing a result saves at least its
+        labelled saving in the reply-stage request too: the decision's size
+        after shedding remains an upper bound.
         """
         from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers, supports_anthropic_prompt_cache_markers
 
@@ -1680,22 +1682,21 @@ class ComposerServiceImpl:
         segments.extend(tool_segments)
 
         # The decision measures the request as it will be sent: with cache
-        # markers, plus the worst case the omission counts can add. It takes
-        # two sizes: the content split for the token estimate (the basis the
-        # stored bytes-per-token ratio is calibrated on) and the wire bytes
-        # for the byte ceiling (what the gateway's body cap sees).
+        # markers, in wire bytes (content, tool-call arguments, thinking
+        # blocks and tool definitions all count), plus the worst case the
+        # omission counts can add. The content split above only labels
+        # segments and names components; its savings are lower bounds on the
+        # wire savings.
         sent_messages = _request_as_sent(messages, reply_instruction)
         sent_tools: list[dict[str, Any]] | None = tools or None
         if supports_anthropic_prompt_cache_markers(self._model):
             sent_messages, marked_tools = apply_anthropic_cache_markers(sent_messages, tools, mark_history_tail=True)
             sent_tools = marked_tools or None
-        sent_split = split if sent_messages is messages else message_bytes(sent_messages, sent_tools)
 
         try:
             decision = decide_context_budget(
                 policy=self._context_budget_policy,
-                content_bytes=sent_split.total_bytes + omission_allowance,
-                wire_bytes=request_wire_bytes(sent_messages, sent_tools) + omission_allowance,
+                request_bytes=request_wire_bytes(sent_messages, sent_tools) + omission_allowance,
                 segments=segments,
                 # The ratio measured on this model's own budgeted calls, when the session has one.
                 bytes_per_token=frame.history.ratio_for(self._model),
@@ -1717,6 +1718,8 @@ class ComposerServiceImpl:
             bytes_per_token=decision.bytes_per_token,
             estimated_tokens_before=decision.estimated_tokens_before,
             estimated_tokens_after=decision.estimated_tokens_after,
+            # The decision's bound; the caller records the exact size of the request it sends.
+            request_wire_bytes=decision.request_bytes_after,
             shed_keys=decision.shed_keys,
         )
         shed = frozenset(decision.shed_keys)
@@ -1771,8 +1774,8 @@ class ComposerServiceImpl:
             evidence={
                 "ceiling": refusal.ceiling,
                 "estimated_tokens": refusal.estimated_tokens,
-                # Wire bytes: the measure ``max_request_bytes`` bounds.
-                "request_bytes": refusal.wire_bytes,
+                # Wire bytes: the measure both ceilings are judged on.
+                "request_bytes": refusal.request_bytes,
                 "max_prompt_tokens": self._context_budget_policy.max_prompt_tokens,
                 "max_request_bytes": self._context_budget_policy.max_request_bytes,
                 "largest_component": largest_component(component_bytes),

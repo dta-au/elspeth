@@ -161,7 +161,13 @@ class ComposerContextBudgetRecord:
 
     Carries integer counts, the policy hash and the identifiers of what was
     shed; never any content. ``bytes_per_token`` is the ``repr`` of the float
-    the estimate used. The shed decisions are by position
+    the estimate used. ``request_wire_bytes`` is the size of the request this
+    call sent: the canonical JSON of its ``{messages, tools}``, which counts
+    content, tool-call arguments, thinking blocks and tool definitions. The
+    token estimates are on that same measure, and a later call's
+    bytes-per-token ratio is this size over the call's reported prompt
+    tokens. (``request_byte_split`` on the call stays the content split.)
+    The shed decisions are by position
     (``shed_history_indices``, ``shed_hatch_event_indices``, ascending) or by
     tool-call id (``stubbed_tool_call_ids``, in request order).
     """
@@ -170,6 +176,7 @@ class ComposerContextBudgetRecord:
     bytes_per_token: str
     estimated_tokens_before: int
     estimated_tokens_after: int
+    request_wire_bytes: int
     shed_history_indices: tuple[int, ...]
     stubbed_tool_call_ids: tuple[str, ...]
     shed_hatch_event_indices: tuple[int, ...]
@@ -179,6 +186,7 @@ class ComposerContextBudgetRecord:
         _require_non_empty_str(self.bytes_per_token, "bytes_per_token")
         _require_component_bytes(self.estimated_tokens_before, "estimated_tokens_before")
         _require_component_bytes(self.estimated_tokens_after, "estimated_tokens_after")
+        _require_component_bytes(self.request_wire_bytes, "request_wire_bytes")
         _require_index_tuple(self.shed_history_indices, "shed_history_indices")
         _require_index_tuple(self.shed_hatch_event_indices, "shed_hatch_event_indices")
         if type(self.stubbed_tool_call_ids) is not tuple:
@@ -195,6 +203,7 @@ class ComposerContextBudgetRecord:
         bytes_per_token: float,
         estimated_tokens_before: int,
         estimated_tokens_after: int,
+        request_wire_bytes: int,
         shed_keys: Sequence[str],
     ) -> Self:
         """Partition budgeter shed keys: ``history:<int>``, ``tool:<id>``, ``hatch:<int>``.
@@ -224,6 +233,7 @@ class ComposerContextBudgetRecord:
             bytes_per_token=repr(bytes_per_token),
             estimated_tokens_before=estimated_tokens_before,
             estimated_tokens_after=estimated_tokens_after,
+            request_wire_bytes=request_wire_bytes,
             shed_history_indices=tuple(sorted(history)),
             stubbed_tool_call_ids=tuple(tool_ids),
             shed_hatch_event_indices=tuple(sorted(hatch)),
@@ -236,6 +246,7 @@ class ComposerContextBudgetRecord:
             "bytes_per_token": self.bytes_per_token,
             "estimated_tokens_before": self.estimated_tokens_before,
             "estimated_tokens_after": self.estimated_tokens_after,
+            "request_wire_bytes": self.request_wire_bytes,
             "shed_history_indices": list(self.shed_history_indices),
             "stubbed_tool_call_ids": list(self.stubbed_tool_call_ids),
             "shed_hatch_event_indices": list(self.shed_hatch_event_indices),

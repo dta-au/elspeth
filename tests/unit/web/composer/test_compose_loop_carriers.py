@@ -361,7 +361,12 @@ def _timeout_service() -> ComposerServiceImpl:
 
 def _no_shed_budget_record() -> ComposerContextBudgetRecord:
     return ComposerContextBudgetRecord.from_shed_keys(
-        policy_hash="0" * 64, bytes_per_token=3.0, estimated_tokens_before=0, estimated_tokens_after=0, shed_keys=()
+        policy_hash="0" * 64,
+        bytes_per_token=3.0,
+        estimated_tokens_before=0,
+        estimated_tokens_after=0,
+        request_wire_bytes=1200,
+        shed_keys=(),
     )
 
 
