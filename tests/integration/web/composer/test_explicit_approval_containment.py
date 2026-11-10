@@ -25,6 +25,7 @@ from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.composer.tools import execute_tool as real_execute_tool
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, composition_states_table
+from elspeth.web.sessions.protocol import CompositionStateData
 from tests.integration.web.composer.test_freeform_proposal_prevalidation import (
     _count_rows,
     _fake_llm_response,
@@ -138,7 +139,10 @@ async def test_batch_with_two_staged_edits_is_refused_before_effects_then_one_co
             version=state.version,
         )
         assert "set_pipeline" in message
-        assert "nothing was applied and no proposal was recorded" in message
+        # True of every call in the response whatever each one's own outcome,
+        # including a sibling refused for malformed arguments.
+        assert "carried 2 pipeline-change calls" in message
+        assert "None of them was applied and no proposal was recorded" in message
         assert json.loads(_persisted_tool_content(harness, call_id))["validation"]["errors"][0]["error_code"] == (
             "approval_batch_not_atomic"
         )
@@ -210,6 +214,8 @@ async def test_later_compose_request_is_refused_while_a_proposal_is_pending_and_
     result = await _compose(harness, second, state, "Also rename it.")
     message = _assert_refused(_tool_feedback(second, 1, "call_later"), error_code="approval_proposal_pending", version=state.version)
     assert str(pending.id) in message
+    # This pending proposal still sits on the current base, so either decision is open.
+    assert "accept or reject" in message
     assert [inv.tool_call_id for inv in result.tool_invocations] == ["call_later"]
     assert [p.id for p in await harness.sessions.list_composition_proposals(UUID(harness.session_id))] == [pending.id]
 
@@ -387,3 +393,53 @@ async def test_pending_blob_only_proposal_does_not_block_a_composition_proposal(
     await _compose(harness, llm, state)
     proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
     assert [proposal.tool_call_id for proposal in proposals] == ["call_blob", "call_metadata"]
+
+
+@pytest.mark.asyncio
+async def test_stale_pending_proposal_is_named_as_reject_only(tmp_path: Path) -> None:
+    """A pending proposal drawn against an earlier state can never be accepted, so the refusal must not offer that."""
+    harness = _harness(tmp_path)
+    state = _incremental_base_state(tmp_path)
+    seed = CompositionStateData(
+        sources={},
+        nodes=[],
+        edges=[],
+        outputs=[],
+        metadata_={"name": "Untitled Pipeline", "description": ""},
+        is_valid=False,
+    )
+    earlier = await harness.sessions.save_composition_state(UUID(harness.session_id), seed, provenance="session_seed")
+    stale = await harness.sessions.create_composition_proposal(
+        session_id=UUID(harness.session_id),
+        tool_call_id="call_stale_leftover",
+        tool_name="set_metadata",
+        summary="Earlier proposal.",
+        rationale="Drawn against a state that is no longer the base of this request.",
+        affects=("metadata",),
+        arguments_json={"patch": {"name": "stale"}},
+        arguments_redacted_json={"patch": {"name": "stale"}},
+        base_state_id=earlier.id,
+        actor="test",
+    )
+    llm = _ScriptedLLM(
+        _tool_turn("call_blocked", "set_metadata", {"patch": {"name": "blocked"}}),
+        _fake_llm_response(content="An old proposal is in the way."),
+    )
+    # The session has since moved to a newer state, which this request composes against.
+    current = await harness.sessions.save_composition_state(UUID(harness.session_id), seed, provenance="session_seed")
+    assert current.id != earlier.id
+    with patch.object(harness.service._provider_gateway, "_call_llm", new=llm):
+        await harness.service.compose(
+            "Rename it.",
+            [],
+            state,
+            session_id=harness.session_id,
+            current_state_id=str(current.id),
+            user_id=_USER,
+            user_message_id=harness.user_message_id,
+        )
+    message = _assert_refused(_tool_feedback(llm, 1, "call_blocked"), error_code="approval_proposal_pending", version=state.version)
+    assert str(stale.id) in message
+    assert "can no longer be accepted" in message
+    assert "must reject it" in message
+    assert "accept or reject" not in message
