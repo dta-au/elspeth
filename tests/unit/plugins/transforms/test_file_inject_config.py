@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import csv
 import datetime
+import json
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
 from elspeth.contracts.schema import FieldDefinition
+from elspeth.core.canonical import stable_hash
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.transforms import file_inject
 from elspeth.plugins.transforms.file_inject import (
@@ -99,6 +101,7 @@ def test_bom_is_stripped_for_structured_formats() -> None:
 def test_empty_file_per_format() -> None:
     assert _one("", "text") == ""
     assert _one("", "jsonl") == []
+    assert _one("\n  \n\r\n", "jsonl") == []
     for fmt in ("json", "csv"):
         message = _refused(_all({"blank": {"content": "", "format": fmt, "output_field": "out"}}))
         assert "'blank'" in message
@@ -186,7 +189,128 @@ def test_default_content_nested_past_the_depth_limit_is_refused() -> None:
     for _ in range(5000):
         deep = [deep]
     files = {"A": {"content": "x", "format": "text"}}
-    assert "default_content nested more than 100 levels deep" in _refused(_select(files, on_miss="default", default_content=deep))
+    assert "default_content is nested more than 100 levels deep" in _refused(_select(files, on_miss="default", default_content=deep))
+
+
+# --- values the row hasher cannot canonicalise ------------------------------
+#
+# A written value is hashed with every row that receives it. One the hasher
+# refuses would pass config validation and then fail every such row, so it is
+# refused here instead, by the hasher's own number predicate.
+
+_SAFE_MAX = 2**53 - 1
+_LONE_SURROGATE = "\ud800"
+
+
+def _files_entry(content: str, fmt: str) -> dict[str, Any]:
+    return _all({"ids": {"content": content, "format": fmt, "output_field": "out"}})
+
+
+@pytest.mark.parametrize(
+    ("fmt", "content"),
+    [
+        ("json", '{"customer_id": 1234567890123456789}'),
+        ("json", f"[{_SAFE_MAX + 1}]"),
+        ("jsonl", '{"a": 1}\n{"customer_id": 1234567890123456789}\n'),
+    ],
+)
+def test_integer_outside_the_safe_range_is_refused(fmt: str, content: str) -> None:
+    message = _refused(_files_entry(content, fmt))
+    assert "files entry 'ids'" in message
+    assert "outside the JSON safe integer range" in message
+    assert "as a string" in message
+
+
+def test_integer_outside_the_safe_range_is_refused_in_default_content() -> None:
+    files = {"A": {"content": "x", "format": "text"}}
+    for default_content in (1234567890123456789, {"ids": [-(_SAFE_MAX + 1)]}):
+        message = _refused(_select(files, on_miss="default", default_content=default_content))
+        assert "default_content holds the integer" in message
+        assert "outside the JSON safe integer range" in message
+
+
+@pytest.mark.parametrize("value", [_SAFE_MAX, -_SAFE_MAX, 0])
+def test_integer_at_the_safe_range_boundary_is_accepted(value: int) -> None:
+    assert _one(str(value), "json") == value
+    assert _one(f"{value}\n", "jsonl") == [value]
+    files = {"A": {"content": "x", "format": "text"}}
+    assert FileInjectConfig.model_validate(_select(files, on_miss="default", default_content=value)).default_content == value
+
+
+@pytest.mark.parametrize("value", [_SAFE_MAX + 1, -(_SAFE_MAX + 1)])
+def test_integer_one_past_the_safe_range_boundary_is_refused(value: int) -> None:
+    assert f"holds the integer {value}" in _refused(_files_entry(str(value), "json"))
+    assert f"holds the integer {value}" in _refused(_files_entry(f"{value}\n", "jsonl"))
+    files = {"A": {"content": "x", "format": "text"}}
+    assert f"default_content holds the integer {value}" in _refused(_select(files, on_miss="default", default_content=value))
+
+
+@pytest.mark.parametrize(
+    ("fmt", "content"),
+    [
+        ("json", '"\\ud800"'),
+        ("json", '{"\\ud800": 1}'),
+        ("jsonl", '"ok"\n["\\udfff"]\n'),
+        ("text", f"before{_LONE_SURROGATE}after"),
+        ("csv", f"k\n{_LONE_SURROGATE}\n"),
+        ("csv", f"k{_LONE_SURROGATE}\nv\n"),
+    ],
+    ids=["json-string", "json-member-name", "jsonl", "text", "csv-cell", "csv-header"],
+)
+def test_text_that_is_not_utf8_encodable_is_refused(fmt: str, content: str) -> None:
+    message = _refused(_files_entry(content, fmt))
+    assert "files entry 'ids'" in message
+    assert "cannot be encoded as UTF-8" in message
+    assert "lone surrogate" in message
+
+
+def test_text_that_is_not_utf8_encodable_is_refused_in_default_content() -> None:
+    files = {"A": {"content": "x", "format": "text"}}
+    for default_content in (_LONE_SURROGATE, {"a": [_LONE_SURROGATE]}, {_LONE_SURROGATE: 1}):
+        message = _refused(_select(files, on_miss="default", default_content=default_content))
+        assert "default_content holds" in message
+        assert "cannot be encoded as UTF-8" in message
+
+
+def test_what_validation_accepts_the_row_hasher_accepts() -> None:
+    """Validation and the hasher must agree, or an accepted value fails every row it reaches."""
+    edge_json = json.dumps(
+        {
+            "max": _SAFE_MAX,
+            "min": -_SAFE_MAX,
+            "float": 1.7976931348623157e308,
+            "tiny": 5e-324,
+            "astral": "\U0001f600",
+            "controls": "\x00\x1f\u2028\uffff",
+            "nested": [[None, True, {"k": []}]],
+        }
+    )
+    cfg = FileInjectConfig.model_validate(
+        _all(
+            {
+                "doc": {"content": edge_json, "format": "json", "output_field": "doc"},
+                "lines": {"content": edge_json + "\n" + str(_SAFE_MAX) + "\n", "format": "jsonl", "output_field": "lines"},
+                "table": {"content": "k,v\n\U0001f600,\uffff\n", "format": "csv", "output_field": "table"},
+                "note": {"content": "\ufeff\x00\U0001f600\r\n", "format": "text", "output_field": "note"},
+            }
+        )
+    )
+    row = {name: cfg._parsed[name] for name in cfg.files}
+    assert len(stable_hash(row)) == 64
+    default_cfg = FileInjectConfig.model_validate(
+        _select({"A": {"content": "x", "format": "text"}}, on_miss="default", default_content=json.loads(edge_json))
+    )
+    assert len(stable_hash({"guidance": default_cfg.default_content})) == 64
+
+
+@pytest.mark.parametrize("digits", [4301, 5000])
+def test_integer_too_long_to_parse_is_refused_in_plain_words(digits: int) -> None:
+    for fmt, content in (("json", "1" * digits), ("jsonl", "[" + "1" * digits + "]\n")):
+        message = _refused(_files_entry(content, fmt))
+        assert "files entry 'ids'" in message
+        assert f"an integer of {digits} digits" in message
+        assert "set_int_max_str_digits" not in message
+        assert "1" * 60 not in message
 
 
 def test_default_content_is_capped_and_counts_toward_the_node(monkeypatch: pytest.MonkeyPatch) -> None:
