@@ -11,7 +11,10 @@ import respx
 
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.audit import Call
+from elspeth.contracts.call_mode import ReplaySSRFRequest
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.results import TransformResult
 from elspeth.plugins.transforms.web_scrape import WebScrapeTransform
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.mock_audit import mock_item_audit_authority
@@ -118,3 +121,53 @@ def test_self_link_with_urlencode_escaped_query_is_a_cycle_without_refetch(conte
     metadata = result.success_reason["metadata"]
     assert metadata["pagination_stop_reason"] == "cycle"
     assert [page["number"] for page in metadata["pagination_pages"]] == [1]
+
+
+# --- Finding #4: replay/verify refuse a malformed row URL exactly as live does ---
+
+
+class _ArchiveMustNotBeConsulted:
+    """A call-mode session whose archive must not be read for a refused URL."""
+
+    def __init__(self, mode: RunMode) -> None:
+        self.mode = mode
+
+    def replay_ssrf_request(self, **_kwargs: Any) -> ReplaySSRFRequest:
+        raise AssertionError("archived SSRF request consulted for a malformed URL")
+
+    def preflight_verify_http_request(self, **_kwargs: Any) -> None:
+        raise AssertionError("verify preflight reached for a malformed URL")
+
+
+def _default_transform() -> WebScrapeTransform:
+    return WebScrapeTransform(
+        {
+            "schema": {"mode": "observed"},
+            "url_field": "url",
+            "content_field": "content",
+            "fingerprint_field": "fingerprint",
+            "http": {"abuse_contact": "test@example.com", "scraping_reason": "Replay sweep regression"},
+        }
+    )
+
+
+@pytest.mark.parametrize("mode", [RunMode.LIVE, RunMode.REPLAY, RunMode.VERIFY])
+def test_malformed_row_url_is_the_same_row_refusal_in_every_run_mode(context: PluginContext, mode: RunMode) -> None:
+    transform = _default_transform()
+    transform.on_start(context)
+    if mode is not RunMode.LIVE:
+        context.call_mode_session = _ArchiveMustNotBeConsulted(mode)
+        context.run_mode = mode
+        context.replay_from = "source-run"
+
+    outcome: TransformResult | Exception
+    try:
+        outcome = transform.process(make_pipeline_row({"url": "http://[bad/x"}), context)
+    except ValueError as exc:
+        outcome = exc
+
+    assert isinstance(outcome, TransformResult), f"{mode.value} raised {outcome!r} instead of refusing the row"
+    assert outcome.status == "error"
+    assert outcome.reason["reason"] == "validation_failed"
+    assert outcome.reason["error_type"] == "SSRFBlockedError"
+    assert outcome.reason["cause"] == "malformed_url"
