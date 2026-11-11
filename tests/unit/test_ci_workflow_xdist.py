@@ -182,6 +182,9 @@ def _assert_timing_workflow_contract(workflow: dict[str, Any]) -> None:
     assert job["runs-on"] == ordinary["runs-on"]
     assert job["container"] == ordinary["container"]
     assert job["strategy"]["fail-fast"] is False
+    # The runners share one host: two lanes of load-sensitive tests at once
+    # contend with each other, which defeats the point of the job.
+    assert job["strategy"]["max-parallel"] == 1
     assert job["strategy"]["matrix"] == {
         "python-version": ordinary["strategy"]["matrix"]["python-version"],
         "include": ordinary["strategy"]["matrix"]["include"],

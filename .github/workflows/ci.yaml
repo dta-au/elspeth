@@ -603,6 +603,11 @@ jobs:
       COVERAGE_FILE: coverage-data
     strategy:
       fail-fast: false
+      # One Python version at a time. The runners share one host, so two lanes
+      # of load-sensitive tests running together contend with each other: on
+      # 2026-11-11 both lanes failed the same process-death test within three
+      # seconds, each child blocked on disk.
+      max-parallel: 1
       matrix:
         python-version: ["3.12", "3.13"]
         include:
