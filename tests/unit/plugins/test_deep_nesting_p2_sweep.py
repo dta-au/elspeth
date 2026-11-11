@@ -18,6 +18,8 @@ from collections.abc import Callable
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 from elspeth.contracts.plugin_context import PluginContext
 from tests.fixtures.factories import make_operation_context
 
@@ -154,3 +156,58 @@ def test_azure_blob_jsonl_moderate_nesting_still_loads() -> None:
 
     assert isinstance(rows, list)
     assert [row.is_quarantined for row in rows] == [False]
+
+
+# ── #68: blob_json_expand parse paths ───────────────────────────────────────
+
+
+def _expand_field_text(parse_format: str, document: str) -> Any:
+    from elspeth.plugins.transforms.blob_json_expand import BlobJSONExpand
+    from elspeth.testing import make_pipeline_row
+    from tests.fixtures.factories import make_context
+
+    transform = BlobJSONExpand(
+        {
+            "schema": {"mode": "observed", "guaranteed_fields": ["content"]},
+            "source": "field",
+            "format": parse_format,
+            "fields": ["document_id", "sections"],
+        }
+    )
+    return _outcome(lambda: transform.process(make_pipeline_row({"content": document}), make_context()))
+
+
+def _deep_record(depth: int) -> str:
+    return '{"document_id": "d1", "sections": ' + _nested_list(depth) + "}"
+
+
+_DEEP_DOCUMENTS = [
+    pytest.param("json", "[" * UNPARSEABLY_DEEP, id="json-undecodable"),
+    pytest.param("json", "[" + _deep_record(PARSEABLY_DEEP) + "]", id="json-deep-record"),
+    pytest.param("jsonl", "[" * UNPARSEABLY_DEEP, id="jsonl-undecodable"),
+    pytest.param("jsonl", '{"document_id": "d0", "sections": []}\n' + _deep_record(PARSEABLY_DEEP), id="jsonl-deep-record"),
+]
+
+
+@pytest.mark.parametrize(("parse_format", "document"), _DEEP_DOCUMENTS)
+def test_blob_json_expand_routes_deep_json_to_on_error(parse_format: str, document: str) -> None:
+    result = _expand_field_text(parse_format, document)
+
+    assert not isinstance(result, Exception), f"process() raised {type(result).__name__} instead of returning an error result"
+    assert result.status == "error"
+    assert result.reason is not None
+    assert result.reason["reason"] == "invalid_json"
+    assert result.reason["error_type"] == "nesting_too_deep"
+    assert result.retryable is False
+
+
+@pytest.mark.parametrize("parse_format", ["json", "jsonl"])
+def test_blob_json_expand_moderate_nesting_still_expands(parse_format: str) -> None:
+    """Negative control: ordinary nested records are not refused by the bound."""
+    record = _deep_record(5)
+    document = "[" + record + "]" if parse_format == "json" else record
+
+    result = _expand_field_text(parse_format, document)
+
+    assert not isinstance(result, Exception)
+    assert result.status == "success"
