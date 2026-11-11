@@ -4,6 +4,94 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
+## 0.8.14 - 2026-11-11
+
+Python 3.14. ELSPETH now requires and runs on Python 3.14 only; this release
+moves the packages, the images and CI to it and corrects the behaviour that
+changed under the new interpreter. The dated entry and package version do not
+establish qualification, a published tag or an image. Not run for this work:
+the PostgreSQL testcontainer suites, a live provider, end-to-end browser tests
+and CI itself on the new single lane.
+
+### Upgrade notes
+
+These changes are breaking:
+
+- **Python 3.14 is required** for `elspeth`, `elspeth-lints` and the LLM
+  gateway (and the gateway adapter template). Python 3.12 and 3.13 are no
+  longer supported or tested. Locked dependency versions are unchanged; only
+  the 3.12 and 3.13 markers and wheels left the lockfiles.
+- **Startup refuses `JSON_LOGS=true`.** This applies to the CLI, the web
+  server and both MCP servers. LiteLLM's JSON-logs mode logs unhandled
+  exception messages verbatim through its own handler, which ELSPETH's log
+  scrubbing cannot reach. Unset it; ELSPETH's JSON output has its own setting.
+- **Drain in-flight runs and pending approvals before upgrading.** The
+  runtime-validation manifest hash changes with the interpreter, so a run
+  checkpointed under 3.13 refuses to resume under 3.14, and a web approval
+  recorded under 3.13 no longer matches.
+- **The release image carries its own interpreter.** The runtime base is now
+  `gcr.io/distroless/cc-debian13:debug-nonroot`, and the image carries CPython
+  3.14.5, installed by the pinned uv under `/opt/python`, with the venv at
+  `/opt/venv`. There is no `/usr/bin/python3` in the image any more. The
+  builder is `debian:trixie-slim`. The gateway image is `python:3.14-alpine`.
+  3.14.5 is the newest CPython the pinned uv offers; a later patch release
+  needs a uv image bump.
+- **CI runs one Python 3.14 lane**, which is the coverage lane. Required
+  status-check names change with it, for example
+  `Test (Python 3.14, shard N)` and `Timing-sensitive tests (Python 3.14)`,
+  and the repository ruleset must be updated to match.
+
+Schema and stored data:
+
+- No schema epoch changed and no stored data is migrated, reset or rewritten.
+  Session epoch 78 and Landscape epoch 50 are unchanged from the previous
+  release; this release adds no schema-epoch cutover. Existing 0.8.13 session
+  and Landscape stores need no action beyond the drain above, and the 0.8.10
+  cutover guidance below continues to apply to older stores. This authorizes
+  no migration, reset, restamping or downgrade.
+
+### Engine and runtime
+
+Each of these keeps the behaviour ELSPETH had under Python 3.13.
+
+- **Strict JSON parsing bounds nesting explicitly** at the interpreter
+  recursion limit. Python 3.14's C decoder no longer stops there.
+- **The runtime-validation manifest again records helper dependencies reached
+  through local loads**, for which 3.14 emits new instructions. It also
+  ignores docstring-only edits, which 3.14 marks with a new `CO_HAS_DOCSTRING`
+  flag.
+- **Runtime preflight keeps reporting an abandoned task failure by class
+  only.** Python 3.14's `asyncio.shield` began logging the message and
+  traceback.
+
+### Logging
+
+- **asyncio diagnostics that carry an exception are reduced to class and code
+  location.** A task exception that was never retrieved, a failed loop
+  callback and 3.14's shielded-future report are logged as
+  `asyncio_unhandled_exception exc_class=… frames=file:line:function,…`, on
+  every event loop in the process. Records without an exception are
+  unchanged.
+
+### Known limits
+
+- Ruff still targets `py313`, so that the formatter does not rewrite 169 files
+  to the PEP 758 `except A, B:` form. That is separate work.
+- One `elspeth-lints` masquerade test, of definition-time annotation order,
+  stays skipped on 3.14: the model it checks predates PEP 649.
+- Four signed tier-model allowlist entries for
+  `contracts/runtime_val_manifest.py` drift and await operator re-signing.
+  Keyless scans report them.
+
+### Publication and acceptance
+
+Automatic image publication from main remains held. The 0.8.14 tag and
+container publication follow successful required checks and the protected
+merge. Operator signing, live-provider acceptance and deployment remain
+separate steps.
+
+---
+
 ## 0.8.13 - 2026-11-11
 
 Composer context budget. Long Composer sessions grew until the server or the

@@ -999,7 +999,11 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # plugin_version values advance (seven manifest lines), engine:0.8.12 ->
 # engine:0.8.13. Captured from this file's parity failure (previous pin
 # b3162f4d...).
-EXPECTED_CASE_REGISTRY_SHA256 = "3338f07b09c11e79c487f9136bff55eef0c0f80aad4f25de32a07e67eab110d7"
+# 0.8.14 version cut (Python 3.14 only): the same eight engine-owned
+# plugin_version values advance (seven manifest lines), engine:0.8.13 ->
+# engine:0.8.14. Captured from this file's parity failure (previous pin
+# 3338f07b...); reverting the eight values reproduces that pin.
+EXPECTED_CASE_REGISTRY_SHA256 = "d287953784cfb9bcd56f17f0be4b68c59df0a1e4c1b411cf1a3d0786409e091e"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
