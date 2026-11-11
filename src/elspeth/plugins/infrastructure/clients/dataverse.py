@@ -138,6 +138,37 @@ class DataversePageResponse:
         freeze_fields(self, "rows", "headers", "request_headers")
 
 
+def _extract_fetchxml_paging_cookie(page: DataversePageResponse, annotation: str) -> str:
+    """Parse the Tier 3 fetchxmlpagingcookie annotation into the cookie to send back.
+
+    Dataverse returns a wrapper element such as
+    ``<cookie pagenumber="2" pagingcookie="%253ccookie..." istracking="False" />``
+    (Microsoft "Page results using FetchXml", Web API tab). The paging cookie
+    is the wrapper's ``pagingcookie`` attribute, URL-encoded twice.
+    """
+
+    def _violation(detail: str) -> DataverseClientError:
+        return DataverseClientError(
+            f"FetchXML pagination: malformed '@Microsoft.Dynamics.CRM.fetchxmlpagingcookie' annotation — {detail}",
+            retryable=False,
+            error_category="protocol_violation",
+            status_code=page.status_code,
+            latency_ms=page.latency_ms,
+            request_url=page.request_url,
+            request_headers=page.request_headers,
+        )
+
+    try:
+        wrapper = ET.fromstring(annotation)
+    except ET.ParseError as exc:
+        raise _violation(f"not a parseable XML element ({exc})") from exc
+
+    encoded_cookie = wrapper.get("pagingcookie")
+    if encoded_cookie is None:
+        raise _violation(f"<{wrapper.tag}> element has no 'pagingcookie' attribute")
+    return urllib.parse.unquote(urllib.parse.unquote(encoded_cookie))
+
+
 class DataverseAuthConfig(BaseModel):
     """Authentication configuration for Dataverse connections."""
 
@@ -923,7 +954,7 @@ class DataverseClient:
             # Inject paging cookie into the existing ET root.
             # The paging cookie is Tier 3 data — ET.set() handles
             # attribute escaping automatically (no string formatting).
-            decoded_cookie = urllib.parse.unquote(page.paging_cookie)
+            decoded_cookie = _extract_fetchxml_paging_cookie(page, page.paging_cookie)
 
             current_page += 1
             root.set("paging-cookie", decoded_cookie)
