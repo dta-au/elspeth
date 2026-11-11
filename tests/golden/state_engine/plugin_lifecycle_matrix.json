@@ -150,7 +150,7 @@
         "close": "elspeth.plugins.sinks.database_sink:DatabaseSink"
       },
       "source_hash_present": true,
-      "sink_effect_capability": "contract",
+      "sink_effect_capability": "restaging",
       "sink_effect_modes": [
         "append"
       ],
