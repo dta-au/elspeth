@@ -11,7 +11,7 @@ import os
 import re
 import stat
 import threading
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -72,6 +72,7 @@ from elspeth.web.coordination.quota_authority import (
     session_storage_bytes_on_connection,
 )
 from elspeth.web.sessions.converters import pipeline_dict_from_record
+from elspeth.web.sessions.fork_custody import _fork_blob_plan_identity_from_content
 from elspeth.web.sessions.locking import _blob_custody_session_lock as _blob_custody_session_lock
 from elspeth.web.sessions.locking import (
     _run_lock_cleanup,
@@ -498,6 +499,25 @@ def _require_live_fork_write_fence(conn: Connection, fence: BlobForkWriteFence) 
     ).one_or_none()
     if row is None:
         raise BlobForkFenceLostError(fence.operation_id, attempt=fence.attempt)
+
+
+def _fork_plan_message_id(session_fork_audit_rows: Sequence[Row[Any]], fence: BlobForkWriteFence) -> str:
+    """Return the id of the child's retained plan row for this fork operation.
+
+    A copy of an LLM-authored blob needs a lineage anchor in its own session
+    (``fk_blobs_created_from_message_session``), and the parent's originating
+    message is not there. The fork's ``session_fork`` plan row is: it is
+    written before any copy runs and names the source and target blob ids, so
+    the walk from the copy leads to the blob it was copied from.
+
+    ``session_fork_audit_rows`` are the ``(id, content)`` rows that writer left
+    in the child session.
+    """
+    operation = (fence.source_session_id, fence.target_session_id, fence.operation_id)
+    matching: list[str] = [row.id for row in session_fork_audit_rows if _fork_blob_plan_identity_from_content(row.content) == operation]
+    if len(matching) != 1:
+        raise AuditIntegrityError("Fork copy of an LLM-authored blob requires exactly one retained blob plan row to anchor it")
+    return matching[0]
 
 
 def _require_live_blob_write_fence(
@@ -4105,7 +4125,7 @@ class BlobServiceImpl:
             ):
                 raise AuditIntegrityError("fork blob plan contains a non-deterministic target blob id")
 
-        def _verify_plan_and_quota() -> tuple[BlobRecord, ...]:
+        def _verify_plan_and_quota() -> tuple[tuple[BlobRecord, ...], str | None]:
             with self._engine.connect() as conn:
                 _verify_fork_child_custody(
                     conn,
@@ -4149,10 +4169,19 @@ class BlobServiceImpl:
                         operation="session_fork",
                         record=self._quota_exceeded_recorder,
                     )
-                return tuple(source_records)
+                if not any(record.creation_modality.requires_llm_provenance() for record in source_records):
+                    return tuple(source_records), None
+                session_fork_audit_rows = conn.execute(
+                    select(chat_messages_table.c.id, chat_messages_table.c.content).where(
+                        chat_messages_table.c.session_id == target_session_id_str,
+                        chat_messages_table.c.role == "audit",
+                        chat_messages_table.c.writer_principal == "session_fork",
+                    )
+                ).all()
+            return tuple(source_records), _fork_plan_message_id(session_fork_audit_rows, write_fence)
 
         await checkpoint()
-        source_records = await self._run_sync(_verify_plan_and_quota)
+        source_records, llm_authored_anchor = await self._run_sync(_verify_plan_and_quota)
         blob_map: dict[UUID, BlobRecord] = {}
         for entry, source_blob in zip(plan, source_records, strict=True):
             await checkpoint()
@@ -4203,13 +4232,17 @@ class BlobServiceImpl:
                     mime_type=source_blob.mime_type,
                     created_by=source_blob.created_by,
                     source_description=f"copied from session fork (original: {source_blob.id})",
-                    creation_modality=CreationModality.VERBATIM,
-                    created_from_message_id=None,
-                    creating_model_identifier=None,
-                    creating_model_version=None,
-                    creating_provider=None,
-                    creating_composer_skill_hash=None,
-                    creating_arguments_hash=None,
+                    # A copy is as LLM-authored as its source: relabelling it
+                    # VERBATIM would let a fork launder model-written content
+                    # past every modality guard (dta-au/elspeth#365). The
+                    # creating_* fields are NULL on a non-LLM source row.
+                    creation_modality=source_blob.creation_modality,
+                    created_from_message_id=(llm_authored_anchor if source_blob.creation_modality.requires_llm_provenance() else None),
+                    creating_model_identifier=source_blob.creating_model_identifier,
+                    creating_model_version=source_blob.creating_model_version,
+                    creating_provider=source_blob.creating_provider,
+                    creating_composer_skill_hash=source_blob.creating_composer_skill_hash,
+                    creating_arguments_hash=source_blob.creating_arguments_hash,
                     idempotent=True,
                     fork_write_fence=write_fence,
                     write_guard=authority.require,
