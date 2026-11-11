@@ -1,0 +1,198 @@
+From c6563519e497bb95b5a32421e8ef1f8a3dea2946 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 07:51:24 +0000
+Subject: [PATCH 3/4] ci: remove the uncovered test steps the 3.12 lane used
+
+With one covered 3.14 lane the '!matrix.coverage' steps (ordinary,
+timing-sensitive, long-run proof) can never run. They are removed and
+the workflow contract tests now assert their absence and count one
+pytest step per job. actionlint clean; tests/unit/cicd and
+test_ci_workflow_xdist: 1385 passed together with the lint tests.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Szt2FzuKZ4Y8WpNigvatoY
+---
+ .github/workflows/ci.yaml                     | 26 -------------------
+ .github/workflows/landscape-long-run.yml      | 13 ----------
+ tests/unit/cicd/test_ci_sharding.py           |  2 +-
+ .../cicd/test_state_engine_ci_selection.py    |  6 ++---
+ tests/unit/test_ci_workflow_xdist.py          | 18 +++++++------
+ 5 files changed, 14 insertions(+), 51 deletions(-)
+
+diff --git a/.github/workflows/ci.yaml b/.github/workflows/ci.yaml
+index 704b07d9..70ebdd8c 100644
+--- a/.github/workflows/ci.yaml
++++ b/.github/workflows/ci.yaml
+@@ -543,21 +543,6 @@ jobs:
+             -q -rfE \
+             --junitxml=pytest-junit.xml
+ 
+-      - name: Run tests without coverage
+-        if: ${{ !matrix.coverage }}
+-        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+-        run: |
+-          # No `-m`: same reason as the coverage step above. Use the same
+-          # per-lane worker cap as the coverage lane, and the same output
+-          # flags and JUnit report.
+-          uv run python -m pytest tests/ -p scripts.ci_test_shards \
+-            --ci-partition=ordinary \
+-            --ci-shard-count=8 --ci-shard-index=${{ matrix.shard }} \
+-            --ci-shard-report=shard-manifest.json \
+-            -n "$PYTEST_WORKERS" \
+-            -q -rfE \
+-            --junitxml=pytest-junit.xml
+-
+       - name: Upload JUnit report
+         if: always()
+         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+@@ -677,17 +662,6 @@ jobs:
+             --cov=src/elspeth --cov-report= --cov-fail-under=0 \
+             -n 0 -q -rfE --junitxml=pytest-junit.xml
+ 
+-      - name: Run timing-sensitive tests without coverage
+-        if: ${{ !matrix.coverage }}
+-        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+-        run: |
+-          uv run python -m pytest tests/ -p scripts.ci_test_shards \
+-            --ci-partition=timing \
+-            --ci-shard-count=1 --ci-shard-index=0 \
+-            --ci-shard-report=shard-manifest.json \
+-            -m "not slow and not stress and not performance and not testcontainer and not live_provider and timing_sensitive" \
+-            -n 0 -q -rfE --junitxml=pytest-junit.xml
+-
+       - name: Upload JUnit report
+         if: always()
+         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+diff --git a/.github/workflows/landscape-long-run.yml b/.github/workflows/landscape-long-run.yml
+index 8933e15f..2b3da271 100644
+--- a/.github/workflows/landscape-long-run.yml
++++ b/.github/workflows/landscape-long-run.yml
+@@ -120,19 +120,6 @@ jobs:
+             --cov=src/elspeth --cov-report= --cov-fail-under=0 \
+             -n 0 -q -rfE --junitxml=pytest-junit.xml
+ 
+-      - name: Run long-run proof without coverage
+-        if: ${{ !matrix.coverage }}
+-        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+-        run: |
+-          uv run python scripts/ci_proof_progress.py \
+-            --nodeid "$PROOF_NODEID" --timeout-seconds "$PROOF_TIMEOUT_SECONDS" \
+-            --heartbeat-seconds 30 --grace-seconds 10 --report proof-progress.json -- \
+-            uv run python -m pytest tests/ -p scripts.ci_test_shards \
+-            --ci-partition=proof --ci-proof-case="$PROOF_CASE" \
+-            --ci-shard-count=1 --ci-shard-index=0 \
+-            --ci-shard-report=shard-manifest.json \
+-            -n 0 -q -rfE --junitxml=pytest-junit.xml
+-
+       - name: Upload proof selection, coverage and execution evidence
+         if: always()
+         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+diff --git a/tests/unit/cicd/test_ci_sharding.py b/tests/unit/cicd/test_ci_sharding.py
+index 65ccf0b5..1fadd062 100644
+--- a/tests/unit/cicd/test_ci_sharding.py
++++ b/tests/unit/cicd/test_ci_sharding.py
+@@ -1936,7 +1936,7 @@ def _assert_activation_contract(jobs: dict[str, Any]) -> None:
+     assert set(caller) == {"name", "if", "uses"}
+     assert caller["uses"] == "./.github/workflows/landscape-long-run.yml"
+     assert caller["if"] == "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository"
+-    for name in ("Run tests with coverage", "Run tests without coverage"):
++    for name in ("Run tests with coverage",):
+         run = _activation_step(jobs["test"], name)["run"]
+         tokens = shlex.split(run.replace("\\\n", " "), comments=True)
+         args = tokens[tokens.index("pytest") + 1 :]
+diff --git a/tests/unit/cicd/test_state_engine_ci_selection.py b/tests/unit/cicd/test_state_engine_ci_selection.py
+index a93c6342..c7727a76 100644
+--- a/tests/unit/cicd/test_state_engine_ci_selection.py
++++ b/tests/unit/cicd/test_state_engine_ci_selection.py
+@@ -172,7 +172,7 @@ def test_test_job_steps_carry_no_marker_expression_of_their_own() -> None:
+     that no ``pytest`` invocation in the Test job re-states it.
+     """
+     pytest_steps = [step for step in _job("test")["steps"] if "pytest" in str(step.get("run", ""))]
+-    assert len(pytest_steps) == 2, [step.get("name") for step in pytest_steps]
++    assert len(pytest_steps) == 1, [step.get("name") for step in pytest_steps]
+     for step in pytest_steps:
+         tokens = _pytest_arguments(step["run"])
+         assert "-m" not in tokens, step.get("name")
+@@ -239,14 +239,14 @@ def test_no_job_restates_the_marker_selection_except_required_partition_override
+             if markers:
+                 marker_expressions.setdefault(job_name, []).extend(markers)
+     assert len(steps_with_pytest) >= 6, steps_with_pytest  # never pass by finding nothing to check
+-    assert sum(job_name == "landscape-proof/proof" for job_name, _ in steps_with_pytest) == 2
++    assert sum(job_name == "landscape-proof/proof" for job_name, _ in steps_with_pytest) == 1
+     assert set(marker_expressions) == {"testcontainer", "timing-sensitive"}, marker_expressions
+     assert marker_expressions["testcontainer"] == ["testcontainer"], marker_expressions
+     addopts = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["tool"]["pytest"]["ini_options"]["addopts"]
+     default_expression = addopts[addopts.index("-m") + 1]
+     assert default_expression.count("not timing_sensitive") == 1
+     timing_expression = default_expression.replace("not timing_sensitive", "timing_sensitive")
+-    assert marker_expressions["timing-sensitive"] == [timing_expression, timing_expression], marker_expressions
++    assert marker_expressions["timing-sensitive"] == [timing_expression], marker_expressions
+ 
+ 
+ def test_testcontainer_job_selects_the_postgresql_matrix() -> None:
+diff --git a/tests/unit/test_ci_workflow_xdist.py b/tests/unit/test_ci_workflow_xdist.py
+index 776418d0..adb47838 100644
+--- a/tests/unit/test_ci_workflow_xdist.py
++++ b/tests/unit/test_ci_workflow_xdist.py
+@@ -159,10 +159,10 @@ def test_python_matrix_ci_does_not_hard_disable_xdist() -> None:
+     test_job = workflow["jobs"]["test"]
+ 
+     coverage_run = _step_run(test_job, "Run tests with coverage")
+-    no_coverage_run = _step_run(test_job, "Run tests without coverage")
+ 
+     assert "0" not in _pytest_numprocesses_values(coverage_run)
+-    assert "0" not in _pytest_numprocesses_values(no_coverage_run)
++    # The single 3.14 lane is the coverage lane; no uncovered variant remains.
++    assert "Run tests without coverage" not in {step["name"] for step in test_job["steps"] if "name" in step}
+ 
+ 
+ def _assert_timing_workflow_contract(workflow: dict[str, Any]) -> None:
+@@ -202,10 +202,11 @@ def _assert_timing_workflow_contract(workflow: dict[str, Any]) -> None:
+         "CI_CHECKOUT_PATH": "ci-${{ github.run_id }}-${{ github.run_attempt }}-timing-${{ matrix.python-version }}",
+         "COVERAGE_FILE": "coverage-data",
+     }
+-    for covered, name in ((True, "Run timing-sensitive tests with coverage"), (False, "Run timing-sensitive tests without coverage")):
++    assert "Run timing-sensitive tests without coverage" not in {step["name"] for step in job["steps"] if "name" in step}
++    for covered, name in ((True, "Run timing-sensitive tests with coverage"),):
+         step = _step(job, name)
+         assert set(step) == {"name", "if", "working-directory", "run"}
+-        assert step["if"] == ("matrix.coverage" if covered else "${{ !matrix.coverage }}")
++        assert step["if"] == "matrix.coverage"
+         assert step["working-directory"] == "${{ env.CI_CHECKOUT_PATH }}"
+         expected = [
+             "uv",
+@@ -646,7 +647,7 @@ def test_test_job_reports_through_junit_not_verbose_log() -> None:
+     whatever the outcome."""
+     test_job = _ci_workflow()["jobs"]["test"]
+ 
+-    for step_name in ("Run tests with coverage", "Run tests without coverage"):
++    for step_name in ("Run tests with coverage",):
+         args = _pytest_args(_step_run(test_job, step_name))
+         assert "-v" not in args
+         assert "--junitxml=pytest-junit.xml" in args
+@@ -731,10 +732,11 @@ def _assert_long_run_workflow_contract(workflow: dict[str, Any]) -> None:
+     }
+     assert _step(job, "Checkout code")["with"] == {"path": "${{ env.CI_CHECKOUT_PATH }}", "ref": "${{ github.sha }}", "fetch-depth": 0}
+     assert _step(job, "Install dependencies")["run"] == "uv sync --frozen --all-extras"
+-    for covered, name in ((True, "Run long-run proof with coverage"), (False, "Run long-run proof without coverage")):
++    assert "Run long-run proof without coverage" not in {step["name"] for step in job["steps"] if "name" in step}
++    for covered, name in ((True, "Run long-run proof with coverage"),):
+         step = _step(job, name)
+         assert set(step) == {"name", "if", "working-directory", "run"}
+-        assert step["if"] == ("matrix.coverage" if covered else "${{ !matrix.coverage }}")
++        assert step["if"] == "matrix.coverage"
+         assert step["working-directory"] == "${{ env.CI_CHECKOUT_PATH }}"
+         expected = [
+             "uv",
+@@ -877,7 +879,7 @@ def test_three_case_contract_rejects_identity_and_admission_bypasses(mutation: s
+         _assert_long_run_workflow_contract(workflow)
+ 
+ 
+-@pytest.mark.parametrize("step_name", ["Run long-run proof with coverage", "Run long-run proof without coverage"])
++@pytest.mark.parametrize("step_name", ["Run long-run proof with coverage"])
+ @pytest.mark.parametrize(
+     "mutation", ["or-true", "newline-exit", "newline-true", "prefix-true", "marker", "partition", "case", "parallel", "step-continue"]
+ )
+-- 
+2.43.0
+
