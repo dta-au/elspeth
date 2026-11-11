@@ -1668,10 +1668,9 @@ class ComposerServiceImpl:
 
         Segments are always labelled on the loop's messages. With
         ``reply_stage`` the size the decision is fed is that of the
-        reply-stage request built from them. Quoting a tool record as JSON
-        text only adds bytes, so stubbing a result saves at least its
-        labelled saving in the reply-stage request too: the decision's size
-        after shedding remains an upper bound.
+        reply-stage request built from them, and a tool result's saving is
+        measured on the quoted message that request carries in its place, so
+        the decision's size after shedding is a tight upper bound there too.
         """
         from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers, supports_anthropic_prompt_cache_markers
 
@@ -1690,8 +1689,22 @@ class ComposerServiceImpl:
                 segments.append(SheddableSegment(kind=kind, key=f"history:{chat_index}", saving_bytes=saving))
         # A re-render after shedding history adds the omission counts.
         omission_allowance = CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES if segments else 0
+
+        # The reply stage quotes each tool record as text, one message for one,
+        # unless the turn replays native thinking (the rule _reply_only_messages
+        # applies): a stub's saving is then measured on the quoted form, whose
+        # second layer of escaping stubbing also removes.
+        def quoted_saving(index: int) -> int:
+            quoted = _reply_only_messages([messages[index], stubbed_tool_message(messages[index])])
+            return message_wire_split(quoted[:1], None).total_bytes - message_wire_split(quoted[1:], None).total_bytes
+
+        quotes_records = reply_stage and not any(entry is not None for entry in detach_prompt_guard_evidence(messages).thinking_parts)
         tool_segments, tool_positions = tool_result_segments(
-            messages, split, start=state_index + 2, stop=latest_start if latest_start is not None else len(messages)
+            messages,
+            split,
+            start=state_index + 2,
+            stop=latest_start if latest_start is not None else len(messages),
+            saving_at=quoted_saving if quotes_records else None,
         )
         segments.extend(tool_segments)
 
