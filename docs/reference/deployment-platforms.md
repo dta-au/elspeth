@@ -52,6 +52,13 @@ Terraform package, the ACA Bicep bundle, and their acceptance controllers.
   `elspeth doctor deployment --init-schema`, then run the same command without
   `--init-schema` before admitting traffic. AWS keeps the compatible operator
   entry point `elspeth doctor aws-ecs --init-schema`.
+- Configure both Composer prompt guards
+  (`ELSPETH_WEB__COMPOSER_PROMPT_GUARD` and
+  `ELSPETH_WEB__COMPOSER_ADVISOR_PROMPT_GUARD`) and leave
+  `ELSPETH_WEB__COMPOSER_PROMPT_GUARD_MODE` at its default, `required`. The
+  value `debug-when-unconfigured` lets authoring proceed with no guard, for
+  debugging only; see
+  [Environment variables](environment-variables.md#composer-models).
 - Treat `/api/health` as liveness and `/api/ready` as the traffic gate.
 
 Web startup validates existing schemas; it does not create or repair them.
