@@ -174,8 +174,8 @@ _MAX_DIFFS_PER_RULE = 10
 
 @pytest.mark.fingerprint_baseline
 @pytest.mark.skipif(
-    sys.version_info[:2] != (3, 13),
-    reason="elspeth-lints raw fingerprint baselines are version-specific; Python 3.13 is canonical",
+    sys.version_info[:2] != (3, 14),
+    reason="elspeth-lints raw fingerprint baselines are version-specific; Python 3.14 is canonical",
 )
 def test_baseline_capture_is_self_consistent(tmp_path: Path) -> None:
     """Re-run every rule; the result must equal the committed baseline byte-for-byte.

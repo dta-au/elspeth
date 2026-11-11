@@ -23,7 +23,7 @@ building and running auditable pipelines.
 
 ### Installation
 
-Install Python 3.12 or newer and `uv`, then synchronize the locked source
+Install Python 3.14 or newer and `uv`, then synchronize the locked source
 checkout:
 
 ```bash
@@ -515,7 +515,7 @@ elspeth health --json
   "checks": {
     "version": {"status": "ok", "value": "0.8.0"},
     "commit": {"status": "ok", "value": "abc123f"},
-    "python": {"status": "ok", "value": "3.13.1"},
+    "python": {"status": "ok", "value": "3.14.5"},
     "database": {"status": "ok", "value": "connected"},
     "config_dir": {"status": "ok", "value": "./config"},
     "output_dir": {"status": "ok", "value": "./output"},

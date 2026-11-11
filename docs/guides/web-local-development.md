@@ -6,7 +6,7 @@ topologies, use the [deployment platform reference](../reference/deployment-plat
 
 ## Prerequisites
 
-- Python 3.12 or newer and [uv](https://docs.astral.sh/uv/)
+- Python 3.14 or newer and [uv](https://docs.astral.sh/uv/)
 - Node.js 24 and npm 11 (the frontend's pinned toolchain)
 - OpenSSL to generate local secret keys
 - Credentials for the Composer model provider you configure

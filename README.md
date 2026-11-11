@@ -3,7 +3,7 @@
 **E**xtensible **L**ayered **S**ecure **P**ipeline **E**ngine for **T**ransformation and **H**andling
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.14+](https://img.shields.io/badge/python-3.14+-blue.svg)](https://www.python.org/downloads/)
 ![Status: 0.8.13](https://img.shields.io/badge/status-0.8.13-green.svg)
 
 ELSPETH builds, validates, runs, and audits data and LLM workflows whose
@@ -59,7 +59,7 @@ yet run a shared, persisted compiled-pipeline artifact. The
 
 ## Try a YAML pipeline
 
-You need Python 3.12 or newer and [uv](https://docs.astral.sh/uv/). From a
+You need Python 3.14 or newer and [uv](https://docs.astral.sh/uv/). From a
 source checkout:
 
 ```bash

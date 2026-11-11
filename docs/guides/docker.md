@@ -473,7 +473,7 @@ image without `DATABASE_URL` reports the database check as skipped:
   "checks": {
     "version": {"status": "ok", "value": "0.8.0"},
     "commit": {"status": "warn", "value": "unavailable"},
-    "python": {"status": "ok", "value": "3.13.5"},
+    "python": {"status": "ok", "value": "3.14.5"},
     "database": {"status": "skip", "value": "DATABASE_URL not set"},
     "config_dir": {"status": "ok", "value": "/app/config"},
     "output_dir": {"status": "ok", "value": "/app/output"},
