@@ -51,8 +51,12 @@ def _fault_response(fault: str, request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused", request=request)
     if fault == "read_timeout":
         raise httpx.ReadTimeout("read timed out", request=request)
-    if fault == "proxy_502":
-        return httpx.Response(502, text="<html>502 Bad Gateway</html>")
+    if fault.startswith("proxy_"):
+        # A non-Chroma error page: the SDK raises a bare Exception(resp.text)
+        # inside ``except httpx.HTTPStatusError``, so the status survives on
+        # ``exc.__context__``.
+        status = int(fault.removeprefix("proxy_"))
+        return httpx.Response(status, text=f"<html>{status} from a proxy</html>")
     if fault == "non_json_body":
         return httpx.Response(200, text="<html>not json</html>")
     raise AssertionError(f"unknown fault {fault!r}")
@@ -131,24 +135,30 @@ def _provider_on_http_collection() -> tuple[ChromaSearchProvider, _FakeExecution
     return provider, execution
 
 
-# (fault, expected retryable). Transport errors and non-Chroma HTTP error
-# statuses (gateway pages) are transient; a 2xx body that is not JSON is a
-# malformed response that a retry will not repair.
+# (fault, expected retryable, expected status_code). Transport errors are
+# transient. A non-Chroma HTTP error page is classified by its status: 408,
+# 429 and 5xx are transient, every other status is permanent. A 2xx body that
+# is not JSON is a malformed response that a retry will not repair.
 _FAULTS = [
-    pytest.param("connect", True, id="httpx-ConnectError"),
-    pytest.param("read_timeout", True, id="httpx-ReadTimeout"),
-    pytest.param("proxy_502", True, id="bare-Exception-502"),
-    pytest.param("non_json_body", False, id="orjson-JSONDecodeError"),
+    pytest.param("connect", True, None, id="httpx-ConnectError"),
+    pytest.param("read_timeout", True, None, id="httpx-ReadTimeout"),
+    pytest.param("proxy_502", True, 502, id="bare-Exception-502"),
+    pytest.param("proxy_503", True, 503, id="bare-Exception-503"),
+    pytest.param("proxy_429", True, 429, id="bare-Exception-429"),
+    pytest.param("proxy_408", True, 408, id="bare-Exception-408"),
+    pytest.param("proxy_403", False, 403, id="bare-Exception-403"),
+    pytest.param("non_json_body", False, None, id="orjson-JSONDecodeError"),
 ]
 
 
 @pytest.mark.parametrize("phase", ["count", "query"])
-@pytest.mark.parametrize(("fault", "expected_retryable"), _FAULTS)
+@pytest.mark.parametrize(("fault", "expected_retryable", "expected_status"), _FAULTS)
 def test_sdk_failure_is_audited_and_raised_as_retrieval_error(
     chroma_server: _ChromaServer,
     phase: str,
     fault: str,
     expected_retryable: bool,
+    expected_status: int | None,
 ) -> None:
     provider, execution = _provider_on_http_collection()
     chroma_server.fault_phase = phase
@@ -163,6 +173,7 @@ def test_sdk_failure_is_audited_and_raised_as_retrieval_error(
         f"allocated={execution.call_indices} recorded={len(execution.recorded_calls)}"
     )
     assert raised.retryable is expected_retryable
+    assert raised.status_code == expected_status
     assert execution.call_indices == {"s1": 1}
     call = execution.only_recorded_call()
     assert call["status"] == CallStatus.ERROR
@@ -197,4 +208,23 @@ def test_non_sdk_exception_subclass_still_crashes_through(
     monkeypatch.setattr(type(provider._collection), phase, _bug)
     with pytest.raises(TypeError, match="bad argument"):
         provider.search("query", top_k=3, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
+    assert all(call["status"] == CallStatus.SUCCESS for call in execution.recorded_calls)
+
+
+@pytest.mark.parametrize("phase", ["count", "query"])
+def test_bare_exception_without_http_status_context_crashes_through(
+    chroma_server: _ChromaServer,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    """A bare ``Exception`` is classified only when it carries the SDK's HTTPStatusError context."""
+    provider, execution = _provider_on_http_collection()
+
+    def _unidentified(*_args: object, **_kwargs: object) -> object:
+        raise Exception("not from the SDK's HTTP status path")
+
+    monkeypatch.setattr(type(provider._collection), phase, _unidentified)
+    with pytest.raises(Exception) as exc_info:  # broad on purpose: the exact type is asserted below
+        provider.search("query", top_k=3, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
+    assert type(exc_info.value) is Exception, f"unidentified bare Exception was classified as {exc_info.value!r}"
     assert all(call["status"] == CallStatus.SUCCESS for call in execution.recorded_calls)
