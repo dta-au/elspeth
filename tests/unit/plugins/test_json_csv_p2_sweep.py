@@ -7,6 +7,10 @@ validation error (and snapshot_for_resume does not crash).
 #80: CSVSource decode errors must name the physical line that holds the bad
 byte, and every valid row before it must be emitted, not the first line of the
 ~8 KB TextIOWrapper decode chunk that contains it.
+
+#103: JSONSink JSONL append must refuse a baseline that does not end at an LF
+record boundary (or holds a non-object line) instead of gluing the first new
+record onto the existing last line.
 """
 
 from __future__ import annotations
@@ -16,10 +20,13 @@ from pathlib import Path
 import pytest
 
 from elspeth.contracts.plugin_context import PluginContext
+from elspeth.plugins.sinks.json_sink import JSONSink
 from elspeth.plugins.sources.csv_source import CSVSource
 from elspeth.plugins.sources.json_source import JSONSource
 from tests.fixtures.factories import make_source_context
 from tests.fixtures.landscape import make_recorder_with_run
+from tests.unit.plugins.sinks.test_local_file_sink_effects import _CTX as _SINK_CTX
+from tests.unit.plugins.sinks.test_local_file_sink_effects import _prepare
 
 
 def _landscape_ctx() -> PluginContext:
@@ -116,3 +123,62 @@ def test_csv_decode_error_line_is_exact_for_utf16(tmp_path: Path) -> None:
     assert len(quarantined) == 1
     assert quarantined[0].row["__line_number__"] == 2001
     assert quarantined[0].source_row_index == 1999
+
+
+def _jsonl_append_sink(target: Path) -> JSONSink:
+    return JSONSink(
+        {
+            "path": str(target),
+            "format": "jsonl",
+            "schema": {"mode": "observed"},
+            "mode": "append",
+            "collision_policy": "append_or_create",
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("baseline", "reason"),
+    [
+        pytest.param('{"id": 0}', "LF record boundary", id="no_trailing_newline"),
+        pytest.param('{"id": 0}\nnot json\n', "invalid JSON", id="later_line_not_json"),
+        pytest.param('{"id": 0}\n[1, 2]\n', "non-object", id="later_line_not_object"),
+    ],
+)
+def test_jsonl_append_target_validation_refuses_non_canonical_baseline(tmp_path: Path, baseline: str, reason: str) -> None:
+    target = tmp_path / "out.jsonl"
+    target.write_text(baseline)
+
+    validation = _jsonl_append_sink(target).validate_output_target()
+
+    assert validation.valid is False
+    assert validation.error_message is not None
+    assert reason in validation.error_message
+
+
+def test_jsonl_append_does_not_glue_first_record_onto_unterminated_baseline(tmp_path: Path) -> None:
+    target = tmp_path / "out.jsonl"
+    target.write_text('{"id": 0}')
+    sink = _jsonl_append_sink(target)
+
+    refusal: str | None = None
+    try:
+        sink.commit_effect(_prepare(sink, effect_id="dd" * 32, rows=[{"id": 1}]), _SINK_CTX)
+    except ValueError as exc:
+        refusal = str(exc)
+
+    assert target.read_text() != '{"id": 0}{"id": 1}\n'
+    assert refusal is not None
+    assert "LF record boundary" in refusal
+    assert target.read_text() == '{"id": 0}'
+
+
+def test_jsonl_append_onto_terminated_baseline_still_appends(tmp_path: Path) -> None:
+    target = tmp_path / "out.jsonl"
+    target.write_text('{"id": 0}\n')
+    sink = _jsonl_append_sink(target)
+
+    assert sink.validate_output_target().valid is True
+    sink.commit_effect(_prepare(sink, effect_id="ee" * 32, rows=[{"id": 1}]), _SINK_CTX)
+
+    assert target.read_text() == '{"id": 0}\n{"id": 1}\n'
