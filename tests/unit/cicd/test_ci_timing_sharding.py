@@ -17,7 +17,7 @@ from scripts.ci_test_shards import (
     finalize_long_run_manifest,
     validate_long_run_shards,
 )
-from tests.unit.cicd.test_ci_sharding import _init_checkout, _long_run_artifacts, _partition_run, _partition_suite
+from tests.unit.cicd.test_ci_sharding import LANE, _init_checkout, _long_run_artifacts, _partition_run, _partition_suite
 
 
 @pytest.fixture(autouse=True)
@@ -158,25 +158,34 @@ def test_timing_real_no_pass_evidence_is_refused(tmp_path: Path, monkeypatch: py
     manifest = json.loads(report.read_text(encoding="utf-8"))
     nodeids = ["tests/test_tiny_timing.py::test_timing"]
     assert manifest["selected_nodeids"] == nodeids
-    artifacts = _long_run_artifacts(tmp_path, monkeypatch, "3.12")
-    validate_long_run_shards(artifacts, 4, tmp_path, "3.12")
-    target = artifacts / "timing-shard-3.12-attempt-2" / "shard-manifest.json"
+    artifacts = _long_run_artifacts(tmp_path, monkeypatch)
+    validate_long_run_shards(artifacts, 4, tmp_path, LANE)
+    target = artifacts / f"timing-shard-{LANE}-attempt-2" / "shard-manifest.json"
     # Supply only the native producer envelope from the artifact fixture. The
     # collection and call evidence must come from the real subprocess above.
+    # On the coverage lane the envelope includes the fixture's coverage
+    # database, so its hash travels with the other producer identity fields.
     envelope = json.loads(target.read_text(encoding="utf-8"))
-    for field in ("tested_commit", "duration_profile_sha256", "python_version", "github_run_id", "github_run_attempt", "producer_job"):
+    for field in (
+        "tested_commit",
+        "duration_profile_sha256",
+        "python_version",
+        "github_run_id",
+        "github_run_attempt",
+        "producer_job",
+        "coverage_sha256",
+    ):
         manifest[field] = envelope[field]
     positive = {**manifest, "timing_call_outcomes": dict.fromkeys(nodeids, "passed"), "timing_passed_count": 1}
     target.write_text(json.dumps(positive), encoding="utf-8")
-    validate_long_run_shards(artifacts, 4, tmp_path, "3.12")
+    validate_long_run_shards(artifacts, 4, tmp_path, LANE)
     target.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="timing call"):
-        validate_long_run_shards(artifacts, 4, tmp_path, "3.12")
+        validate_long_run_shards(artifacts, 4, tmp_path, LANE)
     assert manifest["timing_call_outcomes"] == ({} if collect_only else {nodeids[0]: "skipped"})
     assert manifest["timing_passed_count"] == 0
 
 
-@pytest.mark.parametrize("version", ["3.12", "3.13"])
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -191,10 +200,9 @@ def test_timing_real_no_pass_evidence_is_refused(tmp_path: Path, monkeypatch: py
         "bool-count",
     ],
 )
-def test_timing_consumer_requires_complete_calls_and_a_pass(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str, mutation: str
-) -> None:
-    artifacts = _long_run_artifacts(tmp_path, monkeypatch, version)
+def test_timing_consumer_requires_complete_calls_and_a_pass(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str) -> None:
+    version = LANE
+    artifacts = _long_run_artifacts(tmp_path, monkeypatch)
     report = artifacts / f"timing-shard-{version}-attempt-2" / "shard-manifest.json"
     manifest = json.loads(report.read_text(encoding="utf-8"))
     nodeids = ["test_sample.py::test_timing", "test_sample.py::test_other_timing"]
@@ -251,31 +259,29 @@ def test_timing_partition_refuses_empty_or_unmarked_real_collection(tmp_path: Pa
     assert "Timing evidence requires" in result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("version", ["3.12", "3.13"])
-def test_timing_consumer_requires_its_producer_and_includes_covered_lines(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
-) -> None:
-    artifacts = _long_run_artifacts(tmp_path, monkeypatch, version)
-    resolved = validate_long_run_shards(artifacts, 4, tmp_path, version)
-    assert resolved[f"timing-shard-{version}"] == f"timing-shard-{version}-attempt-2"
-    if version == "3.13":
-        data = coverage.CoverageData(basename=str(tmp_path / ".coverage"))
-        data.read()
-        assert data.lines(str(tmp_path / "src" / "elspeth" / "sample.py")) == [1, 2, 3, 4, 5, 6]
-    shutil.rmtree(artifacts / resolved[f"timing-shard-{version}"])
+def test_timing_consumer_requires_its_producer_and_includes_covered_lines(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    artifacts = _long_run_artifacts(tmp_path, monkeypatch)
+    resolved = validate_long_run_shards(artifacts, 4, tmp_path, LANE)
+    assert resolved[f"timing-shard-{LANE}"] == f"timing-shard-{LANE}-attempt-2"
+    data = coverage.CoverageData(basename=str(tmp_path / ".coverage"))
+    data.read()
+    assert data.lines(str(tmp_path / "src" / "elspeth" / "sample.py")) == [1, 2, 3, 4, 5, 6]
+    (tmp_path / ".coverage").unlink()
+    shutil.rmtree(artifacts / resolved[f"timing-shard-{LANE}"])
     with pytest.raises(ValueError, match="Missing producer evidence"):
-        validate_long_run_shards(artifacts, 4, tmp_path, version)
+        validate_long_run_shards(artifacts, 4, tmp_path, LANE)
+    assert not (tmp_path / ".coverage").exists()
 
 
-@pytest.mark.parametrize("version", ["3.12", "3.13"])
 @pytest.mark.parametrize(
     "mutation",
-    ["sha", "run", "attempt", "python", "role", "empty", "markers", "missing-markers", "duplicate", "overlap", "digest"],
+    ["sha", "run", "attempt", "python", "retired-python", "role", "empty", "markers", "missing-markers", "duplicate", "overlap", "digest"],
 )
 def test_timing_consumer_refuses_invalid_identity_collection_or_marker_evidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str, mutation: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
 ) -> None:
-    artifacts = _long_run_artifacts(tmp_path, monkeypatch, version)
+    version = LANE
+    artifacts = _long_run_artifacts(tmp_path, monkeypatch)
     validate_long_run_shards(artifacts, 4, tmp_path, version)
     report = artifacts / f"timing-shard-{version}-attempt-2" / "shard-manifest.json"
     manifest = json.loads(report.read_text(encoding="utf-8"))
@@ -284,6 +290,7 @@ def test_timing_consumer_refuses_invalid_identity_collection_or_marker_evidence(
         "run": ("github_run_id", "9999"),
         "attempt": ("github_run_attempt", "1"),
         "python": ("python_version", "3.99"),
+        "retired-python": ("python_version", "3.13"),
         "role": ("producer_job", "test"),
         "digest": ("collection_digest", "0" * 64),
     }
@@ -314,9 +321,9 @@ def test_timing_consumer_refuses_invalid_identity_collection_or_marker_evidence(
 
 @pytest.mark.parametrize("mutation", ["missing", "hash", "tampered", "empty", "foreign"])
 def test_timing_consumer_verifies_its_coverage_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str) -> None:
-    artifacts = _long_run_artifacts(tmp_path, monkeypatch, "3.13")
-    validate_long_run_shards(artifacts, 4, tmp_path, "3.13")
-    folder = artifacts / "timing-shard-3.13-attempt-2"
+    artifacts = _long_run_artifacts(tmp_path, monkeypatch)
+    validate_long_run_shards(artifacts, 4, tmp_path, LANE)
+    folder = artifacts / f"timing-shard-{LANE}-attempt-2"
     database = folder / "coverage-data"
     report = folder / "shard-manifest.json"
     manifest = json.loads(report.read_text(encoding="utf-8"))
@@ -335,24 +342,24 @@ def test_timing_consumer_verifies_its_coverage_database(tmp_path: Path, monkeypa
         manifest["coverage_sha256"] = hashlib.sha256(database.read_bytes()).hexdigest()
     report.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises((ValueError, FileNotFoundError)):
-        validate_long_run_shards(artifacts, 4, tmp_path, "3.13")
+        validate_long_run_shards(artifacts, 4, tmp_path, LANE)
 
 
 @pytest.mark.parametrize("selected_damage", ["truncated", "missing"])
 def test_timing_latest_attempt_supersedes_bad_older_evidence_without_falling_back(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected_damage: str
 ) -> None:
-    artifacts = _long_run_artifacts(tmp_path, monkeypatch, "3.12")
-    latest = artifacts / "timing-shard-3.12-attempt-2"
-    older = artifacts / "timing-shard-3.12-attempt-1"
+    artifacts = _long_run_artifacts(tmp_path, monkeypatch)
+    latest = artifacts / f"timing-shard-{LANE}-attempt-2"
+    older = artifacts / f"timing-shard-{LANE}-attempt-1"
     shutil.copytree(latest, older)
     (older / "shard-manifest.json").write_text("{", encoding="utf-8")
-    resolved = validate_long_run_shards(artifacts, 4, tmp_path, "3.12")
-    assert resolved["timing-shard-3.12"] == latest.name
+    resolved = validate_long_run_shards(artifacts, 4, tmp_path, LANE)
+    assert resolved[f"timing-shard-{LANE}"] == latest.name
     report = latest / "shard-manifest.json"
     if selected_damage == "truncated":
         report.write_text("{", encoding="utf-8")
     else:
         report.unlink()
     with pytest.raises((ValueError, FileNotFoundError)):
-        validate_long_run_shards(artifacts, 4, tmp_path, "3.12")
+        validate_long_run_shards(artifacts, 4, tmp_path, LANE)

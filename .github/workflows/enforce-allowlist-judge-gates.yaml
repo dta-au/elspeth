@@ -74,7 +74,7 @@ permissions:
 # Every ``run`` step in this workflow is a bash script: the gate steps use
 # ``set -o pipefail`` and the bash-only ``${PIPESTATUS[0]}`` to capture a
 # command's exit status through a ``| tee`` pipe. Inside the
-# ``python:3.13-bookworm`` container jobs, GitHub's shell auto-detection falls
+# ``python:3.14-bookworm`` container jobs, GitHub's shell auto-detection falls
 # back to ``sh -e {0}`` (dash), which rejects ``set -o pipefail`` ("Illegal
 # option") and has no ``PIPESTATUS`` — so the steps crashed before running their
 # real check. Declaring bash explicitly (the image ships it) makes the shell
@@ -93,7 +93,7 @@ jobs:
     # Judge gates should fail fast if checkout/dependency/git plumbing hangs.
     timeout-minutes: 15
     container:
-      image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
+      image: python:3.14-bookworm@sha256:3fe825da0a80fa8e2cd79baadeb76b03c0ddf3d6cdbc8346778a0208b9d6038c
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-override-rate
     steps:
