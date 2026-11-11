@@ -40,6 +40,26 @@ from elspeth.core.url_validation import validate_credential_safe_https_url
 SUPPORTED_TRACING_PROVIDERS = frozenset({"none", "azure_ai", "langfuse"})
 
 
+# ``parse_tracing_config`` splats the untyped ``tracing`` options dict into the
+# dataclasses below, and ``${VAR}`` expansion always yields ``str``. Policy
+# flags are therefore checked by exact type: ``bool("false")`` is True, so a
+# truthiness read would turn content recording ON when the operator asked for
+# OFF. Credentials must be non-empty strings. Neither check echoes the value.
+
+
+def _require_bool(cls_name: str, field_name: str, value: object) -> None:
+    if type(value) is not bool:
+        raise ValueError(
+            f"{cls_name} requires {field_name} to be a boolean (true/false), got {type(value).__name__}. "
+            "Quoted or environment-expanded values such as 'false' are strings and are refused, not coerced."
+        )
+
+
+def _require_credential(cls_name: str, field_name: str, value: object) -> None:
+    if type(value) is not str or not value.strip():
+        raise ValueError(f"{cls_name} requires {field_name} to be a non-empty string, got {type(value).__name__}.")
+
+
 @dataclass(frozen=True, slots=True)
 class TracingConfig:
     """Base tracing configuration.
@@ -84,6 +104,9 @@ class AzureAITracingConfig(TracingConfig):
             raise ValueError(f"AzureAITracingConfig requires provider='azure_ai', got {self.provider!r}")
         if self.connection_string is None:
             raise ValueError("AzureAITracingConfig requires connection_string. Use ${APPLICATIONINSIGHTS_CONNECTION_STRING} in YAML.")
+        _require_credential("AzureAITracingConfig", "connection_string", self.connection_string)
+        _require_bool("AzureAITracingConfig", "enable_content_recording", self.enable_content_recording)
+        _require_bool("AzureAITracingConfig", "enable_live_metrics", self.enable_live_metrics)
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +153,9 @@ class LangfuseTracingConfig(TracingConfig):
             raise ValueError("LangfuseTracingConfig requires secret_key. Use ${LANGFUSE_SECRET_KEY} in YAML.")
         if self.host is None:
             raise ValueError("LangfuseTracingConfig requires host (e.g. 'https://cloud.langfuse.com' or your on-prem URL).")
+        _require_credential("LangfuseTracingConfig", "public_key", self.public_key)
+        _require_credential("LangfuseTracingConfig", "secret_key", self.secret_key)
+        _require_bool("LangfuseTracingConfig", "tracing_enabled", self.tracing_enabled)
         # ``parse_tracing_config`` splats untrusted YAML into this dataclass, so
         # a non-string host would reach the shared validator's ``.strip()`` as an
         # AttributeError rather than a configuration rejection.

@@ -3041,6 +3041,8 @@ class TestConfigureAzureMonitor:
         an incompatible SDK version or a bug in our call, both of which we
         need to know about immediately.
         """
+        import sys
+
         from elspeth.plugins.transforms.llm.providers.azure import _configure_azure_monitor
         from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig
 
@@ -3049,8 +3051,11 @@ class TestConfigureAzureMonitor:
         def broken_sdk(**kwargs: Any) -> None:
             raise TypeError("unexpected keyword argument 'enable_live_metrics'")
 
+        # The instrumentor dependency is checked before configure_azure_monitor
+        # runs, so it must be present for the SDK call to be reached at all.
         with (
             patch("elspeth.plugins.transforms.llm.providers.azure.configure_azure_monitor", broken_sdk),
+            patch.dict(sys.modules, {"azure.ai.inference.tracing": self._fake_inference_tracing_module()}),
             pytest.raises(TypeError, match="unexpected keyword argument"),
         ):
             _configure_azure_monitor(config)
