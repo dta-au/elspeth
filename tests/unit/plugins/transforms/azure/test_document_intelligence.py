@@ -12,7 +12,7 @@ import httpx
 import pytest
 import respx
 
-import elspeth.plugins.transforms.azure.document_intelligence as document_intelligence_module
+import elspeth.plugins.transforms.azure.analyze_lro as analyze_lro_module
 from elspeth.contracts import CallType, Determinism
 from elspeth.contracts.call_data import HTTPCallResponse
 from elspeth.contracts.events import ExternalCallCompleted
@@ -338,10 +338,12 @@ class _FakeClient:
         self._post_resps = post_resps if isinstance(post_resps, list) else [post_resps]
         self._get_resps = list(get_resps)
         self.get_calls = 0
+        self.posts: list[tuple[Any, Any]] = []
         self.closed = False
 
-    def post(self, url: str, *, json: Any = None, timeout: float | None = None) -> Any:
-        del url, json, timeout
+    def post(self, url: str, *, json: Any = None, audit_json: Any = None, timeout: float | None = None) -> Any:
+        del url, timeout
+        self.posts.append((json, audit_json))
         return self._post_resps.pop(0)
 
     def get(self, url: str, *, timeout: float | None = None) -> Any:
@@ -386,6 +388,14 @@ def _run_with_fake(t: AzureDocumentIntelligence, fake: _FakeClient, row: Pipelin
     finally:
         with t._http_clients_lock:
             t._http_clients.pop("s1", None)
+
+
+def _poll_or_failure(t: AzureDocumentIntelligence, *args: Any, **kwargs: Any) -> Any:
+    """Call ``_poll`` directly; a row failure it raises comes back as the error result."""
+    try:
+        return t._poll(*args, **kwargs)
+    except analyze_lro_module._RowFailed as failed:
+        return failed.result
 
 
 def _post_202() -> _Resp:
@@ -552,7 +562,8 @@ def test_poll_deadline_expired_before_get_does_not_accept_success() -> None:
     with t._http_clients_lock:
         t._http_clients["s1"] = fake
     try:
-        result = t._poll(
+        result = _poll_or_failure(
+            t,
             OP,
             "s1",
             token_id=None,
@@ -583,9 +594,9 @@ def test_poll_deadline_expired_during_get_does_not_accept_success(monkeypatch: p
     with t._http_clients_lock:
         t._http_clients["s1"] = fake
     ctx = make_context()
-    monkeypatch.setattr(document_intelligence_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(analyze_lro_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     try:
-        result = t._poll(OP, "s1", token_id=None, ctx=ctx, retry_after=None, capacity_deadline=10.0, started_at=0.0)
+        result = _poll_or_failure(t, OP, "s1", token_id=None, ctx=ctx, retry_after=None, capacity_deadline=10.0, started_at=0.0)
     finally:
         with t._http_clients_lock:
             t._http_clients.pop("s1", None)
@@ -611,10 +622,12 @@ def test_first_poll_waits_for_interval_or_retry_after(
         clock[0] += timeout
         return False
 
-    monkeypatch.setattr(document_intelligence_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(analyze_lro_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     monkeypatch.setattr(t._shutdown, "wait", wait)
     try:
-        result = t._poll(OP, "s1", token_id=None, ctx=make_context(), retry_after=retry_after, capacity_deadline=30.0, started_at=0.0)
+        result = _poll_or_failure(
+            t, OP, "s1", token_id=None, ctx=make_context(), retry_after=retry_after, capacity_deadline=30.0, started_at=0.0
+        )
     finally:
         with t._http_clients_lock:
             t._http_clients.pop("s1", None)
@@ -809,3 +822,294 @@ def test_real_client_streaming_lro_sends_apikey_and_overload() -> None:
             client = t._http_clients.pop("s-real", None)
         if client is not None:
             client.close()
+
+
+# ── Audit projection: SAS credentials are fingerprinted, never stored raw ──
+
+_SAS_URL = "https://acct.blob.core.windows.net/docs/a.pdf?sv=2024-11-04&sp=r&sig=SECRETSIGVALUE%3D"
+
+
+def test_url_submit_sends_sas_verbatim_but_audits_it_fingerprinted(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "unit-test-fingerprint-key")
+    monkeypatch.delenv("ELSPETH_ALLOW_RAW_SECRETS", raising=False)
+    t = _t_for_lro()
+    fake = _FakeClient(_post_202(), [_Resp(200, body={"status": "succeeded", "analyzeResult": {"content": "x"}})])
+
+    result = _run_with_fake(t, fake, row=_row(url=_SAS_URL))
+
+    assert result.status == "success"
+    [(wire, audit)] = fake.posts
+    assert wire == {"urlSource": _SAS_URL}
+    assert set(audit) == {"urlSource"}
+    assert "SECRETSIGVALUE" not in audit["urlSource"]
+    assert "sig=%3Cfingerprint%3A" in audit["urlSource"]
+    assert "sv=2024-11-04" in audit["urlSource"]  # non-credential parameters stay readable
+
+
+def test_url_without_credentials_is_audited_unchanged() -> None:
+    t = _t_for_lro()
+    fake = _FakeClient(_post_202(), [_Resp(200, body={"status": "succeeded", "analyzeResult": {"content": "x"}})])
+    _run_with_fake(t, fake)
+    assert fake.posts == [({"urlSource": "https://x/y.pdf"}, {"urlSource": "https://x/y.pdf"})]
+
+
+@respx.mock
+def test_real_client_records_fingerprinted_sas_and_sends_raw(monkeypatch: pytest.MonkeyPatch) -> None:
+    """End to end through AuditedHTTPClient: the wire carries the SAS, the Landscape record does not."""
+    monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "unit-test-fingerprint-key")
+    monkeypatch.delenv("ELSPETH_ALLOW_RAW_SECRETS", raising=False)
+    t = _t_for_lro()
+    recorder = Mock(spec=ExecutionRepository)
+    recorder.record_call = Mock(spec_set=lambda *args, **kwargs: None)
+    t._recorder = recorder
+    t._run_id = "run-1"
+    t._telemetry_emit = lambda event: None
+    t._poll_interval_seconds = 0.0
+    t._poll_max_interval_seconds = 0.0
+    respx.post(url__regex=r".*/documentModels/prebuilt-layout:analyze.*").mock(
+        return_value=httpx.Response(202, headers={"operation-location": OP})
+    )
+    respx.get(OP).mock(return_value=httpx.Response(200, json={"status": "succeeded", "analyzeResult": {"content": "x"}}))
+
+    result = t._process_single_with_state(_row(url=_SAS_URL), "s-sas", ctx=make_context(run_id="run-1"), token_id=None)
+    try:
+        assert result.status == "success"
+        assert json.loads(respx.calls[0].request.content) == {"urlSource": _SAS_URL}
+        recorded = repr(recorder.record_call.call_args_list)
+        assert recorder.record_call.call_args_list
+        assert "SECRETSIGVALUE" not in recorded
+        assert "fingerprint" in recorded
+    finally:
+        with t._http_clients_lock:
+            client = t._http_clients.pop("s-sas", None)
+        if client is not None:
+            client.close()
+
+
+# ── Terminal statuses ──────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("body", "status", "cause"),
+    [
+        ({"status": "canceled"}, "canceled", "canceled"),
+        ({"status": "canceled", "error": {"code": "OperationCanceled"}}, "canceled", "OperationCanceled"),
+        ({"status": "skipped"}, "failed", "skipped"),
+        ({"status": "failed", "error": {"code": "InvalidContent"}}, "failed", "InvalidContent"),
+        ({"status": "failed"}, "failed", "failed"),
+    ],
+)
+def test_terminal_non_success_statuses_are_analysis_failed(body: dict[str, Any], status: str, cause: str) -> None:
+    """``canceled``/``skipped`` are documented 2024-11-30 statuses, not malformed responses."""
+    t = _t_for_lro()
+    result = _run_with_fake(t, _FakeClient(_post_202(), [_Resp(200, body=body)]))
+    assert result.reason == {"reason": "analysis_failed", "error_type": status, "cause": cause}
+
+
+# ── Bounded Azure error codes on rejected calls ────────────────────────────
+
+
+class _ErrResp(_Resp):
+    """A non-2xx response whose raise_for_status carries the real body and headers."""
+
+    def raise_for_status(self) -> None:
+        request = httpx.Request("POST", "https://x")
+        response = httpx.Response(self.status_code, request=request, headers=self.headers, text=self.text)
+        raise httpx.HTTPStatusError("err", request=request, response=response)
+
+
+def test_submit_rejection_carries_bounded_azure_codes_not_message() -> None:
+    t = _t_for_lro()
+    body = {"error": {"code": "InvalidRequest", "message": "secret detail", "innererror": {"code": "InvalidContentSourceFormat"}}}
+    result = _run_with_fake(t, _FakeClient(_ErrResp(400, body=body), []))
+    assert result.reason == {
+        "reason": "api_error",
+        "error_type": "submit_rejected",
+        "status_code": 400,
+        "code": "InvalidRequest",
+        "cause": "InvalidContentSourceFormat",
+    }
+    assert "secret detail" not in json.dumps(result.reason)
+
+
+def test_submit_rejection_without_a_parseable_envelope_has_no_cause() -> None:
+    t = _t_for_lro()
+    resp = _ErrResp(401)
+    resp.text = "<html>denied</html>"
+    result = _run_with_fake(t, _FakeClient(resp, []))
+    assert result.reason == {"reason": "api_error", "error_type": "submit_rejected", "status_code": 401}
+
+
+# ── Retry-After is honoured, never past the budget ─────────────────────────
+
+
+def _clocked(monkeypatch: pytest.MonkeyPatch, t: AzureDocumentIntelligence) -> list[float]:
+    clock = [0.0]
+    waits: list[float] = []
+
+    def wait(timeout: float) -> bool:
+        waits.append(timeout)
+        clock[0] += timeout
+        return False
+
+    monkeypatch.setattr(analyze_lro_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(t._shutdown, "wait", wait)
+    return waits
+
+
+def test_capacity_retry_honours_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
+    t = _t_for_lro(poll_interval_seconds=1.0)
+    waits = _clocked(monkeypatch, t)
+    fake = _FakeClient(
+        [_ErrResp(429, headers={"retry-after": "7"}), _post_202()],
+        [_Resp(200, body={"status": "succeeded", "analyzeResult": {"content": "ok"}})],
+    )
+    with t._http_clients_lock:
+        t._http_clients["s1"] = fake
+    try:
+        result = t._process_single_with_state(_row(), "s1", ctx=make_context(), token_id=None)
+    finally:
+        with t._http_clients_lock:
+            t._http_clients.pop("s1", None)
+    assert result.status == "success"
+    assert waits[0] == 7.0  # not the 0.05s backoff floor
+
+
+def test_capacity_retry_after_is_clamped_to_the_row_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    t = _t_for_lro(max_capacity_retry_seconds=5)
+    waits = _clocked(monkeypatch, t)
+    fake = _FakeClient([_ErrResp(503, headers={"retry-after": "3600"})], [])
+    with t._http_clients_lock:
+        t._http_clients["s1"] = fake
+    try:
+        result = t._process_single_with_state(_row(), "s1", ctx=make_context(), token_id=None)
+    finally:
+        with t._http_clients_lock:
+            t._http_clients.pop("s1", None)
+    assert waits == [5.0]
+    assert result.reason["reason"] == "retry_timeout"
+    assert result.reason["status_code"] == 503
+
+
+def test_running_poll_retry_after_lengthens_the_next_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    t = _t_for_lro(poll_interval_seconds=1.0, poll_max_interval_seconds=2.0)
+    waits = _clocked(monkeypatch, t)
+    fake = _FakeClient(
+        _post_202(),
+        [
+            _Resp(200, headers={"retry-after": "9"}, body={"status": "running"}),
+            _Resp(200, body={"status": "succeeded", "analyzeResult": {"content": "ok"}}),
+        ],
+    )
+    with t._http_clients_lock:
+        t._http_clients["s1"] = fake
+    try:
+        result = t._process_single_with_state(_row(), "s1", ctx=make_context(), token_id=None)
+    finally:
+        with t._http_clients_lock:
+            t._http_clients.pop("s1", None)
+    assert result.status == "success"
+    assert waits == [1.0, 9.0]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"), [("2", 2.0), ("0", 0.0), ("-1", None), ("nan", None), ("inf", None), ("soon", None), (None, None)]
+)
+def test_parse_retry_after(value: str | None, expected: float | None) -> None:
+    assert AzureDocumentIntelligence._parse_retry_after(value) == expected
+
+
+# ── Batch wait budget covers a full in-flight request ─────────────────────
+
+
+def test_batch_wait_budget_covers_the_last_request_timeout() -> None:
+    t = _transform(poll_timeout_seconds=10, max_capacity_retry_seconds=10, request_timeout_seconds=600, batch_wait_timeout_seconds=1)
+    assert t._effective_batch_wait_timeout_seconds == 10 + 10 + 600 + 30
+
+
+# ── base64 is validated locally, before a billed and audited submit ───────
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["data:application/pdf;base64,JVBERi0=", "JVBE Ri0=", "JVBERi0", "JVBERi0-_w==", "===="],
+)
+def test_invalid_base64_is_rejected_without_a_submit(value: str) -> None:
+    t = _t_for_lro(source_mode="base64", source_field="doc_b64")
+    fake = _FakeClient([], [])
+    result = _run_with_fake(t, fake, row=_row(url=value, field="doc_b64"))
+    assert result.reason == {"reason": "invalid_input", "field": "doc_b64", "error_type": "invalid_base64"}
+    assert fake.posts == []
+
+
+def test_valid_base64_is_submitted_and_audited_as_is() -> None:
+    t = _t_for_lro(source_mode="base64", source_field="doc_b64")
+    fake = _FakeClient(_post_202(), [_Resp(200, body={"status": "succeeded", "analyzeResult": {"content": "x"}})])
+    result = _run_with_fake(t, fake, row=_row(url="JVBERi0xLjQK", field="doc_b64"))
+    assert result.status == "success"
+    assert fake.posts == [({"base64Source": "JVBERi0xLjQK"}, {"base64Source": "JVBERi0xLjQK"})]
+
+
+# ── fields_field and metadata_field ────────────────────────────────────────
+
+
+def test_fields_and_metadata_outputs() -> None:
+    t = _t_for_lro(fields_field="di_fields", metadata_field="di_meta")
+    done = _Resp(
+        200,
+        body={
+            "status": "succeeded",
+            "analyzeResult": {
+                "modelId": "prebuilt-invoice",
+                "content": "x",
+                "pages": [{}],
+                "warnings": [{"code": "ModelDeprecated", "message": "ignore me"}],
+                "documents": [{"fields": {"InvoiceTotal": {"type": "currency", "valueCurrency": {"amount": 5.0}}}}],
+            },
+        },
+    )
+    result = _run_with_fake(t, _FakeClient(_post_202(), [done]))
+    assert result.status == "success"
+    out = result.row.to_dict()
+    assert out["di_fields"] == {"InvoiceTotal": {"amount": 5.0}}
+    assert out["di_meta"] == {
+        "model_id": "prebuilt-invoice",
+        "api_version": "2024-11-30",
+        "operation_id": "abc",
+        "page_count": 1,
+        "document_count": 1,
+        "warning_count": 1,
+        "warning_codes": ["ModelDeprecated"],
+        "content_format": "text",
+        "features": [],
+        "result_status": "succeeded",
+    }
+    declared = {name: contract.python_type for name, contract in t._stamped_output_field_contracts().items()}
+    assert declared["di_fields"] is object
+    assert declared["di_meta"] is object
+    verify_produced_output_types(transform=t, input_row=_row(), emitted_rows=[result.row])
+
+
+def test_fields_field_alone_is_a_valid_output_target() -> None:
+    data = {key: value for key, value in BASE.items() if key != "content_field"}
+    cfg = AzureDocumentIntelligenceConfig.from_dict({**data, "fields_field": "f"}, plugin_name="azure_document_intelligence")
+    assert cfg.all_output_field_names() == ["f"]
+
+
+def test_malformed_document_fields_fail_the_row_closed() -> None:
+    t = _t_for_lro(fields_field="di_fields")
+    done = _Resp(200, body={"status": "succeeded", "analyzeResult": {"documents": [{"fields": {"A": {"no": "type"}}}]}})
+    result = _run_with_fake(t, _FakeClient(_post_202(), [done]))
+    assert result.status == "error"
+    assert result.reason["reason"] == "malformed_response"
+
+
+def test_reported_model_id_that_is_not_a_model_id_is_not_echoed() -> None:
+    t = _t_for_lro()
+    done = _Resp(200, body={"status": "succeeded", "analyzeResult": {"modelId": "<script>" * 40, "content": "x"}})
+    result = _run_with_fake(t, _FakeClient(_post_202(), [done]))
+    assert result.success_reason["metadata"]["model_id"] == "prebuilt-layout"
+
+
+def test_new_output_options_are_output_naming_keys() -> None:
+    assert {"fields_field", "metadata_field"} <= AzureDocumentIntelligence.output_naming_config_keys

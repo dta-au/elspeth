@@ -92,7 +92,7 @@ may select, so a deployment exposes a subset [EV-009], [EV-013].
 | Kind | Count | Registered plugins that can reach outside the process |
 |---|---:|---|
 | Sources | 9 | `aws_s3`, `azure_blob`, `dataverse`, `llm` |
-| Transforms | 39 | `llm`, `blob_fetch`, `web_scrape`, `azure_ai_search`, `rag_retrieval`, `azure_content_safety`, `azure_prompt_shield`, `azure_document_intelligence`, `aws_bedrock_content_safety`, `aws_bedrock_prompt_shield`, `aws_textract_document_analysis`, `aws_textract_inline_analysis` |
+| Transforms | 39 | `llm`, `blob_fetch`, `web_scrape`, `azure_ai_search`, `rag_retrieval`, `azure_content_safety`, `azure_prompt_shield`, `azure_document_intelligence`, `azure_content_understanding`, `aws_bedrock_content_safety`, `aws_bedrock_prompt_shield`, `aws_textract_document_analysis`, `aws_textract_inline_analysis` |
 | Sinks | 9 | `aws_s3`, `azure_blob`, `chroma_sink`, `database`, `dataverse` |
 
 The exact enabled set and its operator profiles belong in the controlled

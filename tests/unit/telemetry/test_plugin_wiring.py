@@ -704,7 +704,10 @@ _KNOWN_AUDITED_CLIENT_USERS: set[str] = {
     "src/elspeth/plugins/transforms/llm/providers/openrouter.py",
     "src/elspeth/plugins/transforms/llm/providers/gateway.py",
     "src/elspeth/plugins/transforms/azure/base.py",
-    "src/elspeth/plugins/transforms/azure/document_intelligence.py",
+    # Shared analyze/poll core for azure_document_intelligence and
+    # azure_content_understanding; each plugin's respx test drives the real
+    # AuditedHTTPClient and asserts the ExternalCallCompleted telemetry.
+    "src/elspeth/plugins/transforms/azure/analyze_lro.py",
     "src/elspeth/plugins/transforms/web_scrape.py",
     "src/elspeth/plugins/transforms/blob_fetch.py",
     "src/elspeth/plugins/infrastructure/clients/power_automate.py",

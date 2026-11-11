@@ -23,38 +23,10 @@
         "tier": "common"
       },
       {
-        "description": "Azure Document Intelligence resource endpoint URL (HTTPS, Azure host only).",
-        "kind": "text",
-        "label": "Endpoint",
-        "name": "endpoint",
-        "nullable": false,
-        "required": true,
-        "tier": "common"
-      },
-      {
-        "description": "Document Intelligence API key (Ocp-Apim-Subscription-Key).",
+        "description": "Resource API key (sent as Ocp-Apim-Subscription-Key).",
         "kind": "text",
         "label": "API Key",
         "name": "api_key",
-        "nullable": false,
-        "required": true,
-        "tier": "common"
-      },
-      {
-        "default": "2024-11-30",
-        "description": "REST api-version (GA 2024-11-30 only in v1).",
-        "kind": "text",
-        "label": "API Version",
-        "name": "api_version",
-        "nullable": false,
-        "required": false,
-        "tier": "common"
-      },
-      {
-        "description": "Prebuilt or custom model id, e.g. prebuilt-layout, prebuilt-invoice.",
-        "kind": "text",
-        "label": "Model ID",
-        "name": "model_id",
         "nullable": false,
         "required": true,
         "tier": "common"
@@ -85,6 +57,114 @@
         "name": "max_base64_chars",
         "nullable": false,
         "required": false,
+        "tier": "common"
+      },
+      {
+        "default": 1.0,
+        "description": "Initial poll delay.",
+        "kind": "number-float",
+        "label": "Poll Interval Seconds",
+        "name": "poll_interval_seconds",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": 1.5,
+        "description": "Exponential poll backoff factor.",
+        "kind": "number-float",
+        "label": "Poll Backoff Multiplier",
+        "name": "poll_backoff_multiplier",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": 10.0,
+        "description": "Poll backoff cap.",
+        "kind": "number-float",
+        "label": "Poll Max Interval Seconds",
+        "name": "poll_max_interval_seconds",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": 300.0,
+        "description": "Outer bound on the poll sequence.",
+        "kind": "number-float",
+        "label": "Poll Timeout Seconds",
+        "name": "poll_timeout_seconds",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": 60.0,
+        "description": "Per HTTP call timeout.",
+        "kind": "number-float",
+        "label": "Request Timeout Seconds",
+        "name": "request_timeout_seconds",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": 50000000,
+        "description": "Cap on the analyze result response body.",
+        "kind": "number-int",
+        "label": "Max Response Body Bytes",
+        "name": "max_response_body_bytes",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": 300,
+        "description": "Per-row 429/503 retry budget (default 300 bounds web-worker hold time).",
+        "kind": "number-int",
+        "label": "Max Capacity Retry Seconds",
+        "name": "max_capacity_retry_seconds",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": 3600,
+        "description": "Batch-mixin per-row wait timeout.",
+        "kind": "number-int",
+        "label": "Batch Wait Timeout Seconds",
+        "name": "batch_wait_timeout_seconds",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "description": "Azure Document Intelligence resource endpoint URL (HTTPS, Azure host only).",
+        "kind": "text",
+        "label": "Endpoint",
+        "name": "endpoint",
+        "nullable": false,
+        "required": true,
+        "tier": "common"
+      },
+      {
+        "default": "2024-11-30",
+        "description": "REST api-version (GA 2024-11-30 only in v1).",
+        "kind": "text",
+        "label": "API Version",
+        "name": "api_version",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "description": "Prebuilt or custom model id, e.g. prebuilt-layout, prebuilt-invoice.",
+        "kind": "text",
+        "label": "Model ID",
+        "name": "model_id",
+        "nullable": false,
+        "required": true,
         "tier": "common"
       },
       {
@@ -122,6 +202,26 @@
         "kind": "text",
         "label": "Page Count Field",
         "name": "page_count_field",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Row field for the first document's extracted fields as plain values ({name: value}); for typed models (prebuilt-invoice, custom) and queryFields.",
+        "kind": "text",
+        "label": "Fields Field",
+        "name": "fields_field",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Row field for bounded analysis metadata (model id, api version, operation id, counts, warning codes).",
+        "kind": "text",
+        "label": "Metadata Field",
+        "name": "metadata_field",
         "nullable": true,
         "required": false,
         "tier": "common"
@@ -182,86 +282,6 @@
         "kind": "string-list",
         "label": "Query Fields",
         "name": "query_fields",
-        "nullable": false,
-        "required": false,
-        "tier": "common"
-      },
-      {
-        "default": 1.0,
-        "description": "Initial poll delay.",
-        "kind": "number-float",
-        "label": "Poll Interval Seconds",
-        "name": "poll_interval_seconds",
-        "nullable": false,
-        "required": false,
-        "tier": "common"
-      },
-      {
-        "default": 1.5,
-        "description": "Exponential poll backoff factor.",
-        "kind": "number-float",
-        "label": "Poll Backoff Multiplier",
-        "name": "poll_backoff_multiplier",
-        "nullable": false,
-        "required": false,
-        "tier": "common"
-      },
-      {
-        "default": 10.0,
-        "description": "Poll backoff cap.",
-        "kind": "number-float",
-        "label": "Poll Max Interval Seconds",
-        "name": "poll_max_interval_seconds",
-        "nullable": false,
-        "required": false,
-        "tier": "common"
-      },
-      {
-        "default": 300.0,
-        "description": "Outer bound on the poll sequence.",
-        "kind": "number-float",
-        "label": "Poll Timeout Seconds",
-        "name": "poll_timeout_seconds",
-        "nullable": false,
-        "required": false,
-        "tier": "common"
-      },
-      {
-        "default": 60.0,
-        "description": "Per HTTP call timeout.",
-        "kind": "number-float",
-        "label": "Request Timeout Seconds",
-        "name": "request_timeout_seconds",
-        "nullable": false,
-        "required": false,
-        "tier": "common"
-      },
-      {
-        "default": 50000000,
-        "description": "Cap on the analyzeResult response body.",
-        "kind": "number-int",
-        "label": "Max Response Body Bytes",
-        "name": "max_response_body_bytes",
-        "nullable": false,
-        "required": false,
-        "tier": "common"
-      },
-      {
-        "default": 300,
-        "description": "Per-call 429/503 retry budget (default 300 bounds web-worker hold time).",
-        "kind": "number-int",
-        "label": "Max Capacity Retry Seconds",
-        "name": "max_capacity_retry_seconds",
-        "nullable": false,
-        "required": false,
-        "tier": "common"
-      },
-      {
-        "default": 3600,
-        "description": "Batch-mixin per-row wait timeout.",
-        "kind": "number-int",
-        "label": "Batch Wait Timeout Seconds",
-        "name": "batch_wait_timeout_seconds",
         "nullable": false,
         "required": false,
         "tier": "common"

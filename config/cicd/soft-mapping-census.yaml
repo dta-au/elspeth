@@ -511,16 +511,32 @@ files:
     dict[str, Any]: 19
   src/elspeth/plugins/transforms/azure/ai_search.py:
     dict[str, Any]: 2
+  src/elspeth/plugins/transforms/azure/analyze_lro.py:
+    Mapping[str, Any]: 6
+    dict[str, Any]: 1
+  src/elspeth/plugins/transforms/azure/analyze_result.py:
+    Mapping[str, Any]: 2
+    boundary: 2
+    dict[str, Any]: 3
   src/elspeth/plugins/transforms/azure/base.py:
     dict[str, Any]: 2
   src/elspeth/plugins/transforms/azure/content_safety.py:
     Mapping[str, object]: 1
     dict[str, Any]: 4
+  src/elspeth/plugins/transforms/azure/content_understanding.py:
+    Mapping[str, Any]: 2
+    dict[str, Any]: 2
+  src/elspeth/plugins/transforms/azure/content_understanding_result.py:
+    Mapping[str, Any]: 3
+    boundary: 1
+    dict[str, Any]: 1
   src/elspeth/plugins/transforms/azure/document_intelligence.py:
     Mapping[str, Any]: 2
-    dict[str, Any]: 4
+    dict[str, Any]: 2
   src/elspeth/plugins/transforms/azure/document_intelligence_result.py:
-    Mapping[str, Any]: 3
+    Mapping[str, Any]: 2
+    boundary: 2
+    dict[str, Any]: 1
   src/elspeth/plugins/transforms/azure/prompt_shield.py:
     dict[str, Any]: 2
   src/elspeth/plugins/transforms/batch_classifier_metrics.py:
@@ -1100,10 +1116,10 @@ files:
   src/elspeth/web/shareable_reviews/service.py:
     dict[str, object]: 1
 totals:
-  Mapping[str, Any]: 798
+  Mapping[str, Any]: 810
   Mapping[str, object]: 317
   MutableMapping[str, Any]: 8
-  boundary: 65
-  dict[str, Any]: 1125
+  boundary: 70
+  dict[str, Any]: 1131
   dict[str, object]: 402
-  soft: 2650
+  soft: 2668

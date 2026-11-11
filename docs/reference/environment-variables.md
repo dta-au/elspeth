@@ -1005,6 +1005,17 @@ option references `${AZURE_DOCUMENT_INTELLIGENCE_KEY}`. Configure the Document
 Intelligence endpoint in the transform's `options.endpoint`; there is no
 implicit endpoint environment variable.
 
+### Azure Content Understanding
+
+| Variable | Purpose |
+|----------|---------|
+| `AZURE_CONTENT_UNDERSTANDING_KEY` | API key for the Azure AI Foundry / AI Services resource that hosts Content Understanding |
+
+Used by the `azure_content_understanding` transform plugin when the plugin
+option references `${AZURE_CONTENT_UNDERSTANDING_KEY}`. Configure the resource
+endpoint in the transform's `options.endpoint`; there is no implicit endpoint
+environment variable.
+
 ### Azure Blob Storage
 
 | Variable | Purpose |
@@ -1108,6 +1119,9 @@ AZURE_PROMPT_SHIELD_ENDPOINT=https://example-resource.cognitiveservices.azure.co
 
 # Azure Document Intelligence (for azure_document_intelligence transform)
 AZURE_DOCUMENT_INTELLIGENCE_KEY=fake_document_intelligence_key_for_docs_only
+
+# Azure Content Understanding (for azure_content_understanding transform)
+AZURE_CONTENT_UNDERSTANDING_KEY=fake_content_understanding_key_for_docs_only
 
 # =====================================================================
 # Azure Storage

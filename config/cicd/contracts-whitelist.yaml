@@ -222,6 +222,7 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/transforms/pdf_rasterize.py:PDFRasterize.probe_config:return"
   - "src/elspeth/plugins/transforms/azure/content_safety.py:AzureContentSafety.probe_config:return"
   - "src/elspeth/plugins/transforms/azure/document_intelligence.py:AzureDocumentIntelligence.probe_config:return"
+  - "src/elspeth/plugins/transforms/azure/content_understanding.py:AzureContentUnderstanding.probe_config:return"
   - "src/elspeth/plugins/transforms/azure/prompt_shield.py:AzurePromptShield.probe_config:return"
   - "src/elspeth/plugins/transforms/aws/textract_document_analysis.py:AWSTextractDocumentAnalysis.probe_config:return"
   - "src/elspeth/plugins/transforms/aws/textract_inline_analysis.py:AWSTextractInlineAnalysis.probe_config:return"
@@ -275,6 +276,7 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/transforms/file_inject.py:FileInject.__init__:options"
   - "src/elspeth/plugins/transforms/pdf_rasterize.py:PDFRasterize.__init__:options"
   - "src/elspeth/plugins/transforms/azure/document_intelligence.py:AzureDocumentIntelligence.__init__:config"
+  - "src/elspeth/plugins/transforms/azure/content_understanding.py:AzureContentUnderstanding.__init__:config"
   - "src/elspeth/plugins/transforms/aws/textract_document_analysis.py:AWSTextractDocumentAnalysis.__init__:config"
   - "src/elspeth/plugins/transforms/aws/textract_inline_analysis.py:AWSTextractInlineAnalysis.__init__:config"
   - "src/elspeth/plugins/sources/json_source.py:JSONSource.__init__:config"
@@ -838,10 +840,14 @@ allowed_dict_patterns:
   # Schema; a TypedDict would duplicate and drift from that authority.
   - "src/elspeth/web/composer/tools/schema_contract.py:canonical_set_pipeline_schema:return"
 
-  # Azure Document Intelligence forward-invariant probe fake response payload.
-  # Mirrors an HTTP JSON body emitted by the local fake client, not an internal
-  # durable contract.
-  - "src/elspeth/plugins/transforms/azure/document_intelligence.py:_ProbeResponse.__init__:payload"
+  # Azure analyze (Document Intelligence / Content Understanding) typed-field
+  # projection. The result is the provider's own open {field name: value} map
+  # (names come from the analyzer's schema, values are Azure-typed JSON), written
+  # to a row field declared ``any``; there is no closed key set to type.
+  - "src/elspeth/plugins/transforms/azure/analyze_result.py:flatten_fields:return"
+  - "src/elspeth/plugins/transforms/azure/analyze_result.py:_flatten_field_map:return"
+  - "src/elspeth/plugins/transforms/azure/document_intelligence_result.py:first_document_fields:return"
+  - "src/elspeth/plugins/transforms/azure/content_understanding_result.py:ResultContents.first_fields:return"
 
   # ═══════════════════════════════════════════════════════════════════════════
   # WEB COMPOSER — Tool executor (Tier 3 LLM tool call arguments)
