@@ -28,7 +28,9 @@ These changes are breaking:
 - **Drain in-flight runs and pending approvals before upgrading.** The
   runtime-validation manifest hash changes with the interpreter, so a run
   checkpointed under 3.13 refuses to resume under 3.14, and a web approval
-  recorded under 3.13 no longer matches.
+  recorded under 3.13 no longer matches. The `database` sink's effect plan
+  format also changed, so a batch prepared but not committed before the
+  upgrade is refused.
 - **The release image carries its own interpreter.** The runtime base is now
   `gcr.io/distroless/cc-debian13:debug-nonroot`, and the image carries CPython
   3.14.5, installed by the pinned uv under `/opt/python`, with the venv at
@@ -141,6 +143,15 @@ Each of these keeps the behaviour ELSPETH had under Python 3.13.
   results, and the paging cookie sent back is the annotation's inner
   `pagingcookie` value. If the server ignores the annotations and a second
   page exists, the source fails instead of truncating.
+- **The `database` sink publishes batches larger than about 64 KiB.** The
+  effect plan no longer embeds every row; it binds them by hash and member
+  count, and commit re-derives them from the durable member payloads. Such
+  batches previously failed at prepare. Not run for this change: the
+  PostgreSQL testcontainer suite.
+- **The `database` sink writes object and list values as RFC 8785 canonical
+  JSON text** (`{"k":1}`), where it previously wrote `json.dumps` output
+  (`{"k": 1}`). Consumers that compare the stored text byte-for-byte will see
+  the difference.
 
 ### Logging
 
