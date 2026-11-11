@@ -49,6 +49,43 @@ class RuntimePreflightUnavailable(RuntimeError):
     """The lifecycle sealed preflight admission before this request arrived."""
 
 
+def _shield[T](task: asyncio.Task[T]) -> asyncio.Future[T]:
+    """Await ``task`` without letting the awaiter's cancellation reach it.
+
+    ``asyncio.shield`` semantics, minus one Python 3.14 addition: once a
+    shielded awaiter is cancelled, 3.14's ``shield`` hands any later task
+    exception to the loop exception handler, which logs it with its message
+    and traceback. This coordinator owns every task outcome and reports an
+    abandoned failure by class only, so that log would publish worker content
+    the coordinator deliberately withholds.
+    """
+    if task.done():
+        # As ``asyncio.shield``: a finished task is its own outcome, which
+        # lets a zero-budget ``wait_for`` still deliver a completed worker.
+        return task
+    outer: asyncio.Future[T] = task.get_loop().create_future()
+
+    def _relay(inner: asyncio.Task[T]) -> None:
+        if outer.cancelled():
+            return
+        if inner.cancelled():
+            outer.cancel()
+            return
+        failure = inner.exception()
+        if failure is not None:
+            outer.set_exception(failure)
+        else:
+            outer.set_result(inner.result())
+
+    def _detach(_outer: asyncio.Future[T]) -> None:
+        if not task.done():
+            task.remove_done_callback(_relay)
+
+    task.add_done_callback(_relay)
+    outer.add_done_callback(_detach)
+    return outer
+
+
 @dataclass(slots=True)
 class _RetainedPreflight:
     task: asyncio.Task[RuntimePreflightEntry]
@@ -137,11 +174,11 @@ class RuntimePreflightCoordinator:
         cancellations_before = caller.cancelling()
         try:
             if timeout is None:
-                result = await asyncio.shield(task)
+                result = await _shield(task)
             else:
                 try:
                     # Expiry cancels only the shield, never the shared task.
-                    result = await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+                    result = await asyncio.wait_for(_shield(task), timeout=timeout)
                 except TimeoutError as exc:
                     return RuntimePreflightFailure(exc)
         except BaseException:
@@ -239,7 +276,7 @@ class RuntimePreflightCoordinator:
         cancellation: asyncio.CancelledError | None = None
         while not task.done():
             try:
-                await asyncio.shield(task)
+                await _shield(task)
             except asyncio.CancelledError as original:
                 if cancellation is None:
                     cancellation = original

@@ -25,7 +25,7 @@ docs/composer/ux-redesign-2026-05/18a-phase-5b-backend.md §"Test shape"
 
 from __future__ import annotations
 
-import asyncio
+import inspect
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
@@ -3221,10 +3221,10 @@ def test_13_dual_registry_invariant() -> None:
 
     # Async-ness contract.
     for tool_name, handler in _SESSION_AWARE_TOOL_HANDLERS.items():
-        assert asyncio.iscoroutinefunction(handler), f"_SESSION_AWARE_TOOL_HANDLERS[{tool_name!r}] is not a coroutine function"
+        assert inspect.iscoroutinefunction(handler), f"_SESSION_AWARE_TOOL_HANDLERS[{tool_name!r}] is not a coroutine function"
     for registry_name, registry in sync_registries.items():
         for tool_name, sync_handler in registry.items():
-            assert not asyncio.iscoroutinefunction(sync_handler), (
+            assert not inspect.iscoroutinefunction(sync_handler), (
                 f"{registry_name}[{tool_name!r}] is async; belongs in _SESSION_AWARE_TOOL_HANDLERS"
             )
 
