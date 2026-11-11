@@ -211,3 +211,43 @@ def test_blob_json_expand_moderate_nesting_still_expands(parse_format: str) -> N
 
     assert not isinstance(result, Exception)
     assert result.status == "success"
+
+
+# ── #112: source-boundary non-canonical-number walker ───────────────────────
+
+
+def _source_schema(mode: str) -> Any:
+    from elspeth.contracts.schema import SchemaConfig
+    from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+
+    config = {"mode": "observed"} if mode == "observed" else {"mode": "flexible", "fields": ["id: int"]}
+    return create_schema_from_config(SchemaConfig.from_dict(config), "DeepRow", allow_coercion=True)
+
+
+@pytest.mark.parametrize("mode", ["observed", "flexible"])
+@pytest.mark.parametrize("depth", [100, PARSEABLY_DEEP])
+def test_source_schema_rejects_deep_nesting_as_a_validation_error(mode: str, depth: int) -> None:
+    from pydantic import ValidationError
+
+    from elspeth.contracts.safe_validation_errors import safe_validation_error_text
+
+    schema = _source_schema(mode)
+    row = {"id": 1, "x": json.loads(_nested_list(depth))}
+
+    outcome = _outcome(lambda: schema.model_validate(row))
+
+    assert isinstance(outcome, ValidationError), f"model_validate returned/raised {type(outcome).__name__}, not a ValidationError"
+    assert [error["type"] for error in outcome.errors()] == ["nesting_too_deep"]
+    # The rendered, value-free reason names the rule rather than "custom".
+    assert safe_validation_error_text(outcome, schema) == "1 validation error: <root>: [nesting_too_deep]"
+
+
+def test_source_schema_still_admits_moderately_nested_rows() -> None:
+    """Negative control: nesting within the bound still validates."""
+    schema = _source_schema("observed")
+    row = {"id": 1, "x": json.loads(_nested_list(10))}
+
+    outcome = _outcome(lambda: schema.model_validate(row))
+
+    assert not isinstance(outcome, Exception)
+    assert outcome.to_row()["id"] == 1
