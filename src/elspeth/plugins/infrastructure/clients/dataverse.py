@@ -204,6 +204,22 @@ def _extract_fetchxml_paging_cookie(page: DataversePageResponse, annotation: str
     return urllib.parse.unquote(urllib.parse.unquote(encoded_cookie))
 
 
+def _https_origin(url: str) -> tuple[str, int] | None:
+    """The (lower-cased host, port) of an https URL, or None for any other URL.
+
+    An unreadable port (``ValueError`` from urllib) also yields None, so the
+    caller rejects it rather than guessing an origin.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme.lower() != "https" or parsed.hostname is None:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    return parsed.hostname.lower(), 443 if port is None else port
+
+
 class DataverseAuthConfig(BaseModel):
     """Authentication configuration for Dataverse connections."""
 
@@ -348,6 +364,7 @@ class DataverseClient:
             raise DataverseClientError(str(exc), retryable=False) from exc
 
         self._environment_url = safe_environment_url.rstrip("/")
+        self._environment_origin = _https_origin(self._environment_url)
         self._credential = credential
         self._api_version = api_version
         self._limiter = limiter
@@ -901,6 +918,20 @@ class DataverseClient:
             # No more pages
             if page.next_link is None:
                 break
+
+            # The nextLink is Tier-3 data and the next request carries this
+            # environment's bearer token, so it must stay on the configured
+            # environment's https origin. The family-wide domain allowlist
+            # alone admits plaintext http and every other tenant's host.
+            if _https_origin(page.next_link) != self._environment_origin:
+                raise DataverseClientError(
+                    f"@odata.nextLink {fingerprint_url(page.next_link)!r} is not on the configured "
+                    f"environment's https origin — refusing to send credentials to it. "
+                    f"Possible SSRF attempt via @odata.nextLink redirection.",
+                    retryable=False,
+                    error_category="ssrf_rejected",
+                    request_url=page.next_link,
+                )
 
             # SSRF validate the nextLink and pin the resolved IP.
             # The returned SSRFSafeRequest is passed to _execute_request
