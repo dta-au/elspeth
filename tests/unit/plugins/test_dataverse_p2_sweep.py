@@ -297,3 +297,65 @@ def test_next_link_on_the_environment_origin_is_followed(next_link: str) -> None
 
     assert error is None
     assert len(transport.requests) == 2
+
+
+# ---------------------------------------------------------------------------
+# Finding #83: sink guidance promises row diversion that no real error reaches
+# ---------------------------------------------------------------------------
+
+
+class _RejectingDataverse(httpx.BaseTransport):
+    """Answers every PATCH with a documented Dataverse OData error body."""
+
+    def __init__(self, status_code: int) -> None:
+        self._status_code = status_code
+        self.requests: list[httpx.Request] = []
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        body = {"error": {"code": "0x80040237", "message": "A record with matching key values already exists."}}
+        return httpx.Response(self._status_code, json=body)
+
+
+def _effect_fixture(sink: Any, rows: tuple[dict[str, object], ...]) -> tuple[Any, Any, Any]:
+    from elspeth.contracts.sink_effects import (
+        SinkEffectInspectionRequest,
+        SinkEffectPipelineMembersInput,
+        SinkEffectPrepareRequest,
+    )
+    from tests.unit.plugins.sinks.test_dataverse_sink import _effect_member, _restricted_effect_context
+
+    members = tuple(_effect_member(index, row) for index, row in enumerate(rows))
+    effect_input = SinkEffectPipelineMembersInput(members, members, len(members))
+    ctx = _restricted_effect_context()
+    inspection = sink.inspect_effect(SinkEffectInspectionRequest(effect_id="a" * 64, target="{}", predecessor_descriptor=None), ctx)
+    plan = sink.prepare_effect(SinkEffectPrepareRequest(effect_id="a" * 64, effect_input=effect_input, inspection=inspection), ctx)
+    return plan, effect_input, ctx
+
+
+@pytest.mark.parametrize("status_code", [400, 404, 409, 412, 422])
+def test_sink_guidance_matches_what_a_row_level_4xx_does(status_code: int) -> None:
+    from elspeth.plugins.infrastructure.clients.dataverse import DataverseClientError
+    from elspeth.plugins.sinks.dataverse import DataverseSink
+    from tests.fixtures.base_classes import inject_write_failure
+    from tests.unit.plugins.sinks.test_dataverse_sink import _config
+
+    sink = inject_write_failure(DataverseSink(_config()), "quarantine")
+    transport = _RejectingDataverse(status_code)
+    sink._client = _client(transport)
+    plan, effect_input, ctx = _effect_fixture(sink, ({"email": "a@example.com", "name": "Alice"},))
+
+    # Behaviour against a real client: the 4xx raises and aborts the effect.
+    with pytest.raises(DataverseClientError) as excinfo:
+        sink.commit_member_effect(plan, effect_input.members[0], effect_input, ctx)
+    assert excinfo.value.status_code == status_code
+    assert len(transport.requests) == 1
+
+    # Guidance given to operators and the planner must say the same.
+    assistance = DataverseSink.get_agent_assistance()
+    assert assistance is not None
+    hints = assistance.composer_hints
+    assert not any("divert" in hint for hint in hints), "guidance promises a row diversion that cannot happen"
+    status_hints = [hint for hint in hints if str(status_code) in hint]
+    assert status_hints, f"no guidance covers HTTP {status_code}"
+    assert all("raise" in hint for hint in status_hints)
