@@ -230,6 +230,7 @@ TRANSFORMS:
   aws_textract_inline_analysis - Enrich managed-blob document rows through synchronous Amazon Textract analysis.
   azure_ai_search      - RAG retrieval against an existing Azure AI Search index.
   azure_content_safety - Analyze content using Azure Content Safety API.
+  azure_content_understanding - Enrich rows with Azure AI Content Understanding analysis (async analyze LRO).
   azure_document_intelligence - Enrich rows with Azure Document Intelligence extraction (async analyze LRO).
   azure_prompt_shield  - Detect jailbreak attempts and prompt injection using Azure Prompt Shield.
   llm                  - Unified LLM transform with provider dispatch and strategy selection.

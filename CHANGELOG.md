@@ -64,6 +64,45 @@ Each of these keeps the behaviour ELSPETH had under Python 3.13.
   only.** Python 3.14's `asyncio.shield` began logging the message and
   traceback.
 
+### Plugins
+
+- **New `azure_content_understanding` transform.** It runs an Azure AI
+  Content Understanding analyzer (GA api-version `2025-11-01`) over one
+  document, image, audio or video reference per row. The reference is a URL or
+  a base64 string. Like `azure_document_intelligence`, it submits an
+  asynchronous analyze operation, polls it to completion and writes the
+  configured outputs onto the row: `content_field` (markdown), `fields_field`
+  (the analyzer's fields as plain values), `page_count_field`,
+  `metadata_field`, `result_field`, and `extract` facets that are
+  concatenated across the result's contents. Options also cover
+  `content_range`, `mime_type`, `processing_location`, `string_encoding` and
+  per-request `model_deployments`. Its key is `AZURE_CONTENT_UNDERSTANDING_KEY`.
+- **`azure_document_intelligence` no longer stores a SAS signature in the
+  audit trail.** A `urlSource` that carried a SAS `sig` was recorded verbatim
+  in the Landscape request record. The audit now fingerprints the
+  credential-shaped query values and userinfo, while Azure still receives the
+  URL unchanged. The fingerprint key requirement is the same one the api-key
+  header already had.
+- **`azure_document_intelligence` reports `canceled` and `skipped` operations
+  as `analysis_failed`.** They were reported as `malformed_response`. The
+  error reason now carries `error_type` (`failed` or `canceled`) alongside the
+  bounded `cause`.
+- **Rejected Document Intelligence calls name Azure's error code.** An
+  `api_error` now carries `code` (Azure's `error.code`) and `cause` (its
+  `innererror.code`), both bounded tokens from Azure's error envelope; the error message is still never recorded.
+  Capacity retries (429/503) honour `Retry-After` within the per-row budget,
+  and a running poll's `Retry-After` is honoured too.
+- **Invalid base64 is rejected before it is sent.** A base64 source that is
+  not canonical standard base64 (including a `data:` URI) fails the row with
+  `invalid_input/invalid_base64` instead of costing a billed Azure call.
+- **The Document Intelligence batch wait now covers a full request
+  timeout.** A large `request_timeout_seconds` could previously let a row
+  outlive the batch wait.
+- **New `azure_document_intelligence` outputs.** `fields_field` writes the
+  first document's typed fields as plain values (for example `InvoiceTotal`).
+  `metadata_field` writes bounded analysis metadata: model id, operation id,
+  page and document counts, and warning codes.
+
 ### Logging
 
 - **asyncio diagnostics that carry an exception are reduced to class and code

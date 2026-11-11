@@ -1583,6 +1583,7 @@ hosted server, which is why the web boundary pins `base_url` separately.
 | Plugin | Purpose |
 |--------|---------|
 | `azure_document_intelligence` | Enrich rows with Azure AI Document Intelligence extraction |
+| `azure_content_understanding` | Enrich rows with an Azure AI Content Understanding analyzer (documents, images, audio, video) |
 | `blob_fetch` | Fetch an operator-authorised remote document into the run payload store |
 | `blob_csv_expand` | Expand a payload-store CSV blob into output rows |
 | `passthrough` | Pass rows unchanged |

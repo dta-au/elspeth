@@ -322,6 +322,16 @@ _SKILL_REWORK_0812_CANONICAL_BYTES = 3878
 # growth: the baseline, 10% band and prior headroom (zero before this change)
 # are preserved, with the exact-boundary / +1-byte overflow control.
 _FILE_INJECT_CATALOG_CANONICAL_BYTES = 867
+# azure_content_understanding transform catalog entry (2026-11-11), awaiting
+# maintainer review like the allowances above: measured with the same live
+# request, removing only that entry from the discovery digest and its name
+# from the shield-producer list. The scaffold is 140,468 B without it and
+# 141,063 B with it: +595 B, in both the live and small catalog cases. System
+# message and tool palette are unchanged; the azure_document_intelligence entry
+# is byte-identical to its pre-change text. Price only this measured growth:
+# the prior 7 B headroom and the exact-boundary / +1-byte overflow control are
+# preserved.
+_CONTENT_UNDERSTANDING_CATALOG_CANONICAL_BYTES = 595
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
@@ -335,6 +345,7 @@ _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     + _SEMANTIC_REVIEW_GUIDANCE_CANONICAL_BYTES
     + _SKILL_REWORK_0812_CANONICAL_BYTES
     + _FILE_INJECT_CATALOG_CANONICAL_BYTES
+    + _CONTENT_UNDERSTANDING_CATALOG_CANONICAL_BYTES
 )
 
 

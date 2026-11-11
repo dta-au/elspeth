@@ -199,6 +199,7 @@ EXPECTED_TRANSFORM_DETERMINISMS: dict[str, Determinism] = {
     "aws_textract_document_analysis": Determinism.EXTERNAL_CALL,
     "aws_textract_inline_analysis": Determinism.EXTERNAL_CALL,
     "azure_content_safety": Determinism.EXTERNAL_CALL,
+    "azure_content_understanding": Determinism.EXTERNAL_CALL,
     "azure_document_intelligence": Determinism.EXTERNAL_CALL,
     "azure_prompt_shield": Determinism.EXTERNAL_CALL,
     "blob_csv_expand": Determinism.IO_READ,
