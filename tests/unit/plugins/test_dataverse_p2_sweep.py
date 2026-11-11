@@ -241,3 +241,59 @@ def test_property_level_annotations_are_stripped(annotation_key: str) -> None:
     source = DataverseSource(_odata_config(include_formatted_values=True))
     cleaned = source._strip_odata_metadata({"contactid": "1", annotation_key: "x"})
     assert cleaned == {"contactid": "1"}
+
+
+# ---------------------------------------------------------------------------
+# Finding #74: nextLink not held to HTTPS and the configured environment host
+# ---------------------------------------------------------------------------
+
+
+def _follow_next_link(next_link: str) -> tuple[_FakeDataverse, Exception | None]:
+    def data(request: httpx.Request) -> dict[str, Any]:
+        if "skiptoken" in str(request.url):
+            return {"value": [{"accountid": "2"}]}
+        return {"value": [{"accountid": "1"}], "@odata.nextLink": next_link}
+
+    transport = _FakeDataverse(data)
+    client = _client(transport)
+    try:
+        list(client.paginate_odata(f"{ENV_URL}/api/data/v9.2/accounts"))
+    except Exception as exc:
+        return transport, exc
+    finally:
+        client.close()
+    return transport, None
+
+
+@pytest.mark.parametrize(
+    "next_link",
+    [
+        pytest.param("http://myorg.crm.dynamics.com/api/data/v9.2/accounts?$skiptoken=2", id="plaintext-same-host"),
+        pytest.param("https://attacker.crm.dynamics.com/api/data/v9.2/accounts?$skiptoken=2", id="other-tenant-same-family"),
+        pytest.param("https://myorg.crm4.dynamics.com/api/data/v9.2/accounts?$skiptoken=2", id="other-region-host"),
+        pytest.param("https://myorg.crm.dynamics.com:8443/api/data/v9.2/accounts?$skiptoken=2", id="other-port"),
+    ],
+)
+def test_next_link_off_the_environment_origin_is_rejected_before_sending_the_token(next_link: str) -> None:
+    from elspeth.plugins.infrastructure.clients.dataverse import DataverseClientError
+
+    transport, error = _follow_next_link(next_link)
+
+    assert len(transport.requests) == 1, "the bearer token was sent to the nextLink"
+    assert isinstance(error, DataverseClientError)
+    assert error.error_category == "ssrf_rejected"
+    assert error.retryable is False
+
+
+@pytest.mark.parametrize(
+    "next_link",
+    [
+        pytest.param("https://myorg.crm.dynamics.com/api/data/v9.2/accounts?$skiptoken=2", id="same-origin"),
+        pytest.param("https://MyOrg.crm.dynamics.com:443/api/data/v9.2/accounts?$skiptoken=2", id="same-origin-explicit-port"),
+    ],
+)
+def test_next_link_on_the_environment_origin_is_followed(next_link: str) -> None:
+    transport, error = _follow_next_link(next_link)
+
+    assert error is None
+    assert len(transport.requests) == 2
