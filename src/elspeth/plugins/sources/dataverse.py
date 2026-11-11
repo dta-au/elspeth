@@ -290,7 +290,7 @@ class DataverseSource(BaseSource):
     _normalizes_external_names = True
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a993a9a403c9b3b8"
+    source_file_hash: str | None = "sha256:8d3f3de6d9e62d9f"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 
@@ -414,7 +414,10 @@ class DataverseSource(BaseSource):
         )
 
     @staticmethod
-    def _verify_request_data(url: str) -> _DataverseSourceRequest:
+    def _verify_request_data(url: str, extra_headers: Mapping[str, str]) -> _DataverseSourceRequest:
+        # Mirrors the non-auth headers DataverseClient sends and records:
+        # its fixed OData headers plus the per-request extras (e.g. the
+        # FetchXML Prefer header).
         return {
             "method": "GET",
             "url": fingerprint_url(url),
@@ -422,10 +425,11 @@ class DataverseSource(BaseSource):
                 "Accept": "application/json",
                 "OData-MaxVersion": "4.0",
                 "OData-Version": "4.0",
+                **extra_headers,
             },
         }
 
-    def _preflight_verify_request(self, ctx: SourceContext, url: str) -> None:
+    def _preflight_verify_request(self, ctx: SourceContext, url: str, extra_headers: Mapping[str, str]) -> None:
         session = ctx.call_mode_session
         if session is None or session.mode is not RunMode.VERIFY:
             return
@@ -433,7 +437,7 @@ class DataverseSource(BaseSource):
         if operation_id is None:
             raise AuditIntegrityError("Dataverse verify requires a source-load operation")
         evidence = session.preflight_verify_operation_http_managed_identity(
-            request_data=self._verify_request_data(url),
+            request_data=self._verify_request_data(url, extra_headers),
             current_operation_id=operation_id,
         )
         self._pending_verify_source_call_id = evidence.source_call_id
@@ -902,7 +906,7 @@ class DataverseSource(BaseSource):
             session = ctx.call_mode_session
             if session is None or session.mode is not RunMode.VERIFY:
                 raise RuntimeError("on_start() must be called before load() — this is a bug")
-            self._preflight_verify_request(ctx, self._metadata_url(logical_name))
+            self._preflight_verify_request(ctx, self._metadata_url(logical_name), {})
             credential = self._auth_config.create_credential()
             self._client = DataverseClient(
                 environment_url=self._environment_url,
@@ -910,7 +914,7 @@ class DataverseSource(BaseSource):
                 api_version=self._api_version,
                 limiter=self._source_limiter,
                 additional_domains=self._additional_domains,
-                before_request=lambda url: self._preflight_verify_request(ctx, url),
+                before_request=lambda url, extra_headers: self._preflight_verify_request(ctx, url, extra_headers),
             )
 
         entity_set_name = self._resolve_entity_set_name(ctx, logical_name)
