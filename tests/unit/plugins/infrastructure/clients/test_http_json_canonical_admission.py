@@ -16,13 +16,14 @@ client returns normally so callers keep a routable result.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 
 import httpx
 import pytest
 
 from elspeth.contracts import json_parser
+from elspeth.contracts.audit_protocols import CallRecorder
 from elspeth.core.canonical import stable_hash
 from elspeth.core.security.web import SSRFSafeRequest
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
@@ -62,8 +63,8 @@ class _HTTPClientDouble:
     def __enter__(self) -> _HTTPClientDouble:
         return self
 
-    def __exit__(self, *_args: object) -> bool:
-        return False
+    def __exit__(self, *_args: object) -> None:
+        return None
 
     def get(self, *_args: object, **_kwargs: object) -> httpx.Response:
         return self._response
@@ -90,7 +91,7 @@ def _json_response(body: bytes) -> httpx.Response:
 def _make_client(recorder: _HashingRecorder) -> AuditedHTTPClient:
     return AuditedHTTPClient(
         **mock_item_audit_authority("run-1"),
-        execution=recorder,
+        execution=cast(CallRecorder, recorder),
         state_id="state-1",
         run_id="run-1",
         telemetry_emit=lambda _event: None,

@@ -44,8 +44,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.http_policy import HTTP_FAILURE_CODES, HTTPAuditPolicy, HTTPFailureCode
-from elspeth.contracts.json_parser import _reject_duplicate_keys, _reject_non_finite, check_json_depth
-from elspeth.contracts.json_parser import parse_json_strict as _parse_json_strict
+from elspeth.contracts.json_parser import _reject_duplicate_keys, _reject_non_finite, check_json_depth, parse_json_bounded
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
 from elspeth.core.canonical import canonical_json, stable_hash
@@ -175,6 +174,12 @@ def _policy_failure_code(error: Exception) -> HTTPFailureCode:
     if isinstance(error, contract_errors.TIER_1_ERRORS):
         return "authority_refused"
     return "transport_failed"
+
+
+# Nesting bound for GENERIC-policy JSON response bodies; matches the
+# POWER_AUTOMATE_V1 bound below and keeps the recorder's recursive
+# canonicalization far from the interpreter's recursion limit.
+GENERIC_JSON_MAX_DEPTH = 64
 
 
 def _policy_json_body(content: bytes) -> Any:
@@ -422,7 +427,17 @@ class AuditedHTTPClient(AuditedClientBase):
             if content_type == "application/json":
                 return _policy_json_body(response.content)
         elif "application/json" in content_type:
-            parsed, error = _parse_json_strict(response.text)
+            # Bound depth and refuse overflow floats before decoding, then
+            # require the canonical wire domain (e.g. integers within
+            # ±(2**53-1)): the recorder hashes this body before any Call row
+            # is written, so an inadmissible body must become the sentinel
+            # here or the sent request would leave no audit record.
+            parsed, error = parse_json_bounded(response.text, max_depth=GENERIC_JSON_MAX_DEPTH)
+            if error is None:
+                try:
+                    canonical_json(parsed)
+                except (ValueError, UnicodeError) as canonical_error:
+                    error = str(canonical_error)
             if error is not None:
                 # JSON parse failure is captured in the audit trail via the
                 # _json_parse_failed sentinel dict recorded by record_call().
