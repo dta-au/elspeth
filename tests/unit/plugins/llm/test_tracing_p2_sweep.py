@@ -4,6 +4,9 @@
 the azure-ai-inference dependency, and silently accepted a later configuration
 whose connection string or content-recording policy conflicted with the
 active one.
+
+#147: tracing privacy flags and credentials were not type-checked, so the
+string "false" (what ``${VAR:-false}`` expands to) turned content recording ON.
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ from elspeth.plugins.transforms.llm.providers.azure import (
     _configure_azure_monitor,
     _reset_azure_monitor_state,
 )
-from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig
+from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig, parse_tracing_config
 
 _CONFIGURE_TARGET = "elspeth.plugins.transforms.llm.providers.azure.configure_azure_monitor"
 _INSTRUMENTOR_MODULE = "azure.ai.inference.tracing"
@@ -123,3 +126,42 @@ class TestAzureMonitorConflictingReconfiguration:
         assert self._configure(first, azure_monitor, instrument_calls) is True
         with pytest.raises(ValueError, match="enable_live_metrics"):
             self._configure(second, azure_monitor, instrument_calls)
+
+
+_LANGFUSE_BASE: dict[str, Any] = {
+    "provider": "langfuse",
+    "public_key": "pk-lf-test",
+    "secret_key": "sk-lf-test",
+    "host": "https://langfuse.example.com",
+}
+_AZURE_BASE: dict[str, Any] = {"provider": "azure_ai", "connection_string": "InstrumentationKey=k"}
+
+
+class TestTracingPolicyFlagsAreBool:
+    """#147: a non-bool privacy/policy flag must be refused, never coerced by truthiness."""
+
+    @pytest.mark.parametrize("field_name", ["enable_content_recording", "enable_live_metrics"])
+    @pytest.mark.parametrize("value", ["false", "true", "", 0, 1, None])
+    def test_azure_ai_rejects_non_bool_flag(self, field_name: str, value: object) -> None:
+        with pytest.raises(ValueError, match=field_name):
+            parse_tracing_config({**_AZURE_BASE, field_name: value})
+
+    @pytest.mark.parametrize("value", ["false", "true", "", 0, 1, None])
+    def test_langfuse_rejects_non_bool_tracing_enabled(self, value: object) -> None:
+        with pytest.raises(ValueError, match="tracing_enabled"):
+            parse_tracing_config({**_LANGFUSE_BASE, "tracing_enabled": value})
+
+
+class TestTracingCredentialsAreNonEmptyStrings:
+    """#147: empty or non-str credentials must be refused at construction."""
+
+    @pytest.mark.parametrize("value", ["", "   ", 123, ["InstrumentationKey=k"]])
+    def test_azure_ai_rejects_bad_connection_string(self, value: object) -> None:
+        with pytest.raises(ValueError, match="connection_string"):
+            parse_tracing_config({**_AZURE_BASE, "connection_string": value})
+
+    @pytest.mark.parametrize("field_name", ["public_key", "secret_key"])
+    @pytest.mark.parametrize("value", ["", "   ", 123, b"sk"])
+    def test_langfuse_rejects_bad_key(self, field_name: str, value: object) -> None:
+        with pytest.raises(ValueError, match=field_name):
+            parse_tracing_config({**_LANGFUSE_BASE, field_name: value})
