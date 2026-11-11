@@ -1,8 +1,16 @@
-# `file_inject` upload-only guard: fork provenance gap (open)
+# `file_inject` upload-only guard: fork provenance gap
 
-**Status:** open, not fixed. Recorded 2026-11-11 at branch head `85deed575`
-(`claude/happy-cray-mbfmm1`). Needs a maintainer decision between the options
-below. Parent design: `2026-11-10-file-inject-design.md` § "Web Composer".
+**Status:** closed for `file_inject`, open for the `llm` prompt-surface guard.
+Maintainer ruling, 2026-11-11: an agent write is an agent write. `update_blob`
+now records any blob it rewrites with `created_by == "assistant"`, as it
+records a file the agent created new, so a rewritten upload and every fork copy
+of it fail `is_user_uploaded_blob`, in the same session and after a fork. None
+of the four options below was taken. What stays open is the modality-only
+`llm` guard, which a fork copy of a model-written blob still passes
+(dta-au/elspeth#365); the prompt review card covers that route. Uploads
+rewritten before the change keep their old creator. The text below is the
+analysis as recorded at branch head `85deed575` (`claude/happy-cray-mbfmm1`),
+before the ruling. Parent design: `2026-11-10-file-inject-design.md` § "Web Composer".
 
 ## The route
 

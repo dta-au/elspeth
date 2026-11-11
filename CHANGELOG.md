@@ -114,6 +114,13 @@ published tag or an image.
   in the default web plugin set. In the Composer its content must be a file the
   user uploaded: content written by the planner is refused. A shipped example
   is in `examples/file_inject/`.
+- **A file the agent rewrites is recorded as the agent's file.** `update_blob`
+  kept the uploader as creator, so a rewritten upload could pass as a user
+  upload after a session fork, or when the new text came from the user's
+  message. It now records the assistant as creator, as for a file the agent
+  creates. Files rewritten before this release keep their old record. Known
+  and deferred: the `llm` prompt guard reads modality only, and a fork copy of
+  a model-written file still passes it; prompt review cards cover that route.
 
 ### MCP server
 
