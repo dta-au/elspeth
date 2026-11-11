@@ -207,42 +207,6 @@ older numeric clients must adapt their response parsing. Proxy deployments must
 explicitly configure `ELSPETH_WEB__TRUSTED_PROXY_HOSTS` with their actual numeric
 forwarding peers; the default trusts no forwarding headers.
 
-## Previously in 0.8.9
-
-0.8.9 combines Composer, Azure Container Apps and engine improvements.
-Full-replacement refusals and incremental output refusals
-retain their distinct candidate and saved-graph meanings, safe path diagnostics
-and repair guidance. Shared-link failures preserve the requested link instead
-of opening the recipient's workspace. Configured container token ceilings are
-provisioned before serving; configured container storage ceilings bound aggregate
-retained and reserved bytes. Automatic title
-requests disable the adapter and SDK retry paths. See the [release notes](CHANGELOG.md).
-
-Provider request rejections retain sanitized reason codes through tool feedback,
-audit records and readiness responses while remaining nonretryable and blocking
-publication. Exact no-op source patches preserve graph state. Shared-inspect
-links distinguish Bearer authentication failures from invalid links.
-
-Primary Composer and advisor requests use independently configured Azure AI
-Content Safety Prompt Shields, with required fail-closed protection by default.
-See [guard setup](docs/reference/composer-prompt-guard.md) for input limits and
-failure behavior. Advisor checkpoints retain complete mandatory evidence; this
-can increase request cost and latency.
-
-The Azure Container Apps first-install instructions select the GHCR account
-explicitly, separate model routing and pricing identities, export the transport
-ceiling, and mount both required authoring guards through versioned secret
-references. ACA startup and doctor require one `sslmode=verify-full` and one
-`sslrootcert` set to `system` or an absolute CA-file path. Duplicate TLS
-parameters, legacy `requiressl` and competing GSS encryption options are refused;
-correctly URL-escaped credentials remain supported.
-
-Doctor measures TLS on its initial schema-inspection connections and blocks
-schema initialization when preflight fails. Separate initialization, final
-verification and later web connections are outside that measurement. Offline
-instruction rehearsal does not establish live cloud acceptance. These ACA
-enhancements were developed under 0.8.8 and are included in 0.8.9.
-
 See the [release notes](CHANGELOG.md) and [deployment runbooks](docs/runbooks/index.md)
 before upgrading.
 
