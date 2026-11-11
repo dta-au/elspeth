@@ -135,7 +135,8 @@ counts; the hatch transcript's gap marker).
 ### Recorded policy
 
 The four settings plus the fallback ratio are hashed into a policy hash
-recorded on every call. Whether a request was reduced is a pure function of
+recorded on every budgeted call (advisor and auto-title calls are not
+budgeted and record none; see Recording). Whether a request was reduced is a pure function of
 persisted history, persisted call records and this policy. No per-process
 flag or cache decides what the model sees.
 
@@ -184,7 +185,7 @@ no recap.
 
 ### Stability
 
-- Cross-turn: a history message shed on the session's previous call stays
+- Cross-turn: a history message shed on an earlier call stays
   shed until the whole unshed request would be at or below the low-water mark
   and under the byte ceiling. The previously shed set is read from the newest
   stored call that carries a shedding record, not from memory.
@@ -229,9 +230,9 @@ step keeps this to an occasional call.
 - **Reply stage** (`service.py`, the one optional call after review cards are
   staged). It advertises no authoring tools, so its request carries each tool
   record as quoted text. The loop's own messages are fitted first and the
-  reply request is built from the fitted list, so results stubbed earlier in
-  the turn stay stubbed and only the latest round is quoted in full. Nothing
-  is prepared when the stage is out of time.
+  reply request is built from the fitted list, so a result stubbed here or
+  earlier in the turn is quoted as its stub and every other tool record is
+  quoted in full. Nothing is prepared when the stage is out of time.
 - **Settings.** The three new settings and the changed default on
   `WebSettings`, through the settings-to-runtime contract.
 
@@ -263,7 +264,10 @@ are updated together.
   before any provider call.
 - The refusal uses a new planner/composer code, distinct from
   `REQUEST_BYTES_EXHAUSTED`, and names the ceiling (tokens or bytes) and the
-  largest component, sized per message on the wire.
+  largest component. Components are sized per message on the wire of the
+  request the decision measured; at the reply stage that is the reply-stage
+  request, in which each tool record is quoted text, and its closing
+  instruction counts as `other`.
 - Both paths answer it with HTTP 422. The named cause is stored in the
   operation's sealed result body (`error_type` `context_budget_exceeded`,
   with the detail codes). The operation row's `failure_code` column is
@@ -351,7 +355,7 @@ estimate is not exact:
   tokenizer.
 - There is no retry when the provider rejects a request for context length.
 - Graph recovery, run diagnostics, auto-title and the boot probe are not
-  budgeted; their requests are small and carry no history.
+  budgeted. Their request sizes were not measured for this design.
 
 ## Out of scope
 
@@ -399,3 +403,14 @@ first said:
 - **Advisor calls are not covered** (Ruling 12).
 - **Within-turn tool stubs are never released**, to keep the approved
   "stays stubbed for the rest of that turn" true at the reply stage.
+- **The largest component is sized on the wire, on the request the decision
+  measured.** The approved design took it from the stored byte split. That
+  split leaves out tool-call arguments, and at the reply stage it describes
+  the loop's messages, not the quoted request that was refused.
+- **The pure module returns a decision, not messages.** The approved design
+  had it return the reduced message list; it returns which segment keys to
+  shed and the sizes, and each call site applies them to its own message
+  shapes.
+- **The previously shed set comes from the newest stored call that carries a
+  shedding record**, not from "the session's previous call": the newest call
+  may be an advisor or auto-title call, which records none.
