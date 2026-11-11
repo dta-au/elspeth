@@ -885,7 +885,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ecf90258957184af"
+    source_file_hash: str | None = "sha256:9d252a163980b4ce"
     config_model = AWSS3SourceConfig
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 
@@ -1115,7 +1115,20 @@ class AWSS3Source(BaseSource):
                 self._active_download = None
             download.close()
 
-    def _file_error(self, ctx: SourceContext, message: str) -> Generator[SourceRow, None, None]:
+    def _file_error(
+        self,
+        ctx: SourceContext,
+        message: str,
+        *,
+        source_row_index: int = 0,
+    ) -> Generator[SourceRow, None, None]:
+        """Record a file-level parse failure as one quarantined row.
+
+        ``source_row_index`` must be the next index this load has not yet
+        used: a streaming parser can fail after earlier records were already
+        yielded, and reusing index 0 would collide with the first emitted row
+        (landscape rows are unique per run, source node and source row index).
+        """
         raw_row = {**self._audit_object_identity(), "error": message}
         ctx.record_validation_error(
             row=raw_row,
@@ -1128,7 +1141,7 @@ class AWSS3Source(BaseSource):
                 row=raw_row,
                 error=message,
                 destination=self._on_validation_failure,
-                source_row_index=0,
+                source_row_index=source_row_index,
             )
 
     def _load_csv(self, handle: BinaryIO, ctx: SourceContext) -> Generator[SourceRow, None, None]:
@@ -1312,7 +1325,14 @@ class AWSS3Source(BaseSource):
                 try:
                     row = next(items, _ROW_EXHAUSTED)
                 except (ijson.JSONError, UnicodeDecodeError, _RecordLimitExceeded, _JSONBoundaryError):
-                    yield from self._file_error(ctx, "JSON object could not be parsed within configured bounds")
+                    # Items are streamed, so the document can prove invalid
+                    # after earlier items were already emitted. Those rows
+                    # stand; the file error takes the next unused index and
+                    # says so, rather than colliding with row 0.
+                    message = "JSON object could not be parsed within configured bounds"
+                    if source_row_index:
+                        message = f"{message}; {source_row_index} rows were already emitted from this document before it proved invalid"
+                    yield from self._file_error(ctx, message, source_row_index=source_row_index)
                     return
                 if row is _ROW_EXHAUSTED:
                     return
