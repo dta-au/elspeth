@@ -3,7 +3,7 @@ name = "elspeth"
 version = "0.8.13"
 description = "Auditable Sense/Decide/Act pipelines for high-reliability systems"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 license = { text = "MIT" }
 authors = [{ name = "John" }]
 keywords = ["elspeth", "audit", "pipeline", "sda", "traceability", "data-processing"]
@@ -12,8 +12,8 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3 :: Only",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
@@ -310,6 +310,10 @@ audit = [
 
 # === Ruff Configuration ===
 [tool.ruff]
+# The runtime floor is Python 3.14, but the formatter stays on the 3.13
+# target: at py314 it rewrites every parenthesised multi-exception
+# ``except (A, B):`` to the PEP 758 ``except A, B:`` form (169 files when
+# measured), churn that belongs in its own change rather than the upgrade.
 target-version = "py313"
 line-length = 140
 src = ["src", "tests", "elspeth-lints/src"]
@@ -337,7 +341,7 @@ select = [
 ignore = [
     "E501",   # line too long (handled by formatter)
     "SIM108", # ternary operator - prefer explicit if/else for readability with comments
-    "UP043",  # unnecessary default type args - keep explicit for Python 3.12 compatibility
+    "UP043",  # unnecessary default type args - keep them explicit (house style)
     "RUF019", # unnecessary key check before dict access - conflicts with project no-.get() policy
     "RUF051", # dict.pop(key, None) over if/del - conflicts with project no-.get() policy (Tier 1: crash on missing keys)
     "SIM401", # dict.get() over if/else - conflicts with project no-.get() policy
@@ -369,7 +373,7 @@ extend-immutable-calls = ["typer.Option", "typer.Argument"]
 
 # === Mypy Configuration ===
 [tool.mypy]
-python_version = "3.13"
+python_version = "3.14"
 mypy_path = ["typings"]
 strict = true
 warn_return_any = true
