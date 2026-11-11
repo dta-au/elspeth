@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import json
 import urllib.parse
+import xml.etree.ElementTree as ET
+from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
@@ -171,7 +173,7 @@ def client(transport: MockTransport) -> DataverseClient:
 
 
 def test_verify_callback_refuses_before_token_dns_or_http() -> None:
-    def refuse(_url: str) -> None:
+    def refuse(_url: str, _extra_headers: Mapping[str, str]) -> None:
         raise AuditIntegrityError("archived source call missing")
 
     client = DataverseClient(environment_url=ENV_URL, credential=cast(Any, FakeCredential()), before_request=refuse)
@@ -190,7 +192,7 @@ def test_verify_callback_refuses_next_link_before_dns_or_http() -> None:
     initial_url = f"{ENV_URL}/api/data/v9.2/contacts"
     next_url = f"{initial_url}?$skiptoken=next"
 
-    def admit(url: str) -> None:
+    def admit(url: str, _extra_headers: Mapping[str, str]) -> None:
         if url == next_url:
             raise AuditIntegrityError("archived next page missing")
 
@@ -863,6 +865,13 @@ class TestEmptyPageGuard:
 # ---------------------------------------------------------------------------
 
 
+def _fetchxml_paging_annotation(cookie: str) -> str:
+    """Wrap a paging cookie the way Dataverse returns it: a <cookie> element
+    whose pagingcookie attribute holds the cookie URL-encoded twice."""
+    twice = urllib.parse.quote(urllib.parse.quote(cookie, safe=""), safe="")
+    return f'<cookie pagenumber="2" pagingcookie="{twice}" istracking="False" />'
+
+
 class TestPaginateFetchxml:
     """FetchXML paging cookie injection via ElementTree."""
 
@@ -881,7 +890,7 @@ class TestPaginateFetchxml:
 
     def test_paging_cookie_injection(self, client: DataverseClient, transport: MockTransport) -> None:
         """Paging cookie is injected into FetchXML via ElementTree (not string concat)."""
-        cookie_value = urllib.parse.quote("<cookie page='1'/>")
+        cookie_value = _fetchxml_paging_annotation("<cookie page='1'/>")
         # Page 1
         transport.add_response(
             _make_json_response(
@@ -918,7 +927,7 @@ class TestPaginateFetchxml:
         """Cookie containing XML metacharacters (<>&'") is safely injected via ET."""
         # Cookie with XML metacharacters that would break string interpolation
         raw_cookie = '<cookie page="1" attr="a&b<c>d"/>'
-        encoded_cookie = urllib.parse.quote(raw_cookie)
+        encoded_cookie = _fetchxml_paging_annotation(raw_cookie)
 
         transport.add_response(
             _make_json_response(
@@ -942,6 +951,8 @@ class TestPaginateFetchxml:
         # This must not raise — ET handles escaping
         pages = list(client.paginate_fetchxml("accounts", fetch_xml))
         assert len(pages) == 2
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(str(transport.requests[1].url)).query)
+        assert ET.fromstring(query["fetchXml"][0]).get("paging-cookie") == raw_cookie
 
     def test_invalid_fetchxml_root_element(self, client: DataverseClient, transport: MockTransport) -> None:
         """Non-<fetch> root element is rejected."""
@@ -977,17 +988,17 @@ class TestPaginateFetchxml:
         with pytest.raises(DataverseClientError, match="Failed to parse FetchXML"):
             list(client.paginate_fetchxml("accounts", bad_xml))
 
-    def test_missing_morerecords_crashes_fetchxml_pagination(self, client: DataverseClient, transport: MockTransport) -> None:
-        """FetchXML pagination crashes if morerecords field is absent.
+    def test_paging_cookie_without_morerecords_crashes_fetchxml_pagination(self, client: DataverseClient, transport: MockTransport) -> None:
+        """A paging cookie with morerecords absent is a contradictory page.
 
-        Absence is a protocol anomaly — we must not silently infer pagination
-        state. The field is required for FetchXML; only OData omits it.
+        The documented final page omits BOTH annotations (absent morerecords
+        means end of results); a cookie alone matches no documented shape.
         """
         transport.add_response(
             _make_json_response(
                 {
                     "value": [],
-                    # No @Microsoft.Dynamics.CRM.morerecords — anomaly
+                    # No @Microsoft.Dynamics.CRM.morerecords, but a cookie — anomaly
                     "@Microsoft.Dynamics.CRM.fetchxmlpagingcookie": urllib.parse.quote("<cookie/>"),
                 }
             )
@@ -996,7 +1007,7 @@ class TestPaginateFetchxml:
         fetch_xml = '<fetch count="50"><entity name="account"/></fetch>'
         pages = client.paginate_fetchxml("accounts", fetch_xml)
         current_page = next(pages)
-        with pytest.raises(DataverseClientError, match=r"missing.*morerecords") as exc_info:
+        with pytest.raises(DataverseClientError, match=r"paging cookie but no.*morerecords") as exc_info:
             next(pages)
 
         error = exc_info.value

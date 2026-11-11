@@ -14,7 +14,7 @@ import re
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -71,6 +71,12 @@ _ADDITIONAL_DOMAIN_PATTERN = re.compile(
 
 # Maximum consecutive empty pages before pagination terminates.
 _MAX_CONSECUTIVE_EMPTY_PAGES = 3
+
+# Dataverse returns the FetchXML paging annotations only when the request asks
+# for them (Microsoft "Page results using FetchXml", Web API tab).
+_FETCHXML_PREFER_HEADER = {
+    "Prefer": 'odata.include-annotations="Microsoft.Dynamics.CRM.fetchxmlpagingcookie,Microsoft.Dynamics.CRM.morerecords"',
+}
 
 
 class DataverseClientError(Exception):
@@ -130,6 +136,57 @@ class DataversePageResponse:
                 "next_link and paging_cookie are mutually exclusive — OData queries use next_link, FetchXML queries use paging_cookie"
             )
         freeze_fields(self, "rows", "headers", "request_headers")
+
+
+def _fetchxml_page_one_may_be_truncated(root: ET.Element, row_count: int) -> bool:
+    """Whether an unannotated FetchXML page 1 could be a truncated result set.
+
+    ``top`` is documented as incompatible with paging, so a ``top`` query is a
+    complete result. An empty page or one shorter than ``count`` is the end.
+    A page that fills ``count``, or any non-empty page when ``count`` is unset
+    (the server default page size applies), may have more rows behind it.
+    """
+    if "top" in root.attrib or row_count == 0:
+        return False
+    count = root.get("count")
+    if count is None:
+        return True
+    try:
+        return row_count >= int(count)
+    except ValueError:
+        # Unreadable count: the page size is unknown, so assume it may be full.
+        return True
+
+
+def _extract_fetchxml_paging_cookie(page: DataversePageResponse, annotation: str) -> str:
+    """Parse the Tier 3 fetchxmlpagingcookie annotation into the cookie to send back.
+
+    Dataverse returns a wrapper element such as
+    ``<cookie pagenumber="2" pagingcookie="%253ccookie..." istracking="False" />``
+    (Microsoft "Page results using FetchXml", Web API tab). The paging cookie
+    is the wrapper's ``pagingcookie`` attribute, URL-encoded twice.
+    """
+
+    def _violation(detail: str) -> DataverseClientError:
+        return DataverseClientError(
+            f"FetchXML pagination: malformed '@Microsoft.Dynamics.CRM.fetchxmlpagingcookie' annotation — {detail}",
+            retryable=False,
+            error_category="protocol_violation",
+            status_code=page.status_code,
+            latency_ms=page.latency_ms,
+            request_url=page.request_url,
+            request_headers=page.request_headers,
+        )
+
+    try:
+        wrapper = ET.fromstring(annotation)
+    except ET.ParseError as exc:
+        raise _violation(f"not a parseable XML element ({exc})") from exc
+
+    encoded_cookie = wrapper.get("pagingcookie")
+    if encoded_cookie is None:
+        raise _violation(f"<{wrapper.tag}> element has no 'pagingcookie' attribute")
+    return urllib.parse.unquote(urllib.parse.unquote(encoded_cookie))
 
 
 class DataverseAuthConfig(BaseModel):
@@ -259,7 +316,7 @@ class DataverseClient:
         limiter: LimiterProtocol | None = None,
         retry_after_cap: float = 60.0,
         additional_domains: tuple[str, ...] = (),
-        before_request: Callable[[str], None] | None = None,
+        before_request: Callable[[str, Mapping[str, str]], None] | None = None,
     ) -> None:
         raw_environment_url = environment_url.rstrip("/")
         parsed = urllib.parse.urlparse(raw_environment_url)
@@ -507,14 +564,17 @@ class DataverseClient:
             DataverseClientError: For protocol-level errors
         """
         if self._before_request is not None:
-            self._before_request(url)
+            # The hook sees the non-auth headers this request adds, so a
+            # VERIFY preflight can rebuild the request exactly as recorded.
+            self._before_request(url, extra_headers or {})
         self._acquire_rate_limit()
 
         auth_headers = self.get_auth_headers()
         headers = {**auth_headers, **(extra_headers or {})}
-        # Fingerprint auth headers early so every error path can carry
-        # request metadata for accurate audit trail recording.
-        fingerprinted = fingerprint_headers(auth_headers)
+        # Fingerprint every header that will be sent (sensitive values become
+        # fingerprints, the rest pass through) early so every error path can
+        # carry the request metadata for an accurate audit trail.
+        fingerprinted = fingerprint_headers(headers)
 
         # IP-pinning SSRF validation on every outbound request.
         # When ssrf_safe is pre-validated (e.g., from paginate_odata nextLink
@@ -730,10 +790,10 @@ class DataverseClient:
                     request_headers=fingerprinted,
                 )
         else:
-            # Field absent — record the absence, don't infer.
+            # Field absent — record the absence, don't infer here.
             # OData queries don't include morerecords (uses nextLink instead).
-            # FetchXML queries should always include it — absence there is
-            # an anomaly the consumer should detect, not one we paper over.
+            # FetchXML final pages omit it too; paginate_fetchxml interprets
+            # absence against the documented FetchXML contract.
             more_records = None
 
         return DataversePageResponse(
@@ -829,7 +889,7 @@ class DataverseClient:
             # so the HTTP call connects to the validated IP, preventing
             # DNS rebinding between validation and connection.
             if self._before_request is not None:
-                self._before_request(page.next_link)
+                self._before_request(page.next_link, {})
             ssrf_safe = self._validate_url_ssrf(page.next_link)
             url = page.next_link
 
@@ -869,29 +929,56 @@ class DataverseClient:
 
         current_page = 1
 
-        while True:
-            xml_str = ET.tostring(root, encoding="unicode")
-            encoded_xml = urllib.parse.quote(xml_str)
+        def fetch_current() -> DataversePageResponse:
+            encoded_xml = urllib.parse.quote(ET.tostring(root, encoding="unicode"))
             url = f"{self._environment_url}/api/data/{self._api_version}/{entity_set_name}?fetchXml={encoded_xml}"
+            return self._execute_request("GET", url, extra_headers=_FETCHXML_PREFER_HEADER)
 
-            page = self.get_page(url)
+        while True:
+            page = fetch_current()
             yield page
 
-            # Check if more records exist.
-            # FetchXML responses must include morerecords — its absence is a
-            # protocol anomaly we must not silently infer around.
+            # Check if more records exist. Per the Dataverse Web API contract
+            # the final page carries neither morerecords nor the paging
+            # cookie, so an absent morerecords means end of results. A cookie
+            # without morerecords matches no documented page shape.
             if page.more_records is None:
-                raise DataverseClientError(
-                    "FetchXML response missing '@Microsoft.Dynamics.CRM.morerecords' field "
-                    "— cannot determine pagination state. OData uses nextLink instead, "
-                    "but FetchXML pagination requires this field.",
-                    retryable=False,
-                    error_category="protocol_violation",
-                    status_code=page.status_code,
-                    latency_ms=page.latency_ms,
-                    request_url=page.request_url,
-                    request_headers=page.request_headers,
-                )
+                if page.paging_cookie is not None:
+                    raise DataverseClientError(
+                        "FetchXML response has a paging cookie but no "
+                        "'@Microsoft.Dynamics.CRM.morerecords' field — the documented final "
+                        "page carries neither annotation, so pagination state is contradictory.",
+                        retryable=False,
+                        error_category="protocol_violation",
+                        status_code=page.status_code,
+                        latency_ms=page.latency_ms,
+                        request_url=page.request_url,
+                        request_headers=page.request_headers,
+                    )
+                # Page-1 truncation guard. A server or proxy that ignored the
+                # Prefer header returns a full first page with no annotations,
+                # which is indistinguishable from a complete result set. Once
+                # any page carries annotations, Prefer is known to be honoured,
+                # so only page 1 is exposed. Probe page 2 once with simple
+                # paging (page number, no cookie): rows there mean the
+                # annotations were withheld; no rows means the end of results.
+                if current_page == 1 and _fetchxml_page_one_may_be_truncated(root, len(page.rows)):
+                    root.set("page", "2")
+                    probe = fetch_current()
+                    if probe.rows:
+                        raise DataverseClientError(
+                            "FetchXML pagination: paging annotations not honoured; refusing to truncate. "
+                            "Page 1 was full with no '@Microsoft.Dynamics.CRM.morerecords' annotation, "
+                            "but a simple-paging probe for page 2 returned rows.",
+                            retryable=False,
+                            error_category="protocol_violation",
+                            status_code=probe.status_code,
+                            latency_ms=probe.latency_ms,
+                            request_url=probe.request_url,
+                            request_headers=probe.request_headers,
+                        )
+                    yield probe
+                break
             if not page.more_records:
                 break
 
@@ -914,7 +1001,7 @@ class DataverseClient:
             # Inject paging cookie into the existing ET root.
             # The paging cookie is Tier 3 data — ET.set() handles
             # attribute escaping automatically (no string formatting).
-            decoded_cookie = urllib.parse.unquote(page.paging_cookie)
+            decoded_cookie = _extract_fetchxml_paging_cookie(page, page.paging_cookie)
 
             current_page += 1
             root.set("paging-cookie", decoded_cookie)
