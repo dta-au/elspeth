@@ -57,6 +57,7 @@ from elspeth.core.security.web import (
     validate_archived_ssrf_request,
     validate_configured_url_for_ssrf,
     validate_url_for_ssrf,
+    validate_url_scheme,
 )
 from elspeth.core.security.web import (
     NetworkError as SSRFNetworkError,
@@ -819,7 +820,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:2506325fd6780ba3"
+    source_file_hash: str | None = "sha256:1ecbd3ab145d2c04"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -1346,6 +1347,11 @@ class WebScrapeTransform(BaseTransform):
                     return TransformResult.error({"reason": "validation_failed", "error": "query parameters cannot be URL encoded"})
                 if encoded_url_size > 8192:
                     return TransformResult.error({"reason": "validation_failed", "error": "URL with query parameters exceeds 8192 bytes"})
+            # Refuse a malformed URL shape before replay/verify compute
+            # fingerprint_url, whose urlsplit raises a bare ValueError; this is
+            # the same first check live mode's validate_url_for_ssrf applies,
+            # so every run mode records the same row refusal.
+            validate_url_scheme(url)
             session = ctx.call_mode_session
             if session is not None and session.mode is RunMode.REPLAY:
                 archived = session.replay_ssrf_request(
