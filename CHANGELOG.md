@@ -4,15 +4,18 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
-## Unreleased (0.8.13)
+## 0.8.13 - 2026-11-11
 
-This section records changes intended for 0.8.13. It does not establish
-qualification, a published tag or an image.
+Composer context budget. Long Composer sessions grew until the server or the
+model gateway rejected a request for size; the Composer now sheds older
+context to fit an operator-set budget, or refuses with a named cause. The
+dated entry and package version do not establish qualification, a published
+tag or an image. Not run for this work: the PostgreSQL suites, a live
+provider, replay of real sessions and end-to-end browser tests.
 
 ### Upgrade notes
 
-Neither schema epoch changes and no stored data is migrated, reset or
-rewritten. Two configuration changes are breaking:
+Two configuration changes are breaking:
 
 - **`ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS` is required.** It has no
   default; the web server will not start without it. Set it to the
@@ -28,6 +31,25 @@ Two optional settings are new: `ELSPETH_WEB__COMPOSER_CONTEXT_SHED_ABOVE`
 (default `0.85`) and `ELSPETH_WEB__COMPOSER_CONTEXT_SHED_TO` (default `0.60`),
 fractions of the token cap; `SHED_TO` must be below `SHED_ABOVE`.
 
+Other things an operator or client will notice:
+
+- A request that cannot fit is answered with HTTP 422 and
+  `context_budget_exceeded` on both the compose loop and the planner. This
+  replaces the generic failure previously shown when the planner's
+  request-byte ceiling refused a request.
+- `composer_skill_hash` changes: the composer skill gains one paragraph
+  explaining the counts of omitted earlier messages.
+- Composer call records gain a `context_budget` field. Older records without
+  it read as "no shedding recorded".
+- Existing sessions keep working. A session already over the high mark sheds on
+  its next turn, with the omissions recorded.
+- No schema epoch changed and no stored data is migrated, reset or rewritten.
+  Session epoch 78 and Landscape epoch 50 are unchanged from the previous
+  release; this release adds no schema-epoch cutover. Existing 0.8.12 session
+  and Landscape stores need no action, and the 0.8.10 cutover guidance below
+  continues to apply to older stores. This authorizes no migration, reset,
+  restamping or downgrade.
+
 ### Composer
 
 - **The Composer sheds context to fit an operator-set budget.** Before each
@@ -38,66 +60,81 @@ fractions of the token cap; `SHED_TO` must be below `SHED_ABOVE`.
   tool results in the current turn (each body replaced by a fixed stub; the
   call and result message stay), then earlier assistant prose, then
   escape-hatch transcript events, then the oldest earlier user requests,
-  oldest first within each. Shedding starts above `SHED_ABOVE` of the cap and
-  continues to `SHED_TO`. What was shed stays shed, and nothing more is shed
-  until the reduced request crosses `SHED_ABOVE` again; it is restored only
-  when the whole request is back at or under `SHED_TO`. A tool result stubbed
-  during a turn stays stubbed for the rest of that turn. The system skill,
-  catalog, tool definitions, current request, pipeline state and latest tool
-  round trip are never removed. The budgeter makes no provider call and adds
-  no text of its own beyond the stub and counts of omitted messages.
+  oldest first within each. The system skill, catalog, tool definitions,
+  current request, pipeline state and latest tool round trip are never
+  removed. The budgeter makes no provider call and adds no text of its own
+  beyond the stub and counts of omitted messages.
+- **Shedding has a high and a low mark.** It starts when the request is above
+  `SHED_ABOVE` of the token cap, or over the byte ceiling, and continues to
+  `SHED_TO`. What was shed stays shed. Whether more must go is judged on the
+  already-reduced request, so nothing more is shed until that crosses
+  `SHED_ABOVE` again; shed history is restored only when the whole request is
+  back at or under `SHED_TO`. A tool result stubbed during a turn stays
+  stubbed for the rest of that turn.
 - **Both ceilings are judged on the request as sent.** The measure is the
-  JSON of the request's messages and tools, escaping included: what a
-  gateway's body cap sees, and everything the model reads (content,
-  tool-call arguments, thinking blocks and tool definitions). The token
-  estimate divides that size by a bytes-per-token ratio measured on the same
-  basis. The stored `request_byte_split` keeps its meaning (the content
-  split) and is not what the budget is judged on.
-- **What was shed is recorded on each call.** Composer call records gain a
-  `context_budget` field (the policy hash, estimated tokens before and after,
-  the `bytes_per_token` ratio the estimate used, `request_wire_bytes` (the
-  size of the request sent), and what was removed or stubbed). Older records
-  without it read as "no shedding recorded".
+  wire bytes of the request: the JSON of its messages and tools, escaping
+  included. That is what a gateway's body cap sees, and everything the model
+  reads (content, tool-call arguments, thinking blocks and tool definitions).
+  The token estimate divides that size by a bytes-per-token ratio measured on
+  the same basis.
 - **A request that cannot fit is refused with a named cause.** When the
   protected content alone exceeds either ceiling, the server refuses before
   any provider call with `context_budget_exceeded`: "This conversation is too
   large for the composer to continue. Start a new session, or shorten your
-  request." It offers no Retry. The compose loop and the planner both answer
-  it with HTTP 422. This also replaces the generic failure previously shown
-  when the planner's request-byte ceiling refused a request. The refusal
-  names the ceiling and the largest component of the request as sent.
+  request." It offers no Retry. The refusal names the ceiling and the largest
+  component of the request as sent.
 - **A reply that cannot fit does not fail a finished turn.** If the optional
   reply after review cards are staged cannot be fitted, no provider call is
   made and the turn completes with its staged work intact. The user sees:
   "This turn's work was completed, but the model's final reply could not be
   produced because this conversation is too large for the composer. Start a
-  new session, or shorten your request." The refusal is recorded on the
-  turn's audit trail as an audit row (`composer_reply_stage_refusal`, reason
-  `context_budget_exceeded`) with the ceiling, the estimated tokens and
-  request bytes, the configured ceilings and the largest component.
+  new session, or shorten your request."
 - **Users are told when history is shed.** A turn whose model call leaves
   earlier conversation out shows the progress notice "Earlier conversation is
   no longer visible to the composer."
 - **The escape-hatch transcript header no longer says "Complete"**, because
   the transcript can now be reduced to fit the budget.
-- **`composer_skill_hash` changes.** The composer skill gains one paragraph
-  explaining the counts of omitted earlier messages.
 
-Known limits:
+### Audit records
 
+- **What was shed is recorded on each budgeted call.** The call record and
+  its public envelope gain a `context_budget` field: the policy hash, the
+  `bytes_per_token` ratio the estimate used, the estimated tokens before and
+  after shedding (the figure after is an upper bound), `request_wire_bytes`
+  (the size of the request sent), and what was removed or stubbed. A call
+  that shed nothing says so explicitly. Advisor and auto-title calls are not
+  budgeted and store a null `context_budget`.
+- **A refused reply is recorded on the turn's audit trail.** It is an audit
+  row (`composer_reply_stage_refusal`, reason `context_budget_exceeded`) with
+  the ceiling, the estimated tokens and request bytes, the configured
+  ceilings and the largest component. It holds sizes and fixed names only. No
+  call record is written, because no call was made.
+- **The stored `request_byte_split` keeps its meaning** (the content split).
+  It is not what the budget is judged on.
+
+### Known limits
+
+- Advisor and review calls are not yet bounded by the context budget
+  (dta-au/elspeth#364). In a long session with the advisor enabled, such a
+  call can still be rejected by the gateway for size; the advisor is then
+  unavailable for that turn.
+- Tool-call arguments and thinking blocks count toward the budget but are
+  not shed. A turn whose arguments alone cannot fit is refused.
 - Token counts are estimated from request bytes, not a tokenizer. The
   bytes-per-token ratio is the recorded `request_wire_bytes` over the
   reported prompt tokens of the session's newest successful budgeted call on
   the same model (failing that, on any model), clamped to 2.0-6.0. Until the
   session has such a call the ratio is 3.0, which over-estimates tokens; this
   includes the first turn of an existing session after the upgrade.
-- Tool-call arguments and thinking blocks count toward the budget but are
-  not shed. A turn whose arguments alone cannot fit is refused.
 - If the provider still rejects a request for context length, it is recorded
   as before and there is no automatic retry.
-- Advisor and review calls are not yet bounded by the context budget. In a
-  long session with the advisor enabled, such a call can still be rejected by
-  the gateway for size; the advisor is then unavailable for that turn.
+
+### Publication and acceptance
+
+Automatic image publication from main remains held. The 0.8.13 tag and
+container publication follow successful required checks and the protected
+merge. Operator signing, live-provider acceptance and deployment remain
+separate steps.
 
 ---
 

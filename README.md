@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-![Status: 0.8.12](https://img.shields.io/badge/status-0.8.12-green.svg)
+![Status: 0.8.13](https://img.shields.io/badge/status-0.8.13-green.svg)
 
 ELSPETH builds, validates, runs, and audits data and LLM workflows whose
 outputs need to be reviewed and explained. You can author a pipeline in
@@ -98,10 +98,47 @@ ELSPETH supports audit export and optional signing. The
 [export settings and limits](docs/reference/configuration.md#export-settings)
 describe what is exported and how to configure it.
 
-## What changed in 0.8.12
+## What changed in 0.8.13
 
-0.8.12 is the Composer tool remediation. See the [release notes](CHANGELOG.md),
+0.8.13 adds the Composer context budget. See the [release notes](CHANGELOG.md),
 which also record earlier releases.
+
+Long Composer sessions used to grow until the server or the model gateway
+rejected a request for size. Before each compose-loop and planner model call,
+the server now removes older context in a fixed order until the request fits an
+operator-set prompt-token cap and a request-byte ceiling: earlier tool results
+in the turn, then earlier assistant prose, then escape-hatch transcript events,
+then the oldest earlier user requests. The system skill, catalog, tool
+definitions, current request, pipeline state and latest tool round trip are
+never removed. What was removed is recorded on each call's audit record, and
+the user is told when earlier conversation is no longer visible to the
+Composer. A request that cannot fit is refused before any model call, with a
+named cause and the recourse (start a new session, or shorten the request).
+
+Two configuration changes are breaking. `ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS`
+is required and has no default: the web server does not start without it. Set
+it to the prompt-token limit of the model gateway in front of the Composer. The
+default of `ELSPETH_WEB__COMPOSER_PLANNER_MAX_REQUEST_BYTES` drops from 2 MiB
+to 960 KiB and now also bounds the compose loop.
+
+The budget does not bound every Composer request. Advisor and review calls are
+not yet covered ([#364](https://github.com/dta-au/elspeth/issues/364)), token
+counts are estimated from request bytes rather than a tokenizer, and a request
+the provider still rejects for context length is not retried.
+
+Session epoch 78 and Landscape epoch 50 are unchanged from the previous
+release; this release adds no schema-epoch cutover, so existing session and
+Landscape stores need no action. The 0.8.10 cutover guidance below continues to
+apply to older stores. Backwards compatibility is permitted and considered from 0.8.5 within
+explicitly supported boundaries. This release authorizes no in-place migration,
+reset or downgrade. Package metadata is 0.8.13; the package version alone does
+not establish qualification or image publication. Automatic image publication
+from main is held; verify the release tag and image digest before installing a
+published image.
+
+## Previously in 0.8.12
+
+0.8.12 is the Composer tool remediation. See the [release notes](CHANGELOG.md).
 
 Under explicit approval, one composition proposal is pending at a time: a
 response carrying more than one mutation is refused whole, and a mutation is
@@ -130,10 +167,7 @@ release; this release adds no schema-epoch cutover, so existing session and
 Landscape stores need no action. The 0.8.10 cutover guidance below continues to
 apply to older stores. Backwards compatibility is permitted and considered from 0.8.5 within
 explicitly supported boundaries. This release authorizes no in-place migration,
-reset or downgrade. Package metadata is 0.8.12; the package version alone does
-not establish qualification or image publication. Automatic image publication
-from main is held; verify the release tag and image digest before installing a
-published image.
+reset or downgrade.
 
 ## Previously in 0.8.10
 

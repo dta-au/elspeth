@@ -54,6 +54,7 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
     current_heading = f"\n## {CURRENT_VERSION} - "
     assert changelog.count(current_heading) == 1
     current_release = changelog.split(current_heading, maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
+    release_0812 = changelog.split("\n## 0.8.12 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_0810 = changelog.split("\n## 0.8.10 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_086 = changelog.split("\n## 0.8.6 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_085 = changelog.split("\n## 0.8.5 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
@@ -66,16 +67,26 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
     current_text = " ".join(current_release.split())
     release_date = current_release.splitlines()[0].strip()
     assert date.fromisoformat(release_date).isoformat() == release_date
-    assert "Composer tool remediation" in current_text
+    assert "Composer context budget" in current_text
+    assert "`ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS` is required" in current_text
+    assert "is now 960 KiB" in current_text
+    assert "Advisor and review calls are not yet bounded by the context budget (dta-au/elspeth#364)" in current_text
     assert (
         f"Session epoch {SESSION_SCHEMA_EPOCH} and Landscape epoch {SQLITE_SCHEMA_EPOCH} are unchanged from the previous release"
         in current_text
     )
     assert "this release adds no schema-epoch cutover" in current_text
-    assert "Existing 0.8.10 session and Landscape stores need no action" in current_text
+    assert "Existing 0.8.12 session and Landscape stores need no action" in current_text
     assert "This authorizes no migration, reset, restamping or downgrade" in current_text
     assert "Session epoch advances" not in current_text
     assert "Landscape advances from epoch" not in current_text
+    # 0.8.12 is history, pinned against its own section.
+    text_0812 = " ".join(release_0812.split())
+    assert release_0812.splitlines()[0].strip() == "2026-11-10"
+    assert "Composer tool remediation" in text_0812
+    assert "Existing 0.8.10 session and Landscape stores need no action" in text_0812
+    assert "This authorizes no migration, reset, restamping or downgrade" in text_0812
+    assert "The 0.8.12 tag and container publication follow successful required checks and the protected merge" in text_0812
     # The 0.8.10 cutover is history, pinned against its own section.
     assert f"Session epoch advances from 77 to {SESSION_SCHEMA_EPOCH}" in release_0810
     assert f"Landscape advances from epoch 49 to {SQLITE_SCHEMA_EPOCH}" in release_0810
