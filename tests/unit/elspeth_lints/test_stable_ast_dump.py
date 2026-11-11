@@ -9,7 +9,8 @@ reports every pinned inventory as drift there (elspeth-b4f1be3f80). Two pins:
 * the exact 3.13-shape string for a sample that exercises each omission rule,
   asserted on EVERY interpreter — removing either omission rule from the port
   changes this string;
-* on 3.13 itself, byte-equality with :func:`ast.dump` over every Python file
+* on 3.14, the supported interpreter (whose default ``ast.dump`` still has the
+  3.13 shape), byte-equality with :func:`ast.dump` over every Python file
   in the tree, in both annotate modes — the proof that no pinned fingerprint
   moves when a gate switches to the helper. The corpus comes from the lint
   tree's single file-walk authority, :func:`elspeth_lints.core.ast_walker.walk_python_files`
@@ -60,8 +61,11 @@ def test_rejects_non_ast_input() -> None:
         stable_ast_dump("not a tree")  # type: ignore[arg-type]
 
 
-@pytest.mark.skipif(sys.version_info[:2] != (3, 13), reason="the pinned shape IS CPython 3.13's ast.dump; equality is the proof only there")
-def test_matches_ast_dump_over_the_whole_tree_on_3_13() -> None:
+@pytest.mark.skipif(
+    sys.version_info[:2] != (3, 14),
+    reason="byte-equality with the running interpreter's ast.dump is measured on the supported interpreter, 3.14",
+)
+def test_matches_ast_dump_over_the_whole_tree_on_the_supported_interpreter() -> None:
     mismatches: list[str] = []
     checked = 0
     for root in CORPUS_ROOTS:
