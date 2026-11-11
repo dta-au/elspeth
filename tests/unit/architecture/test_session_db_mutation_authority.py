@@ -3359,7 +3359,10 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         symbol="_RepositoryBlobMutations.commit_blob_replacement",
         table="blobs",
         operation="update",
-        fingerprint="d2ea73ee0e8472e4",
+        # Fingerprint re-pinned: the replacement UPDATE now also assigns
+        # created_by (update_blob records an agent rewrite as the assistant's
+        # file). Same table, operation, authority and line.
+        fingerprint="5bc8446e966cea72",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
         line=2601,

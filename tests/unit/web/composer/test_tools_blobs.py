@@ -3691,6 +3691,61 @@ class TestUpdateBlobActiveRunGuard:
         assert row.creating_composer_skill_hash == "a" * 64
         assert row.creating_arguments_hash == "b" * 64
 
+    @pytest.mark.parametrize(
+        ("authored", "expected_modality"),
+        [
+            ("invented", CreationModality.LLM_GENERATED),
+            ("verbatim", CreationModality.VERBATIM),
+        ],
+    )
+    def test_update_records_the_rewritten_user_upload_as_the_assistants_file(
+        self, authored: str, expected_modality: CreationModality
+    ) -> None:
+        """An agent write is an agent write: rewriting an upload makes it the assistant's file.
+
+        ``file_inject`` accepts only a user upload, judged by creator and
+        modality together. A verbatim-substring rewrite keeps modality
+        ``VERBATIM`` and a fork copy resets modality to ``VERBATIM``, so only
+        the creator can carry "the agent rewrote this" across both routes.
+        """
+        new_content = "name,score\nada,42\n"
+        if authored == "verbatim":
+            provenance = _verbatim_blob_context(self.engine, self.session_id, new_content)
+        else:
+            user_message_content = "Generate a replacement CSV for the current scratch blob."
+            provenance = {
+                "user_message_id": _insert_user_message(self.engine, self.session_id, user_message_content),
+                "user_message_content": user_message_content,
+                "composer_model_identifier": "openai/gpt-5-mini",
+                "composer_model_version": "gpt-5-mini-2026-05-01",
+                "composer_provider": "openai",
+                "composer_skill_hash": "a" * 64,
+                "tool_arguments_hash": "b" * 64,
+            }
+        with self.engine.begin() as conn:
+            before = conn.execute(select(blobs_table.c.created_by).where(blobs_table.c.id == self.blob_id)).scalar_one()
+        assert before == "user"
+
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "update_blob",
+                {"blob_id": self.blob_id, "content": new_content},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **provenance,
+            )
+
+        assert result.success is True, [error.message for error in result.validation.errors]
+        with self.engine.begin() as conn:
+            row = conn.execute(select(blobs_table).where(blobs_table.c.id == self.blob_id)).one()
+        assert row.creation_modality == expected_modality.value
+        assert row.created_by == "assistant"
+
     def test_update_rejected_when_pending_run_linked(self) -> None:
         self._insert_run_and_link("pending")
         state = _empty_state()

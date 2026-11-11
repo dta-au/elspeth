@@ -1881,7 +1881,9 @@ inline `content` and in `default_content` before expansion. Text read from a
 In Composer, `content` must be a file the user uploaded, attached at
 `node:<node_id>.options.files.<entry_name>.content`. Anything else there is
 refused, including in imported YAML: literal text, a file the planner created,
-a file a pipeline wrote as output, and a session-fork copy of either.
+a file a pipeline wrote as output, an upload the planner has since rewritten
+with `update_blob` (it becomes the planner's file), and a session-fork copy of
+any of these.
 `default_content` is refused in any form.
 
 An upload can only be attached to an entry whose name starts with a letter or

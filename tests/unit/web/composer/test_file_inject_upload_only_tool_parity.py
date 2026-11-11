@@ -440,6 +440,48 @@ def test_session_fork_copy_of_a_user_upload_is_still_accepted(blob_env: dict[str
     _assert_uploaded_marker_stored(result, node_id, marker)
 
 
+@pytest.mark.parametrize("tool", (*_NODE_OPTION_TOOLS, "wire_blob_inline_ref"))
+def test_user_upload_the_composer_rewrote_with_its_own_words_is_refused(blob_env: dict[str, Any], tool: str) -> None:
+    """An agent write is an agent write, even when the new bytes are a substring of the user's message.
+
+    ``update_blob`` with content copied from the user's message records
+    ``VERBATIM`` (no LLM provenance), so modality alone would still call the
+    rewritten upload an upload. The creator flips to ``assistant`` at the rewrite.
+    """
+    marker = _upload(blob_env, content="Original upload.\n")
+    rewritten = "Check the totals.\n"
+    updated = blob_tools.execute_tool(
+        "update_blob",
+        {"blob_id": marker["blob_ref"], "content": rewritten},
+        blob_tools._empty_state(),
+        blob_tools._catalog(),
+        data_dir=blob_env["data_dir"],
+        session_engine=blob_env["engine"],
+        session_id=blob_env["session_id"],
+        session_operation_context=blob_env["operation"],
+        session_operation_authority=blob_env["authority"],
+        user_message_id="user-message-1",
+        user_message_content=f"Use this exact content:\n{rewritten}",
+    )
+    assert updated.success is True, [error.message for error in updated.validation.errors]
+    with blob_env["engine"].connect() as conn:
+        row = conn.execute(blobs_table.select().where(blobs_table.c.id == marker["blob_ref"])).one()
+    assert (row.created_by, row.creation_modality) == ("assistant", CreationModality.VERBATIM.value)
+    rewritten_marker = {"blob_ref": marker["blob_ref"], "mode": "inline_content", "sha256": updated.data["content_hash"]}
+
+    if tool == "wire_blob_inline_ref":
+        state = _state(_node("inject", _options(_upload(blob_env, content="Earlier upload.\n"))))
+        result = _execute(
+            tool, {"field_path": "node:inject.options.files.invoice.content", "blob_id": rewritten_marker["blob_ref"]}, state, blob_env
+        )
+        node_id = "inject"
+    else:
+        result, state, node_id = _run(tool, _options(rewritten_marker), blob_env)
+
+    message = _assert_refused(result, state, tool=tool, node_id=node_id, option_path="files.invoice.content")
+    assert f"blob '{marker['blob_ref']}' is not a file the user uploaded" in message
+
+
 @pytest.mark.parametrize("tool", _NODE_OPTION_TOOLS)
 def test_marker_for_a_blob_outside_the_session_is_deferred_at_authoring(blob_env: dict[str, Any], tool: str) -> None:
     """No record to judge here; /validate reports the blob missing (see the readiness tests)."""

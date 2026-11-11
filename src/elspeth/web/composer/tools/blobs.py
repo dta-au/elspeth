@@ -1861,6 +1861,9 @@ def _blob_replacement_record(
 ) -> BlobRecord:
     return replace(
         expected,
+        # An agent write is an agent write: a rewrite of a user upload (or any
+        # other blob) makes it the assistant's file, as a newly created one is.
+        created_by="assistant",
         size_bytes=len(content_bytes),
         content_hash=content_hash(content_bytes),
         creation_modality=provenance.creation_modality,

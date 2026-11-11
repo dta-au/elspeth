@@ -2174,7 +2174,7 @@ class _RepositoryBlobMutations:
             ("mime_type", replacement.mime_type, expected.mime_type),
             ("storage_path", replacement.storage_path, expected.storage_path),
             ("created_at", replacement.created_at, expected.created_at),
-            ("created_by", replacement.created_by, expected.created_by),
+            # created_by is not pinned: update_blob records an agent rewrite as the assistant's file.
             ("source_description", replacement.source_description, expected.source_description),
             ("status", replacement.status, expected.status),
         )
@@ -2610,6 +2610,7 @@ class _RepositoryBlobMutations:
             .values(
                 size_bytes=replacement.size_bytes,
                 content_hash=replacement.content_hash,
+                created_by=replacement.created_by,
                 creation_modality=replacement.creation_modality.value,
                 created_from_message_id=replacement.created_from_message_id,
                 creating_model_identifier=replacement.creating_model_identifier,
@@ -2621,8 +2622,7 @@ class _RepositoryBlobMutations:
         )
         if replaced.rowcount != 1:
             raise AuditIntegrityError("ready blob changed during exact replacement commit")
-        # Preserve recoverable sink-stage overhead when this formerly generated
-        # output is edited. Shrinkage is released only after backup cleanup.
+        # Keep recoverable sink-stage overhead for an edited generated output; shrinkage is released after backup cleanup.
         growth = max(replacement.size_bytes - actual.size_bytes, 0)
         connection.execute(
             update(output_storage_reservations_table)

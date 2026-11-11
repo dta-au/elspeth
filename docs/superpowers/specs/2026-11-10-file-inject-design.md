@@ -241,7 +241,7 @@ the user (`created_by == "user"`) and its creation modality is not
 LLM-authored. Both are read as a pair because a blob the composer created from
 text in the user's message, a pipeline output and a session-fork copy of either
 all record a verbatim modality without being an upload; a fork copy keeps its
-source's creator, so a copied upload is still an upload. The existing `llm`
+source's creator, so a copy of an untouched upload is still an upload. The existing `llm`
 prompt-surface guard is unchanged and stays modality-only. The refusal is applied at the same three points as the
 existing guard, through the same predicate module so the three cannot drift:
 
@@ -250,20 +250,27 @@ existing guard, through the same predicate module so the three cannot drift:
 2. `/validate` materialization;
 3. run admission.
 
-**Known gap, open at the final review (2026-11-11).** The creator-and-modality
-pair does not hold across a session fork. `update_blob` on a user upload keeps
-`created_by == "user"` and records `LLM_GENERATED`, which the guard refuses;
-`copy_blobs_for_fork` then copies every ready blob, keeps the creator and
-resets the modality to `VERBATIM` with null provenance, so the copy of that
-planner-written content reads as a user upload and is accepted. The blob row
-has no structured field marking a fork copy (only the free-text
-`source_description`), and the copy cannot simply carry the source's
-LLM provenance: `created_from_message_id` is bound to the copy's own session
-by `fk_blobs_created_from_message_session`, and the parent's message is not in
-the child session (measured: `FOREIGN KEY constraint failed`). The fix needs a
-decision on the fork writer and is not part of this change. Until it lands,
-the sentence above that "a copied upload is still an upload" is true only of a
-copy whose source was never rewritten by `update_blob`.
+**Known gap, closed 2026-11-11 by ruling: an agent write is an agent write.**
+The creator-and-modality pair used to fail across a session fork and in one
+same-session case. `update_blob` kept `created_by == "user"` on a rewritten
+upload. `copy_blobs_for_fork` keeps the creator and resets the modality to
+`VERBATIM` with null provenance, so the copy of planner-written content read as
+a user upload. And an `update_blob` whose content is a contiguous substring of
+the user's current message records `VERBATIM`, so the rewritten upload stayed
+user/`VERBATIM`. The blob row has no structured field marking a fork copy, and
+the copy cannot carry the source's LLM provenance
+(`fk_blobs_created_from_message_session` binds `created_from_message_id` to the
+copy's own session), so the fix is at the rewrite: `update_blob` now sets
+`created_by = "assistant"` on any blob it rewrites, exactly as for a blob the
+agent created new. A rewritten upload, and any fork copy of it
+(assistant/`VERBATIM`), is refused by the existing predicate.
+
+What this closes: a user upload rewritten by `update_blob` can no longer be
+bound to `file_inject`, in the same session or after a fork. What remains open:
+the rewrite is one-way (the original upload bytes are gone and the blob stays
+the assistant's), and the `llm` prompt-surface guard is modality-only, so a
+fork copy of a rewritten upload (assistant/`VERBATIM`) still resets that guard.
+That guard is deliberately unchanged here.
 
 Literal content is refused as well (decided 2026-11-10, after the transform was
 built). The blob guard alone leaves a second route open: a composer authoring

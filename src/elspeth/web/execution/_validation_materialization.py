@@ -241,7 +241,9 @@ def is_user_uploaded_blob(*, created_by: str, creation_modality: CreationModalit
     (``shareable_reviews.service._check_shareable_blob``): a blob the composer
     created from text in the user's message, a pipeline output and a session-fork
     copy of either all record ``VERBATIM`` without being an upload. A fork copy
-    keeps its source's creator, so a copied upload is still an upload.
+    keeps its source's creator, so a copy of an untouched upload is still an
+    upload. ``update_blob`` records the assistant as creator of any blob it
+    rewrites, so a rewritten upload, and a fork copy of it, is not.
     """
     return created_by == USER_BLOB_CREATOR and not is_llm_authored_creation_modality(creation_modality)
 
