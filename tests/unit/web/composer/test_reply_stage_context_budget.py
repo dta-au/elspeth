@@ -29,13 +29,19 @@ from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.web.composer import no_tool_policy
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.context_budget import ContextBudgetRefusal
+from elspeth.web.composer.context_budget_apply import latest_round_trip_start, message_wire_split, stubbed_tool_message
 from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.composer.reply_stage_refusal import (
     COMPOSER_REPLY_STAGE_REFUSAL_KIND,
     ComposeLoopContextBudgetComponent,
     ReplyStageRefusal,
 )
-from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl, _context_budget_component_bytes
+from elspeth.web.composer.service import (
+    ComposerAvailability,
+    ComposerServiceImpl,
+    _context_budget_component_bytes,
+    _reply_stage_messages,
+)
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -265,6 +271,63 @@ async def test_a_context_budget_refusal_at_the_reply_stage_leaves_the_finished_t
 
 
 @pytest.mark.asyncio
+async def test_a_real_reply_stage_refusal_names_the_largest_component_of_the_request_it_measured(
+    tmp_path: Path, sessions: SessionServiceImpl, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stored component is sized on the reply-stage request, where tool records are quoted as JSON text.
+
+    Nothing about the refusal is hand-fed: the real decision refuses and the
+    real component computation names the largest. The test supplies only the
+    inputs: a latest tool result that is smaller than the system message in
+    the loop's form and larger than it once quoted, and a byte ceiling the
+    protected content cannot fit.
+    """
+    turn = _Turn(tmp_path, sessions, monkeypatch)
+    composer = turn.composer
+    decide = composer._shed_to_context_budget
+    policy = composer._context_budget_policy
+    tight_policy = replace(policy, max_request_bytes=1024)
+    measured: list[tuple[int, int, int]] = []
+
+    def _decide_on_a_quote_heavy_latest_round(**kwargs: Any) -> Any:
+        if not _is_reply_stage(kwargs["tools"]):
+            return decide(**kwargs)
+        messages = kwargs["messages"]
+        latest_start = latest_round_trip_start(messages)
+        assert latest_start is not None and messages[-1]["role"] == "tool"
+        loop_sizes = message_wire_split(messages, kwargs["tools"]).message_bytes
+        largest_other = max(loop_sizes[:latest_start])
+        # One row is seven wire bytes in a tool message and eleven once the record is quoted as text:
+        # each of its quotes is escaped once there and twice here.
+        row_count = (largest_other * 4 // 5) // 7
+        # A plain tool result with new content: the original's prompt-guard provenance described other content.
+        messages[-1] = {**stubbed_tool_message(messages[-1]), "content": json.dumps({"rows": ["x"] * row_count})}
+        loop_round = sum(message_wire_split(messages, kwargs["tools"]).message_bytes[latest_start:])
+        quoted_sizes = message_wire_split(_reply_stage_messages(messages), kwargs["tools"]).message_bytes
+        measured.append((loop_round, largest_other, sum(quoted_sizes[latest_start : len(messages)])))
+        monkeypatch.setattr(composer, "_context_budget_policy", tight_policy)
+        try:
+            return decide(**kwargs)
+        finally:
+            monkeypatch.setattr(composer, "_context_budget_policy", policy)
+
+    monkeypatch.setattr(composer, "_shed_to_context_budget", _decide_on_a_quote_heavy_latest_round)
+
+    result = await turn.run()
+
+    # Instrument guard: in the loop's form the round is not the largest; in the request the decision measured it is.
+    ((loop_round, largest_other, quoted_round),) = measured
+    assert loop_round < largest_other < quoted_round
+    assert turn.reply_stage_calls() == 0
+    assert result.assistant_message.count(no_tool_policy._REVIEW_REPLY_CONTEXT_BUDGET_NOTICE) == 1
+    ((_content, envelope),) = turn.refusal_records()
+    assert envelope["ceiling"] == "bytes"
+    assert envelope["max_request_bytes"] == 1024
+    assert envelope["request_wire_bytes"] > quoted_round
+    assert envelope["largest_component"] == "latest_tool_round"
+
+
+@pytest.mark.asyncio
 async def test_control_a_provider_failure_at_the_reply_stage_keeps_its_call_record_and_its_notice(
     tmp_path: Path, sessions: SessionServiceImpl, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -415,5 +478,5 @@ def test_a_refusal_outside_its_closed_shape_is_rejected(overrides: dict[str, Any
 
 def test_the_refusal_component_vocabulary_is_the_compose_loops() -> None:
     split = ComposerLLMRequestByteSplit(message_bytes=(1, 1, 1, 1), tools_bytes=1, total_bytes=5)
-    named = _context_budget_component_bytes(split, state_index=2, latest_start=None, sheddable_bytes=0)
+    named = _context_budget_component_bytes(split, state_index=2, latest_start=None, latest_stop=4, sheddable_bytes=0)
     assert set(named) == set(get_args(ComposeLoopContextBudgetComponent))
