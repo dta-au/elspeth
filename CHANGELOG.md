@@ -36,6 +36,9 @@ These changes are breaking:
   builder is `debian:trixie-slim`. The gateway image is `python:3.14-alpine`.
   3.14.5 is the newest CPython the pinned uv offers; a later patch release
   needs a uv image bump.
+- **Dataverse FetchXML runs recorded before this release cannot be replayed
+  in verify mode.** The `Prefer` header is now part of the recorded request,
+  so the earlier records no longer match. OData runs are unaffected.
 - **CI runs one Python 3.14 lane**, which is the coverage lane. Required
   status-check names change with it, for example
   `Test (Python 3.14, shard N)` and `Timing-sensitive tests (Python 3.14)`,
@@ -122,6 +125,22 @@ Each of these keeps the behaviour ELSPETH had under Python 3.13.
   success metadata's `operation_id` is omitted when Azure's id is not a plain
   token. The catalogue lists the shared source, polling and timeout options
   before `endpoint` and `model_id`. Option names and defaults are unchanged.
+- **Generic HTTP JSON responses are admitted only if the audit can record
+  them.** A body nested deeper than 64 levels, a number that overflows to
+  infinity or an integer outside the canonical range is now recorded as a
+  JSON parse failure. Previously the call raised with no audit record.
+- **`web_scrape` refuses a row URL that contains a control character**, such
+  as a trailing newline, as a `validation_failed` row error. It previously
+  crashed the run.
+- **Chroma search records and classifies HTTP-layer failures.** Transport
+  errors and HTTP 408, 429 and 5xx are retryable; other 4xx responses and
+  non-JSON bodies are permanent. These calls were previously unrecorded and
+  not retried.
+- **Dataverse FetchXML paging works past the first page.** The request now
+  asks for the paging annotations, a page without `morerecords` ends the
+  results, and the paging cookie sent back is the annotation's inner
+  `pagingcookie` value. If the server ignores the annotations and a second
+  page exists, the source fails instead of truncating.
 
 ### Logging
 
