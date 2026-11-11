@@ -1013,7 +1013,13 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # resumed_full_projection_sha256 moved 86bda402... -> b8c16e2c..., measured by
 # the production harness (test_dag_scenario_production_path). Captured from
 # this file's parity failure (previous pin 0ce52bbb...).
-EXPECTED_CASE_REGISTRY_SHA256 = "28a82fc86ae1d37ef3053e1d249d1f801e78dffaf297f177928ee4bf39704857"
+# Sweep finding #103 (20261111-plugins-review): JSONSink refuses a JSONL
+# append baseline without a trailing LF; its seventeen manifest provenance
+# tokens moved 9ef547005076060e -> 0241bd4eb91ae378, and reopen-resume's
+# resumed_full_projection_sha256 moved b8c16e2c... -> d9f57ba0..., measured by
+# the production harness. Captured from this file's parity failure (previous
+# pin 28a82fc8...).
+EXPECTED_CASE_REGISTRY_SHA256 = "b14d1da892a0ca3625763cb1e89b47f60056f52d9e87fe485a0d4fb2cc49644d"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
