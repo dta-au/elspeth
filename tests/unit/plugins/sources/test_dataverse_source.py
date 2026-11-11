@@ -1235,18 +1235,18 @@ class TestDataverseSourceLoadStructured:
             )
         )
 
-        def client_factory(*_args: Any, before_request: Callable[[str], None], **_kwargs: Any) -> _DataverseClientFake:
+        def client_factory(*_args: Any, before_request: Callable[[str, Mapping[str, str]], None], **_kwargs: Any) -> _DataverseClientFake:
             assert events == ["preflight:metadata"]
             events.append("client")
             client = _DataverseClientFake(metadata_page=metadata_page)
 
             def get_metadata(url: str) -> DataversePageResponse:
-                before_request(url)
+                before_request(url, {})
                 events.append("dispatch:metadata")
                 return metadata_page
 
             def get_pages(url: str) -> Any:
-                before_request(url)
+                before_request(url, {})
                 events.append("dispatch:page")
                 yield data_page
 
@@ -1310,15 +1310,15 @@ class TestDataverseSourceLoadStructured:
         lifecycle_ctx.call_mode_session = source_ctx.call_mode_session = _VerifySession()
         source_ctx.record_call = _CallRecorder(return_value=SimpleNamespace(call_index=0, call_id="current-metadata"))
 
-        def client_factory(*_args: Any, before_request: Callable[[str], None], **_kwargs: Any) -> _DataverseClientFake:
+        def client_factory(*_args: Any, before_request: Callable[[str, Mapping[str, str]], None], **_kwargs: Any) -> _DataverseClientFake:
             client = _DataverseClientFake(metadata_page=metadata_page)
 
             def get_metadata(url: str) -> DataversePageResponse:
-                before_request(url)
+                before_request(url, {})
                 return metadata_page
 
             def get_pages(url: str) -> Any:
-                before_request(url)
+                before_request(url, {})
                 events.append("page dispatched")
                 yield _make_page([{"contactid": "1"}])
 
@@ -1364,11 +1364,11 @@ class TestDataverseSourceLoadStructured:
         lifecycle_ctx.call_mode_session = source_ctx.call_mode_session = _VerifySession()
         source_ctx.record_call = _CallRecorder(return_value=SimpleNamespace(call_index=0, call_id="current-error"))
 
-        def client_factory(*_args: Any, before_request: Callable[[str], None], **_kwargs: Any) -> _DataverseClientFake:
+        def client_factory(*_args: Any, before_request: Callable[[str, Mapping[str, str]], None], **_kwargs: Any) -> _DataverseClientFake:
             client = _DataverseClientFake()
 
             def metadata_error(url: str) -> None:
-                before_request(url)
+                before_request(url, {})
                 raise DataverseClientError(
                     "metadata server error",
                     retryable=True,

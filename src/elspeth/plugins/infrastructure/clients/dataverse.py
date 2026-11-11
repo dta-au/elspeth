@@ -14,7 +14,7 @@ import re
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -296,7 +296,7 @@ class DataverseClient:
         limiter: LimiterProtocol | None = None,
         retry_after_cap: float = 60.0,
         additional_domains: tuple[str, ...] = (),
-        before_request: Callable[[str], None] | None = None,
+        before_request: Callable[[str, Mapping[str, str]], None] | None = None,
     ) -> None:
         raw_environment_url = environment_url.rstrip("/")
         parsed = urllib.parse.urlparse(raw_environment_url)
@@ -544,14 +544,17 @@ class DataverseClient:
             DataverseClientError: For protocol-level errors
         """
         if self._before_request is not None:
-            self._before_request(url)
+            # The hook sees the non-auth headers this request adds, so a
+            # VERIFY preflight can rebuild the request exactly as recorded.
+            self._before_request(url, extra_headers or {})
         self._acquire_rate_limit()
 
         auth_headers = self.get_auth_headers()
         headers = {**auth_headers, **(extra_headers or {})}
-        # Fingerprint auth headers early so every error path can carry
-        # request metadata for accurate audit trail recording.
-        fingerprinted = fingerprint_headers(auth_headers)
+        # Fingerprint every header that will be sent (sensitive values become
+        # fingerprints, the rest pass through) early so every error path can
+        # carry the request metadata for an accurate audit trail.
+        fingerprinted = fingerprint_headers(headers)
 
         # IP-pinning SSRF validation on every outbound request.
         # When ssrf_safe is pre-validated (e.g., from paginate_odata nextLink
@@ -866,7 +869,7 @@ class DataverseClient:
             # so the HTTP call connects to the validated IP, preventing
             # DNS rebinding between validation and connection.
             if self._before_request is not None:
-                self._before_request(page.next_link)
+                self._before_request(page.next_link, {})
             ssrf_safe = self._validate_url_ssrf(page.next_link)
             url = page.next_link
 
