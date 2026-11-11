@@ -96,3 +96,22 @@ def test_empty_string_document_id_diverts_at_prepare_while_siblings_land() -> No
         live = {item.row_index: item.reason for item in run.sink._get_diversions()}
         assert set(live) == {1}
         assert "empty" in live[1]
+
+
+def test_duplicate_document_id_diverts_later_occurrence_while_siblings_land() -> None:
+    rows: list[dict[str, Any]] = [
+        {"doc_id": "d0", "text": "document 0", "topic": "test"},
+        {"doc_id": "d0", "text": "document 0 again", "topic": "test"},
+        {"doc_id": "d2", "text": "document 2", "topic": "test"},
+    ]
+    with _execute(rows) as run:
+        assert not isinstance(run.outcome, Exception), f"duplicate ID failed the effect instead of diverting: {run.outcome!r}"
+        assert run.outcome.effect.state is SinkEffectState.FINALIZED
+        # The first occurrence wins; the later duplicate never reaches the collection.
+        assert run.collection.documents == {"d0": ("document 0", {"topic": "test"}), "d2": ("document 2", {"topic": "test"})}
+        members = run.factory.execution.sink_effects.get_members(run.outcome.effect.effect_id)
+        assert [member.prepared_disposition for member in members] == ["accepted", "diverted", "accepted"]
+        assert members[1].reason_hash is not None
+        live = {item.row_index: item.reason for item in run.sink._get_diversions()}
+        assert set(live) == {1}
+        assert "duplicate" in live[1]
