@@ -51,7 +51,11 @@ from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputPort
 from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_url
-from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient, HTTPResponseBodyTooLargeError
+from elspeth.plugins.infrastructure.clients.http import (
+    AuditedHTTPClient,
+    HTTPResponseBodyTooLargeError,
+    HTTPResponseEncodingLimitError,
+)
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.telemetry import make_warn_telemetry_before_start
@@ -73,7 +77,13 @@ _HTTP_TIMEOUT_HEADROOM_SECONDS = 30.0
 # optionally ``xx==`` or ``xxx=``. Rejects whitespace, ``data:`` URI prefixes,
 # the URL-safe alphabet and unpadded or mis-padded input up front, which Azure
 # would otherwise reject only after a billed, audited submit.
-_BASE64_PATTERN = re.compile(r"(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?")
+# The group repeat is possessive so an 8M-character document costs no backtrack state.
+_BASE64_PATTERN = re.compile(r"(?:[A-Za-z0-9+/]{4})*+(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?")
+
+# Longest provider-requested poll delay honoured as-is. A larger Retry-After on
+# an accepted or running operation is treated as this value, so a Tier-3 header
+# cannot park a row (and its worker) until the poll deadline.
+_MAX_HONOURED_POLL_RETRY_AFTER_SECONDS = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,11 +370,11 @@ class AzureAnalyzeTransform(BaseTransform, BatchTransformMixin):
     ) -> TransformResult:
         """Submit the document, poll the LRO to completion, and enrich the row.
 
-        ``capacity_deadline`` is a single per-row total-budget anchor shared by the
-        submit POST and every poll GET (it is NOT a per-phase budget): the
-        ``max_capacity_retry_seconds`` cap applies to total 429/503 wait across the
-        whole row. Poll GETs further clamp it to ``min(capacity_deadline,
-        poll_deadline)`` so capacity retries never outlive the outer poll budget.
+        ``max_capacity_retry_seconds`` bounds the 429/503 retrying of ONE call: the
+        submit POST from the row start, and each poll GET from the moment that GET
+        is first attempted, clamped to the poll deadline. A capacity response late
+        in a long analysis therefore still gets its retries, and the row as a whole
+        stays bounded by ``poll_timeout_seconds``.
 
         Every per-row failure below is raised as ``_RowFailed`` and returned here
         as the row's error result, so it never escapes past the executor.
@@ -382,7 +392,6 @@ class AzureAnalyzeTransform(BaseTransform, BatchTransformMixin):
                 ctx=ctx,
                 token_id=token_id,
                 retry_after=retry_after,
-                capacity_deadline=capacity_deadline,
                 started_at=started_at,
             )
         except _RowFailed as failed:
@@ -404,13 +413,24 @@ class AzureAnalyzeTransform(BaseTransform, BatchTransformMixin):
             raise self._row_failure({"reason": "non_string_field", "field": self._source_field, "actual_type": type(ref).__name__})
 
         if self._source_mode == "url":
-            parsed = urlparse(ref)
+            invalid_url: TransformErrorReason = {
+                "reason": "invalid_input",
+                "field": self._source_field,
+                "error_type": "invalid_document_url",
+            }
+            try:
+                # urlparse/urlsplit raise ValueError on a malformed bracketed host
+                # (``http://[::1``); that is a bad row value, not a reason to end the run.
+                parsed = urlparse(ref)
+                # A SAS ``sig`` (or any credential-shaped query value / userinfo) in the
+                # document URL is a credential: Azure needs it verbatim, the recorded
+                # request must not keep it raw.
+                audit_url = fingerprint_url(ref)
+            except ValueError as e:
+                raise self._row_failure(invalid_url) from e
             if parsed.scheme not in ("http", "https") or not parsed.netloc:
-                raise self._row_failure({"reason": "invalid_input", "field": self._source_field, "error_type": "invalid_document_url"})
-            # A SAS ``sig`` (or any credential-shaped query value / userinfo) in the
-            # document URL is a credential: Azure needs it verbatim, the audit
-            # trail must not keep it raw.
-            return self._url_request(ref, fingerprint_url(ref))
+                raise self._row_failure(invalid_url)
+            return self._url_request(ref, audit_url)
 
         if len(ref) > self._max_base64_chars:
             raise self._row_failure(
@@ -450,9 +470,11 @@ class AzureAnalyzeTransform(BaseTransform, BatchTransformMixin):
     def _http_call_with_capacity_retry(self, do_call: Callable[[], Any], *, deadline: float, started_at: float, error_type: str) -> Any:
         """Run one HTTP call with capacity (429/503) retry and return the 2xx response.
 
-        ``deadline`` is the total-budget anchor (``min(capacity_deadline, poll_deadline)``
-        when called from ``_poll``). Azure's ``Retry-After`` on a capacity response
-        lengthens the wait (never shortens our backoff) but never past ``deadline``.
+        ``deadline`` bounds this call's capacity retrying (clamped to the poll
+        deadline when called from ``_poll``). Azure's ``Retry-After`` on a capacity
+        response lengthens the wait (never shortens our backoff); one that asks for
+        longer than the remaining budget ends the row at once instead of sleeping
+        the budget away first.
         Non-capacity HTTP errors end the row in the ``api_error`` category with
         ``error_type`` as the sub-label. Raises PluginRetryableError on network
         errors (engine retries the row).
@@ -471,6 +493,11 @@ class AzureAnalyzeTransform(BaseTransform, BatchTransformMixin):
                 # max_response_body_bytes. If it escaped here it would propagate past the
                 # executor and cancel the WHOLE batch; convert to a per-row error instead.
                 raise self._row_failure({"reason": "body_too_large", "body_size": e.body_size, "max_body_bytes": e.max_body_bytes}) from e
+            except HTTPResponseEncodingLimitError as e:
+                # Sibling of the cap above (unsupported or invalid Content-Encoding,
+                # decompression-ratio breach): also an httpx.HTTPError that is neither a
+                # status nor a request error, and equally fatal to the batch if it escaped.
+                raise self._row_failure({"reason": "malformed_response", "error_type": "response_encoding_refused"}) from e
             except httpx.HTTPStatusError as e:
                 status_code = e.response.status_code
                 if not is_capacity_error(status_code):
@@ -480,6 +507,8 @@ class AzureAnalyzeTransform(BaseTransform, BatchTransformMixin):
                     raise _RowFailed(self._retry_timeout_result(status_code, started_at)) from e
                 retry_after = self._parse_retry_after(e.response.headers["retry-after"] if "retry-after" in e.response.headers else None)
                 wait = delay if retry_after is None else max(delay, retry_after)
+                if retry_after is not None and retry_after > deadline - now:
+                    raise _RowFailed(self._retry_timeout_result(status_code, started_at)) from e
                 sleep_seconds = min(wait, deadline - now)
                 if sleep_seconds > 0 and self._shutdown.wait(timeout=sleep_seconds):
                     raise _RowFailed(self._shutdown_result(started_at)) from e
@@ -526,13 +555,14 @@ class AzureAnalyzeTransform(BaseTransform, BatchTransformMixin):
         token_id: str | None,
         ctx: TransformContext,
         retry_after: float | None,
-        capacity_deadline: float,
         started_at: float,
     ) -> Mapping[str, Any]:
         client = self._get_http_client(state_id, token_id=token_id, ctx=ctx)
         poll_deadline = started_at + self._poll_timeout_seconds
         # Wait before the first GET. Honor Azure's Retry-After when present;
         # the configured poll cap bounds our backoff, not Azure's requested delay.
+        if retry_after is not None:
+            retry_after = min(retry_after, _MAX_HONOURED_POLL_RETRY_AFTER_SECONDS)
         first_delay = max(retry_after or 0.0, self._poll_interval_seconds)
         if first_delay > 0:
             now = time.monotonic()
@@ -555,8 +585,9 @@ class AzureAnalyzeTransform(BaseTransform, BatchTransformMixin):
             def do_call() -> Any:
                 return client.get(operation_url, timeout=self._request_timeout_seconds)
 
+            call_capacity_deadline = time.monotonic() + float(self._max_capacity_retry_seconds)
             resp = self._http_call_with_capacity_retry(
-                do_call, deadline=min(capacity_deadline, poll_deadline), started_at=started_at, error_type="poll_request_failed"
+                do_call, deadline=min(call_capacity_deadline, poll_deadline), started_at=started_at, error_type="poll_request_failed"
             )
             if time.monotonic() >= poll_deadline:
                 raise _RowFailed(self._poll_timeout_result(started_at))
@@ -582,9 +613,9 @@ class AzureAnalyzeTransform(BaseTransform, BatchTransformMixin):
             if now >= poll_deadline:
                 raise _RowFailed(self._poll_timeout_result(started_at))
             # A running poll's own Retry-After may ask for a longer wait than our
-            # backoff; honour it (bounded by the poll deadline), never a shorter one.
+            # backoff; honour it up to the cap (and the poll deadline), never a shorter one.
             poll_retry_after = self._parse_retry_after(resp.headers["retry-after"] if "retry-after" in resp.headers else None)
-            wait = interval if poll_retry_after is None else max(interval, poll_retry_after)
+            wait = interval if poll_retry_after is None else max(interval, min(poll_retry_after, _MAX_HONOURED_POLL_RETRY_AFTER_SECONDS))
             sleep_seconds = min(wait, poll_deadline - now)
             if sleep_seconds > 0 and self._shutdown.wait(timeout=sleep_seconds):
                 raise _RowFailed(self._shutdown_result(started_at))

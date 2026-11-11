@@ -19,7 +19,7 @@ from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.engine.executors.declared_output_types import verify_produced_output_types
-from elspeth.plugins.infrastructure.clients.http import HTTPResponseBodyTooLargeError
+from elspeth.plugins.infrastructure.clients.http import HTTPResponseBodyTooLargeError, HTTPResponseEncodingLimitError
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.transforms.azure.document_intelligence import (
@@ -569,7 +569,6 @@ def test_poll_deadline_expired_before_get_does_not_accept_success() -> None:
             token_id=None,
             ctx=make_context(),
             retry_after=None,
-            capacity_deadline=time.monotonic() + 10,
             started_at=time.monotonic() - 2,
         )
     finally:
@@ -596,7 +595,7 @@ def test_poll_deadline_expired_during_get_does_not_accept_success(monkeypatch: p
     ctx = make_context()
     monkeypatch.setattr(analyze_lro_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     try:
-        result = _poll_or_failure(t, OP, "s1", token_id=None, ctx=ctx, retry_after=None, capacity_deadline=10.0, started_at=0.0)
+        result = _poll_or_failure(t, OP, "s1", token_id=None, ctx=ctx, retry_after=None, started_at=0.0)
     finally:
         with t._http_clients_lock:
             t._http_clients.pop("s1", None)
@@ -625,9 +624,7 @@ def test_first_poll_waits_for_interval_or_retry_after(
     monkeypatch.setattr(analyze_lro_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     monkeypatch.setattr(t._shutdown, "wait", wait)
     try:
-        result = _poll_or_failure(
-            t, OP, "s1", token_id=None, ctx=make_context(), retry_after=retry_after, capacity_deadline=30.0, started_at=0.0
-        )
+        result = _poll_or_failure(t, OP, "s1", token_id=None, ctx=make_context(), retry_after=retry_after, started_at=0.0)
     finally:
         with t._http_clients_lock:
             t._http_clients.pop("s1", None)
@@ -878,7 +875,8 @@ def test_real_client_records_fingerprinted_sas_and_sends_raw(monkeypatch: pytest
         recorded = repr(recorder.record_call.call_args_list)
         assert recorder.record_call.call_args_list
         assert "SECRETSIGVALUE" not in recorded
-        assert "fingerprint" in recorded
+        assert "sv=2024-11-04" in recorded  # positive control: the request URL is in the record
+        assert "sig=%3Cfingerprint%3A" in recorded
     finally:
         with t._http_clients_lock:
             client = t._http_clients.pop("s-sas", None)
@@ -896,7 +894,7 @@ def test_real_client_records_fingerprinted_sas_and_sends_raw(monkeypatch: pytest
         ({"status": "canceled", "error": {"code": "OperationCanceled"}}, "canceled", "OperationCanceled"),
         ({"status": "skipped"}, "failed", "skipped"),
         ({"status": "failed", "error": {"code": "InvalidContent"}}, "failed", "InvalidContent"),
-        ({"status": "failed"}, "failed", "failed"),
+        ({"status": "failed"}, "failed", "unknown"),
     ],
 )
 def test_terminal_non_success_statuses_are_analysis_failed(body: dict[str, Any], status: str, cause: str) -> None:
@@ -975,7 +973,7 @@ def test_capacity_retry_honours_retry_after(monkeypatch: pytest.MonkeyPatch) -> 
     assert waits[0] == 7.0  # not the 0.05s backoff floor
 
 
-def test_capacity_retry_after_is_clamped_to_the_row_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_capacity_retry_after_beyond_the_budget_fails_without_sleeping(monkeypatch: pytest.MonkeyPatch) -> None:
     t = _t_for_lro(max_capacity_retry_seconds=5)
     waits = _clocked(monkeypatch, t)
     fake = _FakeClient([_ErrResp(503, headers={"retry-after": "3600"})], [])
@@ -986,7 +984,7 @@ def test_capacity_retry_after_is_clamped_to_the_row_budget(monkeypatch: pytest.M
     finally:
         with t._http_clients_lock:
             t._http_clients.pop("s1", None)
-    assert waits == [5.0]
+    assert waits == []  # sleeping the budget away could not change the outcome
     assert result.reason["reason"] == "retry_timeout"
     assert result.reason["status_code"] == 503
 
@@ -1113,3 +1111,75 @@ def test_reported_model_id_that_is_not_a_model_id_is_not_echoed() -> None:
 
 def test_new_output_options_are_output_naming_keys() -> None:
     assert {"fields_field", "metadata_field"} <= AzureDocumentIntelligence.output_naming_config_keys
+
+
+# ── Review follow-ups: row values and responses that used to end the run ───
+
+
+@pytest.mark.parametrize("url", ["http://[::1", "https://[bad]/x.pdf", "https://a]b/x"])
+def test_url_with_a_malformed_authority_fails_the_row_not_the_run(url: str) -> None:
+    """urlparse raises ValueError on these; the row must fail closed without a submit."""
+    t = _t_for_lro()
+    fake = _FakeClient([], [])
+    result = _run_with_fake(t, fake, row=_row(url=url))
+    assert result.reason == {"reason": "invalid_input", "field": "doc_url", "error_type": "invalid_document_url"}
+    assert fake.posts == []
+
+
+def test_refused_response_encoding_is_per_row_not_batch_cancel() -> None:
+    t = _t_for_lro()
+    payload = HTTPCallResponse(status_code=200, headers={}, body_size=0, body={"_truncated": True})
+
+    class _EncodingRefusedClient(_FakeClient):
+        def get(self, url: str, *, timeout: float | None = None) -> Any:
+            del url, timeout
+            raise HTTPResponseEncodingLimitError(reason="unsupported_content_encoding", response_payload=payload)
+
+    result = _run_with_fake(t, _EncodingRefusedClient(_post_202(), []))
+    assert result.reason == {"reason": "malformed_response", "error_type": "response_encoding_refused"}
+
+
+def _run_clocked(t: AzureDocumentIntelligence, fake: _FakeClient) -> Any:
+    with t._http_clients_lock:
+        t._http_clients["s1"] = fake
+    try:
+        return t._process_single_with_state(_row(), "s1", ctx=make_context(), token_id=None)
+    finally:
+        with t._http_clients_lock:
+            t._http_clients.pop("s1", None)
+
+
+def test_late_poll_capacity_response_still_gets_its_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 429 on a poll long after the row started must retry, not fail with zero attempts."""
+    t = _t_for_lro(
+        poll_interval_seconds=400.0, poll_max_interval_seconds=400.0, poll_timeout_seconds=1800.0, max_capacity_retry_seconds=300
+    )
+    _clocked(monkeypatch, t)
+    fake = _FakeClient(
+        _post_202(),
+        [_ErrResp(429), _Resp(200, body={"status": "succeeded", "analyzeResult": {"content": "late but fine"}})],
+    )
+    result = _run_clocked(t, fake)
+    # The first poll happens at t=400s, past the old row-wide 300s capacity anchor.
+    assert result.status == "success"
+    assert fake.get_calls == 2
+
+
+def test_oversized_poll_retry_after_is_capped(monkeypatch: pytest.MonkeyPatch) -> None:
+    t = _t_for_lro(poll_interval_seconds=1.0, poll_timeout_seconds=3600.0)
+    waits = _clocked(monkeypatch, t)
+    fake = _FakeClient(
+        _Resp(202, headers={"operation-location": OP, "retry-after": "100000"}),
+        [
+            _Resp(200, headers={"retry-after": "100000"}, body={"status": "running"}),
+            _Resp(200, body={"status": "succeeded", "analyzeResult": {"content": "ok"}}),
+        ],
+    )
+    result = _run_clocked(t, fake)
+    assert result.status == "success"
+    assert waits == [60.0, 60.0]
+
+
+def test_large_base64_is_validated_in_one_pass() -> None:
+    assert AzureDocumentIntelligence._is_valid_base64("QUJD" * 500_000)
+    assert not AzureDocumentIntelligence._is_valid_base64("QUJD" * 500_000 + "!")

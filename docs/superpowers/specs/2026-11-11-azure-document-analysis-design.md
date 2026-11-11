@@ -149,21 +149,64 @@ raises `PluginRetryableError`. Every failure is per-row and non-retryable.
   as `_RowFailed` rather than as `TransformResult` unions. Raw R5 hits under
   `plugins/transforms/azure/*` fell from 16 (at the ceiling) to 3. The keyless
   corpus adds no findings beyond `R_TB_SUPPRESSED` observations.
-- **Soft-mapping census.** 2,617 → 2,635 soft sites (+18, re-pinned and
-  recorded), with 5 more boundary-parsed. The new sites are the provider JSON
-  surfaces of a second service. Result contents parse once into the owned
+- **Soft-mapping census.** +18 soft sites over the base when first measured (2,617 → 2,635; the
+  pin is 2,668 after the rebase onto 0.8.13), with 5 more boundary-parsed. The new sites are the provider JSON
+  surfaces of a second service. Result contents parse once into
   `ResultContents`, and the emitted metadata is an owned TypedDict.
 - **Planner scaffolding.** The new catalogue entry adds a measured 595 B to the
   fixed planner request. That is the entry alone: without it the request is
-  140,468 B after the rebase onto 0.8.13 (7 B under the prior ceiling), and the DI entry is byte-identical. It is
+  140,468 B after the rebase onto 0.8.13 (7 B under the prior ceiling), and
+  the DI entry is byte-identical. It is
   priced as `_CONTENT_UNDERSTANDING_CATALOG_CANONICAL_BYTES`, and the
   maintainer should review it like the other allowances there.
 
 ## Compatibility
 
-Document Intelligence configuration is unchanged except for the two new
-optional outputs. Behaviour changes only on paths that were wrong:
-`canceled`/`skipped` now report `analysis_failed` instead of
-`malformed_response`, and an invalid base64 value is now rejected locally
-instead of by Azure. The plugin's `source_file_hash` and lifecycle owners
-move, because the shared machinery moved into `analyze_lro`.
+Document Intelligence option names and defaults are unchanged; there are two
+new optional outputs. Behaviour changes:
+
+- `canceled`/`skipped` report `analysis_failed` instead of `malformed_response`.
+  A failed operation with no error code still reports `cause: unknown`.
+- Base64 that is not padded standard-alphabet base64 is rejected locally. That
+  includes line-wrapped or whitespace-containing input, which was previously
+  forwarded to Azure.
+- `max_capacity_retry_seconds` bounds each call's 429/503 retrying, clamped to
+  the poll deadline, instead of being measured from the row start. A capacity
+  `Retry-After` longer than the remaining budget fails the row at once. A poll
+  `Retry-After` is honoured up to 60 seconds.
+- A `malformed_response` message names the facet without the `analyzeResult.`
+  prefix, and `operation_id` is omitted when Azure's id is not a plain token.
+- The catalogue lists the shared source, polling and timeout options before
+  `endpoint` and `model_id`, because they now come from the shared config base.
+- The plugin's `source_file_hash` and lifecycle owners move, because the
+  shared machinery moved into `analyze_lro`.
+
+## Review follow-ups (2026-11-11)
+
+An independent review of the first commit found these, all fixed with tests:
+
+- Both plugins had dropped out of the source-hash gate, because the rule only
+  recognises direct plugin bases. `AzureAnalyzeTransform` is now a recognised
+  base in the lint rule and in `scripts/cicd/plugin_hash.py`.
+- Two exceptions could still end the run: `urlparse` raising on a malformed
+  bracketed host in the row value, and the HTTP client's encoding-limit error.
+- The capacity budget was anchored to the row start, so a 429 on a late poll
+  failed with no retry. An oversized `Retry-After` slept the whole budget and
+  then failed anyway.
+- The base64 check held about 255 MB of backtracking state for an 8M-character
+  input. The pattern is now possessive.
+- `ResultContents` froze the result and thawed it once per output. It now holds
+  the parsed contents as-is.
+
+Known limits, not changed here:
+
+- A plugin's `source_file_hash` covers its own file. The shared `analyze_lro`
+  and `analyze_result` modules are not in any plugin hash, as was already true
+  of `document_intelligence_result.py`.
+- The SAS fingerprinting covers the recorded HTTP request. The row's own
+  `source_field` value is stored unchanged wherever row data is stored, and the
+  fingerprinting recognises credentials by query-parameter name.
+- Azure's error response bodies are recorded by the HTTP client as received.
+- The Content Understanding endpoint allowlist has no sovereign-cloud hosts.
+- The live-provider workflow file needs the four-line change described in the
+  hand-off, because the agent token cannot push workflow files.

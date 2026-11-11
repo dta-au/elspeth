@@ -17,7 +17,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.plugins.transforms.azure.analyze_result import facet_list, flatten_fields
 from elspeth.plugins.transforms.azure.errors import MalformedResponseError
@@ -25,24 +24,22 @@ from elspeth.plugins.transforms.azure.errors import MalformedResponseError
 _MAX_PAGE_NUMBER = 1_000_000
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class ResultContents:
-    """The validated ``result.contents``.
+    """The validated ``result.contents`` of one row's analysis.
 
-    ``items`` keeps the provider's own content objects (facets and the
-    ``contents`` output pass them through as Azure sent them), deep-frozen at
-    construction and thawed back to plain JSON containers by each accessor;
-    ``markdown_parts`` and ``page_count`` were validated at the parse boundary.
-    The freeze is one walk of the contents, beside the HTTP round trip and JSON
-    parse that produced them.
+    A per-row parse product that never leaves ``_build_enriched_result``.
+    ``items`` are the provider's own content objects, held as parsed and passed
+    through to the row as Azure sent them. It is deliberately not frozen: a
+    deep freeze would copy a result of up to ``max_response_body_bytes`` once to
+    freeze and again per configured output to thaw, for a value nothing else
+    can reach. ``markdown_parts`` and ``page_count`` were validated at the
+    parse boundary.
     """
 
-    items: tuple[Mapping[str, Any], ...]
-    markdown_parts: tuple[str, ...]
+    items: list[Mapping[str, Any]]
+    markdown_parts: list[str]
     page_count: int
-
-    def __post_init__(self) -> None:
-        freeze_fields(self, "items", "markdown_parts")
 
     def __len__(self) -> int:
         return len(self.items)
@@ -60,18 +57,19 @@ class ResultContents:
         """
         if not self.items:
             return {}
-        return flatten_fields(deep_thaw(self.items[0])["fields"] if "fields" in self.items[0] else None)
+        first = self.items[0]
+        return flatten_fields(first["fields"] if "fields" in first else None)
 
     def facet(self, azure_key: str) -> list[Any]:
         """``contents[*][azure_key]`` lists concatenated in content order ([] when absent)."""
         combined: list[Any] = []
         for content in self.items:
-            combined.extend(facet_list(deep_thaw(content), azure_key))
+            combined.extend(facet_list(content, azure_key))
         return combined
 
     def as_list(self) -> list[Mapping[str, Any]]:
-        """The content objects themselves (thawed to plain JSON containers), for the ``contents`` facet."""
-        return [deep_thaw(content) for content in self.items]
+        """The content objects themselves, for the ``contents`` facet."""
+        return list(self.items)
 
 
 @trust_boundary(
@@ -109,4 +107,4 @@ def parse_result_contents(result: Mapping[str, Any]) -> ResultContents:
             if type(start) is not int or type(end) is not int or not 1 <= start <= end <= _MAX_PAGE_NUMBER:
                 raise MalformedResponseError("document contents require integer 1 <= startPageNumber <= endPageNumber")
             page_count += end - start + 1
-    return ResultContents(items=tuple(items), markdown_parts=tuple(markdown_parts), page_count=page_count)
+    return ResultContents(items=items, markdown_parts=markdown_parts, page_count=page_count)

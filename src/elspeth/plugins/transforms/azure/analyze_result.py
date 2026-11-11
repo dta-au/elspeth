@@ -149,8 +149,9 @@ def parse_poll_body(
 ) -> tuple[PollOutcome, Mapping[str, Any] | None]:
     """Map one poll body onto ``(outcome, result)``; ``result`` is set only on success.
 
-    A failed or canceled operation's cause is its bounded ``error.code`` or,
-    when Azure sent none, the lower-cased status itself.
+    A failed or canceled operation's cause is its bounded ``error.code``. When
+    Azure sent none it is ``unknown`` for a plain failure, else the lower-cased
+    status (``canceled``, ``skipped``), which says why there is no result.
     """
     if not isinstance(body, Mapping):
         raise MalformedPollBodyError("unknown_status")
@@ -166,7 +167,8 @@ def parse_poll_body(
     if mapped is AnalyzeStatus.RUNNING:
         return PollOutcome(AnalyzeStatus.RUNNING), None
     cause = failure_cause(body)
-    return PollOutcome(mapped, cause=cause if cause is not None else status.lower()), None
+    fallback = "unknown" if status.lower() == "failed" else status.lower()
+    return PollOutcome(mapped, cause=cause if cause is not None else fallback), None
 
 
 @trust_boundary(
@@ -269,7 +271,7 @@ def _flatten_field_map(fields: object, depth: int) -> dict[str, Any]:
     test_fingerprint="a1cbca03645bbf4eed6ad74fcdbbfef93f1ef87f567a226cba090a5afa282839",
 )
 def _flatten_field(field: object, depth: int) -> Any:
-    if depth > _MAX_FIELD_DEPTH:
+    if depth >= _MAX_FIELD_DEPTH:
         raise MalformedResponseError(f"field values nest deeper than {_MAX_FIELD_DEPTH} levels")
     if not isinstance(field, Mapping):
         raise MalformedResponseError(f"a field must be an object, got {type(field).__name__}")
