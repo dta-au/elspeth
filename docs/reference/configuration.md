@@ -1756,10 +1756,12 @@ Options of each `files` entry:
 The loader also writes `content_source`, the original path, beside each
 materialized `content`. It appears in diagnostics; do not set it.
 
-Entry names must be quoted, non-empty strings with no leading or trailing
-whitespace. In `select` they are the key values and are compared exactly: no
-trimming, no case folding, no coercion. A row value `1` does not match an entry
-named `"1"`. In `all` they are labels.
+Entry names must be non-empty strings with no leading or trailing whitespace.
+A name YAML reads as a string, such as `A`, may be left unquoted. One it reads
+as another type, such as `1` or `true`, is refused unless quoted, so quoting
+every name is the safe habit. In `select` they are the key values and are
+compared exactly: no trimming, no case folding, no coercion. A row value `1`
+does not match an entry named `"1"`. In `all` they are labels.
 
 | `format` | Value written | Rules |
 | -------- | ------------- | ----- |
@@ -1807,8 +1809,12 @@ processed:
   is given together with `content`;
 - an entry with neither `content` nor `content_file`, or with no `format`;
 - content that does not parse under its `format`;
-- `data_key` on a format other than `json`, or `delimiter` on a format other
-  than `csv`;
+- `data_key` on a format other than `json`, or a `delimiter` other than the
+  default `,` on a format other than `csv`;
+- a `delimiter` that is not exactly one character, or is a double quote or a
+  line break;
+- an entry name that is not a string, is empty, or has leading or trailing
+  whitespace;
 - an option that belongs to the other mode: `key_field`, top-level
   `output_field`, `on_miss`, or `default_content` in `all`; an entry-level
   `output_field` in `select`;
@@ -1847,9 +1853,19 @@ inline `content` and in `default_content` before expansion. Text read from a
 `content_file` or a Composer upload is kept literally.
 
 In Composer, `content` must be a file the user uploaded, attached at
-`node:<node_id>.options.files.<entry_name>.content`. Literal text there,
-content the planner created, and `default_content` are all refused, including
-in imported YAML. See
+`node:<node_id>.options.files.<entry_name>.content`. Anything else there is
+refused, including in imported YAML: literal text, a file the planner created,
+a file a pipeline wrote as output, and a session-fork copy of either.
+`default_content` is refused in any form.
+
+An upload can only be attached to an entry whose name starts with a letter or
+`_` and contains only letters, digits, `_` and `-` (`[A-Za-z_][A-Za-z0-9_-]*`),
+so in Composer every entry name must have that form, in both modes. Names such
+as `v1.2`, `Type A` or `2024` are refused. In `mode: select` the entry name is
+the value rows are matched on, so a key column with values of another form
+cannot be matched as it stands: add a step before `file_inject` that maps those
+values to names of that form. Renaming an entry changes which rows match it.
+See
 [Attach uploaded files to rows](../guides/user-manual.md#attach-uploaded-files-to-rows)
 in the user manual. A settings file run from the CLI is not restricted this
 way. The [`file_inject` example](../../examples/file_inject/README.md) has

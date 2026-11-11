@@ -121,10 +121,11 @@ type `D`. No entry is named `D`.
 
 `on_miss` defaults to `fail`. The row becomes a per-row error and leaves
 through the node's `on_error`, which this config points at the `unmatched`
-sink. The run ends PARTIAL and the CLI exits 1:
+sink. The run ends PARTIAL and the CLI exits 1. Its last line, where the total
+time varies from run to run:
 
 ```text
-⚠ Run PARTIAL: 3 rows processed | ✓2 succeeded | ✗1 failed | ⚠0 quarantined | →1 routed (unmatched:1)
+⚠ Run PARTIAL: 3 rows processed | ✓2 succeeded | ✗1 failed | ⚠0 quarantined | →1 routed (unmatched:1) | 0.36s total
 ```
 
 `output/unmatched_type_tickets.jsonl` holds the ticket exactly as it arrived,
@@ -137,10 +138,10 @@ with no `guidance` field at all:
 `output/known_type_tickets.jsonl` holds the other two, T-2001 and T-2003, with
 their guidance. The audit database (`runs/audit_miss.db`) records why the row
 was routed. The reason names the key field and the entry names, never the row's
-value or any file content:
+value or any file content. As stored in `transform_errors.error_details_json`:
 
 ```json
-{"error": "no file_inject entry named for the row's 'type'; entries: ['A', 'B', 'C']", "field": "type", "reason": "file_inject_miss"}
+{"error":"no file_inject entry named for the row's 'type'; entries: ['A', 'B', 'C']","field":"type","reason":"file_inject_miss"}
 ```
 
 The other policies:
@@ -161,10 +162,12 @@ error under every `on_miss`. That is a wiring fault, not a miss.
 file's text lands inside the node's options, and so inside the node identity
 and the run's topology hash.
 
-Edit `guidance_a.md` between a run and its resume and the resume is refused:
+Edit `guidance_a.md` between a run and its resume and the resume is refused.
+The message, cut short here at the ellipsis, goes on to explain why and to give
+the two topology hashes:
 
 ```text
-Cannot resume run <run_id>: Pipeline configuration changed since checkpoint was created.
+Cannot resume run <run_id>: Pipeline configuration changed since checkpoint was created. ...
 ```
 
 Put the file back as it was and the same resume proceeds. Replay and verify do

@@ -46,7 +46,7 @@ from elspeth.web.coordination.composer_progress_authority import (
 )
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.credential_guard import require_no_credential_material_in_state
-from elspeth.web.execution._validation_materialization import file_inject_state_refusals
+from elspeth.web.execution._validation_materialization import FILE_INJECT_ENTRY_RENAME_CONSEQUENCE, file_inject_state_refusals
 from elspeth.web.interpretation_state import (
     InterpretationReviewCapacityError,
     InterpretationReviewIntegrityError,
@@ -1430,7 +1430,7 @@ def _reject_file_inject_content_not_uploaded(state: CompositionState) -> None:
     if refusal.cause == "default_content":
         action = "Remove default_content from the YAML and use on_miss: null or on_miss: fail, then import again."
     elif refusal.cause == "unaddressable_entry":
-        action = "Rename the entry in the YAML to a name of that form and import again."
+        action = f"Rename the entry in the YAML to a name of that form and import again. {FILE_INJECT_ENTRY_RENAME_CONSEQUENCE}"
     else:
         action = (
             f"Remove '{refusal.option_path}' from the YAML and import again, upload the file in this session, then attach it to that entry."

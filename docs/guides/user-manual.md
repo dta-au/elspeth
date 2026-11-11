@@ -799,8 +799,9 @@ same files on every row.
 
 In Composer the content must be a file you uploaded:
 
-1. Save the text as a file. Use `.txt` for plain text, or `.json`, `.jsonl`,
-   or `.csv` when later steps need the parsed data.
+1. Save the text as a file. Use `.txt` for plain text (the chat upload picker
+   does not offer `.md`), or `.json`, `.jsonl`, or `.csv` when later steps need
+   the parsed data.
 2. Upload it with **Upload file** in the chat input. Upload one file per
    entry.
 3. Ask for it to be attached. For example: "Attach `guidance_a.txt` to rows
@@ -816,9 +817,11 @@ What Composer will not do:
 
 - **Write the content for you.** The LLM cannot type text into a `file_inject`
   entry or create the file itself. If you ask for guidance you have not
-  uploaded, it tells you to save the text as a file and upload it, and attaches
-  it once the upload exists. The content reaches your rows, and from there a
-  prompt, without a review step, so it must be text you supplied.
+  uploaded, it is told to ask you to save the text as a file and upload it, and
+  to attach it once the upload exists. The content reaches your rows, and from
+  there a prompt, without a review step, so it must be a file you uploaded.
+  Nothing else is accepted: a file a pipeline wrote as output is refused, and
+  so is a copy, in a forked session, of a file the LLM created.
 - **Use `default_content`.** A fallback value for rows that match no entry is
   not available in Composer. Ask for unmatched rows to fail and go to an error
   output (`on_miss: fail`, the default) or to carry a null (`on_miss: null`).
@@ -828,8 +831,8 @@ What Composer will not do:
   import again, upload the file in the session, then ask for it to be attached.
 
 The same rule is checked again when the pipeline is validated and when a run
-is admitted, so a pipeline that carries literal or LLM-created `file_inject`
-content does not run.
+is admitted, so a pipeline whose `file_inject` content is anything other than
+a file you uploaded does not run.
 
 An attached file can be up to 256 KiB, and all inline attachments in one
 pipeline can total 1 MiB. Files are attached as text. This rule applies only to

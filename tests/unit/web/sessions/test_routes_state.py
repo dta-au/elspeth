@@ -4593,7 +4593,10 @@ transforms:
         assert resp.status_code == 400, resp.text
         detail = resp.json()["detail"]
         assert detail.startswith("Imported YAML: file_inject node 'inject' option 'files.v1.2' is refused: ")
-        assert "Rename the entry in the YAML to a name of that form and import again." in detail
+        assert detail.endswith(
+            "Rename the entry in the YAML to a name of that form and import again. In mode select the entry name is "
+            "the value rows are matched on, so renaming it changes which rows match."
+        )
         assert await service.get_current_state(session.id) is None
 
     @pytest.mark.asyncio

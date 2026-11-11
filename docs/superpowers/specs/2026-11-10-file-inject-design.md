@@ -1,9 +1,8 @@
 # `file_inject` transform — design
 
-**Status:** design approved in conversation 2026-11-10; awaiting review of this
-written spec. No code written.
-**Target release:** 0.8.11 (built on `release/0.8.11-candidate`; confirm before
-any changelog or release-notes entry).
+**Status:** implemented on `claude/happy-cray-mbfmm1` and merged onto the 0.8.12
+code base (`fix/composer-remediation-0.8.12`).
+**Target release:** 0.8.12.
 **Branch:** `claude/happy-cray-mbfmm1`.
 
 ## Goal
