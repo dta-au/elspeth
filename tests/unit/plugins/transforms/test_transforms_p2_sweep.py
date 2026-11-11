@@ -3,7 +3,7 @@
 Each class pins one sweep finding against the plugin's real behaviour.
 """
 
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -97,3 +97,57 @@ class TestFieldMapperDottedSourceCollision:
         assert result.row is not None
         assert result.row["origin"] == "X"
         assert result.row["status"] == "ORIGINAL"
+
+
+def _replicate_contract(mode: Literal["FIXED", "FLEXIBLE", "OBSERVED"], *fields: tuple[str, type]) -> SchemaContract:
+    return SchemaContract(
+        mode=mode,
+        fields=tuple(
+            FieldContract(normalized_name=name, original_name=name, python_type=python_type, required=True, source="inferred")
+            for name, python_type in fields
+        ),
+        locked=True,
+    )
+
+
+class TestBatchReplicateJoinsHeterogeneousContracts:
+    """Sweep finding #122: every emitted copy's contract must describe that copy's own values."""
+
+    def test_each_copy_contract_admits_its_own_values(self) -> None:
+        from elspeth.plugins.transforms.batch_replicate import BatchReplicate
+
+        transform = BatchReplicate({"schema": {"mode": "observed"}, "copies_field": "copies", "include_copy_index": True})
+        rows = [
+            PipelineRow({"x": 1, "y": "a", "copies": 1}, _replicate_contract("FLEXIBLE", ("x", int), ("y", str), ("copies", int))),
+            PipelineRow({"x": "hello", "copies": 1}, _replicate_contract("FLEXIBLE", ("x", str), ("copies", int))),
+        ]
+
+        result = transform.process(rows, make_context())
+
+        assert result.status == "success"
+        assert result.rows is not None
+        contract = result.rows[0].contract
+        # A field the producers type differently is ``object``; one only some carry is optional.
+        assert contract.get_field("x").python_type is object
+        assert contract.get_field("y").required is False
+        assert contract.get_field("copies").python_type is int
+        for emitted in result.rows:
+            assert emitted.contract.validate(emitted.to_dict()) == []
+
+    def test_mixed_contract_modes_join_instead_of_crashing(self) -> None:
+        from elspeth.plugins.transforms.batch_replicate import BatchReplicate
+
+        transform = BatchReplicate({"schema": {"mode": "observed"}, "copies_field": "copies"})
+        rows = [
+            PipelineRow({"x": 1, "copies": 1}, _replicate_contract("FIXED", ("x", int), ("copies", int))),
+            PipelineRow({"x": 2, "copies": 2}, _replicate_contract("OBSERVED", ("x", int), ("copies", int))),
+        ]
+
+        try:
+            result = transform.process(rows, make_context())
+        except ValueError as exc:
+            pytest.fail(f"mixed contract modes must join to the most restrictive mode, not raise: {exc}")
+
+        assert result.status == "success"
+        assert result.rows is not None
+        assert [row["x"] for row in result.rows] == [1, 2, 2]
