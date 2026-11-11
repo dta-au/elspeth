@@ -1720,7 +1720,7 @@ class ComposerServiceImpl:
             raise self._context_budget_refusal(
                 refusal,
                 _context_budget_component_bytes(
-                    # Sized on the request the decision measured: the reply stage's quotes each tool record as text.
+                    # Sized on the form of the request the decision measured (the reply stage's own), before cache markers.
                     message_wire_split(_reply_stage_messages(messages) if reply_stage else messages, tools or None),
                     state_index=state_index,
                     latest_start=latest_start,
