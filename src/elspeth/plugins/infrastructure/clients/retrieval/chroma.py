@@ -158,6 +158,28 @@ def _collection_distance_space(collection_metadata: Any, collection_name: str) -
     return actual_space
 
 
+def _sdk_http_error_status(exc: Exception) -> int | None:
+    """Identify the chromadb HTTP client's bare HTTP-error ``Exception``.
+
+    ``BaseHTTPClient._raise_chroma_error`` raises ``Exception(resp.text)`` for
+    an HTTP error status whose body is not a Chroma error (a gateway or proxy
+    page). It raises it inside ``except httpx.HTTPStatusError``, so the status
+    error survives as ``__context__``. Returns that status, or ``None`` when
+    ``exc`` is not positively that SDK path (the caller then re-raises).
+    """
+    if type(exc) is not Exception:
+        return None
+    context = exc.__context__
+    if not isinstance(context, httpx.HTTPStatusError):
+        return None
+    return context.response.status_code
+
+
+def _http_status_is_transient(status_code: int) -> bool:
+    """Request timeout, rate limiting and server-side errors are worth retrying."""
+    return status_code in (408, 429) or 500 <= status_code <= 599
+
+
 class ChromaSearchProvider:
     """ChromaDB implementation of RetrievalProvider.
 
@@ -307,8 +329,10 @@ class ChromaSearchProvider:
                 work_item=work_item,
             )
             raise RetrievalError(f"Chroma count failed: {exc}", retryable=True) from exc
-        except (ConnectionError, TimeoutError, OSError) as exc:
-            # OS-level failures that bypass the ChromaDB SDK's own error wrapping
+        except (ConnectionError, TimeoutError, OSError, httpx.HTTPError) as exc:
+            # Transport failures that bypass the ChromaDB SDK's own error wrapping.
+            # The HTTP client calls httpx directly, so refused connections and
+            # timeouts arrive as httpx.HTTPError, which is not an OSError.
             self._record_error(
                 state_id,
                 count_start,
@@ -320,6 +344,45 @@ class ChromaSearchProvider:
                 work_item=work_item,
             )
             raise RetrievalError(f"Chroma connection failed during count: {exc}", retryable=True) from exc
+        except ValueError as exc:
+            # The HTTP client decodes every 2xx body with orjson.loads, which
+            # raises JSONDecodeError (a ValueError) on a non-JSON body; the SDK
+            # also raises ValueError for request arguments it rejects. Neither
+            # is repaired by retrying the same call.
+            self._record_error(
+                state_id,
+                count_start,
+                count_request,
+                exc,
+                call_index=call_index,
+                retryable=False,
+                member_token=member_token,
+                work_item=work_item,
+            )
+            raise RetrievalError(f"Chroma count returned an unusable response: {exc}", retryable=False) from exc
+        except Exception as exc:
+            # Only the SDK's bare HTTP-error Exception, positively identified
+            # by its HTTPStatusError context, is classified; anything else is a
+            # code defect and crashes through.
+            status_code = _sdk_http_error_status(exc)
+            if status_code is None:
+                raise
+            retryable = _http_status_is_transient(status_code)
+            self._record_error(
+                state_id,
+                count_start,
+                count_request,
+                exc,
+                call_index=call_index,
+                retryable=retryable,
+                member_token=member_token,
+                work_item=work_item,
+            )
+            raise RetrievalError(
+                f"Chroma count failed with HTTP {status_code} (non-Chroma error body): {exc}",
+                retryable=retryable,
+                status_code=status_code,
+            ) from exc
         if type(collection_count) is not int or collection_count < 0:
             error = RetrievalError(
                 f"Chroma collection count returned malformed evidence: expected a non-negative exact int, "
@@ -424,8 +487,9 @@ class ChromaSearchProvider:
                 work_item=work_item,
             )
             raise RetrievalError(f"Chroma query failed: {exc}", retryable=True) from exc
-        except (ConnectionError, TimeoutError, OSError) as exc:
-            # OS-level failures that bypass the ChromaDB SDK's own error wrapping
+        except (ConnectionError, TimeoutError, OSError, httpx.HTTPError) as exc:
+            # Transport failures that bypass the ChromaDB SDK's own error
+            # wrapping (see the count() handler above).
             self._record_error(
                 state_id,
                 start_time,
@@ -437,6 +501,41 @@ class ChromaSearchProvider:
                 work_item=work_item,
             )
             raise RetrievalError(f"Chroma connection failed: {exc}", retryable=True) from exc
+        except ValueError as exc:
+            # Non-JSON 2xx body or SDK-rejected arguments (see count() above).
+            self._record_error(
+                state_id,
+                start_time,
+                request_payload,
+                exc,
+                call_index=call_index,
+                retryable=False,
+                member_token=member_token,
+                work_item=work_item,
+            )
+            raise RetrievalError(f"Chroma query returned an unusable response: {exc}", retryable=False) from exc
+        except Exception as exc:
+            # The SDK's bare HTTP-error Exception (see count() above); anything
+            # not positively identified crashes through.
+            status_code = _sdk_http_error_status(exc)
+            if status_code is None:
+                raise
+            retryable = _http_status_is_transient(status_code)
+            self._record_error(
+                state_id,
+                start_time,
+                request_payload,
+                exc,
+                call_index=call_index,
+                retryable=retryable,
+                member_token=member_token,
+                work_item=work_item,
+            )
+            raise RetrievalError(
+                f"Chroma query failed with HTTP {status_code} (non-Chroma error body): {exc}",
+                retryable=retryable,
+                status_code=status_code,
+            ) from exc
         elapsed_ms = (time.monotonic() - start_time) * 1000
 
         # Post-query processing: parse response, validate distances, build chunks.
