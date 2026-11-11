@@ -42,10 +42,12 @@ from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.errors import FrameworkBugError, TransformErrorReason
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.json_parser import check_json_depth
 from elspeth.contracts.payload_store import IntegrityError, PayloadNotFoundError
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.contracts.source_read_verification import MAX_JSON_DEPTH
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import NormalizedFieldMappingOption, TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -310,6 +312,22 @@ def _json_error_reason(reason: str, **details: object) -> TransformErrorReason:
     return cast(TransformErrorReason, {"reason": reason, **details})
 
 
+def _check_json_nesting(text: str, *, phase: str, line_number: int | None = None) -> None:
+    """Refuse nesting deeper than the external-JSON bound before decoding.
+
+    Deep text either makes the C decoder raise ``RecursionError`` (an engine
+    crash class) or decodes into a value too deep for the row freeze and the
+    audit hash; both must leave as a value-level ``on_error`` failure.
+    """
+    try:
+        check_json_depth(text, max_depth=MAX_JSON_DEPTH)
+    except ValueError as exc:
+        location = {} if line_number is None else {"line_number": line_number}
+        raise _BlobJSONParseError(
+            _json_error_reason("invalid_json", error_type="nesting_too_deep", phase=phase, **location, error=str(exc))
+        ) from exc
+
+
 def _is_payload_hash(value: str) -> bool:
     return len(value) == 64 and all(char in _SHA256_HEX_CHARS for char in value)
 
@@ -374,7 +392,7 @@ class BlobJSONExpand(BaseTransform):
     name = "blob_json_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:5bc93feb6e7900bd"
+    source_file_hash: str | None = "sha256:86a847226bed8d18"
     config_model = BlobJSONExpandConfig
     usage_when_to_use: str = (
         "Use when a row carries a JSON document — either a payload-store reference from blob_fetch or JSON text in a "
@@ -836,6 +854,7 @@ class BlobJSONExpand(BaseTransform):
             for line_number, line in enumerate(text.splitlines(), start=1):
                 if not line.strip():
                     continue
+                _check_json_nesting(line, phase="jsonl_line", line_number=line_number)
                 try:
                     elements.append(json.loads(line))
                 except json.JSONDecodeError as exc:
@@ -844,6 +863,7 @@ class BlobJSONExpand(BaseTransform):
                     ) from exc
             return tuple(elements)
 
+        _check_json_nesting(text, phase="document")
         try:
             document = json.loads(text)
         except json.JSONDecodeError as exc:
