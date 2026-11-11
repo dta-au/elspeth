@@ -386,28 +386,54 @@ else:
 
 configure_azure_monitor: Callable[..., None] | None = _imported_configure_azure_monitor
 
-# Module-level idempotency guard — Azure Monitor is process-global.
-_azure_monitor_configured: bool = False
+# Module-level idempotency guard — Azure Monitor is process-global. Holds the
+# configuration that was applied, so a later caller asking for a different
+# policy is refused rather than silently given the first caller's policy.
+_active_azure_monitor_config: AzureAITracingConfig | None = None
 
 
 def _reset_azure_monitor_state() -> None:
     """Reset module state for testing only."""
-    global _azure_monitor_configured
-    _azure_monitor_configured = False
+    global _active_azure_monitor_config
+    _active_azure_monitor_config = None
 
 
 def _configure_azure_monitor(config: TracingConfig) -> bool:
     """Configure Azure Monitor (module-level to allow mocking).
 
-    Returns True on success, False on failure.
-    Idempotent: second call logs a warning and returns True.
+    Returns True on success, False when ``config`` is not an azure_ai config.
+    Idempotent for an identical configuration. Raises ``ValueError`` when the
+    process is already configured with a different connection_string,
+    enable_content_recording or enable_live_metrics: Azure Monitor is
+    process-global, so the second policy could not be honoured.
+    Raises ``ImportError`` before any process-global side effect when a
+    required SDK is missing.
     """
-    global _azure_monitor_configured
+    global _active_azure_monitor_config
 
     if not isinstance(config, AzureAITracingConfig):
         return False
 
-    if _azure_monitor_configured:
+    active = _active_azure_monitor_config
+    if active is not None:
+        conflicting = [
+            name
+            for name, active_value, requested_value in (
+                ("connection_string", active.connection_string, config.connection_string),
+                ("enable_content_recording", active.enable_content_recording, config.enable_content_recording),
+                ("enable_live_metrics", active.enable_live_metrics, config.enable_live_metrics),
+            )
+            if active_value != requested_value
+        ]
+        if conflicting:
+            # Values are deliberately not echoed: connection_string carries an
+            # instrumentation key.
+            raise ValueError(
+                "Azure Monitor is process-global and is already configured with a different "
+                f"{', '.join(conflicting)}. A second azure_ai tracing configuration in the same "
+                "process must match the active one; refusing rather than silently applying the "
+                "first configuration's policy."
+            )
         logger.warning(
             "Azure Monitor already configured — skipping duplicate initialization",
         )
@@ -420,11 +446,6 @@ def _configure_azure_monitor(config: TracingConfig) -> bool:
             "Reinstall with: uv pip install 'elspeth[azure]'"
         )
 
-    configure_azure_monitor(
-        connection_string=config.connection_string,
-        enable_live_metrics=config.enable_live_metrics,
-    )
-
     # Wire enable_content_recording to the Azure AI Inference tracing SDK.
     # Without this, the config field is accepted and logged but never applied,
     # leaving operators with a false sense of their content recording policy.
@@ -432,6 +453,9 @@ def _configure_azure_monitor(config: TracingConfig) -> bool:
     # no verifiable downstream control applies it when the instrumentor is
     # missing — an environment-variable fallback asserts a policy nothing is
     # proven to read (same posture as the configure_azure_monitor check above).
+    # The import is checked BEFORE configure_azure_monitor: that call installs a
+    # process-global exporter, which must not be left live when the policy
+    # cannot be applied.
     try:
         from azure.ai.inference.tracing import AIInferenceInstrumentor
     except ImportError as exc:
@@ -442,7 +466,12 @@ def _configure_azure_monitor(config: TracingConfig) -> bool:
             "Install with: uv pip install azure-ai-inference"
         ) from exc
 
+    configure_azure_monitor(
+        connection_string=config.connection_string,
+        enable_live_metrics=config.enable_live_metrics,
+    )
+
     AIInferenceInstrumentor().instrument(enable_content_recording=config.enable_content_recording)
 
-    _azure_monitor_configured = True
+    _active_azure_monitor_config = config
     return True
