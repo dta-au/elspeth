@@ -704,14 +704,11 @@ def _assert_long_run_workflow_contract(workflow: dict[str, Any]) -> None:
     assert job["strategy"]["max-parallel"] == 2
     assert set(job["strategy"]["matrix"]) == {"include"}
     rows = job["strategy"]["matrix"]["include"]
-    assert len(rows) == 6
-    assert {(row["proof-case"], row["python-version"]) for row in rows} == {
-        (case, version) for case in LONG_RUN_CASES for version in ("3.12", "3.13")
-    }
-    images = {
-        "3.12": "python:3.12-bookworm@sha256:dbbe4ceb97851e2e5fa83798b239811f871cb743b259ba3563737349f6bcfaa0",
-        "3.13": "python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea",
-    }
+    # One row per proof case on the single supported interpreter, which is
+    # also the coverage lane.
+    assert len(rows) == 3
+    assert {(row["proof-case"], row["python-version"]) for row in rows} == {(case, "3.14") for case in LONG_RUN_CASES}
+    image = "python:3.14-bookworm@sha256:3fe825da0a80fa8e2cd79baadeb76b03c0ddf3d6cdbc8346778a0208b9d6038c"
     for row in rows:
         assert set(row) == {
             "proof-case",
@@ -722,12 +719,11 @@ def _assert_long_run_workflow_contract(workflow: dict[str, Any]) -> None:
             "job-timeout-minutes",
             "ci-container-image",
         }
-        version = row["python-version"]
         assert row["proof-nodeid"] == "tests/unit/architecture/test_web_landscape_mutation_fencing.py::" + LONG_RUN_CASES[row["proof-case"]]
-        assert row["coverage"] is (version == "3.13")
-        assert row["execution-timeout-seconds"] == (14400 if version == "3.13" else 7200)
-        assert row["job-timeout-minutes"] == (270 if version == "3.13" else 150)
-        assert row["ci-container-image"] == images[version]
+        assert row["coverage"] is True
+        assert row["execution-timeout-seconds"] == 14400
+        assert row["job-timeout-minutes"] == 270
+        assert row["ci-container-image"] == image
     assert job["container"] == {"image": "${{ matrix.ci-container-image }}", "options": "--ulimit nofile=65536:524288"}
     assert job["env"] == {
         "CI_CHECKOUT_PATH": "ci-${{ github.run_id }}-${{ github.run_attempt }}-landscape-proof-${{ matrix.proof-case }}-${{ matrix.python-version }}",
@@ -810,13 +806,13 @@ def test_three_case_workflow_is_called_complete_and_serial() -> None:
     assert not (REPO_ROOT / ".github/workflows/landscape-no-escape.yml").exists()
 
 
-@pytest.mark.parametrize("row_index", range(6))
+@pytest.mark.parametrize("row_index", range(3))
 @pytest.mark.parametrize(
     "field,value",
     [
         ("proof-case", "unknown"),
         ("proof-nodeid", "tests/wrong.py::test_wrong"),
-        ("python-version", "3.14"),
+        ("python-version", "3.13"),
         ("coverage", "true"),
         ("execution-timeout-seconds", 1),
         ("job-timeout-minutes", 1),
