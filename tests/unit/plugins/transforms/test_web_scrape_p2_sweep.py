@@ -8,6 +8,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 import respx
+from pydantic import ValidationError
 
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.audit import Call
@@ -15,7 +16,9 @@ from elspeth.contracts.call_mode import ReplaySSRFRequest
 from elspeth.contracts.enums import RunMode
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.results import TransformResult
-from elspeth.plugins.transforms.web_scrape import WebScrapeTransform
+from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.plugins.transforms.web_scrape import WebScrapeConfig, WebScrapeTransform
+from elspeth.plugins.transforms.web_scrape_pagination import PaginationConfig
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.mock_audit import mock_item_audit_authority
 
@@ -171,3 +174,41 @@ def test_malformed_row_url_is_the_same_row_refusal_in_every_run_mode(context: Pl
     assert outcome.reason["reason"] == "validation_failed"
     assert outcome.reason["error_type"] == "SSRFBlockedError"
     assert outcome.reason["cause"] == "malformed_url"
+
+
+# --- Finding #155: an invalid next_link_selector is a config validation error ---
+
+
+def test_invalid_next_link_selector_is_a_pydantic_validation_error() -> None:
+    raised: Exception | None = None
+    try:
+        PaginationConfig(mode="next_link_css", next_link_selector="a[")
+    except Exception as exc:
+        raised = exc
+
+    assert isinstance(raised, ValidationError), f"expected ValidationError, got {raised!r}"
+    assert "next_link_selector is not a valid CSS selector" in str(raised)
+
+
+def test_invalid_next_link_selector_is_a_plugin_config_error() -> None:
+    raised: Exception | None = None
+    try:
+        WebScrapeConfig.from_dict(
+            {
+                "schema": {"mode": "observed"},
+                "url_field": "url",
+                "content_field": "content",
+                "fingerprint_field": "fingerprint",
+                "pagination": {"mode": "next_link_css", "next_link_selector": "a["},
+                "http": {
+                    "abuse_contact": "test@example.com",
+                    "scraping_reason": "Selector sweep regression",
+                    "allowed_origins": ["https://example.com"],
+                },
+            },
+            plugin_name="web_scrape",
+        )
+    except Exception as exc:
+        raised = exc
+
+    assert isinstance(raised, PluginConfigError), f"expected PluginConfigError, got {raised!r}"
