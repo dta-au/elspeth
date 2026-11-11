@@ -329,7 +329,7 @@ class FieldMapper(BaseTransform):
     determinism = Determinism.DETERMINISTIC
     preserves_input_values = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9f4e287978efe335"
+    source_file_hash: str | None = "sha256:02daa59b58731a0c"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -778,11 +778,16 @@ class FieldMapper(BaseTransform):
         if not self._select_only:
             collisions: set[str] = set()
             for source, target in self._mapping.items():
-                if target not in row_data or source not in row:
+                if target not in row_data:
                     continue
                 if "." in source:
-                    # Dotted reads never consume the flat target field.
+                    # Dotted reads never consume the flat target field. Decided
+                    # before the membership test below: a dotted path is never
+                    # a contract name or payload key, so ``source in row`` is
+                    # False for it and would skip this check entirely.
                     collisions.add(target)
+                    continue
+                if source not in row:
                     continue
                 try:
                     resolved_source = row.contract.resolve_name(source)
