@@ -3716,4 +3716,4 @@ _MIN_USEFUL_ADVISOR_SECONDS: Final[float] = 5.0
 def _remaining_compose_seconds(deadline: float) -> float:
     """Return the compose budget available at the advisor boundary."""
 
-    return deadline - asyncio.get_running_loop().time()
+    return deadline - asyncio.get_event_loop().time()
