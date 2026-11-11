@@ -819,7 +819,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0c38862aa7a0f075"
+    source_file_hash: str | None = "sha256:2506325fd6780ba3"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -1529,7 +1529,10 @@ class WebScrapeTransform(BaseTransform):
             initial_request_url = str(httpx.Request("GET", url, params=request_params or None).url)
             page_contents = [content]
             page_records = list(records) if records is not None else None
-            seen_urls = {initial_request_url, final_hostname_url}
+            # Every discovered next URL is canonicalized with fingerprint_url
+            # before the cycle check, so seen URLs must be held in that same
+            # spelling; httpx and urlencode escape query characters differently.
+            seen_urls = {fingerprint_url(initial_request_url), fingerprint_url(final_hostname_url)}
             total_body_bytes = body_size
             next_source = self._pagination.mode
             pagination_pages.append(
@@ -1660,7 +1663,7 @@ class WebScrapeTransform(BaseTransform):
                         next_source=next_source,
                     )
                 )
-                seen_urls.update((next_url, final_hostname_url))
+                seen_urls.update((next_url, fingerprint_url(final_hostname_url)))
             content = self._aggregate_page_contents(page_contents)
             records = page_records
             final_resolved_ip = _final_response_ip(response)
