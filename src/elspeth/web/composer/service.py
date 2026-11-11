@@ -627,13 +627,18 @@ class _ContextBudgetRefusalScope:
 
 
 def _context_budget_component_bytes(
-    split: ComposerLLMRequestByteSplit, *, state_index: int, latest_start: int | None, sheddable_bytes: int
+    split: ComposerLLMRequestByteSplit, *, state_index: int, latest_start: int | None, latest_stop: int, sheddable_bytes: int
 ) -> dict[str, int]:
     """Name each component of a request sized per message on the wire; ``other`` excludes what could still be shed.
 
-    ``split`` is :func:`message_wire_split`, so an assistant tool-call turn
-    counts with its arguments. ``sheddable_bytes`` is what the decision
-    credited the sheddable segments with.
+    ``split`` is :func:`message_wire_split` of the request the decision
+    measured, so an assistant tool-call turn counts with its arguments and, at
+    the reply stage, a tool record counts as the quoted text it is sent as.
+    ``latest_start`` and ``latest_stop`` bound the latest tool round by the
+    loop's message positions, which the reply-stage request keeps one to one;
+    its closing instruction lies past ``latest_stop`` and counts as
+    ``other``. ``sheddable_bytes`` is what the decision credited the
+    sheddable segments with.
     """
     sizes = split.message_bytes
     if latest_start is not None and latest_start <= state_index + 1:
@@ -644,7 +649,7 @@ def _context_budget_component_bytes(
         "tools": split.tools_bytes if split.tools_bytes is not None else 0,
         "state": sizes[state_index],
         "current_message": sizes[state_index + 1],
-        "latest_tool_round": sum(sizes[latest_start:]) if latest_start is not None else 0,
+        "latest_tool_round": sum(sizes[latest_start:latest_stop]) if latest_start is not None else 0,
     }
     named["other"] = split.total_bytes - sum(named.values()) - sheddable_bytes
     return named
@@ -1601,6 +1606,8 @@ class ComposerServiceImpl:
             refusal_scope=refusal_scope,
             reply_stage=reply_stage,
         )
+        # The latest tool round by the fitted loop messages' positions; the reply-stage form keeps them one to one.
+        latest_start, latest_stop = latest_round_trip_start(selected_messages), len(selected_messages)
         if reply_stage:
             # Quoted inspections were registered from the unshed request above; a stubbed result registers none.
             selected_messages = _reply_stage_messages(selected_messages)
@@ -1627,7 +1634,8 @@ class ComposerServiceImpl:
                 _context_budget_component_bytes(
                     marked_split,
                     state_index=_CONTEXT_BUDGET_HISTORY_START + kept_history,
-                    latest_start=latest_round_trip_start(marked_messages),
+                    latest_start=latest_start,
+                    latest_stop=latest_stop,
                     sheddable_bytes=0,
                 ),
                 refusal_scope,
@@ -1712,9 +1720,11 @@ class ComposerServiceImpl:
             raise self._context_budget_refusal(
                 refusal,
                 _context_budget_component_bytes(
-                    message_wire_split(messages, tools or None),
+                    # Sized on the request the decision measured: the reply stage's quotes each tool record as text.
+                    message_wire_split(_reply_stage_messages(messages) if reply_stage else messages, tools or None),
                     state_index=state_index,
                     latest_start=latest_start,
+                    latest_stop=len(messages),
                     sheddable_bytes=sum(segment.saving_bytes for segment in segments),
                 ),
                 refusal_scope,
