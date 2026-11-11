@@ -89,12 +89,12 @@ def _client(transport: _RecordingTransport) -> DataverseClient:
     return client
 
 
-def _drain(transport: _RecordingTransport) -> tuple[list[DataversePageResponse], DataverseClientError | None]:
+def _drain(transport: _RecordingTransport, fetch_xml: str = FETCH_XML) -> tuple[list[DataversePageResponse], DataverseClientError | None]:
     """Collect every page; capture a client error so the test asserts on it."""
     client = _client(transport)
     pages: list[DataversePageResponse] = []
     try:
-        for page in client.paginate_fetchxml("contacts", FETCH_XML):
+        for page in client.paginate_fetchxml("contacts", fetch_xml):
             pages.append(page)
     except DataverseClientError as exc:
         return pages, exc
@@ -406,3 +406,98 @@ def test_verify_of_freshly_recorded_fetchxml_run_matches(monkeypatch: pytest.Mon
     assert error is None, f"VERIFY refused a freshly recorded FetchXML run: {error}"
     assert len(rows) == 1
     assert session.verified == [0, 1]
+
+
+# ---------------------------------------------------------------------------
+# Follow-up B: page-1 truncation guard. If page 1 is full and carries no
+# paging annotations, the server (or a proxy) may have ignored Prefer; one
+# simple-paging probe for page 2 decides between "done" and "refuse".
+# ---------------------------------------------------------------------------
+
+_TWO_ROWS = [{"contactid": "1"}, {"contactid": "2"}]
+
+
+def test_full_unannotated_page_one_with_nonempty_probe_refuses_to_truncate() -> None:
+    transport = _RecordingTransport([{"value": _TWO_ROWS}, {"value": [{"contactid": "3"}]}])
+    pages, error = _drain(transport)
+
+    assert error is not None, "a full page 1 without paging annotations was accepted as the whole result set"
+    assert error.error_category == "protocol_violation"
+    assert "refusing to truncate" in str(error)
+    assert [len(p.rows) for p in pages] == [2]
+    assert len(transport.requests) == 2
+    probe = transport.requests[1]
+    probe_fetch = _sent_fetch_element(probe)
+    assert probe_fetch.get("page") == "2"
+    assert probe_fetch.get("paging-cookie") is None
+    assert probe.headers.get("prefer") == PREFER_VALUE
+    assert error.request_url == str(probe.url)
+
+
+def test_full_unannotated_page_one_with_empty_probe_ends_cleanly() -> None:
+    transport = _RecordingTransport([{"value": _TWO_ROWS}, {"value": []}])
+    pages, error = _drain(transport)
+
+    assert error is None, f"empty probe should end pagination: {error}"
+    assert len(transport.requests) == 2, "full unannotated page 1 was not probed"
+    assert [len(p.rows) for p in pages] == [2, 0]
+    assert _sent_fetch_element(transport.requests[1]).get("page") == "2"
+
+
+def test_unannotated_page_one_without_count_is_probed() -> None:
+    transport = _RecordingTransport([{"value": [{"contactid": "1"}]}, {"value": []}])
+    pages, error = _drain(transport, '<fetch><entity name="contact" /></fetch>')
+
+    assert error is None, f"empty probe should end pagination: {error}"
+    assert len(transport.requests) == 2, "page 1 with no count was not probed"
+    assert [len(p.rows) for p in pages] == [1, 0]
+
+
+def test_partial_unannotated_page_one_is_not_probed() -> None:
+    transport = _RecordingTransport([{"value": [{"contactid": "1"}]}])
+    pages, error = _drain(transport)
+
+    assert error is None, f"pagination raised: {error}"
+    assert len(transport.requests) == 1
+    assert [len(p.rows) for p in pages] == [1]
+
+
+def test_empty_unannotated_page_one_is_not_probed() -> None:
+    transport = _RecordingTransport([{"value": []}])
+    pages, error = _drain(transport)
+
+    assert error is None, f"pagination raised: {error}"
+    assert len(transport.requests) == 1
+    assert [len(p.rows) for p in pages] == [0]
+
+
+def test_top_query_is_not_probed() -> None:
+    transport = _RecordingTransport([{"value": _TWO_ROWS}])
+    pages, error = _drain(transport, '<fetch top="2"><entity name="contact" /></fetch>')
+
+    assert error is None, f"pagination raised: {error}"
+    assert len(transport.requests) == 1
+    assert [len(p.rows) for p in pages] == [2]
+
+
+def test_annotated_page_one_is_not_probed() -> None:
+    transport = _RecordingTransport([{"value": _TWO_ROWS, MORERECORDS: False}])
+    pages, error = _drain(transport)
+
+    assert error is None, f"pagination raised: {error}"
+    assert len(transport.requests) == 1
+    assert [len(p.rows) for p in pages] == [2]
+
+
+def test_unannotated_final_page_after_annotated_page_is_not_probed() -> None:
+    transport = _RecordingTransport(
+        [
+            {"value": _TWO_ROWS, MORERECORDS: True, PAGINGCOOKIE: _doc_wrapper_cookie()},
+            {"value": [{"contactid": "3"}, {"contactid": "4"}]},
+        ]
+    )
+    pages, error = _drain(transport)
+
+    assert error is None, f"pagination raised: {error}"
+    assert len(transport.requests) == 2
+    assert [len(p.rows) for p in pages] == [2, 2]
