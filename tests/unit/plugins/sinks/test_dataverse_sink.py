@@ -874,7 +874,8 @@ class _RecoverableDataverseClient:
         self.records[key] = dict(body)
         return _make_204_response()
 
-    def get_page(self, url: str) -> DataversePageResponse:
+    def get_page(self, url: str, *, annotations: tuple[str, ...] = ()) -> DataversePageResponse:
+        del annotations
         key = self._key(url)
         if key not in self.records:
             raise DataverseClientError(

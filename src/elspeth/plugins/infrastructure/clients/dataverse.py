@@ -840,11 +840,12 @@ class DataverseClient:
             more_records=more_records,
         )
 
-    def get_page(self, url: str) -> DataversePageResponse:
+    def get_page(self, url: str, *, annotations: tuple[str, ...] = ()) -> DataversePageResponse:
         """Fetch a single page of data from Dataverse.
 
         Args:
             url: Full URL to fetch
+            annotations: Instance annotations to request via the Prefer header
 
         Returns:
             DataversePageResponse with validated page data
@@ -852,7 +853,7 @@ class DataverseClient:
         Raises:
             DataverseClientError: For protocol-level errors
         """
-        return self._execute_request("GET", url)
+        return self._execute_request("GET", url, extra_headers=_include_annotations_headers(annotations))
 
     def upsert(self, url: str, body: dict[str, Any]) -> DataversePageResponse:
         """PATCH upsert a record to Dataverse.
