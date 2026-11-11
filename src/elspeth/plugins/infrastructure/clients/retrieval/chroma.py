@@ -158,6 +158,28 @@ def _collection_distance_space(collection_metadata: Any, collection_name: str) -
     return actual_space
 
 
+def _sdk_http_error_status(exc: Exception) -> int | None:
+    """Identify the chromadb HTTP client's bare HTTP-error ``Exception``.
+
+    ``BaseHTTPClient._raise_chroma_error`` raises ``Exception(resp.text)`` for
+    an HTTP error status whose body is not a Chroma error (a gateway or proxy
+    page). It raises it inside ``except httpx.HTTPStatusError``, so the status
+    error survives as ``__context__``. Returns that status, or ``None`` when
+    ``exc`` is not positively that SDK path (the caller then re-raises).
+    """
+    if type(exc) is not Exception:
+        return None
+    context = exc.__context__
+    if not isinstance(context, httpx.HTTPStatusError):
+        return None
+    return context.response.status_code
+
+
+def _http_status_is_transient(status_code: int) -> bool:
+    """Request timeout, rate limiting and server-side errors are worth retrying."""
+    return status_code in (408, 429) or 500 <= status_code <= 599
+
+
 class ChromaSearchProvider:
     """ChromaDB implementation of RetrievalProvider.
 
@@ -339,23 +361,28 @@ class ChromaSearchProvider:
             )
             raise RetrievalError(f"Chroma count returned an unusable response: {exc}", retryable=False) from exc
         except Exception as exc:
-            if type(exc) is not Exception:
+            # Only the SDK's bare HTTP-error Exception, positively identified
+            # by its HTTPStatusError context, is classified; anything else is a
+            # code defect and crashes through.
+            status_code = _sdk_http_error_status(exc)
+            if status_code is None:
                 raise
-            # BaseHTTPClient._raise_chroma_error raises a bare Exception(resp.text)
-            # for an HTTP error status whose body is not a Chroma error (a
-            # gateway or proxy page). Only that exact type is classified here;
-            # every subclass is a code defect and crashes through above.
+            retryable = _http_status_is_transient(status_code)
             self._record_error(
                 state_id,
                 count_start,
                 count_request,
                 exc,
                 call_index=call_index,
-                retryable=True,
+                retryable=retryable,
                 member_token=member_token,
                 work_item=work_item,
             )
-            raise RetrievalError(f"Chroma count failed with a non-Chroma HTTP error: {exc}", retryable=True) from exc
+            raise RetrievalError(
+                f"Chroma count failed with HTTP {status_code} (non-Chroma error body): {exc}",
+                retryable=retryable,
+                status_code=status_code,
+            ) from exc
         if type(collection_count) is not int or collection_count < 0:
             error = RetrievalError(
                 f"Chroma collection count returned malformed evidence: expected a non-negative exact int, "
@@ -488,21 +515,27 @@ class ChromaSearchProvider:
             )
             raise RetrievalError(f"Chroma query returned an unusable response: {exc}", retryable=False) from exc
         except Exception as exc:
-            if type(exc) is not Exception:
+            # The SDK's bare HTTP-error Exception (see count() above); anything
+            # not positively identified crashes through.
+            status_code = _sdk_http_error_status(exc)
+            if status_code is None:
                 raise
-            # The SDK's bare Exception(resp.text) for a non-Chroma HTTP error
-            # status (see count() above); subclasses crash through.
+            retryable = _http_status_is_transient(status_code)
             self._record_error(
                 state_id,
                 start_time,
                 request_payload,
                 exc,
                 call_index=call_index,
-                retryable=True,
+                retryable=retryable,
                 member_token=member_token,
                 work_item=work_item,
             )
-            raise RetrievalError(f"Chroma query failed with a non-Chroma HTTP error: {exc}", retryable=True) from exc
+            raise RetrievalError(
+                f"Chroma query failed with HTTP {status_code} (non-Chroma error body): {exc}",
+                retryable=retryable,
+                status_code=status_code,
+            ) from exc
         elapsed_ms = (time.monotonic() - start_time) * 1000
 
         # Post-query processing: parse response, validate distances, build chunks.
