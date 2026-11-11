@@ -6,10 +6,10 @@
 # runtime venv onto a fresh, pinned base and runs as a non-root UID with no
 # further installation. There is no shell entrypoint or build tool at runtime.
 #
-# Base image is pinned by digest (not just the ``3.12-alpine`` tag) so a
+# Base image is pinned by digest (not just the ``3.14-alpine`` tag) so a
 # repository push behind that tag can never silently change what this
 # image is built FROM.
-FROM python:3.12-alpine@sha256:e064671ca452259bab50e8e2c7bd896e39e9a343bb06ca25234adf6fe18d0fc7 AS builder
+FROM python:3.14-alpine@sha256:a18b20ad69e74df6cf6d2e1b1a260d7a1ecf5380fd83b310f83ba88c461cf894 AS builder
 
 ARG GATEWAY_REVISION
 RUN test -n "$GATEWAY_REVISION"
@@ -54,7 +54,7 @@ RUN VIRTUAL_ENV=/build-venv PATH="/build-venv/bin:$PATH" uv build \
       --active && \
     uv pip install --python /venv/bin/python --no-deps /dist/elspeth_llm_gateway-*.whl
 
-FROM python:3.12-alpine@sha256:e064671ca452259bab50e8e2c7bd896e39e9a343bb06ca25234adf6fe18d0fc7
+FROM python:3.14-alpine@sha256:a18b20ad69e74df6cf6d2e1b1a260d7a1ecf5380fd83b310f83ba88c461cf894
 
 ARG GATEWAY_REVISION
 LABEL org.opencontainers.image.revision="${GATEWAY_REVISION}" \

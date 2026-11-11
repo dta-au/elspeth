@@ -103,7 +103,7 @@ corresponding boundary crossings.
 
 | Layer | Product baseline at the reviewed commit | Evidence |
 |---|---|---|
-| Language and runtime | Python 3.12+ from source; Python 3.13 in the official distroless container runtime | [EV-627] |
+| Language and runtime | Python 3.14+ from source; CPython 3.14, shipped with the application, on the distroless `cc-debian13` container runtime | [EV-627] |
 | Web | FastAPI served by uvicorn; React and TypeScript frontend built with Vite | [EV-003] |
 | Data access | SQLAlchemy Core | [EV-003] |
 | Databases | SQLite, with optional SQLCipher for the Landscape, for single-host use; PostgreSQL 16 for external-state deployment profiles | [EV-003], [EV-320] |

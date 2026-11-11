@@ -232,7 +232,7 @@ validate its own targets does not qualify.
   `uv` from an immutable image digest, installs the locked build group into a
   separate build venv, builds the wheel without isolation, then installs only
   the frozen runtime graph and that exact wheel into `/venv`.
-- **final** — `FROM` the same digest-pinned `python:3.12-alpine` base,
+- **final** — `FROM` the same digest-pinned `python:3.14-alpine` base,
   copies `/venv` only (no `pip install`, no `ADD`, in this stage), runs as
   the fixed non-root UID/GID `65532:65532`, and starts with an absolute,
   shell-free entrypoint:

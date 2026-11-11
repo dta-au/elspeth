@@ -590,11 +590,15 @@ and their contract tests together when intentionally changing a toolchain.
 The release Dockerfile uses three stages:
 
 1. a pinned Node.js 24 builder runs `npm ci` and creates the React bundle;
-2. a pinned Python 3.13 builder installs locked Python extras, installs ELSPETH
-   non-editably, normalizes generated frontend directories to `0755` and files
-   to `0644`, and prepares the runtime filesystem; and
-3. a pinned `gcr.io/distroless/python3-debian13:debug-nonroot` image receives
-   only that prepared runtime.
+2. a pinned Debian 13 builder installs CPython 3.14 through the pinned uv
+   (a checksummed, self-contained build under `/opt/python`), installs the
+   locked Python extras and ELSPETH non-editably into `/opt/venv`, normalizes
+   generated frontend directories to `0755` and files to `0644`, and prepares
+   the runtime filesystem; and
+3. a pinned `gcr.io/distroless/cc-debian13:debug-nonroot` image receives only
+   that prepared runtime: the interpreter tree and the venv, at the same paths
+   as in the builder. Distroless publishes no Python 3.14 image, so the
+   interpreter travels with the application rather than coming from the base.
 
 The final image runs as UID/GID 1654, contains no package manager or OS build
 toolchain, and does not contain `psql`. The debug-nonroot variant deliberately
@@ -615,9 +619,10 @@ test "$(docker run --rm --entrypoint id "$IMAGE" -g)" = "1654"
 docker run --rm --entrypoint /bin/sh "$IMAGE" -c \
   'test -d /app/data/blobs &&
    test -d /app/data/outputs &&
-   test -r /opt/venv/lib/python3.13/site-packages/elspeth/web/frontend/dist/index.html &&
+   test -r /opt/venv/lib/python3.14/site-packages/elspeth/web/frontend/dist/index.html &&
    test ! -e /usr/bin/apt-get &&
-   test ! -e /usr/bin/psql'
+   test ! -e /usr/bin/psql &&
+   test ! -e /usr/bin/python3'
 ```
 
 ---
