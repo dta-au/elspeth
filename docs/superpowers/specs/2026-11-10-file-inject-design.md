@@ -268,9 +268,15 @@ agent created new. A rewritten upload, and any fork copy of it
 What this closes: a user upload rewritten by `update_blob` can no longer be
 bound to `file_inject`, in the same session or after a fork. What remains open:
 the rewrite is one-way (the original upload bytes are gone and the blob stays
-the assistant's), and the `llm` prompt-surface guard is modality-only, so a
-fork copy of a rewritten upload (assistant/`VERBATIM`) still resets that guard.
-That guard is deliberately unchanged here.
+the assistant's).
+
+The `llm` prompt-surface guard is modality-only, and the fork writer used to
+reset a copy's modality, so a fork copy of model-written content passed it.
+That was closed in the fork writer, not the guard (dta-au/elspeth#365):
+`copy_blobs_for_fork` now carries the source's modality and `creating_*`
+fields, and anchors `created_from_message_id` of an LLM-authored copy to the
+child session's own `session_fork` plan row, which satisfies the foreign key
+and names the source blob. Copies made before that change keep `VERBATIM`.
 
 Literal content is refused as well (decided 2026-11-10, after the transform was
 built). The blob guard alone leaves a second route open: a composer authoring

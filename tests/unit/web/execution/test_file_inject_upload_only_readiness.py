@@ -123,8 +123,8 @@ def _record(modality: CreationModality, *, created_by: BlobCreator = "user", sou
 
 
 # VERBATIM records that are not user uploads: (created_by, source_description).
-# ``copy_blobs_for_fork`` keeps the source's creator and relabels the copy
-# VERBATIM, so a fork copy of a planner-created blob is an assistant row.
+# ``copy_blobs_for_fork`` keeps the source's creator and modality, so a fork
+# copy of a blob the planner created from the user's words is an assistant row.
 _NOT_UPLOADED_VERBATIM_RECORDS = {
     "composer_create_blob_verbatim": ("assistant", None),
     "fork_copy_of_composer_blob": ("assistant", "copied from session fork (original: 0b0f6f0e-0000-4000-8000-000000000001)"),
