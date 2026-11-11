@@ -658,7 +658,7 @@ class FileInject(BaseTransform):
     name = "file_inject"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:d3b715a959dab1a3"
+    source_file_hash: str | None = "sha256:3cf2db3f01fd35fd"
     config_model = FileInjectConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -679,10 +679,10 @@ class FileInject(BaseTransform):
     output_field: review_guidance
     files:
       "invoice":
-        content: "Check the totals against the line items.\\n"
+        content_file: invoice_guidance.md
         format: text
       "contract":
-        content: "Check the parties, dates and signatures.\\n"
+        content_file: contract_guidance.md
         format: text
     on_miss: fail
     schema:

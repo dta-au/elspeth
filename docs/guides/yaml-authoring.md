@@ -323,7 +323,9 @@ entry its own `output_field`. Every row then receives every file:
 
 What to know before you run it:
 
-- **Formats.** `text` writes the file as one string, unmodified. `json` writes
+- **Formats.** `text` writes the file as one string, with nothing trimmed. A
+  `content_file` is read in text mode, so Windows (`\r\n`) line endings arrive
+  as `\n`; a file uploaded in Composer keeps its line endings. `json` writes
   the parsed value, or one member of a top-level object with `data_key`.
   `jsonl` writes a list with one parsed value per non-blank line. `csv` needs a
   header row and writes a list of objects keyed by it; cells stay strings.

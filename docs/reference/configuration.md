@@ -1765,13 +1765,34 @@ does not match an entry named `"1"`. In `all` they are labels.
 
 | `format` | Value written | Rules |
 | -------- | ------------- | ----- |
-| `text` | The whole content as one string, unmodified. Nothing is trimmed; a leading byte-order mark is kept. | None. |
-| `json` | The parsed value: an object, an array, or a scalar. With `data_key`, that member. | `NaN`, `Infinity`, and numbers that overflow are refused, as are duplicate object members and empty content. `data_key` needs a top-level object that has the member. |
+| `text` | The whole content as one string. Nothing is trimmed; a leading byte-order mark is kept. Line endings depend on how the file was bound, as described below. | None. |
+| `json` | The parsed value: an object, an array, or a scalar. With `data_key`, that member. | `NaN`, `Infinity`, and numbers that overflow are refused, as are integers outside the JSON safe range (see below), duplicate object members, and empty content. `data_key` needs a top-level object that has the member. |
 | `jsonl` | A list with one parsed value per non-blank line. | The `json` rules apply to each line. |
 | `csv` | A list with one object per data row, keyed by the header. Cells stay strings. | A header row is required; there is no headerless form. Empty or duplicate header names are refused, and so is a data row with more or fewer cells than the header. |
 
 For `json`, `jsonl`, and `csv` a leading byte-order mark is removed before
 parsing. There is no `encoding` option: `content_file` is read as UTF-8.
+
+Line endings in a `text` value differ between the two ways of binding a file:
+
+- A `content_file` in a CLI settings file is read in text mode, so every
+  Windows (`\r\n`) or old Mac (`\r`) line ending becomes `\n`.
+- A file uploaded in Composer is written exactly as uploaded, so `\r\n`
+  stays `\r\n`.
+
+The same file can therefore produce a different `text` value, and a different
+row hash, on the CLI and in Composer. Save the file with `\n` line endings if
+that matters. The structured formats are not affected: `json`, `jsonl`, and
+`csv` read every line ending alike.
+
+An empty file behaves differently per format:
+
+| `format` | Empty content |
+| -------- | ------------- |
+| `text` | Writes the empty string `""`. |
+| `jsonl` | Writes the empty list `[]`. A file of only blank lines does the same. |
+| `json` | Refused: the format needs one JSON value. |
+| `csv` | Refused: a header row is required. A header with no data rows writes `[]`. |
 
 Each written field is declared in the node's output schema and guaranteed on
 every row the node emits, so a downstream node may name it in
@@ -1805,10 +1826,15 @@ looks like any other row at a sink.
 These are refused when the configuration is validated, before any row is
 processed:
 
-- a `content_file` that is missing, resolves outside the settings directory, or
-  is given together with `content`;
+- a `content_file` that is missing, is a directory, is not UTF-8 text, resolves
+  outside the settings directory, or is given together with `content`;
 - an entry with neither `content` nor `content_file`, or with no `format`;
 - content that does not parse under its `format`;
+- a value a row cannot carry, in any format and in `default_content`: an
+  integer outside the JSON safe range of ±(2^53 − 1), which is
+  ±9,007,199,254,740,991, or text holding a character that cannot be encoded
+  as UTF-8 (a lone surrogate, which a JSON `\ud800` escape can produce). Write
+  a large identifier as a string, in quotes;
 - `data_key` on a format other than `json`, or a `delimiter` other than the
   default `,` on a format other than `csv`;
 - a `delimiter` that is not exactly one character, or is a double quote or a

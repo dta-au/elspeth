@@ -49,6 +49,7 @@ from elspeth.plugins.infrastructure.base import BaseSink, BaseSource, BaseTransf
 from elspeth.plugins.infrastructure.discovery import discover_all_plugins
 from elspeth.plugins.infrastructure.runtime_factory import PluginBundle, instantiate_plugins_from_config
 from elspeth.plugins.sinks.database_sink import database_effect_ledger_table
+from tests.fixtures.catalog_reference import materialize_example_file_options
 from tests.fixtures.pdf_documents import minimal_pdf
 from tests.fixtures.power_automate import READ_URL, WRITE_URL, DurablePowerAutomateFlow, pipeline_settings
 
@@ -218,6 +219,10 @@ def _materialize_pipeline(
         section = cast("dict[str, dict[str, Any]]", flow_settings["sources" if kind == "source" else "sinks"])
         options = dict(section["records" if kind == "source" else "publish"]["options"])
         options["auth"] = {"method": "sas_url", "trigger_url_secret": READ_URL if kind == "source" else WRITE_URL}
+
+    # An example that binds files names them beside a settings file; the
+    # in-memory loader used below has none, so they are bound here first.
+    options = materialize_example_file_options(plugin_name, options, tmp_path / "bound_files")
 
     if case.plugin_key == "source:csv":
         source_path = tmp_path / "input.csv"

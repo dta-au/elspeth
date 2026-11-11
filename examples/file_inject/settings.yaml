@@ -7,7 +7,7 @@
 #
 # The three entries show the three value shapes:
 #
-#   A  text  -> the file as one string, unmodified
+#   A  text  -> the file as one string, nothing trimmed
 #   B  json  -> the parsed value (here one member of it, via data_key)
 #   C  csv   -> a list of objects keyed by the header; cells stay strings
 #
