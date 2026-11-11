@@ -773,10 +773,15 @@ jobs:
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: uv sync --frozen --all-extras
 
-      - name: Download Python 3.12 ordinary evidence
+      # One step for the ordinary and timing shards, on purpose. The action puts
+      # each artifact in a folder named after it only when the pattern matches
+      # more than one; a lone match is unpacked straight into `path`, which the
+      # validator refuses. The timing shard is a single artifact, so it shares
+      # the ordinary shards' pattern. The validator refuses any unknown folder.
+      - name: Download Python 3.12 ordinary and timing evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          pattern: ordinary-shard-3.12-*-attempt-*
+          pattern: "*-shard-3.12-*"
           path: ${{ env.CI_CHECKOUT_PATH }}/proof-evidence/3.12
 
       - name: Download Python 3.12 proof evidence
@@ -785,28 +790,16 @@ jobs:
           pattern: landscape-proof-*-3.12-attempt-*
           path: ${{ env.CI_CHECKOUT_PATH }}/proof-evidence/3.12
 
-      - name: Download Python 3.12 timing evidence
+      - name: Download Python 3.13 ordinary and timing evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          pattern: timing-shard-3.12-attempt-*
-          path: ${{ env.CI_CHECKOUT_PATH }}/proof-evidence/3.12
-
-      - name: Download Python 3.13 ordinary evidence
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          pattern: ordinary-shard-3.13-*-attempt-*
+          pattern: "*-shard-3.13-*"
           path: ${{ env.CI_CHECKOUT_PATH }}/proof-evidence/3.13
 
       - name: Download Python 3.13 proof evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           pattern: landscape-proof-*-3.13-attempt-*
-          path: ${{ env.CI_CHECKOUT_PATH }}/proof-evidence/3.13
-
-      - name: Download Python 3.13 timing evidence
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          pattern: timing-shard-3.13-attempt-*
           path: ${{ env.CI_CHECKOUT_PATH }}/proof-evidence/3.13
 
       - name: Validate Python 3.12 ordinary and proof selection

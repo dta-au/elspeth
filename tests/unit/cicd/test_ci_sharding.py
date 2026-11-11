@@ -1946,9 +1946,11 @@ def _assert_activation_contract(jobs: dict[str, Any]) -> None:
     assert "continue-on-error" not in gate and "||" not in gate["run"]
     for version in ("3.12", "3.13"):
         for partition, pattern in (
-            ("ordinary", f"ordinary-shard-{version}-*-attempt-*"),
+            # The timing shard is one artifact. The action unpacks a lone match
+            # straight into `path` with no folder of its own, which the validator
+            # refuses, so the timing shard shares the ordinary shards' pattern.
+            ("ordinary and timing", f"*-shard-{version}-*"),
             ("proof", f"landscape-proof-*-{version}-attempt-*"),
-            ("timing", f"timing-shard-{version}-attempt-*"),
         ):
             download = _activation_step(aggregate, f"Download Python {version} {partition} evidence")
             assert download["uses"] == "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
@@ -2037,7 +2039,8 @@ def test_activation_contract_refuses_disconnected_timing_paths(mutation: str) ->
         step = _activation_step(jobs["coverage"], "Require every test shard and exhaustive proof to pass")
         step["run"] = step["run"].replace("needs.timing-sensitive.result", "needs.test.result")
     elif mutation == "download":
-        jobs["coverage"]["steps"].remove(_activation_step(jobs["coverage"], "Download Python 3.12 timing evidence"))
+        step = _activation_step(jobs["coverage"], "Download Python 3.12 ordinary and timing evidence")
+        step["with"]["pattern"] = "ordinary-shard-3.12-*-attempt-*"
     elif mutation == "success_dependency":
         jobs["ci-success"]["needs"].remove("timing-sensitive")
     elif mutation == "success_result":
