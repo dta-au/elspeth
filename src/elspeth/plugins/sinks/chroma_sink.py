@@ -216,7 +216,7 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
     name = "chroma_sink"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:53866f704b91068f"
+    source_file_hash: str | None = "sha256:e37f21d0c0038e1c"
     config_model = ChromaSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
@@ -379,6 +379,11 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
             raise ValueError(f"Chroma effect member is missing required field {exc.args[0]!r}") from exc
         if type(raw_id) is not str or type(raw_document) is not str:
             raise ValueError("Chroma effect member id and document fields must be strings")
+        if not raw_id:
+            # Chroma rejects an empty ID at upsert with InvalidArgumentError (a
+            # ChromaError), which would escape commit on every attempt; divert
+            # the member here instead.
+            raise ValueError("Chroma effect member id must not be empty")
         metadata: dict[str, object] = {}
         for field_name in fm.metadata_fields:
             if field_name not in row:
