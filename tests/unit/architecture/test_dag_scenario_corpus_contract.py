@@ -1003,7 +1003,11 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # plugin_version values advance (seven manifest lines), engine:0.8.13 ->
 # engine:0.8.14. Captured from this file's parity failure (previous pin
 # 3338f07b...); reverting the eight values reproduces that pin.
-EXPECTED_CASE_REGISTRY_SHA256 = "d287953784cfb9bcd56f17f0be4b68c59df0a1e4c1b411cf1a3d0786409e091e"
+# Sweep finding #40 (20261111-plugins-review): JSONSource's structural
+# quarantines now record the row they yield; its manifest provenance token
+# moved 0c356038d5722d0c -> 204c8485e712dc75, the manifest's only changed byte
+# run. Captured from this file's parity failure (previous pin d2879537...).
+EXPECTED_CASE_REGISTRY_SHA256 = "0ce52bbbfc7982e24a3c9fbb9cb194081583d05995702e4d981af78140828865"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
