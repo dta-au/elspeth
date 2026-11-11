@@ -472,13 +472,20 @@ def test_canonical_pa_json_positive_control(media_type):
 
 
 @respx.mock
-def test_generic_unsafe_integer_parsing_is_unchanged():
+def test_generic_unsafe_integer_is_recorded_as_parse_failure():
+    # An integer outside ±(2**53-1) cannot be canonicalized, so the real
+    # recorder's stable_hash would refuse it and no Call row would be written
+    # (sweep finding #21, 20261111-plugins-review). GENERIC now records the
+    # _json_parse_failed sentinel instead of the inadmissible parsed body.
     instance, execution, _ = client(HTTPAuditPolicy.GENERIC)
     respx.get(request().connection_url).mock(
         return_value=httpx.Response(200, content=b'{"rows":[9007199254740992]}', headers={"content-type": "application/json"})
     )
     instance.request_ssrf_safe("GET", request())
-    assert captured(execution)["body"] == {"rows": [9007199254740992]}
+    body = captured(execution)["body"]
+    assert body["_json_parse_failed"] is True
+    assert body["_raw_text"] == '{"rows":[9007199254740992]}'
+    canonical_json(captured(execution))
 
 
 @pytest.mark.parametrize("media_type", ["application/json-extra", "other/application/json"])
