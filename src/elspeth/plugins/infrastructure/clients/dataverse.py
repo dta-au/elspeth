@@ -138,6 +138,26 @@ class DataversePageResponse:
         freeze_fields(self, "rows", "headers", "request_headers")
 
 
+def _fetchxml_page_one_may_be_truncated(root: ET.Element, row_count: int) -> bool:
+    """Whether an unannotated FetchXML page 1 could be a truncated result set.
+
+    ``top`` is documented as incompatible with paging, so a ``top`` query is a
+    complete result. An empty page or one shorter than ``count`` is the end.
+    A page that fills ``count``, or any non-empty page when ``count`` is unset
+    (the server default page size applies), may have more rows behind it.
+    """
+    if "top" in root.attrib or row_count == 0:
+        return False
+    count = root.get("count")
+    if count is None:
+        return True
+    try:
+        return row_count >= int(count)
+    except ValueError:
+        # Unreadable count: the page size is unknown, so assume it may be full.
+        return True
+
+
 def _extract_fetchxml_paging_cookie(page: DataversePageResponse, annotation: str) -> str:
     """Parse the Tier 3 fetchxmlpagingcookie annotation into the cookie to send back.
 
@@ -909,12 +929,13 @@ class DataverseClient:
 
         current_page = 1
 
-        while True:
-            xml_str = ET.tostring(root, encoding="unicode")
-            encoded_xml = urllib.parse.quote(xml_str)
+        def fetch_current() -> DataversePageResponse:
+            encoded_xml = urllib.parse.quote(ET.tostring(root, encoding="unicode"))
             url = f"{self._environment_url}/api/data/{self._api_version}/{entity_set_name}?fetchXml={encoded_xml}"
+            return self._execute_request("GET", url, extra_headers=_FETCHXML_PREFER_HEADER)
 
-            page = self._execute_request("GET", url, extra_headers=_FETCHXML_PREFER_HEADER)
+        while True:
+            page = fetch_current()
             yield page
 
             # Check if more records exist. Per the Dataverse Web API contract
@@ -934,6 +955,29 @@ class DataverseClient:
                         request_url=page.request_url,
                         request_headers=page.request_headers,
                     )
+                # Page-1 truncation guard. A server or proxy that ignored the
+                # Prefer header returns a full first page with no annotations,
+                # which is indistinguishable from a complete result set. Once
+                # any page carries annotations, Prefer is known to be honoured,
+                # so only page 1 is exposed. Probe page 2 once with simple
+                # paging (page number, no cookie): rows there mean the
+                # annotations were withheld; no rows means the end of results.
+                if current_page == 1 and _fetchxml_page_one_may_be_truncated(root, len(page.rows)):
+                    root.set("page", "2")
+                    probe = fetch_current()
+                    if probe.rows:
+                        raise DataverseClientError(
+                            "FetchXML pagination: paging annotations not honoured; refusing to truncate. "
+                            "Page 1 was full with no '@Microsoft.Dynamics.CRM.morerecords' annotation, "
+                            "but a simple-paging probe for page 2 returned rows.",
+                            retryable=False,
+                            error_category="protocol_violation",
+                            status_code=probe.status_code,
+                            latency_ms=probe.latency_ms,
+                            request_url=probe.request_url,
+                            request_headers=probe.request_headers,
+                        )
+                    yield probe
                 break
             if not page.more_records:
                 break

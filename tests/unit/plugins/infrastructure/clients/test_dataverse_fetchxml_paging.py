@@ -135,12 +135,16 @@ def test_fetchxml_request_asks_for_paging_annotations() -> None:
 
 
 def test_single_page_without_annotations_is_end_of_results() -> None:
-    """A documented final page (no annotations) ends pagination cleanly."""
-    transport = _RecordingTransport([{"value": [{"contactid": "1"}, {"contactid": "2"}]}])
+    """A documented final page (no annotations) ends pagination cleanly.
+
+    The page is shorter than ``count``, so the page-1 truncation guard does
+    not probe.
+    """
+    transport = _RecordingTransport([{"value": [{"contactid": "1"}]}])
     pages, error = _drain(transport)
 
     assert error is None, f"final page without annotations raised: {error}"
-    assert [len(p.rows) for p in pages] == [2]
+    assert [len(p.rows) for p in pages] == [1]
     assert len(transport.requests) == 1
 
 
@@ -338,7 +342,9 @@ class _ArchiveReplaySession:
 
 
 def _source_bodies() -> list[dict[str, Any]]:
-    return [_METADATA_BODY, {"value": [{"contactid": "1", "fullname": "Ada"}]}]
+    # The source FetchXML sets no count, so the unannotated page 1 is followed
+    # by the page-1 truncation probe, which comes back empty.
+    return [_METADATA_BODY, {"value": [{"contactid": "1", "fullname": "Ada"}]}, {"value": []}]
 
 
 def test_recorded_fetchxml_page_includes_prefer_header() -> None:
@@ -354,10 +360,10 @@ def test_recorded_fetchxml_page_includes_prefer_header() -> None:
         source._client.close()
 
     assert len(rows) == 1
-    page_request = ctx.recorded[-1]["request_data"]
+    page_request = ctx.recorded[1]["request_data"]
     assert "fetchXml=" in page_request["url"]
     assert page_request["headers"].get("Prefer") == PREFER_VALUE, "audit record omits the Prefer header that was sent"
-    assert transport.requests[-1].headers.get("prefer") == PREFER_VALUE
+    assert transport.requests[1].headers.get("prefer") == PREFER_VALUE
 
 
 def test_verify_of_freshly_recorded_fetchxml_run_matches(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -378,8 +384,8 @@ def test_verify_of_freshly_recorded_fetchxml_run_matches(monkeypatch: pytest.Mon
     finally:
         recorder._client.close()
     archived = [call["request_data"] for call in record_ctx.recorded]
-    assert len(archived) == 2
-    assert archived[-1]["headers"].get("Prefer") == PREFER_VALUE, "audit record omits the Prefer header that was sent"
+    assert len(archived) == 3
+    assert archived[1]["headers"].get("Prefer") == PREFER_VALUE, "audit record omits the Prefer header that was sent"
 
     verify_transport = _RecordingTransport(_source_bodies())
     real_httpx_client = httpx.Client
@@ -405,7 +411,7 @@ def test_verify_of_freshly_recorded_fetchxml_run_matches(monkeypatch: pytest.Mon
 
     assert error is None, f"VERIFY refused a freshly recorded FetchXML run: {error}"
     assert len(rows) == 1
-    assert session.verified == [0, 1]
+    assert session.verified == [0, 1, 2]
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +437,10 @@ def test_full_unannotated_page_one_with_nonempty_probe_refuses_to_truncate() -> 
     assert probe_fetch.get("page") == "2"
     assert probe_fetch.get("paging-cookie") is None
     assert probe.headers.get("prefer") == PREFER_VALUE
-    assert error.request_url == str(probe.url)
+    assert error.request_url is not None
+    assert error.request_url != pages[0].request_url
+    error_query = urllib.parse.parse_qs(urllib.parse.urlparse(error.request_url).query)
+    assert ET.fromstring(error_query["fetchXml"][0]).get("page") == "2"
 
 
 def test_full_unannotated_page_one_with_empty_probe_ends_cleanly() -> None:
