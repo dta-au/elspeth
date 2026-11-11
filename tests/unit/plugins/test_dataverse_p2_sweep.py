@@ -359,3 +359,143 @@ def test_sink_guidance_matches_what_a_row_level_4xx_does(status_code: int) -> No
     status_hints = [hint for hint in hints if str(status_code) in hint]
     assert status_hints, f"no guidance covers HTTP {status_code}"
     assert all("raise" in hint for hint in status_hints)
+
+
+# ---------------------------------------------------------------------------
+# Finding #84: reconcile reports 'divergent' for every member with a lookup
+# ---------------------------------------------------------------------------
+
+_ACCOUNT_GUID = "8A5F1C2E-3B4D-4E6F-9A0B-1C2D3E4F5A6B"
+_REGION_GUID = "11111111-2222-3333-4444-555555555555"
+# Navigation property -> lookup attribute logical name, as Dataverse defines
+# them: the polymorphic customer lookup's navigation property names the target
+# table, and a custom lookup's navigation property keeps its schema-name case.
+_NAVIGATION_TO_ATTRIBUTE = {"parentcustomerid_account": "parentcustomerid", "new_RegionId": "new_regionid"}
+_NAVIGATION_PROPERTY = "Microsoft.Dynamics.CRM.associatednavigationproperty"
+_LOOKUP_LOGICAL_NAME = "Microsoft.Dynamics.CRM.lookuplogicalname"
+
+
+class _StoringDataverse(httpx.BaseTransport):
+    """Stores PATCH bodies and answers GET the way Dataverse retrieves a record.
+
+    A GET never echoes ``<nav>@odata.bind``: the lookup comes back as
+    ``_<attribute>_value`` holding the lower-case GUID, with its navigation
+    property and target table as annotations only when the request asks for
+    them.
+    """
+
+    def __init__(self) -> None:
+        self.records: dict[str, dict[str, Any]] = {}
+        self.requests: list[httpx.Request] = []
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        key = request.url.path
+        if request.method == "PATCH":
+            self.records[key] = dict(httpx.Response(200, content=request.content).json())
+            return httpx.Response(204)
+        if key not in self.records:
+            return httpx.Response(404, json={"error": {"code": "0x80040217", "message": "Not found"}})
+        record: dict[str, Any] = {"@odata.context": "ctx", "@odata.etag": 'W/"7"', "contactid": "c0ffee00-0000-0000-0000-000000000001"}
+        for field, value in self.records[key].items():
+            navigation, bind, _ = field.partition("@odata.bind")
+            if not bind:
+                record[field] = value
+                continue
+            attribute = _NAVIGATION_TO_ATTRIBUTE[navigation]
+            entity, _, guid = value.strip("/").rstrip(")").partition("(")
+            value_key = f"_{attribute}_value"
+            record[value_key] = guid.lower()
+            if _annotation_requested(request, _NAVIGATION_PROPERTY):
+                record[f"{value_key}@{_NAVIGATION_PROPERTY}"] = navigation
+            if _annotation_requested(request, _LOOKUP_LOGICAL_NAME):
+                record[f"{value_key}@{_LOOKUP_LOGICAL_NAME}"] = entity.rstrip("s")
+        return httpx.Response(200, json=record)
+
+
+def _lookup_sink(transport: httpx.BaseTransport) -> Any:
+    from elspeth.plugins.sinks.dataverse import DataverseSink
+    from tests.fixtures.base_classes import inject_write_failure
+    from tests.unit.plugins.sinks.test_dataverse_sink import _config
+
+    sink = inject_write_failure(
+        DataverseSink(
+            _config(
+                field_mapping={"email": "emailaddress1", "name": "fullname", "account": "parentcustomerid", "region": "new_regionid"},
+                lookups={
+                    "account": {"target_entity": "accounts", "target_field": "parentcustomerid_account"},
+                    "region": {"target_entity": "new_regions", "target_field": "new_RegionId"},
+                },
+            )
+        )
+    )
+    sink._client = _client(transport)
+    return sink
+
+
+def _reconcile_after_commit(rows: tuple[dict[str, object], ...], *, tamper: Callable[[_StoringDataverse], None] | None = None) -> Any:
+    transport = _StoringDataverse()
+    sink = _lookup_sink(transport)
+    plan, effect_input, ctx = _effect_fixture(sink, rows)
+    member = effect_input.members[0]
+    sink.commit_member_effect(plan, member, effect_input, ctx)
+    if tamper is not None:
+        tamper(transport)
+    # Response-lost recovery: a fresh sink reconciles the same plan.
+    recovered = _lookup_sink(transport)
+    return recovered.reconcile_member_effect(plan, member, effect_input, ctx), transport
+
+
+def _classification(result: Any) -> str:
+    from elspeth.contracts.freeze import deep_thaw
+
+    return cast(str, deep_thaw(result.evidence)["classification"])
+
+
+def test_reconcile_recognises_an_exact_write_with_lookups() -> None:
+    from elspeth.contracts.sink_effects import SinkEffectReconcileKind
+
+    result, transport = _reconcile_after_commit(
+        ({"email": "a@example.com", "name": "Alice", "account": _ACCOUNT_GUID, "region": _REGION_GUID},)
+    )
+
+    assert (result.kind, _classification(result)) == (SinkEffectReconcileKind.APPLIED_WITH_EXACT_DESCRIPTOR, "exact")
+    assert transport.requests[-1].method == "GET"
+
+
+def test_reconcile_with_a_null_lookup_is_exact() -> None:
+    from elspeth.contracts.sink_effects import SinkEffectReconcileKind
+
+    result, _transport = _reconcile_after_commit(({"email": "a@example.com", "name": "Alice", "account": _ACCOUNT_GUID, "region": None},))
+
+    assert result.kind is SinkEffectReconcileKind.APPLIED_WITH_EXACT_DESCRIPTOR
+
+
+def test_reconcile_still_reports_a_lookup_bound_to_another_record_as_divergent() -> None:
+    from elspeth.contracts.sink_effects import SinkEffectReconcileKind
+
+    def rebind(transport: _StoringDataverse) -> None:
+        (record,) = transport.records.values()
+        record["parentcustomerid_account@odata.bind"] = "/accounts(99999999-9999-9999-9999-999999999999)"
+
+    result, _transport = _reconcile_after_commit(
+        ({"email": "a@example.com", "name": "Alice", "account": _ACCOUNT_GUID, "region": _REGION_GUID},),
+        tamper=rebind,
+    )
+
+    assert (result.kind, _classification(result)) == (SinkEffectReconcileKind.UNKNOWN, "divergent")
+
+
+def test_reconcile_still_reports_a_missing_lookup_as_divergent() -> None:
+    from elspeth.contracts.sink_effects import SinkEffectReconcileKind
+
+    def unbind(transport: _StoringDataverse) -> None:
+        (record,) = transport.records.values()
+        del record["new_RegionId@odata.bind"]
+
+    result, _transport = _reconcile_after_commit(
+        ({"email": "a@example.com", "name": "Alice", "account": _ACCOUNT_GUID, "region": _REGION_GUID},),
+        tamper=unbind,
+    )
+
+    assert (result.kind, _classification(result)) == (SinkEffectReconcileKind.UNKNOWN, "divergent")
