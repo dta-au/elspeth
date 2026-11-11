@@ -13,6 +13,7 @@ string is the constant stub.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Final
 
@@ -135,7 +136,7 @@ def tool_result_segments(
     carries it, and the returned positions list each of them.
     """
     positions: dict[str, list[int]] = {}
-    savings: dict[str, int] = {}
+    savings: Counter[str] = Counter()
     for index in range(start, stop):
         message = messages[index]
         if message["role"] != "tool":
@@ -145,7 +146,7 @@ def tool_result_segments(
             continue
         key = f"tool:{message['tool_call_id']}"
         positions.setdefault(key, []).append(index)
-        savings[key] = savings.get(key, 0) + saving
+        savings[key] += saving
     segments = [SheddableSegment(kind=SheddableKind.TOOL_RESULT, key=key, saving_bytes=saving) for key, saving in savings.items()]
     return segments, positions
 
