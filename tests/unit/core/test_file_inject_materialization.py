@@ -34,6 +34,17 @@ def test_content_file_becomes_content_and_source(tmp_path: Path) -> None:
     assert _options(raw) == {"files": {"A": {"content_file": "a.md", "format": "text"}}}
 
 
+def test_content_file_line_endings_become_newlines(tmp_path: Path) -> None:
+    """The loader reads in text mode: documented, because a web upload keeps its line endings."""
+    (tmp_path / "a.md").write_bytes(b"\xef\xbb\xbfone\r\ntwo\rthree\n")
+
+    result = TemplateOptionMaterializer(tmp_path / "settings.yaml").materialize_config(
+        _config({"files": {"A": {"content_file": "a.md", "format": "text"}}})
+    )
+
+    assert _options(result)["files"]["A"]["content"] == "\ufeffone\ntwo\nthree\n"
+
+
 def test_content_file_outside_settings_dir_is_refused(tmp_path: Path) -> None:
     config_dir = tmp_path / "config"
     config_dir.mkdir()
@@ -53,6 +64,39 @@ def test_missing_content_file_is_refused(tmp_path: Path) -> None:
         TemplateOptionMaterializer(tmp_path / "settings.yaml").materialize_config(_config({"files": {"A": {"content_file": "missing.md"}}}))
 
     assert str(exc.value).startswith("Injected file 'A': Injected file not found: ")
+
+
+def test_content_file_that_is_not_utf8_names_the_entry_and_the_file(tmp_path: Path) -> None:
+    (tmp_path / "a.md").write_bytes(b"ok \xff\xfe not text\n")
+
+    with pytest.raises(TemplateFileError) as exc:
+        TemplateOptionMaterializer(tmp_path / "settings.yaml").materialize_config(_config({"files": {"A": {"content_file": "a.md"}}}))
+
+    message = str(exc.value)
+    assert message.startswith("Injected file 'A': Injected file is not UTF-8 text: ")
+    assert str((tmp_path / "a.md").resolve()) in message
+    assert "codec" not in message
+
+
+def test_content_file_that_is_a_directory_names_the_entry_and_the_file(tmp_path: Path) -> None:
+    (tmp_path / "guidance").mkdir()
+
+    with pytest.raises(TemplateFileError) as exc:
+        TemplateOptionMaterializer(tmp_path / "settings.yaml").materialize_config(_config({"files": {"A": {"content_file": "guidance"}}}))
+
+    assert str(exc.value) == f"Injected file 'A': Injected file is a directory, not a file: {(tmp_path / 'guidance').resolve()}"
+
+
+def test_reference_join_read_faults_are_not_reworded(tmp_path: Path) -> None:
+    """Only file_inject opted in; a reference table's read fault propagates as it always did."""
+    (tmp_path / "binary.csv").write_bytes(b"\xff\xfe")
+    (tmp_path / "folder.csv").mkdir()
+    materializer = TemplateOptionMaterializer(tmp_path / "settings.yaml")
+
+    with pytest.raises(UnicodeDecodeError):
+        materializer.materialize_config(_config({"tables": {"T": {"reference_file": "binary.csv"}}}, plugin="reference_join"))
+    with pytest.raises(IsADirectoryError):
+        materializer.materialize_config(_config({"tables": {"T": {"reference_file": "folder.csv"}}}, plugin="reference_join"))
 
 
 def test_content_and_content_file_together_are_refused(tmp_path: Path) -> None:

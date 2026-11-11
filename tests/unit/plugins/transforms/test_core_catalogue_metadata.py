@@ -14,6 +14,7 @@ from tests.fixtures.catalog_reference import (
     assert_reference_tags,
     assert_reference_text,
     discover_builtin_references,
+    materialize_example_file_options,
     parse_and_validate_example,
 )
 
@@ -85,7 +86,10 @@ def _assert_constructor_is_side_effect_free(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    options = cast(Mapping[str, Any], _declaring_node(reference).get("options", {}))
+    declared = cast(Mapping[str, Any], _declaring_node(reference).get("options", {}))
+    # Files an example binds are read by the settings loader, before the
+    # constructor runs; they are written before the snapshot for that reason.
+    options = materialize_example_file_options(reference.plugin_cls.name, declared, tmp_path)
     before = tuple(tmp_path.rglob("*"))
     reference.plugin_cls(dict(options))
     assert tuple(tmp_path.rglob("*")) == before

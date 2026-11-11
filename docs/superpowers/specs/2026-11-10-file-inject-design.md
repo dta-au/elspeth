@@ -111,7 +111,7 @@ In `all` mode they are labels for diagnostics and for the web option path.
 
 | `format` | Value written | Parsing rules |
 |---|---|---|
-| `text` | The whole content as one `str`, unmodified (no trimming). | None. |
+| `text` | The whole content as one `str`, with no trimming. Line endings follow the binding path (see "Decisions taken during implementation"). | None. |
 | `json` | The parsed value: object, array or scalar. With `data_key`, that member. | NaN and Infinity refused; duplicate object members refused; `data_key` requires a top-level object containing it. |
 | `jsonl` | A list with one parsed value per non-blank line. | Same per-line rules as `json`. |
 | `csv` | A list of row dicts keyed by header. | Header row required; `csv` strict mode; duplicate or empty headers refused; a row whose cell count differs from the header refused; cells stay `str`. |
@@ -139,6 +139,8 @@ All of these fail config validation, before any row is processed:
   together with `content`;
 - an entry with neither `content` nor `content_file`;
 - content that does not parse under its `format`;
+- a value the row hasher cannot canonicalise (an integer outside ±(2^53 − 1),
+  or text that is not UTF-8 encodable), in any format and in `default_content`;
 - a format option on the wrong format (`data_key` on `csv`, and so on);
 - two entries writing the same `output_field`;
 - an `output_field` the node's declared input schema already carries
@@ -247,6 +249,21 @@ existing guard, through the same predicate module so the three cannot drift:
    (`upsert_node`, `patch_node_options`, `splice_transform`, `set_pipeline`);
 2. `/validate` materialization;
 3. run admission.
+
+**Known gap, open at the final review (2026-11-11).** The creator-and-modality
+pair does not hold across a session fork. `update_blob` on a user upload keeps
+`created_by == "user"` and records `LLM_GENERATED`, which the guard refuses;
+`copy_blobs_for_fork` then copies every ready blob, keeps the creator and
+resets the modality to `VERBATIM` with null provenance, so the copy of that
+planner-written content reads as a user upload and is accepted. The blob row
+has no structured field marking a fork copy (only the free-text
+`source_description`), and the copy cannot simply carry the source's
+LLM provenance: `created_from_message_id` is bound to the copy's own session
+by `fk_blobs_created_from_message_session`, and the parent's message is not in
+the child session (measured: `FOREIGN KEY constraint failed`). The fix needs a
+decision on the fork writer and is not part of this change. Until it lands,
+the sentence above that "a copied upload is still an upload" is true only of a
+copy whose source was never rewritten by `update_blob`.
 
 Literal content is refused as well (decided 2026-11-10, after the transform was
 built). The blob guard alone leaves a second route open: a composer authoring
@@ -376,7 +393,33 @@ Recorded here so the spec matches what was built.
   type in the node's `schema` is allowed and is checked against the derived
   type.
 - **A leading byte-order mark** is stripped before parsing `json`, `jsonl` and
-  `csv`; `text` is written unmodified.
+  `csv`; `text` keeps it. The transform never alters `text` content, but the
+  two binding paths deliver different strings for the same file: the CLI
+  settings loader reads a `content_file` in text mode
+  (`core/template_materialization.py`, shared with `reference_join` and the
+  prompt files), so `\r\n` and `\r` become `\n`; a web upload is decoded
+  byte-for-byte (`core/blobs_inline.py`) and keeps its line endings. The loader
+  is not changed; the documentation states the difference.
+- **Empty content**: `text` writes `""`, `jsonl` writes `[]`, and `json` and
+  `csv` are refused.
+- **Values the row hasher refuses are refused at config validation** (final
+  review, 2026-11-11). A written value is hashed with every row that receives
+  it, so an integer outside the JSON safe range or a string holding a lone
+  surrogate used to pass validation and `/validate` and then fail every such
+  row as a contract violation. The config walk now refuses both, in `json`,
+  `jsonl`, `csv`, `text` and `default_content`, naming the entry. The number
+  rule is `core.canonical.is_non_canonical_number`, the hasher's own
+  predicate, not a second copy of the bound, and a test hashes values that
+  validation accepts so the two cannot drift apart silently. A JSON integer
+  too long for Python to convert (more than 4300 digits) is refused in the
+  same words instead of surfacing the interpreter's advice.
+- **An unreadable `content_file`** (a directory, or not UTF-8 text) is a
+  configuration error naming the entry and the file. The rule is opt-in per
+  registry entry (`unreadable_file_is_config_error`), so `reference_join`'s
+  read faults propagate unchanged.
+- **The catalogue example (`example_use`) binds files with `content_file`.**
+  The example is carried to the planner in inventory results, and literal
+  `content` is the form the composer refuses, so the example must not teach it.
 - **Shared parsing helpers** live in `plugins/infrastructure/config_content.py`
   and raise neutral `ValueError` subclasses; `reference_join` wraps them to keep
   its existing exception types and text.

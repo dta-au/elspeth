@@ -59,8 +59,10 @@ configuration is refused.
 `output/tickets_with_guidance.jsonl` has one line per ticket. One row of each
 type, as the run writes them:
 
-Type `A`, a `text` entry. The value is the file as one string, unmodified, down
-to its final newline:
+Type `A`, a `text` entry. The value is the file as one string, with nothing
+trimmed, down to its final newline. The settings loader reads a `content_file`
+in text mode, so a file saved with Windows (`\r\n`) line endings arrives with
+`\n`; the same file uploaded in Composer keeps its `\r\n`:
 
 ```json
 {"guidance": "# Type A: delivery problems\n\nApologise once, in the first sentence.\nOffer a replacement or a refund and let the customer choose.\nDo not ask for photos unless the order is over $200.\n", "summary": "Parcel arrived with a crushed corner", "ticket_id": "T-1001", "type": "A"}

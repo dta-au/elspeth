@@ -39,6 +39,7 @@ from elspeth.contracts.identifiers import validate_field_name
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig, declare_missing_guaranteed_fields
 from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.core.canonical import is_non_canonical_number
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.config_content import (
@@ -67,30 +68,65 @@ MAX_FILE_INJECT_JSON_DEPTH = 100
 InjectedFormat = Literal["text", "json", "jsonl", "csv"]
 
 
-def _refuse_deep_or_nonfinite(value: object) -> None:
-    """Refuse a value nested past the depth limit or holding a non-finite float.
+#: Longest number spelled out in a refusal; a longer one is described by its length.
+_MAX_NUMBER_CHARS_IN_MESSAGE = 40
 
+
+def _refuse_unencodable_text(text: str) -> None:
+    """Refuse text the row hasher cannot encode as UTF-8 (a lone surrogate)."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(
+            f"holds a character that cannot be encoded as UTF-8 (a lone surrogate, U+{ord(text[exc.start]):04X}, "
+            f"at character {exc.start + 1}). Remove it, or replace it with the character that was meant."
+        ) from exc
+
+
+def _refuse_uncanonical(value: object) -> None:
+    """Refuse a value a row cannot carry: one the row hasher cannot canonicalise, or one nested too deep.
+
+    Every written value is hashed with each row that receives it
+    (``elspeth.core.canonical.stable_hash``), so a value the hasher refuses
+    would pass config validation and then fail every such row. The number rule
+    is the hasher's own (``is_non_canonical_number``), not a copy of its bound.
+
+    The message starts with a verb; the caller puts the subject before it.
     Iterative on purpose: the values it guards against are the ones a
     recursive walk cannot survive.
     """
     pending: list[tuple[object, int]] = [(value, 0)]
     while pending:
         item, depth = pending.pop()
-        if type(item) is float and not math.isfinite(item):
-            raise ValueError("holds a non-finite number (NaN or Infinity)")
+        if type(item) is str:
+            _refuse_unencodable_text(item)
+            continue
+        if type(item) in (int, float) and is_non_canonical_number(item):
+            if type(item) is float:
+                raise ValueError("holds a non-finite number (NaN or Infinity)")
+            spelled = str(item)
+            described = f"the integer {spelled}" if len(spelled) <= _MAX_NUMBER_CHARS_IN_MESSAGE else f"an integer of {len(spelled)} digits"
+            raise ValueError(
+                f"holds {described}, which is outside the JSON safe integer range (plus or minus 2^53 - 1), so a row "
+                "cannot carry it as a number. Write it as a string instead, in quotes."
+            )
         # isinstance, not an exact-type test: this must descend into exactly
         # what bounded_canonical_size descends into (any Mapping, list or
         # tuple, e.g. a frozen options bag), or a container it skipped would
         # reach that recursive walk unchecked.
         children: Iterable[object]
         if isinstance(item, Mapping):
+            for key in item:
+                # A key of any other type is refused by bounded_canonical_size.
+                if type(key) is str:
+                    _refuse_unencodable_text(key)
             children = item.values()
         elif isinstance(item, (list, tuple)):
             children = item
         else:
             continue
         if depth >= MAX_FILE_INJECT_JSON_DEPTH:
-            raise ValueError(f"nested more than {MAX_FILE_INJECT_JSON_DEPTH} levels deep")
+            raise ValueError(f"is nested more than {MAX_FILE_INJECT_JSON_DEPTH} levels deep")
         pending.extend((child, depth + 1) for child in children)
 
 
@@ -103,8 +139,25 @@ def _finite_float(literal: str) -> float:
     """
     value = float(literal)
     if not math.isfinite(value):
-        raise ValueError(f"JSON number {literal} is not finite")
+        spelled = literal if len(literal) <= _MAX_NUMBER_CHARS_IN_MESSAGE else f"of {len(literal)} characters"
+        raise ValueError(f"JSON number {spelled} is not finite")
     return value
+
+
+def _parseable_int(literal: str) -> int:
+    """Refuse a JSON integer too long for Python to convert, in this module's words.
+
+    ``int`` refuses a literal past the interpreter's digit limit with advice to
+    call ``sys.set_int_max_str_digits()``, which is no help to a pipeline
+    author. Such a number is far outside what a row can carry anyway.
+    """
+    try:
+        return int(literal)
+    except ValueError as exc:
+        raise ValueError(
+            f"JSON holds an integer of {len(literal.lstrip('-'))} digits, which is too large to be carried as a number. "
+            "Write it as a string instead, in quotes."
+        ) from exc
 
 
 def _load_json(text: str) -> object:
@@ -115,6 +168,7 @@ def _load_json(text: str) -> object:
             object_pairs_hook=reject_duplicate_json_object_members,
             parse_constant=reject_nonfinite_constant,
             parse_float=_finite_float,
+            parse_int=_parseable_int,
         )
     except json.JSONDecodeError as exc:
         raise ValueError(f"not valid JSON: {exc}") from exc
@@ -122,9 +176,9 @@ def _load_json(text: str) -> object:
         # The scanner gave up before the explicit check below could count.
         raise ValueError(f"JSON is nested more than {MAX_FILE_INJECT_JSON_DEPTH} levels deep") from exc
     try:
-        _refuse_deep_or_nonfinite(loaded)
+        _refuse_uncanonical(loaded)
     except ValueError as exc:
-        raise ValueError(f"JSON is {exc}") from exc
+        raise ValueError(f"JSON {exc}") from exc
     return loaded
 
 
@@ -169,6 +223,10 @@ def _parse_csv(text: str, *, delimiter: str) -> list[dict[str, str]]:
                 f"(near line {reader.line_num}). Shorten the cell, or bind the file as format 'text'."
             ) from exc
         raise ValueError(f"not valid CSV: {exc}") from exc
+    try:
+        _refuse_uncanonical(rows)
+    except ValueError as exc:
+        raise ValueError(f"CSV {exc}") from exc
     return rows
 
 
@@ -189,6 +247,10 @@ def parse_injected_content(content: str, *, fmt: InjectedFormat, data_key: str |
     if delimiter != "," and fmt != "csv":
         raise ValueError(f"delimiter applies only to format 'csv', not {fmt!r}")
     if fmt == "text":
+        try:
+            _refuse_unencodable_text(content)
+        except ValueError as exc:
+            raise ValueError(f"content {exc}") from exc
         return content
 
     text = content.removeprefix("\ufeff")
@@ -509,10 +571,11 @@ def _default_content_size(value: object) -> int:
     """Canonical size of ``default_content``, refusing what a row cannot carry.
 
     The value is written to row data on every miss, so it is held to the same
-    rules as bound content: canonical JSON, finite, bounded in depth and size.
+    rules as bound content: canonical JSON the row hasher accepts, bounded in
+    depth and size.
     """
     try:
-        _refuse_deep_or_nonfinite(value)
+        _refuse_uncanonical(value)
         return bounded_canonical_size(value, limit=MAX_FILE_INJECT_ENTRY_BYTES)
     except CanonicalSizeLimitExceededError as exc:
         raise ValueError(f"default_content exceeds the {MAX_FILE_INJECT_ENTRY_BYTES}-byte per-entry limit. Reduce it.") from exc
@@ -595,7 +658,7 @@ class FileInject(BaseTransform):
     name = "file_inject"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:140f6fd430a57d2a"
+    source_file_hash: str | None = "sha256:3cf2db3f01fd35fd"
     config_model = FileInjectConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -616,10 +679,10 @@ class FileInject(BaseTransform):
     output_field: review_guidance
     files:
       "invoice":
-        content: "Check the totals against the line items.\\n"
+        content_file: invoice_guidance.md
         format: text
       "contract":
-        content: "Check the parties, dates and signatures.\\n"
+        content_file: contract_guidance.md
         format: text
     on_miss: fail
     schema:

@@ -6,12 +6,14 @@ The config half (parsing, refusals, caps, declared types) is covered by
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
 import yaml
 
 from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.core.template_materialization import TemplateOptionMaterializer
 from elspeth.plugins.transforms import file_inject
 from elspeth.plugins.transforms.file_inject import FileInject
 from elspeth.testing import make_pipeline_row
@@ -310,12 +312,32 @@ def test_agent_assistance_teaches_wiring_and_the_upload_rule() -> None:
     assert FileInject.get_agent_assistance(issue_code="anything") is None
 
 
-def test_example_use_is_yaml_that_builds_the_plugin() -> None:
-    options = yaml.safe_load(FileInject.example_use)["transform"]["options"]
+def test_example_use_binds_files_and_builds_the_plugin_through_the_settings_loader(tmp_path: Path) -> None:
+    """The catalogue example reaches the planner, so it shows ``content_file``, never literal ``content``.
 
-    assert options["files"]["invoice"]["content"] == "Check the totals against the line items.\n"
-    assert options["files"]["contract"]["content"].endswith("signatures.\n")
+    It is built the way a settings file is: the loader's materializer reads
+    each named file from beside the settings file, then the plugin constructs.
+    """
+    node = yaml.safe_load(FileInject.example_use)["transform"]
+    entries = node["options"]["files"]
+    assert {name: sorted(entry) for name, entry in entries.items()} == {
+        "invoice": ["content_file", "format"],
+        "contract": ["content_file", "format"],
+    }
+    guidance = {"invoice": "Check the totals against the line items.\n", "contract": "Check the parties, dates and signatures.\n"}
+    for name, text in guidance.items():
+        (tmp_path / entries[name]["content_file"]).write_text(text, encoding="utf-8")
+
+    loaded = TemplateOptionMaterializer(tmp_path / "settings.yaml").materialize_config({"transforms": [{"name": "inject", **node}]})
+    options = loaded["transforms"][0]["options"]
+
+    assert options["files"]["invoice"] == {
+        "content": guidance["invoice"],
+        "content_source": entries["invoice"]["content_file"],
+        "format": "text",
+    }
     transform = FileInject(options)
-    result = transform.process(make_pipeline_row({"document_kind": "invoice"}), make_source_context())
-    assert result.row is not None
-    assert result.row.to_dict()["review_guidance"] == "Check the totals against the line items.\n"
+    for kind, text in guidance.items():
+        result = transform.process(make_pipeline_row({"document_kind": kind}), make_source_context())
+        assert result.row is not None
+        assert result.row.to_dict()["review_guidance"] == text

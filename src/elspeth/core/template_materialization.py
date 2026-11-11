@@ -57,6 +57,11 @@ class FileBackedTemplateOption:
     # False for a nested-only key: it has no top-level form, so the top-level
     # materialization and the in-memory rejection scan both leave it alone.
     top_level: bool = True
+    # True: a nested file that is a directory or is not UTF-8 text is refused
+    # as a TemplateFileError naming the entry and the file. False (the
+    # default) leaves the read fault to propagate unchanged, which the
+    # reference_join tests pin.
+    unreadable_file_is_config_error: bool = False
 
     def __post_init__(self) -> None:
         if not self.top_level and self.nested_in is None:
@@ -119,6 +124,7 @@ FILE_BACKED_TEMPLATE_OPTION_REGISTRY: tuple[FileBackedTemplateOption, ...] = (
         content_kind="text",
         nested_in=("file_inject", "files"),
         top_level=False,
+        unreadable_file_is_config_error=True,
     ),
 )
 # The keys with a TOP-LEVEL form. A nested-only key is deliberately absent: at
@@ -248,7 +254,19 @@ class TemplateOptionMaterializer:
                 live_content = self._load_content(rule, file_path)
             else:
                 if file_path not in reference_contents:
-                    reference_contents[file_path] = file_path.read_text(encoding="utf-8")
+                    try:
+                        reference_contents[file_path] = file_path.read_text(encoding="utf-8")
+                    except IsADirectoryError as exc:
+                        if not rule.unreadable_file_is_config_error:
+                            raise
+                        raise TemplateFileError(f"{rule.label} is a directory, not a file: {file_path}") from exc
+                    except UnicodeDecodeError as exc:
+                        if not rule.unreadable_file_is_config_error:
+                            raise
+                        raise TemplateFileError(
+                            f"{rule.label} is not UTF-8 text: {file_path} (first invalid byte at offset {exc.start}). "
+                            "Save the file as UTF-8; a binary file cannot be bound."
+                        ) from exc
                 live_content = reference_contents[file_path]
             if run_mode is RunMode.VERIFY and live_content != archived_content:
                 raise TemplateFileError(f"{rule.label} differs from source-run materialized content")
