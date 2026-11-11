@@ -7,6 +7,8 @@ from typing import Any
 
 import pytest
 
+from elspeth.contracts.errors import PluginContractViolation
+from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.transforms.reference_join import ReferenceJoin
 from elspeth.testing import make_pipeline_row
@@ -54,3 +56,44 @@ class TestReferenceJoinRefusesNonCanonicalValuesAtLoad:
         assert result.status == "success"
         assert result.row is not None
         assert result.row["r"] == 9007199254740991
+
+
+def _header_row() -> PipelineRow:
+    """An OBSERVED row whose ``first_name`` came from the original header ``First Name``."""
+    return PipelineRow(
+        {"first_name": "A", "meta": {"origin": "X"}, "status": "ORIGINAL"},
+        SchemaContract(
+            mode="OBSERVED",
+            fields=(
+                FieldContract(normalized_name="first_name", original_name="First Name", python_type=str, required=False, source="inferred"),
+                FieldContract(normalized_name="meta", original_name="meta", python_type=object, required=False, source="inferred"),
+                FieldContract(normalized_name="status", original_name="status", python_type=str, required=False, source="inferred"),
+            ),
+            locked=True,
+        ),
+    )
+
+
+class TestFieldMapperDottedSourceCollision:
+    """Sweep finding #67: a dotted source must not silently overwrite an existing target when the executor gate is off."""
+
+    def test_dotted_source_onto_existing_field_is_refused(self) -> None:
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper({"schema": {"mode": "observed"}, "mapping": {"First Name": "first", "meta.origin": "status"}})
+        # The original-header source is what turns the executor collision gate off.
+        assert transform.forwards_input_fields is False
+        assert transform.passes_through_input is False
+
+        with pytest.raises(PluginContractViolation, match=r"would overwrite existing input fields \['status'\]"):
+            transform.process(_header_row(), make_context())
+
+    def test_dotted_source_onto_new_field_still_maps(self) -> None:
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper({"schema": {"mode": "observed"}, "mapping": {"First Name": "first", "meta.origin": "origin"}})
+        result = transform.process(_header_row(), make_context())
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row["origin"] == "X"
+        assert result.row["status"] == "ORIGINAL"
