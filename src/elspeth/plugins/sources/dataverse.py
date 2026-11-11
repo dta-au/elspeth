@@ -64,9 +64,13 @@ class _DataverseSourceRequest(TypedDict):
     headers: dict[str, str] | None
 
 
-# OData annotation prefixes to strip from row data
-_ODATA_ANNOTATION_PATTERN = re.compile(r"^@odata\.|@Microsoft\.Dynamics\.CRM\.")
-_FORMATTED_VALUE_SUFFIX = "@OData.Community.Display.V1.FormattedValue"
+# OData annotations to strip from row data. Searched, not matched: an
+# annotation is either instance-level ("@odata.etag") or property-level
+# ("_parentcustomerid_value@Microsoft.Dynamics.CRM.lookuplogicalname"), and
+# Dataverse column logical names never contain "@".
+_ODATA_ANNOTATION_PATTERN = re.compile(r"@(?:odata|Microsoft\.Dynamics\.CRM)\.")
+_FORMATTED_VALUE_ANNOTATION = "OData.Community.Display.V1.FormattedValue"
+_FORMATTED_VALUE_SUFFIX = f"@{_FORMATTED_VALUE_ANNOTATION}"
 _DATAVERSE_LOGICAL_NAME_PATTERN = re.compile(r"^[a-z_][a-z0-9_]*$")
 _DATAVERSE_ENTITY_SET_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -290,7 +294,7 @@ class DataverseSource(BaseSource):
     _normalizes_external_names = True
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8d3f3de6d9e62d9f"
+    source_file_hash: str | None = "sha256:a6da227d8a3dfe57"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 
@@ -639,7 +643,7 @@ class DataverseSource(BaseSource):
                 continue
 
             # Strip OData annotations
-            if _ODATA_ANNOTATION_PATTERN.match(key):
+            if _ODATA_ANNOTATION_PATTERN.search(key):
                 continue
 
             cleaned[key] = value
@@ -920,15 +924,17 @@ class DataverseSource(BaseSource):
         entity_set_name = self._resolve_entity_set_name(ctx, logical_name)
         if self._entity is not None:
             url = self._build_query_url(entity_set_name)
+        # Dataverse returns FormattedValue annotations only when asked for them.
+        annotations = (_FORMATTED_VALUE_ANNOTATION,) if self._include_formatted_values else ()
 
         try:
             if self._entity is not None:
                 # Structured OData query
-                page_iterator = self._client.paginate_odata(url)
+                page_iterator = self._client.paginate_odata(url, annotations=annotations)
             else:
                 # FetchXML query
                 assert self._fetch_xml is not None
-                page_iterator = self._client.paginate_fetchxml(entity_set_name, self._fetch_xml)
+                page_iterator = self._client.paginate_fetchxml(entity_set_name, self._fetch_xml, annotations=annotations)
 
             for page in page_iterator:
                 # Record successful page fetch — use the actual URL from the
