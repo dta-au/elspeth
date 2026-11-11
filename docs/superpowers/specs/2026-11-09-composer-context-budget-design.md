@@ -229,10 +229,12 @@ step keeps this to an occasional call.
   history and tool round trips.
 - **Reply stage** (`service.py`, the one optional call after review cards are
   staged). It advertises no authoring tools, so its request carries each tool
-  record as quoted text. The loop's own messages are fitted first and the
-  reply request is built from the fitted list, so a result stubbed here or
-  earlier in the turn is quoted as its stub and every other tool record is
-  quoted in full. Nothing is prepared when the stage is out of time.
+  record as quoted text, unless the turn carries native thinking, in which
+  case the records are sent as they are. The loop's own messages are fitted
+  first and the reply request is built from the fitted list, so a result
+  stubbed here or earlier in the turn is carried as its stub and every other
+  tool record is carried in full. Nothing is prepared when the stage is out
+  of time.
 - **Settings.** The three new settings and the changed default on
   `WebSettings`, through the settings-to-runtime contract.
 
@@ -264,10 +266,10 @@ are updated together.
   before any provider call.
 - The refusal uses a new planner/composer code, distinct from
   `REQUEST_BYTES_EXHAUSTED`, and names the ceiling (tokens or bytes) and the
-  largest component. Components are sized per message on the wire of the
-  request the decision measured; at the reply stage that is the reply-stage
-  request, in which each tool record is quoted text, and its closing
-  instruction counts as `other`.
+  largest component. Components are sized per message on the wire form of the
+  request the decision measured, before cache markers are added; at the reply
+  stage that is the reply-stage request, and its closing instruction counts
+  as `other`.
 - Both paths answer it with HTTP 422. The named cause is stored in the
   operation's sealed result body (`error_type` `context_budget_exceeded`,
   with the detail codes). The operation row's `failure_code` column is
