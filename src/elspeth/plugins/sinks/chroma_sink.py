@@ -216,7 +216,7 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
     name = "chroma_sink"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:53866f704b91068f"
+    source_file_hash: str | None = "sha256:c08d757cf9512990"
     config_model = ChromaSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
@@ -379,6 +379,11 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
             raise ValueError(f"Chroma effect member is missing required field {exc.args[0]!r}") from exc
         if type(raw_id) is not str or type(raw_document) is not str:
             raise ValueError("Chroma effect member id and document fields must be strings")
+        if not raw_id:
+            # Chroma rejects an empty ID at upsert with InvalidArgumentError (a
+            # ChromaError), which would escape commit on every attempt; divert
+            # the member here instead.
+            raise ValueError("Chroma effect member id must not be empty")
         metadata: dict[str, object] = {}
         for field_name in fm.metadata_fields:
             if field_name not in row:
@@ -418,8 +423,9 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
     ) -> tuple[ArtifactDescriptor, str, str, dict[int, tuple[str, str, dict[str, object] | None]], tuple[tuple[int, str], ...]]:
         """Deterministically partition members into extractable payloads and diversions.
 
-        An invalid member (missing/non-string ID or document, unsupported or
-        non-finite metadata) diverts individually with its exact reason instead
+        An invalid member (missing/non-string/empty ID or document, unsupported
+        or non-finite metadata, or an ID already used by an earlier member of
+        the group) diverts individually with its exact reason instead
         of aborting the plan and blocking valid siblings (elspeth-32bf1a9b63).
         The descriptor and payload hash cover only the members that will be
         published. Recomputation over the same members is exact, so plan
@@ -427,14 +433,22 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
         """
         extracted_by_ordinal: dict[int, tuple[str, str, dict[str, object] | None]] = {}
         diversions: list[tuple[int, str]] = []
+        accepted_ids: set[str] = set()
         for member in effect_input.members:
             try:
-                extracted_by_ordinal[member.ordinal] = self._extract_effect_member(member)
+                extracted = self._extract_effect_member(member)
             except ValueError as exc:
                 diversions.append((member.ordinal, str(exc)))
+                continue
+            # Per-member upserts need unique IDs within the group: reconciling an
+            # earlier member would otherwise observe a later member's document.
+            # The first occurrence publishes; later ones divert.
+            if extracted[0] in accepted_ids:
+                diversions.append((member.ordinal, "Chroma effect member duplicates the document id of an earlier member in this group"))
+                continue
+            accepted_ids.add(extracted[0])
+            extracted_by_ordinal[member.ordinal] = extracted
         ids = [item[0] for item in extracted_by_ordinal.values()]
-        if len(ids) != len(set(ids)):
-            raise ValueError("Chroma effect members require unique stable document IDs")
         documents = [item[1] for item in extracted_by_ordinal.values()]
         aligned_metadata = [item[2] for item in extracted_by_ordinal.values()]
         hash_metadata = aligned_metadata if any(item is not None for item in aligned_metadata) else None
