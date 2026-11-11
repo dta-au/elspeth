@@ -108,7 +108,8 @@ content counts as that content alone). Its meaning is unchanged and the
 budget is not judged on it.
 
 A sheddable segment's saving is what it occupies on the wire: a whole
-history message's canonical JSON, a tool result's wire bytes less its stub's,
+history message's canonical JSON, a tool result's wire bytes less its stub's (at the reply stage, measured on
+the quoted message sent in its place),
 and for a planner history entry or a hatch transcript event (both carried
 inside a message's content) its serialization as escaped once more. Shedding
 never saves less than that, so sizes computed after shedding are upper bounds

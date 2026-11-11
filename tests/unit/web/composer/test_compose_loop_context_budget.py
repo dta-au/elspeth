@@ -991,6 +991,32 @@ def _two_round_turn(service: ComposerServiceImpl, first: str, second: str) -> li
 
 
 @pytest.mark.asyncio
+async def test_an_escape_heavy_result_that_fits_once_stubbed_in_the_reply_stage_is_stubbed_not_refused() -> None:
+    """A reply-stage saving is measured on the quoted form the reply stage sends.
+
+    The reply stage quotes each tool record as JSON text, so a backslash in a
+    result is four bytes on the wire against two in the loop's tool message.
+    Measured on the loop's form, half the result's escapes stay in the size
+    bound once it is stubbed, and a reply that fits would be refused.
+    """
+    first = "\\" * 50_000
+    generous, _ = _service(_GENEROUS_TOKENS)
+    unshed, unshed_tools, _ = await _prepare_reply(generous, _two_round_turn(generous, first, "s"))
+    small, small_tools, _ = await _prepare_reply(generous, _two_round_turn(generous, "x", "s"))
+    full_wire = request_wire_bytes(unshed, unshed_tools)
+    cap = request_wire_bytes(small, small_tools) + 2_000
+    loop_form_saving = len(canonical_json(first).encode("utf-8")) - 2 - len(CONTEXT_BUDGET_TOOL_RESULT_STUB)
+    assert full_wire - loop_form_saving > cap
+    service, _ = _service(_GENEROUS_TOKENS, composer_planner_max_request_bytes=cap)
+
+    selected, tools, record = await _prepare_reply(service, _two_round_turn(service, first, "s"))
+
+    assert record.stubbed_tool_call_ids == ("call-1",)
+    assert CONTEXT_BUDGET_TOOL_RESULT_STUB in selected[5]["content"]
+    assert request_wire_bytes(selected, tools) <= cap
+
+
+@pytest.mark.asyncio
 async def test_the_reply_stage_request_stubs_earlier_tool_results_and_keeps_the_latest_round() -> None:
     base = await _base_request_bytes()
     first, second = "f" * (base * 6 // 10), "s" * (base * 6 // 10)

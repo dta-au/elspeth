@@ -14,7 +14,7 @@ string is the constant stub.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Final
 
 from elspeth.contracts.composer_llm_audit import ComposerContextBudgetRecord, ComposerLLMCall, ComposerLLMRequestByteSplit
@@ -126,7 +126,12 @@ def largest_component(named_bytes: Mapping[str, int]) -> str:
 
 
 def tool_result_segments(
-    messages: list[dict[str, Any]], split: ComposerLLMRequestByteSplit, *, start: int, stop: int
+    messages: list[dict[str, Any]],
+    split: ComposerLLMRequestByteSplit,
+    *,
+    start: int,
+    stop: int,
+    saving_at: Callable[[int], int] | None = None,
 ) -> tuple[list[SheddableSegment], dict[str, list[int]]]:
     """Label the tool results in ``messages[start:stop]`` that stubbing would shrink.
 
@@ -136,6 +141,11 @@ def tool_result_segments(
     is keyed ``tool:<tool_call_id>`` in request order. A provider may reuse a
     tool-call id across rounds; one key then covers every result in the range
     that carries it, and the returned positions list each of them.
+
+    ``saving_at`` gives the saving of the result at a position when the
+    request carries it in another form than ``messages`` does (the reply
+    stage quotes each tool record as text): it is measured on that form,
+    whose extra escaping makes it larger.
     """
     positions: dict[str, list[int]] = {}
     savings: Counter[str] = Counter()
@@ -143,7 +153,10 @@ def tool_result_segments(
         message = messages[index]
         if message["role"] != "tool":
             continue
-        saving = split.message_bytes[index] - message_wire_split([stubbed_tool_message(message)], None).total_bytes
+        if saving_at is None:
+            saving = split.message_bytes[index] - message_wire_split([stubbed_tool_message(message)], None).total_bytes
+        else:
+            saving = saving_at(index)
         if saving <= 0:
             continue
         key = f"tool:{message['tool_call_id']}"
