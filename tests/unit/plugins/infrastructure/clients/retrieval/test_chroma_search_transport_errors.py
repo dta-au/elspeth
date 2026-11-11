@@ -24,15 +24,13 @@ import uuid
 from collections.abc import Callable, Iterator
 from typing import Any
 
+import httpx
 import pytest
 
 from elspeth.contracts.enums import CallStatus, CallType
 from tests.fixtures.mock_audit import mock_item_audit_authority
 
 chromadb = pytest.importorskip("chromadb")
-httpx = pytest.importorskip("httpx")
-
-import chromadb.api.fastapi as chroma_fastapi  # noqa: E402
 
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError  # noqa: E402
 from elspeth.plugins.infrastructure.clients.retrieval.chroma import (  # noqa: E402
@@ -112,7 +110,9 @@ def chroma_server(monkeypatch: pytest.MonkeyPatch) -> Iterator[_ChromaServer]:
         kwargs["transport"] = httpx.MockTransport(server.handle)
         return real_client(*args, **kwargs)
 
-    monkeypatch.setattr(chroma_fastapi.httpx, "Client", _client_with_mock_transport)
+    # chromadb.api.fastapi builds its session with httpx.Client(...); every
+    # client built during the test gets the in-process mock transport.
+    monkeypatch.setattr(httpx, "Client", _client_with_mock_transport)
     yield server
 
 

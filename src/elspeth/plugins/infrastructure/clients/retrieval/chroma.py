@@ -307,8 +307,10 @@ class ChromaSearchProvider:
                 work_item=work_item,
             )
             raise RetrievalError(f"Chroma count failed: {exc}", retryable=True) from exc
-        except (ConnectionError, TimeoutError, OSError) as exc:
-            # OS-level failures that bypass the ChromaDB SDK's own error wrapping
+        except (ConnectionError, TimeoutError, OSError, httpx.HTTPError) as exc:
+            # Transport failures that bypass the ChromaDB SDK's own error wrapping.
+            # The HTTP client calls httpx directly, so refused connections and
+            # timeouts arrive as httpx.HTTPError, which is not an OSError.
             self._record_error(
                 state_id,
                 count_start,
@@ -320,6 +322,40 @@ class ChromaSearchProvider:
                 work_item=work_item,
             )
             raise RetrievalError(f"Chroma connection failed during count: {exc}", retryable=True) from exc
+        except ValueError as exc:
+            # The HTTP client decodes every 2xx body with orjson.loads, which
+            # raises JSONDecodeError (a ValueError) on a non-JSON body; the SDK
+            # also raises ValueError for request arguments it rejects. Neither
+            # is repaired by retrying the same call.
+            self._record_error(
+                state_id,
+                count_start,
+                count_request,
+                exc,
+                call_index=call_index,
+                retryable=False,
+                member_token=member_token,
+                work_item=work_item,
+            )
+            raise RetrievalError(f"Chroma count returned an unusable response: {exc}", retryable=False) from exc
+        except Exception as exc:
+            if type(exc) is not Exception:
+                raise
+            # BaseHTTPClient._raise_chroma_error raises a bare Exception(resp.text)
+            # for an HTTP error status whose body is not a Chroma error (a
+            # gateway or proxy page). Only that exact type is classified here;
+            # every subclass is a code defect and crashes through above.
+            self._record_error(
+                state_id,
+                count_start,
+                count_request,
+                exc,
+                call_index=call_index,
+                retryable=True,
+                member_token=member_token,
+                work_item=work_item,
+            )
+            raise RetrievalError(f"Chroma count failed with a non-Chroma HTTP error: {exc}", retryable=True) from exc
         if type(collection_count) is not int or collection_count < 0:
             error = RetrievalError(
                 f"Chroma collection count returned malformed evidence: expected a non-negative exact int, "
@@ -424,8 +460,9 @@ class ChromaSearchProvider:
                 work_item=work_item,
             )
             raise RetrievalError(f"Chroma query failed: {exc}", retryable=True) from exc
-        except (ConnectionError, TimeoutError, OSError) as exc:
-            # OS-level failures that bypass the ChromaDB SDK's own error wrapping
+        except (ConnectionError, TimeoutError, OSError, httpx.HTTPError) as exc:
+            # Transport failures that bypass the ChromaDB SDK's own error
+            # wrapping (see the count() handler above).
             self._record_error(
                 state_id,
                 start_time,
@@ -437,6 +474,35 @@ class ChromaSearchProvider:
                 work_item=work_item,
             )
             raise RetrievalError(f"Chroma connection failed: {exc}", retryable=True) from exc
+        except ValueError as exc:
+            # Non-JSON 2xx body or SDK-rejected arguments (see count() above).
+            self._record_error(
+                state_id,
+                start_time,
+                request_payload,
+                exc,
+                call_index=call_index,
+                retryable=False,
+                member_token=member_token,
+                work_item=work_item,
+            )
+            raise RetrievalError(f"Chroma query returned an unusable response: {exc}", retryable=False) from exc
+        except Exception as exc:
+            if type(exc) is not Exception:
+                raise
+            # The SDK's bare Exception(resp.text) for a non-Chroma HTTP error
+            # status (see count() above); subclasses crash through.
+            self._record_error(
+                state_id,
+                start_time,
+                request_payload,
+                exc,
+                call_index=call_index,
+                retryable=True,
+                member_token=member_token,
+                work_item=work_item,
+            )
+            raise RetrievalError(f"Chroma query failed with a non-Chroma HTTP error: {exc}", retryable=True) from exc
         elapsed_ms = (time.monotonic() - start_time) * 1000
 
         # Post-query processing: parse response, validate distances, build chunks.
