@@ -140,6 +140,7 @@ jobs:
           - source:azure_blob@sas_token
           - source:azure_blob@service_principal
           - transform:azure_content_safety@default
+          - transform:azure_content_understanding@default
           - transform:azure_document_intelligence@default
           - transform:azure_prompt_shield@default
     runs-on: [self-hosted, Linux, X64, ephemeral, aws-ecs, postgresql-16-rds, state-engine-live-provider]
@@ -157,12 +158,15 @@ jobs:
       ELSPETH_TEST_AZURE_CONTENT_SAFETY_ENDPOINT: ${{ vars.ELSPETH_TEST_AZURE_CONTENT_SAFETY_ENDPOINT }}
       ELSPETH_TEST_AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT: ${{ vars.ELSPETH_TEST_AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT }}
       ELSPETH_TEST_AZURE_DOCUMENT_INTELLIGENCE_MODEL: ${{ vars.ELSPETH_TEST_AZURE_DOCUMENT_INTELLIGENCE_MODEL }}
+      ELSPETH_TEST_AZURE_CONTENT_UNDERSTANDING_ENDPOINT: ${{ vars.ELSPETH_TEST_AZURE_CONTENT_UNDERSTANDING_ENDPOINT }}
+      ELSPETH_TEST_AZURE_CONTENT_UNDERSTANDING_ANALYZER: ${{ vars.ELSPETH_TEST_AZURE_CONTENT_UNDERSTANDING_ANALYZER }}
       ELSPETH_TEST_AZURE_DOCUMENT_URL: ${{ vars.ELSPETH_TEST_AZURE_DOCUMENT_URL }}
       AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
       AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
       AZURE_CONTENT_SAFETY_KEY: ${{ secrets.AZURE_CONTENT_SAFETY_KEY }}
       AZURE_DOCUMENT_INTELLIGENCE_KEY: ${{ secrets.AZURE_DOCUMENT_INTELLIGENCE_KEY }}
+      AZURE_CONTENT_UNDERSTANDING_KEY: ${{ secrets.AZURE_CONTENT_UNDERSTANDING_KEY }}
     steps:
       - name: Checkout frozen baseline
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
