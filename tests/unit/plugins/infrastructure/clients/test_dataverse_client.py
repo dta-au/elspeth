@@ -977,17 +977,17 @@ class TestPaginateFetchxml:
         with pytest.raises(DataverseClientError, match="Failed to parse FetchXML"):
             list(client.paginate_fetchxml("accounts", bad_xml))
 
-    def test_missing_morerecords_crashes_fetchxml_pagination(self, client: DataverseClient, transport: MockTransport) -> None:
-        """FetchXML pagination crashes if morerecords field is absent.
+    def test_paging_cookie_without_morerecords_crashes_fetchxml_pagination(self, client: DataverseClient, transport: MockTransport) -> None:
+        """A paging cookie with morerecords absent is a contradictory page.
 
-        Absence is a protocol anomaly — we must not silently infer pagination
-        state. The field is required for FetchXML; only OData omits it.
+        The documented final page omits BOTH annotations (absent morerecords
+        means end of results); a cookie alone matches no documented shape.
         """
         transport.add_response(
             _make_json_response(
                 {
                     "value": [],
-                    # No @Microsoft.Dynamics.CRM.morerecords — anomaly
+                    # No @Microsoft.Dynamics.CRM.morerecords, but a cookie — anomaly
                     "@Microsoft.Dynamics.CRM.fetchxmlpagingcookie": urllib.parse.quote("<cookie/>"),
                 }
             )
@@ -996,7 +996,7 @@ class TestPaginateFetchxml:
         fetch_xml = '<fetch count="50"><entity name="account"/></fetch>'
         pages = client.paginate_fetchxml("accounts", fetch_xml)
         current_page = next(pages)
-        with pytest.raises(DataverseClientError, match=r"missing.*morerecords") as exc_info:
+        with pytest.raises(DataverseClientError, match=r"paging cookie but no.*morerecords") as exc_info:
             next(pages)
 
         error = exc_info.value

@@ -1924,8 +1924,10 @@ class TestDataverseSourceLoadFetchXML:
                 {"value": [], "@odata.nextLink": f"{VALID_ENV_URL}/api/data/v9.2/contacts?page=4"},
             ]
         elif guard == "fetchxml_missing_morerecords":
+            # A cookie without morerecords is contradictory; absence of both
+            # is the documented final page and is not a guard.
             config = _fetchxml_config()
-            data_bodies = [{"value": []}]
+            data_bodies = [{"value": [], "@Microsoft.Dynamics.CRM.fetchxmlpagingcookie": "<cookie />"}]
         else:
             config = _fetchxml_config()
             data_bodies = [{"value": [], "@Microsoft.Dynamics.CRM.morerecords": True}]

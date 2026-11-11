@@ -72,6 +72,12 @@ _ADDITIONAL_DOMAIN_PATTERN = re.compile(
 # Maximum consecutive empty pages before pagination terminates.
 _MAX_CONSECUTIVE_EMPTY_PAGES = 3
 
+# Dataverse returns the FetchXML paging annotations only when the request asks
+# for them (Microsoft "Page results using FetchXml", Web API tab).
+_FETCHXML_PREFER_HEADER = {
+    "Prefer": 'odata.include-annotations="Microsoft.Dynamics.CRM.fetchxmlpagingcookie,Microsoft.Dynamics.CRM.morerecords"',
+}
+
 
 class DataverseClientError(Exception):
     """Exception for Dataverse protocol-level errors.
@@ -730,10 +736,10 @@ class DataverseClient:
                     request_headers=fingerprinted,
                 )
         else:
-            # Field absent — record the absence, don't infer.
+            # Field absent — record the absence, don't infer here.
             # OData queries don't include morerecords (uses nextLink instead).
-            # FetchXML queries should always include it — absence there is
-            # an anomaly the consumer should detect, not one we paper over.
+            # FetchXML final pages omit it too; paginate_fetchxml interprets
+            # absence against the documented FetchXML contract.
             more_records = None
 
         return DataversePageResponse(
@@ -874,24 +880,27 @@ class DataverseClient:
             encoded_xml = urllib.parse.quote(xml_str)
             url = f"{self._environment_url}/api/data/{self._api_version}/{entity_set_name}?fetchXml={encoded_xml}"
 
-            page = self.get_page(url)
+            page = self._execute_request("GET", url, extra_headers=_FETCHXML_PREFER_HEADER)
             yield page
 
-            # Check if more records exist.
-            # FetchXML responses must include morerecords — its absence is a
-            # protocol anomaly we must not silently infer around.
+            # Check if more records exist. Per the Dataverse Web API contract
+            # the final page carries neither morerecords nor the paging
+            # cookie, so an absent morerecords means end of results. A cookie
+            # without morerecords matches no documented page shape.
             if page.more_records is None:
-                raise DataverseClientError(
-                    "FetchXML response missing '@Microsoft.Dynamics.CRM.morerecords' field "
-                    "— cannot determine pagination state. OData uses nextLink instead, "
-                    "but FetchXML pagination requires this field.",
-                    retryable=False,
-                    error_category="protocol_violation",
-                    status_code=page.status_code,
-                    latency_ms=page.latency_ms,
-                    request_url=page.request_url,
-                    request_headers=page.request_headers,
-                )
+                if page.paging_cookie is not None:
+                    raise DataverseClientError(
+                        "FetchXML response has a paging cookie but no "
+                        "'@Microsoft.Dynamics.CRM.morerecords' field — the documented final "
+                        "page carries neither annotation, so pagination state is contradictory.",
+                        retryable=False,
+                        error_category="protocol_violation",
+                        status_code=page.status_code,
+                        latency_ms=page.latency_ms,
+                        request_url=page.request_url,
+                        request_headers=page.request_headers,
+                    )
+                break
             if not page.more_records:
                 break
 
