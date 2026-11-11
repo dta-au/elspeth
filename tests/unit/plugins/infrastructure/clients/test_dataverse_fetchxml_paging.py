@@ -8,13 +8,17 @@ Microsoft's "Page results using FetchXml" (Web API tab) says:
   (or ``"*"``).
 * On the final page the response carries neither annotation; absence means
   there are no more records.
+* The paging-cookie annotation is a ``<cookie pagenumber=.. pagingcookie=..>``
+  wrapper; the cookie to send back is its ``pagingcookie`` attribute,
+  URL-decoded twice.
 
-Sweep finding #71, 20261111-plugins-review.
+Sweep findings #71 and #72, 20261111-plugins-review.
 """
 
 from __future__ import annotations
 
 import urllib.parse
+import xml.etree.ElementTree as ET
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
@@ -182,3 +186,71 @@ def test_morerecords_true_without_cookie_still_raises() -> None:
         client.close()
 
     assert exc_info.value.error_category == "protocol_violation"
+
+
+# ---------------------------------------------------------------------------
+# Finding #72: the annotation is a wrapper element; the cookie is its
+# pagingcookie attribute, URL-encoded twice.
+# ---------------------------------------------------------------------------
+
+
+def _sent_fetch_element(request: httpx.Request) -> ET.Element:
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(str(request.url)).query)
+    return ET.fromstring(query["fetchXml"][0])
+
+
+def test_paging_cookie_is_inner_pagingcookie_decoded_twice() -> None:
+    inner = '<cookie page="1"><contactid last="{A}" first="{B}" /></cookie>'
+    transport = _RecordingTransport(
+        [
+            {"value": [{"contactid": "1"}], MORERECORDS: True, PAGINGCOOKIE: _doc_wrapper_cookie()},
+            {"value": [{"contactid": "2"}]},
+        ]
+    )
+    pages, error = _drain(transport)
+
+    assert error is None, f"pagination raised: {error}"
+    assert len(pages) == 2
+    fetch = _sent_fetch_element(transport.requests[1])
+    assert fetch.get("paging-cookie") == inner
+    assert fetch.get("page") == "2"
+
+
+def test_paging_cookie_with_xml_metacharacters_round_trips() -> None:
+    inner = '<cookie page="1"><name last="a&amp;b&lt;c&gt;&quot;d" first="x" /></cookie>'
+    twice = urllib.parse.quote(urllib.parse.quote(inner, safe=""), safe="")
+    wrapper = f'<cookie pagenumber="2" pagingcookie="{twice}" istracking="False" />'
+    transport = _RecordingTransport(
+        [
+            {"value": [{"contactid": "1"}], MORERECORDS: True, PAGINGCOOKIE: wrapper},
+            {"value": []},
+        ]
+    )
+    pages, error = _drain(transport)
+
+    assert error is None, f"pagination raised: {error}"
+    assert len(pages) == 2
+    assert _sent_fetch_element(transport.requests[1]).get("paging-cookie") == inner
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    [
+        pytest.param("not xml at all", id="not-xml"),
+        pytest.param("<cookie pagenumber=", id="truncated-xml"),
+        pytest.param('<cookie pagenumber="2" istracking="False" />', id="no-pagingcookie-attribute"),
+    ],
+)
+def test_malformed_paging_cookie_annotation_is_protocol_violation(annotation: str) -> None:
+    transport = _RecordingTransport(
+        [
+            {"value": [{"contactid": "1"}], MORERECORDS: True, PAGINGCOOKIE: annotation},
+            {"value": []},
+        ]
+    )
+    pages, error = _drain(transport)
+
+    assert error is not None, "malformed paging-cookie annotation was forwarded to Dataverse"
+    assert error.error_category == "protocol_violation"
+    assert error.request_url == pages[0].request_url
+    assert len(transport.requests) == 1
