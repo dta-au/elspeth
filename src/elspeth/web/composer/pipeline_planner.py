@@ -96,6 +96,7 @@ from elspeth.web.composer.context_budget import (
     SheddableKind,
     SheddableSegment,
     decide_context_budget,
+    escaped_bytes,
 )
 from elspeth.web.composer.context_budget_apply import (
     CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
@@ -104,7 +105,6 @@ from elspeth.web.composer.context_budget_apply import (
     held_tool_keys,
     largest_component,
     latest_round_trip_start,
-    message_bytes,
     message_wire_split,
     previously_shed_keys,
     request_wire_bytes,
@@ -3454,15 +3454,16 @@ def _fit_planner_context_budget(
     arguments, thinking blocks and tool definitions), plus the omission
     allowance when history may be shed and the transcript gap allowance when
     transcript events may be shed. Token estimates use the same measure, with
-    a ratio calibrated on it. Segment savings are content bytes, never more
-    than what removing the segment saves on the wire, so a request the
-    decision admits passes the final check while anything remains sheddable.
+    a ratio calibrated on it. Segment savings are what each segment occupies
+    on the wire, escapes included, never more than removing it saves, so a
+    request the decision admits passes the final check while anything remains
+    sheddable.
     The record's ``request_wire_bytes`` is the decision's bound; the caller
     replaces it with the exact size of the request it sends.
     """
     if (hatch_transcript_index is None) != (hatch_transcript is None):
         raise FrameworkBugError("the hatch transcript and its message index are set together")
-    split = message_bytes(messages, tools)
+    split = message_wire_split(messages, tools)
     latest_start = latest_round_trip_start(messages)
 
     segments: list[SheddableSegment] = []
@@ -3491,9 +3492,10 @@ def _fit_planner_context_budget(
             ],
             key=lambda entry: entry[0],
         )
-        # An entry's saving is its canonical JSON inside the request plus its separator.
+        # An entry's saving is its canonical JSON as escaped inside the request
+        # message's content, plus its separator.
         segments.extend(
-            SheddableSegment(kind=kind, key=f"history:{index}", saving_bytes=len(canonical_json(entry).encode("utf-8")) + 1)
+            SheddableSegment(kind=kind, key=f"history:{index}", saving_bytes=escaped_bytes(canonical_json(entry)) + 1)
             for index, kind, entry in entries
         )
         history_index_by_key = {f"history:{index}": index for index, _kind, _entry in entries}
@@ -3507,9 +3509,9 @@ def _fit_planner_context_budget(
     if hatch_transcript is not None and hatch_transcript_index is not None:
         if messages[hatch_transcript_index]["content"] != _HATCH_TRANSCRIPT_HEADER + hatch_transcript.provider_json:
             raise FrameworkBugError("planner hatch message does not carry the transcript the context budget labels")
-        # An event's saving is its bytes in the transcript plus a separator;
-        # escaping the content again inside the request only adds to it.
-        event_sizes = hatch_transcript.event_bytes()
+        # An event's saving is its bytes in the transcript as escaped inside
+        # the request message's content, plus a separator.
+        event_sizes = hatch_transcript.event_wire_bytes()
         hatch_index_by_key = {f"hatch:{index}": index for index in hatch_transcript.sheddable_event_indices()}
         hatch_segments = [
             SheddableSegment(kind=SheddableKind.HATCH_EVENT, key=key, saving_bytes=event_sizes[index])

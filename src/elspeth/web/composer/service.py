@@ -110,7 +110,6 @@ from elspeth.web.composer.context_budget_apply import (
     held_tool_keys,
     largest_component,
     latest_round_trip_start,
-    message_bytes,
     message_wire_split,
     previously_shed_keys,
     request_wire_bytes,
@@ -1679,7 +1678,9 @@ class ComposerServiceImpl:
         state_index = frame.state_index
         if len(messages) < state_index + 2 or messages[state_index]["content"] != frame.state_message_content:
             raise InvariantError("compose-loop request does not have the layout its context budget frame describes")
-        split = message_bytes(messages, tools or None)
+        # Savings are wire bytes: a history message's whole canonical JSON (its
+        # separator is not counted), a tool result's wire bytes less its stub's.
+        split = message_wire_split(messages, tools or None)
         latest_start = latest_round_trip_start(messages)
 
         segments: list[SheddableSegment] = []
@@ -1697,9 +1698,9 @@ class ComposerServiceImpl:
         # The decision measures the request as it will be sent: with cache
         # markers, in wire bytes (content, tool-call arguments, thinking
         # blocks and tool definitions all count), plus the worst case the
-        # omission counts can add. The content split above only labels
-        # segments and names components; its savings are lower bounds on the
-        # wire savings.
+        # omission counts can add. The savings above are what each segment
+        # occupies on the wire, so the size after shedding stays an upper
+        # bound without carrying the escapes and framing of what was shed.
         sent_messages = _reply_stage_messages(messages) if reply_stage else messages
         sent_tools = tools or None
         if supports_anthropic_prompt_cache_markers(self._model):
