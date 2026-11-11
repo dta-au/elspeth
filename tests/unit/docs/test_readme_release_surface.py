@@ -38,8 +38,22 @@ def test_readme_operational_cutover_states_the_live_schema_epochs() -> None:
     assert "the package version alone does not establish qualification or image publication" in text
     assert "Automatic image publication from main is held" in text
     assert "verify the release tag and image digest" in text
+    assert "0.8.13 adds the Composer context budget" in text
+    assert "`ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS` is required and has no default" in text
+    assert "the web server does not start without it" in text
+    assert "The default of `ELSPETH_WEB__COMPOSER_PLANNER_MAX_REQUEST_BYTES` drops from 2 MiB to 960 KiB" in text
+    assert "The budget does not bound every Composer request" in text
+    assert "Advisor and review calls are not yet covered ([#364](https://github.com/dta-au/elspeth/issues/364))" in text
+
+
+def test_readme_keeps_the_0_8_12_remediation_as_a_historical_pin() -> None:
+    """The 0.8.12 section keeps its own statements and no current-release claim."""
+    text = _section(_readme_text(), "\n## Previously in 0.8.12\n")
+
+    assert "0.8.12 is the Composer tool remediation" in text
     assert "This contains the defect rather than redesigning it; auto-commit sessions and blob-only proposals are not covered" in text
     assert "MCP file paths are confined to the configured data directory" in text
+    assert "Package metadata is" not in text
 
 
 def test_readme_keeps_the_0_8_10_cutover_as_a_historical_pin() -> None:

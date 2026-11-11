@@ -995,7 +995,11 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # JSONSource token move 01ae33ed...): both byte runs change in one manifest,
 # so neither parent's digest applies. Captured from this file's parity failure
 # on the merged tree.
-EXPECTED_CASE_REGISTRY_SHA256 = "b3162f4d2c0923ba580c22d65a0656aa1d64a7cc005c43d28bdf123b8fa9c17f"
+# 0.8.13 version cut on that merged tree: the same eight engine-owned
+# plugin_version values advance (seven manifest lines), engine:0.8.12 ->
+# engine:0.8.13. Captured from this file's parity failure (previous pin
+# b3162f4d...).
+EXPECTED_CASE_REGISTRY_SHA256 = "3338f07b09c11e79c487f9136bff55eef0c0f80aad4f25de32a07e67eab110d7"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
