@@ -1007,7 +1007,13 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # quarantines now record the row they yield; its manifest provenance token
 # moved 0c356038d5722d0c -> 204c8485e712dc75, the manifest's only changed byte
 # run. Captured from this file's parity failure (previous pin d2879537...).
-EXPECTED_CASE_REGISTRY_SHA256 = "0ce52bbbfc7982e24a3c9fbb9cb194081583d05995702e4d981af78140828865"
+# Sweep finding #80 (20261111-plugins-review): CSVSource decodes line by line
+# so decode errors name the exact line; its fifteen manifest provenance tokens
+# moved 5a67572be967d4aa -> 94e4e14b6d89d7e1, and reopen-resume's
+# resumed_full_projection_sha256 moved 86bda402... -> b8c16e2c..., measured by
+# the production harness (test_dag_scenario_production_path). Captured from
+# this file's parity failure (previous pin 0ce52bbb...).
+EXPECTED_CASE_REGISTRY_SHA256 = "28a82fc86ae1d37ef3053e1d249d1f801e78dffaf297f177928ee4bf39704857"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
