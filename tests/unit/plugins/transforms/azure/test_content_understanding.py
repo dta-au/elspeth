@@ -409,7 +409,7 @@ def test_missing_and_non_string_and_invalid_url_sources() -> None:
     ("body", "status", "cause"),
     [
         ({"id": "op", "status": "Failed", "error": {"code": "InvalidContent", "message": "leak"}}, "failed", "InvalidContent"),
-        ({"id": "op", "status": "Failed"}, "failed", "failed"),
+        ({"id": "op", "status": "Failed"}, "failed", "unknown"),
         ({"id": "op", "status": "Canceled"}, "canceled", "canceled"),
     ],
 )

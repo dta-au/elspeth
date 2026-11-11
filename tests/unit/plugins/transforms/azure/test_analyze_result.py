@@ -167,7 +167,7 @@ def test_parse_poll_body_maps_each_status() -> None:
         PollOutcome(AnalyzeStatus.FAILED, cause="Bad"),
         None,
     )
-    assert _parse({"status": "failed"}) == (PollOutcome(AnalyzeStatus.FAILED, cause="failed"), None)
+    assert _parse({"status": "failed"}) == (PollOutcome(AnalyzeStatus.FAILED, cause="unknown"), None)
     assert _parse({"status": "Canceled"}) == (PollOutcome(AnalyzeStatus.CANCELED, cause="canceled"), None)
 
 

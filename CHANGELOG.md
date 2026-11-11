@@ -22,24 +22,39 @@ qualification, a published tag or an image.
   concatenated across the result's contents. Options also cover
   `content_range`, `mime_type`, `processing_location`, `string_encoding` and
   per-request `model_deployments`. Its key is `AZURE_CONTENT_UNDERSTANDING_KEY`.
-- **`azure_document_intelligence` no longer stores a SAS signature in the
-  audit trail.** A `urlSource` that carried a SAS `sig` was recorded verbatim
-  in the Landscape request record. The audit now fingerprints the
-  credential-shaped query values and userinfo, while Azure still receives the
-  URL unchanged. The fingerprint key requirement is the same one the api-key
-  header already had.
+- **`azure_document_intelligence` no longer records a SAS signature in its
+  HTTP request record.** A `urlSource` that carried a SAS `sig` was recorded
+  verbatim in the Landscape request record and its telemetry. The recorded
+  request now fingerprints the credential-shaped query values and userinfo,
+  while Azure still receives the URL unchanged. The fingerprint key
+  requirement is the same one the api-key header already had. The row's own
+  `source_field` value is unchanged, so the URL is still stored wherever row
+  data is stored.
 - **`azure_document_intelligence` reports `canceled` and `skipped` operations
   as `analysis_failed`.** They were reported as `malformed_response`. The
   error reason now carries `error_type` (`failed` or `canceled`) alongside the
   bounded `cause`.
 - **Rejected Document Intelligence calls name Azure's error code.** An
   `api_error` now carries `code` (Azure's `error.code`) and `cause` (its
-  `innererror.code`), both bounded tokens from Azure's error envelope; the error message is still never recorded.
-  Capacity retries (429/503) honour `Retry-After` within the per-row budget,
-  and a running poll's `Retry-After` is honoured too.
+  `innererror.code`), both bounded tokens from Azure's error envelope; the
+  error message is still never placed in the error reason.
+- **Document Intelligence retry timing follows Azure's `Retry-After`.**
+  Capacity retries (429/503) wait as long as Azure asks. A request for longer
+  than the remaining budget fails the row at once. `max_capacity_retry_seconds`
+  now bounds each call's retrying (clamped to `poll_timeout_seconds`) instead
+  of being measured from the row start, so a 429 on a late poll is retried. A
+  poll `Retry-After` is honoured up to 60 seconds.
+- **Two Document Intelligence failures no longer end the run.** A document
+  URL with a malformed bracketed host fails the row as
+  `invalid_input/invalid_document_url`, and a response with a refused
+  `Content-Encoding` fails it as
+  `malformed_response/response_encoding_refused`.
 - **Invalid base64 is rejected before it is sent.** A base64 source that is
-  not canonical standard base64 (including a `data:` URI) fails the row with
-  `invalid_input/invalid_base64` instead of costing a billed Azure call.
+  not padded standard-alphabet base64 fails the row with
+  `invalid_input/invalid_base64` instead of costing a billed Azure call. This
+  includes a `data:` URI, the URL-safe alphabet, and line-wrapped or
+  whitespace-containing output, which was previously forwarded to Azure;
+  strip line breaks upstream.
 - **The Document Intelligence batch wait now covers a full request
   timeout.** A large `request_timeout_seconds` could previously let a row
   outlive the batch wait.
@@ -47,6 +62,11 @@ qualification, a published tag or an image.
   first document's typed fields as plain values (for example `InvoiceTotal`).
   `metadata_field` writes bounded analysis metadata: model id, operation id,
   page and document counts, and warning codes.
+- **Smaller `azure_document_intelligence` changes.** A `malformed_response`
+  message now names the facet without the `analyzeResult.` prefix. The
+  success metadata's `operation_id` is omitted when Azure's id is not a plain
+  token. The catalogue lists the shared source, polling and timeout options
+  before `endpoint` and `model_id`. Option names and defaults are unchanged.
 
 
 ---
