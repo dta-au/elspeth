@@ -819,7 +819,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:eb90d8e44c6ff93d"
+    source_file_hash: str | None = "sha256:0c38862aa7a0f075"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -1330,6 +1330,13 @@ class WebScrapeTransform(BaseTransform):
                 raise FrameworkBugError("web_scrape has no configured URL source")
             if type(url) is not str:
                 raise TypeError("URL field must be a string")
+            # httpx refuses ASCII control characters (C0 and DEL) with
+            # httpx.InvalidURL, which is neither ValueError nor RequestError;
+            # urlsplit silently drops some of them, so the SSRF checks admit
+            # them. Refuse here, whatever allowed_origins says, so a trailing
+            # newline in a row's URL is a row error and not a crash.
+            if any(char.isascii() and not char.isprintable() for char in url):
+                raise SSRFBlockedError("URL contains an ASCII control character", kind="malformed_url")
             validate_allowed_http_origin(url, self._request_allowed_origins)
             if request_params:
                 try:
