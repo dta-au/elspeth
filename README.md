@@ -118,6 +118,13 @@ standalone MCP server runs under a supervisor that settles its child process on
 shutdown, failed start and parent death. Creating Landscape tables on PostgreSQL
 no longer breaks a later SQLite initialization in the same process.
 
+The web interface takes the ARGOnite look in light and dark themes. A new
+`file_inject` transform attaches the content of a file to each row; in the
+Composer it accepts only a file the user uploaded. Langfuse moves to 5.2.0 and
+the OpenTelemetry packages to 1.45.1, which clears the remaining Python
+dependency advisories; Langfuse tracing now needs Langfuse Cloud or a
+self-hosted server at 4.59.0 or later.
+
 Session epoch 78 and Landscape epoch 50 are unchanged from the previous
 release; this release adds no schema-epoch cutover, so existing session and
 Landscape stores need no action. The 0.8.10 cutover guidance below continues to
