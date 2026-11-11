@@ -107,10 +107,14 @@ The stored `request_byte_split` is a different measure (a message with string
 content counts as that content alone). Its meaning is unchanged and the
 budget is not judged on it.
 
-A sheddable segment's saving is counted in content bytes. Shedding never
-saves less than that on the wire, so sizes computed after shedding are upper
-bounds: an admitted request fits, and shedding may go further than strictly
-needed. A fixed allowance covers the bytes a re-render adds (the omission
+A sheddable segment's saving is what it occupies on the wire: a whole
+history message's canonical JSON, a tool result's wire bytes less its stub's,
+and for a planner history entry or a hatch transcript event (both carried
+inside a message's content) its serialization as escaped once more. Shedding
+never saves less than that, so sizes computed after shedding are upper bounds
+and an admitted request fits. Counting content bytes alone would leave the
+escapes and framing of everything shed in the bound, which grows with the
+history and would refuse a long session that fits once shed. A fixed allowance covers the bytes a re-render adds (the omission
 counts; the hatch transcript's gap marker).
 
 ### Token estimate

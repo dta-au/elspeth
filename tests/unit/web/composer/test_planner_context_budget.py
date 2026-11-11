@@ -79,8 +79,12 @@ _TRANSCRIPT_ALLOWANCE = CONTEXT_BUDGET_TRANSCRIPT_GAP_ALLOWANCE_BYTES
 
 
 def _entry_saving(index: int, content: str) -> int:
-    """Bytes an entry occupies inside the request message, plus its separator."""
-    return len(canonical_json({"history_index": index, "content": content}).encode("utf-8")) + 1
+    """Wire bytes an entry occupies inside the request message, plus its separator.
+
+    The payload is the message's content, so the entry's canonical JSON is
+    escaped once more on the wire; the outer string's quotes are not its own.
+    """
+    return len(canonical_json(canonical_json({"history_index": index, "content": content})).encode("utf-8")) - 2 + 1
 
 
 def _sent_bytes(request: dict[str, Any]) -> int:
@@ -318,6 +322,32 @@ async def test_both_ceilings_and_the_recorded_size_are_on_the_wire_bytes_of_the_
     cap_bytes = wire - 5_000
     assert content + _ALLOWANCE < cap_bytes < wire
     request, call = await _decline(tmp_path, tool_context, context, policy=_context_policy(max_request_bytes=cap_bytes), model=model)
+    assert _sent_bytes(request) <= cap_bytes
+    assert call.context_budget is not None and call.context_budget.shed_history_indices == (1,)
+    assert call.context_budget.request_wire_bytes == _sent_bytes(request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", [_ANTHROPIC, _UNMARKED], ids=["anthropic-marked", "unmarked"])
+async def test_escape_heavy_history_that_fits_once_shed_is_shed_not_refused(tmp_path: Path, tool_context: ToolContext, model: str) -> None:
+    """An entry's saving is what it occupies on the wire, escapes included, not its content bytes.
+
+    The payload rides inside the request message's content, so each quote in
+    the reply is three bytes on the wire. Counted by content alone, those
+    escapes stay in the size bound after the reply is shed, and a request
+    that fits without it would be refused.
+    """
+    users = {0: "Build CSV to JSON."}
+    reply = '"' * 40_000
+    users_only_request, _ = await _decline(tmp_path, tool_context, _context(users=users), model=model)
+    context = _context(users=users, assistants={1: reply})
+    full_request, _ = await _decline(tmp_path, tool_context, context, model=model)
+    cap_bytes = _sent_bytes(users_only_request) + _ALLOWANCE + 2_000
+    content_saving = len(canonical_json({"history_index": 1, "content": reply}).encode("utf-8")) + 1
+    assert _sent_bytes(full_request) + _ALLOWANCE - content_saving > cap_bytes
+
+    request, call = await _decline(tmp_path, tool_context, context, policy=_context_policy(max_request_bytes=cap_bytes), model=model)
+
     assert _sent_bytes(request) <= cap_bytes
     assert call.context_budget is not None and call.context_budget.shed_history_indices == (1,)
     assert call.context_budget.request_wire_bytes == _sent_bytes(request)
@@ -1107,6 +1137,30 @@ def test_transcript_events_shed_on_an_earlier_call_of_the_request_stay_shed_betw
     assert sticky[3]["content"] == _HATCH_TRANSCRIPT_HEADER + transcript.without_events(frozenset({0, 1})).provider_json
     # The rebuilt message's prompt-guard parts describe the content it now carries.
     assert "".join(part.text for part in sticky[3][PROMPT_GUARD_CONTENT_PARTS_KEY]) == sticky[3]["content"]
+
+
+def test_an_escape_heavy_hatch_event_that_fits_once_shed_is_shed_not_refused() -> None:
+    """An event's saving is what it occupies on the wire, not its bytes in the transcript.
+
+    The transcript rides inside the request message's content, so each quote
+    in the event is three bytes on the wire; counted by transcript bytes, the
+    escapes stay in the size bound after the event is shed.
+    """
+    transcript, _ = _hatch_message([{"role": "user", "content": '"' * 20_000}, {"role": "user", "content": "keep"}], [])
+    full, _, _ = _fit_hatch_request(transcript, earlier_calls=(), policy=_context_policy(max_request_bytes=1_000_000))
+    shed_size = _request_size_of(
+        [
+            message if index != 3 else _hatch_transcript_message(transcript.without_events(frozenset({0})))
+            for index, message in enumerate(full)
+        ]
+    )
+    policy = _context_policy(max_request_bytes=shed_size + _TRANSCRIPT_ALLOWANCE + 500)
+    assert _request_size_of(full) + _TRANSCRIPT_ALLOWANCE - transcript.event_bytes()[0] > policy.max_request_bytes
+
+    applied, record, _ = _fit_hatch_request(transcript, earlier_calls=(), policy=policy)
+
+    assert record.shed_hatch_event_indices == (0,)
+    assert _request_size_of(applied) <= policy.max_request_bytes
 
 
 @pytest.mark.parametrize("gaps", [[], ["authenticated_persisted_history_not_supplied"]], ids=["no-gaps", "a-gap"])

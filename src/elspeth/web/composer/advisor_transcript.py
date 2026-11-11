@@ -18,6 +18,7 @@ from pydantic import JsonValue
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import is_lower_sha256_hex, stable_hash
 from elspeth.contracts.prompt_guard import PromptGuardContentPart
+from elspeth.web.composer.context_budget import escaped_bytes
 from elspeth.web.composer.control_messages import replay_composer_control_message
 from elspeth.web.composer.prompt_guard_rendering import JsonPath, _json_inspection_text, json_content_parts
 from elspeth.web.composer.visible_tool_event import (
@@ -618,6 +619,19 @@ class AdvisorVisibleTranscript:
         """
         payload = json.loads(self.provider_json)
         return tuple(len(json.dumps(event, ensure_ascii=False).encode("utf-8")) + 1 for event in payload["events"])
+
+    def event_wire_bytes(self) -> tuple[int, ...]:
+        """Wire bytes each event occupies once the transcript is carried as a request message's content, plus one.
+
+        The transcript travels inside a JSON string, so each event's
+        serialization is escaped once more; escaping is per character, so an
+        event's share is its own escaped length. The separator escapes to its
+        own two bytes, and the plus-one carries :meth:`event_bytes`'s
+        convention: a lower bound while one event remains, one over when the
+        lone last event goes.
+        """
+        payload = json.loads(self.provider_json)
+        return tuple(escaped_bytes(json.dumps(event, ensure_ascii=False)) + 1 for event in payload["events"])
 
     def sheddable_event_indices(self) -> tuple[int, ...]:
         """Indices of every event except the current request's reference.

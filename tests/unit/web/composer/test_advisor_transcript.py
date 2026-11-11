@@ -505,6 +505,24 @@ def test_event_bytes_are_each_events_serialization_in_the_transcript_plus_its_se
     assert all(json.dumps(event, ensure_ascii=False) in transcript.provider_json for event in events)
 
 
+def test_event_wire_bytes_are_each_events_escaped_serialization_inside_a_message_plus_one():
+    """The transcript rides inside a JSON string: an event's wire share is its escaped serialization."""
+    from elspeth.core.canonical import canonical_json
+
+    transcript = _transcript_with_history()
+    events = json.loads(transcript.provider_json)["events"]
+
+    wire = transcript.event_wire_bytes()
+
+    escaped = [canonical_json(json.dumps(event, ensure_ascii=False))[1:-1] for event in events]
+    assert wire == tuple(len(text.encode("utf-8")) + 1 for text in escaped)
+    # Each escaped serialization is a verbatim substring of the escaped transcript.
+    carried = canonical_json(transcript.provider_json)
+    assert all(text in carried for text in escaped)
+    # Events carry quotes, so the wire share is larger than the transcript share.
+    assert all(w > b for w, b in zip(wire, transcript.event_bytes(), strict=True))
+
+
 def test_without_events_drops_exactly_the_named_events_and_discloses_the_omission_once():
     from elspeth.contracts.hashing import stable_hash
     from elspeth.web.composer.advisor_transcript import CONTEXT_BUDGET_TRANSCRIPT_OMISSION_GAP

@@ -130,10 +130,12 @@ def tool_result_segments(
 ) -> tuple[list[SheddableSegment], dict[str, list[int]]]:
     """Label the tool results in ``messages[start:stop]`` that stubbing would shrink.
 
-    ``split`` is ``message_bytes(messages, ...)``. Each segment is keyed
-    ``tool:<tool_call_id>`` in request order. A provider may reuse a tool-call
-    id across rounds; one key then covers every result in the range that
-    carries it, and the returned positions list each of them.
+    ``split`` is ``message_wire_split(messages, ...)``. A result's saving is
+    its wire bytes less its stub's: stubbing replaces it in place, so that is
+    exactly what the request loses on the wire, escapes and all. Each segment
+    is keyed ``tool:<tool_call_id>`` in request order. A provider may reuse a
+    tool-call id across rounds; one key then covers every result in the range
+    that carries it, and the returned positions list each of them.
     """
     positions: dict[str, list[int]] = {}
     savings: Counter[str] = Counter()
@@ -141,7 +143,7 @@ def tool_result_segments(
         message = messages[index]
         if message["role"] != "tool":
             continue
-        saving = split.message_bytes[index] - message_bytes([stubbed_tool_message(message)], None).total_bytes
+        saving = split.message_bytes[index] - message_wire_split([stubbed_tool_message(message)], None).total_bytes
         if saving <= 0:
             continue
         key = f"tool:{message['tool_call_id']}"

@@ -686,6 +686,34 @@ async def test_a_request_under_the_byte_ceiling_by_content_but_over_it_on_the_wi
 
 @pytest.mark.asyncio
 @_MODELS
+async def test_escape_heavy_history_that_fits_once_shed_is_shed_not_refused(model: str) -> None:
+    """A segment's saving is what it occupies on the wire, escapes included, not its content bytes.
+
+    Counted by content alone, the reply's 40,000 escape bytes stay in the
+    size bound after it is shed, and a request that fits once the reply is
+    gone would be refused.
+    """
+    user_request = _user(0, "Please read the CSV file.")
+    reply = '"' * 40_000
+    history = [user_request, _assistant(reply)]
+    _full_content, full_wire = await _measure_sizes(model, history)
+    _kept_content, kept_wire = await _measure_sizes(model, [user_request])
+    max_request_bytes = kept_wire + 2_000
+    assert full_wire - len(reply.encode()) > max_request_bytes
+
+    provider, result = await _compose_or_refusal(model, history, max_prompt_tokens=_GENEROUS_TOKENS, max_request_bytes=max_request_bytes)
+
+    assert not isinstance(result, ComposerConvergenceError), result
+    (request,) = provider.requests
+    (call,) = result.llm_calls
+    assert _wire_bytes(request) <= max_request_bytes
+    assert call.context_budget is not None
+    assert call.context_budget.shed_history_indices == (1,)
+    _assert_record_matches_request(call, request)
+
+
+@pytest.mark.asyncio
+@_MODELS
 async def test_protected_content_under_the_byte_ceiling_by_content_but_over_it_on_the_wire_is_refused_unsent(model: str) -> None:
     current_message = "Build a CSV pipeline. " + _ESCAPING_PROSE
     full_content, full_wire = await _measure_sizes(model, [], message=current_message)
@@ -809,8 +837,8 @@ _ESCAPING_CONTENTS = [
 
 
 @pytest.mark.parametrize("content", _ESCAPING_CONTENTS)
-def test_a_segments_wire_saving_is_never_less_than_its_content_saving(content: str) -> None:
-    """The byte-ceiling arithmetic subtracts content savings from wire bytes; that is safe only while this holds."""
+def test_a_segments_saving_is_its_wire_saving_never_more(content: str) -> None:
+    """The byte-ceiling arithmetic subtracts savings from wire bytes: each must be the wire saving, at most."""
     prefix: list[dict[str, Any]] = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
     tool_round: list[dict[str, Any]] = [
         {
@@ -821,16 +849,18 @@ def test_a_segments_wire_saving_is_never_less_than_its_content_saving(content: s
         {"role": "tool", "tool_call_id": "c1", "content": content},
     ]
     messages = [*prefix, *tool_round]
-    segments, positions = tool_result_segments(messages, message_bytes(messages, None), start=2, stop=len(messages))
+    segments, positions = tool_result_segments(messages, message_wire_split(messages, None), start=2, stop=len(messages))
     (segment,) = segments
     stubbed = [stubbed_tool_message(m) if i in positions[segment.key] else m for i, m in enumerate(messages)]
-    assert request_wire_bytes(messages, None) - request_wire_bytes(stubbed, None) >= segment.saving_bytes
+    # Stubbing replaces the result in place: the saving is exactly the wire difference.
+    assert segment.saving_bytes == request_wire_bytes(messages, None) - request_wire_bytes(stubbed, None)
 
-    # Removing a history message: the content saving is the message's content bytes.
+    # Removing a history message saves its whole wire form and one separator; the saving counts the message.
     history = [*prefix, {"role": "assistant", "content": content}, {"role": "user", "content": "now"}]
-    content_saving = message_bytes(history, None).message_bytes[2]
-    assert content_saving == len(content.encode("utf-8"))
-    assert request_wire_bytes(history, None) - request_wire_bytes([*history[:2], history[3]], None) >= content_saving
+    wire_saving = message_wire_split(history, None).message_bytes[2]
+    assert wire_saving == len(canonical_json(history[2]).encode("utf-8"))
+    assert wire_saving > len(content.encode("utf-8"))
+    assert request_wire_bytes(history, None) - request_wire_bytes([*history[:2], history[3]], None) == wire_saving + 1
 
 
 # --- The shed-history notice ----------------------------------------------------------------

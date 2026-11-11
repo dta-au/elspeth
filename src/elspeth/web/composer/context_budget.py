@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final, Literal
 
-from elspeth.core.canonical import stable_hash
+from elspeth.core.canonical import canonical_json, stable_hash
 
 CONTEXT_BUDGET_FALLBACK_BYTES_PER_TOKEN: Final[float] = 3.0
 # Every size in this module is WIRE bytes: the canonical JSON of the request
@@ -46,6 +46,16 @@ CONTEXT_BUDGET_FALLBACK_BYTES_PER_TOKEN: Final[float] = 3.0
 CONTEXT_BUDGET_MIN_BYTES_PER_TOKEN: Final[float] = 2.0
 CONTEXT_BUDGET_MAX_BYTES_PER_TOKEN: Final[float] = 6.0
 CONTEXT_BUDGET_TOOL_RESULT_STUB: Final[str] = "[Result omitted by ELSPETH to fit the context budget. Call the tool again if you need it.]"
+
+
+def escaped_bytes(text: str) -> int:
+    """UTF-8 wire bytes ``text`` occupies inside a JSON string of the canonical request, without the quotes.
+
+    String escaping is per character, so a substring's share of an escaped
+    string is its own escaped length. Callers size text nested in a message's
+    content (a serialized payload or transcript) with it.
+    """
+    return len(canonical_json(text).encode("utf-8")) - 2
 
 
 class SheddableKind(StrEnum):
@@ -166,11 +176,13 @@ def decide_context_budget(
     it gives the token estimate.
 
     A segment's ``saving_bytes`` must never exceed what shedding it removes
-    from the wire. A content-byte saving qualifies: JSON escaping and message
-    framing only add bytes, and the constant stub escapes to itself. Because
-    savings are lower bounds, the sizes computed after shedding over-state
-    what will be sent: an admitted request fits both ceilings, at the cost
-    that shedding may go one segment further than strictly needed.
+    from the wire, and should be close to it: callers count what the segment
+    occupies on the wire, escapes and framing included. Because savings are
+    lower bounds, the sizes computed after shedding over-state what will be
+    sent and an admitted request fits both ceilings. A looser bound (content
+    bytes alone) would also be safe but leaves the escapes of everything shed
+    in the size, which grows with the history until a request that fits once
+    shed is refused.
     """
     if bytes_per_token is not None and not (math.isfinite(bytes_per_token) and bytes_per_token > 0):
         raise ValueError("bytes_per_token must be a finite positive number or None")
