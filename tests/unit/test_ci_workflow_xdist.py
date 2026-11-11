@@ -159,10 +159,10 @@ def test_python_matrix_ci_does_not_hard_disable_xdist() -> None:
     test_job = workflow["jobs"]["test"]
 
     coverage_run = _step_run(test_job, "Run tests with coverage")
-    no_coverage_run = _step_run(test_job, "Run tests without coverage")
 
     assert "0" not in _pytest_numprocesses_values(coverage_run)
-    assert "0" not in _pytest_numprocesses_values(no_coverage_run)
+    # The single 3.14 lane is the coverage lane; no uncovered variant remains.
+    assert "Run tests without coverage" not in {step["name"] for step in test_job["steps"] if "name" in step}
 
 
 def _assert_timing_workflow_contract(workflow: dict[str, Any]) -> None:
@@ -206,10 +206,11 @@ def _assert_timing_workflow_contract(workflow: dict[str, Any]) -> None:
         "UV_PYTHON": "${{ matrix.python-version }}",
         "COVERAGE_FILE": "coverage-data",
     }
-    for covered, name in ((True, "Run timing-sensitive tests with coverage"), (False, "Run timing-sensitive tests without coverage")):
+    assert "Run timing-sensitive tests without coverage" not in {step["name"] for step in job["steps"] if "name" in step}
+    for covered, name in ((True, "Run timing-sensitive tests with coverage"),):
         step = _step(job, name)
         assert set(step) == {"name", "if", "working-directory", "run"}
-        assert step["if"] == ("matrix.coverage" if covered else "${{ !matrix.coverage }}")
+        assert step["if"] == "matrix.coverage"
         assert step["working-directory"] == "${{ env.CI_CHECKOUT_PATH }}"
         expected = [
             "uv",
@@ -650,7 +651,7 @@ def test_test_job_reports_through_junit_not_verbose_log() -> None:
     whatever the outcome."""
     test_job = _ci_workflow()["jobs"]["test"]
 
-    for step_name in ("Run tests with coverage", "Run tests without coverage"):
+    for step_name in ("Run tests with coverage",):
         args = _pytest_args(_step_run(test_job, step_name))
         assert "-v" not in args
         assert "--junitxml=pytest-junit.xml" in args
@@ -735,10 +736,11 @@ def _assert_long_run_workflow_contract(workflow: dict[str, Any]) -> None:
     }
     assert _step(job, "Checkout code")["with"] == {"path": "${{ env.CI_CHECKOUT_PATH }}", "ref": "${{ github.sha }}", "fetch-depth": 0}
     assert _step(job, "Install dependencies")["run"] == "uv sync --frozen --all-extras"
-    for covered, name in ((True, "Run long-run proof with coverage"), (False, "Run long-run proof without coverage")):
+    assert "Run long-run proof without coverage" not in {step["name"] for step in job["steps"] if "name" in step}
+    for covered, name in ((True, "Run long-run proof with coverage"),):
         step = _step(job, name)
         assert set(step) == {"name", "if", "working-directory", "run"}
-        assert step["if"] == ("matrix.coverage" if covered else "${{ !matrix.coverage }}")
+        assert step["if"] == "matrix.coverage"
         assert step["working-directory"] == "${{ env.CI_CHECKOUT_PATH }}"
         expected = [
             "uv",
@@ -881,7 +883,7 @@ def test_three_case_contract_rejects_identity_and_admission_bypasses(mutation: s
         _assert_long_run_workflow_contract(workflow)
 
 
-@pytest.mark.parametrize("step_name", ["Run long-run proof with coverage", "Run long-run proof without coverage"])
+@pytest.mark.parametrize("step_name", ["Run long-run proof with coverage"])
 @pytest.mark.parametrize(
     "mutation", ["or-true", "newline-exit", "newline-true", "prefix-true", "marker", "partition", "case", "parallel", "step-continue"]
 )

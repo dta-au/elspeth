@@ -1936,7 +1936,7 @@ def _assert_activation_contract(jobs: dict[str, Any]) -> None:
     assert set(caller) == {"name", "if", "uses"}
     assert caller["uses"] == "./.github/workflows/landscape-long-run.yml"
     assert caller["if"] == "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository"
-    for name in ("Run tests with coverage", "Run tests without coverage"):
+    for name in ("Run tests with coverage",):
         run = _activation_step(jobs["test"], name)["run"]
         tokens = shlex.split(run.replace("\\\n", " "), comments=True)
         args = tokens[tokens.index("pytest") + 1 :]

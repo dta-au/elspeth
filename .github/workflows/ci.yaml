@@ -552,21 +552,6 @@ jobs:
             -q -rfE \
             --junitxml=pytest-junit.xml
 
-      - name: Run tests without coverage
-        if: ${{ !matrix.coverage }}
-        working-directory: ${{ env.CI_CHECKOUT_PATH }}
-        run: |
-          # No `-m`: same reason as the coverage step above. Use the same
-          # per-lane worker cap as the coverage lane, and the same output
-          # flags and JUnit report.
-          uv run python -m pytest tests/ -p scripts.ci_test_shards \
-            --ci-partition=ordinary \
-            --ci-shard-count=8 --ci-shard-index=${{ matrix.shard }} \
-            --ci-shard-report=shard-manifest.json \
-            -n "$PYTEST_WORKERS" \
-            -q -rfE \
-            --junitxml=pytest-junit.xml
-
       - name: Upload JUnit report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -690,17 +675,6 @@ jobs:
             --ci-shard-report=shard-manifest.json \
             -m "not slow and not stress and not performance and not testcontainer and not live_provider and timing_sensitive" \
             --cov=src/elspeth --cov-report= --cov-fail-under=0 \
-            -n 0 -q -rfE --junitxml=pytest-junit.xml
-
-      - name: Run timing-sensitive tests without coverage
-        if: ${{ !matrix.coverage }}
-        working-directory: ${{ env.CI_CHECKOUT_PATH }}
-        run: |
-          uv run python -m pytest tests/ -p scripts.ci_test_shards \
-            --ci-partition=timing \
-            --ci-shard-count=1 --ci-shard-index=0 \
-            --ci-shard-report=shard-manifest.json \
-            -m "not slow and not stress and not performance and not testcontainer and not live_provider and timing_sensitive" \
             -n 0 -q -rfE --junitxml=pytest-junit.xml
 
       - name: Upload JUnit report
