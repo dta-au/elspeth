@@ -86,6 +86,9 @@ from elspeth.plugins.transforms.aws.textract_result import (
 
 _BUCKET_PATTERN = re.compile(r"^[0-9A-Za-z.\-_]*$")
 _TEXTRACT_SDK_TIMEOUT_HEADROOM_SECONDS = 90.0
+# Poll-sleep slice: the plugin waits on the engine's shutdown event and
+# re-checks its private close() event at least this often.
+_SHUTDOWN_WAIT_SLICE_SECONDS = 0.25
 
 # Hard ceilings on what an author may configure. Each row holds the shared
 # execution worker until its job reaches a terminal status or the poll deadline
@@ -340,7 +343,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:bd472cf7bdb1f53b"
+    source_file_hash: str | None = "sha256:867e64a6669937f3"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -461,6 +464,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         self._row_clients: dict[str, TextractClient] = {}
         self._row_clients_lock = threading.Lock()
         self._shutdown = threading.Event()
+        self._run_shutdown: threading.Event | None = None
         self._batch_initialized = False
 
     def _bind_profiled_audit_identity(
@@ -523,8 +527,11 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         self._node_id = node_id
         self._telemetry_emit = ctx.telemetry_emit
         self._limiter = ctx.rate_limit_registry.get_limiter(self.name) if ctx.rate_limit_registry is not None else None
-        if ctx.shutdown_event is not None:
-            self._shutdown = ctx.shutdown_event
+        # A fresh private event per start: close() sets it, so a restarted
+        # instance must not inherit the previous run's stop. The engine's
+        # event is only ever read.
+        self._shutdown = threading.Event()
+        self._run_shutdown = ctx.shutdown_event
         self._bucket_region_coordinator = BucketRegionCoordinator()
         created_s3 = False
         created_textract = False
@@ -772,12 +779,38 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             digest.update(encoded)
         return digest.hexdigest()
 
+    def _shutdown_requested(self) -> bool:
+        """Whether close() (private event) or the engine (run event) asked work to stop.
+
+        The engine's ``ctx.shutdown_event`` is read-only to this plugin:
+        close() stops this plugin's workers through the private
+        ``_shutdown`` event and never raises the run-wide cancellation signal.
+        """
+        run_shutdown = self._run_shutdown
+        return self._shutdown.is_set() or (run_shutdown is not None and run_shutdown.is_set())
+
+    def _wait_for_shutdown(self, timeout: float) -> bool:
+        """Sleep up to ``timeout`` seconds; return True as soon as either stop event is set.
+
+        Waits on the engine event in short slices so a close()-driven private
+        stop is also observed promptly without ever writing the engine event.
+        """
+        deadline = time.monotonic() + timeout
+        while not self._shutdown_requested():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            wait_on = self._shutdown if self._run_shutdown is None else self._run_shutdown
+            if wait_on.wait(timeout=min(remaining, _SHUTDOWN_WAIT_SLICE_SECONDS)):
+                return True
+        return True
+
     def _process_single_with_state(
         self, row: PipelineRow, state_id: str, *, ctx: TransformContext, token_id: str | None
     ) -> TransformResult:
         if not self._run_id or not self._node_id or token_id is None:
             raise FrameworkBugError("Amazon Textract processing requires run, node, and token identity")
-        if self._shutdown.is_set():
+        if self._shutdown_requested():
             return TransformResult.error({"reason": "shutdown_requested"}, retryable=False)
         location = self._read_document_location(row)
         if isinstance(location, TransformResult):
@@ -967,7 +1000,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         block_count = 0
         retained_result_bytes = 0
         while True:
-            if self._shutdown.is_set():
+            if self._shutdown_requested():
                 return TransformResult.error({"reason": "shutdown_requested"}, retryable=False)
             if time.monotonic() >= deadline:
                 return TransformResult.error({"reason": "poll_timeout"}, retryable=True)
@@ -984,7 +1017,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 poll_reason: TransformErrorCategory = "result_too_large" if error.category == "response_too_large" else "malformed_response"
                 return TransformResult.error({"reason": poll_reason, "error_type": "poll_response"}, retryable=False)
 
-            if self._shutdown.is_set():
+            if self._shutdown_requested():
                 return TransformResult.error({"reason": "shutdown_requested"}, retryable=False)
             if time.monotonic() >= deadline:
                 return TransformResult.error({"reason": "poll_timeout"}, retryable=True)
@@ -1000,7 +1033,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 if now >= deadline:
                     return TransformResult.error({"reason": "poll_timeout"}, retryable=True)
                 sleep_seconds = min(interval, deadline - now)
-                if sleep_seconds > 0 and self._shutdown.wait(timeout=sleep_seconds):
+                if sleep_seconds > 0 and self._wait_for_shutdown(sleep_seconds):
                     return TransformResult.error({"reason": "shutdown_requested"}, retryable=False)
                 interval = min(interval * self._poll_backoff_multiplier, self._poll_max_interval_seconds)
                 continue
@@ -1154,6 +1187,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         prior_limiter = self._limiter
         prior_clients = self._row_clients
         prior_shutdown = self._shutdown
+        prior_run_shutdown = self._run_shutdown
         try:
             self._recorder = ctx.landscape
             self._run_id = ctx.run_id
@@ -1165,6 +1199,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             self._limiter = None
             self._row_clients = {}
             self._shutdown = threading.Event()
+            self._run_shutdown = None
             state_id = ctx.state_id or "textract-invariant-probe-state"
             token_id = ctx.token.token_id if ctx.token is not None else "textract-invariant-probe-token"
             return self._process_single_with_state(probe_rows[0], state_id, token_id=token_id, ctx=ctx)
@@ -1179,6 +1214,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             self._limiter = prior_limiter
             self._row_clients = prior_clients
             self._shutdown = prior_shutdown
+            self._run_shutdown = prior_run_shutdown
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:
