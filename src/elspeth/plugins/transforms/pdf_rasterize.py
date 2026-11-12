@@ -105,6 +105,47 @@ def _page_output_refusal(page_number: int, data: bytes, max_page_bytes: int) -> 
     return None
 
 
+def _page_claim_refusal(page: RenderedPage, *, extract_text: bool, max_page_text_bytes: int, max_page_pixels: int) -> RefusedPage | None:
+    """The parent's own verdict on one worker page's geometry and text claims.
+
+    Like ``_page_output_refusal``, these values come from a worker that parses hostile
+    PDF bytes and reach row data and the audit receipt, so every bound the worker
+    enforces on them is enforced again here. ``RenderedPage`` itself validates nothing.
+    """
+    width, height = page.width_px, page.height_px
+    if type(width) is not int or type(height) is not int or width <= 0 or height <= 0:
+        return RefusedPage(
+            page_number=page.page_number,
+            kind=PageRefusalKind.INVALID_GEOMETRY,
+            detail="render worker claimed a page size that is not a positive integer pixel geometry",
+        )
+    if width * height > max_page_pixels:
+        return RefusedPage(
+            page_number=page.page_number,
+            kind=PageRefusalKind.OVERSIZE_PIXELS,
+            detail=f"render worker claimed {width}x{height} px; max_page_pixels is {max_page_pixels}",
+        )
+    if not extract_text:
+        if page.text is not None:
+            return RefusedPage(
+                page_number=page.page_number,
+                kind=PageRefusalKind.RENDER_ERROR,
+                detail="render worker returned page text although extract_text is disabled",
+            )
+    elif type(page.text) is str:
+        # A non-str text with extraction enabled is a worker protocol break, raised
+        # as a FrameworkBugError where the row is built. surrogatepass: measuring
+        # must not crash on a lone surrogate a broken worker could return.
+        text_bytes = len(page.text.encode("utf-8", "surrogatepass"))
+        if text_bytes > max_page_text_bytes:
+            return RefusedPage(
+                page_number=page.page_number,
+                kind=PageRefusalKind.OVERSIZE_TEXT,
+                detail=f"render worker text is {text_bytes} bytes; max_page_text_bytes is {max_page_text_bytes}",
+            )
+    return None
+
+
 def _build_invariant_probe_pdf() -> bytes:
     """Build a valid one-page PDF for the invariant probe seam.
 
@@ -424,7 +465,7 @@ class PDFRasterize(BaseTransform):
     name = "pdf_rasterize"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:16a1d8c599b42132"
+    source_file_hash: str | None = "sha256:da4a025f44029b01"
     config_model = PDFRasterizeConfig
     usage_when_to_use: str = (
         "Use when each row carries a payload-store content hash for a PDF (from the blob_rows source or blob_fetch) "
@@ -902,9 +943,11 @@ class PDFRasterize(BaseTransform):
 
         The worker parses hostile PDF bytes, so what it says it rendered is checked
         here rather than believed: the page partition, that every page file lies in
-        its own render output directory, that every page file is a PNG within
-        ``max_page_bytes``, and that the admitted pages total at most
-        ``max_total_bytes``. A page failing the per-page check becomes a typed
+        its own render output directory, that every page's claimed geometry is a
+        positive integer size within ``max_page_pixels``, that its text is absent
+        unless ``extract_text`` and then within ``max_page_text_bytes``, that every
+        page file is a PNG within ``max_page_bytes``, and that the admitted pages
+        total at most ``max_total_bytes``. A page failing the per-page check becomes a typed
         refusal, and an aggregate overrun refuses the document, exactly as if the
         worker had refused it.
         """
@@ -949,6 +992,15 @@ class PDFRasterize(BaseTransform):
                     f"pdf_rasterize worker returned page {page.page_number} at path {page.png_path!r}, "
                     f"outside its own render output directory {output_dir!r} — worker containment breach"
                 )
+            claim_refusal = _page_claim_refusal(
+                page,
+                extract_text=self._limits.extract_text,
+                max_page_text_bytes=self._limits.max_page_text_bytes,
+                max_page_pixels=self._limits.max_page_pixels,
+            )
+            if claim_refusal is not None:
+                refused.append(claim_refusal)
+                continue
             data = _read_page_output(resolved_png_path, self._limits.max_page_bytes)
             refusal = _page_output_refusal(page.page_number, data, self._limits.max_page_bytes)
             if refusal is None:
