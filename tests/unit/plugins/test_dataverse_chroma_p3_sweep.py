@@ -403,3 +403,77 @@ class TestFinding93ChromaComposerHintMatchesDiversion:
         assert "aborts the whole batch" not in hints
         assert "non-string" in hints
         assert "diverted per row" in hints
+
+
+def _chroma_member(ordinal: int, row: dict[str, object]) -> Any:
+    import hashlib
+
+    from elspeth.contracts.hashing import canonical_json, stable_hash
+    from elspeth.contracts.sink_effects import SinkEffectMember
+
+    lineage_json = "[]"
+    return SinkEffectMember(
+        ordinal=ordinal,
+        token_id=f"token-{ordinal}",
+        row_id=f"row-{ordinal}",
+        ingest_sequence=ordinal,
+        lineage_json=lineage_json,
+        lineage_hash=hashlib.sha256(lineage_json.encode()).hexdigest(),
+        payload_hash=hashlib.sha256(canonical_json(row).encode()).hexdigest(),
+        row=row,
+        member_effect_id=stable_hash({"effect": "c" * 64, "ordinal": ordinal}),
+    )
+
+
+class TestFinding94ChromaPayloadRejectionDivertsRow:
+    """#94: a payload Chroma rejects at commit (ValueError) diverts that row, as the Dataverse sibling does."""
+
+    def test_rejected_member_is_diverted_and_sibling_is_written(self) -> None:
+        import uuid
+        from datetime import UTC, datetime
+
+        chromadb = pytest.importorskip("chromadb")
+        from elspeth.contracts.sink_effects import (
+            RestrictedSinkEffectContext,
+            SinkEffectInspectionRequest,
+            SinkEffectPipelineMembersInput,
+            SinkEffectPrepareRequest,
+        )
+        from elspeth.plugins.sinks.chroma_sink import ChromaSink
+        from tests.fixtures.base_classes import inject_write_failure
+
+        collection_name = f"p3-reject-{uuid.uuid4().hex[:12]}"
+        collection = chromadb.Client().get_or_create_collection(name=collection_name, metadata={"hnsw:space": "cosine"})
+        config = _chroma_sink_config(
+            "./unused",
+            collection=collection_name,
+            field_mapping={"document_field": "text", "id_field": "doc_id", "metadata_fields": ["chroma:document"]},
+            schema={"mode": "observed"},
+        )
+        sink = inject_write_failure(ChromaSink(config))
+        sink._collection = collection
+        members = (
+            _chroma_member(0, {"doc_id": "bad", "text": "rejected", "chroma:document": "reserved key"}),
+            _chroma_member(1, {"doc_id": "good", "text": "accepted"}),
+        )
+        effect_input = SinkEffectPipelineMembersInput(members, members, len(members))
+        ctx = RestrictedSinkEffectContext(
+            run_id="run-1", run_started_at=datetime(2026, 11, 12, tzinfo=UTC), operation_id="operation-1", sink_node_id="sink-1"
+        )
+        inspection = sink.inspect_effect(SinkEffectInspectionRequest(effect_id="c" * 64, target="{}", predecessor_descriptor=None), ctx)
+        plan = sink.prepare_effect(SinkEffectPrepareRequest(effect_id="c" * 64, effect_input=effect_input, inspection=inspection), ctx)
+
+        outcome: object
+        try:
+            outcome = sink.commit_member_effect(plan, members[0], effect_input, ctx)
+        except Exception as exc:
+            outcome = exc
+        assert not isinstance(outcome, Exception), f"commit raised {outcome!r} instead of diverting the rejected row"
+        rejected = outcome
+        accepted = sink.commit_member_effect(plan, members[1], effect_input, ctx)
+
+        assert rejected.diverted_ordinals == (0,)
+        assert 0 not in rejected.accepted_ordinals
+        assert accepted.diverted_ordinals == ()
+        assert collection.get(ids=["good"])["ids"] == ["good"]
+        assert collection.get(ids=["bad"])["ids"] == []
