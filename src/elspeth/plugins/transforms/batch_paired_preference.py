@@ -132,7 +132,7 @@ class BatchPairedPreference(BaseTransform):
     name = "batch_paired_preference"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:d74b9452995a54ec"
+    source_file_hash: str | None = "sha256:b4177c6dd3fe6a5e"
     config_model = BatchPairedPreferenceConfig
     is_batch_aware = True
     # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
@@ -174,6 +174,9 @@ class BatchPairedPreference(BaseTransform):
                 composer_hints=(
                     "Use output_mode: transform; passthrough requires one emitted row per buffered row. A failed batch applies on_error to every buffered input; discard records quarantine outcomes.",
                     "Use batch_paired_preference under aggregations with a trigger; it compares variants within pair_field groups.",
+                    f"A flush over more than {_MAX_BATCH_ROWS} buffered rows fails the whole batch (batch_too_large): "
+                    f"keep trigger count at or below {_MAX_BATCH_ROWS}, and do not rely on an end-of-source flush "
+                    "(omitted trigger) when the input can exceed it.",
                     "pair_field, variant_field, and score_field must be three distinct fields.",
                     "baseline_variant defaults to the first-seen variant; incomplete pairs are counted but not compared.",
                     "Output is paired preference metrics, not the original rows.",
