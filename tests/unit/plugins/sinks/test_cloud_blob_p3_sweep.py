@@ -297,3 +297,61 @@ class TestFinding64AzureCloseReleasesOwnedClients:
         assert service.container_client.blob_client.close_calls == 1
         assert service.close_calls == 1
         assert service.credential.close_calls == 1
+
+
+class TestFinding66AzureJsonStreaming:
+    """#66: Azure JSON/JSONL must stream into the bounded stage and terminate every JSONL record."""
+
+    @pytest.mark.parametrize("fmt", ["json", "jsonl"])
+    def test_cumulative_json_is_streamed_into_the_stage_limit(self, fmt: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.plugins.sinks import _remote_object_effects as remote_effects
+        from tests.unit.plugins.sinks.test_remote_object_sink_effects import _azure, _AzureStore, _member, _prepare
+
+        sink = _azure(_AzureStore(), blob_path=f"out.{fmt}", format=fmt, max_blob_bytes=8)
+        original = sink._serialize_rows
+        batch_sizes: list[int] = []
+
+        def recording(rows: list[dict[str, Any]]) -> bytes:
+            batch_sizes.append(len(rows))
+            return original(rows)
+
+        monkeypatch.setattr(sink, "_serialize_rows", recording)
+        first = _member(0, {"id": 1})
+        second = _member(1, {"id": 2})
+        raised: BaseException | None = None
+        try:
+            _prepare(sink, effect_id="c" * 64, current=(first, second), target_snapshot=(first, second))
+        except Exception as exc:
+            raised = exc
+
+        assert max(batch_sizes) == 1, "the cumulative body must not be materialised as one bytes object"
+        assert isinstance(raised, remote_effects.RemoteObjectEffectLimitError)
+
+    def test_jsonl_terminates_every_record(self) -> None:
+        from pathlib import Path
+
+        from tests.unit.plugins.sinks.test_remote_object_sink_effects import _azure, _AzureStore, _member, _prepare
+
+        sink = _azure(_AzureStore(), blob_path="out.jsonl", format="jsonl")
+        first = _member(0, {"id": 1})
+        second = _member(1, {"id": 2})
+
+        plan = _prepare(sink, effect_id="d" * 64, current=(first, second), target_snapshot=(first, second))
+
+        body = Path(str(plan.safe_evidence["staging_path"])).read_bytes()
+        assert body == b'{"id": 1}\n{"id": 2}\n'
+
+    def test_json_array_bytes_are_unchanged(self) -> None:
+        import json
+        from pathlib import Path
+
+        from tests.unit.plugins.sinks.test_remote_object_sink_effects import _azure, _AzureStore, _member, _prepare
+
+        sink = _azure(_AzureStore(), blob_path="out.json", format="json")
+        rows = [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]
+        members = tuple(_member(index, row) for index, row in enumerate(rows))
+
+        plan = _prepare(sink, effect_id="e" * 64, current=members, target_snapshot=members)
+
+        body = Path(str(plan.safe_evidence["staging_path"])).read_bytes()
+        assert body == json.dumps(rows, indent=2).encode("utf-8")
