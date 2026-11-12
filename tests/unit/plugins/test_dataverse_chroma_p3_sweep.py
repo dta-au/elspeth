@@ -58,3 +58,34 @@ class TestFinding48SelectAndTopValidation:
 
         with pytest.raises(PluginConfigError, match="top"):
             DataverseSourceConfig.from_dict(_source_config(top=top))
+
+
+def _fetchxml_source_config(fetch_xml: str) -> dict[str, Any]:
+    config = _source_config(fetch_xml=fetch_xml)
+    del config["entity"]
+    return config
+
+
+class TestFinding49FetchXmlEntityRequiredAtConfigTime:
+    """#49: FetchXML must name exactly one <entity> under <fetch>, checked at config time."""
+
+    @pytest.mark.parametrize(
+        "fetch_xml",
+        [
+            "<fetch><all-attributes/></fetch>",
+            "<fetch><entity><attribute name='fullname'/></entity></fetch>",
+            "<fetch><entity name='contact'/><entity name='account'/></fetch>",
+        ],
+        ids=["no-entity", "entity-without-name", "two-entities"],
+    )
+    def test_fetchxml_without_exactly_one_named_entity_rejected(self, fetch_xml: str) -> None:
+        from elspeth.plugins.sources.dataverse import DataverseSourceConfig
+
+        with pytest.raises(PluginConfigError, match="entity"):
+            DataverseSourceConfig.from_dict(_fetchxml_source_config(fetch_xml))
+
+    def test_fetchxml_with_one_named_entity_accepted(self) -> None:
+        from elspeth.plugins.sources.dataverse import DataverseSourceConfig
+
+        xml = "<fetch><entity name='contact'><attribute name='fullname'/></entity></fetch>"
+        assert DataverseSourceConfig.from_dict(_fetchxml_source_config(xml)).fetch_xml == xml
