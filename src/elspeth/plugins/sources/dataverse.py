@@ -275,9 +275,14 @@ class DataverseSourceConfig(DataPluginConfig):
                 ) from exc
             if root.tag != "fetch":
                 raise ValueError(f"FetchXML root element must be <fetch>, got <{root.tag}>.")
-            entity_elem = root.find("entity")
-            if entity_elem is not None and "name" in entity_elem.attrib:
-                _validate_dataverse_logical_name(entity_elem.attrib["name"], field_name="FetchXML <entity name>")
+            # _load_rows derives the entity set URL from this element, so a
+            # query without exactly one named <entity> can never run.
+            entity_elems = root.findall("entity")
+            if len(entity_elems) != 1:
+                raise ValueError(f"FetchXML <fetch> must contain exactly one <entity> element, found {len(entity_elems)}.")
+            if "name" not in entity_elems[0].attrib:
+                raise ValueError("FetchXML <entity> element must have a 'name' attribute.")
+            _validate_dataverse_logical_name(entity_elems[0].attrib["name"], field_name="FetchXML <entity name>")
         return v
 
 
@@ -296,7 +301,7 @@ class DataverseSource(BaseSource):
     _normalizes_external_names = True
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:61dbcacae8dedacd"
+    source_file_hash: str | None = "sha256:c84e1f8a147d4255"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 
@@ -902,10 +907,8 @@ class DataverseSource(BaseSource):
                 raise RuntimeError("config validator ensures entity or fetch_xml — neither is set, this is a bug")
             root = ET.fromstring(self._fetch_xml)
             entity_elem = root.find("entity")
-            if entity_elem is None:
-                raise RuntimeError("FetchXML is missing <entity> element — cannot determine entity name for URL")
-            if "name" not in entity_elem.attrib:
-                raise RuntimeError("FetchXML <entity> element missing 'name' attribute")
+            if entity_elem is None or "name" not in entity_elem.attrib:
+                raise RuntimeError("config validator ensures FetchXML has exactly one named <entity> — none found, this is a bug")
             logical_name = entity_elem.attrib["name"]
 
         if self._client is None:
