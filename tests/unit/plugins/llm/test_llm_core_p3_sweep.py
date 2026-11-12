@@ -307,3 +307,62 @@ class TestFinding151TracingWithoutProviderDropsKeys:
     @pytest.mark.parametrize("config", [{}, {"provider": "none"}], ids=["empty", "explicit-none"])
     def test_bare_none_config_still_means_no_tracing(self, config: dict[str, Any]) -> None:
         assert parse_tracing_config(config) == TracingConfig(provider="none")
+
+
+class TestFinding116UpstreamOperationalSuffixCollision:
+    """Sweep finding #116: upstream multi-query refuses suffixes the transform's own fields would overwrite.
+
+    Single-prompt mode refuses an output suffix equal to ``response_field`` or
+    its ``_usage``/``_model`` companions. Upstream multi-query mode with the
+    default (query-name) stem used to accept the same collision and then let
+    the raw response and operational values silently overwrite the extracted
+    value at row assembly. The collision is refused at config time instead.
+    """
+
+    @staticmethod
+    def _queries(suffix: str, *, explicit_none: bool) -> dict[str, Any]:
+        definition: dict[str, Any] = {
+            "input_fields": {"text": "text"},
+            "response_format": "structured",
+            "output_fields": [{"suffix": suffix, "type": "integer"}],
+        }
+        if explicit_none:
+            definition["structured_output_prefix"] = None
+        return {"quality": definition}
+
+    @staticmethod
+    def _config(queries: dict[str, Any], **overrides: Any) -> dict[str, Any]:
+        return _llm_config_dict(required_input_fields=["text"], queries=queries, **overrides)
+
+    @pytest.mark.parametrize("explicit_none", [False, True], ids=["prefix-omitted", "prefix-explicit-none"])
+    @pytest.mark.parametrize(
+        ("response_field", "suffix"),
+        [
+            ("llm_response", "llm_response"),
+            ("llm_response", "llm_response_usage"),
+            ("llm_response", "llm_response_model"),
+            ("answer", "answer"),
+            ("answer", "answer_model"),
+        ],
+    )
+    def test_upstream_default_stem_refuses_operational_collision(self, response_field: str, suffix: str, explicit_none: bool) -> None:
+        raised = _raised_by(
+            lambda: LLMConfig.from_dict(self._config(self._queries(suffix, explicit_none=explicit_none), response_field=response_field))
+        )
+        assert isinstance(raised, PluginConfigError), f"expected PluginConfigError, got {raised!r}"
+        assert "collides with the transform's own response/operational fields" in str(raised)
+        assert f"quality_{suffix}" in str(raised)
+
+    def test_upstream_default_stem_refuses_cross_query_operational_collision(self) -> None:
+        queries = {
+            "a": {"input_fields": {"text": "text"}, "output_fields": [{"suffix": "b_llm_response", "type": "string"}]},
+            "a_b": {"input_fields": {"text": "text"}},
+        }
+        raised = _raised_by(lambda: LLMConfig.from_dict(self._config(queries)))
+        assert isinstance(raised, PluginConfigError), f"expected PluginConfigError, got {raised!r}"
+        assert "collides with the transform's own response/operational fields" in str(raised)
+        assert "a_b_llm_response" in str(raised)
+
+    def test_upstream_default_stem_non_colliding_suffix_is_admitted(self) -> None:
+        config = LLMConfig.from_dict(self._config(self._queries("score", explicit_none=False)))
+        assert [spec.structured_field_name("score") for spec in config.resolved_queries()] == ["quality_score"]
