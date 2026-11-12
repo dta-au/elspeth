@@ -18,7 +18,7 @@ import codecs
 import csv
 import io
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, cast
 
 from jinja2 import TemplateSyntaxError
@@ -99,6 +99,10 @@ class AzureBlobRecordSerializationError(ValueError):
     character, json's ``ValueError`` the non-finite float), with the cause
     suppressed so an uncaught one prints no value either.
     """
+
+
+# Characters of JSON-array text batched into one streamed body chunk.
+_JSON_CHUNK_CHARS = 64 * 1024
 
 
 def _azure_provider_exception_types() -> tuple[type[Exception], ...]:
@@ -397,7 +401,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
     name = "azure_blob"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:c3867c587f977dc9"
+    source_file_hash: str | None = "sha256:8c5310c3821b716f"
     config_model = AzureBlobSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP
@@ -696,7 +700,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
         if type(request.effect_input) is not SinkEffectPipelineMembersInput:
             raise TypeError("AzureBlobSink effects require pipeline member input")
         rows, accepted, diverted, diversion_attribution = self._preflight_effect_members(request.effect_input)
-        body_chunks = self._serialize_csv(rows) if self._format == "csv" else (self._serialize_rows(rows),)
+        body_chunks = self._serialize_csv(rows) if self._format == "csv" else self._json_body_chunks(rows)
         evidence = request.inspection.evidence
         predecessor: ArtifactDescriptor | None = None
         predecessor_declared = evidence["predecessor_declared"]
@@ -757,7 +761,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
         restage_remote_object(
             plan,
             provider="azure_blob",
-            body_chunks=self._serialize_csv(rows) if self._format == "csv" else (self._serialize_rows(rows),),
+            body_chunks=self._serialize_csv(rows) if self._format == "csv" else self._json_body_chunks(rows),
             max_bytes=self._max_blob_bytes,
             accepted_ordinals=accepted,
             diverted_ordinals=diverted,
@@ -837,10 +841,21 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
         """
         if self._format == "csv":
             return b"".join(self._serialize_csv(rows))
-        elif self._format == "json":
-            return self._serialize_json(rows)
+        return b"".join(self._json_body_chunks(rows))
+
+    def _json_body_chunks(self, rows: Sequence[object]) -> Iterator[bytes]:
+        """Stream a JSON or JSONL body as incremental chunks for the bounded stage.
+
+        Like ``_serialize_csv``, every format streams, so
+        ``prepare_remote_object`` enforces ``max_blob_bytes`` while the body is
+        produced rather than after the whole cumulative body has been built in
+        memory. Rows are typed as JSON-encodable objects: the encoder needs
+        nothing more.
+        """
+        if self._format == "json":
+            return self._serialize_json_chunks(rows)
         elif self._format == "jsonl":
-            return self._serialize_jsonl(rows)
+            return self._serialize_jsonl_chunks(rows)
         else:
             # Unreachable due to Pydantic Literal validation, but satisfies static analysis
             raise AssertionError(f"Unsupported format: {self._format}")
@@ -981,18 +996,45 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
 
     def _serialize_json(self, rows: list[dict[str, Any]]) -> bytes:
         """Serialize rows to JSON array bytes."""
-        try:
-            return json.dumps(rows, indent=2, allow_nan=False).encode("utf-8")
-        except (ValueError, TypeError, UnicodeError) as exc:
-            raise AzureBlobRecordSerializationError(type(exc).__name__) from None
+        return b"".join(self._serialize_json_chunks(rows))
+
+    def _serialize_json_chunks(self, rows: Sequence[object]) -> Iterator[bytes]:
+        """Stream the JSON array, byte-identical to ``json.dumps(rows, indent=2)``.
+
+        ``iterencode`` with an indent uses the pure-Python encoder, which
+        yields fragments lazily; they are batched into bounded chunks.
+        """
+        fragments = json.JSONEncoder(indent=2, allow_nan=False).iterencode(rows)
+        pending: list[str] = []
+        pending_chars = 0
+        while True:
+            try:
+                fragment = next(fragments, None)
+            except (ValueError, TypeError, UnicodeError) as exc:
+                raise AzureBlobRecordSerializationError(type(exc).__name__) from None
+            if fragment is None:
+                break
+            pending.append(fragment)
+            pending_chars += len(fragment)
+            if pending_chars >= _JSON_CHUNK_CHARS:
+                yield "".join(pending).encode("utf-8")
+                pending.clear()
+                pending_chars = 0
+        if pending:
+            yield "".join(pending).encode("utf-8")
 
     def _serialize_jsonl(self, rows: list[dict[str, Any]]) -> bytes:
         """Serialize rows to JSONL bytes (newline-delimited JSON)."""
-        try:
-            lines = [json.dumps(row, allow_nan=False) for row in rows]
-            return "\n".join(lines).encode("utf-8")
-        except (ValueError, TypeError, UnicodeError) as exc:
-            raise AzureBlobRecordSerializationError(type(exc).__name__) from None
+        return b"".join(self._serialize_jsonl_chunks(rows))
+
+    def _serialize_jsonl_chunks(self, rows: Sequence[object]) -> Iterator[bytes]:
+        """Stream one newline-terminated JSON record per row (as the S3 twin does)."""
+        for row in rows:
+            try:
+                line = json.dumps(row, allow_nan=False)
+            except (ValueError, TypeError, UnicodeError) as exc:
+                raise AzureBlobRecordSerializationError(type(exc).__name__) from None
+            yield f"{line}\n".encode()
 
     def set_resume_field_resolution(self, resolution_mapping: dict[str, str]) -> None:
         set_resume_field_resolution(self, resolution_mapping)
