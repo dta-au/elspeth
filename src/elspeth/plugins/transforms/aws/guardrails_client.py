@@ -66,7 +66,9 @@ _FILTER_CONFIDENCE = frozenset({"NONE", "LOW", "MEDIUM", "HIGH"})
 _MAX_USAGE_UNITS = 2**31 - 1
 _MAX_OUTPUTS = 8
 _MAX_OUTPUT_TEXT = 4096
-_MAX_REQUEST_TEXT = 1_000_000
+# ApplyGuardrail text bound; the transform checks it per field so an over-long
+# field is a row-data error, not a client-side refusal reported as a service failure.
+MAX_REQUEST_TEXT_CHARS = 1_000_000
 _MAX_ACTION_REASON = 4096
 _MAX_LONG = 2**63 - 1
 _APPLIED_GUARDRAIL_ID = re.compile(r"[a-z0-9]+\Z")
@@ -605,7 +607,7 @@ class BedrockGuardrailsClient(AuditedClientBase):
         source: GuardrailSource,
         required_filters: tuple[str, ...],
     ) -> GuardrailDecision:
-        if type(text) is not str or not 1 <= len(text) <= _MAX_REQUEST_TEXT:
+        if type(text) is not str or not 1 <= len(text) <= MAX_REQUEST_TEXT_CHARS:
             raise ValueError("guardrail text must be a bounded non-empty string")
         if source not in ("INPUT", "OUTPUT"):
             raise ValueError("guardrail source must be INPUT or OUTPUT")
