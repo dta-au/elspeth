@@ -22,7 +22,6 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from elspeth.contracts import ArtifactDescriptor, CallType, Determinism, PluginSchema
 from elspeth.contracts.contexts import SinkContext
 from elspeth.contracts.diversion import SinkWriteResult
-from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.header_modes import HeaderMode, parse_header_mode
 from elspeth.contracts.plugin_assistance import PluginAssistance
@@ -621,32 +620,19 @@ class S3WriteOutcomeUnknownError(RuntimeError):
         super().__init__("S3 object write outcome is unknown; reconciliation is required.")
 
 
-class S3SinkPoisonedError(RuntimeError):
-    """The sink cannot safely make another cumulative request."""
-
-
 class S3SinkClosedError(RuntimeError):
     """The sink has already released its provider resources."""
+
+    def __init__(self) -> None:
+        super().__init__("AWSS3Sink is closed; no further S3 requests may be made.")
 
 
 class S3ClientCloseError(RuntimeError):
     """The detached S3 client failed during close."""
 
 
-def _raise_conditional_rejected() -> Never:
-    raise S3ConditionalWriteRejectedError from None
-
-
-def _raise_sink_write_rejected() -> Never:
-    raise S3SinkWriteError from None
-
-
 def _raise_outcome_unknown() -> Never:
     raise S3WriteOutcomeUnknownError from None
-
-
-def _raise_audit_integrity(error_type: str) -> Never:
-    raise AuditIntegrityError(f"Failed to record S3 call in the audit trail ({error_type}).") from None
 
 
 def _s3_provider_exception_types() -> tuple[type[Exception], ...]:
@@ -736,7 +722,7 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
     name = "aws_s3"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:5d0aa08060d18093"
+    source_file_hash: str | None = "sha256:69312e5ada819dc3"
     config_model = AWSS3SinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP
@@ -824,6 +810,10 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
         set_resume_field_resolution(self, resolution_mapping)
 
     def _get_s3_client(self) -> _S3Client:
+        # close() released the client; building a replacement would let a
+        # post-close inspect/commit/reconcile silently reopen provider access.
+        if self._closed:
+            raise S3SinkClosedError
         if self._s3_client is None:
             self._s3_client = cast("_S3Client", build_s3_client(self._region_name, self._endpoint_url))
         return self._s3_client
