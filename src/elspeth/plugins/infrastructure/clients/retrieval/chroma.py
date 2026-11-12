@@ -180,6 +180,13 @@ def _http_status_is_transient(status_code: int) -> bool:
     return status_code in (408, 429) or 500 <= status_code <= 599
 
 
+# Failures of the readiness count() that mean "collection unreachable" rather
+# than a code defect. ValueError: chromadb 1.5.5 raises plain ValueError on an
+# unreachable HTTP server (and _readiness_count raises it for a malformed
+# count). httpx.HTTPError: transport errors do not inherit from the others.
+_READINESS_UNREACHABLE_ERRORS = (chromadb.errors.ChromaError, ConnectionError, OSError, ValueError, httpx.HTTPError)
+
+
 class ChromaSearchProvider:
     """ChromaDB implementation of RetrievalProvider.
 
@@ -291,10 +298,25 @@ class ChromaSearchProvider:
                 current_operation_id=None,
                 current_call_index=call_index,
             )
-        if self._collection is None:
-            self._initialize_client()
         count_start = time.monotonic()
         count_request = request_payload
+        if self._collection is None:
+            try:
+                self._initialize_client()
+            except RetrievalError as exc:
+                # The call index is allocated (and admitted in VERIFY): the
+                # failed attempt must still leave its ERROR Call row.
+                self._record_error(
+                    state_id,
+                    count_start,
+                    count_request,
+                    exc,
+                    call_index=call_index,
+                    retryable=exc.retryable,
+                    member_token=member_token,
+                    work_item=work_item,
+                )
+                raise
         try:
             collection_count = self._collection.count()
         except (
@@ -871,29 +893,72 @@ class ChromaSearchProvider:
         return self._live_readiness()
 
     def _live_readiness(self) -> CollectionReadinessResult:
-        collection_name = self._config.collection
         if self._collection is None:
             self._initialize_client()
         try:
-            count = self._collection.count()
-            if type(count) is not int or count < 0:
-                raise ValueError(f"malformed collection count: expected a non-negative exact int, got {count!r} ({type(count).__name__})")
-            return CollectionReadinessResult(
-                collection=collection_name,
-                reachable=True,
-                count=count,
-                message=f"Collection '{collection_name}' has {count} documents"
-                if count > 0
-                else f"Collection '{collection_name}' is empty",
-            )
-        except (chromadb.errors.ChromaError, ConnectionError, OSError, ValueError, httpx.HTTPError) as exc:
-            # ValueError: chromadb 1.5.5 raises plain ValueError on unreachable HTTP server.
-            # httpx.HTTPError: transport errors do not inherit from the other classes here.
-            return CollectionReadinessResult(
-                collection=collection_name,
-                reachable=False,
-                count=None,
-                message=f"Collection '{collection_name}' unreachable: {type(exc).__name__}: {exc}",
+            count = self._readiness_count()
+        except _READINESS_UNREACHABLE_ERRORS as exc:
+            return self._unreachable_readiness(exc)
+        return self._reachable_readiness(count)
+
+    def _readiness_count(self) -> int:
+        count = self._collection.count()
+        if type(count) is not int or count < 0:
+            raise ValueError(f"malformed collection count: expected a non-negative exact int, got {count!r} ({type(count).__name__})")
+        return count
+
+    def _reachable_readiness(self, count: int) -> CollectionReadinessResult:
+        collection_name = self._config.collection
+        return CollectionReadinessResult(
+            collection=collection_name,
+            reachable=True,
+            count=count,
+            message=f"Collection '{collection_name}' has {count} documents" if count > 0 else f"Collection '{collection_name}' is empty",
+        )
+
+    def _unreachable_readiness(self, exc: Exception) -> CollectionReadinessResult:
+        collection_name = self._config.collection
+        return CollectionReadinessResult(
+            collection=collection_name,
+            reachable=False,
+            count=None,
+            message=f"Collection '{collection_name}' unreachable: {type(exc).__name__}: {exc}",
+        )
+
+    def _record_operation_error(
+        self,
+        *,
+        operation_id: str,
+        coordination_token: CoordinationToken,
+        call_index: int,
+        request_data: dict[str, str],
+        start_time: float,
+        exc: Exception,
+    ) -> None:
+        """Record a failed readiness attempt so its allocated call index has an ERROR Call row."""
+        error_data = {"error_type": type(exc).__name__, "message": str(exc)}
+        recorded = self._execution.record_operation_call(
+            operation_id=operation_id,
+            coordination_token=coordination_token,
+            call_index=call_index,
+            call_type=CallType.VECTOR,
+            status=CallStatus.ERROR,
+            request_data=RawCallPayload(request_data),
+            error=RawCallPayload(error_data),
+            latency_ms=round((time.monotonic() - start_time) * 1000),
+        )
+        session = self._call_mode_session
+        if session is not None and session.mode is RunMode.VERIFY:
+            session.verify_call(
+                call_type=CallType.VECTOR,
+                request_data=request_data,
+                current_state_id=None,
+                current_operation_id=operation_id,
+                current_call_index=call_index,
+                current_call_id=recorded.call_id,
+                live_status=CallStatus.ERROR,
+                live_response_data=None,
+                live_error_data=error_data,
             )
 
     def runtime_preflight(self, *, operation_id: str, coordination_token: CoordinationToken) -> CollectionReadinessResult:
@@ -946,11 +1011,33 @@ class ChromaSearchProvider:
                 current_operation_id=operation_id,
                 current_call_index=call_index,
             )
-        readiness = self._live_readiness()
-        if not readiness.reachable:
-            return readiness
-        assert readiness.count is not None
-        response_data = {"collection_count": readiness.count}
+        start_time = time.monotonic()
+        try:
+            if self._collection is None:
+                self._initialize_client()
+            count = self._readiness_count()
+        except RetrievalError as exc:
+            self._record_operation_error(
+                operation_id=operation_id,
+                coordination_token=coordination_token,
+                call_index=call_index,
+                request_data=request_data,
+                start_time=start_time,
+                exc=exc,
+            )
+            raise
+        except _READINESS_UNREACHABLE_ERRORS as exc:
+            self._record_operation_error(
+                operation_id=operation_id,
+                coordination_token=coordination_token,
+                call_index=call_index,
+                request_data=request_data,
+                start_time=start_time,
+                exc=exc,
+            )
+            return self._unreachable_readiness(exc)
+        readiness = self._reachable_readiness(count)
+        response_data = {"collection_count": count}
         recorded = self._execution.record_operation_call(
             operation_id=operation_id,
             coordination_token=coordination_token,
