@@ -119,3 +119,37 @@ class TestAllModeRecordsUnscannedFields:
         assert result.success_reason is not None
         warnings = result.success_reason.get("validation_warnings", [])
         assert any("'payload'" in w and "dict" in w for w in warnings), warnings
+
+
+class TestTypeCoerceStrictNumericGrammar:
+    """#106: strict int/float parsing accepts only ASCII digits, no PEP 515 underscores."""
+
+    @pytest.mark.parametrize("raw", ["1_000", " 1_0 ", "12_34", "\uff11\uff12\uff13", "\u0664\u0662", "-1_0"])
+    def test_int_rejects_underscores_and_non_ascii_digits(self, raw: str) -> None:
+        from elspeth.plugins.transforms.type_coerce import CoercionError, coerce_to_int
+
+        with pytest.raises(CoercionError) as exc_info:
+            coerce_to_int(raw)
+        assert exc_info.value.failure == "not_integer_string"
+
+    @pytest.mark.parametrize("raw", ["1_000.5", "1_0e3", "\uff11.\uff15", "\u0664.\u0662"])
+    def test_float_rejects_underscores_and_non_ascii_digits(self, raw: str) -> None:
+        from elspeth.plugins.transforms.type_coerce import CoercionError, coerce_to_float
+
+        with pytest.raises(CoercionError) as exc_info:
+            coerce_to_float(raw)
+        assert exc_info.value.failure == "not_numeric_string"
+
+    @pytest.mark.parametrize(("raw", "expected"), [("42", 42), (" -7 ", -7), ("+5", 5), ("007", 7)])
+    def test_int_still_accepts_plain_ascii_integers(self, raw: str, expected: int) -> None:
+        """Negative control: the ordinary grammar is unchanged."""
+        from elspeth.plugins.transforms.type_coerce import coerce_to_int
+
+        assert coerce_to_int(raw) == expected
+
+    @pytest.mark.parametrize(("raw", "expected"), [("12.5", 12.5), ("1e3", 1000.0), (" -0.5 ", -0.5), (".5", 0.5), ("1E-3", 0.001)])
+    def test_float_still_accepts_plain_ascii_numbers(self, raw: str, expected: float) -> None:
+        """Negative control: the ordinary grammar is unchanged."""
+        from elspeth.plugins.transforms.type_coerce import coerce_to_float
+
+        assert coerce_to_float(raw) == expected
