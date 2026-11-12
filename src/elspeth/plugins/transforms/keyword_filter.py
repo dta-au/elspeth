@@ -29,7 +29,11 @@ _MAX_PATTERN_LENGTH = 1000
 
 
 def _brace_quantifier_end(pattern: str, start: int) -> int | None:
-    """Return the exclusive end offset for a valid brace quantifier."""
+    """Return the exclusive end offset for a valid brace quantifier.
+
+    Mirrors ``re``: ``{n}``, ``{n,}``, ``{n,m}``, and — with an empty lower
+    bound — ``{,m}`` and ``{,}`` are quantifiers; ``{}`` is a literal.
+    """
     if start >= len(pattern) or pattern[start] != "{":
         return None
 
@@ -37,11 +41,10 @@ def _brace_quantifier_end(pattern: str, start: int) -> int | None:
     digits_start = i
     while i < len(pattern) and pattern[i].isdigit():
         i += 1
-    if i == digits_start:
-        return None
 
     if i < len(pattern) and pattern[i] == "}":
-        return i + 1
+        # "{}" (no digits) is a literal brace pair, "{n}" a quantifier.
+        return i + 1 if i > digits_start else None
 
     if i >= len(pattern) or pattern[i] != ",":
         return None
@@ -218,7 +221,7 @@ class KeywordFilter(BaseTransform):
     name = "keyword_filter"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3377cd14f8dd007e"
+    source_file_hash: str | None = "sha256:0f3c1c7001681966"
     config_model = KeywordFilterConfig
     usage_when_to_use: str = (
         "Use for regex content screening when a pattern match must return an error for the node's "
