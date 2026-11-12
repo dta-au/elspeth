@@ -260,7 +260,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_inline_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:229d85c78907213d"
+    source_file_hash: str | None = "sha256:05bfd9c53a814fed"
     config_model = AWSTextractInlineAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -508,26 +508,29 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         store = self._payload_store
         if store is None:
             raise FrameworkBugError("Amazon Textract inline transform requires a payload store")
+        # A bounded read stops after max_document_bytes + 1 bytes, so an
+        # oversized blob is rejected without any worker holding its whole
+        # body; the exact size is therefore unknown and reported as ">max".
         try:
-            content = store.retrieve(payload_ref)
+            content = store.retrieve_bounded(payload_ref, max_bytes=self._max_document_bytes)
         except PayloadNotFoundError:
             return TransformResult.error(
                 {"reason": "blob_not_found", "field": field_name, "blob_ref": payload_ref},
                 retryable=False,
             )
-        if not content:
-            return TransformResult.error(
-                {"reason": "invalid_input", "field": field_name, "error_type": "empty_document"},
-                retryable=False,
-            )
-        if len(content) > self._max_document_bytes:
+        if content is None:
             return TransformResult.error(
                 {
                     "reason": "blob_too_large",
                     "field": field_name,
                     "max_blob_bytes": self._max_document_bytes,
-                    "actual": str(len(content)),
+                    "actual": f">{self._max_document_bytes}",
                 },
+                retryable=False,
+            )
+        if not content:
+            return TransformResult.error(
+                {"reason": "invalid_input", "field": field_name, "error_type": "empty_document"},
                 retryable=False,
             )
         if not binary_document_signature_matches(self._document_format, content):
