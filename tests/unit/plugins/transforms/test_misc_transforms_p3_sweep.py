@@ -192,3 +192,39 @@ class TestTypeCoerceIntSafeRange:
         assert result.reason is not None
         assert result.reason["reason"] == "type_mismatch"
         assert result.reason["error_type"] == "out_of_range"
+
+
+def _retrieval_output_config(**overrides: object) -> dict[str, object]:
+    base: dict[str, object] = {"output_prefix": "policy", "query_field": "question", "schema_config": {"mode": "observed"}}
+    base.update(overrides)
+    return base
+
+
+class TestRetrievalQueryModesUsePresenceNotTruthiness:
+    """#96: query_template and query_pattern are exclusive by presence, and neither may be empty."""
+
+    @pytest.mark.parametrize(("template", "pattern"), [("", r"(\w+)"), ("{{ query }}", ""), ("", "")])
+    def test_both_options_present_is_rejected_even_when_one_is_empty(self, template: str, pattern: str) -> None:
+        from pydantic import ValidationError
+
+        from elspeth.plugins.transforms.rag.core import RetrievalOutputConfig
+
+        with pytest.raises(ValidationError, match=r"query_template|query_pattern"):
+            RetrievalOutputConfig(**_retrieval_output_config(query_template=template, query_pattern=pattern))
+
+    @pytest.mark.parametrize("option", ["query_template", "query_pattern"])
+    def test_empty_option_alone_is_rejected(self, option: str) -> None:
+        from pydantic import ValidationError
+
+        from elspeth.plugins.transforms.rag.core import RetrievalOutputConfig
+
+        with pytest.raises(ValidationError, match=f"{option} cannot be empty"):
+            RetrievalOutputConfig(**_retrieval_output_config(**{option: ""}))
+
+    @pytest.mark.parametrize("overrides", [{}, {"query_template": "{{ query }}"}, {"query_pattern": r"issue:\s*(.+)"}])
+    def test_single_non_empty_mode_is_accepted(self, overrides: dict[str, str]) -> None:
+        """Negative control: field-only, template-only and pattern-only configs still build."""
+        from elspeth.plugins.transforms.rag.core import RetrievalOutputConfig
+
+        cfg = RetrievalOutputConfig(**_retrieval_output_config(**overrides))
+        assert cfg.query_field == "question"
