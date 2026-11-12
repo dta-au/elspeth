@@ -138,10 +138,18 @@ def _analysis(plugin: str, node: str, reason: str, *, groups: int, members: int)
 
 
 def test_codex_collector_counts_probe_now_counts_the_failed_members(tmp_path: Path) -> None:
-    """Codex's probe shape through ``elspeth run``: a collector's non-canonical sum fails its group of two.
+    """Codex's probe shape through ``elspeth run``: a collector's unrepresentable sum fails its group of two.
 
     Before the arm: categories ``[]`` and ``errors.total == 0`` beside two
     ``(FAILURE, UNROUTED)`` members.
+
+    The group's int sum lies beyond the JSON safe range. Since #99 batch_stats
+    detects that itself and returns a value-free ``float_overflow`` error, so
+    the group fails on the returned-error arm (``collector_transform_error``);
+    before #99 it released the sum and the engine's release check failed the
+    group as ``collector_contract_violation``. Both arms are counted the same
+    way; ``test_each_failure_arm_counts_its_members_once_under_its_recorded_reason``
+    drives the contract-violation arm explicitly.
     """
     cli = _run_cli(tmp_path, _summing_collector_settings(tmp_path))
     assert cli.exit_code == 1, cli.output
@@ -153,10 +161,10 @@ def test_codex_collector_counts_probe_now_counts_the_failed_members(tmp_path: Pa
 
     surfaces = _surfaces(db, run_id)
 
-    assert surfaces.categories == [("collector_group", node, "collector_contract_violation", 2)]
+    assert surfaces.categories == [("collector_group", node, "collector_transform_error", 2)]
     assert surfaces.errors == {"validation": 0, "transform": 0, "collector_group": 2, "total": 2}
     assert surfaces.groups_failed_mcp == surfaces.groups_failed_projection == surfaces.groups_failed_accounting == 1
-    assert surfaces.collector_analysis == _analysis("batch_stats", node, "collector_contract_violation", groups=1, members=2)
+    assert surfaces.collector_analysis == _analysis("batch_stats", node, "collector_transform_error", groups=1, members=2)
     assert surfaces.discarded == {}, "a failed collector member is failed, not discarded"
 
 
