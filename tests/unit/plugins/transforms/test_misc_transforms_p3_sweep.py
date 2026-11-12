@@ -153,3 +153,42 @@ class TestTypeCoerceStrictNumericGrammar:
         from elspeth.plugins.transforms.type_coerce import coerce_to_float
 
         assert coerce_to_float(raw) == expected
+
+
+_SAFE_INT_MAX = 2**53 - 1
+
+
+class TestTypeCoerceIntSafeRange:
+    """#109: coerce_to_int refuses integers canonical JSON cannot carry, as a type_coerce failure."""
+
+    @pytest.mark.parametrize(
+        "raw",
+        [str(_SAFE_INT_MAX + 1), str(-_SAFE_INT_MAX - 1), "99999999999999999999", 1e20, -(2.0**60), _SAFE_INT_MAX + 1],
+    )
+    def test_out_of_safe_range_is_rejected(self, raw: object) -> None:
+        from elspeth.plugins.transforms.type_coerce import CoercionError, coerce_to_int
+
+        with pytest.raises(CoercionError) as exc_info:
+            coerce_to_int(raw)
+        assert exc_info.value.failure == "out_of_range"
+        # The value is row data: it never reaches the message.
+        assert str(raw) not in str(exc_info.value)
+
+    @pytest.mark.parametrize("raw", [str(_SAFE_INT_MAX), str(-_SAFE_INT_MAX), float(2**52), _SAFE_INT_MAX])
+    def test_safe_range_boundary_is_accepted(self, raw: object) -> None:
+        """Negative control: the boundary itself is still a valid int."""
+        from elspeth.plugins.transforms.type_coerce import coerce_to_int
+
+        assert abs(coerce_to_int(raw)) <= _SAFE_INT_MAX
+
+    def test_transform_routes_out_of_range_as_type_mismatch(self) -> None:
+        from elspeth.plugins.transforms.type_coerce import TypeCoerce
+
+        transform = TypeCoerce({"schema": {"mode": "observed"}, "conversions": [{"field": "n", "to": "int"}]})
+
+        result = transform.process(make_pipeline_row({"n": "9007199254740993"}), make_context())
+
+        assert result.status == "error"
+        assert result.reason is not None
+        assert result.reason["reason"] == "type_mismatch"
+        assert result.reason["error_type"] == "out_of_range"
