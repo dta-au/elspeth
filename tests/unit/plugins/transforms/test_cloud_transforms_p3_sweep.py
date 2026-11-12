@@ -11,9 +11,11 @@ import threading
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 
 from elspeth.contracts import RunMode, TransformResult
+from elspeth.contracts.errors import PluginRetryableError
 from elspeth.plugins.transforms.aws.guardrails_client import BedrockGuardrailsClient, GuardrailServiceError
 from elspeth.plugins.transforms.aws.textract_document_analysis import AWSTextractDocumentAnalysis
 from elspeth.plugins.transforms.aws.textract_inline_analysis import AWSTextractInlineAnalysis
@@ -24,6 +26,11 @@ from elspeth.plugins.transforms.aws.textract_result import (
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_context
 from tests.fixtures.mock_audit import mock_item_audit_authority
+from tests.unit.plugins.transforms.azure.test_document_intelligence import _FakeClient as _DIFakeClient
+from tests.unit.plugins.transforms.azure.test_document_intelligence import _post_202 as _di_post_202
+from tests.unit.plugins.transforms.azure.test_document_intelligence import _Resp as _DIResp
+from tests.unit.plugins.transforms.azure.test_document_intelligence import _run_with_fake as _di_run_with_fake
+from tests.unit.plugins.transforms.azure.test_document_intelligence import _t_for_lro as _di_transform
 
 # ---------------------------------------------------------------------------
 # Finding #35: FORMS projection must carry checkbox selection state.
@@ -311,3 +318,59 @@ def test_f50_transport_failure_audits_every_botocore_attempt(monkeypatch: pytest
     assert len(sends) == 3, "botocore standard retries must have made three HTTP attempts"
     assert len(execution.calls) == 1
     assert execution.calls[0]["response_data"].to_dict()["attempts"] == len(sends)
+
+
+# ---------------------------------------------------------------------------
+# Finding #61: a poll-phase network error must not resubmit the document.
+# ---------------------------------------------------------------------------
+
+
+class _F61Client(_DIFakeClient):
+    """Scripted DI client whose scripted entries may be exceptions to raise."""
+
+    def post(self, url: str, *, json: Any = None, audit_json: Any = None, timeout: float | None = None) -> Any:
+        response = super().post(url, json=json, audit_json=audit_json, timeout=timeout)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    def get(self, url: str, *, timeout: float | None = None) -> Any:
+        response = super().get(url, timeout=timeout)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+def _f61_succeeded() -> _DIResp:
+    return _DIResp(200, body={"status": "succeeded", "analyzeResult": {"modelId": "prebuilt-layout", "content": "# Doc"}})
+
+
+def _f61_connect_error() -> httpx.ConnectError:
+    return httpx.ConnectError("connection dropped", request=httpx.Request("GET", "https://x"))
+
+
+def test_f61_poll_network_error_is_retried_in_place_without_resubmitting() -> None:
+    transform = _di_transform()
+    client = _F61Client(_di_post_202(), [_f61_connect_error(), _DIResp(200, body={"status": "running"}), _f61_succeeded()])
+
+    escalated: PluginRetryableError | None = None
+    result = None
+    try:
+        result = _di_run_with_fake(transform, client)
+    except PluginRetryableError as error:
+        escalated = error
+
+    assert escalated is None, f"a poll GET network error escalated to a row retry (resubmit): {escalated}"
+    assert result is not None
+    assert result.status == "success"
+    assert len(client.posts) == 1
+    assert client.get_calls == 3
+
+
+def test_f61_submit_network_error_still_escalates_to_a_row_retry() -> None:
+    transform = _di_transform()
+    client = _F61Client([_f61_connect_error()], [])
+
+    with pytest.raises(PluginRetryableError):
+        _di_run_with_fake(transform, client)
+    assert client.get_calls == 0
