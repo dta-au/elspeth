@@ -228,3 +228,57 @@ class TestRetrievalQueryModesUsePresenceNotTruthiness:
 
         cfg = RetrievalOutputConfig(**_retrieval_output_config(**overrides))
         assert cfg.query_field == "question"
+
+
+_CHROMA_PROVIDER_MODULE = "elspeth.plugins.infrastructure.clients.retrieval.chroma"
+
+
+def _fail_chroma_provider_import(monkeypatch: pytest.MonkeyPatch, missing: str) -> None:
+    """Make importing the chroma provider module raise ModuleNotFoundError(name=missing)."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == _CHROMA_PROVIDER_MODULE:
+            raise ModuleNotFoundError(f"No module named {missing!r}", name=missing)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+
+class TestRagProviderRegistryBrokenInstall:
+    """#142: only an absent chromadb means 'not installed'; a missing chromadb submodule is a broken install."""
+
+    def test_missing_chromadb_submodule_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.plugins.transforms.rag.config import _get_providers
+
+        _fail_chroma_provider_import(monkeypatch, "chromadb.api")
+
+        with pytest.raises(ModuleNotFoundError) as exc_info:
+            _get_providers()
+        assert exc_info.value.name == "chromadb.api"
+
+    def test_absent_chromadb_leaves_provider_unregistered(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Negative control: the documented optional-extra state still reads as 'not installed'."""
+        from elspeth.plugins.transforms.rag.config import _get_providers
+
+        _fail_chroma_provider_import(monkeypatch, "chromadb")
+
+        assert "chroma" not in _get_providers()
+
+    def test_unregistered_known_provider_names_the_rag_extra(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from pydantic import ValidationError
+
+        from elspeth.plugins.transforms.rag import config as rag_config
+
+        monkeypatch.setattr(rag_config, "PROVIDERS", {})
+
+        with pytest.raises(ValidationError, match=r"elspeth\[rag\]"):
+            rag_config.RAGRetrievalConfig(
+                output_prefix="policy",
+                query_field="question",
+                provider="chroma",
+                provider_config={"collection": "test-index", "mode": "ephemeral"},
+                schema_config={"mode": "observed"},
+            )
