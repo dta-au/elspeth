@@ -6,7 +6,13 @@ on the lane base and passes after that finding's fix commit.
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
+
 from elspeth.contracts.enums import Determinism
+from elspeth.plugins.infrastructure import discovery
+from elspeth.plugins.infrastructure.base import BaseSink, BaseTransform
 from elspeth.plugins.infrastructure.hookspecs import hookimpl
 from elspeth.plugins.infrastructure.manager import PluginManager
 from elspeth.plugins.infrastructure.validation import UnknownPluginTypeError
@@ -62,3 +68,50 @@ def test_create_transform_on_private_manager_still_refuses_invalid_config() -> N
         assert "not_a_knob" in str(exc)
     else:
         raise AssertionError("an unknown config key must be refused")
+
+
+# ---------------------------------------------------------------------------
+# Finding #129: a missing CORE dependency must crash discovery, not skip
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("core_module", ["chromadb", "bs4", "html2text"])
+def test_missing_core_plugin_dependency_crashes_discovery(core_module: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Finding #129: chromadb/bs4/html2text are core [project] dependencies.
+
+    A plugin file whose import of one of them fails is a broken install; the
+    discovery loop used to log a warning and silently drop the plugin from the
+    catalog (chroma_sink, web_scrape) because the module was on the optional
+    allowlist.
+    """
+    (tmp_path / "core_dep_plugin.py").write_text("raise AssertionError('patched discovery must not execute this file')\n")
+
+    def missing_core_module(_py_file: Path, _base_class: type) -> list[type]:
+        raise ModuleNotFoundError(f"No module named '{core_module}'", name=core_module)
+
+    monkeypatch.setattr(discovery, "_discover_in_file", missing_core_module)
+
+    try:
+        skipped = discovery.discover_plugins_in_directory(tmp_path, BaseSink)
+    except ModuleNotFoundError as exc:
+        assert exc.name == core_module
+    else:
+        raise AssertionError(f"missing core dependency {core_module!r} was skipped as optional; discovery returned {skipped!r}")
+
+
+def test_optional_plugin_import_allowlist_holds_only_optional_extras() -> None:
+    """Finding #129: only jinja2 ships in an optional extra ([llm]/[azure]/[aws])."""
+    allowlist = discovery.OPTIONAL_PLUGIN_IMPORT_MODULES
+    assert allowlist == frozenset({"jinja2"})
+
+
+def test_missing_jinja2_still_skips_as_optional_extra(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Finding #129 control: the genuine optional extra keeps its skip path."""
+    (tmp_path / "llm_plugin.py").write_text("raise AssertionError('patched discovery must not execute this file')\n")
+
+    def missing_jinja2(_py_file: Path, _base_class: type) -> list[type]:
+        raise ModuleNotFoundError("No module named 'jinja2'", name="jinja2")
+
+    monkeypatch.setattr(discovery, "_discover_in_file", missing_jinja2)
+
+    assert discovery.discover_plugins_in_directory(tmp_path, BaseTransform) == []
