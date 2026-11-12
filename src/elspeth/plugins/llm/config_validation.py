@@ -237,11 +237,20 @@ def normalize_openrouter_base_url(value: str) -> str:
       them would change the wire bytes; accepting them would leave the gate
       defeatable. This matches ``validate_gateway_endpoint``'s stance on
       ambiguous segments.
+    * **Reject** a query string or fragment: the runtime appends the API path
+      after the base URL, so either would swallow that path.
     """
     parsed = urlsplit(value)
     hostname = parsed.hostname
     if hostname is None:
         raise ValueError("base_url must include a hostname")
+    # The runtime joins f"{base_url}/{path}", which would put the API path
+    # inside a query string or fragment and POST to the bare base path.
+    # Same stance as validate_gateway_endpoint.
+    if parsed.query:
+        raise ValueError("base_url must not contain a query string")
+    if parsed.fragment:
+        raise ValueError("base_url must not contain a fragment")
     try:
         port = parsed.port
     except ValueError as exc:
@@ -262,7 +271,7 @@ def normalize_openrouter_base_url(value: str) -> str:
         # server collapses it is server-dependent. (An empty segment consumed
         # by a following ``..`` never reaches the wire and is fine.)
         raise ValueError("base_url path must not contain empty path segments")
-    return urlunsplit((parsed.scheme, netloc, path, parsed.query, parsed.fragment))
+    return urlunsplit((parsed.scheme, netloc, path, "", ""))
 
 
 def validate_openrouter_base_url(value: str) -> str:
