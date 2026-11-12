@@ -342,3 +342,50 @@ class TestFinding85LookupKeysMustBeMapped:
         cfg = DataverseSinkConfig.from_dict(config)
         assert cfg.lookups is not None
         assert set(cfg.lookups) == {"account_id"}
+
+
+def _chroma_sink_config(persist_directory: str, **overrides: Any) -> dict[str, Any]:
+    config: dict[str, Any] = {
+        "collection": "p3-sink-collection",
+        "mode": "persistent",
+        "persist_directory": persist_directory,
+        "distance_function": "cosine",
+        "field_mapping": {"document_field": "text", "id_field": "doc_id", "metadata_fields": ["topic"]},
+        "on_duplicate": "overwrite",
+        "schema": {"mode": "fixed", "fields": ["doc_id: str", "text: str", "topic: str"]},
+    }
+    config.update(overrides)
+    return config
+
+
+class TestFinding92ChromaSinkDistanceFunctionMismatch:
+    """#92: on_start refuses an existing collection whose hnsw:space differs from distance_function."""
+
+    def test_existing_collection_with_other_distance_function_refused(self, tmp_path: Any) -> None:
+        chromadb = pytest.importorskip("chromadb")
+        from elspeth.plugins.sinks.chroma_sink import ChromaSink
+        from tests.fixtures.factories import make_context
+
+        persist = str(tmp_path / "chroma")
+        chromadb.PersistentClient(path=persist).get_or_create_collection(name="p3-sink-collection", metadata={"hnsw:space": "cosine"})
+
+        sink = ChromaSink(_chroma_sink_config(persist, distance_function="l2"))
+        try:
+            with pytest.raises(ValueError, match="distance_function"):
+                sink.on_start(make_context(node_id="chroma"))
+        finally:
+            sink.close()
+
+    def test_existing_collection_with_matching_distance_function_accepted(self, tmp_path: Any) -> None:
+        chromadb = pytest.importorskip("chromadb")
+        from elspeth.plugins.sinks.chroma_sink import ChromaSink
+        from tests.fixtures.factories import make_context
+
+        persist = str(tmp_path / "chroma")
+        chromadb.PersistentClient(path=persist).get_or_create_collection(name="p3-sink-collection", metadata={"hnsw:space": "l2"})
+
+        sink = ChromaSink(_chroma_sink_config(persist, distance_function="l2"))
+        try:
+            sink.on_start(make_context(node_id="chroma"))
+        finally:
+            sink.close()
