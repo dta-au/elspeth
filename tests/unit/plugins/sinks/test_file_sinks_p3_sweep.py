@@ -30,3 +30,18 @@ def test_csv_sink_config_rejects_delimiters_csv_writer_cannot_use(delimiter: str
 @pytest.mark.parametrize("delimiter", [",", ";", "\t", "|"])
 def test_csv_sink_config_keeps_accepting_usable_delimiters(delimiter: str) -> None:
     assert _csv_config_error(delimiter=delimiter) is None
+
+
+# --- Finding #26: non-text codecs must fail config validation ---
+
+
+@pytest.mark.parametrize("encoding", ["base64", "hex", "rot13", "zlib"])
+def test_csv_sink_config_rejects_non_text_codecs(encoding: str) -> None:
+    error = _csv_config_error(encoding=encoding)
+    assert error is not None, f"CSVSinkConfig admitted non-text codec {encoding!r}, which crashes at publication"
+    assert "encoding" in error
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig", "latin-1", "cp1252", "utf-16"])
+def test_csv_sink_config_keeps_accepting_text_encodings(encoding: str) -> None:
+    assert _csv_config_error(encoding=encoding) is None
