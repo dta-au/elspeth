@@ -167,7 +167,7 @@ class JSONSink(BaseSink):
     name = "json"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9ef547005076060e"
+    source_file_hash: str | None = "sha256:0241bd4eb91ae378"
     config_model = JSONSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM
@@ -260,10 +260,46 @@ class JSONSink(BaseSink):
         self._mode = "append"
         self._collision_policy = "append_or_create"
 
+    def _scan_existing_jsonl(self) -> tuple[str | None, list[str] | None]:
+        """Scan a non-empty JSONL baseline; return (refusal reason, first-line keys).
+
+        An append streams the baseline byte-for-byte and writes the new records
+        straight after it, so every existing line must be a JSON object and the
+        file must end at an LF record boundary; otherwise the first new record
+        is glued onto the last existing line and the artifact is corrupt JSONL.
+        The keys are those of the first line's record, or None when the first
+        line is blank.
+        """
+        first_line_keys: list[str] | None = None
+        final_character = ""
+        try:
+            with open(self._path, encoding=self._encoding, newline="") as f:
+                for line_index, line in enumerate(f):
+                    final_character = line[-1]
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        record = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        return "Existing JSONL file contains invalid JSON", None
+                    # JSONL should contain objects
+                    if not isinstance(record, dict):
+                        return "Existing JSONL file contains non-object records", None
+                    if line_index == 0:
+                        first_line_keys = list(record.keys())
+        except UnicodeError:
+            return f"Existing JSONL file is not valid {self._encoding}", None
+        if final_character != "\n":
+            return "Existing JSONL output does not end at an LF record boundary", None
+        return None, first_line_keys
+
     def validate_output_target(self) -> "OutputValidationResult":
         """Validate existing JSONL file structure against configured schema.
 
-        Reads the first line of the JSONL file to check field structure.
+        Scans every line so a baseline that cannot be appended to byte-for-byte
+        (an invalid or non-object line, or no trailing LF) is refused, and
+        takes the first line's keys to check field structure.
 
         Checks that:
         - Strict mode: Record fields match schema fields exactly (set comparison)
@@ -290,21 +326,12 @@ class JSONSink(BaseSink):
         if not self._path.exists() or self._path.stat().st_size == 0:
             return OutputValidationResult.success()
 
-        # Read first line to check structure
-        with open(self._path, encoding=self._encoding) as f:
-            first_line = f.readline().strip()
-            if not first_line:
-                return OutputValidationResult.success()
-            try:
-                first_record = json.loads(first_line)
-            except json.JSONDecodeError:
-                return OutputValidationResult.failure(message="Existing JSONL file contains invalid JSON")
-
-            # Ensure first record is a dict (JSONL should contain objects)
-            if not isinstance(first_record, dict):
-                return OutputValidationResult.failure(message="Existing JSONL file contains non-object records")
-
-            existing = list(first_record.keys())
+        baseline_failure, existing = self._scan_existing_jsonl()
+        if baseline_failure is not None:
+            return OutputValidationResult.failure(message=baseline_failure)
+        if existing is None:
+            # Blank first line: no field structure to compare against.
+            return OutputValidationResult.success()
 
         # Dynamic schema = no validation needed
         if self._schema_config.is_observed:

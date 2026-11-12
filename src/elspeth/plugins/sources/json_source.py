@@ -19,9 +19,11 @@ from pydantic import Field, JsonValue, ValidationError, field_validator, model_v
 from elspeth.contracts import Determinism, PluginSchema, SourceRow
 from elspeth.contracts.contexts import SourceContext
 from elspeth.contracts.contract_builder import ContractBuilder, ContractFieldLimitExceeded
+from elspeth.contracts.json_parser import check_json_depth
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
+from elspeth.contracts.source_read_verification import MAX_JSON_DEPTH
 from elspeth.plugins.infrastructure.base import BaseSource
 from elspeth.plugins.infrastructure.config_base import (
     NormalizedFieldMappingOption,
@@ -166,7 +168,7 @@ class JSONSource(BaseSource):
     name = "json"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0c356038d5722d0c"
+    source_file_hash: str | None = "sha256:35519150141e19b9"
     config_model = JSONSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str
@@ -312,6 +314,10 @@ class JSONSource(BaseSource):
                     # Catch JSON parse errors at the trust boundary
                     # parse_constant rejects NaN/Infinity at parse time (canonical JSON policy)
                     try:
+                        # Bound nesting before decoding: a deep line decodes into a
+                        # row too deep for the schema walker and audit hashing, so
+                        # it must quarantine here as its raw line.
+                        check_json_depth(line, max_depth=MAX_JSON_DEPTH)
                         row = json.loads(line, parse_constant=reject_nonfinite_constant)
                     except (json.JSONDecodeError, ValueError) as e:
                         # External data parse failure - quarantine, don't crash
@@ -355,7 +361,10 @@ class JSONSource(BaseSource):
             with open(self._path, encoding=self._encoding) as f:
                 # parse_constant rejects NaN/Infinity at parse time (canonical JSON policy)
                 try:
-                    data = json.load(f, parse_constant=reject_nonfinite_constant)
+                    # Same nesting bound as the JSONL path, over the whole file.
+                    text = f.read()
+                    check_json_depth(text, max_depth=MAX_JSON_DEPTH)
+                    data = json.loads(text, parse_constant=reject_nonfinite_constant)
                 except (json.JSONDecodeError, ValueError) as e:
                     # File-level parse error - treat as Tier 3 boundary
                     # External data can be malformed; don't crash the pipeline
@@ -398,37 +407,27 @@ class JSONSource(BaseSource):
             # Check 1: Root must be a dict to use data_key
             if not isinstance(data, dict):
                 error_msg = f"Cannot extract data_key '{self._data_key}': expected JSON object, got {type(data).__name__}"
-                ctx.record_validation_error(
-                    row={"file_path": str(self._path), "data_key": self._data_key},
-                    error=error_msg,
-                    schema_mode="parse",
-                    destination=self._on_validation_failure,
+                quarantined = self._record_parse_error(
+                    ctx=ctx,
+                    row={"file_path": str(self._path), "structure_error": error_msg},
+                    error_msg=error_msg,
+                    source_row_index=0,
                 )
-                if self._on_validation_failure != "discard":
-                    yield SourceRow.quarantined(
-                        row={"file_path": str(self._path), "structure_error": error_msg},
-                        error=error_msg,
-                        destination=self._on_validation_failure,
-                        source_row_index=0,
-                    )
+                if quarantined is not None:
+                    yield quarantined
                 return
 
             # Check 2: Key must exist in the dict
             if self._data_key not in data:
                 error_msg = f"data_key '{self._data_key}' not found in JSON object. Available keys: {list(data.keys())}"
-                ctx.record_validation_error(
-                    row={"file_path": str(self._path), "data_key": self._data_key},
-                    error=error_msg,
-                    schema_mode="parse",
-                    destination=self._on_validation_failure,
+                quarantined = self._record_parse_error(
+                    ctx=ctx,
+                    row={"file_path": str(self._path), "structure_error": error_msg},
+                    error_msg=error_msg,
+                    source_row_index=0,
                 )
-                if self._on_validation_failure != "discard":
-                    yield SourceRow.quarantined(
-                        row={"file_path": str(self._path), "structure_error": error_msg},
-                        error=error_msg,
-                        destination=self._on_validation_failure,
-                        source_row_index=0,
-                    )
+                if quarantined is not None:
+                    yield quarantined
                 return
 
             data = data[self._data_key]
@@ -436,19 +435,14 @@ class JSONSource(BaseSource):
         # Check 3: Data must be a list (either root or extracted via data_key)
         if not isinstance(data, list):
             error_msg = f"Expected JSON array, got {type(data).__name__}"
-            ctx.record_validation_error(
-                row={"file_path": str(self._path)},
-                error=error_msg,
-                schema_mode="parse",
-                destination=self._on_validation_failure,
+            quarantined = self._record_parse_error(
+                ctx=ctx,
+                row={"file_path": str(self._path), "structure_error": error_msg},
+                error_msg=error_msg,
+                source_row_index=0,
             )
-            if self._on_validation_failure != "discard":
-                yield SourceRow.quarantined(
-                    row={"file_path": str(self._path), "structure_error": error_msg},
-                    error=error_msg,
-                    destination=self._on_validation_failure,
-                    source_row_index=0,
-                )
+            if quarantined is not None:
+                yield quarantined
             return
 
         for source_row_index, row in enumerate(data):

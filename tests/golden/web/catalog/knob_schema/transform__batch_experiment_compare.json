@@ -42,11 +42,11 @@
       },
       {
         "default": null,
-        "description": "Optional baseline variant label. When omitted, the first-seen variant is the baseline.",
-        "kind": "text",
+        "description": "Optional baseline variant label (string, integer, number or boolean), matched by exact type. When omitted, the first-seen variant is the baseline.",
+        "kind": "json-value",
         "label": "Baseline Variant",
         "name": "baseline_variant",
-        "nullable": true,
+        "nullable": false,
         "required": false,
         "tier": "common"
       }

@@ -9,8 +9,9 @@ observed schemas preserve parsed cells as strings.
 
 import codecs
 import csv
+import re
 from collections.abc import Iterator, Mapping
-from typing import Any
+from typing import Any, BinaryIO
 
 from pydantic import Field, ValidationError, field_validator
 
@@ -30,6 +31,76 @@ from elspeth.plugins.infrastructure.base import BaseSource
 from elspeth.plugins.infrastructure.config_base import TabularSourceDataConfig
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.sources.field_normalization import ExternalHeaderError, FieldResolution, resolve_field_names
+
+_DECODE_CHUNK_BYTES = 64 * 1024
+_LINE_TERMINATOR = re.compile(r"\r\n|\r|\n")
+
+
+def _iter_decoded_text(raw: BinaryIO, encoding: str) -> Iterator[str]:
+    """Strictly decode ``raw`` and raise only once the text before the bad byte is out.
+
+    A text-mode ``open()`` decodes ~8 KB chunks and raises when the first line
+    of the failing chunk is requested, so the error lands on an earlier, clean
+    line and the rows in between are lost. Here a failing chunk is replayed one
+    byte at a time from the decoder state before it, so every character ahead
+    of the bad byte is yielded before the ``UnicodeDecodeError`` propagates.
+    """
+    decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
+    while True:
+        chunk = raw.read(_DECODE_CHUNK_BYTES)
+        final = chunk == b""
+        state = decoder.getstate()
+        try:
+            text = decoder.decode(chunk, final=final)
+        except UnicodeDecodeError:
+            decoder.setstate(state)
+            for index in range(len(chunk)):
+                yield decoder.decode(chunk[index : index + 1])
+            yield decoder.decode(b"", final=final)
+            raise
+        yield text
+        if final:
+            return
+
+
+def _iter_physical_lines(pieces: Iterator[str]) -> Iterator[str]:
+    """Split decoded text into physical lines, keeping terminators.
+
+    Matches a text-mode ``open(..., newline="")``: lines end at ``\\r\\n``,
+    ``\\r`` or ``\\n`` and the terminator is kept for csv.reader. A line is
+    yielded as soon as its terminator is seen, so when decoding fails,
+    ``csv.reader.line_num`` counts exactly the lines that decoded cleanly.
+    """
+    partial: list[str] = []
+    held_cr = False  # partial ends in "\r" that may still become "\r\n"
+    try:
+        for text in pieces:
+            start = 0
+            if held_cr and text:
+                held_cr = False
+                if text[0] == "\n":
+                    partial.append("\n")
+                    start = 1
+                yield "".join(partial)
+                partial = []
+            for match in _LINE_TERMINATOR.finditer(text, start):
+                end = match.end()
+                partial.append(text[start:end])
+                start = end
+                if match.group() == "\r" and end == len(text):
+                    held_cr = True
+                    break
+                yield "".join(partial)
+                partial = []
+            if start < len(text):
+                partial.append(text[start:])
+    except UnicodeDecodeError:
+        if held_cr:
+            # The bad byte follows a bare "\r", so that line is complete.
+            yield "".join(partial)
+        raise
+    if partial:
+        yield "".join(partial)
 
 
 class CSVSourceConfig(TabularSourceDataConfig):
@@ -106,7 +177,7 @@ class CSVSource(BaseSource):
     name = "csv"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:5a67572be967d4aa"
+    source_file_hash: str | None = "sha256:94e4e14b6d89d7e1"
     # Structural observed-cell fact (elspeth-e6e552ce34): csv.reader yields
     # strings, and observed schemas preserve parsed cells untouched (module
     # docstring), so under mode: observed EVERY emitted cell is str by
@@ -196,7 +267,7 @@ class CSVSource(BaseSource):
     def load(self, ctx: SourceContext) -> Iterator[SourceRow]:
         """Load rows from CSV file with mandatory field normalization.
 
-        Uses csv.reader directly on file handle to properly support
+        Uses csv.reader over the decoded physical lines to properly support
         multiline quoted fields (e.g., "field with\nembedded newline").
 
         Field resolution modes:
@@ -218,77 +289,55 @@ class CSVSource(BaseSource):
         if not self._path.exists():
             raise FileNotFoundError(f"CSV file not found: {self._path}")
 
-        # CRITICAL: newline='' required for proper embedded newline handling
-        # See: https://docs.python.org/3/library/csv.html
-        try:
-            f = open(self._path, encoding=self._encoding, newline="")  # noqa: SIM115
-        except UnicodeDecodeError as e:
-            # Some encodings (e.g., utf-16) can fail at open() on BOM/header bytes.
-            # This is Tier 3 (external data) — quarantine, don't crash.
-            raw_row = {"file_path": str(self._path), "__encoding__": self._encoding}
-            error_msg = f"CSV file cannot be decoded with encoding '{self._encoding}': {e}"
-            ctx.record_validation_error(
-                row=raw_row,
-                error=error_msg,
-                schema_mode="parse",
-                destination=self._on_validation_failure,
-            )
-            if self._on_validation_failure != "discard":
-                yield SourceRow.quarantined(
+        # The file is opened in binary and decoded by _iter_decoded_text so a
+        # decode failure is attributed to the physical line holding the bad
+        # byte (a text-mode open() decodes ~8 KB chunks and raises early).
+        # _iter_physical_lines keeps line terminators, as newline='' would, which
+        # csv.reader needs for embedded newlines in quoted fields.
+        with open(self._path, "rb") as f:
+            try:
+                yield from self._load_from_file(_iter_physical_lines(_iter_decoded_text(f, self._encoding)), ctx)
+            except UnicodeDecodeError as e:
+                # A decode failure that escapes _load_from_file happened before
+                # any data row was read (skip_rows or the header line itself);
+                # data-row failures are recorded there with their exact line.
+                # Record a file-level parse error and stop.
+                raw_row = {
+                    "file_path": str(self._path),
+                    "__encoding__": self._encoding,
+                }
+                error_msg = f"CSV decode error (encoding '{self._encoding}'): {e}"
+                ctx.record_validation_error(
                     row=raw_row,
                     error=error_msg,
+                    schema_mode="parse",
                     destination=self._on_validation_failure,
-                    source_row_index=0,
                 )
-            return
+                if self._on_validation_failure != "discard":
+                    yield SourceRow.quarantined(
+                        row=raw_row,
+                        error=error_msg,
+                        destination=self._on_validation_failure,
+                        source_row_index=0,
+                    )
 
-        try:
-            yield from self._load_from_file(f, ctx)
-        except UnicodeDecodeError as e:
-            # Decode failure while reading rows — Tier 3 boundary.
-            # Record parse-level error and stop (remaining rows may be corrupt).
-            # File-level decode errors occur before CSV parsing — no meaningful
-            # line number exists. Don't fabricate "unknown" or use dead getattr
-            # (file objects don't have lineno; csv.reader does, but it's not
-            # in scope here).
-            raw_row = {
-                "file_path": str(self._path),
-                "__encoding__": self._encoding,
-            }
-            error_msg = f"CSV decode error (encoding '{self._encoding}'): {e}"
-            ctx.record_validation_error(
-                row=raw_row,
-                error=error_msg,
-                schema_mode="parse",
-                destination=self._on_validation_failure,
-            )
-            if self._on_validation_failure != "discard":
-                yield SourceRow.quarantined(
-                    row=raw_row,
-                    error=error_msg,
-                    destination=self._on_validation_failure,
-                    source_row_index=0,
-                )
-        finally:
-            f.close()
-
-    def _load_from_file(self, f: Any, ctx: SourceContext) -> Iterator[SourceRow]:
-        """Load rows from an open CSV file handle.
+    def _load_from_file(self, f: Iterator[str], ctx: SourceContext) -> Iterator[SourceRow]:
+        """Load rows from an iterator of physical CSV lines.
 
         Extracted from load() to allow UnicodeDecodeError handling at the
         file-reading boundary (Tier 3 external data). All csv.Error and
         StopIteration handling remains here.
 
-        The caller (load()) is responsible for closing f.
+        The caller (load()) is responsible for closing the underlying file.
 
         Args:
-            f: Open file handle for the CSV file
+            f: Physical lines of the CSV file, terminators included
             ctx: Plugin context for recording errors
 
         Yields:
             SourceRow for each row (valid or quarantined)
         """
-        # Create csv.reader on file handle for multiline field support.
+        # Create csv.reader on the line iterator for multiline field support.
         # strict=True is required so malformed quoted input fails at the
         # source boundary instead of being silently merged into later rows.
         reader = csv.reader(f, delimiter=self._delimiter, strict=True)

@@ -12,6 +12,7 @@ from typing import Literal
 from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
 
 import httpx
+import soupsieve
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field, model_validator
 
@@ -46,7 +47,9 @@ class PaginationConfig(BaseModel):
         if self.next_link_selector is not None:
             try:
                 BeautifulSoup("<html></html>", "html.parser").select(self.next_link_selector)
-            except (ValueError, TypeError) as exc:
+            # soupsieve.SelectorSyntaxError subclasses Exception, not
+            # ValueError; it must become a ValueError so pydantic reports it.
+            except (soupsieve.SelectorSyntaxError, ValueError, TypeError) as exc:
                 raise ValueError("next_link_selector is not a valid CSS selector") from exc
         return self
 

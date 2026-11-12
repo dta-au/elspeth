@@ -59,6 +59,10 @@ _BASE_CONFIG: dict[str, Any] = {
     "schema": DYNAMIC_SCHEMA,
 }
 
+# A lookup binds the value of a mapped pipeline field, so lookup keys must be
+# field_mapping keys (DataverseSinkConfig.validate_lookup_keys_in_field_mapping).
+_LOOKUP_FIELD_MAPPING: dict[str, str] = {**_BASE_CONFIG["field_mapping"], "account_id": "parentcustomerid"}
+
 INVALID_ENTITY_SET_NAMES = (
     "accounts/systemusers",
     "accounts?query=true",
@@ -253,12 +257,13 @@ class TestDataverseSinkConfig:
     def test_lookup_config_valid(self) -> None:
         cfg = DataverseSinkConfig.from_dict(
             _config(
+                field_mapping=_LOOKUP_FIELD_MAPPING,
                 lookups={
                     "account_id": {
                         "target_entity": "accounts",
                         "target_field": "parentcustomerid",
                     }
-                }
+                },
             )
         )
         assert cfg.lookups is not None
@@ -282,12 +287,13 @@ class TestDataverseSinkConfig:
     def test_plain_placeholder_words_can_be_lookup_target_entities(self, target_entity: str) -> None:
         cfg = DataverseSinkConfig.from_dict(
             _config(
+                field_mapping=_LOOKUP_FIELD_MAPPING,
                 lookups={
                     "account_id": {
                         "target_entity": target_entity,
                         "target_field": "parentcustomerid",
                     }
-                }
+                },
             )
         )
         assert cfg.lookups is not None
@@ -337,12 +343,13 @@ class TestDataverseSinkConfig:
     def test_lookup_entity_set_name_preserves_valid_custom_case_and_spelling(self, target_entity: str) -> None:
         cfg = DataverseSinkConfig.from_dict(
             _config(
+                field_mapping=_LOOKUP_FIELD_MAPPING,
                 lookups={
                     "account_id": {
                         "target_entity": target_entity,
                         "target_field": "parentcustomerid",
                     }
-                }
+                },
             )
         )
 
@@ -378,12 +385,13 @@ class TestDataverseSinkConfig:
     def test_lookup_target_field_stripped(self) -> None:
         cfg = DataverseSinkConfig.from_dict(
             _config(
+                field_mapping=_LOOKUP_FIELD_MAPPING,
                 lookups={
                     "account_id": {
                         "target_entity": "accounts",
                         "target_field": "  parentcustomerid  ",
                     }
-                }
+                },
             )
         )
 
@@ -407,12 +415,13 @@ class TestDataverseSinkConfig:
     def test_plain_placeholder_words_can_be_lookup_target_fields(self, target_field: str) -> None:
         cfg = DataverseSinkConfig.from_dict(
             _config(
+                field_mapping=_LOOKUP_FIELD_MAPPING,
                 lookups={
                     "account_id": {
                         "target_entity": "accounts",
                         "target_field": target_field,
                     }
-                }
+                },
             )
         )
         assert cfg.lookups is not None
@@ -874,7 +883,8 @@ class _RecoverableDataverseClient:
         self.records[key] = dict(body)
         return _make_204_response()
 
-    def get_page(self, url: str) -> DataversePageResponse:
+    def get_page(self, url: str, *, annotations: tuple[str, ...] = ()) -> DataversePageResponse:
+        del annotations
         key = self._key(url)
         if key not in self.records:
             raise DataverseClientError(

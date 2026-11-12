@@ -1003,7 +1003,27 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # plugin_version values advance (seven manifest lines), engine:0.8.13 ->
 # engine:0.8.14. Captured from this file's parity failure (previous pin
 # 3338f07b...); reverting the eight values reproduces that pin.
-EXPECTED_CASE_REGISTRY_SHA256 = "d287953784cfb9bcd56f17f0be4b68c59df0a1e4c1b411cf1a3d0786409e091e"
+# Sweep finding #40 (20261111-plugins-review): JSONSource's structural
+# quarantines now record the row they yield; its manifest provenance token
+# moved 0c356038d5722d0c -> 204c8485e712dc75, the manifest's only changed byte
+# run. Captured from this file's parity failure (previous pin d2879537...).
+# Sweep finding #80 (20261111-plugins-review): CSVSource decodes line by line
+# so decode errors name the exact line; its fifteen manifest provenance tokens
+# moved 5a67572be967d4aa -> 94e4e14b6d89d7e1, and reopen-resume's
+# resumed_full_projection_sha256 moved 86bda402... -> b8c16e2c..., measured by
+# the production harness (test_dag_scenario_production_path). Captured from
+# this file's parity failure (previous pin 0ce52bbb...).
+# Sweep finding #103 (20261111-plugins-review): JSONSink refuses a JSONL
+# append baseline without a trailing LF; its seventeen manifest provenance
+# tokens moved 9ef547005076060e -> 0241bd4eb91ae378, and reopen-resume's
+# resumed_full_projection_sha256 moved b8c16e2c... -> d9f57ba0..., measured by
+# the production harness. Captured from this file's parity failure (previous
+# pin 28a82fc8...).
+# Deep-nesting follow-up (20261111-plugins-review #18/#68/#112/#138): JSONSource
+# bounds nesting before decode; its manifest provenance token moved
+# 204c8485e712dc75 -> 35519150141e19b9, the manifest's only changed byte run.
+# Captured from this file's parity failure (previous pin b14d1da8...).
+EXPECTED_CASE_REGISTRY_SHA256 = "70bb6809b9fa28b1888034ce64774a2a6c7f2116697bff9a41c746915704cab9"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

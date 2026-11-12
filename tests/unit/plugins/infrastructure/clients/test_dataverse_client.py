@@ -711,7 +711,7 @@ class TestPaginateOdata:
         assert [dict(r) for r in pages[1].rows] == [{"id": 2}]
 
     def test_ssrf_rejection_on_cross_host_next_link(self, client: DataverseClient, transport: MockTransport) -> None:
-        """nextLink pointing to a different host is rejected by domain allowlist."""
+        """nextLink pointing to a different host is rejected before credentials are sent."""
         transport.add_response(
             _make_json_response(
                 {
@@ -720,9 +720,10 @@ class TestPaginateOdata:
                 }
             )
         )
-        with pytest.raises(DataverseClientError, match="rejected by domain allowlist"):
+        with pytest.raises(DataverseClientError, match="not on the configured environment's https origin") as exc_info:
             # Consume the iterator to trigger the SSRF check
             list(client.paginate_odata(f"{ENV_URL}/api/data/v9.2/accounts"))
+        assert exc_info.value.error_category == "ssrf_rejected"
 
     def test_ssrf_ip_pinning_failure(self, client: DataverseClient, transport: MockTransport) -> None:
         """nextLink failing IP-pinning validation is rejected."""

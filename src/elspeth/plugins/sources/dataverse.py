@@ -64,9 +64,13 @@ class _DataverseSourceRequest(TypedDict):
     headers: dict[str, str] | None
 
 
-# OData annotation prefixes to strip from row data
-_ODATA_ANNOTATION_PATTERN = re.compile(r"^@odata\.|@Microsoft\.Dynamics\.CRM\.")
-_FORMATTED_VALUE_SUFFIX = "@OData.Community.Display.V1.FormattedValue"
+# OData annotations to strip from row data. Searched, not matched: an
+# annotation is either instance-level ("@odata.etag") or property-level
+# ("_parentcustomerid_value@Microsoft.Dynamics.CRM.lookuplogicalname"), and
+# Dataverse column logical names never contain "@".
+_ODATA_ANNOTATION_PATTERN = re.compile(r"@(?:odata|Microsoft\.Dynamics\.CRM)\.")
+_FORMATTED_VALUE_ANNOTATION = "OData.Community.Display.V1.FormattedValue"
+_FORMATTED_VALUE_SUFFIX = f"@{_FORMATTED_VALUE_ANNOTATION}"
 _DATAVERSE_LOGICAL_NAME_PATTERN = re.compile(r"^[a-z_][a-z0-9_]*$")
 _DATAVERSE_ENTITY_SET_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -146,6 +150,7 @@ class DataverseSourceConfig(DataPluginConfig):
     )
     top: int | None = Field(
         default=None,
+        ge=1,
         description="$top limit (None = all records)",
     )
 
@@ -208,9 +213,10 @@ class DataverseSourceConfig(DataPluginConfig):
         for index, select_name in enumerate(v):
             if not select_name or not select_name.strip():
                 raise ValueError(f"select[{index}] cannot be empty")
-            stripped = select_name.strip()
-            reject_operator_required_placeholder_value(stripped, field_name=f"select[{index}]")
-            stripped_fields.append(stripped)
+            # Each entry is joined unencoded into ``$select=``, so it must be a
+            # Dataverse logical name: '#', '&', ',' or whitespace would end or
+            # rewrite the query string (lookup columns like ``_x_value`` match).
+            stripped_fields.append(_validate_dataverse_logical_name(select_name.strip(), field_name=f"select[{index}]"))
         return stripped_fields
 
     @model_validator(mode="after")
@@ -269,9 +275,14 @@ class DataverseSourceConfig(DataPluginConfig):
                 ) from exc
             if root.tag != "fetch":
                 raise ValueError(f"FetchXML root element must be <fetch>, got <{root.tag}>.")
-            entity_elem = root.find("entity")
-            if entity_elem is not None and "name" in entity_elem.attrib:
-                _validate_dataverse_logical_name(entity_elem.attrib["name"], field_name="FetchXML <entity name>")
+            # _load_rows derives the entity set URL from this element, so a
+            # query without exactly one named <entity> can never run.
+            entity_elems = root.findall("entity")
+            if len(entity_elems) != 1:
+                raise ValueError(f"FetchXML <fetch> must contain exactly one <entity> element, found {len(entity_elems)}.")
+            if "name" not in entity_elems[0].attrib:
+                raise ValueError("FetchXML <entity> element must have a 'name' attribute.")
+            _validate_dataverse_logical_name(entity_elems[0].attrib["name"], field_name="FetchXML <entity name>")
         return v
 
 
@@ -290,7 +301,7 @@ class DataverseSource(BaseSource):
     _normalizes_external_names = True
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8d3f3de6d9e62d9f"
+    source_file_hash: str | None = "sha256:c84e1f8a147d4255"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 
@@ -639,7 +650,7 @@ class DataverseSource(BaseSource):
                 continue
 
             # Strip OData annotations
-            if _ODATA_ANNOTATION_PATTERN.match(key):
+            if _ODATA_ANNOTATION_PATTERN.search(key):
                 continue
 
             cleaned[key] = value
@@ -896,10 +907,8 @@ class DataverseSource(BaseSource):
                 raise RuntimeError("config validator ensures entity or fetch_xml — neither is set, this is a bug")
             root = ET.fromstring(self._fetch_xml)
             entity_elem = root.find("entity")
-            if entity_elem is None:
-                raise RuntimeError("FetchXML is missing <entity> element — cannot determine entity name for URL")
-            if "name" not in entity_elem.attrib:
-                raise RuntimeError("FetchXML <entity> element missing 'name' attribute")
+            if entity_elem is None or "name" not in entity_elem.attrib:
+                raise RuntimeError("config validator ensures FetchXML has exactly one named <entity> — none found, this is a bug")
             logical_name = entity_elem.attrib["name"]
 
         if self._client is None:
@@ -920,15 +929,17 @@ class DataverseSource(BaseSource):
         entity_set_name = self._resolve_entity_set_name(ctx, logical_name)
         if self._entity is not None:
             url = self._build_query_url(entity_set_name)
+        # Dataverse returns FormattedValue annotations only when asked for them.
+        annotations = (_FORMATTED_VALUE_ANNOTATION,) if self._include_formatted_values else ()
 
         try:
             if self._entity is not None:
                 # Structured OData query
-                page_iterator = self._client.paginate_odata(url)
+                page_iterator = self._client.paginate_odata(url, annotations=annotations)
             else:
                 # FetchXML query
                 assert self._fetch_xml is not None
-                page_iterator = self._client.paginate_fetchxml(entity_set_name, self._fetch_xml)
+                page_iterator = self._client.paginate_fetchxml(entity_set_name, self._fetch_xml, annotations=annotations)
 
             for page in page_iterator:
                 # Record successful page fetch — use the actual URL from the

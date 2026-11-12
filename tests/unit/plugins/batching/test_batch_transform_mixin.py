@@ -670,6 +670,7 @@ class FailingOutputPort:
         self._fail_count = 0
         self._should_fail_at: set[int] = set()
         self._emit_count = 0
+        self.pending_failures: list[Exception] = []
 
     def fail_at(self, *indices: int) -> None:
         """Configure which emit calls should fail (0-indexed)."""
@@ -683,6 +684,9 @@ class FailingOutputPort:
                 raise self._failure
             raise RuntimeError(f"Simulated output port failure at emit #{current}")
         self.results.append((token, result, state_id))
+
+    def fail_pending(self, failure: Exception) -> None:
+        self.pending_failures.append(failure)
 
 
 class TestReleaseLoopStaleTokenDetection:
@@ -799,9 +803,13 @@ class AlwaysFailingOutputPort:
 
     def __init__(self, failure: Exception | None = None) -> None:
         self.failure = RuntimeError("Port is completely broken") if failure is None else failure
+        self.pending_failures: list[Exception] = []
 
     def emit(self, token: Any, result: Any, state_id: Any) -> None:
         raise self.failure
+
+    def fail_pending(self, failure: Exception) -> None:
+        self.pending_failures.append(failure)
 
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
