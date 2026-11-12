@@ -317,3 +317,28 @@ class TestFinding82UpsertKeyQuoteEscaping:
 
         url = DataverseSink(_sink_config())._build_upsert_url("alice@example.com")
         assert url == f"{_ENV_URL}/api/data/v9.2/contacts(emailaddress1='alice%40example.com')"
+
+
+class TestFinding85LookupKeysMustBeMapped:
+    """#85: a lookup keyed by a pipeline field absent from field_mapping is refused, not silently dropped."""
+
+    def test_unmapped_lookup_key_rejected(self) -> None:
+        from elspeth.plugins.sinks.dataverse import DataverseSinkConfig
+
+        config = _sink_config(
+            field_mapping={"email": "emailaddress1"},
+            lookups={"account_id": {"target_entity": "accounts", "target_field": "parentcustomerid"}},
+        )
+        with pytest.raises(PluginConfigError, match="account_id"):
+            DataverseSinkConfig.from_dict(config)
+
+    def test_mapped_lookup_key_accepted(self) -> None:
+        from elspeth.plugins.sinks.dataverse import DataverseSinkConfig
+
+        config = _sink_config(
+            field_mapping={"email": "emailaddress1", "account_id": "parentcustomerid"},
+            lookups={"account_id": {"target_entity": "accounts", "target_field": "parentcustomerid"}},
+        )
+        cfg = DataverseSinkConfig.from_dict(config)
+        assert cfg.lookups is not None
+        assert set(cfg.lookups) == {"account_id"}
