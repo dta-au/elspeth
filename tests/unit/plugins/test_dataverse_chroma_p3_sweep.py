@@ -283,3 +283,37 @@ class TestFinding76DataverseRetryAfterCarried:
         assert missing.retryable is True
         assert "retry_after" in vars(server_error)
         assert server_error.retry_after is None
+
+
+def _sink_config(**overrides: Any) -> dict[str, Any]:
+    config: dict[str, Any] = {
+        "environment_url": _ENV_URL,
+        "auth": _AUTH,
+        "entity": "contacts",
+        "alternate_key": "emailaddress1",
+        "field_mapping": {"email": "emailaddress1", "name": "fullname"},
+        "schema": {"mode": "observed"},
+    }
+    config.update(overrides)
+    return config
+
+
+class TestFinding82UpsertKeyQuoteEscaping:
+    """#82: a single quote in an alternate-key value is doubled (OData) before percent-encoding."""
+
+    def test_apostrophe_key_value_is_odata_escaped(self) -> None:
+        import urllib.parse
+
+        from elspeth.plugins.sinks.dataverse import DataverseSink
+
+        url = DataverseSink(_sink_config())._build_upsert_url("o'brien@x.com")
+
+        # Servers percent-decode before parsing OData: the decoded key predicate
+        # must be one balanced string literal with the quote doubled.
+        assert urllib.parse.unquote(url).endswith("/contacts(emailaddress1='o''brien@x.com')")
+
+    def test_key_value_without_quotes_unchanged(self) -> None:
+        from elspeth.plugins.sinks.dataverse import DataverseSink
+
+        url = DataverseSink(_sink_config())._build_upsert_url("alice@example.com")
+        assert url == f"{_ENV_URL}/api/data/v9.2/contacts(emailaddress1='alice%40example.com')"
