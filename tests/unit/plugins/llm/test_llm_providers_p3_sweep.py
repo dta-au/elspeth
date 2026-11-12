@@ -11,6 +11,7 @@ import pytest
 
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.plugins.infrastructure.clients.llm import ContentPolicyError, LLMClientError, NetworkError
+from elspeth.plugins.llm.config_validation import normalize_openrouter_base_url, validate_openrouter_base_url
 from elspeth.plugins.sources.llm.config import (
     AzureOpenAILLMSourceConfig,
     GatewayLLMSourceConfig,
@@ -312,3 +313,46 @@ class TestLLMSourceConfigHidesApiKey:
         config = config_cls.from_dict({**_SOURCE_COMMON, **options, "api_key": _SOURCE_KEY_SENTINEL})
         assert _SOURCE_KEY_SENTINEL not in repr(config)
         assert _SOURCE_KEY_SENTINEL not in str(config)
+
+
+# ---------------------------------------------------------------------------
+# Finding #133: the OpenRouter base_url admits no query string or fragment
+# ---------------------------------------------------------------------------
+
+
+class TestOpenRouterBaseUrlRejectsQueryAndFragment:
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            pytest.param("https://openrouter.ai/api/v1?token=x", id="query"),
+            pytest.param("https://openrouter.ai/api/v1#frag", id="fragment"),
+            pytest.param("https://openrouter.ai/api/v1/?a=1#b", id="both"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "validator",
+        [
+            pytest.param(validate_openrouter_base_url, id="validate"),
+            pytest.param(normalize_openrouter_base_url, id="normalize"),
+        ],
+    )
+    def test_query_or_fragment_is_rejected(self, validator: Callable[[str], str], base_url: str) -> None:
+        raised = _raised_by(lambda: validator(base_url))
+        assert isinstance(raised, ValueError), f"{base_url!r} was admitted as {raised!r}"
+
+    def test_source_config_rejects_query_base_url(self) -> None:
+        raised = _raised_by(
+            lambda: OpenRouterLLMSourceConfig.from_dict(
+                {
+                    **_SOURCE_COMMON,
+                    "provider": "openrouter",
+                    "model": "openai/gpt-4o-mini",
+                    "api_key": "test-key",
+                    "base_url": "https://openrouter.ai/api/v1?token=x",
+                }
+            )
+        )
+        assert raised is not None, "a query-string base_url was admitted"
+
+    def test_canonical_base_url_still_normalizes(self) -> None:
+        assert validate_openrouter_base_url("https://OpenRouter.ai:443/api/v1/") == "https://openrouter.ai/api/v1"
