@@ -499,9 +499,18 @@ class SingleQueryStrategy:
             PipelineRow(output, output_contract),
             success_reason={
                 "action": "enriched",
-                "fields_added": [self.response_field, *(field.suffix for field in self.output_fields)],
+                # Every field written above: the structured outputs plus the
+                # response and the operational fields populate_llm_operational_fields
+                # writes (get_llm_guaranteed_fields names exactly those).
+                "fields_added": [
+                    *(field.suffix for field in self.output_fields),
+                    *get_llm_guaranteed_fields(self.response_field),
+                ],
+                # ``model`` is the configured model in both modes; the model
+                # the provider actually served is recorded separately.
                 "metadata": {
-                    "model": result.model,
+                    "model": self.model,
+                    "served_model": result.model,
                     "finish_reason": _serialize_finish_reason(result.finish_reason),
                     **result.usage.to_dict(),
                     **audit_metadata,
@@ -861,6 +870,9 @@ class MultiQueryStrategy:
         # Record finish_reason so audit trail distinguishes None (absent) from
         # STOP (confirmed completion). See Bug elspeth-393d2459aa.
         audit_metadata[f"{spec.name}_finish_reason"] = _serialize_finish_reason(result.finish_reason)
+        # The strategy-level ``model`` key is the configured model; record the
+        # model the provider actually served for this query beside it.
+        audit_metadata[f"{spec.name}_served_model"] = result.model
 
         return self._QuerySuccess(fields=partial, audit_metadata=audit_metadata)
 
@@ -1252,7 +1264,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0e12f0bdebf60583"
+    source_file_hash: str | None = "sha256:239240ed0e8901b7"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
