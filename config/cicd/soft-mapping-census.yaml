@@ -367,9 +367,6 @@ files:
     dict[str, Any]: 1
   src/elspeth/plugins/infrastructure/clients/vendor_logging.py:
     Mapping[str, object]: 1
-  src/elspeth/plugins/infrastructure/clients/verifier.py:
-    Mapping[str, Any]: 12
-    dict[str, Any]: 2
   src/elspeth/plugins/infrastructure/config_base.py:
     dict[str, Any]: 2
   src/elspeth/plugins/infrastructure/config_content.py:
@@ -1116,10 +1113,10 @@ files:
   src/elspeth/web/shareable_reviews/service.py:
     dict[str, object]: 1
 totals:
-  Mapping[str, Any]: 810
+  Mapping[str, Any]: 798
   Mapping[str, object]: 317
   MutableMapping[str, Any]: 8
   boundary: 70
-  dict[str, Any]: 1132
+  dict[str, Any]: 1130
   dict[str, object]: 401
-  soft: 2668
+  soft: 2654

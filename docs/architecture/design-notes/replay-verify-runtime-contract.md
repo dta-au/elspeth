@@ -63,8 +63,10 @@ Verify makes its live call only after explicit mode admission, records the
 actual result, compares it with the corresponding source call, and durably
 records match, mismatch, missing-recording, or unverifiable evidence. A
 mismatch, missing recording, missing payload, or unconsumed source call makes
-the verify run fail and produces a nonzero CLI result. In-memory
-`VerificationReport` counters are useful diagnostics but are not the verdict.
+the verify run fail and produces a nonzero CLI result. `CallModeSession.verify_call`
+is the single verify authority; the former in-memory `CallVerifier` /
+`VerificationReport` comparator was removed because it never ran in production
+and applied looser rules.
 Comparisons are exact by default. Narrow adapter-specific identities, such as
 Azure managed-identity Authorization rotation, compare all execution-relevant
 non-authentication fields and record the current credential fingerprint

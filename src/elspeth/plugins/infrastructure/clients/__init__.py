@@ -31,18 +31,11 @@ For replay mode, use CallReplayer to return recorded responses:
     replayer = CallReplayer(execution, source_run_id="run-abc123")
     result = replayer.replay(call_type="llm", request_data={...})
 
-For verify mode, use CallVerifier to compare live responses to recorded:
-
-    from elspeth.plugins.infrastructure.clients import CallVerifier
-
-    verifier = CallVerifier(execution, source_run_id="run-abc123")
-    result = verifier.verify(
-        call_type="llm",
-        request_data={...},
-        live_response={...}
-    )
-    if result.has_differences:
-        print(f"Drift detected: {result.differences}")
+Verify mode has a single authority: the engine's
+``CallModeSession.verify_call`` (``elspeth.engine.orchestrator.call_mode_session``),
+which binds each source call to its parent, compares call status and error
+evidence, and records exact-hash verdicts. This package exports no separate
+verify comparator.
 """
 
 from elspeth.plugins.infrastructure.clients.base import AuditedClientBase
@@ -63,18 +56,12 @@ from elspeth.plugins.infrastructure.clients.replayer import (
     ReplayMissError,
     ReplayPayloadMissingError,
 )
-from elspeth.plugins.infrastructure.clients.verifier import (
-    CallVerifier,
-    VerificationReport,
-    VerificationResult,
-)
 
 __all__ = [
     "AuditedClientBase",
     "AuditedHTTPClient",
     "AuditedLLMClient",
     "CallReplayer",
-    "CallVerifier",
     "ContentPolicyError",
     "ContextLengthError",
     "LLMClientError",
@@ -85,6 +72,4 @@ __all__ = [
     "ReplayPayloadMissingError",
     "ReplayedCall",
     "ServerError",
-    "VerificationReport",
-    "VerificationResult",
 ]
