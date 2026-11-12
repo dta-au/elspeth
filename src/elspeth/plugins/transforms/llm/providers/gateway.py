@@ -491,6 +491,13 @@ def _validate_gateway_success_response(
                 # interpolated, even though it's "just a key name".
                 raise LLMClientError("Non-finite value in gateway usage", retryable=False)
     usage = TokenUsage.from_dict(raw_usage)
+    if usage_required and (usage.prompt_tokens is None or usage.completion_tokens is None):
+        # TokenUsage.from_dict coerces malformed members to None by design; a
+        # profile that requires usage must not accept that coercion as usage.
+        raise LLMClientError(
+            "Gateway response usage data required by this profile's required_capabilities is malformed",
+            retryable=False,
+        )
 
     finish_reason = parse_finish_reason(str(raw_finish_reason)) if raw_finish_reason is not None else None
 
