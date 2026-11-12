@@ -959,7 +959,14 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # for its allocated operation call index). The search() initialisation-failure
 # path reuses the existing _record_error caller. Measured by this gate's scanner
 # on the lane tree against the base 10d56017 (283/87f23b4e…).
-_EXPECTED_CALL_COUNT = 284
+# P3 cloud-blob (#19): 284 -> 285. Arrived 1, departed 0, moved 0:
+# AzureBlobSource._load_csv._quarantine_undecodable_file -> ctx.record_validation_error
+# (the file-level decode quarantine, now shared by the strict-decode fallback and an
+# undecodable header record). _load_csv keeps six callers: the old inline file-level
+# site left and the per-record undecodable-bytes quarantine arrived in its place.
+# Arrival measured on the lane against 10d56017; merged with the dataverse-chroma
+# landing 20584836, scripts/fencing_inventory.py reports live 285 and digest below.
+_EXPECTED_CALL_COUNT = 285
 # Release integration retains the ACA callers and the Dataverse lifecycle
 # wrapper: six validation writes move from load() to _load_rows().
 # AGG-ERROR-EDGE: 0b7a9382… -> d82c45a5…, the one caller added above.
@@ -978,9 +985,11 @@ _EXPECTED_CALL_COUNT = 284
 # and departures named at _EXPECTED_CALL_COUNT.
 # P2 json-csv: 584288fd… -> 87f23b4e…, the four departures named at
 # _EXPECTED_CALL_COUNT.
-# P3 dataverse-chroma: 87f23b4e… -> the value below, the one arrival named at
+# P3 dataverse-chroma: 87f23b4e… -> 9a8cb7c5…, the one arrival named at
 # _EXPECTED_CALL_COUNT.
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "9a8cb7c52580370138905c2164018f47b15255f4647f61e8643d71b758c04200"
+# P3 cloud-blob (#19): 9a8cb7c5… -> the value below, the one arrival named at
+# _EXPECTED_CALL_COUNT.
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "9b4ad47309d8766f7769c2787f0bae58ca9fdcf35aaeabb2b95820b8f6f59fe9"
 # C4 (recorded FAILED verdict): 138 -> 143, d3b83b4c… -> the value below. Arrived:
 # ExecutionRepository.complete_aggregation_failure -> insert_batch_transform_errors_on,
 # -> NodeStateRepository.record_routing_event_on, -> NodeStateRepository.complete_node_state_on,
