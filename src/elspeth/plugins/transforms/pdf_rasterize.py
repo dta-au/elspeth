@@ -34,7 +34,7 @@ from elspeth.contracts.pdf_render import (
 )
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
-from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.replay_payload_store import SourceBoundPayloadStore
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
@@ -465,7 +465,7 @@ class PDFRasterize(BaseTransform):
     name = "pdf_rasterize"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:da4a025f44029b01"
+    source_file_hash: str | None = "sha256:30f98ba21f7a8e25"
     config_model = PDFRasterizeConfig
     usage_when_to_use: str = (
         "Use when each row carries a payload-store content hash for a PDF (from the blob_rows source or blob_fetch) "
@@ -873,6 +873,11 @@ class PDFRasterize(BaseTransform):
             pages_by_number[number] = cast(PDFRenderedPageData, page)
         expected_input = input_row.to_dict()
         output_rows: list[PipelineRow] = []
+        # len(rows) == len(rendered) is checked above; with every row claiming a
+        # DISTINCT rendered page, rows map onto rendered pages one-to-one.
+        claimed_pages: set[int] = set()
+        shared_contract: SchemaContract | None = None
+        first_keys: set[str] | None = None
         for index, output in enumerate(rows):
             if type(output) is not dict or not all(key in output and output[key] == value for key, value in expected_input.items()):
                 raise AuditIntegrityError(f"PDF replay output row {index} disagrees with input")
@@ -881,6 +886,9 @@ class PDFRasterize(BaseTransform):
             number = output[self._page_number_field]
             if number not in pages_by_number:
                 raise AuditIntegrityError(f"PDF replay output row {index} has no matching rendered page")
+            if number in claimed_pages:
+                raise AuditIntegrityError(f"PDF replay output row {index} repeats rendered page {number}")
+            claimed_pages.add(number)
             page = pages_by_number[number]
             required_output = {
                 self._page_blob_ref_field,
@@ -907,10 +915,16 @@ class PDFRasterize(BaseTransform):
                 raise AuditIntegrityError(f"PDF replay output row {index} disagrees with worker receipt")
             if self._extract_text and ("text" not in page or output[self._page_text_field] != page["text"]):
                 raise AuditIntegrityError(f"PDF replay output row {index} text differs from worker receipt")
-            contract = narrow_contract_to_output(input_contract=input_row.contract, output_row=output)
-            contract = self._apply_declared_output_field_contracts(contract)
-            contract = self._align_output_contract(contract)
-            output_rows.append(PipelineRow(output, contract))
+            # One contract for every row, derived from the first, exactly as the live
+            # path builds it: success_multi() requires a single shared instance.
+            if first_keys is None or shared_contract is None:
+                first_keys = set(output)
+                shared_contract = narrow_contract_to_output(input_contract=input_row.contract, output_row=output)
+                shared_contract = self._apply_declared_output_field_contracts(shared_contract)
+                shared_contract = self._align_output_contract(shared_contract)
+            elif set(output) != first_keys:
+                raise AuditIntegrityError(f"PDF replay output row {index} has a different field set from row 0")
+            output_rows.append(PipelineRow(output, shared_contract))
         for page in pages_by_number.values():
             restored_ref = page["page_ref"]
             if type(restored_ref) is not str:
