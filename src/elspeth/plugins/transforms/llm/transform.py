@@ -106,6 +106,16 @@ _warn_telemetry_before_start = make_warn_telemetry_before_start(logger)
 _SEQUENTIAL_RETRY_INITIAL_DELAY_SECONDS: float = 0.05
 _SEQUENTIAL_RETRY_MAX_DELAY_SECONDS: float = 1.0
 
+# Engine batch-wait sizing. The engine's waiter starts at accept, but the
+# plugin's retry budget (max_capacity_retry_seconds) starts inside the worker
+# and is checked only between provider attempts, so the structured
+# retry_timeout result arrives at budget + one in-flight request per query.
+# Providers whose config carries no request timeout run on their SDK's
+# default, mirrored here (tests pin both against the installed SDK).
+_AZURE_OPENAI_SDK_REQUEST_TIMEOUT_SECONDS: float = 600.0  # openai.DEFAULT_TIMEOUT.read
+_BEDROCK_LITELLM_REQUEST_TIMEOUT_SECONDS: float = 6000.0  # litellm.request_timeout
+_BATCH_WAIT_HEADROOM_SECONDS: float = 30.0
+
 
 @dataclass(frozen=True, slots=True)
 class _FinishReasonError:
@@ -1242,7 +1252,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:498b84f2c8939775"
+    source_file_hash: str | None = "sha256:0e12f0bdebf60583"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1814,9 +1824,32 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             output=output,
             name=self.name,
             max_workers=max_pending,
-            batch_wait_timeout=float(self._max_capacity_retry_seconds),
+            batch_wait_timeout=self._effective_batch_wait_timeout_seconds(),
         )
         self._batch_initialized = True
+
+    def _provider_request_timeout_seconds(self) -> float:
+        """Upper bound of one provider request for this transform's provider."""
+        if isinstance(self._config, (OpenRouterConfig, GatewayConfig)):
+            return float(self._config.timeout_seconds)
+        if isinstance(self._config, AzureOpenAIConfig):
+            return _AZURE_OPENAI_SDK_REQUEST_TIMEOUT_SECONDS
+        if isinstance(self._config, BedrockConfig):
+            return _BEDROCK_LITELLM_REQUEST_TIMEOUT_SECONDS
+        raise RuntimeError(f"Unknown config type: {type(self._config).__name__}")
+
+    def _effective_batch_wait_timeout_seconds(self) -> float:
+        """Engine wait that the plugin's structured retry_timeout result always beats.
+
+        After the retry deadline each query gets at most one further provider
+        attempt (the one in flight, or the single attempt of a later
+        sequential query), so the wait covers the budget plus one request per
+        query plus headroom.
+        """
+        query_count = len(self._strategy.query_specs) if isinstance(self._strategy, MultiQueryStrategy) else 1
+        return (
+            float(self._max_capacity_retry_seconds) + query_count * self._provider_request_timeout_seconds() + _BATCH_WAIT_HEADROOM_SECONDS
+        )
 
     def created_output_fields(self) -> tuple[FieldDefinition, ...]:
         """Every field this transform creates, typed by the code that writes it (ADR-050).
