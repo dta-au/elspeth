@@ -7,7 +7,9 @@ from pathlib import Path
 
 import pytest
 
+from elspeth.contracts.sink_effects import SinkEffectInputKind, SinkEffectInspectionRequest
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.plugins.sinks import _local_file_effects as local_effects
 from elspeth.plugins.sinks import database_sink as database_sink_module
 from elspeth.plugins.sinks.csv_sink import CSVSink, CSVSinkConfig
 from elspeth.plugins.sinks.database_sink import DatabaseSink
@@ -137,3 +139,58 @@ def test_database_sink_has_no_dead_ddl_type_map_or_stale_docstring() -> None:
     assert "SCHEMA_TYPE_TO_SQLALCHEMY" not in vars(database_sink_module), "unused DDL type map advertises a DDL path"
     assert DatabaseSink.__doc__ is not None
     assert "Creates the table" not in DatabaseSink.__doc__
+
+
+# --- Finding #79: storage admission is per byte threshold, not per streamed chunk ---
+
+
+def _prepare_under_recorded_admission(tmp_path: Path, chunks: tuple[bytes, ...], *, effect_id: str) -> tuple[list[tuple[int, int]], int]:
+    """Prepare a local effect under a recording authority; return (admitted, on-disk-at-admission) pairs and total bytes."""
+    root = tmp_path / "out"
+    root.mkdir()
+    target = root / "result.csv"
+    calls: list[tuple[int, int]] = []
+
+    def admit(admitted_target: Path, size_bytes: int) -> None:
+        calls.append((size_bytes, local_effects.local_file_storage_bytes(admitted_target)))
+
+    inspection = local_effects.inspect_local_effect(
+        target_path=target,
+        request=SinkEffectInspectionRequest(effect_id=effect_id, target="{}", predecessor_descriptor=None),
+    )
+    with local_effects.local_file_storage_admission([root], admit):
+        plan = local_effects.prepare_local_effect(
+            effect_id=effect_id,
+            input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+            inspection=inspection,
+            chunks=chunks,
+            row_count=len(chunks),
+            accepted_ordinals=tuple(range(len(chunks))),
+            diverted_ordinals=(),
+            encoding="utf-8",
+            format_name="csv",
+            stream_sequence=0,
+        )
+    assert _stage_path(plan).read_bytes() == b"".join(chunks)
+    return calls, sum(len(chunk) for chunk in chunks)
+
+
+def test_local_effect_admission_is_not_one_reservation_per_chunk(tmp_path: Path) -> None:
+    # 500 row-sized chunks plus empty chunks: one admission each on the base.
+    chunks = tuple(b"" if index % 50 == 0 else b"row,%05d,payload\n" % index for index in range(550))
+    calls, total = _prepare_under_recorded_admission(tmp_path, chunks, effect_id="79" * 32)
+
+    assert len(calls) <= 4, f"{len(calls)} storage admissions for {len(chunks)} chunks ({total} bytes)"
+    # Every admission still precedes the bytes it covers, and the stream's full size is admitted before install.
+    assert all(on_disk <= admitted for admitted, on_disk in calls)
+    assert max(admitted for admitted, _ in calls) >= total
+
+
+def test_local_effect_admission_scales_with_bytes_and_stays_pre_write(tmp_path: Path) -> None:
+    chunk = b"x" * 1024
+    chunks = (chunk,) * (4 * 64)  # 256 KiB in 1 KiB chunks
+    calls, total = _prepare_under_recorded_admission(tmp_path, chunks, effect_id="7a" * 32)
+
+    assert len(calls) <= total // (64 * 1024) + 3
+    assert all(on_disk <= admitted for admitted, on_disk in calls)
+    assert [admitted for admitted, _ in calls][-1] == total
