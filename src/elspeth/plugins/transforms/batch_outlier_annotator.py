@@ -177,7 +177,7 @@ class BatchOutlierAnnotator(BaseTransform):
     name = "batch_outlier_annotator"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:2501c11261dd8660"
+    source_file_hash: str | None = "sha256:7975cbe6774adfe9"
     config_model = BatchOutlierAnnotatorConfig
     is_batch_aware = True
     # Not passthrough-capable: a row whose value is null or non-finite is not emitted, and a one-row emission is TransformResult.success.
@@ -220,6 +220,9 @@ class BatchOutlierAnnotator(BaseTransform):
                 summary="Annotates finite numeric rows with batch z-score and robust-z outlier fields.",
                 composer_hints=(
                     "Use batch_outlier_annotator under aggregations with a trigger; it needs the batch distribution.",
+                    f"A flush over more than {_MAX_BATCH_ROWS} buffered rows fails the whole batch (batch_too_large): "
+                    f"keep trigger count at or below {_MAX_BATCH_ROWS}, and do not rely on an end-of-source flush "
+                    "(omitted trigger) when the input can exceed it.",
                     "value_field must be numeric; missing and non-finite values are skipped and reported, and a present non-numeric value fails the whole batch.",
                     "output_prefix creates many annotation fields, so choose a prefix that cannot collide with input fields; an input row already carrying one fails the whole batch.",
                     "It emits one annotated row per finite input value and may drop skipped rows from success output.",
