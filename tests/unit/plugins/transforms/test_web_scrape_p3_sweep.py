@@ -37,3 +37,33 @@ def test_discovered_href_refuses_sensitive_parameter_after_semicolon(href: str) 
     with pytest.raises(ValueError) as caught:
         _resolve(href)
     assert "secret-value" not in str(caught.value)
+
+
+# Finding #161: discovered hrefs and Link headers share one capability-key policy.
+
+
+def test_capability_query_keys_have_one_shared_definition() -> None:
+    from elspeth.plugins.infrastructure.clients import fingerprinting
+
+    assert hasattr(fingerprinting, "is_capability_query_param")
+    for key in ("session", "State", "cursor", "continuation", "next_token", "page_token"):
+        assert fingerprinting.is_capability_query_param(key)
+    assert not fingerprinting.is_capability_query_param("view")
+
+
+@pytest.mark.parametrize(
+    "href",
+    [
+        "/d?session=secret-value",
+        "/d?Session=secret-value",
+        "/d?state=secret-value&code=abc",
+        "/d?cursor=secret-value",
+        "/d?continuation=secret-value",
+        "/d?next_token=secret-value",
+        "/d?a=1;session=secret-value",
+    ],
+)
+def test_discovered_href_refuses_capability_query_keys(href: str) -> None:
+    with pytest.raises(ValueError) as caught:
+        _resolve(href)
+    assert "secret-value" not in str(caught.value)
