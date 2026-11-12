@@ -6,6 +6,9 @@ passes once that finding's fix lands.
 
 from __future__ import annotations
 
+import threading
+import time
+from collections.abc import Callable
 from types import ModuleType
 from typing import Any, ClassVar
 
@@ -411,3 +414,74 @@ class TestFinding140DataQualityDistinctCountIsLinear:
         from elspeth.plugins.transforms.batch_data_quality_report import BatchDataQualityReport
 
         assert BatchDataQualityReport._distinct_count((True, 1, 1.0, "1", 1, True, 0.0, -0.0, False, 0)) == 7
+
+
+def _wait_until(condition: Callable[[], bool], *, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+class TestFinding118EvictedLateFailureIsNotTheNextRowsFailure:
+    """#118: a late failure from an evicted row must not surface as the next row's own failure.
+
+    The executor runs ``accept()`` inside the NEXT token's NodeStateGuard; a
+    non-Tier-1 exception there is recorded as that token's ExecutionError.
+    The orphaned failure must reach the next ``accept()`` as a Tier-1
+    framework failure that names the evicted token and state it came from,
+    chained to the original exception.
+    """
+
+    def test_next_accept_raises_attributed_tier1_failure(self) -> None:
+        from elspeth.contracts.errors import TIER_1_ERRORS
+        from elspeth.plugins.infrastructure.batching.ports import CollectorOutputPort
+        from tests.fixtures.landscape import make_factory
+        from tests.unit.plugins.batching.test_batch_transform_mixin import SimpleBatchTransform, make_token
+
+        transform = SimpleBatchTransform()
+        transform.connect_output(CollectorOutputPort())
+        entered = threading.Event()
+        release = threading.Event()
+        original = ValueError("late plugin bug")
+
+        def fail_after_eviction(row: PipelineRow, ctx: Any) -> Any:
+            entered.set()
+            assert release.wait(timeout=5)
+            raise original
+
+        evicted = make_token("evicted-row", token_id="token-evicted")
+        evicted_ctx = make_context(landscape=make_factory(), token=evicted, state_id="state-evicted")
+        transform.accept_row(_make_row({}), evicted_ctx, fail_after_eviction)
+        assert entered.wait(timeout=5)
+        assert transform.evict_submission(evicted.token_id, "state-evicted")
+        release.set()
+        assert _wait_until(lambda: transform._batch_worker_failure is not None), "late failure never recorded"
+
+        innocent = make_token("next-row", token_id="token-innocent")
+        innocent_ctx = make_context(landscape=make_factory(), token=innocent, state_id="state-innocent")
+        surfaced: Exception | None = None
+        try:
+            transform.accept_row(_make_row({}), innocent_ctx, transform._process_row)
+        except Exception as exc:
+            surfaced = exc
+
+        try:
+            assert surfaced is not None, "the orphaned failure was dropped"
+            assert surfaced is not original, "the evicted row's own exception surfaced as the next row's failure"
+            assert isinstance(surfaced, TIER_1_ERRORS), (
+                f"{type(surfaced).__name__} would be recorded by the executor as the next row's own ExecutionError"
+            )
+            assert "token-evicted" in str(surfaced)
+            assert "state-evicted" in str(surfaced)
+            assert "token-innocent" not in str(surfaced)
+            assert surfaced.__cause__ is original
+        finally:
+            raised_at_shutdown: BaseException | None = None
+            try:
+                transform.shutdown_batch_processing()
+            except Exception as exc:
+                raised_at_shutdown = exc
+            assert raised_at_shutdown is not None
