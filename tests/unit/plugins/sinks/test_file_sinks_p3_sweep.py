@@ -8,7 +8,9 @@ from pathlib import Path
 import pytest
 
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.plugins.sinks import database_sink as database_sink_module
 from elspeth.plugins.sinks.csv_sink import CSVSink, CSVSinkConfig
+from elspeth.plugins.sinks.database_sink import DatabaseSink
 from tests.fixtures.base_classes import inject_write_failure
 from tests.unit.plugins.sinks.test_local_file_sink_effects import _prepare, _stage_path
 
@@ -95,3 +97,43 @@ def test_csv_sink_default_output_is_verbatim(tmp_path: Path) -> None:
     rows = _written_csv_rows(tmp_path, "verbatim.csv", "f2" * 32)
 
     assert [row["cell"] for row in rows] == [row["cell"] for row in _FORMULA_ROWS]
+
+
+# --- Finding #41: DatabaseSink composer guidance must match the runtime ---
+
+
+def _database_guidance_text() -> str:
+    assistance = DatabaseSink.get_agent_assistance()
+    assert assistance is not None
+    return " ".join((assistance.summary, *assistance.composer_hints))
+
+
+def test_database_sink_guidance_does_not_advertise_unsupported_behaviour() -> None:
+    text = _database_guidance_text()
+    lowered = text.lower()
+    assert "sql server" not in lowered, "guidance advertises SQL Server, which _validate_effect_config refuses"
+    assert "creating it if missing" not in lowered, "guidance advertises table creation; the sink performs no DDL"
+    assert "drops and recreates" not in lowered, "guidance advertises if_exists='replace', which is refused"
+    assert "map to column types" not in lowered, "guidance advertises schema-to-column type mapping; no DDL path exists"
+
+
+def test_database_sink_guidance_states_the_runtime_requirements() -> None:
+    lowered = _database_guidance_text().lower()
+    assert "effect_ledger" in lowered
+    assert "sqlite" in lowered and "postgresql" in lowered
+    assert "provisioned" in lowered
+
+
+def test_database_sink_replace_hint_says_replace_is_refused() -> None:
+    hints = DatabaseSink.get_post_call_hints(tool_name="upsert_node", config_snapshot={"if_exists": "replace"})
+    assert hints, "a 'replace' config must still get a corrective hint"
+    joined = " ".join(hints).lower()
+    assert "drops" not in joined, "hint claims 'replace' drops the table; the runtime refuses 'replace'"
+    assert "not supported" in joined
+    assert DatabaseSink.get_post_call_hints(tool_name="upsert_node", config_snapshot={"if_exists": "append"}) == ()
+
+
+def test_database_sink_has_no_dead_ddl_type_map_or_stale_docstring() -> None:
+    assert "SCHEMA_TYPE_TO_SQLALCHEMY" not in vars(database_sink_module), "unused DDL type map advertises a DDL path"
+    assert DatabaseSink.__doc__ is not None
+    assert "Creates the table" not in DatabaseSink.__doc__
