@@ -10,10 +10,14 @@ import httpx
 import pytest
 
 from elspeth.contracts.chat_parts import ChatMessage
-from elspeth.plugins.infrastructure.clients.llm import LLMClientError, NetworkError
+from elspeth.plugins.infrastructure.clients.llm import ContentPolicyError, LLMClientError, NetworkError
 from elspeth.plugins.transforms.llm.provider import LLMAuditParent
 from elspeth.plugins.transforms.llm.providers.gateway import _validate_gateway_success_response, _validate_readyz_payload
 from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterLLMProvider
+from tests.unit.plugins.llm.test_provider_azure import FakeLLMClient as AzureFakeLLMClient
+from tests.unit.plugins.llm.test_provider_azure import _make_llm_response as _make_azure_llm_response
+from tests.unit.plugins.llm.test_provider_azure import _make_provider as _make_azure_provider
+from tests.unit.plugins.llm.test_provider_azure import _provider_llm_client as _azure_provider_llm_client
 from tests.unit.plugins.llm.test_provider_bedrock import _LEADER_TOKEN as _BEDROCK_LEADER_TOKEN
 from tests.unit.plugins.llm.test_provider_bedrock import MODEL as _BEDROCK_MODEL
 from tests.unit.plugins.llm.test_provider_bedrock import _provider as _bedrock_provider
@@ -210,3 +214,60 @@ class TestBedrockPreflightRequiresUsableCompletion:
         provider = _bedrock_provider()
         with patch("litellm.completion", return_value=_bedrock_response(content="ok", finish_reason="stop")):
             provider.runtime_preflight(operation_id="op-1", model=_BEDROCK_MODEL, temperature=0.0, coordination_token=_BEDROCK_LEADER_TOKEN)
+
+
+# ---------------------------------------------------------------------------
+# Finding #123: Azure classifies empty content by finish_reason
+# ---------------------------------------------------------------------------
+
+
+def _azure_empty_completion_error(content: str, finish_reason: str | None) -> BaseException | None:
+    provider = _make_azure_provider()
+    client = AzureFakeLLMClient(response=_make_azure_llm_response(content=content, finish_reason=finish_reason))
+    with _azure_provider_llm_client(provider, client):
+        return _raised_by(
+            lambda: provider.execute_query(
+                messages=[ChatMessage(role="user", content="hi")],
+                model="gpt-4o",
+                temperature=0.0,
+                max_tokens=100,
+                audit_parent=LLMAuditParent.for_row(
+                    member_token=_OPENROUTER_MEMBER_TOKEN,
+                    work_item=_OPENROUTER_WORK_ITEM,
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
+            )
+        )
+
+
+class TestAzureEmptyContentClassification:
+    @pytest.mark.parametrize(
+        ("content", "finish_reason"),
+        [
+            pytest.param("", "length", id="empty-length"),
+            pytest.param("   ", "length", id="whitespace-length"),
+            pytest.param("", "stop", id="empty-stop"),
+            pytest.param("", None, id="empty-no-finish-reason"),
+        ],
+    )
+    def test_empty_content_without_a_refusal_is_not_content_policy(self, content: str, finish_reason: str | None) -> None:
+        raised = _azure_empty_completion_error(content, finish_reason)
+        assert isinstance(raised, LLMClientError), f"expected an LLMClientError, got {raised!r}"
+        assert not isinstance(raised, ContentPolicyError), f"finish_reason={finish_reason!r} was labelled content_policy"
+        assert raised.category == "client"
+        assert raised.retryable is False
+
+    def test_budget_exhaustion_names_the_output_token_budget(self) -> None:
+        raised = _azure_empty_completion_error("", "length")
+        assert isinstance(raised, LLMClientError)
+        assert "output token budget" in str(raised)
+
+    def test_content_filter_stays_content_policy(self) -> None:
+        raised = _azure_empty_completion_error("", "content_filter")
+        assert isinstance(raised, ContentPolicyError)
+
+    def test_tool_calls_stays_unsupported_response(self) -> None:
+        raised = _azure_empty_completion_error("", "tool_calls")
+        assert type(raised) is LLMClientError
+        assert "tool_calls" in str(raised)
