@@ -26,6 +26,8 @@ evidence or validation only.
 | R9 | F9 | In the advisor-repair instruction, add: "The user has not seen your previous draft. Write the reply as the first and only message; do not call it a correction." | XS | s02 T3 and s20 T2 replies stop opening with "Correction". |
 | R10 | F10 | Reword `_ALL_INFORMATION_GAPS_CLOSED_NOTICE` as information: "The schemas you asked for are now in context. When you have what you need, emit the proposal; otherwise continue discovery or reply in text." | XS | Battery: no reasoning conflicts with the notice. |
 | R11 | F11, F15 | `report_assemble` declares `output_semantics()` (STR, unconstrained framing). Fix the `document` sink example, whose `schema.mode: fixed` errors after `report_assemble`. Correct the always-authorized list in `docs/reference/environment-variables.md` (9 listed vs 14 in `plugin_policy/compiler.py`). | S | s08 / s14 validate with no high warnings. |
+| R14 | F16 | In `composer_preflight.reuse_or_recompute_runtime_preflight`, return a computed (cached per version) runtime preflight for every non-empty state, not only invalid or blob-bearing ones. The advisor gate then always has a real base: a green pipeline takes the completion-only `advisor_signoff_pending_validation` path, never the "unverified" one. In the UI copy, replace "after your next pipeline change" with the actual next step, and de-duplicate the repeated sentence. | S | s03 T4 and s09 T2 replays: no "not re-verified" text; a valid graph with an advisor FLAG shows completion-pending only. A unit test pins a valid, unchanged, no-preview turn to a non-`None` preflight. |
+| R15 | F17 | Reply Register addition: questions about checks, readiness or approval state are answered with the user's next action in product terms. Never show tool-call JSON or ask the user to run a tool or file a defect. Add the case to the advisor END rubric so a reply that does either is flagged. | XS | Ask "why can't I share this?" on an advisor-blocked session: the reply names the step and action, with no tool names. |
 | R13 | F14 | At staging, reject a `vague_term` wired at node level on an `llm` node where no query falls back to the node-level template. Alternatively, make the resolver write into every query template that carries the slot. Add one teaching line to the multi-query section. | S | In-process repro from the wiring report: either rejected at `set_pipeline`, or `accepted_in_prompt=True` for every query. |
 | R12 | F12 | Tool-result legibility. For discovery tools, put the tool's own error first and omit whole-pipeline validation. Make sibling argument names agree (`get_plugin_assistance.plugin_name` vs `get_plugin_schema.name`), or accept both with one deprecated. Name the offending property in `canonical_schema` rejections ("unexpected key `nodes` under `source`"). | S | Proposal rejection rate below 16 of 53. |
 
@@ -85,7 +87,7 @@ To keep it true:
 | WP | Contents | When |
 |---|---|---|
 | WP0: demo config (no code) | Runbook below | Before the demo |
-| WP1: stop the visible failures | R2, R3, R5, R9, R10 | Before the demo if possible; each is small and independent |
+| WP1: stop the visible failures | R2, R3, R5, R9, R10, R14, R15 | Before the demo if possible; each is small and independent |
 | WP2: planner surface | R1 (+P1), R4, R8, E3 | After the demo; R1 first because R4 and R8 build on it |
 | WP3: model binding and guard | R6 (after decision), R7 | After WP1 |
 | WP3b: integrity | R13 | With WP1; it is a correctness bug in approved review content, independent of the demo |
@@ -147,3 +149,8 @@ run compared against this audit's turn table.
   - arithmetic without the allowlist above (F6).
 - **Expect** every first build of made-up data to show interpretation review
   cards; that is by design.
+- **If the panel says "Completion advisory review did not clear"** on a valid
+  pipeline, Run still works ("Advisory checks don't block Run"). Click Run.
+  Do not ask the composer about the gate on stage (F16, F17). To clear it,
+  ask for a small real change, or ask it to "check the pipeline is ready to
+  run", which normally makes it call `preview_pipeline`.

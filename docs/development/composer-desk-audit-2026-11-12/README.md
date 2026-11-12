@@ -332,6 +332,67 @@ polish. Verification is **EXECUTED** (reproduced live or in-process), **READ**
 - **Fix.** R13: reject this wiring at staging when no query renders the
   node-level template, and add one teaching line.
 
+### F16. On a valid, unchanged pipeline the completion gate re-checks only if the model calls `preview_pipeline`. HIGH (reported from a live session, 2026-11-13)
+
+- **Where.** `composer_preflight.py:344-380`
+  (`reuse_or_recompute_runtime_preflight`) recomputes the turn-end preflight
+  only when:
+  - the turn changed the pipeline;
+  - the state holds a blob reference; or
+  - the state is **invalid**.
+
+  For a valid, unchanged pipeline with no `preview_pipeline` call this turn,
+  it returns `None`. The advisor gate then takes the "unverified" branch
+  (`advisor_checkpoint.py:1044-1063`, `advisor_signoff_unverified_validation`).
+  The user reads "Completion advisory review did not clear… Pipeline
+  readiness was not re-verified this turn; validation and the advisory review
+  run again after your next pipeline change."
+- **What happens.**
+  - **Live battery.** Both tool-loop turns that ended with an uncleared
+    advisory gate (2 of 33: s03 T4, s09 T2) were turns without
+    `preview_pipeline`. Across tool-loop turns that changed the pipeline,
+    the model skipped preview in 4 of 15.
+  - **Reported session.** After a turn with `upsert_node` + `set_output` +
+    `request_interpretation_review`, the gate did not clear on a valid
+    pipeline with all reviews resolved. Asked why, the composer explained
+    that `preview_pipeline` is "what satisfies the completion advisory gate",
+    showed the raw tool-call JSON, and told the user the behaviour was a bug
+    worth filing.
+- **What it does and does not block (EXECUTED in the browser, this commit).**
+  - The **Run** button stays enabled. Persisted gate facts withhold only
+    `completion_ready` (`execution/completion_gates.py:380-445`). The
+    decision panel says "Share inspect link is blocked. Run pipeline is still
+    available." and the action bar says "Advisory checks don't block Run."
+    Screenshot: [evidence/advisor-gate-ui-s03.png](evidence/advisor-gate-ui-s03.png).
+  - What the uncleared gate does block: **Share inspect link**, and a
+    "completed" turn.
+  - The panel repeats its re-run sentence twice. It also tells the user the
+    gate reruns only "after your next pipeline change", although on a valid
+    pipeline only a pipeline change or a model-initiated preview can clear it.
+  - If Run was actually disabled in the reported session, the cause is
+    something else: pending review cards, a composer turn in flight, or a
+    build other than this commit. That needs the Run button's reason text
+    from that session to confirm.
+- **Fix.** R14: compute the turn-end preflight server-side for every
+  non-empty state, valid or not, so the gate never depends on the model
+  choosing to call `preview_pipeline`. This is the same deterministic check
+  `POST /validate` already runs, so it is validation, not authoring, and
+  within the composer invariants. Also fix the panel copy (R3).
+
+### F17. The composer explains platform internals and tells the user to file bugs. MEDIUM (user-facing)
+
+- **Where.** The Reply Register (`pipeline_composer.md:230-254`) bars tool
+  keys and enum values in unprompted summaries, but allows identifiers "if
+  the user asks". Nothing covers questions about the composer's own gates.
+- **What happens (reported session).** Asked why the pipeline wasn't ready,
+  the model showed `{"tool": "preview_pipeline", "arguments": {}}`, described
+  the "completion advisory gate", and recommended filing a bug against it.
+  For an executive audience that reads as the product diagnosing itself.
+- **Fix.** R15: add a Reply Register rule. When asked about a check,
+  readiness or approval state, state the user's next action in product
+  terms. Never ask the user to run a tool or file a defect. Pair it with R14,
+  which removes the situation that prompts the question.
+
 ### F15. Default-allowlist documentation is stale. LOW
 
 `docs/reference/environment-variables.md:587-592` lists 9 always-authorized
