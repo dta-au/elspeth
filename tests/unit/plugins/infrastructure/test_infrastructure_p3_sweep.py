@@ -330,3 +330,62 @@ def test_export_sink_naming_a_deferred_secret_defers_the_raw_gate(tmp_path: Path
             raise AssertionError(f"deferred export sink escaped as KeyError: {exc!r}") from exc
         assert "audit" not in modes
         assert "${AUDIT_SINK}" not in modes
+
+
+# ---------------------------------------------------------------------------
+# Finding #0: dict-KEYED column options (truncate.fields) reach the fixed-schema check
+# ---------------------------------------------------------------------------
+
+
+def test_truncate_fixed_schema_omitting_a_truncated_field_is_refused_at_construction() -> None:
+    """Finding #0: truncate.fields names its columns as dict KEYS.
+
+    The fixed-schema read check saw only str/list option values, so
+    ``fields: {notes: 5}`` under a fixed schema without ``notes`` constructed,
+    and every row carrying ``notes`` then failed the input model at run time.
+    """
+    from elspeth.plugins.infrastructure.config_base import PluginConfigError
+    from elspeth.plugins.transforms.truncate import Truncate
+
+    try:
+        Truncate({"schema": {"mode": "fixed", "fields": ["id: int"]}, "fields": {"notes": 5}})
+    except PluginConfigError as exc:
+        assert "'notes' (named by fields)" in str(exc)
+    else:
+        raise AssertionError("a fixed schema forbidding a truncated field must be refused at construction")
+
+
+def test_truncate_keys_are_config_named_input_columns() -> None:
+    """Finding #0: demotion protection must see truncate's keyed columns too."""
+    from elspeth.plugins.transforms.truncate import Truncate
+
+    transform = Truncate({"schema": {"mode": "observed"}, "fields": {"notes": 5, "title": 10}})
+    assert {"notes", "title"} <= transform._config_named_input_columns()
+
+
+def test_truncate_header_spelling_key_of_a_declared_field_still_constructs() -> None:
+    """Finding #0 caveat: a key whose canonical spelling IS declared is not refused.
+
+    truncate resolves a header-spelled key through the row contract, so
+    ``{'Value Text': 10}`` / ``{'Notes': 5}`` against fixed ``value_text`` /
+    ``notes`` reach the declared field; only the canonical form is compared.
+    """
+    from elspeth.plugins.transforms.truncate import Truncate
+
+    Truncate({"schema": {"mode": "fixed", "fields": ["id: int", "value_text: str"]}, "fields": {"Value Text": 10}})
+    Truncate({"schema": {"mode": "fixed", "fields": ["id: int", "notes: str"]}, "fields": {"Notes": 5}})
+
+
+def test_web_scrape_query_parameter_names_are_not_read_columns() -> None:
+    """Finding #0 control: only options a plugin declares column-keyed contribute keys.
+
+    web_scrape.query_fields maps query PARAMETER names (keys) to row fields
+    (values); its keys must not be treated as input columns.
+    """
+    from elspeth.plugins.infrastructure.base import BaseTransform
+    from elspeth.plugins.transforms.truncate import Truncate
+    from elspeth.plugins.transforms.web_scrape import WebScrapeTransform
+
+    assert "column_keyed_config_keys" in vars(BaseTransform)
+    assert vars(Truncate)["column_keyed_config_keys"] == frozenset({"fields"})
+    assert "column_keyed_config_keys" not in vars(WebScrapeTransform)
