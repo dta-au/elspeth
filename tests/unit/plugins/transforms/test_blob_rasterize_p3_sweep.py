@@ -15,7 +15,14 @@ from typing import Any
 import pytest
 
 from elspeth.contracts.payload_store import PayloadNotFoundError
+from elspeth.plugins.infrastructure.rasterize.protocol import (
+    PageRefusalKind,
+    RasterizeRequest,
+    RasterizeResponse,
+    RefusedPage,
+)
 from elspeth.plugins.infrastructure.rasterize.renderer import PoolRenderer, RenderLimits
+from elspeth.plugins.infrastructure.rasterize.worker import rasterize_document
 from elspeth.plugins.transforms.blob_csv_expand import BlobCSVExpand
 from elspeth.plugins.transforms.blob_json_expand import BlobJSONExpand
 from elspeth.plugins.transforms.blob_text_expand import BlobTextExpand
@@ -318,3 +325,67 @@ def test_successful_render_still_hands_the_output_dir_to_the_caller(tmp_path: Pa
     finally:
         renderer.close()
     assert _rasterize_dirs(tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
+# Finding #156 — a MemoryError in page load / geometry / text extraction is a
+# per-page MEMORY_EXHAUSTED refusal, not a whole-document failure.
+# ---------------------------------------------------------------------------
+
+
+def _out_of_memory_on_second_call(original: Callable[..., Any]) -> Callable[..., Any]:
+    calls = {"n": 0}
+
+    def _wrapped(*args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise MemoryError("simulated RLIMIT_AS")
+        return original(*args, **kwargs)
+
+    return _wrapped
+
+
+@pytest.mark.parametrize(
+    ("owner_name", "method"),
+    [
+        pytest.param("PdfDocument", "__getitem__", id="page-load"),
+        pytest.param("PdfPage", "get_size", id="page-geometry"),
+        pytest.param("PdfPage", "get_textpage", id="text-page"),
+        pytest.param("PdfTextPage", "get_text_range", id="text-range"),
+    ],
+)
+def test_memory_error_outside_page_render_refuses_only_that_page(
+    owner_name: str, method: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pypdfium2
+
+    from tests.fixtures.pdf_documents import minimal_pdf
+
+    owner = {"PdfDocument": pypdfium2.PdfDocument, "PdfPage": pypdfium2.PdfPage, "PdfTextPage": pypdfium2.PdfTextPage}[owner_name]
+    monkeypatch.setattr(owner, method, _out_of_memory_on_second_call(owner.__dict__[method]))
+    request = RasterizeRequest(
+        pdf_bytes=minimal_pdf(3),
+        dpi=72,
+        max_pages=10,
+        max_page_pixels=1_000_000,
+        max_page_bytes=5 * 1024 * 1024,
+        max_total_bytes=50 * 1024 * 1024,
+        output_dir=tmp_path,
+        extract_text=True,
+        max_page_text_bytes=1024 * 1024,
+    )
+
+    escaped: MemoryError | None = None
+    try:
+        outcome = rasterize_document(request)
+    except MemoryError as exc:
+        escaped = exc
+    assert escaped is None, "a single page's MemoryError escaped and would refuse the whole document as a malformed parse"
+
+    assert type(outcome) is RasterizeResponse
+    assert [page.page_number for page in outcome.rendered] == [1, 3]
+    assert len(outcome.refused) == 1
+    refused = outcome.refused[0]
+    assert type(refused) is RefusedPage
+    assert refused.page_number == 2
+    assert refused.kind is PageRefusalKind.MEMORY_EXHAUSTED
