@@ -5,10 +5,15 @@ Each class pins one finding; the finding number is in the class docstring.
 
 from __future__ import annotations
 
+from typing import Any
+from unittest.mock import patch
+
 import pytest
 
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.transforms.keyword_filter import KeywordFilter
+from elspeth.testing import make_pipeline_row
+from tests.fixtures.factories import make_context
 
 
 class TestKeywordFilterEmptyLowerBoundBraceQuantifier:
@@ -56,3 +61,61 @@ class TestKeywordFilterSingleStringFieldDeclaration:
     def test_all_mode_makes_no_static_string_claim(self) -> None:
         """Negative control: 'all' skips non-strings at runtime, so it declares nothing."""
         assert self._make("all").declared_string_input_fields == frozenset()
+
+
+class TestAllModeRecordsUnscannedFields:
+    """#58: fields='all' must say in success_reason which non-string fields it did not scan."""
+
+    def test_keyword_filter_all_mode_warns_about_nested_value(self) -> None:
+        transform = KeywordFilter({"fields": "all", "blocked_patterns": ["secret"], "schema": {"mode": "observed"}})
+        row = make_pipeline_row({"name": "ok", "payload": {"text": "secret"}, "tags": ["secret"]})
+
+        result = transform.process(row, make_context())
+
+        assert result.status == "success"
+        assert result.success_reason is not None
+        warnings = result.success_reason.get("validation_warnings", [])
+        assert any("'payload'" in w and "dict" in w for w in warnings), warnings
+        assert any("'tags'" in w and "list" in w for w in warnings), warnings
+        # The warning names the field and its type, never the row content.
+        assert not any("secret" in w for w in warnings), warnings
+
+    def test_keyword_filter_all_strings_row_has_no_warning(self) -> None:
+        """Negative control: a fully scanned row keeps the plain success_reason."""
+        transform = KeywordFilter({"fields": "all", "blocked_patterns": ["secret"], "schema": {"mode": "observed"}})
+
+        result = transform.process(make_pipeline_row({"name": "ok", "note": "fine"}), make_context())
+
+        assert result.status == "success"
+        assert result.success_reason == {"action": "filtered"}
+
+    @pytest.mark.parametrize("plugin_name", ["content_safety", "prompt_shield"])
+    def test_azure_safety_all_mode_warns_about_nested_value(self, plugin_name: str) -> None:
+        from elspeth.plugins.transforms.azure.content_safety import AzureContentSafety
+        from elspeth.plugins.transforms.azure.prompt_shield import AzurePromptShield
+
+        options: dict[str, Any] = {
+            "endpoint": "https://test.cognitiveservices.azure.com",
+            "api_key": "test-key",
+            "fields": "all",
+            "schema": {"mode": "observed"},
+        }
+        transform: AzureContentSafety | AzurePromptShield
+        if plugin_name == "content_safety":
+            options["thresholds"] = {"hate": 2, "violence": 2, "sexual": 2, "self_harm": 2}
+            transform = AzureContentSafety(options)
+        else:
+            transform = AzurePromptShield(options)
+        row = make_pipeline_row({"name": "ok", "payload": {"text": "attack"}})
+
+        try:
+            with patch.object(transform, "_analyze_field_with_capacity_retry", return_value=None) as analyze:
+                result = transform._process_single_with_state(row, "state-1", ctx=make_context())
+            assert [c.args[1] for c in analyze.call_args_list] == ["name"]
+        finally:
+            transform.close()
+
+        assert result.status == "success"
+        assert result.success_reason is not None
+        warnings = result.success_reason.get("validation_warnings", [])
+        assert any("'payload'" in w and "dict" in w for w in warnings), warnings
