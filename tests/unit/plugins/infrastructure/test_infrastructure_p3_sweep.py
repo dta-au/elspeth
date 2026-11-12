@@ -6,8 +6,10 @@ on the lane base and passes after that finding's fix commit.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -460,3 +462,84 @@ def test_render_timeout_classification_follows_the_cpu_the_worker_used() -> None
     assert str(spent) == "Template exceeded the execution time limit"
     starved = templates._render_timeout_error(cpu_used_seconds=0.1)
     assert type(starved) is TemplateWorkerLostError
+
+
+# ---------------------------------------------------------------------------
+# Finding #100: pooled multi-query rows record pool stats and query ordering
+# ---------------------------------------------------------------------------
+
+
+def _pooled_multi_query_transform(*, fail_second: bool) -> Any:
+    from unittest.mock import Mock
+
+    from elspeth.contracts.token_usage import TokenUsage
+    from elspeth.plugins.infrastructure.clients.llm import ContentPolicyError
+    from elspeth.plugins.transforms.llm.provider import FinishReason, LLMProvider, LLMQueryResult
+    from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+    transform = LLMTransform(
+        {
+            "provider": "azure",
+            "deployment_name": "gpt-4o",
+            "endpoint": "https://test.openai.azure.com",
+            "api_key": "test-key",
+            "prompt_template": "Evaluate: {{ row.text_content }}",
+            "schema": {"mode": "observed"},
+            "required_input_fields": ["text"],
+            "pool_size": 4,
+            "queries": {name: {"input_fields": {"text_content": "text"}} for name in ("q1", "q2", "q3")},
+        }
+    )
+    calls = [0]
+    lock = threading.Lock()
+
+    def execute_query(messages: object, **_kwargs: object) -> LLMQueryResult:
+        with lock:
+            calls[0] += 1
+            call = calls[0]
+        if fail_second and call == 2:
+            raise ContentPolicyError("blocked")
+        return LLMQueryResult(content="ok", usage=TokenUsage.known(10, 5), model="gpt-4o", finish_reason=FinishReason.STOP)
+
+    provider = Mock(spec=LLMProvider)
+    provider.execute_query.side_effect = execute_query
+    transform._provider = provider
+    return transform
+
+
+def _process_pooled_row(transform: Any) -> Any:
+    from elspeth.contracts.identity import TokenInfo
+    from elspeth.testing import make_pipeline_row
+    from tests.fixtures.factories import make_context
+
+    ctx = make_context(
+        state_id="state-p3-100",
+        run_id="run-p3-100",
+        token=TokenInfo(row_id="row-1", token_id="token-1", row_data=make_pipeline_row({})),
+    )
+    try:
+        return transform._process_row(make_pipeline_row({"text": "hello"}), ctx)
+    finally:
+        transform._query_executor.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("fail_second", [False, True])
+def test_pooled_multi_query_row_records_pool_execution_context(fail_second: bool) -> None:
+    """Finding #100: the executor's stats and per-query ordering reach context_after.
+
+    _execute_parallel kept only ``entry.result`` and never read
+    ``executor.get_stats()``, so AIMD backoff, capacity retries, throttle wait
+    and concurrency for a pooled row never reached the node state.
+    """
+    from elspeth.contracts.node_state_context import PoolExecutionContext
+
+    result = _process_pooled_row(_pooled_multi_query_transform(fail_second=fail_second))
+
+    assert result.status == ("error" if fail_second else "success")
+    context = result.context_after
+    assert type(context) is PoolExecutionContext, context
+    assert context.pool_config.pool_size == 4
+    assert sorted(entry.submit_index for entry in context.query_ordering) == [0, 1, 2]
+    assert sorted(entry.complete_index for entry in context.query_ordering) == [0, 1, 2]
+    recorded = context.to_dict()
+    assert set(recorded) == {"pool_config", "pool_stats", "query_ordering"}
