@@ -15,6 +15,7 @@ import pytest
 from elspeth.contracts import Determinism, TransformResult
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.enums import RunMode
+from elspeth.contracts.node_state_context import PoolExecutionContext
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
@@ -785,16 +786,16 @@ class TestMultiQueryWithMockProvider:
         """Create output collector for capturing results."""
         return CollectorOutputPort()
 
-    def test_parallel_mode_includes_no_pool_stats_in_context_after(
+    def test_parallel_mode_records_pool_stats_in_context_after(
         self,
         mock_recorder: _ExecutionRecorderDouble,
         collector: CollectorOutputPort,
     ) -> None:
-        """Multi-query with mocked provider processes correctly.
+        """Pooled multi-query records its pool behaviour in context_after.
 
-        The new MultiQueryStrategy executes queries sequentially within a row
-        (parallelism is at the row level via BatchTransformMixin).
-        context_after is None for sequential query execution.
+        With pool_size set, MultiQueryStrategy runs the row's queries through
+        the PooledExecutor; the executor's stats and each query's ordering
+        reach the node state as a PoolExecutionContext (sweep finding #100).
         """
         config = _make_config(pool_size=4)
         transform = LLMTransform(config)
@@ -830,9 +831,9 @@ class TestMultiQueryWithMockProvider:
         assert isinstance(result, TransformResult)
         assert result.status == "success"
 
-        # The new multi-query strategy processes queries sequentially within
-        # a row — no per-query pool stats. context_after is None.
-        assert result.context_after is None
+        assert type(result.context_after) is PoolExecutionContext
+        assert result.context_after.pool_config.pool_size == 4
+        assert len(result.context_after.query_ordering) == len(config["queries"])
 
     def test_sequential_mode_processes_rows(
         self,

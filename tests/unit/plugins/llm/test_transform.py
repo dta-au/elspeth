@@ -78,9 +78,30 @@ class _CallRecorder:
         assert self.calls == []
 
 
+def _pool_stats_double() -> dict[str, Any]:
+    """A PooledExecutor.get_stats() shaped reply for executor doubles.
+
+    _execute_parallel records it in context_after (sweep finding #100).
+    """
+    return {
+        "pool_config": {"pool_size": 4, "max_capacity_retry_seconds": 3600, "dispatch_delay_at_completion_ms": 0.0},
+        "pool_stats": {
+            "capacity_retries": 0,
+            "successes": 0,
+            "peak_delay_ms": 0.0,
+            "current_delay_ms": 0.0,
+            "total_throttle_time_ms": 0.0,
+            "max_concurrent_reached": 0,
+        },
+    }
+
+
 class _ExecutorDouble:
     def __init__(self) -> None:
         self.execute_batch = _CallRecorder()
+
+    def get_stats(self) -> dict[str, Any]:
+        return _pool_stats_double()
 
 
 class _RegistryDouble:
