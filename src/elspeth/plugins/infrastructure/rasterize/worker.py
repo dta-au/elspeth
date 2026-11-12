@@ -114,8 +114,15 @@ def rasterize_document(request: RasterizeRequest) -> RasterizeOutcome:
 def _render_page(document: object, index: int, page_number: int, scale: float, request: RasterizeRequest) -> RenderedPage | RefusedPage:
     from pypdfium2 import PdfiumError
 
+    # MemoryError (RLIMIT_AS) anywhere in one page's work — load, geometry, render,
+    # text extraction — is that PAGE's refusal. Letting it escape would make the
+    # renderer refuse the whole document as a malformed parse.
     try:
         page = document[index]  # type: ignore[index]  # PdfDocument.__getitem__; parsed, not typed
+    except MemoryError:
+        return RefusedPage(
+            page_number=page_number, kind=PageRefusalKind.MEMORY_EXHAUSTED, detail="page load exceeded the worker memory limit"
+        )
     except PdfiumError as exc:
         return RefusedPage(page_number=page_number, kind=PageRefusalKind.RENDER_ERROR, detail=str(exc))
     try:
@@ -172,6 +179,10 @@ def _render_page(document: object, index: int, page_number: int, scale: float, r
         png_path.write_bytes(png)
         return RenderedPage(
             page_number=page_number, png_path=png_path, width_px=bitmap.width, height_px=bitmap.height, size_bytes=len(png), text=text
+        )
+    except MemoryError:
+        return RefusedPage(
+            page_number=page_number, kind=PageRefusalKind.MEMORY_EXHAUSTED, detail="page processing exceeded the worker memory limit"
         )
     finally:
         page.close()
