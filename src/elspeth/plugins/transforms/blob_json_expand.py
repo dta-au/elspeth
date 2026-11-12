@@ -406,7 +406,7 @@ class BlobJSONExpand(BaseTransform):
     name = "blob_json_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0d2fd20b0d7ea74c"
+    source_file_hash: str | None = "sha256:e2b9ae839814a457"
     config_model = BlobJSONExpandConfig
     usage_when_to_use: str = (
         "Use when a row carries a JSON document — either a payload-store reference from blob_fetch or JSON text in a "
@@ -567,13 +567,18 @@ class BlobJSONExpand(BaseTransform):
         """Drive the real process path with a hermetic JSON payload seam."""
 
         class _InvariantPayloadStore:
-            def retrieve(self, ref: str) -> bytes:
+            # Mirrors PayloadStore.retrieve_bounded: a negative cap is refused,
+            # an unknown ref is not found, an oversize payload yields None.
+            def retrieve_bounded(self, ref: str, *, max_bytes: int) -> bytes | None:
+                if max_bytes < 0:
+                    raise ValueError("max_bytes must be nonnegative")
                 if ref != _INVARIANT_PROBE_BLOB_REF:
                     raise PayloadNotFoundError(ref)
-                return (
+                body = (
                     b'{"probe_documents": [{"probe_document_identifier": "blob_json_expand_probe_value", '
                     b'"probe_section_titles": ["probe_section"]}]}'
                 )
+                return body if len(body) <= max_bytes else None
 
         had_payload_store = "_payload_store" in self.__dict__
         original_payload_store: Any = None
