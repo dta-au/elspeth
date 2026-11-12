@@ -89,3 +89,144 @@ class TestFinding49FetchXmlEntityRequiredAtConfigTime:
 
         xml = "<fetch><entity name='contact'><attribute name='fullname'/></entity></fetch>"
         assert DataverseSourceConfig.from_dict(_fetchxml_source_config(xml)).fetch_xml == xml
+
+
+class _RecordedCall:
+    def __init__(self, call_id: str) -> None:
+        self.call_id = call_id
+
+
+class _ChromaExecutionRecorder:
+    """Records the provider's audit writes; mirrors the retrieval test fake."""
+
+    def __init__(self) -> None:
+        self.recorded_calls: list[dict[str, Any]] = []
+        self.operation_calls: list[dict[str, Any]] = []
+        self.operation_indices_allocated = 0
+        self.state_indices_allocated = 0
+
+    def allocate_call_index(self, state_id: str, *, member_token: Any, work_item: Any) -> int:
+        self.state_indices_allocated += 1
+        return self.state_indices_allocated - 1
+
+    def record_call(self, **kwargs: Any) -> _RecordedCall:
+        self.recorded_calls.append(kwargs)
+        return _RecordedCall(f"call-{len(self.recorded_calls)}")
+
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: Any) -> int:
+        self.operation_indices_allocated += 1
+        return self.operation_indices_allocated - 1
+
+    def record_operation_call(self, **kwargs: Any) -> _RecordedCall:
+        self.operation_calls.append(kwargs)
+        return _RecordedCall(f"operation-call-{len(self.operation_calls)}")
+
+
+class _UnreachableCountCollection:
+    def count(self) -> int:
+        raise ConnectionError("connection refused")
+
+
+class TestFinding75ChromaPreflightRecordsFailedCount:
+    """#75: an attempted readiness count that fails leaves an ERROR Call row (and is verified in VERIFY)."""
+
+    @staticmethod
+    def _provider(collection: str, *, session: Any = None, execution: _ChromaExecutionRecorder) -> Any:
+        from elspeth.plugins.infrastructure.clients.retrieval.chroma import ChromaSearchProvider, ChromaSearchProviderConfig
+
+        return ChromaSearchProvider(
+            config=ChromaSearchProviderConfig(collection=collection, mode="ephemeral"),
+            execution=execution,
+            run_id="p3-run",
+            call_mode_session=session,
+        )
+
+    @staticmethod
+    def _existing_collection() -> str:
+        import uuid
+
+        chromadb = pytest.importorskip("chromadb")
+        name = f"p3-ready-{uuid.uuid4().hex[:12]}"
+        chromadb.Client().get_or_create_collection(name=name, metadata={"hnsw:space": "cosine"})
+        return name
+
+    def test_live_unreachable_count_records_error_operation_call(self) -> None:
+        from elspeth.contracts.enums import CallStatus
+        from tests.fixtures.mock_audit import mock_audit_authority
+
+        execution = _ChromaExecutionRecorder()
+        provider = self._provider(self._existing_collection(), execution=execution)
+        provider._collection = _UnreachableCountCollection()
+
+        readiness = provider.runtime_preflight(operation_id="op-1", coordination_token=mock_audit_authority()["coordination_token"])
+
+        assert readiness.reachable is False
+        assert execution.operation_indices_allocated == 1
+        assert len(execution.operation_calls) == 1
+        call = execution.operation_calls[0]
+        assert call["status"] is CallStatus.ERROR
+        assert call["call_index"] == 0
+        error = call["error"].to_dict()
+        assert error["error_type"] == "ConnectionError"
+        assert "connection refused" in error["message"]
+
+    def test_verify_unreachable_count_reaches_verify_call(self) -> None:
+        from unittest.mock import MagicMock
+
+        from elspeth.contracts.call_mode import CallModeSession
+        from elspeth.contracts.enums import CallStatus, RunMode
+        from tests.fixtures.mock_audit import mock_audit_authority
+
+        session = MagicMock(spec=CallModeSession)
+        session.mode = RunMode.VERIFY
+        execution = _ChromaExecutionRecorder()
+        provider = self._provider(self._existing_collection(), session=session, execution=execution)
+        provider._initialize_client()
+        provider._collection = _UnreachableCountCollection()
+
+        readiness = provider.runtime_preflight(operation_id="op-1", coordination_token=mock_audit_authority()["coordination_token"])
+
+        assert readiness.reachable is False
+        assert [c["status"] for c in execution.operation_calls] == [CallStatus.ERROR]
+        session.verify_call.assert_called_once()
+        assert session.verify_call.call_args.kwargs["live_status"] is CallStatus.ERROR
+        assert session.verify_call.call_args.kwargs["current_call_id"] == "operation-call-1"
+
+    def test_verify_missing_collection_during_preflight_records_error_before_raising(self) -> None:
+        from unittest.mock import MagicMock
+
+        from elspeth.contracts.call_mode import CallModeSession
+        from elspeth.contracts.enums import CallStatus, RunMode
+        from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
+        from tests.fixtures.mock_audit import mock_audit_authority
+
+        session = MagicMock(spec=CallModeSession)
+        session.mode = RunMode.VERIFY
+        execution = _ChromaExecutionRecorder()
+        provider = self._provider("p3-missing-collection-preflight", session=session, execution=execution)
+
+        with pytest.raises(RetrievalError, match="does not exist"):
+            provider.runtime_preflight(operation_id="op-1", coordination_token=mock_audit_authority()["coordination_token"])
+
+        assert [c["status"] for c in execution.operation_calls] == [CallStatus.ERROR]
+        assert execution.operation_calls[0]["error"].to_dict()["error_type"] == "RetrievalError"
+        session.verify_call.assert_called_once()
+
+    def test_verify_missing_collection_during_search_records_error_before_raising(self) -> None:
+        from unittest.mock import MagicMock
+
+        from elspeth.contracts.call_mode import CallModeSession
+        from elspeth.contracts.enums import CallStatus, RunMode
+        from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
+        from tests.fixtures.mock_audit import mock_item_audit_authority
+
+        session = MagicMock(spec=CallModeSession)
+        session.mode = RunMode.VERIFY
+        execution = _ChromaExecutionRecorder()
+        provider = self._provider("p3-missing-collection-search", session=session, execution=execution)
+
+        with pytest.raises(RetrievalError, match="does not exist"):
+            provider.search("q", 1, 0.0, **mock_item_audit_authority(), state_id="state-1", token_id=None)
+
+        assert [c["status"] for c in execution.recorded_calls] == [CallStatus.ERROR]
+        session.verify_call.assert_called_once()
