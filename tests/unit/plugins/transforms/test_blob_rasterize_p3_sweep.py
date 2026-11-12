@@ -12,12 +12,17 @@ import tempfile
 from collections.abc import Callable
 from importlib import metadata
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from elspeth.contracts.call_mode import ReplayCallEvidence
+from elspeth.contracts.enums import CallStatus, RunMode
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.payload_store import PayloadNotFoundError
 from elspeth.core.payload_store import FilesystemPayloadStore
+from elspeth.core.replay_payload_store import SourceBoundPayloadStore
 from elspeth.plugins.infrastructure.rasterize import identity as rasterize_identity
 from elspeth.plugins.infrastructure.rasterize.protocol import (
     PageRefusalKind,
@@ -624,3 +629,122 @@ def test_page_geometry_claims_are_checked_by_the_parent(width: Any, height: Any,
     assert result.status == "success", result.reason
     assert [row.to_dict()["page_number"] for row in result.rows] == [2], "a page with an impossible geometry claim was emitted"
     assert _refused_kinds(result) == {1: kind.value}
+
+
+# ---------------------------------------------------------------------------
+# Finding #56 — replay enforces ONE output row per rendered page.
+# ---------------------------------------------------------------------------
+
+_REPLAY_PNGS = (b"\x89PNG\r\n\x1a\n" + b"page-one", b"\x89PNG\r\n\x1a\n" + b"page-two")
+
+
+class _TwoPageRenderer:
+    def __init__(self, *, fail_if_called: bool = False) -> None:
+        self.fail_if_called = fail_if_called
+
+    def render(self, pdf_bytes: bytes) -> tuple[RasterizeResponse, Path]:
+        assert not self.fail_if_called, "replay launched the PDF renderer"
+        del pdf_bytes
+        directory = Path(tempfile.mkdtemp(prefix="pdf-two-page-test-"))
+        pages = []
+        for number, png in enumerate(_REPLAY_PNGS, start=1):
+            path = directory / f"page-{number}.png"
+            path.write_bytes(png)
+            pages.append(RenderedPage(page_number=number, png_path=path, width_px=20, height_px=10, size_bytes=len(png), text="t"))
+        return RasterizeResponse(page_count=2, rendered=tuple(pages), refused=()), directory
+
+    def discard(self, output_dir: Path | None) -> None:
+        if output_dir is not None:
+            shutil.rmtree(output_dir, ignore_errors=True)
+
+    def close(self) -> None:
+        pass
+
+
+def _replay_transform(store: Any, renderer: _TwoPageRenderer) -> PDFRasterize:
+    transform = PDFRasterize({"schema": {"mode": "observed"}})
+    transform.on_start(_LifecycleContext(store))
+    transform.__dict__["_renderer"] = renderer
+    return transform
+
+
+def _mode_context(mode: RunMode) -> Any:
+    ctx = make_context()
+    ctx.run_mode = mode
+    ctx.landscape.allocate_call_index.return_value = 0
+    ctx.landscape.record_call.return_value = SimpleNamespace(call_id="render-call")
+    return ctx
+
+
+def _replay_receipt(tmp_path: Path, receipt: dict[str, Any], source_store: FilesystemPayloadStore, pdf_ref: str, row: Any) -> Any:
+    page_refs = {hashlib.sha256(png).hexdigest() for png in _REPLAY_PNGS}
+    bounded = SourceBoundPayloadStore(
+        mode=RunMode.REPLAY,
+        source_store=source_store,
+        current_store=FilesystemPayloadStore(tmp_path / f"replay-{len(list(tmp_path.iterdir()))}"),
+        source_refs={pdf_ref},
+        output_refs=page_refs,
+    )
+    ctx = _mode_context(RunMode.REPLAY)
+    ctx.call_mode_session = SimpleNamespace(
+        replay_call=lambda **kwargs: ReplayCallEvidence(
+            source_call_id="source-render-call",
+            status=CallStatus.SUCCESS,
+            response_data=receipt,
+            error_data=None,
+            latency_ms=1.0,
+        )
+    )
+    return _replay_transform(bounded, _TwoPageRenderer(fail_if_called=True)).process(row, ctx)
+
+
+def _live_two_page_receipt(tmp_path: Path) -> tuple[dict[str, Any], FilesystemPayloadStore, str, Any]:
+    from tests.fixtures.pdf_documents import minimal_pdf
+
+    source_store = FilesystemPayloadStore(tmp_path / "source")
+    pdf_ref = source_store.store(minimal_pdf(2))
+    row = make_pipeline_row({"blob_ref": pdf_ref})
+    live_ctx = _mode_context(RunMode.LIVE)
+    live = _replay_transform(source_store, _TwoPageRenderer()).process(row, live_ctx)
+    assert live.status == "success"
+    receipt = live_ctx.landscape.record_call.call_args.kwargs["response_data"].to_dict()
+    return receipt, source_store, pdf_ref, row
+
+
+def test_replay_refuses_a_receipt_with_a_duplicated_page_row(tmp_path: Path) -> None:
+    receipt, source_store, pdf_ref, row = _live_two_page_receipt(tmp_path)
+    assert [item["page_number"] for item in receipt["rows"]] == [1, 2]
+    tampered = json.loads(json.dumps(receipt))
+    tampered["rows"][1] = json.loads(json.dumps(tampered["rows"][0]))
+
+    raised: Exception | None = None
+    replayed = None
+    try:
+        replayed = _replay_receipt(tmp_path, tampered, source_store, pdf_ref, row)
+    except Exception as exc:
+        raised = exc
+    emitted = None if replayed is None else [item.to_dict()["page_number"] for item in replayed.rows]
+    assert type(raised) is AuditIntegrityError, (
+        f"replay must refuse two rows for page 1 and none for page 2 as an audit integrity failure; got {raised!r}, emitted pages {emitted}"
+    )
+
+
+def test_replay_of_the_untampered_two_page_receipt_succeeds(tmp_path: Path) -> None:
+    """Negative control: the honest receipt still replays page for page.
+
+    A multi-page receipt must replay at all: the rows restored from it have to
+    share one output contract, as success_multi() requires and the live path does.
+    """
+    receipt, source_store, pdf_ref, row = _live_two_page_receipt(tmp_path)
+
+    raised: Exception | None = None
+    replayed = None
+    try:
+        replayed = _replay_receipt(tmp_path, receipt, source_store, pdf_ref, row)
+    except Exception as exc:
+        raised = exc
+    assert raised is None, f"an honest two-page receipt failed to replay: {raised!r}"
+
+    assert replayed is not None
+    assert replayed.status == "success"
+    assert [item.to_dict()["page_number"] for item in replayed.rows] == [1, 2]
