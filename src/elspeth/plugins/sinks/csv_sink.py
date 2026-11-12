@@ -161,12 +161,16 @@ class CSVSinkConfig(SinkPathConfig):
     @field_validator("encoding")
     @classmethod
     def _validate_encoding(cls, v: str) -> str:
-        import codecs
-
         try:
             codecs.lookup(v)
         except LookupError as exc:
             raise ValueError(f"unknown encoding: {v!r}") from exc
+        # codecs.lookup() also resolves bytes-to-bytes and str-to-str codecs
+        # (base64, hex, zlib, rot13); str.encode() refuses them as non-text.
+        try:
+            "".encode(v)
+        except LookupError as exc:
+            raise ValueError(f"encoding {v!r} is not a text encoding") from exc
         return v
 
     @model_validator(mode="after")
@@ -229,7 +233,7 @@ class CSVSink(BaseSink, SinkEffectAuditContextCapability):
     name = "csv"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:1a151b4193ce4ada"
+    source_file_hash: str | None = "sha256:b85f6c786352b952"
     config_model = CSVSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM
