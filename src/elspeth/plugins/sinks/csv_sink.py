@@ -61,6 +61,7 @@ from elspeth.plugins.infrastructure.schema_factory import create_schema_from_con
 from elspeth.plugins.sinks._audit_export_bundle_effects import (
     commit_audit_export_bundle,
     inspect_audit_export_bundle,
+    neutralize_csv_formula,
     preflight_audit_export_bundle,
     prepare_audit_export_bundle,
     reconcile_audit_export_bundle,
@@ -145,22 +146,43 @@ class CSVSinkConfig(SinkPathConfig):
         ),
     )
 
+    neutralize_formulas: bool = Field(
+        default=False,
+        strict=True,
+        description=(
+            "Prefix string cell values that start with =, +, -, @, tab, CR or LF with a single quote so spreadsheet "
+            "applications read them as text, not formulas (the guard CSV audit exports always apply). Use when the "
+            "file may be opened in Excel and carries untrusted text such as LLM output or uploaded data. Header "
+            "names are not rewritten. The written cells then differ from the audited row values; false writes verbatim."
+        ),
+    )
+
     @field_validator("delimiter")
     @classmethod
     def _validate_delimiter(cls, v: str) -> str:
         if len(v) != 1:
             raise ValueError(f"delimiter must be a single character, got {v!r}")
+        # csv.writer also refuses the quotechar and line terminators; reject
+        # them here so the error is a config error, not a publication crash.
+        try:
+            csv.writer(io.StringIO(), delimiter=v)
+        except ValueError as exc:
+            raise ValueError(f"delimiter {v!r} is not usable by the CSV writer: {exc}") from exc
         return v
 
     @field_validator("encoding")
     @classmethod
     def _validate_encoding(cls, v: str) -> str:
-        import codecs
-
         try:
             codecs.lookup(v)
         except LookupError as exc:
             raise ValueError(f"unknown encoding: {v!r}") from exc
+        # codecs.lookup() also resolves bytes-to-bytes and str-to-str codecs
+        # (base64, hex, zlib, rot13); str.encode() refuses them as non-text.
+        try:
+            "".encode(v)
+        except LookupError as exc:
+            raise ValueError(f"encoding {v!r} is not a text encoding") from exc
         return v
 
     @model_validator(mode="after")
@@ -209,6 +231,7 @@ class CSVSink(BaseSink, SinkEffectAuditContextCapability):
         include_audit_context: Render a fixed, audit-linked retention envelope (default: False)
         include_error_reason: Require a readable durable source/transform cause (default: False)
         include_disposition_reason: Require a verified failure or Boolean gate reason (default: False)
+        neutralize_formulas: Quote-prefix formula-leading string cells (default: False)
 
     The schema can be (all use infer-and-lock pattern):
         - Fixed: {"mode": "fixed", "fields": [...]} - columns from config, extras rejected
@@ -223,7 +246,7 @@ class CSVSink(BaseSink, SinkEffectAuditContextCapability):
     name = "csv"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:198b2883591f0b54"
+    source_file_hash: str | None = "sha256:e3f05b88e042f095"
     config_model = CSVSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM
@@ -442,6 +465,7 @@ class CSVSink(BaseSink, SinkEffectAuditContextCapability):
         self._include_audit_context = cfg.include_audit_context
         self._include_error_reason = cfg.include_error_reason
         self._include_disposition_reason = cfg.include_disposition_reason
+        self._neutralize_formulas = cfg.neutralize_formulas
         self._collision_policy = cfg.collision_policy
         if self._mode != "append" and not plugin_preflight_mode_enabled():
             self._path = resolve_output_collision_path(self._requested_path, self._collision_policy)
@@ -605,7 +629,10 @@ class CSVSink(BaseSink, SinkEffectAuditContextCapability):
                 row_buffer = io.StringIO(newline="")
                 writer = csv.DictWriter(row_buffer, fieldnames=data_fields, delimiter=self._delimiter)
                 try:
-                    writer.writerow(row)
+                    if self._neutralize_formulas:
+                        writer.writerow({key: neutralize_csv_formula(value) for key, value in row.items()})
+                    else:
+                        writer.writerow(row)
                     row_text = row_buffer.getvalue()
                     row_text.encode(self._encoding)
                 except UnicodeEncodeError:
@@ -750,6 +777,7 @@ class CSVSink(BaseSink, SinkEffectAuditContextCapability):
                     "collision_policy: 'fail_if_exists', 'auto_increment', or 'append_or_create' (only with mode: append). Unset is the default and OVERWRITES/truncates an existing file — set it deliberately to protect prior runs.",
                     "To guarantee column order, set schema.mode='fixed' and order schema.fields explicitly, including quarantine sinks. 'observed' infers order from first-row keys. headers changes display names only. Resume appends must preserve established order.",
                     "on_write_failure is REQUIRED (no default): set 'discard' (drop with an audit record) or a quarantine sink name for per-row write errors; omitting it fails validation.",
+                    "Cells are written verbatim by default, so text starting with =, +, -, @ or a tab can execute as a formula when the file is opened in a spreadsheet. Set options.neutralize_formulas=true when the output carries untrusted text (LLM output, scraped or uploaded data) and will be opened in Excel; it quote-prefixes those cells.",
                     "Set options.require_all_rows=true when every pipeline row must be retained: a row refusal then stops preparation before publication instead of routing or discarding it. Earlier publications are not rolled back.",
                 ),
             )
