@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -44,6 +45,18 @@ class _FakeChromaClient:
 
     def close(self) -> None:
         self.close_calls += 1
+
+
+@pytest.fixture
+def existing_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the tests' ``./data`` persist_directory exist.
+
+    probe() reports a missing persist_directory as unreachable without
+    constructing a client (sweep finding #149), so tests that exercise the
+    client path need the directory to be present.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data").mkdir()
 
 
 class TestBuildCollectionProbes:
@@ -93,6 +106,7 @@ class TestBuildCollectionProbes:
         assert probes[1].collection_name == "bravo"
 
 
+@pytest.mark.usefixtures("existing_data_dir")
 class TestChromaCollectionProbeBehavior:
     """Behavioral tests for ChromaCollectionProbe.probe() with mocked ChromaDB."""
 
@@ -164,7 +178,7 @@ class TestChromaCollectionProbeBehavior:
 
     def test_client_construction_failure_reports_unreachable(self) -> None:
         """Infrastructure failure during client creation is 'unreachable', not a bug."""
-        probe = ChromaCollectionProbe("test", {"mode": "persistent", "persist_directory": "/nonexistent/path"})
+        probe = ChromaCollectionProbe("test", {"mode": "persistent", "persist_directory": "./data"})
 
         with patch("chromadb.PersistentClient", autospec=True, side_effect=OSError("Permission denied")):
             result = probe.probe()
@@ -238,6 +252,7 @@ class TestChromaCollectionProbeConfigValidation:
         assert probe.collection_name == "test-col"
 
 
+@pytest.mark.usefixtures("existing_data_dir")
 class TestChromaCollectionProbeCrashThrough:
     """Verify that programming errors crash through (are NOT caught)."""
 
@@ -271,6 +286,7 @@ class TestChromaCollectionProbeCrashThrough:
             ChromaCollectionProbe("test", {"mode": "persistent"})
 
 
+@pytest.mark.usefixtures("existing_data_dir")
 class TestChromaProbeWidenedExceptSet:
     """B3.5 -- ValueError and httpx.HTTPError must report reachable=False, not escape.
 
