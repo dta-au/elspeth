@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from typing import Any
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -13,6 +14,10 @@ from elspeth.plugins.infrastructure.clients.llm import LLMClientError, NetworkEr
 from elspeth.plugins.transforms.llm.provider import LLMAuditParent
 from elspeth.plugins.transforms.llm.providers.gateway import _validate_gateway_success_response, _validate_readyz_payload
 from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterLLMProvider
+from tests.unit.plugins.llm.test_provider_bedrock import _LEADER_TOKEN as _BEDROCK_LEADER_TOKEN
+from tests.unit.plugins.llm.test_provider_bedrock import MODEL as _BEDROCK_MODEL
+from tests.unit.plugins.llm.test_provider_bedrock import _provider as _bedrock_provider
+from tests.unit.plugins.llm.test_provider_bedrock import _response as _bedrock_response
 from tests.unit.plugins.llm.test_provider_gateway import _CONTRACT_HEADER, _completion_body, _gateway_response, _readyz_body
 from tests.unit.plugins.llm.test_provider_openrouter import _MEMBER_TOKEN as _OPENROUTER_MEMBER_TOKEN
 from tests.unit.plugins.llm.test_provider_openrouter import _WORK_ITEM as _OPENROUTER_WORK_ITEM
@@ -171,3 +176,37 @@ class TestOpenRouterTransportErrorRedaction:
         assert raised.__cause__ is transport_error
         assert recorder.calls, "the logical LLM error row was not recorded"
         assert _TRANSPORT_SENTINEL not in repr(recorder.calls)
+
+
+# ---------------------------------------------------------------------------
+# Finding #125: Bedrock readiness requires a usable completion
+# ---------------------------------------------------------------------------
+
+
+class TestBedrockPreflightRequiresUsableCompletion:
+    @pytest.mark.parametrize(
+        ("content", "finish_reason"),
+        [
+            pytest.param("", "stop", id="empty-stop"),
+            pytest.param("   ", "stop", id="whitespace-stop"),
+            pytest.param("ok", "length", id="length"),
+            pytest.param("ok", "content_filter", id="content-filter"),
+            pytest.param("ok", "tool_calls", id="tool-calls"),
+        ],
+    )
+    def test_unusable_preflight_completion_is_not_readiness(self, content: str, finish_reason: str) -> None:
+        provider = _bedrock_provider()
+        with patch("litellm.completion", return_value=_bedrock_response(content=content, finish_reason=finish_reason)):
+            raised = _raised_by(
+                lambda: provider.runtime_preflight(
+                    operation_id="op-1", model=_BEDROCK_MODEL, temperature=0.0, coordination_token=_BEDROCK_LEADER_TOKEN
+                )
+            )
+        assert isinstance(raised, LLMClientError), f"preflight accepted content={content!r} finish_reason={finish_reason!r}"
+        assert raised.retryable is False
+        assert content.strip() == "" or content not in str(raised)
+
+    def test_usable_preflight_completion_is_readiness(self) -> None:
+        provider = _bedrock_provider()
+        with patch("litellm.completion", return_value=_bedrock_response(content="ok", finish_reason="stop")):
+            provider.runtime_preflight(operation_id="op-1", model=_BEDROCK_MODEL, temperature=0.0, coordination_token=_BEDROCK_LEADER_TOKEN)
