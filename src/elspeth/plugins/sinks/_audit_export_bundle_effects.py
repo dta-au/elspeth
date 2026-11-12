@@ -410,7 +410,8 @@ def _csv_relative_path(record_type: object, seen: dict[str, str]) -> str:
     return relative_path
 
 
-def _neutralize_csv_formula(value: object) -> object:
+def neutralize_csv_formula(value: object) -> object:
+    """Prefix a spreadsheet-formula-leading string cell with a quote so it reads as text."""
     if type(value) is str and value.startswith(_CSV_FORMULA_PREFIXES):
         return f"'{value}"
     return value
@@ -445,7 +446,7 @@ def _parse_verified_records(
                 record = cast(dict[str, object], value)
                 relative_path = _csv_relative_path(record["record_type"], seen_names)
                 flattened = formatter.format(record)
-                safe_record = {key: _neutralize_csv_formula(item) for key, item in flattened.items()}
+                safe_record = {key: neutralize_csv_formula(item) for key, item in flattened.items()}
                 spool: _RecordSpool | None = None
                 if relative_path in spools:
                     spool = spools[relative_path]
