@@ -508,18 +508,38 @@ def prepare_local_effect(
         total = 0
         stream: IO[bytes] = os.fdopen(descriptor_fd, "wb")
         descriptor_fd = None
+        # Chunks are held back until _COPY_CHUNK_BYTES accumulate, then admitted
+        # and written together: one storage reservation per byte threshold
+        # instead of one per (often row-sized) chunk, and still never a byte
+        # written ahead of its admission.
+        pending: list[bytes] = []
+        written = 0
+
+        def admit_and_write_pending() -> None:
+            nonlocal written
+            # Include the full predecessor and staging body. Buffered writes
+            # may not yet appear in stat(), so use the cumulative count.
+            _admit_local_file_storage(target, size_bytes=existing_storage_bytes + total)
+            for held in pending:
+                stream.write(held)
+            pending.clear()
+            written = total
+
         with stream:
             for chunk in chunks:
                 if type(chunk) is not bytes:
                     raise TypeError("local effect chunks must be exact bytes")
+                if not chunk:
+                    continue
                 total += len(chunk)
                 if total > max_bytes:
                     raise LocalFileEffectLimitError(f"byte limit exceeded: {total} > {max_bytes}")
-                # Include the full predecessor and staging body. Buffered writes
-                # may not yet appear in stat(), so use the cumulative count.
-                _admit_local_file_storage(target, size_bytes=existing_storage_bytes + total)
-                stream.write(chunk)
+                pending.append(chunk)
                 digest.update(chunk)
+                if total - written >= _COPY_CHUNK_BYTES:
+                    admit_and_write_pending()
+            if pending:
+                admit_and_write_pending()
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(building, staging)
