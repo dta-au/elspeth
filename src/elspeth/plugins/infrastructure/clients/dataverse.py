@@ -9,13 +9,16 @@ each HTTP call.
 
 from __future__ import annotations
 
+import email.utils
 import fnmatch
+import math
 import re
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
@@ -104,6 +107,10 @@ class DataverseClientError(Exception):
 
     error_category is a typed classification set at the raise site,
     enabling structured audit recording without fragile string-matching.
+
+    retry_after is the delay in seconds a 429 response's Retry-After header
+    asked for (delta-seconds or HTTP-date form), so a retry path can wait at
+    least that long; None when the server named no usable delay.
     """
 
     def __init__(
@@ -116,6 +123,7 @@ class DataverseClientError(Exception):
         error_category: str = "protocol_error",
         request_url: str | None = None,
         request_headers: dict[str, str] | None = None,
+        retry_after: float | None = None,
     ) -> None:
         super().__init__(message)
         self.retryable = retryable
@@ -124,6 +132,33 @@ class DataverseClientError(Exception):
         self.error_category = error_category
         self.request_url = request_url
         self.request_headers = request_headers
+        self.retry_after = retry_after
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse an RFC 9110 Retry-After value (delta-seconds or HTTP-date) to seconds.
+
+    Tier 3: a response header. Returns None for an absent or unusable value;
+    an HTTP-date in the past means "now" (0.0).
+    """
+    if value is None:
+        return None
+    text = value.strip()
+    try:
+        seconds = float(text)
+    except ValueError:
+        try:
+            when = email.utils.parsedate_to_datetime(text)
+        except (TypeError, ValueError):
+            return None
+        if when.tzinfo is None:
+            # RFC 9110 HTTP-dates are GMT; parsedate_to_datetime returns a
+            # naive datetime for the obsolete "-0000" zone.
+            when = when.replace(tzinfo=UTC)
+        return max(0.0, (when - datetime.now(UTC)).total_seconds())
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return seconds
 
 
 @dataclass(frozen=True, slots=True)
@@ -481,11 +516,8 @@ class DataverseClient:
         """
         # 429: Rate limited — check Retry-After
         if status_code == 429:
-            retry_after_raw = headers.get("retry-after", "")
-            try:
-                retry_after = float(retry_after_raw)
-            except (ValueError, TypeError):
-                retry_after = 1.0
+            parsed_retry_after = _parse_retry_after(headers["retry-after"] if "retry-after" in headers else None)
+            retry_after = 1.0 if parsed_retry_after is None else parsed_retry_after
 
             # Clamp for classification: floor=1, ceiling=retry_after_cap
             effective = max(1.0, min(retry_after, self._retry_after_cap))
@@ -501,6 +533,7 @@ class DataverseClient:
                     latency_ms=latency_ms,
                     request_url=request_url,
                     request_headers=request_headers,
+                    retry_after=parsed_retry_after,
                 )
             return DataverseClientError(
                 f"Rate limited (429) with Retry-After {effective}s",
@@ -509,6 +542,7 @@ class DataverseClient:
                 latency_ms=latency_ms,
                 request_url=request_url,
                 request_headers=request_headers,
+                retry_after=parsed_retry_after,
             )
 
         # 401: Auth failure — retryable once via credential reconstruction

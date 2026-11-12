@@ -389,8 +389,13 @@ class TestBatchStatsFloatOverflow:
         assert result.reason is not None
         assert result.reason["reason"] == "float_overflow"
 
-    def test_mean_overflow_returns_error(self, ctx: PluginContext) -> None:
-        """Huge integer totals that overflow during mean computation return an error."""
+    def test_huge_integer_total_returns_error(self, ctx: PluginContext) -> None:
+        """A huge integer total returns an error at the sum, before the mean.
+
+        An int total beyond ±(2**53-1) cannot be emitted in canonical JSON,
+        so the sum guard records it (sweep finding #99) before the mean
+        division could overflow.
+        """
         from elspeth.plugins.transforms.batch_stats import BatchStats
 
         transform = BatchStats({"schema": DYNAMIC_SCHEMA, "value_field": "amount"})
@@ -400,7 +405,7 @@ class TestBatchStatsFloatOverflow:
         assert result.status == "error"
         assert result.reason is not None
         assert result.reason["reason"] == "float_overflow"
-        assert result.reason["operation"] == "mean"
+        assert result.reason["operation"] == "sum"
 
     def test_no_skipped_field_when_all_finite(self, ctx: PluginContext) -> None:
         """skipped_non_finite field is absent when all values are finite."""
@@ -680,9 +685,9 @@ class TestBatchStatsGroupByRollups:
                     {"id": 1, "amount": 1.0, "category": "returns"},
                     {"id": 2, "amount": 10**1000, "category": "SECRET-GROUP"},
                 ],
-                {"reason": "float_overflow", "operation": "mean"},
+                {"reason": "float_overflow", "operation": "sum"},
                 1,
-                id="mean-overflow",
+                id="int-sum-overflow",
             ),
             pytest.param(
                 [

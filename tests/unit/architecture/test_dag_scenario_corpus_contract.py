@@ -1019,7 +1019,11 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # resumed_full_projection_sha256 moved b8c16e2c... -> d9f57ba0..., measured by
 # the production harness. Captured from this file's parity failure (previous
 # pin 28a82fc8...).
-EXPECTED_CASE_REGISTRY_SHA256 = "b14d1da892a0ca3625763cb1e89b47f60056f52d9e87fe485a0d4fb2cc49644d"
+# Deep-nesting follow-up (20261111-plugins-review #18/#68/#112/#138): JSONSource
+# bounds nesting before decode; its manifest provenance token moved
+# 204c8485e712dc75 -> 35519150141e19b9, the manifest's only changed byte run.
+# Captured from this file's parity failure (previous pin b14d1da8...).
+EXPECTED_CASE_REGISTRY_SHA256 = "70bb6809b9fa28b1888034ce64774a2a6c7f2116697bff9a41c746915704cab9"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

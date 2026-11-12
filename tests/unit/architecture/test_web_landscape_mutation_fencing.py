@@ -953,14 +953,20 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # ctx.record_validation_error #2 (the text-mode and in-reader decode handlers merge
 # into one now that decoding is strict and line-attributed). Measured by
 # scripts/fencing_inventory.py --baseline against a git archive of 08cc09dc.
-# P3 cloud-blob (#19): 283 -> 284. Arrived 1, departed 0, moved 0:
+# P3 dataverse-chroma (#75): 283 -> 284. Arrived 1, departed 0:
+# ChromaSearchProvider._record_operation_error -> self._execution.record_operation_call#1
+# (a failed readiness count / client initialisation now leaves an ERROR Call row
+# for its allocated operation call index). The search() initialisation-failure
+# path reuses the existing _record_error caller. Measured by this gate's scanner
+# on the lane tree against the base 10d56017 (283/87f23b4e…).
+# P3 cloud-blob (#19): 284 -> 285. Arrived 1, departed 0, moved 0:
 # AzureBlobSource._load_csv._quarantine_undecodable_file -> ctx.record_validation_error
 # (the file-level decode quarantine, now shared by the strict-decode fallback and an
 # undecodable header record). _load_csv keeps six callers: the old inline file-level
 # site left and the per-record undecodable-bytes quarantine arrived in its place.
-# Measured with the gate's own scan_production_calls on a git archive of 10d56017
-# and on this tree, rows classified by scripts/fencing_inventory.classify.
-_EXPECTED_CALL_COUNT = 284
+# Arrival measured on the lane against 10d56017; merged with the dataverse-chroma
+# landing 20584836, scripts/fencing_inventory.py reports live 285 and digest below.
+_EXPECTED_CALL_COUNT = 285
 # Release integration retains the ACA callers and the Dataverse lifecycle
 # wrapper: six validation writes move from load() to _load_rows().
 # AGG-ERROR-EDGE: 0b7a9382… -> d82c45a5…, the one caller added above.
@@ -979,9 +985,11 @@ _EXPECTED_CALL_COUNT = 284
 # and departures named at _EXPECTED_CALL_COUNT.
 # P2 json-csv: 584288fd… -> 87f23b4e…, the four departures named at
 # _EXPECTED_CALL_COUNT.
-# P3 cloud-blob (#19): 87f23b4e… -> the value below, the one arrival named at
+# P3 dataverse-chroma: 87f23b4e… -> 9a8cb7c5…, the one arrival named at
 # _EXPECTED_CALL_COUNT.
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "09f096ced9565e7d34d8c447419d2f058a2461fe4d2d7441e59bab5ba570e4d6"
+# P3 cloud-blob (#19): 9a8cb7c5… -> the value below, the one arrival named at
+# _EXPECTED_CALL_COUNT.
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "9b4ad47309d8766f7769c2787f0bae58ca9fdcf35aaeabb2b95820b8f6f59fe9"
 # C4 (recorded FAILED verdict): 138 -> 143, d3b83b4c… -> the value below. Arrived:
 # ExecutionRepository.complete_aggregation_failure -> insert_batch_transform_errors_on,
 # -> NodeStateRepository.record_routing_event_on, -> NodeStateRepository.complete_node_state_on,
