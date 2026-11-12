@@ -125,6 +125,26 @@ class PoolRenderer:
         worker that is about to be killed for a timeout before it disappears.
         """
         output_dir = Path(tempfile.mkdtemp(prefix="elspeth-rasterize-"))
+        # Only a RETURNED result hands output_dir to the caller. Every path that
+        # raises out of render() — the pool build, submit(), the on_submitted seam,
+        # worker death, a worker exception outside the protocol — leaves no caller
+        # holding the path, so render() must discard it (and any pages already
+        # written into it) itself.
+        handed_off = False
+        try:
+            result = self._render_into(output_dir, pdf_bytes, on_submitted)
+            handed_off = True
+        finally:
+            if not handed_off:
+                self.discard(output_dir)
+        return result, output_dir
+
+    def _render_into(
+        self,
+        output_dir: Path,
+        pdf_bytes: bytes,
+        on_submitted: Callable[[tuple[int, ...]], None] | None,
+    ) -> RenderResult:
         request = RasterizeRequest(
             pdf_bytes=pdf_bytes,
             dpi=self._limits.dpi,
@@ -137,20 +157,14 @@ class PoolRenderer:
             max_page_text_bytes=self._limits.max_page_text_bytes,
         )
         pool = self._ensure_pool()
-        try:
-            future = pool.submit(self._worker, request)
-        except Exception:
-            # submit() itself raised before handing back a future to await: no caller
-            # will ever receive this output_dir to discard it, so it must not leak here.
-            self.discard(output_dir)
-            raise
+        future = pool.submit(self._worker, request)
         if on_submitted is not None:
             on_submitted(self.live_worker_pids())
         try:
             outcome = future.result(timeout=self._limits.render_timeout_seconds)
         except FuturesTimeoutError:
             self._kill_pool(future)
-            return RenderTimedOut(timeout_seconds=self._limits.render_timeout_seconds), output_dir
+            return RenderTimedOut(timeout_seconds=self._limits.render_timeout_seconds)
         except BrokenProcessPool as exc:
             self._shutdown_and_drop_pool()
             raise RuntimeError(
@@ -160,15 +174,12 @@ class PoolRenderer:
             # SIGXCPU fired inside the worker while it was between native calls: the document
             # consumed its CPU budget. Same row outcome as the wall clock; the worker is
             # recycled by max_tasks_per_child=1, so the pool itself stays usable.
-            return RenderTimedOut(timeout_seconds=self._limits.render_timeout_seconds), output_dir
+            return RenderTimedOut(timeout_seconds=self._limits.render_timeout_seconds)
         except MemoryError:
             # RLIMIT_AS tripped OUTSIDE the per-page handler in worker.py (which already
             # catches MemoryError around a single page's render and returns a RefusedPage)
             # -- so this means the document PARSE itself blew the memory limit.
-            return (
-                DocumentRefusal(kind=DocumentRefusalKind.MALFORMED, detail="document parse exceeded the worker memory limit"),
-                output_dir,
-            )
+            return DocumentRefusal(kind=DocumentRefusalKind.MALFORMED, detail="document parse exceeded the worker memory limit")
         except Exception as exc:  # narrow in effect: every typed worker exception is handled
             # above; anything else escaping the worker is OUR code's bug, not a document
             # problem, and must crash loudly rather than be swallowed.
@@ -176,7 +187,7 @@ class PoolRenderer:
             raise RuntimeError(
                 "pdf_rasterize worker raised outside its result protocol — this is a code bug, not a document problem"
             ) from exc
-        return outcome, output_dir
+        return outcome
 
     def discard(self, output_dir: Path | None) -> None:
         if output_dir is not None:
