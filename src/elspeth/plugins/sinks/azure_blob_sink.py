@@ -89,8 +89,9 @@ class AzureBlobRecordSerializationError(ValueError):
     property of one row, matching the AWS S3 twin's per-row
     ``S3RecordSerializationError`` treatment). Catching it can never absorb
     row-independent config integrity failures — the CUSTOM header-mapping
-    check raises bare ``ValueError`` outside the wraps and crashes, because
-    it indicates a configuration bug rather than an unserializable row.
+    check and a CSV header record the configured encoding cannot carry both
+    raise bare ``ValueError`` and crash, because they indicate a
+    configuration bug rather than an unserializable row.
 
     Its text becomes the recorded diversion reason, so it is value-free: an
     encoder wrap carries only the wrapped exception's class name (an
@@ -396,7 +397,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
     name = "azure_blob"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0719093e3ea19a79"
+    source_file_hash: str | None = "sha256:1d3cc39b2618f2c8"
     config_model = AzureBlobSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP
@@ -944,7 +945,15 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
             else:
                 header_chunk = b""
         except (ValueError, TypeError, csv.Error, UnicodeError) as exc:
-            raise AzureBlobRecordSerializationError(type(exc).__name__) from None
+            # The header is built from the schema, the header mode and the
+            # configured encoding, not from any one row: a failure here is a
+            # configuration defect. Raise bare ValueError (like the
+            # CUSTOM-mapping check) so the per-member probe cannot divert
+            # every clean row for it. Value-free: no header label is echoed.
+            raise ValueError(
+                f"AzureBlobSink CSV header record cannot be written with csv_options.encoding "
+                f"{self._csv_options.encoding!r} ({type(exc).__name__}); correct the header labels or the encoding."
+            ) from None
         if header_chunk:
             yield header_chunk
 
