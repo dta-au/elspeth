@@ -6,6 +6,7 @@ import math
 import statistics
 from dataclasses import dataclass
 from decimal import Decimal
+from functools import cache
 from typing import Any
 
 from pydantic import Field, field_validator, model_validator
@@ -73,6 +74,56 @@ _PAIRED_OUTPUT_FIELDS = frozenset(field.name for field in _PAIRED_CREATED_FIELDS
 _MAX_BATCH_ROWS = 4096
 
 
+def _student_t_two_sided_coverage(t: float, df: int) -> float:
+    """P(|T| < t) for Student's t with an integer ``df`` (exact finite series).
+
+    The closed form for integer degrees of freedom (Abramowitz & Stegun
+    26.7.3/26.7.4) in theta = atan(t / sqrt(df)): a sum of positive cos^2
+    powers, so it is stable for every df a batch can produce.
+    """
+    theta = math.atan(t / math.sqrt(df))
+    sin_theta = math.sin(theta)
+    cos_squared = math.cos(theta) ** 2
+    if df % 2 == 0:
+        term = 1.0
+        total = 1.0
+        for k in range(1, df // 2):
+            term *= cos_squared * (2 * k - 1) / (2 * k)
+            total += term
+        return sin_theta * total
+    if df == 1:
+        return 2.0 * theta / math.pi
+    term = 1.0
+    total = 1.0
+    for k in range(1, (df - 1) // 2):
+        term *= cos_squared * (2 * k) / (2 * k + 1)
+        total += term
+    return 2.0 / math.pi * (theta + sin_theta * math.cos(theta) * total)
+
+
+@cache
+def _student_t_critical_95(df: int) -> float:
+    """Two-sided 95% critical value of Student's t: the 0.975 quantile at ``df``.
+
+    A paired-difference mean with an estimated standard deviation has a
+    t-distributed pivot with n-1 degrees of freedom; the large-sample z of
+    1.96 is far too small at the pair counts an aggregation window produces
+    (12.71 at n=2, 4.30 at n=3). Solved by bisection in theta, where the
+    coverage is monotone; the result is deterministic for a given df.
+    """
+    low = 0.0
+    high = math.pi / 2
+    for _ in range(200):
+        mid = (low + high) / 2
+        if mid in (low, high):
+            break
+        if _student_t_two_sided_coverage(math.sqrt(df) * math.tan(mid), df) < 0.95:
+            low = mid
+        else:
+            high = mid
+    return math.sqrt(df) * math.tan((low + high) / 2)
+
+
 @dataclass(frozen=True, slots=True)
 class _ScoreEntry:
     variant: Any
@@ -135,7 +186,7 @@ class BatchPairedPreference(BaseTransform):
     name = "batch_paired_preference"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f4b3b3ae1c4c10ae"
+    source_file_hash: str | None = "sha256:ca3fc042c027f83a"
     config_model = BatchPairedPreferenceConfig
     is_batch_aware = True
     # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
@@ -477,8 +528,10 @@ class BatchPairedPreference(BaseTransform):
                 confidence_95_high = None
             else:
                 standard_error_delta = self._require_finite(se_raw, operation="standard_error_delta")
-                confidence_95_low = self._require_finite(mean_delta - 1.96 * standard_error_delta, operation="confidence_95_low")
-                confidence_95_high = self._require_finite(mean_delta + 1.96 * standard_error_delta, operation="confidence_95_high")
+                # Student-t at n-1 df: the SD is estimated from the same pairs.
+                half_width = _student_t_critical_95(compared_count - 1) * standard_error_delta
+                confidence_95_low = self._require_finite(mean_delta - half_width, operation="confidence_95_low")
+                confidence_95_high = self._require_finite(mean_delta + half_width, operation="confidence_95_high")
         except OverflowError as exc:
             aggregate_overflow_reason: TransformErrorReason = {
                 "reason": "float_overflow",
