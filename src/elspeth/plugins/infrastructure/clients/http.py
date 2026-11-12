@@ -1793,7 +1793,9 @@ class AuditedHTTPClient(AuditedClientBase):
             headers: Additional headers for this request
             json: JSON body for POST requests.
             params: Query parameters for the request.
-            follow_redirects: Whether to follow HTTP redirects (default: False)
+            follow_redirects: Whether to follow HTTP redirects (default: False).
+                Only a body-less GET may follow redirects; every hop is
+                re-sent as a GET, so any other method or a body is refused.
             max_redirects: Maximum redirect hops when follow_redirects=True
             allowed_ranges: IP networks that may bypass the default SSRF
                 blocklist when validating redirect targets. This must match
@@ -1818,6 +1820,11 @@ class AuditedHTTPClient(AuditedClientBase):
         method_upper = method.upper()
         if self._audit_policy is HTTPAuditPolicy.POWER_AUTOMATE_V1 and follow_redirects:
             raise ValueError("Power Automate HTTP policy refuses redirects")
+        if follow_redirects and (method_upper != "GET" or json is not None or form is not None or multipart_body is not None):
+            # _follow_redirects_safe re-sends every hop as a body-less GET, so
+            # following a redirect for any other request would silently answer
+            # a POST/PUT (or drop its body on 307/308) with a GET response.
+            raise ValueError("redirect following requires a body-less GET request")
         if form is not None:
             if method_upper != "POST" or json is not None or multipart_body is not None:
                 raise ValueError("form requires POST without a JSON body")
