@@ -389,3 +389,17 @@ class TestFinding92ChromaSinkDistanceFunctionMismatch:
             sink.on_start(make_context(node_id="chroma"))
         finally:
             sink.close()
+
+
+class TestFinding93ChromaComposerHintMatchesDiversion:
+    """#93: the composer hint must say a non-string id/document diverts that row, as the code does."""
+
+    def test_hint_describes_per_row_diversion_for_non_string_id_or_document(self) -> None:
+        from elspeth.plugins.sinks.chroma_sink import ChromaSink
+
+        assistance = ChromaSink.get_agent_assistance()
+        assert assistance is not None
+        hints = " ".join(assistance.composer_hints)
+        assert "aborts the whole batch" not in hints
+        assert "non-string" in hints
+        assert "diverted per row" in hints
