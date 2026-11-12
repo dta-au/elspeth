@@ -1028,7 +1028,12 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # its manifest provenance token moved 35519150141e19b9 -> 098f17f23ccb7c66,
 # the manifest's only changed byte run. Captured from this file's parity
 # failure (previous pin 70bb6809...).
-EXPECTED_CASE_REGISTRY_SHA256 = "b88cee62734c81e1f2dc013787349c9c1b1b623235b942b678036dd857a16c5d"
+# Sweep finding #43 (20261111-plugins-review): JSONSource reads UTF-8 input as
+# utf-8-sig so a leading BOM no longer quarantines the file; its manifest
+# provenance token moved 098f17f23ccb7c66 -> c299bae1329a63c2, the manifest's
+# only changed byte run. Captured from this file's parity failure (previous
+# pin b88cee62...).
+EXPECTED_CASE_REGISTRY_SHA256 = "68e95dc040cf3e924aa37f4fe8b824e119b201554edafe3f78e36ea47a9d75ba"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

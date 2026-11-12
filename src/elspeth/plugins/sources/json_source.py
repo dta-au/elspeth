@@ -218,7 +218,7 @@ class JSONSource(BaseSource):
     name = "json"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:098f17f23ccb7c66"
+    source_file_hash: str | None = "sha256:c299bae1329a63c2"
     config_model = JSONSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str
@@ -249,6 +249,11 @@ class JSONSource(BaseSource):
 
         self._path = cfg.resolved_path()
         self._encoding = cfg.encoding
+        # Windows tooling commonly writes UTF-8 with a leading BOM, which
+        # json.loads rejects ('Unexpected UTF-8 BOM'). Read UTF-8 input as
+        # utf-8-sig so only a BOM at the start of the file is stripped, as
+        # the CSV source's header normalization does.
+        self._read_encoding = "utf-8-sig" if codecs.lookup(cfg.encoding).name == "utf-8" else cfg.encoding
         self._data_key = cfg.data_key
 
         # Auto-detect format from extension if not specified
@@ -343,7 +348,7 @@ class JSONSource(BaseSource):
             # (e.g., utf-16 / utf-32) instead of splitting on raw 0x0A bytes.
             # BYTE_ESCAPE_ERRORS keeps an undecodable code unit on its own line
             # for every codec; surrogateescape cannot for UTF-16/UTF-32.
-            with open(self._path, encoding=self._encoding, errors=BYTE_ESCAPE_ERRORS, newline="") as f:
+            with open(self._path, encoding=self._read_encoding, errors=BYTE_ESCAPE_ERRORS, newline="") as f:
                 for line_num, raw_line in enumerate(f, start=1):
                     if contains_escaped_bytes(raw_line):
                         raw_bytes = escaped_line_to_bytes(raw_line, self._encoding)
@@ -411,7 +416,7 @@ class JSONSource(BaseSource):
         decode is quarantined, not crash the pipeline.
         """
         try:
-            with open(self._path, encoding=self._encoding) as f:
+            with open(self._path, encoding=self._read_encoding) as f:
                 # parse_constant rejects NaN/Infinity at parse time (canonical JSON policy)
                 try:
                     # Same nesting bound as the JSONL path, over the whole file.
