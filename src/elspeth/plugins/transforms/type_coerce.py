@@ -19,6 +19,7 @@ from elspeth.contracts import Determinism
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.core.canonical import is_non_canonical_number
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -41,6 +42,7 @@ CoercionFailure = Literal[
     "not_boolean_string",
     "not_scalar",
     "unsupported_type",
+    "out_of_range",
 ]
 
 # One fixed sentence per failure arm. The coerced value is row data (Tier 2/3):
@@ -59,6 +61,7 @@ _FAILURE_MESSAGES: dict[CoercionFailure, str] = {
     "not_boolean_string": "string is not a valid boolean string",
     "not_scalar": "value is not a scalar type",
     "unsupported_type": "unsupported type",
+    "out_of_range": "integer is outside the canonical JSON safe range of +/-(2**53-1)",
 }
 
 
@@ -105,7 +108,18 @@ def coerce_to_int(value: Any) -> int:
         - empty/whitespace string
         - bool (True/False are technically ints but rejected)
         - None
+        - integers outside the canonical JSON safe range +/-(2**53-1): the
+          row could not be hashed or recorded, so the value routes here as
+          ``out_of_range`` rather than failing later as a non-canonical output
     """
+    result = _coerce_to_int_unchecked(value)
+    if is_non_canonical_number(result):
+        raise CoercionError(failure="out_of_range", target_type="int", actual_type=type(value).__name__)
+    return result
+
+
+def _coerce_to_int_unchecked(value: Any) -> int:
+    """Parse ``value`` as an int by coerce_to_int's grammar, before the range check."""
     # Reject None first
     if value is None:
         raise CoercionError(failure="none_value", target_type="int", actual_type=type(value).__name__)
@@ -357,7 +371,7 @@ class TypeCoerce(BaseTransform):
     name = "type_coerce"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:129eee65f4818a2b"
+    source_file_hash: str | None = "sha256:c9f7641c7d34f48c"
     config_model = TypeCoerceConfig
     usage_when_to_use: str = (
         "Use for explicit field-by-field type normalization when values such as CSV strings must become "
