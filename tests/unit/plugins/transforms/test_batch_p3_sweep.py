@@ -241,3 +241,56 @@ class TestFinding108PairedPreferenceStudentTInterval:
         assert result.row["standard_error_delta"] == pytest.approx(standard_error, rel=1e-12)
         assert result.row["confidence_95_low"] == pytest.approx(mean_delta - half_width, rel=1e-9, abs=1e-12)
         assert result.row["confidence_95_high"] == pytest.approx(mean_delta + half_width, rel=1e-9, abs=1e-12)
+
+
+class TestFinding113ClassifierPositiveLabelTypeMismatch:
+    """#113: a positive_label equal by value but not by type to a present label fails the batch.
+
+    Otherwise the label is treated as absent and every actual positive is
+    counted as a true negative, which reads exactly like an all-negative batch.
+    """
+
+    _ROWS: ClassVar[tuple[dict[str, int], ...]] = ({"a": 1, "p": 1}, {"a": 1, "p": 0}, {"a": 0, "p": 0})
+
+    @pytest.mark.parametrize(
+        "positive_label, configured_type",
+        [pytest.param("1", "str", id="quoted-one"), pytest.param(True, "bool", id="true-vs-one")],
+    )
+    def test_value_equal_label_of_another_type_fails_value_free(
+        self, ctx: PluginContext, positive_label: object, configured_type: str
+    ) -> None:
+        from elspeth.plugins.transforms.batch_classifier_metrics import BatchClassifierMetrics
+
+        transform = BatchClassifierMetrics(
+            {"schema": DYNAMIC_SCHEMA, "actual_field": "a", "predicted_field": "p", "positive_label": positive_label}
+        )
+
+        result = transform.process([_make_row(row) for row in self._ROWS], ctx)
+
+        assert result.status == "error", f"labels of another type were silently counted as true negatives: {result.row}"
+        assert result.reason is not None
+        assert result.reason["reason"] == "validation_failed"
+        assert result.reason["cause"] == "positive_label_type_mismatch"
+        assert result.reason["expected"] == configured_type
+        assert result.reason["actual_type"] == "int"
+        assert result.retryable is False
+
+    def test_genuinely_absent_positive_label_still_succeeds(self, ctx: PluginContext) -> None:
+        from elspeth.plugins.transforms.batch_classifier_metrics import BatchClassifierMetrics
+
+        transform = BatchClassifierMetrics({"schema": DYNAMIC_SCHEMA, "actual_field": "a", "predicted_field": "p", "positive_label": 7})
+
+        result = transform.process([_make_row(row) for row in self._ROWS], ctx)
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row["binary_tp"] == 0
+        assert result.row["binary_tn"] == 3
+
+    def test_float_positive_label_is_refused_not_coerced(self) -> None:
+        from elspeth.plugins.transforms.batch_classifier_metrics import BatchClassifierMetricsConfig
+
+        config = {"schema": DYNAMIC_SCHEMA, "actual_field": "a", "predicted_field": "p", "positive_label": 1.0}
+        cfg, refused = _admit(BatchClassifierMetricsConfig, config, "batch_classifier_metrics")
+        coerced = None if cfg is None else cfg.positive_label
+        assert refused is not None, f"positive_label 1.0 was coerced to {coerced!r}; data labels refuse float"
