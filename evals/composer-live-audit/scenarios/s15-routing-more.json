@@ -1,0 +1,7 @@
+{
+ "turns": [
+  "Make up a short list of review comments \u2014 each with an id, the message text and a\nplain true/false flag saying whether it was approved. The approved ones need to\nend up in one CSV file and the rejected ones in another. Nothing else happens to\nthem on the way.",
+  "Invent a handful of customer transactions \u2014 an id, a customer name, an amount, a\ncurrency and a region. The rows themselves stay exactly as they came in as they\npass through, and then anything worth five thousand or more should be written to a\nhigh-value CSV file while everything else goes to a standard one."
+ ],
+ "name": "s15-routing-more"
+}

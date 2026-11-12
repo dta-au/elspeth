@@ -1,0 +1,6 @@
+{
+ "turns": [
+  "Make up a dozen customer reviews, each with an id and the review text. I want the\nsentiment of each one \u2014 positive, negative or neutral, with a confidence and a\none-line summary \u2014 worked out by a model and kept on the row. Reviews the model\nfails on go to a quarantine file rather than being lost. Write the results out as\nJSON lines."
+ ],
+ "name": "s19-sentiment"
+}

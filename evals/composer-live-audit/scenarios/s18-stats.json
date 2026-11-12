@@ -1,0 +1,6 @@
+{
+ "turns": [
+  "Make up a couple of dozen model prediction records \u2014 an id, the model name, the\nlabel it predicted and the task family. Take them eight at a time and, for each\nmodel in the batch, tell me its three most frequent predicted labels. Write those\nout as JSON lines."
+ ],
+ "name": "s18-stats"
+}

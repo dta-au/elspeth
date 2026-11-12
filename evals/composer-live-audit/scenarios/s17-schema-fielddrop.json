@@ -1,0 +1,7 @@
+{
+ "turns": [
+  "I need a customer transaction feed handled with the column types stated up front:\ncustomer_id is text, amount_usd is a number, transaction_date_time is text,\nproduct_name is text, status_active_inactive is text and notes_comments is text.\nMake the rows up. Every row travels through unchanged, and then anything with an\namount_usd of 500 or more goes to a high-value CSV file while the rest goes to the\nordinary output file.",
+  "I've got a tiny list of three colours \u2014 each one has a name and a hex code. Make the data up.\nIn the file that comes out I only want the colour names, not the hex codes. JSON both ends."
+ ],
+ "name": "s17-schema-fielddrop"
+}

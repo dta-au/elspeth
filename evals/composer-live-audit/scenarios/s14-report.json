@@ -1,0 +1,6 @@
+{
+ "turns": [
+  "I have a plain text file of log lines \u2014 make up something that looks like one, one\nline per row and blank lines kept as they are. Collect the lines two at a time and\nturn each pair into a small markdown report headed Run report, then write those\nreports out as JSON."
+ ],
+ "name": "s14-report"
+}

@@ -1,0 +1,7 @@
+{
+ "turns": [
+  "Make up three products, each with a sku, a name, a price and a long rambling description.\nFirst trim every description down to forty characters. Then I want each product sent\ndown two parallel paths at the same time and the two copies brought back together\ninto one record per product, with each path's copy kept under its own key rather\nthan blended. A final yes/no check on the merged records that always passes should\nsit before the output. Write the merged records out as JSON.",
+  "Explain what each branch does."
+ ],
+ "name": "s05-fork"
+}

@@ -1,0 +1,8 @@
+{
+ "turns": [
+  "Make up a dozen sales deals \u2014 an id, the customer, the amount, a category and a\nfree-text notes field. Every deal is first screened on its notes for passwords,\nsecrets or confidential material; a deal that fails that screening step is an error\nrather than a business outcome, and it must not be dropped \u2014 set it aside in a\nquarantine file. The deals that pass carry on: their notes are shortened to fifty\ncharacters, and then deals of ten thousand or more are split by category \u2014\nenterprise ones to their own file and the other large ones to a commercial file \u2014\nwhile everything under ten thousand goes to a standard file.",
+  "If any row can't be processed I don't want to lose it \u2014 put the failures in a separate file with the reason.",
+  "Actually, just drop failures, I don't care about them."
+ ],
+ "name": "s06-errors"
+}

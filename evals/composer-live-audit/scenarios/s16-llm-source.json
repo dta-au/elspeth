@@ -1,0 +1,7 @@
+{
+ "turns": [
+  "I have no data for this one. The rows should come from a model instead: ask it for\nfive plausible support tickets, one per row, and keep whatever it returns as it\ncomes. Write them straight out as JSON lines.",
+  "Translate each row into plain English and check the translation is accurate."
+ ],
+ "name": "s16-llm-source"
+}

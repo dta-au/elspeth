@@ -1,0 +1,15 @@
+{
+ "attachments": [
+  {
+   "path": "fixtures/feedback.csv",
+   "mime": "text/csv"
+  }
+ ],
+ "turns": [
+  "Here's our feedback export. For each comment, work out whether it's a complaint, a compliment or a question, and give me a one-line summary. Save the results as a CSV I can open in Excel.",
+  "Also put the complaints in their own separate file.",
+  "Make the summary no more than ten words.",
+  "Use GPT-4o for the classification step."
+ ],
+ "name": "s02-feedback-classify"
+}

@@ -1,0 +1,1314 @@
+{
+ "counts": {
+  "tool_loop": 45,
+  "planner": 23,
+  "escape_hatch": 3,
+  "registry": 43
+ },
+ "skill_chars": 135863,
+ "rows": [
+  {
+   "tool": "clear_source",
+   "kind": "mutation",
+   "on_tool_loop": true,
+   "on_planner": false,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [
+    "source_name"
+   ],
+   "required": [],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 58,
+   "description_first_sentence": "Remove a named source from the pipeline composition state.",
+   "skill_mentions": 1,
+   "live_calls": {},
+   "live_results": {},
+   "live_error_samples": []
+  },
+  {
+   "tool": "create_blob",
+   "kind": "mutation",
+   "on_tool_loop": true,
+   "on_planner": false,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [
+    "filename",
+    "mime_type",
+    "content",
+    "description"
+   ],
+   "required": [
+    "filename",
+    "mime_type",
+    "content"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 337,
+   "description_first_sentence": "Create a new file (blob) from inline content",
+   "skill_mentions": 8,
+   "live_calls": {},
+   "live_results": {},
+   "live_error_samples": []
+  },
+  {
+   "tool": "delete_blob",
+   "kind": "mutation",
+   "on_tool_loop": true,
+   "on_planner": false,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [
+    "blob_id"
+   ],
+   "required": [
+    "blob_id"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": true,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 88,
+   "description_first_sentence": "Delete a blob (file) and its storage",
+   "skill_mentions": 1,
+   "live_calls": {},
+   "live_results": {},
+   "live_error_samples": []
+  },
+  {
+   "tool": "diff_pipeline",
+   "kind": "discovery",
+   "on_tool_loop": true,
+   "on_planner": true,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [],
+   "required": [],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 623,
+   "description_first_sentence": "Compare the current pipeline with the baseline supplied by this surface, which may be the request-start state",
+   "skill_mentions": 1,
+   "live_calls": {
+    "tool_loop": 4
+   },
+   "live_results": {
+    "fail": 4
+   },
+   "live_error_samples": [
+    "{\"success\": false, \"validation\": {\"is_valid\": false, \"errors\": [{\"component\": \"rejected_mutation\", \"message\": \"No baseline available. Load or create a session first.\", \"severity\": \"high\", \"error_code\": \"diff_baseline_unavailable\"}], \"warnings\": [{\"component\": \"output:orders_with_gst\", \"message\": \"Output 'orders_with_gst' uses plugin 'json' but filename extension suggests a different format.\", \"severity\": \"low\"}], \"suggestions\": [], \"semantic_contracts\": [], \"graph_repair_suggestions\": []}, \"affected_nodes\": [], \"version\": 16}",
+    "{\"success\": false, \"validation\": {\"is_valid\": false, \"errors\": [{\"component\": \"rejected_mutation\", \"message\": \"No baseline available. Load or create a session first.\", \"severity\": \"high\", \"error_code\": \"diff_baseline_unavailable\"}], \"warnings\": [{\"component\": \"node:classify_comments\", \"message\": \"LLM node 'classify_comments' has no authorized prompt-injection shield in front of it. This pipeline has no declared untrusted-content producer upstream. Operator-supplied or uploaded data is not necessarily trusted. If this LLM consumes untrusted or externally controlled text, stage the required prompt-injection-shield recommendation decision card. Shield installation is optional and may be decline",
+    "{\"success\": false, \"validation\": {\"is_valid\": false, \"errors\": [{\"component\": \"rejected_mutation\", \"message\": \"No baseline available. Load or create a session first.\", \"severity\": \"high\", \"error_code\": \"diff_baseline_unavailable\"}], \"warnings\": [{\"component\": \"node:classify_feedback\", \"message\": \"LLM node 'classify_feedback' has no authorized prompt-injection shield in front of it. This pipeline has no declared untrusted-content producer upstream. Operator-supplied or uploaded data is not necessarily trusted. If this LLM consumes untrusted or externally controlled text, stage the required prompt-injection-shield recommendation decision card. Shield installation is optional and may be decline",
+    "{\"success\": false, \"validation\": {\"is_valid\": false, \"errors\": [{\"component\": \"rejected_mutation\", \"message\": \"No baseline available. Load or create a session first.\", \"severity\": \"high\", \"error_code\": \"diff_baseline_unavailable\"}], \"warnings\": [], \"suggestions\": [{\"component\": \"pipeline\", \"message\": \"Consider adding error routing to a retention output \\u2014 failed rows are currently discarded rather than kept for review.\", \"severity\": \"low\"}], \"semantic_contracts\": [], \"graph_repair_suggestions\": []}, \"affected_nodes\": [], \"version\": 4}"
+   ]
+  },
+  {
+   "tool": "emit_pipeline_proposal",
+   "kind": "planner-terminal",
+   "on_tool_loop": false,
+   "on_planner": true,
+   "on_escape_hatch": true,
+   "strict": false,
+   "args": [
+    "pipeline"
+   ],
+   "required": [
+    "pipeline"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": null,
+   "description_chars": 194,
+   "description_first_sentence": "Return one complete canonical pipeline proposal for server validation, alone in its tool-call turn",
+   "skill_mentions": 0,
+   "live_calls": {
+    "planner": 53
+   },
+   "live_results": {
+    "fail": 16
+   },
+   "live_error_samples": [
+    "{\"success\":false,\"validation\":{\"errors\":[{\"component\":\"source:colours_in\",\"detail\":\"Source 'colours_in': Invalid options for source 'json': path: Field required\",\"error_class\":\"ValidationError\",\"error_code\":\"plugin_options_invalid\",\"explanation\":\"One of the component's options failed its plugin schema. This code alone does not identify WHICH option: the rejection's 'detail' field carries the validator's own message naming the exact option and requirement \u2014 read it before hypothesising a cause.\",\"plugin_contracts\":[{\"aggregation_output_modes\":[],\"composer_hints\":[\"Format auto-detects from extension (.json vs .jsonl); set 'format' explicitly only if extension is misleading.\",\"JSON arrays neste",
+    "{\"success\":false,\"validation\":{\"errors\":[{\"component\":\"pipeline\",\"error_class\":\"SchemaValidationError\",\"error_code\":\"canonical_schema\",\"schema_violations\":[{\"path\":\"sources/item\",\"rule\":\"additionalProperties\"}],\"severity\":\"high\"}],\"is_valid\":false}}",
+    "{\"success\":false,\"validation\":{\"errors\":[{\"component\":\"source\",\"detail\":\"Source 'source': Invalid options for source 'json': schema: Value error, Observed schemas (mode: observed) cannot have explicit field definitions. Use guaranteed_fields/required_fields for contracts instead.\",\"error_class\":\"ValidationError\",\"error_code\":\"plugin_options_invalid\",\"explanation\":\"One of the component's options failed its plugin schema. This code alone does not identify WHICH option: the rejection's 'detail' field carries the validator's own message naming the exact option and requirement \u2014 read it before hypothesising a cause.\",\"plugin_contracts\":[{\"aggregation_output_modes\":[],\"composer_hints\":[\"Format aut",
+    "{\"success\":false,\"validation\":{\"errors\":[{\"component\":\"pipeline\",\"error_class\":\"SchemaValidationError\",\"error_code\":\"canonical_schema\",\"schema_violations\":[{\"path\":\"source\",\"rule\":\"additionalProperties\"},{\"path\":\"nodes\",\"rule\":\"required\"},{\"path\":\"edges\",\"rule\":\"required\"},{\"path\":\"outputs\",\"rule\":\"required\"}],\"severity\":\"high\"}],\"is_valid\":false}}"
+   ]
+  },
+  {
+   "tool": "explain_validation_error",
+   "kind": "discovery",
+   "on_tool_loop": true,
+   "on_planner": true,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [
+    "error_text"
+   ],
+   "required": [
+    "error_text"
+   ],
+   "cacheable_discovery": true,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 283,
+   "description_first_sentence": "Get a human-readable explanation of a validation error with suggested fixes",
+   "skill_mentions": 5,
+   "live_calls": {
+    "planner": 1
+   },
+   "live_results": {},
+   "live_error_samples": []
+  },
+  {
+   "tool": "get_audit_info",
+   "kind": "discovery",
+   "on_tool_loop": true,
+   "on_planner": true,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [],
+   "required": [],
+   "cacheable_discovery": true,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 789,
+   "description_first_sentence": "Return facts about ELSPETH's Landscape audit trail",
+   "skill_mentions": 2,
+   "live_calls": {
+    "planner": 2
+   },
+   "live_results": {
+    "ok": 2
+   },
+   "live_error_samples": []
+  },
+  {
+   "tool": "get_blob_content",
+   "kind": "discovery",
+   "on_tool_loop": true,
+   "on_planner": true,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [
+    "blob_id",
+    "offset_chars",
+    "expected_content_hash"
+   ],
+   "required": [
+    "blob_id"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 829,
+   "description_first_sentence": "Retrieve a blob for inspection: `blob_id`, `filename`, `mime_type`, and UTF-8 decoded `content`",
+   "skill_mentions": 7,
+   "live_calls": {
+    "tool_loop": 1,
+    "planner": 4
+   },
+   "live_results": {
+    "ok": 2,
+    "fail": 1
+   },
+   "live_error_samples": [
+    "{\"success\": false, \"validation\": {\"is_valid\": false, \"errors\": [{\"component\": \"source\", \"message\": \"No source configured.\", \"severity\": \"high\", \"error_code\": \"no_source_configured\"}, {\"component\": \"pipeline\", \"message\": \"No sinks configured.\", \"severity\": \"high\", \"error_code\": \"no_sinks_configured\"}], \"warnings\": [], \"suggestions\": [], \"semantic_contracts\": [], \"graph_repair_suggestions\": []}, \"affected_nodes\": [], \"version\": 1, \"data\": {\"argument_error\": {\"component\": \"tool arguments\", \"severity\": \"high\", \"error_code\": \"SCHEMA_VALIDATION\", \"error_class\": \"ToolArgumentError\", \"error_category\": \"schema_shape\", \"validation_errors\": [{\"loc\": [\"expected_content_hash\"], \"msg\": \"Value has invalid "
+   ]
+  },
+  {
+   "tool": "get_blob_metadata",
+   "kind": "discovery",
+   "on_tool_loop": true,
+   "on_planner": true,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [
+    "blob_id"
+   ],
+   "required": [
+    "blob_id"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 121,
+   "description_first_sentence": "Get metadata for a specific blob (file) by ID: `id`, `filename`, `mime_type`, `size_bytes`, `content_hash`, and `status`.",
+   "skill_mentions": 3,
+   "live_calls": {
+    "planner": 5
+   },
+   "live_results": {
+    "ok": 7
+   },
+   "live_error_samples": []
+  },
+  {
+   "tool": "get_expression_grammar",
+   "kind": "discovery",
+   "on_tool_loop": true,
+   "on_planner": true,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [],
+   "required": [],
+   "cacheable_discovery": true,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 194,
+   "description_first_sentence": "Get the gate expression syntax reference",
+   "skill_mentions": 4,
+   "live_calls": {},
+   "live_results": {},
+   "live_error_samples": []
+  },
+  {
+   "tool": "get_pipeline_state",
+   "kind": "discovery",
+   "on_tool_loop": true,
+   "on_planner": true,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [
+    "component"
+   ],
+   "required": [],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 966,
+   "description_first_sentence": "Inspect the full current pipeline state including all options for source, nodes, and outputs",
+   "skill_mentions": 15,
+   "live_calls": {
+    "tool_loop": 11
+   },
+   "live_results": {
+    "ok": 11
+   },
+   "live_error_samples": []
+  },
+  {
+   "tool": "get_plugin_assistance",
+   "kind": "discovery",
+   "on_tool_loop": true,
+   "on_planner": true,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [
+    "plugin_type",
+    "plugin_name",
+    "issue_code"
+   ],
+   "required": [
+    "plugin_type",
+    "plugin_name"
+   ],
+   "cacheable_discovery": true,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 886,
+   "description_first_sentence": "Retrieve plugin-owned guidance for a source, transform, or sink",
+   "skill_mentions": 7,
+   "live_calls": {
+    "planner": 13,
+    "tool_loop": 2
+   },
+   "live_results": {
+    "ok": 14,
+    "fail": 1
+   },
+   "live_error_samples": [
+    "{\"success\": false, \"validation\": {\"is_valid\": false, \"errors\": [{\"component\": \"source\", \"message\": \"No source configured.\", \"severity\": \"high\", \"error_code\": \"no_source_configured\"}, {\"component\": \"pipeline\", \"message\": \"No sinks configured.\", \"severity\": \"high\", \"error_code\": \"no_sinks_configured\"}], \"warnings\": [], \"suggestions\": [], \"semantic_contracts\": [], \"graph_repair_suggestions\": []}, \"affected_nodes\": [], \"version\": 1, \"data\": {\"argument_error\": {\"component\": \"tool arguments\", \"severity\": \"high\", \"error_code\": \"SCHEMA_VALIDATION\", \"error_class\": \"ToolArgumentError\", \"error_category\": \"schema_shape\", \"validation_errors\": [{\"loc\": [\"plugin_name\"], \"msg\": \"Required value is missing\", "
+   ]
+  },
+  {
+   "tool": "get_plugin_schema",
+   "kind": "discovery",
+   "on_tool_loop": true,
+   "on_planner": true,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [
+    "plugin_type",
+    "name"
+   ],
+   "required": [
+    "plugin_type",
+    "name"
+   ],
+   "cacheable_discovery": true,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 412,
+   "description_first_sentence": "Get the full configuration schema for a plugin",
+   "skill_mentions": 7,
+   "live_calls": {
+    "planner": 99,
+    "tool_loop": 18
+   },
+   "live_results": {
+    "ok": 113,
+    "fail": 4
+   },
+   "live_error_samples": [
+    "{\"success\": false, \"validation\": {\"is_valid\": false, \"errors\": [{\"component\": \"rejected_mutation\", \"message\": \"transform plugin selection is unavailable (plugin_not_enabled): the plugin is installed but not turned on in this deployment's plugin policy; an operator must enable it\", \"severity\": \"high\", \"error_code\": \"plugin_not_enabled\"}, {\"component\": \"source\", \"message\": \"No source configured.\", \"severity\": \"high\", \"error_code\": \"no_source_configured\"}, {\"component\": \"pipeline\", \"message\": \"No sinks configured.\", \"severity\": \"high\", \"error_code\": \"no_sinks_configured\"}], \"warnings\": [], \"suggestions\": [], \"semantic_contracts\": [], \"graph_repair_suggestions\": []}, \"affected_nodes\": [], \"versi",
+    "{\"success\": false, \"validation\": {\"is_valid\": false, \"errors\": [{\"component\": \"rejected_mutation\", \"message\": \"transform plugin selection is unavailable (plugin_not_enabled): the plugin is installed but not turned on in this deployment's plugin policy; an operator must enable it\", \"severity\": \"high\", \"error_code\": \"plugin_not_enabled\"}, {\"component\": \"source\", \"message\": \"No source configured.\", \"severity\": \"high\", \"error_code\": \"no_source_configured\"}, {\"component\": \"pipeline\", \"message\": \"No sinks configured.\", \"severity\": \"high\", \"error_code\": \"no_sinks_configured\"}], \"warnings\": [], \"suggestions\": [], \"semantic_contracts\": [], \"graph_repair_suggestions\": []}, \"affected_nodes\": [], \"versi",
+    "{\"success\": false, \"validation\": {\"is_valid\": false, \"errors\": [{\"component\": \"rejected_mutation\", \"message\": \"transform plugin selection is unavailable (plugin_not_enabled): the plugin is installed but not turned on in this deployment's plugin policy; an operator must enable it\", \"severity\": \"high\", \"error_code\": \"plugin_not_enabled\"}, {\"component\": \"source\", \"message\": \"No source configured.\", \"severity\": \"high\", \"error_code\": \"no_source_configured\"}, {\"component\": \"pipeline\", \"message\": \"No sinks configured.\", \"severity\": \"high\", \"error_code\": \"no_sinks_configured\"}], \"warnings\": [], \"suggestions\": [], \"semantic_contracts\": [], \"graph_repair_suggestions\": []}, \"affected_nodes\": [], \"versi",
+    "{\"success\": false, \"validation\": {\"is_valid\": false, \"errors\": [{\"component\": \"rejected_mutation\", \"message\": \"transform plugin selection is unavailable (plugin_not_enabled): the plugin is installed but not turned on in this deployment's plugin policy; an operator must enable it\", \"severity\": \"high\", \"error_code\": \"plugin_not_enabled\"}, {\"component\": \"source\", \"message\": \"No source configured.\", \"severity\": \"high\", \"error_code\": \"no_source_configured\"}, {\"component\": \"pipeline\", \"message\": \"No sinks configured.\", \"severity\": \"high\", \"error_code\": \"no_sinks_configured\"}], \"warnings\": [], \"suggestions\": [], \"semantic_contracts\": [], \"graph_repair_suggestions\": []}, \"affected_nodes\": [], \"versi"
+   ]
+  },
+  {
+   "tool": "handoff_to_user",
+   "kind": "recovery-control",
+   "on_tool_loop": true,
+   "on_planner": true,
+   "on_escape_hatch": true,
+   "strict": true,
+   "args": [
+    "action",
+    "message"
+   ],
+   "required": [
+    "action",
+    "message"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": null,
+   "description_chars": 393,
+   "description_first_sentence": "End authoring immediately and talk to the user",
+   "skill_mentions": 7,
+   "live_calls": {},
+   "live_results": {},
+   "live_error_samples": []
+  },
+  {
+   "tool": "inspect_source",
+   "kind": "discovery",
+   "on_tool_loop": true,
+   "on_planner": true,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [
+    "blob_id",
+    "encoding"
+   ],
+   "required": [
+    "blob_id"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 1720,
+   "description_first_sentence": "Return bounded structural facts about a blob-backed source: `source_kind`, `observed_headers`, `runtime_headers`, `field_name_mapping` (raw CSV labels to runtime row keys), `sample_row_count`, `inferred_types` (lexical s",
+   "skill_mentions": 6,
+   "live_calls": {
+    "planner": 13
+   },
+   "live_results": {
+    "ok": 11,
+    "fail": 2
+   },
+   "live_error_samples": [
+    "{\"success\": false, \"validation\": {\"is_valid\": false, \"errors\": [{\"component\": \"rejected_mutation\", \"message\": \"CSV inspection requires a supported text encoding.\", \"severity\": \"high\"}, {\"component\": \"source\", \"message\": \"No source configured.\", \"severity\": \"high\", \"error_code\": \"no_source_configured\"}, {\"component\": \"pipeline\", \"message\": \"No sinks configured.\", \"severity\": \"high\", \"error_code\": \"no_sinks_configured\"}], \"warnings\": [], \"suggestions\": [], \"semantic_contracts\": [], \"graph_repair_suggestions\": []}, \"affected_nodes\": [], \"version\": 1}",
+    "{\"success\": false, \"validation\": {\"is_valid\": false, \"errors\": [{\"component\": \"rejected_mutation\", \"message\": \"CSV inspection requires a supported text encoding.\", \"severity\": \"high\"}, {\"component\": \"source\", \"message\": \"No source configured.\", \"severity\": \"high\", \"error_code\": \"no_source_configured\"}, {\"component\": \"pipeline\", \"message\": \"No sinks configured.\", \"severity\": \"high\", \"error_code\": \"no_sinks_configured\"}], \"warnings\": [], \"suggestions\": [], \"semantic_contracts\": [], \"graph_repair_suggestions\": []}, \"affected_nodes\": [], \"version\": 1}"
+   ]
+  },
+  {
+   "tool": "list_blobs",
+   "kind": "discovery",
+   "on_tool_loop": true,
+   "on_planner": true,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [],
+   "required": [],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 272,
+   "description_first_sentence": "List uploaded/created files (blobs) in this session with metadata: each entry carries `id`, `filename`, `mime_type`, `size_bytes`, `status`, `created_by`, and `creation_modality`",
+   "skill_mentions": 5,
+   "live_calls": {
+    "planner": 9
+   },
+   "live_results": {
+    "ok": 9
+   },
+   "live_error_samples": []
+  },
+  {
+   "tool": "list_composer_blobs",
+   "kind": "discovery",
+   "on_tool_loop": true,
+   "on_planner": true,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [],
+   "required": [],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 296,
+   "description_first_sentence": "List ready blobs available for audited inline-content authoring",
+   "skill_mentions": 2,
+   "live_calls": {
+    "planner": 8
+   },
+   "live_results": {
+    "ok": 8
+   },
+   "live_error_samples": []
+  },
+  {
+   "tool": "list_models",
+   "kind": "discovery",
+   "on_tool_loop": true,
+   "on_planner": true,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [
+    "provider",
+    "limit"
+   ],
+   "required": [],
+   "cacheable_discovery": true,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 624,
+   "description_first_sentence": "List available LLM model identifiers",
+   "skill_mentions": 3,
+   "live_calls": {
+    "planner": 2,
+    "tool_loop": 5
+   },
+   "live_results": {
+    "ok": 7
+   },
+   "live_error_samples": []
+  },
+  {
+   "tool": "list_secret_refs",
+   "kind": "discovery",
+   "on_tool_loop": true,
+   "on_planner": true,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [],
+   "required": [],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 320,
+   "description_first_sentence": "List available secret references (API keys, credentials)",
+   "skill_mentions": 2,
+   "live_calls": {},
+   "live_results": {},
+   "live_error_samples": []
+  },
+  {
+   "tool": "list_sinks",
+   "kind": "discovery",
+   "on_tool_loop": true,
+   "on_planner": true,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [],
+   "required": [],
+   "cacheable_discovery": true,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 688,
+   "description_first_sentence": "List available sink plugins",
+   "skill_mentions": 4,
+   "live_calls": {
+    "planner": 2
+   },
+   "live_results": {
+    "ok": 2
+   },
+   "live_error_samples": []
+  },
+  {
+   "tool": "list_sources",
+   "kind": "discovery",
+   "on_tool_loop": true,
+   "on_planner": true,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [],
+   "required": [],
+   "cacheable_discovery": true,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 692,
+   "description_first_sentence": "List available source plugins",
+   "skill_mentions": 4,
+   "live_calls": {
+    "planner": 3
+   },
+   "live_results": {
+    "ok": 4
+   },
+   "live_error_samples": []
+  },
+  {
+   "tool": "list_transforms",
+   "kind": "discovery",
+   "on_tool_loop": true,
+   "on_planner": true,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [],
+   "required": [],
+   "cacheable_discovery": true,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 698,
+   "description_first_sentence": "List available transform plugins",
+   "skill_mentions": 4,
+   "live_calls": {
+    "planner": 3
+   },
+   "live_results": {
+    "ok": 3
+   },
+   "live_error_samples": []
+  },
+  {
+   "tool": "patch_node_options",
+   "kind": "mutation",
+   "on_tool_loop": true,
+   "on_planner": false,
+   "on_escape_hatch": false,
+   "strict": false,
+   "args": [
+    "node_id",
+    "patch"
+   ],
+   "required": [
+    "node_id",
+    "patch"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 566,
+   "description_first_sentence": "Apply a shallow merge-patch to a node's options",
+   "skill_mentions": 5,
+   "live_calls": {
+    "tool_loop": 6
+   },
+   "live_results": {
+    "ok": 5,
+    "fail": 1
+   },
+   "live_error_samples": [
+    "{\"success\": false, \"validation\": {\"is_valid\": false, \"errors\": [{\"component\": \"rejected_mutation\", \"message\": \"Authoritative interpretation-review reconciliation failed: prompt part references unknown interpretation requirement 'angry or urgent:flag_comment_tone'; valid requirement IDs: ['prompt_injection_shield_recommendation:flag_comment_tone', 'prompt_template_review:flag_comment_tone', 'urgency:flag_comment_tone']. Repair the rejected candidate's prompt_template_parts using one of its exact valid requirement IDs, or add the intended authorable requirement shell to that candidate. Node requirement IDs use user_term.strip() + ':' + node_id; internal spaces, case and punctuation are unchang"
+   ]
+  },
+  {
+   "tool": "patch_output_options",
+   "kind": "mutation",
+   "on_tool_loop": true,
+   "on_planner": false,
+   "on_escape_hatch": false,
+   "strict": false,
+   "args": [
+    "sink_name",
+    "patch"
+   ],
+   "required": [
+    "sink_name",
+    "patch"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 152,
+   "description_first_sentence": "Apply a shallow merge-patch to an output's options",
+   "skill_mentions": 2,
+   "live_calls": {
+    "tool_loop": 6
+   },
+   "live_results": {
+    "ok": 4,
+    "fail": 2
+   },
+   "live_error_samples": [
+    "{\"success\": false, \"validation\": {\"is_valid\": false, \"errors\": [{\"component\": \"rejected_mutation\", \"message\": \"Invalid options for sink 'csv': description: Extra inputs are not permitted\", \"severity\": \"high\", \"error_code\": \"plugin_options_invalid\", \"rejected_component\": \"output:large_expenses\"}], \"warnings\": [], \"suggestions\": [], \"semantic_contracts\": [], \"graph_repair_suggestions\": []}, \"affected_nodes\": [], \"version\": 3, \"plugin_schemas\": {\"sink/csv\": {\"name\": \"csv\", \"plugin_type\": \"sink\", \"description\": \"Write rows to a CSV file.\\n\\nReturns ArtifactDescriptor with SHA-256 content hash for audit integrity.\\n\\nCreates the CSV file on first write. When schema is explicit, headers are\\nderiv",
+    "{\"success\": false, \"validation\": {\"is_valid\": false, \"errors\": [{\"component\": \"rejected_mutation\", \"message\": \"Invalid options for sink 'csv': description: Extra inputs are not permitted\", \"severity\": \"high\", \"error_code\": \"plugin_options_invalid\", \"rejected_component\": \"output:routine_expenses\"}], \"warnings\": [], \"suggestions\": [], \"semantic_contracts\": [], \"graph_repair_suggestions\": []}, \"affected_nodes\": [], \"version\": 3, \"plugin_schemas\": {\"sink/csv\": {\"name\": \"csv\", \"plugin_type\": \"sink\", \"description\": \"Write rows to a CSV file.\\n\\nReturns ArtifactDescriptor with SHA-256 content hash for audit integrity.\\n\\nCreates the CSV file on first write. When schema is explicit, headers are\\nder"
+   ]
+  },
+  {
+   "tool": "patch_source_options",
+   "kind": "mutation",
+   "on_tool_loop": true,
+   "on_planner": false,
+   "on_escape_hatch": false,
+   "strict": false,
+   "args": [
+    "source_name",
+    "patch"
+   ],
+   "required": [
+    "patch"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 157,
+   "description_first_sentence": "Apply a shallow merge-patch to a named source's options",
+   "skill_mentions": 2,
+   "live_calls": {},
+   "live_results": {},
+   "live_error_samples": []
+  },
+  {
+   "tool": "preview_pipeline",
+   "kind": "discovery",
+   "on_tool_loop": true,
+   "on_planner": true,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [],
+   "required": [],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 1387,
+   "description_first_sentence": "Preview the current pipeline without executing it",
+   "skill_mentions": 5,
+   "live_calls": {
+    "tool_loop": 16
+   },
+   "live_results": {
+    "ok": 16
+   },
+   "live_error_samples": []
+  },
+  {
+   "tool": "read_attachment",
+   "kind": "discovery",
+   "on_tool_loop": true,
+   "on_planner": true,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [
+    "blob_id",
+    "expected_content_hash"
+   ],
+   "required": [
+    "blob_id"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 903,
+   "description_first_sentence": "Read ONE authorized session attachment's complete UTF-8 text in ONE tool call",
+   "skill_mentions": 16,
+   "live_calls": {},
+   "live_results": {},
+   "live_error_samples": []
+  },
+  {
+   "tool": "remove_edge",
+   "kind": "mutation",
+   "on_tool_loop": true,
+   "on_planner": false,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [
+    "id"
+   ],
+   "required": [
+    "id"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 21,
+   "description_first_sentence": "Remove an edge by ID.",
+   "skill_mentions": 1,
+   "live_calls": {},
+   "live_results": {},
+   "live_error_samples": []
+  },
+  {
+   "tool": "remove_node",
+   "kind": "mutation",
+   "on_tool_loop": true,
+   "on_planner": false,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [
+    "id"
+   ],
+   "required": [
+    "id"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 32,
+   "description_first_sentence": "Remove a node and all its edges.",
+   "skill_mentions": 2,
+   "live_calls": {
+    "tool_loop": 1
+   },
+   "live_results": {
+    "ok": 1
+   },
+   "live_error_samples": []
+  },
+  {
+   "tool": "remove_output",
+   "kind": "mutation",
+   "on_tool_loop": true,
+   "on_planner": false,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [
+    "sink_name"
+   ],
+   "required": [
+    "sink_name"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 40,
+   "description_first_sentence": "Remove a pipeline output (sink) by name.",
+   "skill_mentions": 1,
+   "live_calls": {
+    "tool_loop": 1
+   },
+   "live_results": {
+    "ok": 1
+   },
+   "live_error_samples": []
+  },
+  {
+   "tool": "request_advisor_hint",
+   "kind": "advisor",
+   "on_tool_loop": true,
+   "on_planner": false,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [
+    "trigger",
+    "problem_summary",
+    "recent_errors",
+    "attempted_actions",
+    "schema_excerpt"
+   ],
+   "required": [
+    "trigger",
+    "problem_summary",
+    "recent_errors",
+    "attempted_actions"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 1145,
+   "description_first_sentence": "ESCAPE HATCH \u2014 use cannot_complete as soon as missing or contradictory information, an unavailable capability, or an unreasonable requirement prevents a faithful result",
+   "skill_mentions": 3,
+   "live_calls": {
+    "tool_loop": 1
+   },
+   "live_results": {
+    "unparsed": 1
+   },
+   "live_error_samples": []
+  },
+  {
+   "tool": "request_interpretation_review",
+   "kind": "session-aware",
+   "on_tool_loop": true,
+   "on_planner": false,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [
+    "affected_node_id",
+    "kind",
+    "user_term",
+    "llm_draft"
+   ],
+   "required": [
+    "affected_node_id",
+    "kind",
+    "user_term"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 2244,
+   "description_first_sentence": "Ask the user to review an LLM-authored assumption before it is finalised into the pipeline",
+   "skill_mentions": 19,
+   "live_calls": {
+    "tool_loop": 11
+   },
+   "live_results": {
+    "ok": 1,
+    "fail": 1
+   },
+   "live_error_samples": [
+    "{\"error\": \"Tool 'request_interpretation_review' failed: 'affected_node_id' must be a pending pipeline_decision interpretation requirement, got missing pending pipeline_decision review site\"}"
+   ]
+  },
+  {
+   "tool": "restore_parked_graph",
+   "kind": "recovery-control",
+   "on_tool_loop": true,
+   "on_planner": true,
+   "on_escape_hatch": true,
+   "strict": true,
+   "args": [
+    "park_id",
+    "message"
+   ],
+   "required": [
+    "park_id",
+    "message"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": null,
+   "description_chars": 167,
+   "description_first_sentence": "Restore the exact advertised parked graph and end this turn with your message",
+   "skill_mentions": 3,
+   "live_calls": {},
+   "live_results": {},
+   "live_error_samples": []
+  },
+  {
+   "tool": "set_metadata",
+   "kind": "mutation",
+   "on_tool_loop": true,
+   "on_planner": false,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [
+    "patch"
+   ],
+   "required": [
+    "patch"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 53,
+   "description_first_sentence": "Update pipeline metadata (name and description only).",
+   "skill_mentions": 1,
+   "live_calls": {
+    "tool_loop": 4
+   },
+   "live_results": {
+    "ok": 4
+   },
+   "live_error_samples": []
+  },
+  {
+   "tool": "set_output",
+   "kind": "mutation",
+   "on_tool_loop": true,
+   "on_planner": false,
+   "on_escape_hatch": false,
+   "strict": false,
+   "args": [
+    "sink_name",
+    "plugin",
+    "options",
+    "on_write_failure",
+    "description"
+   ],
+   "required": [
+    "sink_name",
+    "plugin",
+    "options"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 40,
+   "description_first_sentence": "Add or replace a pipeline output (sink).",
+   "skill_mentions": 2,
+   "live_calls": {
+    "tool_loop": 6
+   },
+   "live_results": {
+    "ok": 6
+   },
+   "live_error_samples": []
+  },
+  {
+   "tool": "set_pipeline",
+   "kind": "mutation",
+   "on_tool_loop": true,
+   "on_planner": false,
+   "on_escape_hatch": false,
+   "strict": false,
+   "args": [
+    "source",
+    "sources",
+    "nodes",
+    "edges",
+    "outputs",
+    "metadata"
+   ],
+   "required": [
+    "nodes",
+    "edges",
+    "outputs"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 297,
+   "description_first_sentence": "Atomically create or fully rebuild a pipeline",
+   "skill_mentions": 34,
+   "live_calls": {
+    "tool_loop": 6
+   },
+   "live_results": {
+    "fail": 1,
+    "ok": 5
+   },
+   "live_error_samples": [
+    "{\"success\": false, \"validation\": {\"is_valid\": false, \"errors\": [{\"component\": \"rejected_mutation\", \"message\": \"Source 'source': Invalid options for source 'csv': path: Field required\\ninline_blob: Extra inputs are not permitted\", \"severity\": \"high\", \"error_code\": \"plugin_options_invalid\", \"rejected_component\": \"source\"}], \"warnings\": [], \"suggestions\": [], \"semantic_contracts\": [], \"graph_repair_suggestions\": []}, \"affected_nodes\": [], \"version\": 2, \"plugin_schemas\": {\"source/csv\": {\"name\": \"csv\", \"plugin_type\": \"source\", \"description\": \"Load rows from a CSV file.\\n\\nConfig options:\\n    path: Path to CSV file (required)\\n    schema: Schema configuration (required, via SourceDataConfig)\\n   "
+   ]
+  },
+  {
+   "tool": "set_source",
+   "kind": "mutation",
+   "on_tool_loop": true,
+   "on_planner": false,
+   "on_escape_hatch": false,
+   "strict": false,
+   "args": [
+    "source_name",
+    "plugin",
+    "on_success",
+    "options",
+    "on_validation_failure",
+    "description"
+   ],
+   "required": [
+    "plugin",
+    "on_success",
+    "options"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 39,
+   "description_first_sentence": "Set or replace a named pipeline source.",
+   "skill_mentions": 4,
+   "live_calls": {},
+   "live_results": {},
+   "live_error_samples": []
+  },
+  {
+   "tool": "set_source_from_blob",
+   "kind": "mutation",
+   "on_tool_loop": true,
+   "on_planner": false,
+   "on_escape_hatch": false,
+   "strict": false,
+   "args": [
+    "blob_id",
+    "source_name",
+    "plugin",
+    "on_success",
+    "on_validation_failure",
+    "options"
+   ],
+   "required": [
+    "blob_id",
+    "on_success"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 217,
+   "description_first_sentence": "Wire a blob as the pipeline source",
+   "skill_mentions": 5,
+   "live_calls": {},
+   "live_results": {},
+   "live_error_samples": []
+  },
+  {
+   "tool": "set_source_from_blobs",
+   "kind": "mutation",
+   "on_tool_loop": true,
+   "on_planner": false,
+   "on_escape_hatch": false,
+   "strict": false,
+   "args": [
+    "blob_ids",
+    "source_name",
+    "on_success",
+    "on_validation_failure",
+    "options"
+   ],
+   "required": [
+    "blob_ids",
+    "on_success"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 459,
+   "description_first_sentence": "Wire one or more READY session blobs as a blob_rows source: one blob becomes one row carrying its payload hash and bounded metadata, in the given order",
+   "skill_mentions": 3,
+   "live_calls": {},
+   "live_results": {},
+   "live_error_samples": []
+  },
+  {
+   "tool": "splice_transform",
+   "kind": "mutation",
+   "on_tool_loop": true,
+   "on_planner": false,
+   "on_escape_hatch": false,
+   "strict": false,
+   "args": [
+    "predecessor_id",
+    "successor_id",
+    "node"
+   ],
+   "required": [
+    "predecessor_id",
+    "successor_id",
+    "node"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 659,
+   "description_first_sentence": "Insert one transform between a predecessor and successor on an existing direct linear on_success path",
+   "skill_mentions": 2,
+   "live_calls": {},
+   "live_results": {},
+   "live_error_samples": []
+  },
+  {
+   "tool": "update_blob",
+   "kind": "mutation",
+   "on_tool_loop": true,
+   "on_planner": false,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [
+    "blob_id",
+    "content"
+   ],
+   "required": [
+    "blob_id",
+    "content"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": true,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 190,
+   "description_first_sentence": "Update the content of an existing blob (file)",
+   "skill_mentions": 1,
+   "live_calls": {},
+   "live_results": {},
+   "live_error_samples": []
+  },
+  {
+   "tool": "upsert_edge",
+   "kind": "mutation",
+   "on_tool_loop": true,
+   "on_planner": false,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [
+    "id",
+    "from_node",
+    "to_node",
+    "edge_type",
+    "label"
+   ],
+   "required": [
+    "id",
+    "from_node",
+    "to_node",
+    "edge_type"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 518,
+   "description_first_sentence": "Add or update a connection between nodes",
+   "skill_mentions": 5,
+   "live_calls": {},
+   "live_results": {},
+   "live_error_samples": []
+  },
+  {
+   "tool": "upsert_node",
+   "kind": "mutation",
+   "on_tool_loop": true,
+   "on_planner": false,
+   "on_escape_hatch": false,
+   "strict": false,
+   "args": [
+    "id",
+    "node_type",
+    "plugin",
+    "input",
+    "on_success",
+    "on_error",
+    "options",
+    "condition",
+    "routes",
+    "fork_to",
+    "branches",
+    "policy",
+    "merge",
+    "trigger",
+    "output_mode",
+    "expected_output_count",
+    "timeout_seconds",
+    "description",
+    "scope_name",
+    "scope_opener",
+    "scope_policy"
+   ],
+   "required": [
+    "id",
+    "node_type",
+    "input"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 1327,
+   "description_first_sentence": "Add or update a pipeline node",
+   "skill_mentions": 4,
+   "live_calls": {
+    "tool_loop": 17
+   },
+   "live_results": {
+    "ok": 17
+   },
+   "live_error_samples": []
+  },
+  {
+   "tool": "validate_secret_ref",
+   "kind": "discovery",
+   "on_tool_loop": true,
+   "on_planner": true,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [
+    "name"
+   ],
+   "required": [
+    "name"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 322,
+   "description_first_sentence": "Check if a secret reference exists and is accessible to the current user",
+   "skill_mentions": 1,
+   "live_calls": {},
+   "live_results": {},
+   "live_error_samples": []
+  },
+  {
+   "tool": "wire_blob_inline_ref",
+   "kind": "mutation",
+   "on_tool_loop": true,
+   "on_planner": false,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [
+    "field_path",
+    "blob_id",
+    "encoding"
+   ],
+   "required": [
+    "field_path",
+    "blob_id"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 193,
+   "description_first_sentence": "Author a widened blob_ref inline_content marker at a canonical field_path",
+   "skill_mentions": 2,
+   "live_calls": {},
+   "live_results": {},
+   "live_error_samples": []
+  },
+  {
+   "tool": "wire_secret_ref",
+   "kind": "mutation",
+   "on_tool_loop": true,
+   "on_planner": false,
+   "on_escape_hatch": false,
+   "strict": true,
+   "args": [
+    "name",
+    "target",
+    "target_id",
+    "option_key"
+   ],
+   "required": [
+    "name",
+    "target",
+    "option_key"
+   ],
+   "cacheable_discovery": false,
+   "approval_required_blob_mutation": false,
+   "redaction_mode": "ToolRedaction",
+   "description_chars": 293,
+   "description_first_sentence": "Place a secret reference marker in the pipeline config",
+   "skill_mentions": 1,
+   "live_calls": {},
+   "live_results": {},
+   "live_error_samples": []
+  }
+ ],
+ "taught_not_offered_planner": {
+  "clear_source": 1,
+  "create_blob": 8,
+  "delete_blob": 1,
+  "patch_node_options": 5,
+  "patch_output_options": 2,
+  "patch_source_options": 2,
+  "remove_edge": 1,
+  "remove_node": 2,
+  "remove_output": 1,
+  "request_advisor_hint": 3,
+  "request_interpretation_review": 19,
+  "set_metadata": 1,
+  "set_output": 2,
+  "set_pipeline": 34,
+  "set_source": 4,
+  "set_source_from_blob": 5,
+  "set_source_from_blobs": 3,
+  "splice_transform": 2,
+  "update_blob": 1,
+  "upsert_edge": 5,
+  "upsert_node": 4,
+  "wire_blob_inline_ref": 2,
+  "wire_secret_ref": 1
+ },
+ "taught_not_offered_loop": {},
+ "offered_not_taught_planner": [
+  "emit_pipeline_proposal"
+ ],
+ "offered_not_taught_loop": [],
+ "live_calls_to_unoffered_tools": [],
+ "live_tool_names_not_in_any_registry": []
+}

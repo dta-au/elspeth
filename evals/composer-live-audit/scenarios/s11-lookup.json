@@ -1,0 +1,16 @@
+{
+ "attachments": [
+  {
+   "path": "fixtures/staff.csv",
+   "mime": "text/csv"
+  },
+  {
+   "path": "fixtures/departments.json",
+   "mime": "application/json"
+  }
+ ],
+ "turns": [
+  "Add the department name from the lookup to each staff record and save as CSV."
+ ],
+ "name": "s11-lookup"
+}

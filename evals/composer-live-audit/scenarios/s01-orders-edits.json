@@ -1,0 +1,13 @@
+{
+ "turns": [
+  "Make up a handful of orders \u2014 an order id, a quantity and a unit price, all as\nplain text the way a spreadsheet export would give them. First turn the quantity\nand unit price into proper numbers, then work out a line total for each order,\nand write the finished orders out as CSV.",
+  "Actually also add a 10% GST column after the line total.",
+  "Drop the unit price from the output.",
+  "Rename the output file to orders_final.csv and make it JSON instead.",
+  "Put a step in between the casting and the total that drops any order with quantity zero.",
+  "What changed since the version I accepted?",
+  "Explain what this pipeline does in two sentences.",
+  "Undo that last change."
+ ],
+ "name": "s01-orders-edits"
+}

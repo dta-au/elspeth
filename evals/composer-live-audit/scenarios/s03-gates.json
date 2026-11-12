@@ -1,0 +1,9 @@
+{
+ "turns": [
+  "Make up a dozen expense lines, each with an id, a name, an amount and a category.\nAnything over 1000 goes to one CSV file and the rest goes to another. The amounts\nare the only thing that decides it, and nothing about the rows changes.",
+  "Change the threshold to 500 instead.",
+  "Also add a third file for anything in the 'travel' category, regardless of amount.",
+  "Why did you choose that design?"
+ ],
+ "name": "s03-gates"
+}

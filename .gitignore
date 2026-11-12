@@ -175,6 +175,13 @@ config/cicd/**/.*.lock
 !/evals/composer-standard-battery/**/.env.example
 !/evals/composer-standard-battery/**/.env.template
 !/evals/composer-standard-battery/**/.env.sample
+!/evals/composer-live-audit/
+!/evals/composer-live-audit/**
+/evals/composer-live-audit/runs/
+/evals/composer-live-audit/**/credentials.json
+/evals/composer-live-audit/**/*.api_key
+/evals/composer-live-audit/**/.env
+/evals/composer-live-audit/**/.env.*
 
 # ---------------------------------------------------------------------------
 # Python

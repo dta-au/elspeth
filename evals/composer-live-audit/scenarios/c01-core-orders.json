@@ -1,0 +1,7 @@
+{
+ "name": "c01-core-orders",
+ "turns": [
+  "Make up a handful of orders \u2014 an order id, a quantity and a unit price, all as\nplain text the way a spreadsheet export would give them. First turn the quantity\nand unit price into proper numbers, then work out a line total for each order,\nand write the finished orders out as CSV.",
+  "Only keep orders over 100 dollars."
+ ]
+}

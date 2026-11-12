@@ -1,0 +1,6 @@
+{
+ "turns": [
+  "Make up half a dozen clinical case studies, each with a user id and a background, a\nsymptoms and a history column. Have a model assess every case against five criteria\n\u2014 diagnosis, treatment, prognosis, risk and follow-up \u2014 returning a score out of 100\nand a short rationale for each criterion, all kept on the row. The assessed rows\ncome out as CSV; anything the model fails on goes to a quarantine file as JSON."
+ ],
+ "name": "s13-multiquery"
+}

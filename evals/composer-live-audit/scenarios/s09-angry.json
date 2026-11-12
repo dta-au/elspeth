@@ -1,0 +1,13 @@
+{
+ "attachments": [
+  {
+   "path": "fixtures/feedback.csv",
+   "mime": "text/csv"
+  }
+ ],
+ "turns": [
+  "Flag the comments that sound angry or urgent and send those to a priority file; everything else goes to a normal file.",
+  "Score each comment for urgency out of 10 as well."
+ ],
+ "name": "s09-angry"
+}

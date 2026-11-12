@@ -1,0 +1,7 @@
+{
+ "turns": [
+  "Make up six grant applications with an applicant name, the amount requested and a short project description. For each one assess eligibility, value for money and risk, then write me a one-page briefing summarising the lot.",
+  "Which model is doing the assessment, and can I change it?"
+ ],
+ "name": "s08-grants-llm"
+}

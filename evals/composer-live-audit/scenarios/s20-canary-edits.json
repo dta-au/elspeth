@@ -1,0 +1,8 @@
+{
+ "turns": [
+  "I've got a tiny list of three colours with a name and a hex code, sitting in a JSON file \u2014 just make it up.\nI only want it read in and written straight back out to JSON, nothing else done to it.",
+  "Also write a CSV copy alongside the JSON.",
+  "Add an uppercase version of the colour name."
+ ],
+ "name": "s20-canary-edits"
+}

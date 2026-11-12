@@ -1,0 +1,7 @@
+{
+ "turns": [
+  "Make up a few orders in JSON, each with an order id and a list of the items on it.\nI want one row out per item rather than one per order, with the item kept under its\nown field and its position in the list recorded next to it. Write the result out as\nJSON.",
+  "Make up a dozen product lines with an id, a name, a category and a copies column\nsaying how many labels that product needs. Work through them three at a time and\ngive me one row per label \u2014 a product needing four labels appears four times \u2014 with\neach copy numbered. Write the result out as CSV."
+ ],
+ "name": "s12-json-explode"
+}

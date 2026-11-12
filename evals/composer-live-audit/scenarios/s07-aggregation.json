@@ -1,0 +1,7 @@
+{
+ "turns": [
+  "Make up twenty-odd expense records with an id, a date, a category, an amount and a\nregion. I don't want the individual rows out \u2014 take them five at a time and, for\neach group of five, give me the count, the total and the average amount broken down\nby category. Write those summaries out as CSV.",
+  "Also give me the average as well as the total."
+ ],
+ "name": "s07-aggregation"
+}

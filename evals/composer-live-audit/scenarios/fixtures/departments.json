@@ -1,0 +1,14 @@
+[
+ {
+  "dept_code": "FIN",
+  "department": "Finance"
+ },
+ {
+  "dept_code": "HR",
+  "department": "People and Culture"
+ },
+ {
+  "dept_code": "OPS",
+  "department": "Operations"
+ }
+]

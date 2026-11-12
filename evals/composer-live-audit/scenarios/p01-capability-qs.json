@@ -1,0 +1,9 @@
+{
+ "name": "p01-capability-qs",
+ "turns": [
+  "Which models can I use?",
+  "Can you read PDFs?",
+  "Can you send the results to our Teams channel?",
+  "What kinds of steps can you put in a pipeline?"
+ ]
+}

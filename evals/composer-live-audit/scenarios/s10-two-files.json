@@ -1,0 +1,17 @@
+{
+ "attachments": [
+  {
+   "path": "fixtures/q1.csv",
+   "mime": "text/csv"
+  },
+  {
+   "path": "fixtures/q2.csv",
+   "mime": "text/csv"
+  }
+ ],
+ "turns": [
+  "Combine these two quarters into one file and add a column saying which quarter each row came from.",
+  "Now only keep invoices over 1000."
+ ],
+ "name": "s10-two-files"
+}
