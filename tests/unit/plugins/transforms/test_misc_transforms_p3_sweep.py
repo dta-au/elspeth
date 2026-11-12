@@ -8,6 +8,7 @@ from __future__ import annotations
 import pytest
 
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.plugins.transforms.keyword_filter import KeywordFilter
 
 
 class TestKeywordFilterEmptyLowerBoundBraceQuantifier:
@@ -37,3 +38,21 @@ class TestKeywordFilterEmptyLowerBoundBraceQuantifier:
         from elspeth.plugins.transforms.keyword_filter import _nested_repetition_detected
 
         assert _nested_repetition_detected(pattern) is False
+
+
+class TestKeywordFilterSingleStringFieldDeclaration:
+    """#78: a single named scan field gets the same static string declaration as the list form."""
+
+    @staticmethod
+    def _make(fields: str | list[str]) -> KeywordFilter:
+        return KeywordFilter({"fields": fields, "blocked_patterns": ["secret"], "schema": {"mode": "observed"}})
+
+    def test_single_string_field_is_declared_string_input(self) -> None:
+        assert self._make("message").declared_string_input_fields == frozenset({"message"})
+
+    def test_single_string_matches_list_form(self) -> None:
+        assert self._make("message").declared_string_input_fields == self._make(["message"]).declared_string_input_fields
+
+    def test_all_mode_makes_no_static_string_claim(self) -> None:
+        """Negative control: 'all' skips non-strings at runtime, so it declares nothing."""
+        assert self._make("all").declared_string_input_fields == frozenset()
