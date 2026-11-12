@@ -26,6 +26,7 @@ from elspeth.plugins.infrastructure.config_base import (
     NormalizedColumnsOption,
     NormalizedFieldMappingOption,
     TransformDataConfig,
+    validate_csv_delimiter,
 )
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
@@ -109,9 +110,7 @@ class BlobCSVExpandConfig(TransformDataConfig):
     @field_validator("delimiter")
     @classmethod
     def _validate_delimiter(cls, value: str) -> str:
-        if len(value) != 1:
-            raise ValueError(f"delimiter must be a single character, got {value!r}")
-        return value
+        return validate_csv_delimiter(value)
 
     @field_validator("encoding")
     @classmethod
@@ -307,7 +306,7 @@ class BlobCSVExpand(BaseTransform):
     name = "blob_csv_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:645858af23f9cf25"
+    source_file_hash: str | None = "sha256:1d5a73a06095baf3"
     config_model = BlobCSVExpandConfig
     usage_when_to_use: str = (
         "Use when each input row carries a payload-store reference to a CSV blob and you need to "
