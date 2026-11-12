@@ -6,6 +6,7 @@ on the lane base and passes after that finding's fix commit.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -389,3 +390,73 @@ def test_web_scrape_query_parameter_names_are_not_read_columns() -> None:
     assert "column_keyed_config_keys" in vars(BaseTransform)
     assert vars(Truncate)["column_keyed_config_keys"] == frozenset({"fields"})
     assert "column_keyed_config_keys" not in vars(WebScrapeTransform)
+
+
+# ---------------------------------------------------------------------------
+# Finding #6: a wall-clock render timeout is the row's only when its CPU budget is spent
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _one_template_worker_slot(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """One worker slot, empty: the next render spawns a real worker."""
+    import queue
+
+    from elspeth.plugins.infrastructure import templates
+
+    available: queue.SimpleQueue[int] = queue.SimpleQueue()
+    available.put(0)
+    monkeypatch.setattr(templates, "_AVAILABLE_WORKERS", available)
+    monkeypatch.setattr(templates, "_WORKERS", [None])
+    try:
+        yield
+    finally:
+        templates._stop_template_workers()
+
+
+@pytest.mark.usefixtures("_one_template_worker_slot")
+def test_render_timeout_of_an_off_cpu_worker_is_retryable_worker_loss(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Finding #6: a worker that is off-CPU (here stopped) when the wall clock expires.
+
+    It used none of the row's CPU budget, so the timeout says nothing about
+    the row: it must be the retryable TemplateWorkerLostError, not the row's
+    TemplateError("Template exceeded the execution time limit").
+    """
+    import os
+    import signal
+
+    from elspeth.plugins.infrastructure import templates
+    from elspeth.plugins.infrastructure.templates import SandboxedTemplate, TemplateError, TemplateWorkerLostError
+
+    template = SandboxedTemplate("{{ row.q }}")
+    assert template.render(row={"q": "warm"}) == "warm"
+    entry = templates._WORKERS[0]
+    assert entry is not None
+    monkeypatch.setattr(templates, "_WORKER_TIMEOUT_SECONDS", 0.5)
+    os.kill(entry[0].pid, signal.SIGSTOP)
+    try:
+        template.render(row={"q": "x"})
+    except TemplateWorkerLostError:
+        pass
+    except TemplateError as exc:
+        raise AssertionError(f"an off-CPU worker's timeout was blamed on the row: {exc}") from exc
+    else:
+        raise AssertionError("a stopped worker cannot have replied")
+    finally:
+        if entry[0].is_alive():
+            os.kill(entry[0].pid, signal.SIGCONT)
+    assert templates._WORKERS == [None]
+
+
+def test_render_timeout_classification_follows_the_cpu_the_worker_used() -> None:
+    """Finding #6: classify a timeout by CPU used against the request's budget."""
+    from elspeth.plugins.infrastructure import templates
+    from elspeth.plugins.infrastructure.templates import TemplateError, TemplateWorkerLostError
+
+    assert "_render_timeout_error" in vars(templates)
+    budget = templates._RENDER_CPU_BUDGET_SECONDS
+    spent = templates._render_timeout_error(cpu_used_seconds=budget)
+    assert type(spent) is TemplateError
+    assert str(spent) == "Template exceeded the execution time limit"
+    starved = templates._render_timeout_error(cpu_used_seconds=0.1)
+    assert type(starved) is TemplateWorkerLostError
