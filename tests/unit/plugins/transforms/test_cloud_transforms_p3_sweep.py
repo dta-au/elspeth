@@ -577,3 +577,43 @@ def test_f144_internal_invariant_value_error_is_not_masked_as_a_row_error(monkey
 
     with pytest.raises(ValueError, match="supported closed policy"):
         transform.process(make_pipeline_row({"prompt": "hello"}), context)
+
+
+# ---------------------------------------------------------------------------
+# Finding #134: a required PROMPT_SHIELD input control is credited only when the
+# shield runs both analyses (maintainer ruling 2026-11-12: option (a), "both").
+# ---------------------------------------------------------------------------
+
+
+def _prompt_shield_credit(options: dict[str, object]) -> bool:
+    from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
+    from elspeth.plugins.transforms.azure.prompt_shield import AzurePromptShield
+
+    return AzurePromptShield.is_effective_blocking_control(
+        capability=PluginCapability.PROMPT_SHIELD, role=ControlRole.INPUT, options=options
+    )
+
+
+@pytest.mark.parametrize("analysis_type", ["user_prompt", "document"])
+def test_single_analysis_prompt_shield_gets_no_control_credit(analysis_type: str) -> None:
+    assert _prompt_shield_credit({"analysis_type": analysis_type}) is False
+
+
+@pytest.mark.parametrize("analysis_type", [None, "BOTH", "", 1])
+def test_unrecognised_analysis_type_gets_no_control_credit(analysis_type: object) -> None:
+    assert _prompt_shield_credit({"analysis_type": analysis_type}) is False
+
+
+def test_both_analyses_prompt_shield_keeps_control_credit() -> None:
+    assert _prompt_shield_credit({"analysis_type": "both"}) is True
+
+
+def test_omitted_analysis_type_is_credited_as_the_both_default() -> None:
+    from elspeth.plugins.transforms.azure.prompt_shield import AzurePromptShieldConfig
+
+    assert AzurePromptShieldConfig.model_fields["analysis_type"].default == "both"
+    assert _prompt_shield_credit({}) is True
+
+
+def test_detect_only_prompt_shield_still_gets_no_credit_with_both() -> None:
+    assert _prompt_shield_credit({"analysis_type": "both", "detect_only": True}) is False
