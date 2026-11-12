@@ -307,7 +307,7 @@ class BlobCSVExpand(BaseTransform):
     name = "blob_csv_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:645858af23f9cf25"
+    source_file_hash: str | None = "sha256:1acd00adc3de5f4e"
     config_model = BlobCSVExpandConfig
     usage_when_to_use: str = (
         "Use when each input row carries a payload-store reference to a CSV blob and you need to "
@@ -610,7 +610,10 @@ class BlobCSVExpand(BaseTransform):
             )
 
         try:
-            body = self._payload_store.retrieve(blob_ref)
+            # Bounded read: the store stops after max_blob_bytes + 1 bytes and
+            # returns None for an oversize blob, so the cap limits memory, not
+            # just the accepted size (contracts/payload_store.py).
+            body = self._payload_store.retrieve_bounded(blob_ref, max_bytes=self._max_blob_bytes)
         # ORDER IS LOAD-BEARING. A corrupt payload is not a missing payload: it
         # must crash the run rather than be quarantined as a routed row error,
         # because silently routing it would let a pipeline continue past
@@ -635,14 +638,12 @@ class BlobCSVExpand(BaseTransform):
                 )
             ) from exc
 
-        body_size = len(body)
-        if body_size > self._max_blob_bytes:
+        if body is None:
             raise _BlobCSVParseError(
                 _csv_error_reason(
                     "blob_too_large",
                     field=self._blob_ref_field,
                     blob_ref=blob_ref,
-                    body_size=body_size,
                     max_blob_bytes=self._max_blob_bytes,
                 )
             )

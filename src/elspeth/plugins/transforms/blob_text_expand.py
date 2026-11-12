@@ -219,7 +219,7 @@ class BlobTextExpand(BaseTransform):
     name = "blob_text_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a351eb18517babff"
+    source_file_hash: str | None = "sha256:2d4d2ee531ce3b83"
     config_model = BlobTextExpandConfig
     usage_when_to_use: str = (
         "Use when each input row carries a payload-store reference to a plain-text blob and you need "
@@ -388,7 +388,10 @@ class BlobTextExpand(BaseTransform):
             )
 
         try:
-            body = self._payload_store.retrieve(blob_ref)
+            # Bounded read: the store stops after max_blob_bytes + 1 bytes and
+            # returns None for an oversize blob, so the cap limits memory, not
+            # just the accepted size (contracts/payload_store.py).
+            body = self._payload_store.retrieve_bounded(blob_ref, max_bytes=self._max_blob_bytes)
         except IntegrityError:
             # FIRST, and the order is load-bearing rather than stylistic.
             # `except` clauses match in source order, so a store error that is
@@ -410,14 +413,12 @@ class BlobTextExpand(BaseTransform):
                 retryable=False,
             )
 
-        body_size = len(body)
-        if body_size > self._max_blob_bytes:
+        if body is None:
             return TransformResult.error(
                 {
                     "reason": "blob_too_large",
                     "field": self._blob_ref_field,
                     "blob_ref": blob_ref,
-                    "body_size": body_size,
                     "max_blob_bytes": self._max_blob_bytes,
                 },
                 retryable=False,

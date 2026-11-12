@@ -406,7 +406,7 @@ class BlobJSONExpand(BaseTransform):
     name = "blob_json_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3356c257ea04a4d7"
+    source_file_hash: str | None = "sha256:0d2fd20b0d7ea74c"
     config_model = BlobJSONExpandConfig
     usage_when_to_use: str = (
         "Use when a row carries a JSON document — either a payload-store reference from blob_fetch or JSON text in a "
@@ -743,7 +743,10 @@ class BlobJSONExpand(BaseTransform):
         resolved = self._resolve_blob_format(row)
 
         try:
-            body = self._payload_store.retrieve(blob_ref)
+            # Bounded read: the store stops after max_blob_bytes + 1 bytes and
+            # returns None for an oversize blob, so the cap limits memory, not
+            # just the accepted size (contracts/payload_store.py).
+            body = self._payload_store.retrieve_bounded(blob_ref, max_bytes=self._max_blob_bytes)
         except IntegrityError:
             # FIRST, ahead of the absence handler. The payload store returning
             # bytes that fail their own hash is ELSPETH's storage being corrupt,
@@ -759,14 +762,12 @@ class BlobJSONExpand(BaseTransform):
                 _json_error_reason("blob_not_found", field=self._blob_ref_field, blob_ref=blob_ref, error=str(exc))
             ) from exc
 
-        body_size = len(body)
-        if body_size > self._max_blob_bytes:
+        if body is None:
             raise _BlobJSONParseError(
                 _json_error_reason(
                     "blob_too_large",
                     field=self._blob_ref_field,
                     blob_ref=blob_ref,
-                    body_size=body_size,
                     max_blob_bytes=self._max_blob_bytes,
                 )
             )
