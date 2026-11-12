@@ -5,7 +5,7 @@ Each test class names the sweep finding it pins.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -230,3 +230,56 @@ class TestFinding75ChromaPreflightRecordsFailedCount:
 
         assert [c["status"] for c in execution.recorded_calls] == [CallStatus.ERROR]
         session.verify_call.assert_called_once()
+
+
+class _FakeAzureCredential:
+    def get_token(self, *scopes: str) -> Any:
+        raise AssertionError("classification must not acquire a token")
+
+
+class TestFinding76DataverseRetryAfterCarried:
+    """#76: the parsed 429 Retry-After delay is a typed field on DataverseClientError; HTTP-date is parsed."""
+
+    @staticmethod
+    def _client() -> Any:
+        from elspeth.plugins.infrastructure.clients.dataverse import DataverseClient
+
+        client = DataverseClient(environment_url=_ENV_URL, credential=cast(Any, _FakeAzureCredential()))
+        client.close()
+        return client
+
+    def test_delta_seconds_retry_after_is_carried(self) -> None:
+        error = self._client()._classify_error(429, {"retry-after": "7"}, 1.0)
+        assert "retry_after" in vars(error)
+        assert error.retryable is True
+        assert error.retry_after == 7.0
+
+    def test_http_date_retry_after_is_parsed_not_defaulted(self) -> None:
+        from datetime import UTC, datetime, timedelta
+        from email.utils import format_datetime
+
+        when = format_datetime(datetime.now(UTC) + timedelta(seconds=30), usegmt=True)
+        error = self._client()._classify_error(429, {"retry-after": when}, 1.0)
+        assert "retry_after" in vars(error)
+        assert error.retryable is True
+        assert 20.0 <= error.retry_after <= 31.0
+
+    def test_http_date_beyond_cap_is_non_retryable(self) -> None:
+        from datetime import UTC, datetime, timedelta
+        from email.utils import format_datetime
+
+        when = format_datetime(datetime.now(UTC) + timedelta(hours=1), usegmt=True)
+        error = self._client()._classify_error(429, {"retry-after": when}, 1.0)
+        assert error.retryable is False
+        assert "retry_after" in vars(error)
+        assert error.retry_after > 3000.0
+
+    def test_absent_retry_after_and_non_429_carry_none(self) -> None:
+        client = self._client()
+        missing = client._classify_error(429, {}, 1.0)
+        server_error = client._classify_error(503, {"retry-after": "5"}, 1.0)
+        assert "retry_after" in vars(missing)
+        assert missing.retry_after is None
+        assert missing.retryable is True
+        assert "retry_after" in vars(server_error)
+        assert server_error.retry_after is None
