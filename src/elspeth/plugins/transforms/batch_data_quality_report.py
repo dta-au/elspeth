@@ -24,7 +24,7 @@ from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
-from elspeth.plugins.transforms._scalar_buckets import append_unique_bucket_value
+from elspeth.plugins.transforms._scalar_buckets import scalar_bucket_key
 
 type BatchDataQualityReportRow = dict[str, object]
 
@@ -117,7 +117,7 @@ class BatchDataQualityReport(BaseTransform):
     name = "batch_data_quality_report"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a8aa93a021ea783c"
+    source_file_hash: str | None = "sha256:3cab49032dc91b93"
     config_model = BatchDataQualityReportConfig
     is_batch_aware = True
     # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
@@ -236,10 +236,10 @@ class BatchDataQualityReport(BaseTransform):
 
     @staticmethod
     def _distinct_count(values: tuple[object, ...]) -> int:
-        distinct_values: list[object] = []
-        for value in values:
-            append_unique_bucket_value(distinct_values, value)
-        return len(distinct_values)
+        # Hash-based and type-aware (True, 1 and 1.0 stay separate): every
+        # valid value is a hashable str/int/float/bool, so this is O(n), not
+        # the pairwise list scan of append_unique_bucket_value.
+        return len({scalar_bucket_key(value) for value in values})
 
     def _stats_for_field(self, rows: list[PipelineRow], field_name: str) -> _QualityStats:
         missing_count = 0
