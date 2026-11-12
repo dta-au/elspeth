@@ -28,6 +28,7 @@ evidence or validation only.
 | R11 | F11, F15 | `report_assemble` declares `output_semantics()` (STR, unconstrained framing). Fix the `document` sink example, whose `schema.mode: fixed` errors after `report_assemble`. Correct the always-authorized list in `docs/reference/environment-variables.md` (9 listed vs 14 in `plugin_policy/compiler.py`). | S | s08 / s14 validate with no high warnings. |
 | R14 | F16 | In `composer_preflight.reuse_or_recompute_runtime_preflight`, return a computed (cached per version) runtime preflight for every non-empty state, not only invalid or blob-bearing ones. The advisor gate then always has a real base: a green pipeline takes the completion-only `advisor_signoff_pending_validation` path, never the "unverified" one. In the UI copy, replace "after your next pipeline change" with the actual next step, and de-duplicate the repeated sentence. | S | s03 T4 and s09 T2 replays: no "not re-verified" text; a valid graph with an advisor FLAG shows completion-pending only. A unit test pins a valid, unchanged, no-preview turn to a non-`None` preflight. |
 | R15 | F17 | Reply Register addition: questions about checks, readiness or approval state are answered with the user's next action in product terms. Never show tool-call JSON or ask the user to run a tool or file a defect. Add the case to the advisor END rubric so a reply that does either is flagged. | XS | Ask "why can't I share this?" on an advisor-blocked session: the reply names the step and action, with no tool names. |
+| R16 | F18 | **Decision needed.** Tutorial dead end after "Apply" adds a failure-retention output. Options: (a) let `_tutorial_launch_blocker` (`tutorial_service.py:154-215`) admit one additional `sink:json` that receives only failure routes; (b) hide suggestion Apply in `TutorialFreeformShell` (UI-only; composer untouched); (c) make the 409 `tutorial_plugin_set` detail name the extra output and the fix. Do (c) regardless. Also make the "Every card acknowledged… Select Run pipeline" chat line say "Continue to Run" inside the tutorial. | S | Browser walk: brief → Accept → Apply → acknowledge all cards → Continue to Run either proceeds (a) or the Apply control is absent (b); the 409 text names `failed_rows` (c). |
 | R13 | F14 | At staging, reject a `vague_term` wired at node level on an `llm` node where no query falls back to the node-level template. Alternatively, make the resolver write into every query template that carries the slot. Add one teaching line to the multi-query section. | S | In-process repro from the wiring report: either rejected at `set_pipeline`, or `accepted_in_prompt=True` for every query. |
 | R12 | F12 | Tool-result legibility. For discovery tools, put the tool's own error first and omit whole-pipeline validation. Make sibling argument names agree (`get_plugin_assistance.plugin_name` vs `get_plugin_schema.name`), or accept both with one deprecated. Name the offending property in `canonical_schema` rejections ("unexpected key `nodes` under `source`"). | S | Proposal rejection rate below 16 of 53. |
 
@@ -87,7 +88,7 @@ To keep it true:
 | WP | Contents | When |
 |---|---|---|
 | WP0: demo config (no code) | Runbook below | Before the demo |
-| WP1: stop the visible failures | R2, R3, R5, R9, R10, R14, R15 | Before the demo if possible; each is small and independent |
+| WP1: stop the visible failures | R16(c), R2, R3, R5, R9, R10, R14, R15 | Before the demo if possible; each is small and independent |
 | WP2: planner surface | R1 (+P1), R4, R8, E3 | After the demo; R1 first because R4 and R8 build on it |
 | WP3: model binding and guard | R6 (after decision), R7 | After WP1 |
 | WP3b: integrity | R13 | With WP1; it is a correctness bug in approved review content, independent of the demo |
@@ -149,6 +150,15 @@ run compared against this audit's turn table.
   - arithmetic without the allowlist above (F6).
 - **Expect** every first build of made-up data to show interpretation review
   cards; that is by design.
+- **Tutorial:** do **not** click "Apply" on the "Consider adding error
+  routing to a retention output" suggestion (F18). Accept the proposal,
+  acknowledge the cards, use View prompt then Approve on the prompt card,
+  then Continue to Run. In the browser walk the build took about 40 s to the
+  first card, and the tutorial needed 4 decisions. If "Continue to Run" says
+  the pipeline "does not match the supported tutorial plugin set", ask the
+  Composer to "Remove the failed_rows output and discard failures instead."
+  (verified: one 28 s turn, then tutorial readiness returned 200), or exit
+  the tutorial.
 - **If the panel says "Completion advisory review did not clear"** on a valid
   pipeline, Run still works ("Advisory checks don't block Run"). Click Run.
   Do not ask the composer about the gate on stage (F16, F17). To clear it,

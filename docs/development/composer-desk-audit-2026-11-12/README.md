@@ -32,6 +32,7 @@ The failures cluster in places the presenter is likely to go:
 | F4 | "Screen the notes for passwords or confidential material" | HTTP 422 "This control content appears to contain a credential" | 2/2 failed |
 | F5 | "Use GPT-4o" / "Which models can I use?" | A refusal that also says "GPT-4o is served there", read from an unfiltered 3,938-model catalog | 1/1 |
 | F6 | Any arithmetic, type conversion or filter on a default deployment | An honest refusal: the plugins exist but are not enabled | 2/2 on default allowlist |
+| F18 | **Tutorial:** clicking "Apply" on the "Consider adding error routing…" suggestion | Every card is acknowledged and Checks are green; the chat says "your pipeline's ready", then "Continue to Run" refuses: "The saved tutorial pipeline does not match the supported tutorial plugin set." | 1/1 in a browser walk |
 
 F1, F2 and F4 are the ones that look broken on stage. F6 is configuration
 only. F3 and F5 read as competent refusals, but on stage they still sound
@@ -392,6 +393,53 @@ polish. Verification is **EXECUTED** (reproduced live or in-process), **READ**
   readiness or approval state, state the user's next action in product
   terms. Never ask the user to run a tool or file a defect. Pair it with R14,
   which removes the situation that prompts the question.
+
+### F18. Tutorial: one click on a suggested fix makes the tutorial pipeline unrunnable, with no actionable message. DEMO-BLOCKER
+
+- **Where.**
+  - The tutorial's "Continue to Run" calls `GET /api/tutorial/{id}/readiness`,
+    not the workspace `execution_ready`. That runs the run-admission check
+    `_tutorial_launch_blocker` (`composer/tutorial_service.py:154-215`), which
+    requires **exactly one** output and that it be `sink:json`
+    (`output_valid = len(output_ids) == 1 …`, L174).
+  - The decision panel offers a one-click **Apply** on every validation
+    suggestion. Apply sends the suggestion to the composer as a user request
+    (`frontend/src/components/chat/ChatPanel.tsx:853-857`).
+  - One of those suggestions is "Consider adding error routing to a retention
+    output — failed rows are currently discarded" (`composer/state.py:10079`).
+- **What happens (EXECUTED in a browser on the first-run tutorial).**
+  - After sending the tutorial brief, accepting the proposal and clicking
+    Apply on that suggestion, the composer did exactly what was asked. It
+    added a `failed_rows` json output and routed the source and all three
+    steps' failures to it. The advisor returned CLEAN.
+  - The learner then cleared four review cards: three Acknowledge plus one
+    prompt review, where Approve unlocks only after View prompt.
+  - After that, Checks showed ✓ and the chat said "Every card acknowledged —
+    your pipeline's ready. Select **Run pipeline** to start it."
+  - The tutorial step has no "Run pipeline" button. "Continue to Run" returned
+    409 `tutorial_plugin_set`: "The saved tutorial pipeline does not match the
+    supported tutorial plugin set." Screenshot:
+    [evidence/tutorial-continue-refused.png](evidence/tutorial-continue-refused.png).
+  - Neither the learner nor the composer is told that the second output is
+    the problem. The composer cannot see the tutorial admission rule, and
+    must not be taught tutorial-only rules (Composer invariant 2). So asking
+    it why produces guesses, such as the preview/advisory explanation
+    reported on 2026-11-13 (F16, F17).
+- **Without Apply** the composer chose "discard" with a single output in
+  3 of 3 sends of the same brief, and the tutorial would continue. This is
+  user-triggered, not random, and the Apply button sits in the decision
+  panel the learner is told to work through.
+- **Fix.** R16. Choose one:
+  - make the tutorial admission accept an optional failure-retention json
+    output (it is a correct, safer graph);
+  - do not offer suggestion Apply inside the tutorial shell (a UI-only
+    change; the composer path is untouched);
+  - at minimum, name the mismatch in the 409 detail, for example "This
+    tutorial runs one JSON output; your draft also writes failed_rows. Ask
+    the Composer to remove that output, or exit the tutorial to keep it."
+
+  In all three cases, the chat must not say "Select Run pipeline" where no
+  such button exists.
 
 ### F15. Default-allowlist documentation is stale. LOW
 
