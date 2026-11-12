@@ -150,6 +150,12 @@ class CSVSinkConfig(SinkPathConfig):
     def _validate_delimiter(cls, v: str) -> str:
         if len(v) != 1:
             raise ValueError(f"delimiter must be a single character, got {v!r}")
+        # csv.writer also refuses the quotechar and line terminators; reject
+        # them here so the error is a config error, not a publication crash.
+        try:
+            csv.writer(io.StringIO(), delimiter=v)
+        except ValueError as exc:
+            raise ValueError(f"delimiter {v!r} is not usable by the CSV writer: {exc}") from exc
         return v
 
     @field_validator("encoding")
@@ -223,7 +229,7 @@ class CSVSink(BaseSink, SinkEffectAuditContextCapability):
     name = "csv"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:198b2883591f0b54"
+    source_file_hash: str | None = "sha256:1a151b4193ce4ada"
     config_model = CSVSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM
