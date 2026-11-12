@@ -9,12 +9,14 @@ import hashlib
 import json
 import tempfile
 from collections.abc import Callable
+from importlib import metadata
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from elspeth.contracts.payload_store import PayloadNotFoundError
+from elspeth.plugins.infrastructure.rasterize import identity as rasterize_identity
 from elspeth.plugins.infrastructure.rasterize.protocol import (
     PageRefusalKind,
     RasterizeRequest,
@@ -389,3 +391,107 @@ def test_memory_error_outside_page_render_refuses_only_that_page(
     assert type(refused) is RefusedPage
     assert refused.page_number == 2
     assert refused.kind is PageRefusalKind.MEMORY_EXHAUSTED
+
+
+# ---------------------------------------------------------------------------
+# Finding #162 — renderer_identity() must find the native PDFium binary on
+# every platform pypdfium2 ships wheels for, not only libpdfium.so.
+# ---------------------------------------------------------------------------
+
+
+class _FakePdfiumDistribution:
+    """Models the importlib.metadata.Distribution surface renderer_identity() reads."""
+
+    def __init__(self, root: Path, files: list[str], version: str = "5.0.0") -> None:
+        self._root = root
+        self.files = [metadata.PackagePath(name) for name in files]
+        self.version = version
+
+    def locate_file(self, path: metadata.PackagePath) -> Path:
+        return self._root / str(path)
+
+
+def _identity_with(files: list[str], root: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    for name in files:
+        target = root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"native-binary:" + name.encode())
+    distribution = _FakePdfiumDistribution(root, files)
+
+    def _distribution(name: str) -> _FakePdfiumDistribution:
+        assert name == "pypdfium2"
+        return distribution
+
+    monkeypatch.setattr(rasterize_identity.metadata, "distribution", _distribution)
+    rasterize_identity.renderer_identity.cache_clear()
+    try:
+        return rasterize_identity.renderer_identity()
+    finally:
+        rasterize_identity.renderer_identity.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "native_binary",
+    [
+        pytest.param("pypdfium2_raw/libpdfium.so", id="linux"),
+        pytest.param("pypdfium2_raw/libpdfium.dylib", id="macos"),
+        pytest.param("pypdfium2_raw/pdfium.dll", id="windows"),
+    ],
+)
+def test_renderer_identity_hashes_the_platform_native_pdfium_binary(
+    native_binary: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    files = ["pypdfium2_raw/__init__.py", "pypdfium2_raw/bindings.py", native_binary]
+
+    raised: RuntimeError | None = None
+    try:
+        identity = _identity_with(files, tmp_path, monkeypatch)
+    except RuntimeError as exc:
+        raised = exc
+    assert raised is None, f"renderer_identity() refused {native_binary}: {raised}"
+
+    assert len(identity) == 64
+    assert all(char in "0123456789abcdef" for char in identity)
+
+
+def test_renderer_identity_depends_on_the_native_binary_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The binary's bytes are part of the identity on a non-.so platform too."""
+    files = ["pypdfium2_raw/pdfium.dll"]
+    first = tmp_path / "a"
+    second = tmp_path / "b"
+    raised: RuntimeError | None = None
+    try:
+        identity_a = _identity_with(files, first, monkeypatch)
+        (second / "pypdfium2_raw").mkdir(parents=True)
+        identity_b = _identity_with(files, second, monkeypatch)
+        (second / "pypdfium2_raw" / "pdfium.dll").write_bytes(b"a different build")
+        identity_c = _identity_with_existing(files, second, monkeypatch)
+    except RuntimeError as exc:
+        raised = exc
+    assert raised is None, f"renderer_identity() refused pdfium.dll: {raised}"
+
+    assert identity_a == identity_b
+    assert identity_c != identity_b
+
+
+def _identity_with_existing(files: list[str], root: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    distribution = _FakePdfiumDistribution(root, files)
+    monkeypatch.setattr(rasterize_identity.metadata, "distribution", lambda _name: distribution)
+    rasterize_identity.renderer_identity.cache_clear()
+    try:
+        return rasterize_identity.renderer_identity()
+    finally:
+        rasterize_identity.renderer_identity.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        pytest.param(["pypdfium2_raw/__init__.py"], id="no-binary"),
+        pytest.param(["pypdfium2_raw/libpdfium.so", "pypdfium2_raw/extra/libpdfium.so"], id="two-binaries"),
+    ],
+)
+def test_renderer_identity_still_refuses_an_ambiguous_install(files: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Negative control: exactly one native PDFium binary is still required."""
+    with pytest.raises(RuntimeError):
+        _identity_with(files, tmp_path, monkeypatch)
