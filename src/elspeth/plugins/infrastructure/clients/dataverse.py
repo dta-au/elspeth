@@ -13,11 +13,12 @@ import email.utils
 import fnmatch
 import math
 import re
+import threading
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -108,9 +109,13 @@ class DataverseClientError(Exception):
     error_category is a typed classification set at the raise site,
     enabling structured audit recording without fragile string-matching.
 
-    retry_after is the delay in seconds a 429 response's Retry-After header
-    asked for (delta-seconds or HTTP-date form), so a retry path can wait at
-    least that long; None when the server named no usable delay.
+    retry_after is the delay in seconds a 429/503 response's Retry-After
+    header asked for (delta-seconds or HTTP-date form), so a retry path can
+    wait at least that long; None when the server named no usable delay.
+
+    throttle_waits are the seconds the client already waited on throttled
+    (429/503) responses before giving up with this error; empty when it
+    never waited.
     """
 
     def __init__(
@@ -124,6 +129,7 @@ class DataverseClientError(Exception):
         request_url: str | None = None,
         request_headers: dict[str, str] | None = None,
         retry_after: float | None = None,
+        throttle_waits: tuple[float, ...] = (),
     ) -> None:
         super().__init__(message)
         self.retryable = retryable
@@ -133,6 +139,18 @@ class DataverseClientError(Exception):
         self.request_url = request_url
         self.request_headers = request_headers
         self.retry_after = retry_after
+        self.throttle_waits = throttle_waits
+
+
+# Throttling statuses the client waits out in place (service-protection 429
+# and server-busy 503). A throttled request was rejected before execution, so
+# re-sending it is safe for GET and the idempotent upsert PATCH alike.
+_THROTTLE_STATUS_CODES = frozenset({429, 503})
+# Wait used when a throttled response names no Retry-After; doubled per wait
+# up to retry_after_cap, and never shorter than the server's Retry-After.
+_THROTTLE_INITIAL_BACKOFF_SECONDS = 1.0
+# Total seconds one request may spend waiting on throttled responses.
+DEFAULT_THROTTLE_WAIT_BUDGET_SECONDS = 300.0
 
 
 def _parse_retry_after(value: str | None) -> float | None:
@@ -179,6 +197,8 @@ class DataversePageResponse:
     next_link: str | None  # @odata.nextLink URL, if present (structured queries)
     paging_cookie: str | None  # FetchXML paging cookie, if present
     more_records: bool | None  # True/False if Dataverse stated it; None if field absent
+    # Seconds waited on throttled (429/503) responses before this response.
+    throttle_waits: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         if self.next_link is not None and self.paging_cookie is not None:
@@ -383,6 +403,9 @@ class DataverseClient:
         retry_after_cap: float = 60.0,
         additional_domains: tuple[str, ...] = (),
         before_request: Callable[[str, Mapping[str, str]], None] | None = None,
+        throttle_wait_budget_seconds: float = DEFAULT_THROTTLE_WAIT_BUDGET_SECONDS,
+        shutdown_event: threading.Event | None = None,
+        on_throttle: Callable[[DataverseClientError, float], None] | None = None,
     ) -> None:
         raw_environment_url = environment_url.rstrip("/")
         parsed = urllib.parse.urlparse(raw_environment_url)
@@ -406,6 +429,11 @@ class DataverseClient:
         self._retry_after_cap = retry_after_cap
         self._additional_domains = additional_domains
         self._before_request = before_request
+        self._throttle_wait_budget = throttle_wait_budget_seconds
+        # The run's cooperative-shutdown signal ends a throttle wait early; a
+        # private, never-set Event makes the wait a plain sleep otherwise.
+        self._shutdown_event = shutdown_event if shutdown_event is not None else threading.Event()
+        self._on_throttle = on_throttle
 
         # Validate environment_url against domain allowlist
         if not _validate_domain_allowlist(hostname, self._additional_domains):
@@ -575,7 +603,8 @@ class DataverseClient:
                 request_headers=request_headers,
             )
 
-        # 5xx: Retryable server errors
+        # 5xx: Retryable server errors. A 503 is Dataverse's server-busy
+        # throttle and may name a Retry-After, carried like the 429's.
         if 500 <= status_code < 600:
             return DataverseClientError(
                 f"Server error ({status_code})",
@@ -584,6 +613,9 @@ class DataverseClient:
                 latency_ms=latency_ms,
                 request_url=request_url,
                 request_headers=request_headers,
+                retry_after=(
+                    _parse_retry_after(headers["retry-after"] if "retry-after" in headers else None) if status_code == 503 else None
+                ),
             )
 
         # Any other error status
@@ -596,6 +628,67 @@ class DataverseClient:
             request_headers=request_headers,
         )
 
+    def _send_with_throttle_retry(self, send: Callable[[], DataversePageResponse]) -> DataversePageResponse:
+        """Run one request via ``send``, waiting out throttled (429/503) responses.
+
+        A retryable 429/503 is re-sent after waiting at least the server's
+        Retry-After (and at least an exponential backoff starting at 1s,
+        capped at retry_after_cap, so Retry-After: 0 cannot spin). The waits
+        of one request share throttle_wait_budget_seconds: a wait that does
+        not fit the remaining budget is never slept — the throttled error is
+        raised (still retryable) instead. A set shutdown_event ends a wait
+        early the same way. on_throttle sees each waited-out throttled error
+        and its wait once the wait completes and before the re-send, so the
+        caller records that call (a throttled error that ends retrying is
+        instead raised, for the caller's error path to record once); the waits are also carried on the returned page
+        and on the final error as throttle_waits. Other errors are raised
+        unchanged on their first occurrence.
+        """
+        waits: list[float] = []
+        backoff = _THROTTLE_INITIAL_BACKOFF_SECONDS
+        while True:
+            try:
+                page = send()
+            except DataverseClientError as exc:
+                if not exc.retryable or exc.status_code not in _THROTTLE_STATUS_CODES:
+                    raise
+                wait = backoff if exc.retry_after is None else max(backoff, exc.retry_after)
+                spent = sum(waits)
+                if wait > self._throttle_wait_budget - spent:
+                    if not waits:
+                        raise
+                    raise self._throttle_stop(
+                        exc,
+                        waits,
+                        f"throttle wait budget of {self._throttle_wait_budget}s exhausted "
+                        f"(waited {spent}s over {len(waits)} wait(s); next wait {wait}s)",
+                    ) from exc
+                if self._shutdown_event.wait(timeout=wait):
+                    raise self._throttle_stop(exc, waits, "shutdown requested during throttle wait") from exc
+                waits.append(wait)
+                if self._on_throttle is not None:
+                    self._on_throttle(exc, wait)
+                backoff = min(backoff * 2.0, self._retry_after_cap)
+                continue
+            if waits:
+                return replace(page, throttle_waits=tuple(waits))
+            return page
+
+    @staticmethod
+    def _throttle_stop(exc: DataverseClientError, waits: list[float], why: str) -> DataverseClientError:
+        """The still-retryable error that ends throttle retrying without another send."""
+        return DataverseClientError(
+            f"{exc} — {why}",
+            retryable=True,
+            status_code=exc.status_code,
+            latency_ms=exc.latency_ms,
+            error_category=exc.error_category,
+            request_url=exc.request_url,
+            request_headers=exc.request_headers,
+            retry_after=exc.retry_after,
+            throttle_waits=tuple(waits),
+        )
+
     def _execute_request(
         self,
         method: str,
@@ -605,7 +698,7 @@ class DataverseClient:
         extra_headers: dict[str, str] | None = None,
         ssrf_safe: SSRFSafeRequest | None = None,
     ) -> DataversePageResponse:
-        """Execute an HTTP request against Dataverse.
+        """Execute one HTTP request against Dataverse.
 
         Handles auth header injection, rate limiting, response parsing,
         and error classification. Returns a validated DataversePageResponse.
@@ -887,7 +980,8 @@ class DataverseClient:
         Raises:
             DataverseClientError: For protocol-level errors
         """
-        return self._execute_request("GET", url, extra_headers=_include_annotations_headers(annotations))
+        extra_headers = _include_annotations_headers(annotations)
+        return self._send_with_throttle_retry(lambda: self._execute_request("GET", url, extra_headers=extra_headers))
 
     def upsert(self, url: str, body: dict[str, Any]) -> DataversePageResponse:
         """PATCH upsert a record to Dataverse.
@@ -902,7 +996,7 @@ class DataverseClient:
         Raises:
             DataverseClientError: For protocol-level errors
         """
-        return self._execute_request("PATCH", url, json_body=body)
+        return self._send_with_throttle_retry(lambda: self._execute_request("PATCH", url, json_body=body))
 
     def paginate_odata(self, initial_url: str, *, annotations: tuple[str, ...] = ()) -> Iterator[DataversePageResponse]:
         """Paginate through structured OData query results.
@@ -929,7 +1023,12 @@ class DataverseClient:
         extra_headers = _include_annotations_headers(annotations)
 
         while True:
-            page = self._execute_request("GET", url, extra_headers=extra_headers, ssrf_safe=ssrf_safe)
+            # Bind this hop's url and pinned IP (B023): the callable runs
+            # synchronously, but the loop rebinds both names for the next hop.
+            def send(hop_url: str = url, hop_ssrf: SSRFSafeRequest | None = ssrf_safe) -> DataversePageResponse:
+                return self._execute_request("GET", hop_url, extra_headers=extra_headers, ssrf_safe=hop_ssrf)
+
+            page = self._send_with_throttle_retry(send)
             yield page
 
             # Empty-page guard
@@ -1025,7 +1124,7 @@ class DataverseClient:
         def fetch_current() -> DataversePageResponse:
             encoded_xml = urllib.parse.quote(ET.tostring(root, encoding="unicode"))
             url = f"{self._environment_url}/api/data/{self._api_version}/{entity_set_name}?fetchXml={encoded_xml}"
-            return self._execute_request("GET", url, extra_headers=extra_headers)
+            return self._send_with_throttle_retry(lambda: self._execute_request("GET", url, extra_headers=extra_headers))
 
         while True:
             page = fetch_current()

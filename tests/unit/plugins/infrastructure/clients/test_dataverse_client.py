@@ -161,10 +161,16 @@ def transport() -> MockTransport:
 
 @pytest.fixture()
 def client(transport: MockTransport) -> DataverseClient:
-    """Create a DataverseClient with mock transport and SSRF validation bypassed."""
+    """Create a DataverseClient with mock transport and SSRF validation bypassed.
+
+    The throttle-wait budget is zero so a throttled (429/503) response is
+    raised as classified rather than waited out and re-sent; the waiting
+    path is pinned in test_dataverse_retry_after.py.
+    """
     c = DataverseClient(
         environment_url=ENV_URL,
         credential=FakeCredential(),  # type: ignore[arg-type]  # test fake
+        throttle_wait_budget_seconds=0.0,
     )
     # Replace the internal httpx.Client with one using our mock transport
     c._client.close()
