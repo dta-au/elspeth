@@ -204,3 +204,35 @@ class TestBlobCSVExpandBoundsTheBlobRead:
         assert store.full_reads == []
         assert store.bounded_reads == [(blob_ref, 1024)]
         assert result.status == "success"
+
+
+class TestTextSourceMidFileDecodeErrorKeepsNeighbours:
+    """Sweep finding #137: a mid-file UTF-16 decode error must not drop valid lines or misreport the line."""
+
+    def test_lines_around_bad_code_unit_are_emitted_and_bad_line_is_named(self, tmp_path: Path) -> None:
+        from elspeth.plugins.sources.text_source import TextSource
+
+        text_file = tmp_path / "items.txt"
+        text_file.write_bytes(_utf16le("a\nb\n") + b"\x00\xd8" + _utf16le("c\nd\ne\n"))
+        source = TextSource(
+            {
+                "path": str(text_file),
+                "column": "value",
+                "encoding": "utf-16-le",
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "quarantine",
+            }
+        )
+
+        rows = list(source.load(make_source_context(plugin_name="text")))
+
+        assert [(row.is_quarantined, row.source_row_index) for row in rows] == [
+            (False, 0),
+            (False, 1),
+            (True, 2),
+            (False, 3),
+            (False, 4),
+        ]
+        assert [rows[i].row for i in (0, 1, 3, 4)] == [{"value": "a"}, {"value": "b"}, {"value": "d"}, {"value": "e"}]
+        assert rows[2].row["__line_number__"] == 3
+        assert rows[2].row["__raw_bytes_hex__"] == (b"\x00\xd8" + _utf16le("c\n")).hex()
