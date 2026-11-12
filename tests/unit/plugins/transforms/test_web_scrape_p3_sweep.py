@@ -67,3 +67,16 @@ def test_discovered_href_refuses_capability_query_keys(href: str) -> None:
     with pytest.raises(ValueError) as caught:
         _resolve(href)
     assert "secret-value" not in str(caught.value)
+
+
+# Finding #152: a JSON record column without a path is refused at config time.
+
+
+@pytest.mark.parametrize("column", [{"field": "name"}, {"field": "name", "path": []}])
+def test_json_record_column_requires_nonempty_path(column: dict[str, object]) -> None:
+    from pydantic import ValidationError
+
+    from elspeth.plugins.transforms.web_scrape_json_extraction import JSONRecordsConfig
+
+    with pytest.raises(ValidationError, match="path"):
+        JSONRecordsConfig.model_validate({"field": "r", "records_path": ["results"], "columns": [column]})
