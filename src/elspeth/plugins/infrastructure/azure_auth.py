@@ -257,6 +257,23 @@ class AzureAuthConfig(BaseModel):
             )
             return BlobServiceClient(account_url, credential=sp_credential)
 
+    def close_blob_service_client(self, service_client: BlobServiceClient) -> None:
+        """Close a client from ``create_blob_service_client`` and the credential it created.
+
+        Clients derived with ``get_container_client`` / ``get_blob_client``
+        share the parent's transport through ``TransportWrapper``, whose
+        ``close()`` is a no-op, so only closing the service client releases
+        the HTTP session. ``BlobServiceClient.close()`` does not close its
+        credential, so the managed-identity / service-principal credential
+        this config constructed is closed here too, even when the transport
+        close raises.
+        """
+        try:
+            service_client.close()
+        finally:
+            if self.auth_method in ("managed_identity", "service_principal"):
+                service_client.credential.close()
+
     def _is_set(self, value: str | None) -> bool:
         """Check if a string field is non-empty after stripping whitespace.
 

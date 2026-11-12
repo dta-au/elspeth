@@ -59,7 +59,7 @@ from elspeth.plugins.sources.json_source import (
 )
 
 if TYPE_CHECKING:
-    from azure.storage.blob import BlobClient
+    from azure.storage.blob import BlobClient, BlobServiceClient
 
 logger = structlog.get_logger(__name__)
 
@@ -426,7 +426,7 @@ class AzureBlobSource(BaseSource):
     name = "azure_blob"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:5cdeb02ae492c2f7"
+    source_file_hash: str | None = "sha256:b69c623109562e5e"
     config_model = AzureBlobSourceConfig
 
     usage_when_to_use: str = (
@@ -526,7 +526,9 @@ class AzureBlobSource(BaseSource):
             if initial_contract.locked:
                 self.set_schema_contract(initial_contract)
 
-        # Lazy-loaded blob client
+        # Lazy-loaded clients. The service client owns the HTTP transport and
+        # credential; the derived blob client's close() does not release them.
+        self._service_client: BlobServiceClient | None = None
         self._blob_client: BlobClient | None = None
 
     def _get_blob_client(self) -> BlobClient:
@@ -545,6 +547,7 @@ class AzureBlobSource(BaseSource):
         if self._blob_client is None:
             # Use shared auth config to create the service client
             service_client = self._auth_config.create_blob_service_client()
+            self._service_client = service_client
             container_client = service_client.get_container_client(self._container)
             self._blob_client = container_client.get_blob_client(self._blob_path)
 
@@ -1331,11 +1334,17 @@ class AzureBlobSource(BaseSource):
                 )
 
     def close(self) -> None:
-        """Release the owned Azure blob client exactly once."""
+        """Release the owned Azure clients, transport and credential exactly once."""
         blob_client = self._blob_client
+        service_client = self._service_client
         self._blob_client = None
-        if blob_client is not None:
-            blob_client.close()
+        self._service_client = None
+        try:
+            if blob_client is not None:
+                blob_client.close()
+        finally:
+            if service_client is not None:
+                self._auth_config.close_blob_service_client(service_client)
 
     def get_field_resolution(self) -> tuple[Mapping[str, str], str | None] | None:
         """Return field resolution mapping for audit trail."""

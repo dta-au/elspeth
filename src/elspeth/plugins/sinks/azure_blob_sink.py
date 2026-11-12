@@ -77,7 +77,7 @@ from elspeth.plugins.sinks._remote_object_effects import (
 )
 
 if TYPE_CHECKING:
-    from azure.storage.blob import BlobProperties, ContainerClient
+    from azure.storage.blob import BlobProperties, BlobServiceClient, ContainerClient
 
 
 class AzureBlobRecordSerializationError(ValueError):
@@ -397,7 +397,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
     name = "azure_blob"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:1d3cc39b2618f2c8"
+    source_file_hash: str | None = "sha256:c3867c587f977dc9"
     config_model = AzureBlobSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP
@@ -517,7 +517,10 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
         # Required-field enforcement (centralized in SinkExecutor)
         self.declared_required_fields = self._schema_config.get_effective_required_fields()
 
-        # Lazy-loaded clients
+        # Lazy-loaded clients. The service client owns the HTTP transport and
+        # credential; the container client is derived from it and its close()
+        # does not release them, so both references are kept for close().
+        self._service_client: BlobServiceClient | None = None
         self._container_client: ContainerClient | None = None
 
     def _get_container_client(self) -> ContainerClient:
@@ -536,6 +539,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
         if self._container_client is None:
             # Use shared auth config to create the service client
             service_client = self._auth_config.create_blob_service_client()
+            self._service_client = service_client
             self._container_client = service_client.get_container_client(self._container)
 
         return self._container_client
@@ -1007,7 +1011,18 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
         pass
 
     def close(self) -> None:
-        """Release resources."""
-        if self._container_client is not None:
-            self._container_client.close()
+        """Release the Azure clients, transport and credential exactly once.
+
+        References are cleared before any close runs, so a raising close is
+        not retried by a later call.
+        """
+        container_client = self._container_client
+        service_client = self._service_client
         self._container_client = None
+        self._service_client = None
+        try:
+            if container_client is not None:
+                container_client.close()
+        finally:
+            if service_client is not None:
+                self._auth_config.close_blob_service_client(service_client)
