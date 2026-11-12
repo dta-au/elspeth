@@ -320,7 +320,7 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b6385bbac6b974d2"
+    source_file_hash: str | None = "sha256:3911da9557b47ee8"
     determinism = Determinism.EXTERNAL_CALL
     config_model = DataverseSinkConfig
     idempotent = True  # PATCH upsert is idempotent — safe for retries and crash recovery (engine does not yet read this flag)
@@ -457,13 +457,15 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
         """Build PATCH URL for upsert with alternate key.
 
         URL-encodes entity name, alternate key name, and key value to prevent
-        injection via special characters.
+        injection via special characters. The key value is first escaped as an
+        OData string literal (a single quote is doubled): servers percent-decode
+        before parsing OData, so a bare ``%27`` would still end the literal.
         key_value is guaranteed str by the isinstance checks on the effect paths
         (_member_effect_material / _validate_member_effect).
         """
         encoded_entity = urllib.parse.quote(self._entity, safe="")
         encoded_key_name = urllib.parse.quote(self._alternate_key, safe="")
-        encoded_value = urllib.parse.quote(key_value, safe="")
+        encoded_value = urllib.parse.quote(key_value.replace("'", "''"), safe="")
         return f"{self._environment_url.rstrip('/')}/api/data/{self._api_version}/{encoded_entity}({encoded_key_name}='{encoded_value}')"
 
     def _map_row(self, row: dict[str, Any]) -> dict[str, Any]:
