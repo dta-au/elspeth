@@ -392,7 +392,7 @@ class BlobJSONExpand(BaseTransform):
     name = "blob_json_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:86a847226bed8d18"
+    source_file_hash: str | None = "sha256:a6ac9fd4415e2350"
     config_model = BlobJSONExpandConfig
     usage_when_to_use: str = (
         "Use when a row carries a JSON document — either a payload-store reference from blob_fetch or JSON text in a "
@@ -851,7 +851,12 @@ class BlobJSONExpand(BaseTransform):
                     )
                 )
             elements: list[Any] = []
-            for line_number, line in enumerate(text.splitlines(), start=1):
+            # Split on "\n" only, as the JSONL sources do (a file object /
+            # TextIOWrapper(newline="")). str.splitlines() also breaks on
+            # U+2028, U+2029, U+0085 and \x1c-\x1e, which JSON permits raw
+            # inside strings, so it would cut a valid record mid-string.
+            for line_number, raw_line in enumerate(text.split("\n"), start=1):
+                line = raw_line.removesuffix("\r")
                 if not line.strip():
                     continue
                 _check_json_nesting(line, phase="jsonl_line", line_number=line_number)
