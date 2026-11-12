@@ -5,12 +5,16 @@ One section per finding; each test fails at an assertion on the pre-fix tree.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
 import pytest
 
+from elspeth.contracts.payload_store import PayloadNotFoundError
+from elspeth.plugins.transforms.blob_csv_expand import BlobCSVExpand
 from elspeth.plugins.transforms.blob_json_expand import BlobJSONExpand
+from elspeth.plugins.transforms.blob_text_expand import BlobTextExpand
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_context
 
@@ -131,3 +135,107 @@ def test_finite_numbers_still_parse() -> None:
     assert result.status == "success", result.reason
     assert result.rows is not None
     assert result.rows[0].to_dict()["score"] == 1500.0
+
+
+# ---------------------------------------------------------------------------
+# Finding #95 — max_blob_bytes must bound the READ, not just the decoded size.
+# ---------------------------------------------------------------------------
+
+
+class _ReadTrackingStore:
+    """Payload store fake modelling both read contracts and recording which ran.
+
+    ``retrieve_bounded`` follows contracts/payload_store.py: it reads at most
+    ``max_bytes + 1`` bytes and returns None when the blob is larger.
+    """
+
+    def __init__(self, content: bytes) -> None:
+        self.content_hash = hashlib.sha256(content).hexdigest()
+        self._content = content
+        self.unbounded_reads = 0
+        self.bounded_reads: list[int] = []
+
+    def _get(self, content_hash: str) -> bytes:
+        if content_hash != self.content_hash:
+            raise PayloadNotFoundError(content_hash)
+        return self._content
+
+    def retrieve(self, content_hash: str) -> bytes:
+        self.unbounded_reads += 1
+        return self._get(content_hash)
+
+    def retrieve_bounded(self, content_hash: str, *, max_bytes: int) -> bytes | None:
+        self.bounded_reads.append(max_bytes)
+        content = self._get(content_hash)
+        return None if len(content) > max_bytes else content
+
+    def exists(self, content_hash: str) -> bool:
+        return content_hash == self.content_hash
+
+    def delete(self, content_hash: str) -> bool:
+        return False
+
+
+def _blob_transforms() -> list[Any]:
+    return [
+        pytest.param(
+            lambda: BlobTextExpand(
+                {"schema": {"mode": "observed", "guaranteed_fields": ["blob_ref"]}, "blob_ref_field": "blob_ref", "max_blob_bytes": 8}
+            ),
+            id="blob_text_expand",
+        ),
+        pytest.param(
+            lambda: BlobCSVExpand(
+                {"schema": {"mode": "observed", "guaranteed_fields": ["blob_ref"]}, "blob_ref_field": "blob_ref", "max_blob_bytes": 8}
+            ),
+            id="blob_csv_expand",
+        ),
+        pytest.param(
+            lambda: BlobJSONExpand(
+                {
+                    "schema": {"mode": "observed", "guaranteed_fields": ["blob_ref"]},
+                    "blob_ref_field": "blob_ref",
+                    "format": "jsonl",
+                    "fields": ["a"],
+                    "max_blob_bytes": 8,
+                }
+            ),
+            id="blob_json_expand",
+        ),
+    ]
+
+
+@pytest.mark.parametrize("factory", _blob_transforms())
+def test_oversize_blob_is_refused_through_a_bounded_read(factory: Any) -> None:
+    body = b'{"a": "0123456789abcdef"}\n' * 4
+    store = _ReadTrackingStore(body)
+    transform = factory()
+    transform._payload_store = store
+
+    result = transform.process(make_pipeline_row({"blob_ref": store.content_hash}), make_context())
+
+    assert store.unbounded_reads == 0, "the whole blob was read before max_blob_bytes was checked"
+    assert store.bounded_reads == [8]
+    assert result.status == "error"
+    assert result.reason["reason"] == "blob_too_large"
+    assert result.reason["max_blob_bytes"] == 8
+
+
+@pytest.mark.parametrize("factory", _blob_transforms())
+def test_blob_at_the_cap_is_still_read_in_full(factory: Any) -> None:
+    """Negative control: a blob of exactly max_blob_bytes is not refused for size.
+
+    The 8-byte body is not a valid document for every format (the CSV one has
+    no data row), so the control asserts only that the size cap let it through.
+    """
+    body = b'{"a":1}\n'
+    assert len(body) == 8
+    store = _ReadTrackingStore(body)
+    transform = factory()
+    transform._payload_store = store
+
+    result = transform.process(make_pipeline_row({"blob_ref": store.content_hash}), make_context())
+
+    assert store.unbounded_reads == 0
+    assert store.bounded_reads == [8]
+    assert result.status == "success" or result.reason["reason"] != "blob_too_large", result.reason
