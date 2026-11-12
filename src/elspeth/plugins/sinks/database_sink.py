@@ -241,7 +241,7 @@ class DatabaseSinkConfig(DataPluginConfig):
 
 
 class DatabaseSink(BaseSink, RestagingSinkEffectCapability):
-    """Append rows to an operator-provisioned database table.
+    """Append rows to an existing table.
 
     Supports SQLite and PostgreSQL only. The target table and the declared
     target-side effect ledger must already exist: the sink performs no DDL and
@@ -277,7 +277,7 @@ class DatabaseSink(BaseSink, RestagingSinkEffectCapability):
     name = "database"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e81744135a73d19f"
+    source_file_hash: str | None = "sha256:d8b9d59430a7d1bd"
     config_model = DatabaseSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.SQL
