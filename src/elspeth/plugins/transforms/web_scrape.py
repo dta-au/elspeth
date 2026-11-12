@@ -57,6 +57,7 @@ from elspeth.core.security.web import (
     validate_archived_ssrf_request,
     validate_configured_url_for_ssrf,
     validate_url_for_ssrf,
+    validate_url_scheme,
 )
 from elspeth.core.security.web import (
     NetworkError as SSRFNetworkError,
@@ -819,7 +820,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0c38862aa7a0f075"
+    source_file_hash: str | None = "sha256:1ecbd3ab145d2c04"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -1346,6 +1347,11 @@ class WebScrapeTransform(BaseTransform):
                     return TransformResult.error({"reason": "validation_failed", "error": "query parameters cannot be URL encoded"})
                 if encoded_url_size > 8192:
                     return TransformResult.error({"reason": "validation_failed", "error": "URL with query parameters exceeds 8192 bytes"})
+            # Refuse a malformed URL shape before replay/verify compute
+            # fingerprint_url, whose urlsplit raises a bare ValueError; this is
+            # the same first check live mode's validate_url_for_ssrf applies,
+            # so every run mode records the same row refusal.
+            validate_url_scheme(url)
             session = ctx.call_mode_session
             if session is not None and session.mode is RunMode.REPLAY:
                 archived = session.replay_ssrf_request(
@@ -1529,7 +1535,10 @@ class WebScrapeTransform(BaseTransform):
             initial_request_url = str(httpx.Request("GET", url, params=request_params or None).url)
             page_contents = [content]
             page_records = list(records) if records is not None else None
-            seen_urls = {initial_request_url, final_hostname_url}
+            # Every discovered next URL is canonicalized with fingerprint_url
+            # before the cycle check, so seen URLs must be held in that same
+            # spelling; httpx and urlencode escape query characters differently.
+            seen_urls = {fingerprint_url(initial_request_url), fingerprint_url(final_hostname_url)}
             total_body_bytes = body_size
             next_source = self._pagination.mode
             pagination_pages.append(
@@ -1660,7 +1669,7 @@ class WebScrapeTransform(BaseTransform):
                         next_source=next_source,
                     )
                 )
-                seen_urls.update((next_url, final_hostname_url))
+                seen_urls.update((next_url, fingerprint_url(final_hostname_url)))
             content = self._aggregate_page_contents(page_contents)
             records = page_records
             final_resolved_ip = _final_response_ip(response)
