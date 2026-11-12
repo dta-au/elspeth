@@ -51,3 +51,45 @@ class TestFinding150AccountUrlQueryString:
         config = AzureAuthConfig(use_managed_identity=True, account_url="https://acct.blob.core.windows.net/")
 
         assert config.auth_method == "managed_identity"
+
+
+class TestFinding29S3ClosedLifecycle:
+    """#29: a closed AWSS3Sink must not silently build a new client."""
+
+    def test_provider_call_after_close_raises_closed_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.contracts.sink_effects import SinkEffectInspectionRequest
+        from elspeth.plugins.sinks import aws_s3_sink
+        from tests.unit.plugins.sinks.test_remote_object_sink_effects import _CTX, _s3, _S3Store
+
+        built: list[object] = []
+
+        def build_fresh_client(*_args: object) -> _S3Store:
+            store = _S3Store()
+            built.append(store)
+            return store
+
+        class _ClosableS3Store(_S3Store):
+            def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(aws_s3_sink, "build_s3_client", build_fresh_client)
+        sink = _s3(_ClosableS3Store())
+        sink.close()
+
+        raised: BaseException | None = None
+        try:
+            sink.inspect_effect(SinkEffectInspectionRequest(effect_id="a" * 64, target="{}", predecessor_descriptor=None), _CTX)
+        except Exception as exc:
+            raised = exc
+
+        assert built == [], "a closed sink must not construct a replacement S3 client"
+        assert type(raised).__name__ == "S3SinkClosedError"
+
+    @pytest.mark.parametrize(
+        "symbol",
+        ["S3SinkPoisonedError", "_raise_conditional_rejected", "_raise_sink_write_rejected", "_raise_audit_integrity"],
+    )
+    def test_unused_failure_helpers_are_not_declared(self, symbol: str) -> None:
+        from elspeth.plugins.sinks import aws_s3_sink
+
+        assert symbol not in vars(aws_s3_sink), f"{symbol} is declared but never raised; it claims a guard the sink lacks"
