@@ -27,19 +27,7 @@ from elspeth.contracts.schema_contract_factory import create_contract_from_confi
 from elspeth.plugins.infrastructure.base import BaseSource
 from elspeth.plugins.infrastructure.config_base import SourceDataConfig
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
-
-
-def _contains_surrogateescape_chars(value: str) -> bool:
-    """Return True when value contains surrogateescape-decoded bytes."""
-    return any(0xDC80 <= ord(char) <= 0xDCFF for char in value)
-
-
-def _surrogateescape_line_to_bytes(value: str, encoding: str) -> bytes:
-    """Encode a surrogateescape-decoded line back to bytes for quarantine."""
-    try:
-        return value.encode(encoding, errors="surrogateescape")
-    except UnicodeEncodeError:
-        return value.encode("utf-8", errors="surrogateescape")
+from elspeth.plugins.sources.json_source import BYTE_ESCAPE_ERRORS, contains_escaped_bytes, escaped_line_to_bytes
 
 
 class TextSourceConfig(SourceDataConfig):
@@ -78,7 +66,7 @@ class TextSource(BaseSource):
     name = "text"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:7ca541ba2dd25398"
+    source_file_hash: str | None = "sha256:1010c5ab7ec5d18f"
     config_model = TextSourceConfig
     _on_validation_failure: str
 
@@ -161,10 +149,13 @@ class TextSource(BaseSource):
         skipped_blank_lines = 0
 
         try:
-            with open(self._path, encoding=self._encoding, errors="surrogateescape", newline="") as f:
+            # BYTE_ESCAPE_ERRORS keeps an undecodable code unit on its own line
+            # for every codec; surrogateescape cannot for UTF-16/UTF-32, where
+            # the decode error aborted the whole read-ahead chunk.
+            with open(self._path, encoding=self._encoding, errors=BYTE_ESCAPE_ERRORS, newline="") as f:
                 for line_num, raw_line in enumerate(f, start=1):
-                    if _contains_surrogateescape_chars(raw_line):
-                        raw_bytes = _surrogateescape_line_to_bytes(raw_line, self._encoding)
+                    if contains_escaped_bytes(raw_line):
+                        raw_bytes = escaped_line_to_bytes(raw_line, self._encoding)
                         quarantined = self._record_parse_error(
                             ctx=ctx,
                             row={
@@ -198,6 +189,9 @@ class TextSource(BaseSource):
                         source_row_index=line_num - 1,
                     )
         except UnicodeDecodeError as exc:
+            # Reached only when a codec refuses the stream outright, bypassing
+            # the error handler (utf-16/utf-32 without a BOM raise at the start
+            # of the stream, before any line is read).
             error_line = line_num + 1 if line_num > 0 else 1
             quarantined = self._record_parse_error(
                 ctx=ctx,
