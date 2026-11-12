@@ -21,7 +21,9 @@ from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError, require_scalar_group_key
 from elspeth.plugins.transforms._scalar_buckets import (
+    ConfiguredScalarLabel,
     append_unique_bucket_value,
+    require_matchable_configured_label,
     same_scalar_bucket_value,
     scalar_bucket_contains,
 )
@@ -86,9 +88,12 @@ class BatchPairedPreferenceConfig(TransformDataConfig):
     pair_field: str = Field(description="Field that identifies paired evaluation items")
     variant_field: str = Field(description="Field that identifies the prompt/model/treatment variant")
     score_field: str = Field(description="Numeric score field to compare within each pair")
-    baseline_variant: str | int | bool | None = Field(
+    baseline_variant: ConfiguredScalarLabel | None = Field(
         default=None,
-        description="Optional baseline variant. When omitted, the first-seen variant is the baseline.",
+        description=(
+            "Optional baseline variant (string, integer, number or boolean), matched by exact type. "
+            "When omitted, the first-seen variant is the baseline."
+        ),
     )
 
     @field_validator("pair_field")
@@ -114,10 +119,8 @@ class BatchPairedPreferenceConfig(TransformDataConfig):
 
     @field_validator("baseline_variant")
     @classmethod
-    def _reject_empty_baseline_variant(cls, v: str | int | bool | None) -> str | int | bool | None:
-        if type(v) is str and not v.strip():
-            raise ValueError("baseline_variant must not be empty")
-        return v
+    def _reject_unmatchable_baseline_variant(cls, v: str | int | float | bool | None) -> str | int | float | bool | None:
+        return require_matchable_configured_label(v, field_name="baseline_variant")
 
     @model_validator(mode="after")
     def _reject_field_collisions(self) -> BatchPairedPreferenceConfig:
@@ -132,7 +135,7 @@ class BatchPairedPreference(BaseTransform):
     name = "batch_paired_preference"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b4177c6dd3fe6a5e"
+    source_file_hash: str | None = "sha256:f4b3b3ae1c4c10ae"
     config_model = BatchPairedPreferenceConfig
     is_batch_aware = True
     # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
