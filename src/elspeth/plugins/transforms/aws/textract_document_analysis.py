@@ -343,7 +343,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:867e64a6669937f3"
+    source_file_hash: str | None = "sha256:a97410d662ec7aa7"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -822,10 +822,10 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 lambda: self._verify_bucket_region_live(bucket, state_id=state_id, token_id=token_id, ctx=ctx),
             )
         except BucketRegionUnverifiedError as error:
-            return TransformResult.error(
-                {"reason": "bucket_region_unverified", "error_type": error.code},
-                retryable=error.retryable,
-            )
+            unverified_reason: TransformErrorReason = {"reason": "bucket_region_unverified", "error_type": error.code}
+            if error.inherited:
+                unverified_reason["cache_status"] = "shared_failure"
+            return TransformResult.error(unverified_reason, retryable=error.retryable)
         result = self._process_verified_document(
             row,
             state_id=state_id,
