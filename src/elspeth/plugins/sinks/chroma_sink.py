@@ -66,16 +66,6 @@ from elspeth.plugins.sinks._diversion_attribution import build_diversion_attribu
 slog = structlog.get_logger(__name__)
 
 
-class _ChromaPayloadRejection(Exception):
-    """Chroma API rejected the payload with ValueError.
-
-    Wraps ValueError from Chroma write calls (upsert/add) so the error handler
-    can distinguish "Chroma rejected our data" (Tier 3) from "bug in our code"
-    (framework error). Without this, a broad ValueError catch would suppress
-    framework bugs in the surrounding code.
-    """
-
-
 if TYPE_CHECKING:
     from elspeth.contracts.contexts import LifecycleContext, SinkContext
     from elspeth.contracts.data import PluginSchema
@@ -217,7 +207,7 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
     name = "chroma_sink"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:6d60cdf04f34467a"
+    source_file_hash: str | None = "sha256:90d3261584bd70d4"
     config_model = ChromaSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
@@ -648,7 +638,28 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
                 metadatas=None if metadata is None else [metadata],  # type: ignore[list-item]
             )
         except ValueError as exc:
-            raise _ChromaPayloadRejection(str(exc)) from exc
+            # The Chroma SDK validates the request before any write and raises
+            # ValueError for a payload it will not accept (e.g. a reserved
+            # metadata key such as "chroma:document"). The try wraps only the
+            # upsert call, so this is the member's data being refused, not a
+            # bug in surrounding code: divert that member, as DataverseSink
+            # does for a row-attributable rejection, instead of failing the
+            # whole effect on every attempt.
+            reason = f"Chroma rejected the member payload: {exc}"
+            row = deep_thaw(member.row)
+            # Live diversion log BEFORE the durable result: fails closed with
+            # FrameworkBugError when no on_write_failure policy is configured.
+            self._divert_row(row, row_index=member.ordinal, reason=reason)
+            attribution = build_diversion_attribution(ordinal=member.ordinal, reason=reason)
+            return SinkEffectCommitResult(
+                descriptor=descriptor,
+                evidence={
+                    **self._member_group_evidence(plan, "diverted"),
+                    "diversion_attribution": [attribution.as_mapping()],
+                },
+                accepted_ordinals=tuple(item.ordinal for item in effect_input.members if item.ordinal != member.ordinal),
+                diverted_ordinals=(member.ordinal,),
+            )
         member_metadatas: list[dict[str, Any] | None] | None = None if metadata is None else [metadata]
         _, payload_size = self._compute_payload_hash([document_id], [document], member_metadatas)
         self._total_written += 1
