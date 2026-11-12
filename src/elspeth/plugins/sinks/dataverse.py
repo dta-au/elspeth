@@ -305,6 +305,24 @@ class DataverseSinkConfig(DataPluginConfig):
             )
         return self
 
+    @model_validator(mode="after")
+    def validate_lookup_keys_in_field_mapping(self) -> Self:
+        """Reject lookups keyed by a pipeline field that field_mapping does not read.
+
+        ``_map_row`` applies a lookup only while walking ``field_mapping``, so a
+        lookup whose key is not a ``field_mapping`` key would validate and then
+        never be written: every upsert would silently drop the binding.
+        """
+        if self.lookups:
+            unmapped = sorted(set(self.lookups) - set(self.field_mapping))
+            if unmapped:
+                raise ValueError(
+                    f"lookups keys {unmapped} are not field_mapping keys. A lookup binds the value of a "
+                    f"mapped pipeline field; add each lookup key to field_mapping. "
+                    f"Available field_mapping keys: {sorted(self.field_mapping)}"
+                )
+        return self
+
 
 # Rebuild model to resolve forward references
 DataverseSinkConfig.model_rebuild()
@@ -320,7 +338,7 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3911da9557b47ee8"
+    source_file_hash: str | None = "sha256:902733490be9e3cd"
     determinism = Determinism.EXTERNAL_CALL
     config_model = DataverseSinkConfig
     idempotent = True  # PATCH upsert is idempotent — safe for retries and crash recovery (engine does not yet read this flag)
