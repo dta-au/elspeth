@@ -78,3 +78,56 @@ def test_jsonl_invalid_line_reports_its_newline_line_number() -> None:
     assert result.reason["reason"] == "invalid_json"
     assert result.reason["phase"] == "jsonl_line"
     assert result.reason["line_number"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Finding #70 — blob_json_expand rejects NaN / Infinity at the parse boundary.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+@pytest.mark.parametrize("parse_format", ["json", "jsonl"])
+def test_non_finite_constant_is_quarantined_as_invalid_json(constant: str, parse_format: str) -> None:
+    record = '{"title": "t", "score": ' + constant + "}"
+    text = f"[{record}]" if parse_format == "json" else record + "\n"
+    transform = BlobJSONExpand(
+        {
+            "schema": {"mode": "observed", "guaranteed_fields": ["content"]},
+            "source": "field",
+            "format": parse_format,
+            "fields": ["title", "score"],
+        }
+    )
+
+    # On the pre-fix tree the parsed float('nan') escapes the parser and
+    # process() raises while inferring the output contract; record that as an
+    # assertion failure rather than letting it surface as a crash.
+    raised: ValueError | None = None
+    try:
+        result = transform.process(make_pipeline_row({"content": text}), make_context())
+    except ValueError as exc:
+        raised = exc
+    assert raised is None, f"non-finite constant escaped the JSON boundary: {raised!r}"
+
+    assert result.status == "error"
+    assert result.reason["reason"] == "invalid_json"
+    assert result.reason["error_type"] == "non_finite_constant"
+    assert result.reason["phase"] == ("document" if parse_format == "json" else "jsonl_line")
+
+
+def test_finite_numbers_still_parse() -> None:
+    """Negative control: ordinary floats are not refused by the constant hook."""
+    transform = BlobJSONExpand(
+        {
+            "schema": {"mode": "observed", "guaranteed_fields": ["content"]},
+            "source": "field",
+            "format": "json",
+            "fields": ["title", "score"],
+        }
+    )
+
+    result = transform.process(make_pipeline_row({"content": '[{"title": "t", "score": 1.5e3}]'}), make_context())
+
+    assert result.status == "success", result.reason
+    assert result.rows is not None
+    assert result.rows[0].to_dict()["score"] == 1500.0
