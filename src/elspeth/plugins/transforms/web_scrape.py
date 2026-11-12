@@ -347,7 +347,10 @@ class WebScrapeConfig(TransformDataConfig):
     )
     fingerprint_mode: Literal["content", "full"] = Field(
         default="content",
-        description="Whether fingerprints cover processed content only or the full fetch response context.",
+        description=(
+            "Hash of the extracted content with whitespace collapsed (content) or exactly as extracted (full); "
+            "neither mode covers HTTP status, final URL, headers, or the raw body."
+        ),
     )
     strip_elements: list[str] = Field(
         default_factory=lambda: ["script", "style"],
@@ -820,7 +823,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:1ecbd3ab145d2c04"
+    source_file_hash: str | None = "sha256:43c6990e1378a7d4"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
