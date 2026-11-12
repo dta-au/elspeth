@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import csv
+import os
+import time
 from pathlib import Path
 
 import pytest
 
 from elspeth.contracts.sink_effects import SinkEffectInputKind, SinkEffectInspectionRequest
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.plugins.sinks import _audit_export_bundle_effects as bundle_effects
 from elspeth.plugins.sinks import _local_file_effects as local_effects
 from elspeth.plugins.sinks import database_sink as database_sink_module
 from elspeth.plugins.sinks.csv_sink import CSVSink, CSVSinkConfig
 from elspeth.plugins.sinks.database_sink import DatabaseSink
 from tests.fixtures.base_classes import inject_write_failure
+from tests.unit.plugins.sinks.test_audit_export_bundle_effects import _prepare as _prepare_bundle
 from tests.unit.plugins.sinks.test_local_file_sink_effects import _prepare, _stage_path
 
 
@@ -194,3 +198,45 @@ def test_local_effect_admission_scales_with_bytes_and_stays_pre_write(tmp_path: 
     assert len(calls) <= total // (64 * 1024) + 3
     assert all(on_disk <= admitted for admitted, on_disk in calls)
     assert [admitted for admitted, _ in calls][-1] == total
+
+
+# --- Finding #14: the stale-scratch sweep must not delete a live prepare's building tree ---
+
+
+def test_stale_sweep_spares_a_live_prepares_building_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    parent = tmp_path / "exports"
+    parent.mkdir()
+    target = parent / "audit"
+    real_parse = bundle_effects._parse_verified_records
+    sweeps: list[int] = []
+
+    def parse_while_a_concurrent_export_sweeps(effect_input, portable_records):
+        # A long verified-snapshot pass: the building tree exists, is empty, and
+        # its mtime is already past the stale threshold when another export of
+        # the same parent preflights and sweeps.
+        (building,) = parent.glob(".audit.elspeth-*.building-*")
+        old = time.time() - 2 * 60 * 60
+        os.utime(building, (old, old))
+        removed = bundle_effects.cleanup_stale_audit_export_bundle_scratch(parent)
+        sweeps.append(removed)
+        assert removed == 0, "stale-scratch sweep removed a live prepare's building tree"
+        assert building.is_dir()
+        return real_parse(effect_input, portable_records)
+
+    monkeypatch.setattr(bundle_effects, "_parse_verified_records", parse_while_a_concurrent_export_sweeps)
+
+    plan = _prepare_bundle(target)
+
+    assert sweeps == [0]
+    assert Path(str(plan.safe_evidence["staging_path"])).is_dir()
+
+
+def test_stale_sweep_still_removes_an_abandoned_building_tree(tmp_path: Path) -> None:
+    abandoned = tmp_path / f".audit.elspeth-{'e' * 64}.building-abc123"
+    abandoned.mkdir()
+    (abandoned / "runs.csv").write_bytes(b"record_type\n")
+    old = time.time() - 2 * 60 * 60
+    os.utime(abandoned, (old, old))
+
+    assert bundle_effects.cleanup_stale_audit_export_bundle_scratch(tmp_path) == 1
+    assert not abandoned.exists()
