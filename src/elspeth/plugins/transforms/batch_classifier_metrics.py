@@ -6,7 +6,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal, cast
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, StrictBool, StrictInt, StrictStr, field_validator, model_validator
 
 from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
@@ -121,8 +121,10 @@ class BatchClassifierMetricsConfig(TransformDataConfig):
         str,
         EmittedToOutput("batch_classifier_metrics writes this configured input-field name into each metrics row and its summary text"),
     ] = Field(description="Name of the field containing predicted labels")
+    # Strict members: label identity is type-strict and data labels refuse
+    # float, so 1.0 must be refused here rather than lax-coerced to int 1.
     positive_label: Annotated[
-        str | int | bool | None,
+        StrictStr | StrictInt | StrictBool | None,
         EmittedToOutput(
             "batch_classifier_metrics writes this label back into the emitted metrics row, "
             "and it reaches the durable audit config snapshot unconditionally"
@@ -175,7 +177,7 @@ class BatchClassifierMetrics(BaseTransform):
     name = "batch_classifier_metrics"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:39baa56eede74f4a"
+    source_file_hash: str | None = "sha256:a249ce5e1eb62230"
     config_model = BatchClassifierMetricsConfig
     is_batch_aware = True
     # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
@@ -448,6 +450,33 @@ class BatchClassifierMetrics(BaseTransform):
                     rows.append({"actual": actual, "predicted": predicted, "count": count})
         return rows
 
+    def _positive_label_type_mismatch_error(self, labels: list[LabelValue]) -> TransformResult | None:
+        """Fail the batch when the positive label is present under another type.
+
+        Label identity is type-strict (True is not 1), so a configured
+        positive_label of '1' or True against int labels would be "absent" and
+        every actual positive would be counted as a true negative: a plausible
+        all-negative result that is wrong. A label equal by value or by text
+        but of a different type is a misconfiguration, so the batch fails. The
+        reason names the two TYPES only, never a label value.
+        """
+        positive = self._positive_label
+        for label in labels:
+            if label == positive or str(label) == str(positive):
+                reason: TransformErrorReason = {
+                    "reason": "validation_failed",
+                    "cause": "positive_label_type_mismatch",
+                    "field": self._actual_field,
+                    "expected": type(positive).__name__,
+                    "actual_type": type(label).__name__,
+                    "error": (
+                        f"positive_label is a {type(positive).__name__} but the batch carries an equal "
+                        f"{type(label).__name__} label; labels match by exact type"
+                    ),
+                }
+                return TransformResult.error(reason, retryable=False)
+        return None
+
     def _build_result_row(
         self,
         *,
@@ -457,6 +486,9 @@ class BatchClassifierMetrics(BaseTransform):
     ) -> tuple[BatchClassifierMetricsRow, TransformResult | None]:
         labels = self._labels_for(pairs)
         if self._positive_label is not None and not scalar_bucket_contains(labels, self._positive_label):
+            mismatch_error = self._positive_label_type_mismatch_error(labels)
+            if mismatch_error is not None:
+                return {}, mismatch_error
             # A configured positive_label absent from the batch is legitimate data,
             # not a config fault: rare-positive monitoring (fraud/defects) expects
             # all-negative batches. Include it as a label so its binary metrics come
