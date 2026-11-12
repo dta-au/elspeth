@@ -93,3 +93,72 @@ class TestFinding29S3ClosedLifecycle:
         from elspeth.plugins.sinks import aws_s3_sink
 
         assert symbol not in vars(aws_s3_sink), f"{symbol} is declared but never raised; it claims a guard the sink lacks"
+
+
+_FIXED_NAME_SCHEMA: dict[str, Any] = {"mode": "fixed", "fields": ["name: str"]}
+
+
+def _preflight_outcome(sink: Any, rows: list[dict[str, object]]) -> tuple[BaseException | None, int]:
+    """Run the per-member preflight; return (raised exception, diverted row count)."""
+    from elspeth.contracts.sink_effects import SinkEffectPipelineMembersInput
+    from tests.unit.plugins.sinks.test_remote_object_sink_effects import _member
+
+    members = tuple(_member(index, row) for index, row in enumerate(rows))
+    effect_input = SinkEffectPipelineMembersInput(
+        members=members,
+        target_snapshot_members=members,
+        target_delivered_member_count=len(members),
+    )
+    raised: BaseException | None = None
+    try:
+        sink._preflight_effect_members(effect_input)
+    except Exception as exc:
+        raised = exc
+    return raised, len(sink._get_diversions())
+
+
+class TestFinding28S3ProbeChecksDisplayHeader:
+    """#28: the S3 per-row probe must check the header bytes the final object writes."""
+
+    @staticmethod
+    def _sink(**overrides: object) -> Any:
+        from tests.unit.plugins.sinks.test_remote_object_sink_effects import _s3, _S3Store
+
+        config: dict[str, object] = {
+            "key": "runs/{{ run_id }}/out.csv",
+            "format": "csv",
+            "schema": _FIXED_NAME_SCHEMA,
+        }
+        config.update(overrides)
+        return _s3(_S3Store(), **config)
+
+    def test_unencodable_custom_header_is_a_config_error_not_a_row_failure(self) -> None:
+        from elspeth.plugins.sinks.aws_s3_sink import S3RecordSerializationError
+
+        sink = self._sink(csv_options={"encoding": "ascii"}, headers={"name": "Café"})
+
+        raised, diverted = _preflight_outcome(sink, [{"name": "bob"}, {"name": "alice"}])
+
+        assert isinstance(raised, ValueError), "the probe must check the display header the final object writes"
+        assert not isinstance(raised, S3RecordSerializationError), "a header defect is not row-attributable"
+        assert diverted == 0
+        assert "Café" not in str(raised)
+
+    def test_oversized_custom_header_is_a_config_error_not_a_row_failure(self) -> None:
+        from elspeth.plugins.sinks.aws_s3_sink import S3RecordSerializationError
+
+        sink = self._sink(headers={"name": "H" * 64}, max_record_chars=32)
+
+        raised, diverted = _preflight_outcome(sink, [{"name": "bob"}])
+
+        assert isinstance(raised, ValueError), "the probe must apply max_record_chars to the display header"
+        assert not isinstance(raised, S3RecordSerializationError)
+        assert diverted == 0
+
+    def test_encodable_custom_header_still_passes_the_probe(self) -> None:
+        sink = self._sink(csv_options={"encoding": "latin-1"}, headers={"name": "Café"})
+
+        raised, diverted = _preflight_outcome(sink, [{"name": "bob"}])
+
+        assert raised is None
+        assert diverted == 0
