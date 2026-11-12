@@ -355,3 +355,42 @@ class TestFinding66AzureJsonStreaming:
 
         body = Path(str(plan.safe_evidence["staging_path"])).read_bytes()
         assert body == json.dumps(rows, indent=2).encode("utf-8")
+
+
+class TestFinding19AzureSourceCsvDecodesPerRecord:
+    """#19: one undecodable CSV byte must quarantine its record, not the whole blob."""
+
+    @staticmethod
+    def _load(blob: bytes, monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+        from elspeth.plugins.sources.azure_blob_source import AzureBlobSource
+        from tests.fixtures.factories import make_operation_context
+        from tests.unit.plugins.sources.test_azure_blob_source import _fake_blob_service
+
+        source = AzureBlobSource(
+            {
+                "connection_string": "DefaultEndpointsProtocol=https;AccountName=fake;AccountKey=ZmFrZQ==;EndpointSuffix=core.windows.net",
+                "container": "c",
+                "blob_path": "in.csv",
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "quarantine",
+            }
+        )
+        service = _fake_blob_service(blob)
+        monkeypatch.setattr(_PATCH_SERVICE_CLIENT, lambda _self: service)
+        return list(source.load(make_operation_context(plugin_name="azure_blob")))
+
+    def test_bad_byte_quarantines_only_its_record(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        rows = self._load(b"id,name\n1,a\n2,\xff\n3,c\n", monkeypatch)
+
+        assert [row.is_quarantined for row in rows] == [False, True, False]
+        assert [rows[0].row["id"], rows[2].row["id"]] == ["1", "3"]
+        quarantined = rows[1].row
+        assert quarantined["__line_number__"] == "3"
+        assert quarantined["__raw_bytes_hex__"] == b"2,\xff".hex()
+
+    def test_undecodable_header_still_quarantines_the_file(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        rows = self._load(b"\xff\xfe\n1,a\n", monkeypatch)
+
+        assert len(rows) == 1
+        assert rows[0].is_quarantined is True
+        assert "decode" in rows[0].quarantine_error.lower()
