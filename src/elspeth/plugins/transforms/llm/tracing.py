@@ -196,8 +196,9 @@ def parse_tracing_config(config: dict[str, Any] | None) -> TracingConfig | None:
     if config is None:
         return None
 
-    # "provider" absence is a valid shorthand for "no tracing": it is the
-    # discriminator, not data, so its absence is read by membership.
+    # "provider" absence is a valid shorthand for "no tracing" only when no
+    # other key is given (``{}``): it is the discriminator, not data, so its
+    # absence is read by membership; the 'none' arm refuses extra keys.
     provider = config["provider"] if "provider" in config else "none"
 
     # Pass remaining config fields through to the dataclass, which owns all
@@ -211,6 +212,16 @@ def parse_tracing_config(config: dict[str, Any] | None) -> TracingConfig | None:
         case "langfuse":
             return LangfuseTracingConfig(**fields)
         case "none":
+            # 'none' carries no settings. Keys beside it mean the operator
+            # configured a destination but omitted (or mistyped as none) the
+            # provider; dropping them would disable tracing silently. Name
+            # the keys only: their values may be credentials.
+            if fields:
+                raise ValueError(
+                    f"Tracing provider resolved to 'none' (provider {'omitted' if 'provider' not in config else 'none'}) "
+                    f"but other tracing keys were given: {sorted(fields)}. Set provider to "
+                    f"{', '.join(sorted(SUPPORTED_TRACING_PROVIDERS - {'none'}))}, or remove the other keys to disable tracing."
+                )
             return TracingConfig(provider="none")
         case _:
             raise ValueError(
