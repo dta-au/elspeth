@@ -77,7 +77,8 @@ class _RowRejectingClient:
             )
         self.stored.add(key)
 
-    def get_page(self, url: str) -> DataversePageResponse:
+    def get_page(self, url: str, *, annotations: tuple[str, ...] = ()) -> DataversePageResponse:
+        del annotations
         key = self._key_from_url(url)
         if key not in self.stored:
             raise DataverseClientError("Not found", retryable=False, status_code=404)

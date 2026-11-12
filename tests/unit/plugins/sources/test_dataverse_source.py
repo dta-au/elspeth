@@ -1245,7 +1245,8 @@ class TestDataverseSourceLoadStructured:
                 events.append("dispatch:metadata")
                 return metadata_page
 
-            def get_pages(url: str) -> Any:
+            def get_pages(url: str, *, annotations: tuple[str, ...]) -> Any:
+                assert annotations == ()
                 before_request(url, {})
                 events.append("dispatch:page")
                 yield data_page
@@ -1317,7 +1318,8 @@ class TestDataverseSourceLoadStructured:
                 before_request(url, {})
                 return metadata_page
 
-            def get_pages(url: str) -> Any:
+            def get_pages(url: str, *, annotations: tuple[str, ...]) -> Any:
+                assert annotations == ()
                 before_request(url, {})
                 events.append("page dispatched")
                 yield _make_page([{"contactid": "1"}])

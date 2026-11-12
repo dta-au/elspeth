@@ -329,6 +329,41 @@ def build_llm_call_request(
     )
 
 
+_RECORDED_RESPONSE_FIELDS = frozenset(
+    {
+        "content",
+        "model",
+        "usage",
+        "raw_response",
+        "pricing_model",
+        "provider_cost",
+        "provider_cost_source",
+    }
+)
+
+
+def _rebuild_recorded_response(evidence: ReplayCallEvidence) -> LLMCallResponse:
+    """Rebuild the exact typed response DTO a source run recorded for replay."""
+    response_data = evidence.response_data
+    if response_data is None:
+        raise ValueError("Recorded LLM call has no response payload")
+    if set(response_data) != _RECORDED_RESPONSE_FIELDS:
+        raise ValueError("Recorded LLM response has incomplete fields")
+    usage_data = response_data["usage"]
+    usage = TokenUsage.from_dict(usage_data)
+    if usage.to_dict() != usage_data:
+        raise ValueError("Recorded LLM usage is malformed")
+    return LLMCallResponse(
+        content=response_data["content"],
+        model=response_data["model"],
+        usage=usage,
+        raw_response=response_data["raw_response"],
+        pricing_model=response_data["pricing_model"],
+        provider_cost=response_data["provider_cost"],
+        provider_cost_source=response_data["provider_cost_source"],
+    )
+
+
 class AuditedLLMClient(AuditedClientBase):
     """LLM client that automatically records all calls to audit trail.
 
@@ -438,8 +473,6 @@ class AuditedLLMClient(AuditedClientBase):
             error = evidence.error_data
             if error is None:
                 raise ValueError("Recorded LLM error has no error payload")
-            if evidence.response_data is not None:
-                raise ValueError("Recorded LLM response-processing error cannot be reproduced exactly")
             if set(error) != {"type", "message", "retryable", "pricing_model", "provider_cost", "provider_cost_source", "category"}:
                 raise ValueError("Recorded LLM error lacks a complete public classification")
             retryable = error["retryable"]
@@ -466,15 +499,32 @@ class AuditedLLMClient(AuditedClientBase):
                 provider_cost_source=cast(ComposerLLMProviderCostSource, raw_cost_source),
                 category=category,
             )
+            # The only live ERROR branch that retains a typed response payload
+            # AND a replayable classification is the null-content
+            # (content-filtered) completion: it records LLMCallResponse(content="")
+            # with a content_policy ContentPolicyError. Rebuild that payload so
+            # the replay record carries the same evidence as the source, and
+            # refuse every other response-bearing error (response_processing is
+            # already refused above).
+            recorded_response: LLMCallResponse | None = None
+            if evidence.response_data is not None:
+                if category != "content_policy" or error_type != "ContentPolicyError":
+                    raise ValueError("Recorded LLM error with a response payload is not a content-filtered completion")
+                recorded_response = _rebuild_recorded_response(evidence)
+                if recorded_response.content != "":
+                    raise ValueError("Recorded content-filtered LLM response has non-empty content")
+            replay_usage = UNKNOWN_TOKEN_USAGE if recorded_response is None else recorded_response.usage
             self._record_image_call(
                 messages=messages,
                 call_index=call_index,
                 call_type=CallType.LLM,
                 status=CallStatus.ERROR,
                 request_data=request_dto,
+                response_data=recorded_response,
                 error=error_dto,
                 latency_ms=evidence.latency_ms,
                 approved_prompt_artifact_hash=approved_prompt_artifact_hash,
+                token_usage=replay_usage,
                 source_call_id=evidence.source_call_id,
             )
             self._emit_telemetry_after_audit(
@@ -482,9 +532,9 @@ class AuditedLLMClient(AuditedClientBase):
                 latency_ms=0.0 if evidence.latency_ms is None else evidence.latency_ms,
                 request_data=request_dto.to_dict(),
                 request_payload=request_dto,
-                response_data=None,
-                response_payload=None,
-                token_usage=None,
+                response_data=None if recorded_response is None else recorded_response.to_dict(),
+                response_payload=recorded_response,
+                token_usage=replay_usage if replay_usage.has_data else None,
             )
             if category == "rate_limit":
                 raise RateLimitError(error_dto.message)
@@ -499,33 +549,10 @@ class AuditedLLMClient(AuditedClientBase):
             raise LLMClientError(error_dto.message, retryable=False)
         if evidence.status is not CallStatus.SUCCESS or evidence.error_data is not None:
             raise ValueError("Recorded LLM call has an unsupported status or error payload")
-        response_data = evidence.response_data
-        if response_data is None:
+        if evidence.response_data is None:
             raise ValueError("Recorded LLM success has no response payload")
-        required_fields = {
-            "content",
-            "model",
-            "usage",
-            "raw_response",
-            "pricing_model",
-            "provider_cost",
-            "provider_cost_source",
-        }
-        if set(response_data) != required_fields:
-            raise ValueError("Recorded LLM response has incomplete fields")
-        usage_data = response_data["usage"]
-        usage = TokenUsage.from_dict(usage_data)
-        if usage.to_dict() != usage_data:
-            raise ValueError("Recorded LLM usage is malformed")
-        response_dto = LLMCallResponse(
-            content=response_data["content"],
-            model=response_data["model"],
-            usage=usage,
-            raw_response=response_data["raw_response"],
-            pricing_model=response_data["pricing_model"],
-            provider_cost=response_data["provider_cost"],
-            provider_cost_source=response_data["provider_cost_source"],
-        )
+        response_dto = _rebuild_recorded_response(evidence)
+        usage = response_dto.usage
         response = LLMResponse(
             content=response_dto.content,
             model=response_dto.model,

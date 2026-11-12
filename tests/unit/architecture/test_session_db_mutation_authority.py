@@ -6167,7 +6167,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "3e92055687329a54",
         1,
         None,
-        line=500,
+        line=506,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -6178,7 +6178,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "cb69520a77f4030e",
         1,
         None,
-        line=913,
+        line=934,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -6186,10 +6186,10 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "DatabaseSink.commit_effect",
         "<sessions-write-connection>",
         "write_connection",
-        "a1ed0f32c96a6da4",
+        "f259e8651bc82bb6",
         1,
         None,
-        line=933,
+        line=954,
         connection_escape=True,
     ),
     # ``with LandscapeDB.from_url(...) as database`` then ``database.engine

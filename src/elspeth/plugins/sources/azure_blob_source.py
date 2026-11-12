@@ -28,9 +28,11 @@ from elspeth.contracts.contract_builder import ContractBuilder, ContractFieldLim
 from elspeth.contracts.enums import RunMode
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.identifiers import validate_field_names
+from elspeth.contracts.json_parser import check_json_depth
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
+from elspeth.contracts.source_read_verification import MAX_JSON_DEPTH
 from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
 from elspeth.plugins.infrastructure.azure_auth import AzureAuthConfig, AzureAuthMethod
 from elspeth.plugins.infrastructure.base import BaseSource
@@ -424,7 +426,7 @@ class AzureBlobSource(BaseSource):
     name = "azure_blob"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:c5f9aa22ec4da71d"
+    source_file_hash: str | None = "sha256:5cdeb02ae492c2f7"
     config_model = AzureBlobSourceConfig
 
     usage_when_to_use: str = (
@@ -982,6 +984,10 @@ class AzureBlobSource(BaseSource):
             return
 
         try:
+            # Bound nesting before decoding: a deep document either makes the
+            # C decoder raise RecursionError or decodes into rows too deep for
+            # the schema walker and audit hashing. Both must quarantine here.
+            check_json_depth(text_data, max_depth=MAX_JSON_DEPTH)
             data = json.loads(text_data, parse_constant=reject_nonfinite_constant)
         except (json.JSONDecodeError, ValueError) as e:
             error_msg = f"Invalid JSON in blob: {e}"
@@ -1061,6 +1067,8 @@ class AzureBlobSource(BaseSource):
 
                 # Catch JSON parse errors at the trust boundary
                 try:
+                    # Same nesting bound as the JSON-array path, per line.
+                    check_json_depth(line, max_depth=MAX_JSON_DEPTH)
                     row = json.loads(line, parse_constant=reject_nonfinite_constant)
                 except (json.JSONDecodeError, ValueError) as e:
                     # External data parse failure - quarantine, don't crash
