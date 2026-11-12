@@ -282,3 +282,34 @@ class TestRagProviderRegistryBrokenInstall:
                 provider_config={"collection": "test-index", "mode": "ephemeral"},
                 schema_config={"mode": "observed"},
             )
+
+
+# --- Finding #110: type_coerce does not read a blank string as a definite False ---
+
+
+class TestCoerceToBoolBlankString:
+    """#110: '' and whitespace-only strings are not booleans; they fail like any unrecognised string."""
+
+    @pytest.mark.parametrize("blank", ["", " ", "   ", "\t", "\n"])
+    def test_blank_string_is_not_a_boolean(self, blank: str) -> None:
+        from elspeth.plugins.transforms.type_coerce import CoercionError, coerce_to_bool
+
+        with pytest.raises(CoercionError) as exc_info:
+            coerce_to_bool(blank)
+        assert exc_info.value.failure == "not_boolean_string"
+        assert exc_info.value.target_type == "bool"
+
+    def test_unrecognised_string_fails_the_same_way(self) -> None:
+        """Negative control: the failure mode the blank cases must match."""
+        from elspeth.plugins.transforms.type_coerce import CoercionError, coerce_to_bool
+
+        with pytest.raises(CoercionError) as exc_info:
+            coerce_to_bool("maybe")
+        assert exc_info.value.failure == "not_boolean_string"
+
+    def test_recognised_false_strings_still_coerce(self) -> None:
+        """Negative control: removing the blank mapping leaves the real false spellings intact."""
+        from elspeth.plugins.transforms.type_coerce import coerce_to_bool
+
+        for val in ["false", "0", "no", "n", "off", "  OFF  "]:
+            assert coerce_to_bool(val) is False, f"Expected False for {val!r}"
