@@ -11,6 +11,12 @@ import pytest
 
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.plugins.infrastructure.clients.llm import ContentPolicyError, LLMClientError, NetworkError
+from elspeth.plugins.sources.llm.config import (
+    AzureOpenAILLMSourceConfig,
+    GatewayLLMSourceConfig,
+    LLMSourceConfig,
+    OpenRouterLLMSourceConfig,
+)
 from elspeth.plugins.transforms.llm.provider import LLMAuditParent
 from elspeth.plugins.transforms.llm.providers.gateway import _validate_gateway_success_response, _validate_readyz_payload
 from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterLLMProvider
@@ -271,3 +277,38 @@ class TestAzureEmptyContentClassification:
         raised = _azure_empty_completion_error("", "tool_calls")
         assert type(raised) is LLMClientError
         assert "tool_calls" in str(raised)
+
+
+# ---------------------------------------------------------------------------
+# Finding #128: every LLM source config hides its api_key from repr/str
+# ---------------------------------------------------------------------------
+
+_SOURCE_KEY_SENTINEL = "SENTINEL-source-api-key-4b9d"  # secret-scan: allow-this-line
+_SOURCE_COMMON: dict[str, Any] = {
+    "prompt_template": "Summarise the audit topic.",
+    "schema": {"mode": "observed"},
+    "on_validation_failure": "discard",
+}
+
+
+class TestLLMSourceConfigHidesApiKey:
+    @pytest.mark.parametrize(
+        ("config_cls", "options"),
+        [
+            pytest.param(
+                AzureOpenAILLMSourceConfig,
+                {"provider": "azure", "deployment_name": "gpt-4o-mini", "endpoint": "https://example.openai.azure.com"},
+                id="azure",
+            ),
+            pytest.param(OpenRouterLLMSourceConfig, {"provider": "openrouter", "model": "openai/gpt-4o-mini"}, id="openrouter"),
+            pytest.param(
+                GatewayLLMSourceConfig,
+                {"provider": "gateway", "model": "summariser", "endpoint": "https://gateway.example/v1"},
+                id="gateway",
+            ),
+        ],
+    )
+    def test_api_key_is_not_in_repr_or_str(self, config_cls: type[LLMSourceConfig], options: dict[str, Any]) -> None:
+        config = config_cls.from_dict({**_SOURCE_COMMON, **options, "api_key": _SOURCE_KEY_SENTINEL})
+        assert _SOURCE_KEY_SENTINEL not in repr(config)
+        assert _SOURCE_KEY_SENTINEL not in str(config)
