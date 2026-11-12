@@ -1023,7 +1023,12 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # bounds nesting before decode; its manifest provenance token moved
 # 204c8485e712dc75 -> 35519150141e19b9, the manifest's only changed byte run.
 # Captured from this file's parity failure (previous pin b14d1da8...).
-EXPECTED_CASE_REGISTRY_SHA256 = "70bb6809b9fa28b1888034ce64774a2a6c7f2116697bff9a41c746915704cab9"
+# Sweep finding #42 (20261111-plugins-review): JSONSource decodes JSONL with a
+# byte-escaping error handler so one bad UTF-16/32 code unit stays on its line;
+# its manifest provenance token moved 35519150141e19b9 -> 098f17f23ccb7c66,
+# the manifest's only changed byte run. Captured from this file's parity
+# failure (previous pin 70bb6809...).
+EXPECTED_CASE_REGISTRY_SHA256 = "b88cee62734c81e1f2dc013787349c9c1b1b623235b942b678036dd857a16c5d"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
