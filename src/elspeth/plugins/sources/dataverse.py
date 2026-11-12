@@ -150,6 +150,7 @@ class DataverseSourceConfig(DataPluginConfig):
     )
     top: int | None = Field(
         default=None,
+        ge=1,
         description="$top limit (None = all records)",
     )
 
@@ -212,9 +213,10 @@ class DataverseSourceConfig(DataPluginConfig):
         for index, select_name in enumerate(v):
             if not select_name or not select_name.strip():
                 raise ValueError(f"select[{index}] cannot be empty")
-            stripped = select_name.strip()
-            reject_operator_required_placeholder_value(stripped, field_name=f"select[{index}]")
-            stripped_fields.append(stripped)
+            # Each entry is joined unencoded into ``$select=``, so it must be a
+            # Dataverse logical name: '#', '&', ',' or whitespace would end or
+            # rewrite the query string (lookup columns like ``_x_value`` match).
+            stripped_fields.append(_validate_dataverse_logical_name(select_name.strip(), field_name=f"select[{index}]"))
         return stripped_fields
 
     @model_validator(mode="after")
@@ -294,7 +296,7 @@ class DataverseSource(BaseSource):
     _normalizes_external_names = True
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a6da227d8a3dfe57"
+    source_file_hash: str | None = "sha256:61dbcacae8dedacd"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 

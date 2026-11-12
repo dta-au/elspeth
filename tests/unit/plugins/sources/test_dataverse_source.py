@@ -557,7 +557,7 @@ class TestDataverseSourceConfigValidation:
         with pytest.raises(PluginConfigError, match="placeholder"):
             DataverseSourceConfig.from_dict(_base_config(select=[select_field]))
 
-    @pytest.mark.parametrize("select_field", ["todo", "unknown", "unset", "required", "<literal>"])
+    @pytest.mark.parametrize("select_field", ["todo", "unknown", "unset", "required"])
     def test_plain_placeholder_words_can_be_select_fields(self, select_field: str) -> None:
         from elspeth.plugins.sources.dataverse import DataverseSourceConfig
 
