@@ -510,3 +510,70 @@ def test_f114_remaining_fields_make_no_call_after_the_row_deadline(monkeypatch: 
     assert result.reason["reason"] == "retry_timeout"
     assert result.reason["field"] == "second"
     assert result.retryable is False
+
+
+# ---------------------------------------------------------------------------
+# Finding #144: local guardrail input rejection is not a service failure.
+# ---------------------------------------------------------------------------
+
+
+def _f144_started_transform() -> tuple[Any, Any, _F144RefusingSDK]:
+    from elspeth.plugins.transforms.aws.bedrock_prompt_shield import AWSBedrockPromptShield
+
+    transform = AWSBedrockPromptShield(
+        {
+            "guardrail_identifier": "privateguardrail",
+            "guardrail_version": "7",
+            "region": "us-east-1",
+            "fields": ["prompt"],
+            "schema": {"mode": "observed"},
+        }
+    )
+    sdk = _F144RefusingSDK()
+    transform._sdk_client = sdk
+    landscape = _F50Execution()
+    context = make_context(landscape=landscape, **mock_item_audit_authority())
+    transform.on_start(context)
+    return transform, context, sdk
+
+
+class _F144RefusingSDK:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def apply_guardrail(self, **_kwargs: Any) -> Any:
+        self.calls += 1
+        raise AssertionError("no Bedrock call may be made for locally rejected input")
+
+    def close(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize(
+    ("value", "error_type"),
+    [
+        pytest.param("", "empty_field", id="empty"),
+        pytest.param("x" * 1_000_001, "field_too_long", id="over_length"),
+    ],
+)
+def test_f144_locally_rejected_field_is_invalid_input_not_a_service_failure(value: str, error_type: str) -> None:
+    transform, context, sdk = _f144_started_transform()
+
+    result = transform.process(make_pipeline_row({"prompt": value}), context)
+
+    assert result.status == "error"
+    assert result.reason == {"reason": "invalid_input", "field": "prompt", "error_type": error_type}
+    assert result.retryable is False
+    assert sdk.calls == 0
+
+
+def test_f144_internal_invariant_value_error_is_not_masked_as_a_row_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    transform, context, _sdk = _f144_started_transform()
+
+    def broken_invariant(_client: Any, **_kwargs: Any) -> Any:
+        raise ValueError("required_filters must name a supported closed policy")
+
+    monkeypatch.setattr(BedrockGuardrailsClient, "apply_guardrail", broken_invariant)
+
+    with pytest.raises(ValueError, match="supported closed policy"):
+        transform.process(make_pipeline_row({"prompt": "hello"}), context)
