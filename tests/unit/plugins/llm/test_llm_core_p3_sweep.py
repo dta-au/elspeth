@@ -25,7 +25,7 @@ from elspeth.plugins.transforms.llm.langfuse import ActiveLangfuseTracer, Langfu
 from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig, QuerySpec
 from elspeth.plugins.transforms.llm.provider import FinishReason, LLMProvider, LLMQueryResult
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
-from elspeth.plugins.transforms.llm.tracing import LangfuseTracingConfig
+from elspeth.plugins.transforms.llm.tracing import LangfuseTracingConfig, TracingConfig, parse_tracing_config
 from elspeth.plugins.transforms.llm.transform import MultiQueryStrategy, SingleQueryStrategy
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_context
@@ -285,3 +285,25 @@ class TestFinding148RequiredImageEmptyList:
             max_images_per_call=20,
         )
         assert result == ()
+
+
+class TestFinding151TracingWithoutProviderDropsKeys:
+    """Sweep finding #151: a 'none' tracing config must not silently discard other keys."""
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            pytest.param({"connection_string": "InstrumentationKey=canary-value"}, id="provider-omitted"),
+            pytest.param({"provider": "none", "host": "https://canary-value.example.com"}, id="provider-none-with-keys"),
+        ],
+    )
+    def test_none_provider_with_other_keys_is_refused(self, config: dict[str, Any]) -> None:
+        raised = _raised_by(lambda: parse_tracing_config(config))
+        assert isinstance(raised, ValueError), f"expected ValueError, got {raised!r}"
+        message = str(raised)
+        assert "provider" in message
+        assert "canary-value" not in message
+
+    @pytest.mark.parametrize("config", [{}, {"provider": "none"}], ids=["empty", "explicit-none"])
+    def test_bare_none_config_still_means_no_tracing(self, config: dict[str, Any]) -> None:
+        assert parse_tracing_config(config) == TracingConfig(provider="none")
