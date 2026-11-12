@@ -27,6 +27,8 @@ from typing import Any, assert_never
 
 from elspeth.contracts.errors import TransformErrorReason
 from elspeth.contracts.freeze import deep_freeze
+from elspeth.contracts.json_parser import check_json_depth
+from elspeth.contracts.source_read_verification import MAX_JSON_DEPTH
 from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig, OutputFieldType, ResponseFormat
 
 
@@ -168,8 +170,11 @@ def validate_json_object_response(content: str) -> ValidationResult:
     Returns:
         ValidationSuccess with parsed dict, or ValidationError with details
     """
-    # Step 1: Parse JSON
+    # Step 1: Parse JSON. The nesting bound runs first: deep content either
+    # makes the decoder raise RecursionError or decodes into a value too deep
+    # to freeze; its ValueError carries a fixed message, never the content.
     try:
+        check_json_depth(content, max_depth=MAX_JSON_DEPTH)
         parsed = json.loads(content, parse_constant=reject_nonfinite_constant)
     except (json.JSONDecodeError, ValueError) as e:
         return ValidationError(
@@ -285,6 +290,8 @@ def extract_structured_fields(
         ({}, error reason dict carrying at least "reason") on failure.
     """
     try:
+        # Bound nesting before decoding (see validate_json_object_response).
+        check_json_depth(content, max_depth=MAX_JSON_DEPTH)
         parsed = json.loads(content, parse_constant=reject_nonfinite_constant)
     except (json.JSONDecodeError, ValueError) as e:
         # The response text is external content that echoes the prompt (row
