@@ -33,6 +33,10 @@ class _PayloadStoreFake:
     def retrieve(self, content_hash: str) -> bytes:
         return self.content_by_hash[content_hash]
 
+    def retrieve_bounded(self, content_hash: str, *, max_bytes: int) -> bytes | None:
+        content = self.content_by_hash[content_hash]
+        return None if len(content) > max_bytes else content
+
     def exists(self, content_hash: str) -> bool:
         return content_hash in self.content_by_hash
 
@@ -1125,7 +1129,7 @@ def test_blob_csv_expand_propagates_integrity_error_rather_than_routing_it() -> 
     """
 
     class _CorruptPayloadStore:
-        def retrieve(self, content_hash: str) -> bytes:
+        def retrieve_bounded(self, content_hash: str, *, max_bytes: int) -> bytes | None:
             raise IntegrityError(f"checksum mismatch for {content_hash}")
 
     blob_ref = _hash(b"id,name\n1,alice\n")
@@ -1180,7 +1184,7 @@ def test_blob_csv_expand_integrity_wins_when_an_error_is_both_kinds() -> None:
         """Both kinds at once — the shape a future hierarchy change would create."""
 
     class _AmbiguousPayloadStore:
-        def retrieve(self, content_hash: str) -> bytes:
+        def retrieve_bounded(self, content_hash: str, *, max_bytes: int) -> bytes | None:
             raise _CorruptAndMissingError(f"corrupt and missing: {content_hash}")
 
     blob_ref = _hash(b"id,name\n1,alice\n")
