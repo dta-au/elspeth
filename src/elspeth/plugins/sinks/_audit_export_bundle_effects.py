@@ -11,6 +11,7 @@ from __future__ import annotations
 import csv
 import ctypes
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -809,6 +810,10 @@ def _create_private_building_tree_at(parent_fd: int, target_name: str, effect_id
         descriptor = os.open(name, _directory_read_flags(), dir_fd=parent_fd)
         completed = False
         try:
+            # Liveness proof for the stale-scratch sweep: the exclusive flock is
+            # held on this descriptor until prepare closes it (or the process
+            # dies), so a sweep never deletes a tree whose prepare is running.
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             os.fchmod(descriptor, 0o700)
             identity = os.fstat(descriptor)
             observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -1232,6 +1237,10 @@ def _remove_scratch_path_at(parent_fd: int, name: str) -> bool:
     except OSError:
         return False
     try:
+        # A live prepare holds an exclusive flock on its building tree; an old
+        # mtime alone does not prove the tree was abandoned. A held lock raises
+        # BlockingIOError (an OSError), which skips the entry below.
+        fcntl.flock(directory_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         identity = os.fstat(directory_fd)
         child_names = os.listdir(directory_fd)
         for child_name in child_names:
@@ -1263,6 +1272,8 @@ def cleanup_stale_audit_export_bundle_scratch(
 
     Building trees are pre-staging scratch: prepare removes them in-process,
     so one only survives a hard crash and is never credited by recovery.
+    A building tree whose prepare is still running is skipped whatever its
+    mtime: prepare holds an exclusive flock on it for its whole lifetime.
     Never scans outside parent.
     """
     if older_than_seconds < 0 or type(max_entries) is not int or max_entries < 0:
