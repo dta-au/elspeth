@@ -24,18 +24,13 @@ Example:
         messages=[ChatMessage(role="user", content="Hello")],
     )
 
-For replay mode, use CallReplayer to return recorded responses:
-
-    from elspeth.plugins.infrastructure.clients import CallReplayer, ReplayMissError
-
-    replayer = CallReplayer(execution, source_run_id="run-abc123")
-    result = replayer.replay(call_type="llm", request_data={...})
-
-Verify mode has a single authority: the engine's
-``CallModeSession.verify_call`` (``elspeth.engine.orchestrator.call_mode_session``),
-which binds each source call to its parent, compares call status and error
-evidence, and records exact-hash verdicts. This package exports no separate
-verify comparator.
+Replay and verify modes each have a single authority in the engine:
+``CallModeSession.replay_call`` and ``CallModeSession.verify_call``
+(``elspeth.engine.orchestrator.call_mode_session``). They bind each source
+call to its parent, enforce the Tier-1 status/payload/error invariants, and
+record exact-hash evidence; the audited clients reach them through their
+call-mode adapters. This package exports no separate replayer or verify
+comparator.
 """
 
 from elspeth.plugins.infrastructure.clients.base import AuditedClientBase
@@ -50,26 +45,16 @@ from elspeth.plugins.infrastructure.clients.llm import (
     RateLimitError,
     ServerError,
 )
-from elspeth.plugins.infrastructure.clients.replayer import (
-    CallReplayer,
-    ReplayedCall,
-    ReplayMissError,
-    ReplayPayloadMissingError,
-)
 
 __all__ = [
     "AuditedClientBase",
     "AuditedHTTPClient",
     "AuditedLLMClient",
-    "CallReplayer",
     "ContentPolicyError",
     "ContextLengthError",
     "LLMClientError",
     "LLMResponse",
     "NetworkError",
     "RateLimitError",
-    "ReplayMissError",
-    "ReplayPayloadMissingError",
-    "ReplayedCall",
     "ServerError",
 ]

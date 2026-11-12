@@ -51,7 +51,7 @@ request and response payloads needed by transforms are checked before plugin
 lifecycle starts. Repeated source and runtime-preflight operations carry a
 durable occurrence index; old records with indistinguishable parents fail
 closed. The
-global request-hash sequence in the current `CallReplayer` is insufficient:
+global request-hash sequence of the former `CallReplayer` (removed) was insufficient:
 two nodes may issue identical requests, and timestamp order alone does not
 identify the intended response. Replay consumes each matched occurrence once,
 reconstructs the same runtime return type from retained response data, and
