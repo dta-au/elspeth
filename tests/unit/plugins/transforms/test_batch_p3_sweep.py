@@ -294,3 +294,59 @@ class TestFinding113ClassifierPositiveLabelTypeMismatch:
         cfg, refused = _admit(BatchClassifierMetricsConfig, config, "batch_classifier_metrics")
         coerced = None if cfg is None else cfg.positive_label
         assert refused is not None, f"positive_label 1.0 was coerced to {coerced!r}; data labels refuse float"
+
+
+def _two_arm_rows(baseline_arm: object, candidate_arm: object) -> list[PipelineRow]:
+    # The candidate arm arrives first, so only a configured baseline (never
+    # first-seen order) can select ``baseline_arm``.
+    return [
+        _make_row({"variant": candidate_arm, "score": 0.9}),
+        _make_row({"variant": baseline_arm, "score": 0.4}),
+        _make_row({"variant": candidate_arm, "score": 0.7}),
+        _make_row({"variant": baseline_arm, "score": 0.5}),
+    ]
+
+
+class TestFinding115ExperimentCompareNonStringBaseline:
+    """#115: batch_experiment_compare must accept int and bool baselines, matched by type."""
+
+    def test_every_scalar_baseline_is_admitted_with_its_own_type(self) -> None:
+        from elspeth.plugins.transforms.batch_experiment_compare import BatchExperimentCompareConfig
+
+        for baseline in _BASELINE_LABELS:
+            cfg, refused = _admit(BatchExperimentCompareConfig, _variant_config(baseline, pair_field=False), "batch_experiment_compare")
+            assert refused is None, f"baseline_variant {baseline!r} was refused: {refused}"
+            assert type(cfg.baseline_variant) is type(baseline), f"{baseline!r} was coerced to {cfg.baseline_variant!r}"
+
+    @pytest.mark.parametrize(
+        "baseline_arm, candidate_arm",
+        [pytest.param(1, 2, id="int-arms"), pytest.param(False, True, id="bool-arms"), pytest.param(0.2, 0.7, id="float-arms")],
+    )
+    def test_configured_non_string_baseline_is_selected(self, ctx: PluginContext, baseline_arm: object, candidate_arm: object) -> None:
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.batch_experiment_compare import BatchExperimentCompare
+
+        transform = None
+        refused: PluginConfigError | None = None
+        try:
+            transform = BatchExperimentCompare(_variant_config(baseline_arm, pair_field=False))
+        except PluginConfigError as exc:
+            refused = exc
+        assert refused is None, f"baseline_variant {baseline_arm!r} was refused: {refused}"
+        assert transform is not None
+
+        result = transform.process(_two_arm_rows(baseline_arm, candidate_arm), ctx)
+
+        assert result.status == "success", result.reason
+        assert result.row is not None
+        assert type(result.row["baseline_variant"]) is type(baseline_arm)
+        assert result.row["baseline_variant"] == baseline_arm
+        assert result.row["variant"] == candidate_arm
+
+    def test_blank_and_non_finite_baselines_are_still_refused(self) -> None:
+        from elspeth.plugins.transforms.batch_experiment_compare import BatchExperimentCompareConfig
+
+        for baseline in ("   ", float("nan")):
+            _cfg, refused = _admit(BatchExperimentCompareConfig, _variant_config(baseline, pair_field=False), "batch_experiment_compare")
+            assert refused is not None, f"baseline_variant {baseline!r} must be refused"
+            assert "baseline_variant must" in str(refused), f"refusal does not name the baseline rule: {refused}"
