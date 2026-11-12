@@ -80,3 +80,21 @@ def test_json_record_column_requires_nonempty_path(column: dict[str, object]) ->
 
     with pytest.raises(ValidationError, match="path"):
         JSONRecordsConfig.model_validate({"field": "r", "records_path": ["results"], "columns": [column]})
+
+
+# Finding #5: fingerprint_mode is described as what compute_fingerprint does.
+
+
+def test_fingerprint_mode_description_matches_compute_fingerprint() -> None:
+    import hashlib
+
+    from elspeth.plugins.transforms.web_scrape import WebScrapeConfig
+    from elspeth.plugins.transforms.web_scrape_fingerprint import compute_fingerprint
+
+    description = WebScrapeConfig.model_fields["fingerprint_mode"].description
+    assert description is not None
+    # Both modes hash only the extracted content; 'full' just skips whitespace
+    # normalization, so the contract must not promise response context.
+    assert compute_fingerprint("a  b", "full") == hashlib.sha256(b"a  b").hexdigest()
+    assert "response" not in description.lower()
+    assert "whitespace" in description.lower()
