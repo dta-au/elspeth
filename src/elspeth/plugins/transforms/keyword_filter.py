@@ -7,12 +7,13 @@ from pydantic import Field, field_validator
 
 from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
+from elspeth.contracts.errors import TransformSuccessReason
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
-from elspeth.plugins.transforms.safety_utils import get_fields_to_scan
+from elspeth.plugins.transforms.safety_utils import get_fields_to_scan, unscanned_field_warnings
 from elspeth.plugins.transforms.safety_utils import validate_fields_not_empty as _validate_fields
 
 # ReDoS detection: patterns with nested quantifiers cause catastrophic backtracking
@@ -221,7 +222,7 @@ class KeywordFilter(BaseTransform):
     name = "keyword_filter"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0e6f0fc99df6b254"
+    source_file_hash: str | None = "sha256:9522bc1e48633130"
     config_model = KeywordFilterConfig
     usage_when_to_use: str = (
         "Use for regex content screening when a pattern match must return an error for the node's "
@@ -370,10 +371,16 @@ class KeywordFilter(BaseTransform):
 
         # No matches - pass through unchanged, under the node's declared
         # contract: the ONE stamp writes the operator's declared fields onto
-        # it (ADR-050 Decision 2).
+        # it (ADR-050 Decision 2). In "all" mode, name the non-string fields
+        # that were never scanned so the audit record does not read as a
+        # whole-row verdict.
+        success_reason: TransformSuccessReason = {"action": "filtered"}
+        unscanned = unscanned_field_warnings(self._fields, row)
+        if unscanned:
+            success_reason["validation_warnings"] = unscanned
         return TransformResult.success(
             PipelineRow(row.to_dict(), self._align_output_contract(self._apply_declared_output_field_contracts(row.contract))),
-            success_reason={"action": "filtered"},
+            success_reason=success_reason,
         )
 
     def close(self) -> None:
