@@ -382,3 +382,32 @@ class TestFinding117EffectSizeFloatBaseline:
         _cfg, refused = _admit(BatchEffectSizeConfig, _variant_config(float("inf"), pair_field=False), "batch_effect_size")
         assert refused is not None
         assert "baseline_variant must be finite" in str(refused), f"refusal does not name the non-finite baseline: {refused}"
+
+
+class TestFinding140DataQualityDistinctCountIsLinear:
+    """#140: distinct_count must not do a pairwise scan per value (O(n^2) per field)."""
+
+    def test_distinct_count_does_not_compare_values_pairwise(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.plugins.transforms import _scalar_buckets
+        from elspeth.plugins.transforms.batch_data_quality_report import BatchDataQualityReport
+
+        comparisons = 0
+        original = _scalar_buckets.same_scalar_bucket_value
+
+        def counting(left: object, right: object) -> bool:
+            nonlocal comparisons
+            comparisons += 1
+            return original(left, right)
+
+        monkeypatch.setattr(_scalar_buckets, "same_scalar_bucket_value", counting)
+        values = tuple(f"value-{index}" for index in range(2000))
+
+        assert BatchDataQualityReport._distinct_count(values) == len(values)
+        # A hash-based count compares no value pairwise; a list scan makes
+        # n*(n-1)/2 (about two million here) comparisons.
+        assert comparisons <= len(values), f"{comparisons} pairwise comparisons for {len(values)} values"
+
+    def test_distinct_count_keeps_type_aware_buckets(self) -> None:
+        from elspeth.plugins.transforms.batch_data_quality_report import BatchDataQualityReport
+
+        assert BatchDataQualityReport._distinct_count((True, 1, 1.0, "1", 1, True, 0.0, -0.0, False, 0)) == 7
