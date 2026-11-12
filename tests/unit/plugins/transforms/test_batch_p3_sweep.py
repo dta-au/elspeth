@@ -7,7 +7,7 @@ passes once that finding's fix lands.
 from __future__ import annotations
 
 from types import ModuleType
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -196,3 +196,48 @@ class TestFinding107PairedPreferenceFloatBaseline:
             _cfg, refused = _admit(BatchPairedPreferenceConfig, _variant_config(baseline), "batch_paired_preference")
             assert refused is not None, f"baseline_variant {baseline!r} can never match a variant and must be refused"
             assert "baseline_variant must be finite" in str(refused), f"refusal does not name the non-finite baseline: {refused}"
+
+
+class TestFinding108PairedPreferenceStudentTInterval:
+    """#108: the paired 95% interval must use the Student-t critical value at n-1 df.
+
+    Reference values are the 0.975 quantile of Student's t at df, solved
+    independently with mpmath at 40 digits (root of 1 - I_x(df/2, 1/2)/2 with
+    x = df/(df+t^2)) and pinned as literals; they agree with published tables
+    (12.706, 4.303, 2.262, 1.984).
+    """
+
+    _T_975: ClassVar[dict[int, float]] = {
+        1: 12.706204736174705,
+        2: 4.302652729749464,
+        9: 2.2621571627982053,
+        99: 1.9842169515864174,
+    }
+
+    @pytest.mark.parametrize("pair_count", [2, 3, 10, 100])
+    def test_interval_half_width_uses_t_critical_value(self, ctx: PluginContext, pair_count: int) -> None:
+        import math
+        import statistics
+
+        from elspeth.plugins.transforms.batch_paired_preference import BatchPairedPreference
+
+        transform = BatchPairedPreference(_variant_config("A"))
+        rows: list[PipelineRow] = []
+        deltas: list[float] = []
+        for index in range(pair_count):
+            baseline_score = 0.5
+            candidate_score = 0.5 + ((index * 7) % 5 - 2) / 10
+            deltas.append(float(candidate_score - baseline_score))
+            rows.append(_make_row({"case_id": f"p{index}", "variant": "A", "score": baseline_score}))
+            rows.append(_make_row({"case_id": f"p{index}", "variant": "B", "score": candidate_score}))
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "success", result.reason
+        assert result.row is not None
+        mean_delta = sum(deltas) / pair_count
+        standard_error = statistics.stdev(deltas) / math.sqrt(pair_count)
+        half_width = self._T_975[pair_count - 1] * standard_error
+        assert result.row["standard_error_delta"] == pytest.approx(standard_error, rel=1e-12)
+        assert result.row["confidence_95_low"] == pytest.approx(mean_delta - half_width, rel=1e-9, abs=1e-12)
+        assert result.row["confidence_95_high"] == pytest.approx(mean_delta + half_width, rel=1e-9, abs=1e-12)
