@@ -107,3 +107,35 @@ class TestJSONSourceToleratesUTF8BOM:
 
         assert [(row.is_quarantined, row.source_row_index) for row in rows] == [(False, 0), (False, 1), (True, 2)]
         assert [rows[0].row, rows[1].row] == [{"id": 1}, {"id": 2}]
+
+
+def _blob_csv_config_error(**options: object) -> str | None:
+    from elspeth.plugins.infrastructure.config_base import PluginConfigError
+    from elspeth.plugins.transforms.blob_csv_expand import BlobCSVExpandConfig
+
+    try:
+        BlobCSVExpandConfig.from_dict(
+            {"schema": {"mode": "observed"}, "source": "field", "text_field": "content", **options},
+            plugin_name="blob_csv_expand",
+        )
+    except PluginConfigError as exc:
+        return str(exc)
+    return None
+
+
+class TestBlobCSVExpandDelimiterValidatedAtConfigTime:
+    """Sweep finding #51: a delimiter csv.reader rejects must be refused when config loads."""
+
+    def test_delimiter_csv_reader_rejects_is_refused(self) -> None:
+        # Ordinary delimiters are the control: only csv.reader's rejects are refused.
+        refused = {
+            delimiter: _blob_csv_config_error(delimiter=delimiter) is not None for delimiter in ['"', "\n", "\r", ",", "\t", ";", "|"]
+        }
+
+        assert refused == {'"': True, "\n": True, "\r": True, ",": False, "\t": False, ";": False, "|": False}
+
+    def test_refusal_names_the_delimiter_option(self) -> None:
+        error = _blob_csv_config_error(delimiter='"')
+
+        assert error is not None
+        assert "delimiter" in error
