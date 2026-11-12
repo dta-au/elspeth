@@ -78,6 +78,17 @@ class CoercionError(Exception):
         super().__init__(f"Cannot coerce {actual_type} to {target_type}: {self.message}")
 
 
+def _is_strict_number_text(text: str) -> bool:
+    """Whether ``text`` stays inside the plain ASCII numeric grammar.
+
+    ``int()`` and ``float()`` also accept PEP 515 digit-group underscores
+    ("1_000") and any Unicode decimal digit (fullwidth or Arabic-Indic
+    digits, for example). A strict coercion must not turn such cells into numbers, so the
+    text must be ASCII and underscore-free before the builtin parses it.
+    """
+    return text.isascii() and "_" not in text
+
+
 def coerce_to_int(value: Any) -> int:
     """Coerce value to int with strict rules.
 
@@ -90,6 +101,7 @@ def coerce_to_int(value: Any) -> int:
         - float with fractional part (3.9 -> error)
         - string with decimal ("3.5" -> error)
         - scientific notation string ("1e3" -> error)
+        - digit-group underscores or non-ASCII digits ("1_000", fullwidth digits)
         - empty/whitespace string
         - bool (True/False are technically ints but rejected)
         - None
@@ -119,6 +131,8 @@ def coerce_to_int(value: Any) -> int:
         trimmed = value.strip()
         if not trimmed:
             raise CoercionError(failure="empty_string", target_type="int", actual_type=type(value).__name__)
+        if not _is_strict_number_text(trimmed):
+            raise CoercionError(failure="not_integer_string", target_type="int", actual_type=type(value).__name__)
         try:
             return int(trimmed)
         except ValueError:
@@ -138,6 +152,7 @@ def coerce_to_float(value: Any) -> float:
     Rejects:
         - non-finite floats (NaN, inf, -inf)
         - empty/whitespace string
+        - digit-group underscores or non-ASCII digits ("1_000.5", fullwidth digits)
         - bool
         - None
     """
@@ -164,6 +179,8 @@ def coerce_to_float(value: Any) -> float:
         trimmed = value.strip()
         if not trimmed:
             raise CoercionError(failure="empty_string", target_type="float", actual_type=type(value).__name__)
+        if not _is_strict_number_text(trimmed):
+            raise CoercionError(failure="not_numeric_string", target_type="float", actual_type=type(value).__name__)
         try:
             result = float(trimmed)
         except ValueError:
@@ -340,7 +357,7 @@ class TypeCoerce(BaseTransform):
     name = "type_coerce"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:c1b155d1c89b28cc"
+    source_file_hash: str | None = "sha256:129eee65f4818a2b"
     config_model = TypeCoerceConfig
     usage_when_to_use: str = (
         "Use for explicit field-by-field type normalization when values such as CSV strings must become "
