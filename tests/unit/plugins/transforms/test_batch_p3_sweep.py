@@ -350,3 +350,35 @@ class TestFinding115ExperimentCompareNonStringBaseline:
             _cfg, refused = _admit(BatchExperimentCompareConfig, _variant_config(baseline, pair_field=False), "batch_experiment_compare")
             assert refused is not None, f"baseline_variant {baseline!r} must be refused"
             assert "baseline_variant must" in str(refused), f"refusal does not name the baseline rule: {refused}"
+
+
+class TestFinding117EffectSizeFloatBaseline:
+    """#117: batch_effect_size must keep a float baseline's type (2.0 stays float)."""
+
+    def test_every_scalar_baseline_is_admitted_with_its_own_type(self) -> None:
+        from elspeth.plugins.transforms.batch_effect_size import BatchEffectSizeConfig
+
+        for baseline in _BASELINE_LABELS:
+            cfg, refused = _admit(BatchEffectSizeConfig, _variant_config(baseline, pair_field=False), "batch_effect_size")
+            assert refused is None, f"baseline_variant {baseline!r} was refused: {refused}"
+            assert type(cfg.baseline_variant) is type(baseline), f"{baseline!r} was coerced to {cfg.baseline_variant!r}"
+
+    def test_float_baseline_matches_float_variants(self, ctx: PluginContext) -> None:
+        from elspeth.plugins.transforms.batch_effect_size import BatchEffectSize
+
+        transform = BatchEffectSize(_variant_config(2.0, pair_field=False))
+
+        result = transform.process(_two_arm_rows(2.0, 3.0), ctx)
+
+        assert result.status == "success", result.reason
+        assert result.row is not None
+        assert type(result.row["baseline_variant"]) is float
+        assert result.row["baseline_variant"] == 2.0
+        assert result.row["variant"] == 3.0
+
+    def test_non_finite_baseline_is_refused_as_non_finite(self) -> None:
+        from elspeth.plugins.transforms.batch_effect_size import BatchEffectSizeConfig
+
+        _cfg, refused = _admit(BatchEffectSizeConfig, _variant_config(float("inf"), pair_field=False), "batch_effect_size")
+        assert refused is not None
+        assert "baseline_variant must be finite" in str(refused), f"refusal does not name the non-finite baseline: {refused}"
