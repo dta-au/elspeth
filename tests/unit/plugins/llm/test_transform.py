@@ -90,8 +90,9 @@ class _RegistryDouble:
 
 
 class _LangfuseClientDouble:
-    def __init__(self, **_: Any) -> None:
-        pass
+    def __init__(self, *, host: str, secret_key: str, **_: Any) -> None:
+        # Models the SDK's per-public_key resource manager bound to this config.
+        self._resources = SimpleNamespace(base_url=host, secret_key=secret_key)
 
 
 def _noop_tracer() -> Any:

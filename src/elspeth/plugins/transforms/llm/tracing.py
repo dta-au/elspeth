@@ -119,8 +119,11 @@ class LangfuseTracingConfig(TracingConfig):
     - Evaluation scores and feedback
     - A/B testing for prompts
 
-    Langfuse uses per-instance clients, so multiple plugins can have
-    different Langfuse configurations (e.g., different hosts).
+    Multiple plugins can have different Langfuse configurations (e.g.,
+    different hosts) only under distinct public keys: the Langfuse SDK shares
+    one exporter (host and secret_key) per public_key per process, so
+    ``create_langfuse_tracer`` refuses a second config that reuses a
+    public_key with a different host or secret_key.
 
     Attributes:
         provider: Always 'langfuse'

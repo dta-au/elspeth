@@ -16,6 +16,7 @@ import sys
 from contextlib import contextmanager
 from typing import Any
 from unittest.mock import patch
+from uuid import uuid4
 
 import pytest
 
@@ -214,10 +215,13 @@ class TestLangfuseIntegration:
 
     def test_langfuse_tracer_created_at_init(self) -> None:
         """ActiveLangfuseTracer is created at __init__ time when Langfuse config is valid."""
+        # The SDK shares one exporter per public_key per process, and the factory
+        # refuses a second host under a reused key; a unique key keeps this
+        # real-client test independent of the other tests' "pk-test" clients.
         config = _make_azure_config(
             tracing={
                 "provider": "langfuse",
-                "public_key": "pk-test",
+                "public_key": f"pk-test-{uuid4().hex}",
                 "secret_key": "sk-test",
                 "host": "https://custom.langfuse.com",
             }
