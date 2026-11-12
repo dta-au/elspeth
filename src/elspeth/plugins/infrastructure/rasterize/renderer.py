@@ -176,9 +176,10 @@ class PoolRenderer:
             # recycled by max_tasks_per_child=1, so the pool itself stays usable.
             return RenderTimedOut(timeout_seconds=self._limits.render_timeout_seconds)
         except MemoryError:
-            # RLIMIT_AS tripped OUTSIDE the per-page handler in worker.py (which already
-            # catches MemoryError around a single page's render and returns a RefusedPage)
-            # -- so this means the document PARSE itself blew the memory limit.
+            # RLIMIT_AS tripped OUTSIDE the per-page handlers in worker.py (which catch
+            # MemoryError across a single page's load, render and text extraction and
+            # return a RefusedPage) -- so this means the document PARSE itself blew the
+            # memory limit.
             return DocumentRefusal(kind=DocumentRefusalKind.MALFORMED, detail="document parse exceeded the worker memory limit")
         except Exception as exc:  # narrow in effect: every typed worker exception is handled
             # above; anything else escaping the worker is OUR code's bug, not a document
