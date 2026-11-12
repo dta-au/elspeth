@@ -371,7 +371,10 @@ def _validate_readyz_payload(
     if response.status_code != 200 or payload.get("ready") is not True:
         raise LLMClientError("Gateway reports not ready", retryable=False)
 
-    if payload.get("contract_major") != contract_major:
+    declared_contract_major = payload.get("contract_major")
+    # type() is int, not ==: True == 1 == 1.0 in Python, and bool is an int
+    # subclass, so equality alone admits a malformed document.
+    if type(declared_contract_major) is not int or declared_contract_major != contract_major:
         raise LLMClientError("Gateway readiness contract_major does not match configuration", retryable=False)
 
     adapter = payload.get("adapter")
@@ -407,6 +410,10 @@ def _validate_readyz_payload(
         # empty declared set — treating it as empty would let a profile with
         # no required_capabilities silently pass against a readyz body that
         # never actually reported any.
+        raise LLMClientError("Gateway readiness capabilities field is missing or malformed", retryable=False)
+    if any(type(capability) is not str for capability in declared_capabilities):
+        # Checked before the set arithmetic below: an unhashable element
+        # would otherwise escape this boundary as a raw TypeError.
         raise LLMClientError("Gateway readiness capabilities field is missing or malformed", retryable=False)
     missing = set(required_capabilities) - set(declared_capabilities)
     if missing:
