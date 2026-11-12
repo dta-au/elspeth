@@ -7,15 +7,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tempfile
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from elspeth.contracts.payload_store import PayloadNotFoundError
+from elspeth.plugins.infrastructure.rasterize.renderer import PoolRenderer, RenderLimits
 from elspeth.plugins.transforms.blob_csv_expand import BlobCSVExpand
 from elspeth.plugins.transforms.blob_json_expand import BlobJSONExpand
 from elspeth.plugins.transforms.blob_text_expand import BlobTextExpand
 from elspeth.testing import make_pipeline_row
+from elspeth.testing.rasterize_fakes import crashing_worker, raising_worker
 from tests.fixtures.factories import make_context
 
 # ---------------------------------------------------------------------------
@@ -239,3 +244,77 @@ def test_blob_at_the_cap_is_still_read_in_full(factory: Any) -> None:
     assert store.unbounded_reads == 0
     assert store.bounded_reads == [8]
     assert result.status == "success" or result.reason["reason"] != "blob_too_large", result.reason
+
+
+# ---------------------------------------------------------------------------
+# Finding #132 — PoolRenderer.render must not leak its temp output dir when it raises.
+# ---------------------------------------------------------------------------
+
+
+def _render_limits() -> RenderLimits:
+    return RenderLimits(
+        dpi=72,
+        max_pages=10,
+        max_page_pixels=1_000_000,
+        max_page_bytes=5 * 1024 * 1024,
+        max_total_bytes=50 * 1024 * 1024,
+        render_timeout_seconds=20,
+        worker_memory_limit_bytes=2 * 1024**3,
+        extract_text=True,
+        max_page_text_bytes=1024 * 1024,
+    )
+
+
+def _rasterize_dirs(root: Path) -> list[str]:
+    return sorted(path.name for path in root.iterdir() if path.name.startswith("elspeth-rasterize-"))
+
+
+@pytest.mark.parametrize(
+    "worker",
+    [pytest.param(crashing_worker, id="worker-death"), pytest.param(raising_worker, id="worker-raises")],
+)
+def test_render_discards_its_output_dir_when_the_worker_fails_outside_the_protocol(
+    worker: Callable[..., Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    renderer = PoolRenderer(_render_limits(), worker=worker)
+    try:
+        with pytest.raises(RuntimeError, match="code bug"):
+            renderer.render(b"%PDF-")
+    finally:
+        renderer.close()
+
+    assert _rasterize_dirs(tmp_path) == [], "render() raised but left its caller-less output dir behind"
+
+
+def test_render_discards_its_output_dir_when_on_submitted_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+
+    def _boom(_pids: tuple[int, ...]) -> None:
+        raise LookupError("seam failure")
+
+    renderer = PoolRenderer(_render_limits(), worker=raising_worker)
+    try:
+        with pytest.raises(LookupError, match="seam failure"):
+            renderer.render(b"%PDF-", on_submitted=_boom)
+    finally:
+        renderer.close()
+
+    assert _rasterize_dirs(tmp_path) == [], "render() raised but left its caller-less output dir behind"
+
+
+def test_successful_render_still_hands_the_output_dir_to_the_caller(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Negative control: the success path must keep the dir for the caller to discard."""
+    from tests.fixtures.pdf_documents import minimal_pdf
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    renderer = PoolRenderer(_render_limits())
+    try:
+        _result, output_dir = renderer.render(minimal_pdf(1))
+        assert output_dir is not None
+        assert output_dir.is_dir()
+        assert _rasterize_dirs(tmp_path) == [output_dir.name]
+        renderer.discard(output_dir)
+    finally:
+        renderer.close()
+    assert _rasterize_dirs(tmp_path) == []
