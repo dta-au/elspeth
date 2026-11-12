@@ -98,3 +98,43 @@ def test_fingerprint_mode_description_matches_compute_fingerprint() -> None:
     assert compute_fingerprint("a  b", "full") == hashlib.sha256(b"a  b").hexdigest()
     assert "response" not in description.lower()
     assert "whitespace" in description.lower()
+
+
+# Finding #163: authenticated web_scrape is refused before any row is processed.
+
+
+def _authenticated_options(credential: str) -> dict[str, object]:
+    return {
+        "schema": {"mode": "observed"},
+        "url_field": "url",
+        "content_field": "response_text",
+        "fingerprint_field": "response_fingerprint",
+        "format": "raw",
+        "auth": {"scheme": "bearer", "origin": "https://example.com", "credential": credential},
+        "http": {
+            "abuse_contact": "test@example.com",
+            "scraping_reason": "Read-only public data retrieval",
+            "allowed_origins": ["https://example.com"],
+        },
+    }
+
+
+def test_authenticated_web_scrape_is_refused_at_config_validation() -> None:
+    from elspeth.plugins.infrastructure.validation import validate_transform_config
+
+    credential = "CUSTODY42"
+    errors = validate_transform_config("web_scrape", _authenticated_options(credential))
+    assert any("response evidence is secret safe" in error.message for error in errors)
+    assert credential not in repr(errors)
+
+
+def test_authenticated_web_scrape_construction_fails_without_echoing_credential() -> None:
+    from elspeth.plugins.infrastructure.config_base import PluginConfigError
+    from elspeth.plugins.transforms.web_scrape import WebScrapeTransform
+
+    credential = "CUSTODY42"
+    with pytest.raises(PluginConfigError) as caught:
+        WebScrapeTransform(_authenticated_options(credential))
+    assert "response evidence is secret safe" in str(caught.value)
+    assert credential not in str(caught.value)
+    assert credential not in str(caught.value.__cause__)
