@@ -74,9 +74,24 @@ _MAX_CONSECUTIVE_EMPTY_PAGES = 3
 
 # Dataverse returns the FetchXML paging annotations only when the request asks
 # for them (Microsoft "Page results using FetchXml", Web API tab).
-_FETCHXML_PREFER_HEADER = {
-    "Prefer": 'odata.include-annotations="Microsoft.Dynamics.CRM.fetchxmlpagingcookie,Microsoft.Dynamics.CRM.morerecords"',
-}
+_FETCHXML_PAGING_ANNOTATIONS = (
+    "Microsoft.Dynamics.CRM.fetchxmlpagingcookie",
+    "Microsoft.Dynamics.CRM.morerecords",
+)
+
+
+def _include_annotations_headers(annotations: tuple[str, ...]) -> dict[str, str]:
+    """Build the one Prefer header asking Dataverse for these instance annotations.
+
+    Dataverse omits every instance annotation (formatted values, lookup
+    metadata, FetchXML paging) unless the request names it in
+    ``Prefer: odata.include-annotations``. The names share one comma-separated
+    preference so a request never carries two Prefer headers. No annotations,
+    no header.
+    """
+    if not annotations:
+        return {}
+    return {"Prefer": f'odata.include-annotations="{",".join(annotations)}"'}
 
 
 class DataverseClientError(Exception):
@@ -187,6 +202,22 @@ def _extract_fetchxml_paging_cookie(page: DataversePageResponse, annotation: str
     if encoded_cookie is None:
         raise _violation(f"<{wrapper.tag}> element has no 'pagingcookie' attribute")
     return urllib.parse.unquote(urllib.parse.unquote(encoded_cookie))
+
+
+def _https_origin(url: str) -> tuple[str, int] | None:
+    """The (lower-cased host, port) of an https URL, or None for any other URL.
+
+    An unreadable port (``ValueError`` from urllib) also yields None, so the
+    caller rejects it rather than guessing an origin.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme.lower() != "https" or parsed.hostname is None:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    return parsed.hostname.lower(), 443 if port is None else port
 
 
 class DataverseAuthConfig(BaseModel):
@@ -333,6 +364,7 @@ class DataverseClient:
             raise DataverseClientError(str(exc), retryable=False) from exc
 
         self._environment_url = safe_environment_url.rstrip("/")
+        self._environment_origin = _https_origin(self._environment_url)
         self._credential = credential
         self._api_version = api_version
         self._limiter = limiter
@@ -808,11 +840,12 @@ class DataverseClient:
             more_records=more_records,
         )
 
-    def get_page(self, url: str) -> DataversePageResponse:
+    def get_page(self, url: str, *, annotations: tuple[str, ...] = ()) -> DataversePageResponse:
         """Fetch a single page of data from Dataverse.
 
         Args:
             url: Full URL to fetch
+            annotations: Instance annotations to request via the Prefer header
 
         Returns:
             DataversePageResponse with validated page data
@@ -820,7 +853,7 @@ class DataverseClient:
         Raises:
             DataverseClientError: For protocol-level errors
         """
-        return self._execute_request("GET", url)
+        return self._execute_request("GET", url, extra_headers=_include_annotations_headers(annotations))
 
     def upsert(self, url: str, body: dict[str, Any]) -> DataversePageResponse:
         """PATCH upsert a record to Dataverse.
@@ -837,7 +870,7 @@ class DataverseClient:
         """
         return self._execute_request("PATCH", url, json_body=body)
 
-    def paginate_odata(self, initial_url: str) -> Iterator[DataversePageResponse]:
+    def paginate_odata(self, initial_url: str, *, annotations: tuple[str, ...] = ()) -> Iterator[DataversePageResponse]:
         """Paginate through structured OData query results.
 
         Follows @odata.nextLink URLs with SSRF validation and IP-pinning
@@ -846,6 +879,8 @@ class DataverseClient:
 
         Args:
             initial_url: First page URL
+            annotations: Instance annotations to request on every page
+                (e.g. ``OData.Community.Display.V1.FormattedValue``)
 
         Yields:
             DataversePageResponse per page
@@ -857,9 +892,10 @@ class DataverseClient:
         url = initial_url
         ssrf_safe: SSRFSafeRequest | None = None
         consecutive_empty = 0
+        extra_headers = _include_annotations_headers(annotations)
 
         while True:
-            page = self._execute_request("GET", url, ssrf_safe=ssrf_safe)
+            page = self._execute_request("GET", url, extra_headers=extra_headers, ssrf_safe=ssrf_safe)
             yield page
 
             # Empty-page guard
@@ -884,16 +920,36 @@ class DataverseClient:
             if page.next_link is None:
                 break
 
+            # The nextLink is Tier-3 data and the next request carries this
+            # environment's bearer token, so it must stay on the configured
+            # environment's https origin. The family-wide domain allowlist
+            # alone admits plaintext http and every other tenant's host.
+            if _https_origin(page.next_link) != self._environment_origin:
+                raise DataverseClientError(
+                    f"@odata.nextLink {fingerprint_url(page.next_link)!r} is not on the configured "
+                    f"environment's https origin — refusing to send credentials to it. "
+                    f"Possible SSRF attempt via @odata.nextLink redirection.",
+                    retryable=False,
+                    error_category="ssrf_rejected",
+                    request_url=page.next_link,
+                )
+
             # SSRF validate the nextLink and pin the resolved IP.
             # The returned SSRFSafeRequest is passed to _execute_request
             # so the HTTP call connects to the validated IP, preventing
             # DNS rebinding between validation and connection.
             if self._before_request is not None:
-                self._before_request(page.next_link, {})
+                self._before_request(page.next_link, extra_headers)
             ssrf_safe = self._validate_url_ssrf(page.next_link)
             url = page.next_link
 
-    def paginate_fetchxml(self, entity_set_name: str, fetch_xml: str) -> Iterator[DataversePageResponse]:
+    def paginate_fetchxml(
+        self,
+        entity_set_name: str,
+        fetch_xml: str,
+        *,
+        annotations: tuple[str, ...] = (),
+    ) -> Iterator[DataversePageResponse]:
         """Paginate through FetchXML query results.
 
         Uses paging cookie mechanism: injects cookie and page number into
@@ -904,6 +960,8 @@ class DataverseClient:
         Args:
             entity_set_name: Dataverse EntitySetName for URL construction
             fetch_xml: FetchXML query string
+            annotations: Instance annotations to request in addition to the
+                FetchXML paging annotations, in the same Prefer header
 
         Yields:
             DataversePageResponse per page
@@ -928,11 +986,12 @@ class DataverseClient:
             )
 
         current_page = 1
+        extra_headers = _include_annotations_headers(_FETCHXML_PAGING_ANNOTATIONS + annotations)
 
         def fetch_current() -> DataversePageResponse:
             encoded_xml = urllib.parse.quote(ET.tostring(root, encoding="unicode"))
             url = f"{self._environment_url}/api/data/{self._api_version}/{entity_set_name}?fetchXml={encoded_xml}"
-            return self._execute_request("GET", url, extra_headers=_FETCHXML_PREFER_HEADER)
+            return self._execute_request("GET", url, extra_headers=extra_headers)
 
         while True:
             page = fetch_current()

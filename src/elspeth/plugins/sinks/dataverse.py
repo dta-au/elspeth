@@ -51,6 +51,7 @@ from elspeth.plugins.infrastructure.clients.dataverse import (
     DataverseAuthConfig,
     DataverseClient,
     DataverseClientError,
+    DataversePageResponse,
     validate_additional_domain,
 )
 from elspeth.plugins.infrastructure.config_base import DataPluginConfig
@@ -72,6 +73,42 @@ from elspeth.plugins.sinks._diversion_attribution import build_diversion_attribu
 _DIVERTABLE_STATUS_CODES: frozenset[int] = frozenset({400, 404, 409, 412, 422})
 _ROW_ATTRIBUTABLE_ERROR_CATEGORIES: frozenset[str] = frozenset({"row_data_error"})
 _DATAVERSE_ENTITY_SET_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+# Reconcile reads a lookup back differently from how it was written: the
+# PATCH sends the write-only "<navigation>@odata.bind": "/<entity set>(<id>)",
+# while a GET returns "_<attribute>_value": "<id>" (lower-case GUID). The
+# attribute's logical name is not derivable from the navigation property (a
+# polymorphic lookup's navigation property names its target table; a custom
+# one keeps its schema-name case), so reconcile asks Dataverse to annotate each
+# lookup value with the navigation property it was set through.
+_ODATA_BIND_SUFFIX = "@odata.bind"
+_NAVIGATION_PROPERTY_ANNOTATION = "Microsoft.Dynamics.CRM.associatednavigationproperty"
+_BIND_REFERENCE_PATTERN: re.Pattern[str] = re.compile(r"^/[A-Za-z_][A-Za-z0-9_]*\(([A-Za-z0-9-]+)\)$")
+
+
+def _reconciled_property_matches(response: DataversePageResponse, key: str, expected: Any) -> bool:
+    """Whether the single record Dataverse returned holds this property of the PATCH payload.
+
+    ``response.rows[0]`` is the Tier-3 GET record; ``key``/``expected`` come
+    from our own payload (``_map_row``). A plain column must come back equal.
+    A lookup bind must come back as the ``_<attribute>_value`` annotated with
+    the same navigation property, holding the bound record id. Dataverse
+    returns record GUIDs in lower case, so the bound id is compared lower-cased.
+    """
+    actual = response.rows[0]
+    if not key.endswith(_ODATA_BIND_SUFFIX):
+        return key in actual and actual[key] == expected
+    reference = _BIND_REFERENCE_PATTERN.fullmatch(expected)
+    if reference is None:
+        raise FrameworkBugError(f"Dataverse payload bind {key!r} is not a '/<entity>(<id>)' reference built by _map_row")
+    navigation_property = key[: -len(_ODATA_BIND_SUFFIX)]
+    annotation_suffix = f"@{_NAVIGATION_PROPERTY_ANNOTATION}"
+    for actual_key, actual_value in actual.items():
+        if actual_key.endswith(annotation_suffix) and actual_value == navigation_property:
+            value_key = actual_key[: -len(annotation_suffix)]
+            return value_key in actual and actual[value_key] == reference.group(1).lower()
+    return False
 
 
 def _is_row_attributable_write_error(error: DataverseClientError) -> bool:
@@ -283,7 +320,7 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:934b0bdb38c02efa"
+    source_file_hash: str | None = "sha256:b6385bbac6b974d2"
     determinism = Determinism.EXTERNAL_CALL
     config_model = DataverseSinkConfig
     idempotent = True  # PATCH upsert is idempotent — safe for retries and crash recovery (engine does not yet read this flag)
@@ -350,8 +387,7 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
                     "lookups map pipeline fields to navigation-property bindings; avoid collisions with field_mapping targets.",
                     "environment_url must be HTTPS and within the allowed Dataverse domain patterns.",
                     "Alternate-key values must be non-empty strings at write time; an empty or non-string key crashes the run (it cannot form a valid OData URL).",
-                    "Per-row HTTP failures route via on_write_failure: a non-retryable 4xx about the row (400/404/409/412/422) diverts that row and the batch continues; auth/authz (401/403), rate limit (429), retryable, and 5xx errors raise so the engine retries or aborts.",
-                    "Set on_write_failure to a quarantine sink so single-row 4xx don't abort the batch.",
+                    "Every failed write raises so the engine retries or aborts: a client error about the row (400/404/409/412/422), auth/authz (401/403), rate limit (429), and 5xx alike. Dataverse error responses are not yet classified per row, so on_write_failure never routes them to its sink; fix the offending rows or mapping and rerun.",
                 ),
             )
         return None
@@ -697,7 +733,7 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
             raise FrameworkBugError("Dataverse client is unavailable — on_start() was not called")
         url, expected, descriptor = self._validate_member_effect(plan, member, effect_input)
         try:
-            response = self._client.get_page(url)
+            response = self._client.get_page(url, annotations=(_NAVIGATION_PROPERTY_ANNOTATION,))
         except DataverseClientError as exc:
             if exc.status_code == 404:
                 return SinkEffectReconcileResult.not_applied(evidence=self._member_group_evidence(plan, "missing"))
@@ -706,8 +742,7 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
             return SinkEffectReconcileResult.not_applied(evidence=self._member_group_evidence(plan, "missing"))
         if len(response.rows) != 1:
             return SinkEffectReconcileResult.unknown(evidence=self._member_group_evidence(plan, "ambiguous"))
-        actual = response.rows[0]
-        exact = all(key in actual and actual[key] == value for key, value in expected.items())
+        exact = all(_reconciled_property_matches(response, key, value) for key, value in expected.items())
         if not exact:
             return SinkEffectReconcileResult.unknown(evidence=self._member_group_evidence(plan, "divergent"))
         return SinkEffectReconcileResult.applied(
