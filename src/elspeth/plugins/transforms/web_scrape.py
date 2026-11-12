@@ -470,6 +470,10 @@ class WebScrapeConfig(TransformDataConfig):
                     validate_allowed_http_origin(self.url, (auth_origin,))
                 except SSRFBlockedError as exc:
                     raise ValueError("fixed url must match auth.origin") from exc
+            # The binding checks above keep their specific diagnostics; a
+            # correctly bound auth block is still refused here, before any row,
+            # rather than failing every row at process time.
+            raise ValueError("authenticated web_scrape is unavailable until response evidence is secret safe")
         return self
 
     @model_validator(mode="after")
@@ -823,7 +827,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:43c6990e1378a7d4"
+    source_file_hash: str | None = "sha256:ef6e828ace325e3c"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
