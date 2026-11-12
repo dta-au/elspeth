@@ -8,9 +8,17 @@ from typing import Any
 import httpx
 import pytest
 
-from elspeth.plugins.infrastructure.clients.llm import LLMClientError
+from elspeth.contracts.chat_parts import ChatMessage
+from elspeth.plugins.infrastructure.clients.llm import LLMClientError, NetworkError
+from elspeth.plugins.transforms.llm.provider import LLMAuditParent
 from elspeth.plugins.transforms.llm.providers.gateway import _validate_gateway_success_response, _validate_readyz_payload
+from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterLLMProvider
 from tests.unit.plugins.llm.test_provider_gateway import _CONTRACT_HEADER, _completion_body, _gateway_response, _readyz_body
+from tests.unit.plugins.llm.test_provider_openrouter import _MEMBER_TOKEN as _OPENROUTER_MEMBER_TOKEN
+from tests.unit.plugins.llm.test_provider_openrouter import _WORK_ITEM as _OPENROUTER_WORK_ITEM
+from tests.unit.plugins.llm.test_provider_openrouter import FakeAuditRecorder as OpenRouterFakeAuditRecorder
+from tests.unit.plugins.llm.test_provider_openrouter import FakeHTTPClient, _provider_http_client
+from tests.unit.plugins.llm.test_provider_openrouter import FakeTelemetryEmit as OpenRouterFakeTelemetryEmit
 
 
 def _raised_by(call: Callable[[], object]) -> BaseException | None:
@@ -112,3 +120,54 @@ class TestReadyzPayloadTyping:
     def test_well_formed_readyz_document_is_accepted(self) -> None:
         identity = _validate_readyz(_readyz_response())
         assert identity == {"name": "reference_v1_invoke", "version": "1.0.0", "adapter_api_major": 1, "fingerprint": "abc123"}
+
+
+# ---------------------------------------------------------------------------
+# Finding #97: OpenRouter transport errors never carry the raw httpx text
+# ---------------------------------------------------------------------------
+
+_TRANSPORT_SENTINEL = "SENTINEL-transport-text-7c1e"
+
+
+class TestOpenRouterTransportErrorRedaction:
+    @pytest.mark.parametrize(
+        "transport_error",
+        [
+            pytest.param(httpx.RemoteProtocolError(f"illegal header line: b'X-Leak: {_TRANSPORT_SENTINEL}'"), id="remote-protocol"),
+            pytest.param(httpx.ConnectError(f"connect to https://{_TRANSPORT_SENTINEL}.example failed"), id="connect"),
+        ],
+    )
+    def test_network_error_message_and_audit_row_use_fixed_text(self, transport_error: httpx.RequestError) -> None:
+        recorder = OpenRouterFakeAuditRecorder()
+        provider = OpenRouterLLMProvider(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            timeout_seconds=30.0,
+            recorder=recorder,
+            run_id="run-1",
+            telemetry_emit=OpenRouterFakeTelemetryEmit(),
+        )
+        http_client = FakeHTTPClient(error=transport_error)
+        with _provider_http_client(provider, http_client):
+            raised = _raised_by(
+                lambda: provider.execute_query(
+                    messages=[ChatMessage(role="user", content="hi")],
+                    model="gpt-4o",
+                    temperature=0.0,
+                    max_tokens=100,
+                    audit_parent=LLMAuditParent.for_row(
+                        member_token=_OPENROUTER_MEMBER_TOKEN,
+                        work_item=_OPENROUTER_WORK_ITEM,
+                        state_id="state-1",
+                        token_id="tok-1",
+                    ),
+                )
+            )
+
+        assert isinstance(raised, NetworkError), f"expected NetworkError, got {raised!r}"
+        assert raised.retryable is True
+        assert _TRANSPORT_SENTINEL not in str(raised)
+        assert _TRANSPORT_SENTINEL not in repr(raised)
+        assert raised.__cause__ is transport_error
+        assert recorder.calls, "the logical LLM error row was not recorded"
+        assert _TRANSPORT_SENTINEL not in repr(recorder.calls)
