@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import tempfile
 from collections.abc import Callable
 from importlib import metadata
@@ -16,18 +17,21 @@ from typing import Any
 import pytest
 
 from elspeth.contracts.payload_store import PayloadNotFoundError
+from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.plugins.infrastructure.rasterize import identity as rasterize_identity
 from elspeth.plugins.infrastructure.rasterize.protocol import (
     PageRefusalKind,
     RasterizeRequest,
     RasterizeResponse,
     RefusedPage,
+    RenderedPage,
 )
 from elspeth.plugins.infrastructure.rasterize.renderer import PoolRenderer, RenderLimits
 from elspeth.plugins.infrastructure.rasterize.worker import rasterize_document
 from elspeth.plugins.transforms.blob_csv_expand import BlobCSVExpand
 from elspeth.plugins.transforms.blob_json_expand import BlobJSONExpand
 from elspeth.plugins.transforms.blob_text_expand import BlobTextExpand
+from elspeth.plugins.transforms.pdf_rasterize import PDFRasterize
 from elspeth.testing import make_pipeline_row
 from elspeth.testing.rasterize_fakes import crashing_worker, raising_worker
 from tests.fixtures.factories import make_context
@@ -495,3 +499,128 @@ def test_renderer_identity_still_refuses_an_ambiguous_install(files: list[str], 
     """Negative control: exactly one native PDFium binary is still required."""
     with pytest.raises(RuntimeError):
         _identity_with(files, tmp_path, monkeypatch)
+
+
+# ---------------------------------------------------------------------------
+# Finding #55 — the parent re-checks the worker's page text and geometry claims.
+# ---------------------------------------------------------------------------
+
+_PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 60
+
+
+class _ClaimingRenderer:
+    """Stands in for a compromised worker: writes real PNG files, makes arbitrary claims."""
+
+    def __init__(self, pages: tuple[RenderedPage, ...]) -> None:
+        self._pages = pages
+
+    def render(self, pdf_bytes: bytes) -> tuple[RasterizeResponse, Path]:
+        del pdf_bytes
+        output_dir = Path(tempfile.mkdtemp(prefix="claiming-rasterize-"))
+        written = []
+        for page in self._pages:
+            png_path = output_dir / f"page-{page.page_number}.png"
+            png_path.write_bytes(_PNG_BYTES)
+            written.append(
+                RenderedPage(
+                    page_number=page.page_number,
+                    png_path=png_path,
+                    width_px=page.width_px,
+                    height_px=page.height_px,
+                    size_bytes=len(_PNG_BYTES),
+                    text=page.text,
+                )
+            )
+        return RasterizeResponse(page_count=len(written), rendered=tuple(written), refused=()), output_dir
+
+    def discard(self, output_dir: Path | None) -> None:
+        if output_dir is not None:
+            shutil.rmtree(output_dir, ignore_errors=True)
+
+    def close(self) -> None:
+        pass
+
+
+class _LifecycleContext:
+    def __init__(self, payload_store: Any) -> None:
+        self.payload_store = payload_store
+
+
+def _claimed_page(number: int, *, text: str | None = "", width: Any = 200, height: Any = 100) -> RenderedPage:
+    return RenderedPage(page_number=number, png_path=Path("unset"), width_px=width, height_px=height, size_bytes=0, text=text)
+
+
+def _rasterize_with_claims(tmp_path: Path, pages: tuple[RenderedPage, ...], **options: Any) -> Any:
+    store = FilesystemPayloadStore(tmp_path / "payloads")
+    from tests.fixtures.pdf_documents import minimal_pdf
+
+    pdf_ref = store.store(minimal_pdf(len(pages)))
+    transform = PDFRasterize({"schema": {"mode": "observed"}, "on_page_failure": "emit_rendered", **options})
+    transform.on_start(_LifecycleContext(store))
+    transform.__dict__["_renderer"] = _ClaimingRenderer(pages)
+    raised: Exception | None = None
+    result = None
+    try:
+        result = transform.process(make_pipeline_row({"blob_ref": pdf_ref}), make_context())
+    except Exception as exc:
+        raised = exc
+    assert raised is None, f"a worker claim the parent should refuse crashed the transform instead: {raised!r}"
+    return result
+
+
+def _refused_kinds(result: Any) -> dict[int, str]:
+    return {entry["page_number"]: entry["kind"] for entry in result.success_reason["metadata"]["refused_pages"]}
+
+
+@pytest.mark.parametrize(
+    "oversize_text",
+    [pytest.param("x" * 17, id="ascii"), pytest.param("\u00e9" * 9, id="multibyte-18-bytes-9-chars")],
+)
+def test_page_text_over_max_page_text_bytes_is_refused_by_the_parent(oversize_text: str, tmp_path: Path) -> None:
+    pages = (_claimed_page(1, text=oversize_text), _claimed_page(2, text="ok"))
+
+    result = _rasterize_with_claims(tmp_path, pages, max_page_text_bytes=16)
+
+    assert result.status == "success", result.reason
+    assert [row.to_dict()["page_number"] for row in result.rows] == [2], "the oversize page text was emitted"
+    assert _refused_kinds(result) == {1: PageRefusalKind.OVERSIZE_TEXT.value}
+
+
+def test_page_text_at_max_page_text_bytes_is_admitted(tmp_path: Path) -> None:
+    """Negative control: exactly max_page_text_bytes is within the bound."""
+    pages = (_claimed_page(1, text="x" * 16),)
+
+    result = _rasterize_with_claims(tmp_path, pages, max_page_text_bytes=16)
+
+    assert result.status == "success", result.reason
+    assert [row.to_dict()["page_text"] for row in result.rows] == ["x" * 16]
+
+
+def test_page_text_returned_when_extraction_is_disabled_is_refused(tmp_path: Path) -> None:
+    pages = (_claimed_page(1, text="not requested"), _claimed_page(2, text=None))
+
+    result = _rasterize_with_claims(tmp_path, pages, extract_text=False)
+
+    assert result.status == "success", result.reason
+    assert [row.to_dict()["page_number"] for row in result.rows] == [2]
+    assert set(_refused_kinds(result)) == {1}
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "kind"),
+    [
+        pytest.param(0, 100, PageRefusalKind.INVALID_GEOMETRY, id="zero-width"),
+        pytest.param(200, -1, PageRefusalKind.INVALID_GEOMETRY, id="negative-height"),
+        pytest.param(True, 100, PageRefusalKind.INVALID_GEOMETRY, id="bool-width"),
+        pytest.param(200.0, 100, PageRefusalKind.INVALID_GEOMETRY, id="float-width"),
+        pytest.param(2000, 2000, PageRefusalKind.OVERSIZE_PIXELS, id="over-max-page-pixels"),
+    ],
+)
+def test_page_geometry_claims_are_checked_by_the_parent(width: Any, height: Any, kind: PageRefusalKind, tmp_path: Path) -> None:
+    pages = (_claimed_page(1, width=width, height=height), _claimed_page(2))
+
+    result = _rasterize_with_claims(tmp_path, pages, max_page_pixels=1_000_000)
+
+    assert result.status == "success", result.reason
+    assert [row.to_dict()["page_number"] for row in result.rows] == [2], "a page with an impossible geometry claim was emitted"
+    assert _refused_kinds(result) == {1: kind.value}
