@@ -266,6 +266,7 @@ class CollectingOutputPort(OutputPort):
     def __init__(self) -> None:
         self.results: list[tuple[TokenInfo, TransformResult | ExceptionResult, str | None]] = []
         self.emit_count = 0
+        self.pending_failures: list[Exception] = []
         self._lock = threading.Lock()
         self._emit_event = threading.Event()
 
@@ -275,6 +276,11 @@ class CollectingOutputPort(OutputPort):
             self.results.append((token, result, state_id))
             self.emit_count += 1
             self._emit_event.set()
+
+    def fail_pending(self, failure: Exception) -> None:
+        """Record a terminal failure; nothing blocks on a collected result."""
+        with self._lock:
+            self.pending_failures.append(failure)
 
     def wait_for_results(self, count: int, timeout: float = 5.0) -> bool:
         """Wait for at least `count` results to arrive."""
