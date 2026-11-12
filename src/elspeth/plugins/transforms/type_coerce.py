@@ -208,7 +208,7 @@ def coerce_to_float(value: Any) -> float:
 
 # Boolean string mappings (case-insensitive after trim)
 _BOOL_TRUE_STRINGS: frozenset[str] = frozenset({"true", "1", "yes", "y", "on"})
-_BOOL_FALSE_STRINGS: frozenset[str] = frozenset({"false", "0", "no", "n", "off", ""})
+_BOOL_FALSE_STRINGS: frozenset[str] = frozenset({"false", "0", "no", "n", "off"})
 
 
 def coerce_to_bool(value: Any) -> bool:
@@ -218,11 +218,12 @@ def coerce_to_bool(value: Any) -> bool:
         - bool (unchanged)
         - int 0 -> False, int 1 -> True
         - string true set (case-insensitive): true, 1, yes, y, on
-        - string false set (case-insensitive): false, 0, no, n, off, "" (empty/whitespace-only)
+        - string false set (case-insensitive): false, 0, no, n, off
 
     Rejects:
         - other integers (2, -1, etc.)
-        - other strings
+        - other strings, including empty and whitespace-only strings (a blank
+          value is missing, not False)
         - float
         - None
     """
@@ -371,7 +372,7 @@ class TypeCoerce(BaseTransform):
     name = "type_coerce"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:c9f7641c7d34f48c"
+    source_file_hash: str | None = "sha256:09861e25cfae3f30"
     config_model = TypeCoerceConfig
     usage_when_to_use: str = (
         "Use for explicit field-by-field type normalization when values such as CSV strings must become "
