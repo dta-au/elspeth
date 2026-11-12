@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from elspeth.contracts import RunMode, TransformResult
+from elspeth.plugins.transforms.aws.guardrails_client import BedrockGuardrailsClient, GuardrailServiceError
 from elspeth.plugins.transforms.aws.textract_document_analysis import AWSTextractDocumentAnalysis
 from elspeth.plugins.transforms.aws.textract_inline_analysis import AWSTextractInlineAnalysis
 from elspeth.plugins.transforms.aws.textract_result import (
@@ -22,6 +23,7 @@ from elspeth.plugins.transforms.aws.textract_result import (
 )
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_context
+from tests.fixtures.mock_audit import mock_item_audit_authority
 
 # ---------------------------------------------------------------------------
 # Finding #35: FORMS projection must carry checkbox selection state.
@@ -252,3 +254,60 @@ def test_f36_engine_shutdown_event_still_stops_row_work(factory: Any) -> None:
     assert result.status == "error"
     assert result.reason == {"reason": "shutdown_requested"}
     transform.close()
+
+
+# ---------------------------------------------------------------------------
+# Finding #50: Guardrail transport failures must audit the observed attempts.
+# ---------------------------------------------------------------------------
+
+
+class _F50Execution:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def allocate_call_index(self, state_id: str, *, member_token: Any, work_item: Any) -> int:
+        return len(self.calls)
+
+    def record_call(self, **kwargs: Any) -> SimpleNamespace:
+        self.calls.append(kwargs)
+        return SimpleNamespace(id=f"call-{len(self.calls)}")
+
+
+def test_f50_transport_failure_audits_every_botocore_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    from botocore.exceptions import EndpointConnectionError
+    from botocore.retries.standard import ExponentialBackoff
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
+    monkeypatch.delenv("AWS_SESSION_TOKEN", raising=False)
+    monkeypatch.setattr(ExponentialBackoff, "delay_amount", lambda self, context: 0)
+
+    execution = _F50Execution()
+    client = BedrockGuardrailsClient(
+        **mock_item_audit_authority("run-1"),
+        execution=execution,
+        state_id="state-1",
+        run_id="run-1",
+        telemetry_emit=lambda _event: None,
+        guardrail_identifier="privateguardrail",
+        guardrail_version="7",
+        region="us-east-1",
+        audit_salt=b"0123456789abcdef0123456789abcdef",
+        token_id="token-1",
+    )
+    sends: list[str] = []
+
+    def unreachable_endpoint(request: Any, **_kwargs: Any) -> None:
+        sends.append(request.url)
+        raise EndpointConnectionError(endpoint_url=request.url)
+
+    # Registered after the client's own hooks, so botocore's real standard
+    # retry handler sees an HTTPClientError on every attempt.
+    client.sdk_client.meta.events.register("before-send.bedrock-runtime", unreachable_endpoint)
+
+    with pytest.raises(GuardrailServiceError):
+        client.apply_guardrail(text="marker", source="INPUT", required_filters=("PROMPT_ATTACK",))
+
+    assert len(sends) == 3, "botocore standard retries must have made three HTTP attempts"
+    assert len(execution.calls) == 1
+    assert execution.calls[0]["response_data"].to_dict()["attempts"] == len(sends)
