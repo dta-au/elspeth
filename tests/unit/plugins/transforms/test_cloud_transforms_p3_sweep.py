@@ -7,17 +7,21 @@ code paths the finding describes and assert on the observable outcome.
 from __future__ import annotations
 
 import hashlib
+import threading
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from elspeth.contracts import TransformResult
+from elspeth.contracts import RunMode, TransformResult
+from elspeth.plugins.transforms.aws.textract_document_analysis import AWSTextractDocumentAnalysis
 from elspeth.plugins.transforms.aws.textract_inline_analysis import AWSTextractInlineAnalysis
 from elspeth.plugins.transforms.aws.textract_result import (
     MalformedTextractResponse,
     normalize_analyze_document_result,
 )
 from elspeth.testing import make_pipeline_row
+from tests.fixtures.factories import make_context
 
 # ---------------------------------------------------------------------------
 # Finding #35: FORMS projection must carry checkbox selection state.
@@ -167,3 +171,84 @@ def test_f30_oversized_inline_document_is_rejected_by_a_bounded_read() -> None:
     assert store.full_reads == [], "the whole blob was read before the size cap applied"
     assert store.bounded_reads == [(_F30_SHA, 64)]
     assert result.reason["actual"] == ">64"
+
+
+# ---------------------------------------------------------------------------
+# Finding #36: Textract close() must not set the engine-owned shutdown event.
+# ---------------------------------------------------------------------------
+
+
+def _f36_document_analysis() -> AWSTextractDocumentAnalysis:
+    return AWSTextractDocumentAnalysis(
+        {
+            "region": "ap-southeast-2",
+            "bucket_field": "document_bucket",
+            "key_field": "document_key",
+            "feature_types": ["FORMS"],
+            "text_field": "textract_text",
+            "schema": {"mode": "observed"},
+        }
+    )
+
+
+def _f36_inline_analysis() -> AWSTextractInlineAnalysis:
+    return AWSTextractInlineAnalysis(
+        {
+            "region": "ap-southeast-2",
+            "document_format": "png",
+            "feature_types": ["FORMS"],
+            "text_field": "textract_text",
+            "schema": {"mode": "observed"},
+        }
+    )
+
+
+def _f36_start(transform: AWSTextractDocumentAnalysis | AWSTextractInlineAnalysis, run_shutdown: threading.Event) -> None:
+    transform.on_start(
+        SimpleNamespace(
+            landscape=object(),
+            node_id="node-1",
+            run_id="run-1",
+            telemetry_emit=lambda _event: None,
+            rate_limit_registry=None,
+            shutdown_event=run_shutdown,
+            payload_store=None,
+            run_mode=RunMode.REPLAY,
+        )
+    )
+
+
+_F36_FACTORIES = [
+    pytest.param(_f36_document_analysis, id="document_analysis"),
+    pytest.param(_f36_inline_analysis, id="inline_analysis"),
+]
+
+
+@pytest.mark.parametrize("factory", _F36_FACTORIES)
+def test_f36_close_leaves_the_engine_shutdown_event_unset(factory: Any) -> None:
+    run_shutdown = threading.Event()
+    transform = factory()
+    _f36_start(transform, run_shutdown)
+
+    transform.close()
+
+    assert not run_shutdown.is_set(), "plugin close() raised the run-wide cancellation signal"
+
+
+@pytest.mark.parametrize("factory", _F36_FACTORIES)
+def test_f36_engine_shutdown_event_still_stops_row_work(factory: Any) -> None:
+    run_shutdown = threading.Event()
+    transform = factory()
+    _f36_start(transform, run_shutdown)
+    run_shutdown.set()
+
+    result = transform._process_single_with_state(
+        make_pipeline_row({"blob_ref": _F30_SHA, "document_bucket": "bucket", "document_key": "key"}),
+        "state-1",
+        ctx=make_context(run_id="run-1"),
+        token_id="token-1",
+    )
+
+    assert result.status == "error"
+    assert result.reason == {"reason": "shutdown_requested"}
+    transform.close()
