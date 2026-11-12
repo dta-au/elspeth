@@ -15,6 +15,7 @@ from elspeth.core.security.web import (
 from elspeth.plugins.infrastructure.clients.fingerprinting import (
     MAX_AUDIT_QUERY_CHARS,
     MAX_AUDIT_QUERY_FIELDS,
+    is_capability_query_param,
     is_sensitive_query_param,
 )
 
@@ -61,7 +62,7 @@ def resolve_discovered_href(
         # The query is emitted exactly as the page wrote it, and some servers
         # split parameters on ';' as well as '&', so inspect both separators.
         query = parse_qsl(parsed.query.replace(";", "&"), keep_blank_values=True, max_num_fields=MAX_AUDIT_QUERY_FIELDS)
-        if any(is_sensitive_query_param(name) for name, _ in query):
+        if any(is_sensitive_query_param(name) or is_capability_query_param(name) for name, _ in query):
             raise ValueError("discovered link contains a sensitive query parameter")
 
         # Userinfo was refused by the origin gate and the fragment was dropped
