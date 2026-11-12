@@ -194,3 +194,106 @@ class TestFinding65AzureHeaderEncodeIsConfigError:
 
         assert raised is None
         assert diverted == 1
+
+
+class _Closable:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.close_calls = 0
+        self._fail = fail
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if self._fail:
+            raise RuntimeError("transport close failed")
+
+
+class _ServiceClientFake(_Closable):
+    """Stands in for BlobServiceClient: owns the transport and the credential."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        super().__init__(fail=fail)
+        self.credential = _Closable()
+        self.container_client = _ContainerClientFake()
+
+    def get_container_client(self, _container: str) -> _ContainerClientFake:
+        return self.container_client
+
+
+class _ContainerClientFake(_Closable):
+    """A derived client: in the SDK its close() is a TransportWrapper no-op."""
+
+    account_name = "acct"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.blob_client = _Closable()
+
+    def get_blob_client(self, _blob_path: str) -> _Closable:
+        return self.blob_client
+
+
+_MI_AUTH: dict[str, object] = {"use_managed_identity": True, "account_url": "https://acct.blob.core.windows.net"}
+_PATCH_SERVICE_CLIENT = "elspeth.plugins.infrastructure.azure_auth.AzureAuthConfig.create_blob_service_client"
+
+
+class TestFinding64AzureCloseReleasesOwnedClients:
+    """#64: close() must release the BlobServiceClient transport and credential it created."""
+
+    @staticmethod
+    def _sink() -> Any:
+        from elspeth.plugins.sinks.azure_blob_sink import AzureBlobSink
+        from tests.fixtures.base_classes import inject_write_failure
+
+        return inject_write_failure(
+            AzureBlobSink({"container": "c", "blob_path": "out.json", "format": "json", "schema": {"mode": "observed"}, **_MI_AUTH})
+        )
+
+    def test_sink_close_closes_service_client_and_credential(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        service = _ServiceClientFake()
+        monkeypatch.setattr(_PATCH_SERVICE_CLIENT, lambda _self: service)
+        sink = self._sink()
+        sink._get_container_client()
+
+        sink.close()
+
+        assert service.close_calls == 1, "the BlobServiceClient owns the HTTP transport; close() must close it"
+        assert service.credential.close_calls == 1, "the managed-identity credential must be closed"
+
+    def test_sink_close_is_not_retried_after_a_raising_close(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        service = _ServiceClientFake(fail=True)
+        monkeypatch.setattr(_PATCH_SERVICE_CLIENT, lambda _self: service)
+        sink = self._sink()
+        sink._get_container_client()
+
+        first: BaseException | None = None
+        try:
+            sink.close()
+        except RuntimeError as exc:
+            first = exc
+        sink.close()
+
+        assert first is not None
+        assert service.close_calls == 1
+        assert service.credential.close_calls == 1, "a raising transport close must not skip the credential"
+
+    def test_source_close_closes_service_client_and_credential(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.plugins.sources.azure_blob_source import AzureBlobSource
+
+        service = _ServiceClientFake()
+        monkeypatch.setattr(_PATCH_SERVICE_CLIENT, lambda _self: service)
+        source = AzureBlobSource(
+            {
+                "container": "c",
+                "blob_path": "in.csv",
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "quarantine",
+                **_MI_AUTH,
+            }
+        )
+        source._get_blob_client()
+
+        source.close()
+
+        assert service.container_client.blob_client.close_calls == 1
+        assert service.close_calls == 1
+        assert service.credential.close_calls == 1
