@@ -17,6 +17,7 @@ import pytest
 from elspeth.contracts import RunMode, TransformResult
 from elspeth.contracts.errors import PluginRetryableError
 from elspeth.plugins.transforms.aws.guardrails_client import BedrockGuardrailsClient, GuardrailServiceError
+from elspeth.plugins.transforms.aws.textract_bucket_region import BucketRegionCoordinator, BucketRegionUnverifiedError
 from elspeth.plugins.transforms.aws.textract_document_analysis import AWSTextractDocumentAnalysis
 from elspeth.plugins.transforms.aws.textract_inline_analysis import AWSTextractInlineAnalysis
 from elspeth.plugins.transforms.aws.textract_result import (
@@ -374,3 +375,83 @@ def test_f61_submit_network_error_still_escalates_to_a_row_retry() -> None:
     with pytest.raises(PluginRetryableError):
         _di_run_with_fake(transform, client)
     assert client.get_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# Finding #98: an inherited single-flight HeadBucket failure must say so.
+# ---------------------------------------------------------------------------
+
+
+class _F98SignalingInFlight(dict[str, Any]):
+    """In-flight map that signals when a follower looks up the leader's flight."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.follower_joined = threading.Event()
+
+    def __getitem__(self, key: str) -> Any:
+        value = super().__getitem__(key)
+        self.follower_joined.set()
+        return value
+
+
+def _f98_concurrent_failure() -> tuple[BaseException, BaseException]:
+    """Run a leader and one concurrent follower; the leader's HeadBucket fails."""
+    coordinator = BucketRegionCoordinator()
+    in_flight = _F98SignalingInFlight()
+    coordinator._in_flight = in_flight
+    leader_entered = threading.Event()
+    outcomes: dict[str, BaseException] = {}
+
+    def leader_verify() -> Any:
+        leader_entered.set()
+        assert in_flight.follower_joined.wait(timeout=5), "follower never joined the in-flight verification"
+        raise BucketRegionUnverifiedError(code="AccessDenied", retryable=False, http_status=403)
+
+    def follower_verify() -> Any:
+        raise AssertionError("a concurrent follower must not run its own HeadBucket")
+
+    def run(name: str, live_verify: Any) -> None:
+        try:
+            coordinator.verify("docs", live_verify)
+        except BaseException as error:
+            outcomes[name] = error
+
+    leader = threading.Thread(target=run, args=("leader", leader_verify))
+    leader.start()
+    assert leader_entered.wait(timeout=5)
+    follower = threading.Thread(target=run, args=("follower", follower_verify))
+    follower.start()
+    leader.join(timeout=5)
+    follower.join(timeout=5)
+    assert set(outcomes) == {"leader", "follower"}
+    return outcomes["leader"], outcomes["follower"]
+
+
+def test_f98_concurrent_follower_failure_is_marked_as_inherited() -> None:
+    leader_error, follower_error = _f98_concurrent_failure()
+    assert isinstance(leader_error, BucketRegionUnverifiedError)
+    assert isinstance(follower_error, BucketRegionUnverifiedError)
+    assert follower_error is not leader_error, "the follower re-raised the leader's exception object unmarked"
+
+    transform = _f36_document_analysis()
+    transform._run_id = "run-1"
+    transform._node_id = "node-1"
+    reasons = {}
+    for name, error in (("leader", leader_error), ("follower", follower_error)):
+        transform._bucket_region_coordinator = SimpleNamespace(verify=lambda bucket, live_verify, error=error: (_ for _ in ()).throw(error))
+        result = transform._process_single_with_state(
+            make_pipeline_row({"document_bucket": "docs", "document_key": "invoice.pdf"}),
+            f"state-{name}",
+            ctx=make_context(run_id="run-1"),
+            token_id=f"token-{name}",
+        )
+        assert result.status == "error"
+        reasons[name] = result.reason
+
+    assert reasons["leader"] == {"reason": "bucket_region_unverified", "error_type": "AccessDenied"}
+    assert reasons["follower"] == {
+        "reason": "bucket_region_unverified",
+        "error_type": "AccessDenied",
+        "cache_status": "shared_failure",
+    }
