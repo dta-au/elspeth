@@ -64,3 +64,46 @@ class TestJSONLUndecodableCodeUnitIsolatedToItsLine:
         assert [rows[0].row, rows[2].row, rows[3].row] == [{"id": 1}, {"id": 3}, {"id": 4}]
         assert rows[1].row["__line_number__"] == 2
         assert rows[1].row["__raw_bytes_hex__"] == (bad_unit + _utf16le("\n")).hex()
+
+
+def _json_source(path: Path, **options: object) -> object:
+    from elspeth.plugins.sources.json_source import JSONSource
+
+    return JSONSource(
+        {
+            "path": str(path),
+            "on_validation_failure": "quarantine",
+            "schema": {"mode": "observed"},
+            **options,
+        }
+    )
+
+
+class TestJSONSourceToleratesUTF8BOM:
+    """Sweep finding #43: a leading UTF-8 BOM must not quarantine a valid JSON/JSONL file."""
+
+    def test_bom_prefixed_json_array_yields_its_rows(self, tmp_path: Path) -> None:
+        from elspeth.plugins.sources.json_source import JSONSource
+
+        json_file = tmp_path / "data.json"
+        json_file.write_bytes(b"\xef\xbb\xbf" + b'[{"id": 1}, {"id": 2}]')
+        source = _json_source(json_file)
+        assert isinstance(source, JSONSource)
+
+        rows = list(source.load(make_source_context(plugin_name="json")))
+
+        assert [(row.is_quarantined, row.row) for row in rows] == [(False, {"id": 1}), (False, {"id": 2})]
+
+    def test_bom_prefixed_jsonl_keeps_line_one(self, tmp_path: Path) -> None:
+        """Only the leading BOM is stripped: a U+FEFF later in the file is still data."""
+        from elspeth.plugins.sources.json_source import JSONSource
+
+        jsonl_file = tmp_path / "data.jsonl"
+        jsonl_file.write_bytes(b"\xef\xbb\xbf" + b'{"id": 1}\n{"id": 2}\n\xef\xbb\xbf{"id": 3}\n')
+        source = _json_source(jsonl_file, format="jsonl")
+        assert isinstance(source, JSONSource)
+
+        rows = list(source.load(make_source_context(plugin_name="json")))
+
+        assert [(row.is_quarantined, row.source_row_index) for row in rows] == [(False, 0), (False, 1), (True, 2)]
+        assert [rows[0].row, rows[1].row] == [{"id": 1}, {"id": 2}]
