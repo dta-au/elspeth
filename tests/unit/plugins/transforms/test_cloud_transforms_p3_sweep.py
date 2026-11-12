@@ -6,14 +6,18 @@ code paths the finding describes and assert on the observable outcome.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 import pytest
 
+from elspeth.contracts import TransformResult
+from elspeth.plugins.transforms.aws.textract_inline_analysis import AWSTextractInlineAnalysis
 from elspeth.plugins.transforms.aws.textract_result import (
     MalformedTextractResponse,
     normalize_analyze_document_result,
 )
+from elspeth.testing import make_pipeline_row
 
 # ---------------------------------------------------------------------------
 # Finding #35: FORMS projection must carry checkbox selection state.
@@ -104,3 +108,62 @@ def test_f35_forms_projection_distinguishes_checked_from_unchecked_checkbox() ->
 def test_f35_forms_projection_rejects_unknown_checkbox_status() -> None:
     with pytest.raises(MalformedTextractResponse, match="SELECTED or NOT_SELECTED"):
         _normalize_forms(_checkbox_form_response("MAYBE"))
+
+
+# ---------------------------------------------------------------------------
+# Finding #30: inline Textract must apply max_document_bytes while reading.
+# ---------------------------------------------------------------------------
+
+_F30_PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 4096
+_F30_SHA = hashlib.sha256(_F30_PNG).hexdigest()
+
+
+class _BoundedReadStore:
+    """PayloadStore double that records full and bounded reads separately."""
+
+    def __init__(self, content: bytes) -> None:
+        self.content = content
+        self.full_reads: list[str] = []
+        self.bounded_reads: list[tuple[str, int]] = []
+
+    def store(self, content: bytes) -> str:
+        raise AssertionError("the transform must never store payloads")
+
+    def retrieve(self, content_hash: str) -> bytes:
+        self.full_reads.append(content_hash)
+        return self.content
+
+    def retrieve_bounded(self, content_hash: str, *, max_bytes: int) -> bytes | None:
+        self.bounded_reads.append((content_hash, max_bytes))
+        return None if len(self.content) > max_bytes else self.content
+
+    def exists(self, content_hash: str) -> bool:
+        return True
+
+    def delete(self, content_hash: str) -> bool:
+        raise AssertionError("the transform must never delete payloads")
+
+
+def test_f30_oversized_inline_document_is_rejected_by_a_bounded_read() -> None:
+    transform = AWSTextractInlineAnalysis(
+        {
+            "region": "ap-southeast-2",
+            "document_format": "png",
+            "feature_types": ["FORMS"],
+            "text_field": "textract_text",
+            "schema": {"mode": "observed"},
+            "max_document_bytes": 64,
+        }
+    )
+    store = _BoundedReadStore(_F30_PNG)
+    transform._payload_store = store
+
+    result = transform._read_document_bytes(make_pipeline_row({"blob_ref": _F30_SHA}))
+
+    assert isinstance(result, TransformResult)
+    assert result.status == "error"
+    assert result.reason["reason"] == "blob_too_large"
+    assert result.reason["max_blob_bytes"] == 64
+    assert store.full_reads == [], "the whole blob was read before the size cap applied"
+    assert store.bounded_reads == [(_F30_SHA, 64)]
+    assert result.reason["actual"] == ">64"
