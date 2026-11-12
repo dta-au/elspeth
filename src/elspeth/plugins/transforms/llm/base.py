@@ -615,15 +615,14 @@ class LLMConfig(TransformDataConfig):
         Only *validation* moves earlier; the frozen ``QuerySpec`` runtime
         resolution still happens in ``LLMTransform.__init__`` (the second call is
         idempotent). This validator is deliberately scoped to config-shape errors:
-        it resolves typed queries and, for explicit prefix overrides, checks the
-        complete generated-name inventory. It does not catch or reshape any
+        it resolves typed queries and checks the complete generated-name
+        inventory (structured, raw-response and operational names) under every
+        query mode and structured stem. It does not catch or reshape any
         exception, so a genuine framework failure would still propagate.
         """
         if self.queries is None:
             return self
-        specs = self.resolved_queries()
-        if any(spec.structured_output_prefix is not None for spec in specs):
-            unique_query_generated_fields(tuple(specs), self.response_field)
+        unique_query_generated_fields(tuple(self.resolved_queries()), self.response_field)
         return self
 
     @model_validator(mode="after")

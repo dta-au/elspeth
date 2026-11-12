@@ -104,19 +104,15 @@ def _llm_created_output_fields(
     transform stamps it (``LLMTransform.created_output_fields``) and
     ``LLMConfig`` checks the operator's authored types against it.
 
-    Operational values overwrite extracted values of the same name when
-    the row is assembled, so their declarations have the same precedence.
+    Every caller's config refuses a structured name equal to an operational
+    name (single prompt, multi-query and the LLM source), so the two sets
+    are disjoint here.
     """
-    operational_fields = tuple(
-        FieldDefinition(f"{response_field}{suffix}", _SUFFIX_SCHEMA_TYPES[suffix]) for suffix in LLM_GUARANTEED_SUFFIXES
-    )
-    operational_names = {field.name for field in operational_fields}
     return (
-        *operational_fields,
+        *(FieldDefinition(f"{response_field}{suffix}", _SUFFIX_SCHEMA_TYPES[suffix]) for suffix in LLM_GUARANTEED_SUFFIXES),
         *(
             FieldDefinition(f"{prefix}{field.suffix}", _OUTPUT_FIELD_TYPE_TO_SCHEMA[field.type.value], nullable=field.nullable)
             for field in output_fields
-            if f"{prefix}{field.suffix}" not in operational_names
         ),
     )
 
@@ -205,22 +201,20 @@ def _llm_generated_output_fields(
     *,
     nullable_fields: frozenset[str] = frozenset(),
 ) -> tuple[FieldDefinition, ...]:
-    """Declare successful query fields with operational-field precedence.
+    """Declare successful query fields: the operational fields, then the extracted ones.
 
     nullable_fields contains complete extracted names, including query prefixes.
     A nullable field remains required: only its admitted value domain expands.
+    Config validation refuses an extracted name equal to an operational name.
     """
-    operational_fields = tuple(
-        FieldDefinition(name=f"{response_field}{suffix}", field_type=_SUFFIX_SCHEMA_TYPES[suffix], required=True, nullable=False)
-        for suffix in LLM_GUARANTEED_SUFFIXES
-    )
-    operational_names = {field.name for field in operational_fields}
     return (
-        *operational_fields,
+        *(
+            FieldDefinition(name=f"{response_field}{suffix}", field_type=_SUFFIX_SCHEMA_TYPES[suffix], required=True, nullable=False)
+            for suffix in LLM_GUARANTEED_SUFFIXES
+        ),
         *(
             FieldDefinition(name=name, field_type=field_type, required=True, nullable=name in nullable_fields)
             for name, field_type in extracted_fields
-            if name not in operational_names
         ),
     )
 

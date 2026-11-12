@@ -1264,7 +1264,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:239240ed0e8901b7"
+    source_file_hash: str | None = "sha256:3c60f14ba869b372"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -2219,7 +2219,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     "Multi-query input_fields maps variables to upstream columns by default. Explicit query_input_mode=ordered needs list-form named queries and pool_size=1; exact bindings may name earlier validated generated fields, never self/forward.",
                     "Per-query output_fields default to <queryname>_<suffix>.",
                     "Per-query structured_output_prefix: null/omitted retains the query-name stem; empty string emits bare suffixes; a nonempty ASCII identifier (at most 64 characters) emits <stem>_<suffix>.",
-                    "structured_output_prefix leaves JSON response keys and raw/usage/model names unchanged. Any non-null override requires unique final generated names across every query; ordered mode always rejects collisions.",
+                    "structured_output_prefix leaves JSON response keys and raw/usage/model names unchanged. Final generated names, including raw/usage/model fields, must be unique across every query in every query_input_mode.",
                     "A separate semantic reviewer query must bind the actual earlier generated fields and relevant original evidence explicitly. A Boolean verdict plus result_checks can reject before downstream release.",
                     "Separate model calls are not a certification of semantic correctness; both prompts and authored judgment semantics still need ordinary review.",
                     "Ordered mode preserves original-only source_row/images and atomic final output. Later failure routes the original entry row; prior calls/charges remain. Node-level restart may repeat calls; no durable mid-node resume or exactly-once guarantee.",
