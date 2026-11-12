@@ -127,3 +127,72 @@ class TestFinding99BatchStatsIntegerSumOverflow:
         assert result.reason is not None
         assert result.reason["reason"] == "float_overflow"
         assert result.reason["operation"] == "sum"
+
+
+def _admit(config_cls: Any, config: dict[str, Any], plugin_name: str) -> tuple[Any, Exception | None]:
+    """Run config admission and return (config, refusal) so tests assert on both."""
+    from elspeth.plugins.infrastructure.config_base import PluginConfigError
+
+    try:
+        return config_cls.from_dict(config, plugin_name=plugin_name), None
+    except PluginConfigError as exc:
+        return None, exc
+
+
+def _variant_config(baseline: object, *, pair_field: bool = True) -> dict[str, Any]:
+    config: dict[str, Any] = {
+        "schema": DYNAMIC_SCHEMA,
+        "variant_field": "variant",
+        "score_field": "score",
+        "baseline_variant": baseline,
+    }
+    if pair_field:
+        config["pair_field"] = "case_id"
+    return config
+
+
+# Every scalar a YAML or composer config can carry as a variant label, each of
+# which must reach the plugin with its own type (same_scalar_bucket_value is
+# type-strict, so a coerced baseline never matches its variant).
+_BASELINE_LABELS: tuple[object, ...] = ("control", "1", 1, 0, True, False, 0.2, 1.0, 2.5)
+
+
+class TestFinding107PairedPreferenceFloatBaseline:
+    """#107: a float baseline_variant must keep its type and match float variants."""
+
+    def test_every_scalar_baseline_is_admitted_with_its_own_type(self) -> None:
+        from elspeth.plugins.transforms.batch_paired_preference import BatchPairedPreferenceConfig
+
+        for baseline in _BASELINE_LABELS:
+            cfg, refused = _admit(BatchPairedPreferenceConfig, _variant_config(baseline), "batch_paired_preference")
+            assert refused is None, f"baseline_variant {baseline!r} was refused: {refused}"
+            assert type(cfg.baseline_variant) is type(baseline), f"{baseline!r} was coerced to {cfg.baseline_variant!r}"
+            assert cfg.baseline_variant == baseline
+
+    def test_float_baseline_matches_float_variants(self, ctx: PluginContext) -> None:
+        from elspeth.plugins.transforms.batch_paired_preference import BatchPairedPreference
+
+        transform = BatchPairedPreference(_variant_config(1.0))
+        rows = [
+            _make_row({"case_id": "p1", "variant": 2.0, "score": 0.9}),
+            _make_row({"case_id": "p1", "variant": 1.0, "score": 0.4}),
+            _make_row({"case_id": "p2", "variant": 2.0, "score": 0.7}),
+            _make_row({"case_id": "p2", "variant": 1.0, "score": 0.5}),
+        ]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "success", result.reason
+        assert result.row is not None
+        assert type(result.row["baseline_variant"]) is float
+        assert result.row["baseline_variant"] == 1.0
+        assert result.row["variant"] == 2.0
+        assert result.row["wins"] == 2
+
+    def test_non_finite_baseline_is_refused_as_non_finite(self) -> None:
+        from elspeth.plugins.transforms.batch_paired_preference import BatchPairedPreferenceConfig
+
+        for baseline in (float("nan"), float("inf")):
+            _cfg, refused = _admit(BatchPairedPreferenceConfig, _variant_config(baseline), "batch_paired_preference")
+            assert refused is not None, f"baseline_variant {baseline!r} can never match a variant and must be refused"
+            assert "baseline_variant must be finite" in str(refused), f"refusal does not name the non-finite baseline: {refused}"
