@@ -14,8 +14,10 @@ from typing import Any, ClassVar
 
 import pytest
 
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+from elspeth.engine.batch_adapter import SharedBatchAdapter
 from elspeth.plugins.transforms import (
     batch_drift_compare,
     batch_outlier_annotator,
@@ -485,3 +487,61 @@ class TestFinding118EvictedLateFailureIsNotTheNextRowsFailure:
             except Exception as exc:
                 raised_at_shutdown = exc
             assert raised_at_shutdown is not None
+
+
+class _BrokenDownstreamAdapter(SharedBatchAdapter):
+    """The engine's real adapter whose downstream delivery is broken: every emit raises."""
+
+    def __init__(self, failure: Exception) -> None:
+        super().__init__()
+        self.failure = failure
+
+    def emit(self, token: Any, result: Any, state_id: str | None) -> None:
+        raise self.failure
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+class TestFinding119DeadReleaseThreadWakesWaiters:
+    """#119: when the release thread dies, a blocked waiter must get the failure now.
+
+    Before the fix the waiter sleeps out batch_wait_timeout (3600s by default)
+    and then reports a TimeoutError; the real cause surfaces only on the next
+    accept().
+    """
+
+    @pytest.mark.parametrize(
+        "emit_failure, expected",
+        [
+            pytest.param(RuntimeError("downstream broken"), FrameworkBugError, id="broken-port"),
+            pytest.param(AuditIntegrityError("audit write failed"), AuditIntegrityError, id="tier1-from-emit"),
+        ],
+    )
+    def test_blocked_waiter_receives_release_thread_failure(self, emit_failure: Exception, expected: type[Exception]) -> None:
+        from tests.fixtures.landscape import make_factory
+        from tests.unit.plugins.batching.test_batch_transform_mixin import SimpleBatchTransform, make_token
+
+        adapter = _BrokenDownstreamAdapter(emit_failure)
+        transform = SimpleBatchTransform()
+        transform.connect_output(adapter, max_pending=5)
+        token = make_token("row-0", token_id="token-0")
+        ctx = make_context(landscape=make_factory(), token=token, state_id="state-0")
+        waiter = adapter.register(token.token_id, "state-0")
+        transform.accept_row(_make_row({}), ctx, transform._process_row)
+
+        surfaced: Exception | None = None
+        started = time.monotonic()
+        try:
+            waiter.wait(timeout=3.0)
+        except Exception as exc:
+            surfaced = exc
+        elapsed = time.monotonic() - started
+
+        try:
+            assert surfaced is not None
+            assert not isinstance(surfaced, TimeoutError), "the waiter slept out its timeout behind a dead release thread"
+            assert isinstance(surfaced, expected), f"waiter raised {type(surfaced).__name__}, not the release-thread failure"
+            assert elapsed < 2.5
+        finally:
+            transform._batch_release_thread.join(timeout=3.0)
+            transform._batch_executor.shutdown(wait=True)
+            transform._batch_buffer.shutdown()
