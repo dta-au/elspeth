@@ -16,14 +16,13 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import Boolean, Column, Float, Integer, MetaData, String, Table, Text, create_engine, insert, select, text
+from sqlalchemy import Boolean, Column, Integer, MetaData, String, Table, Text, create_engine, insert, select, text
 from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.exc import DataError, IntegrityError, SQLAlchemyError
 
 if TYPE_CHECKING:
     from elspeth.contracts.sink import OutputValidationResult
 from sqlalchemy.engine import Engine
-from sqlalchemy.types import TypeEngine
 
 from elspeth.contracts import ArtifactDescriptor, Determinism, PluginSchema
 from elspeth.contracts.contexts import SinkContext
@@ -57,20 +56,6 @@ from elspeth.plugins.infrastructure.base import BaseSink
 from elspeth.plugins.infrastructure.config_base import DataPluginConfig
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.sinks._diversion_attribution import DiversionAttribution, build_diversion_attribution
-
-# Map schema field types to SQLAlchemy column types.
-# Text (not String) is used for string columns because String() without a length
-# argument causes truncation or errors on MySQL/MSSQL — Text maps to TEXT on all
-# backends and accepts arbitrary-length values without portability issues.
-SCHEMA_TYPE_TO_SQLALCHEMY: Mapping[str, type[TypeEngine[Any]]] = MappingProxyType(
-    {
-        "str": Text,
-        "int": Integer,
-        "float": Float,
-        "bool": Boolean,
-        "any": Text,  # Fallback to Text for 'any' type
-    }
-)
 
 # The stable failure kind a row's diversion reason names, keyed by the
 # driver's value-free condition name: PostgreSQL's per-SQLSTATE error class
@@ -256,11 +241,12 @@ class DatabaseSinkConfig(DataPluginConfig):
 
 
 class DatabaseSink(BaseSink, RestagingSinkEffectCapability):
-    """Write rows to a database table.
+    """Append rows to an operator-provisioned database table.
 
-    Creates the table on first write. When schema is explicit, columns are
-    derived from schema field definitions with proper type mapping. When schema
-    is dynamic, columns are inferred from the first row's keys.
+    Supports SQLite and PostgreSQL only. The target table and the declared
+    target-side effect ledger must already exist: the sink performs no DDL and
+    refuses a missing table. Only ``if_exists: append`` is accepted at
+    effect-mode resolution; ``replace`` is refused.
 
     Uses SQLAlchemy Core for direct SQL control.
 
@@ -275,7 +261,8 @@ class DatabaseSink(BaseSink, RestagingSinkEffectCapability):
         url: Database connection URL (required)
         table: Table name (required)
         schema: Schema configuration (required, via DataPluginConfig)
-        if_exists: "append" or "replace" (default: "append")
+        if_exists: "append" (default; "replace" is refused at validation)
+        effect_ledger: Operator-provisioned exactly-once ledger table (required)
 
     Input validation is always enabled. Incoming rows are validated against
     the schema before INSERT — wrong types indicate an upstream plugin bug
@@ -290,7 +277,7 @@ class DatabaseSink(BaseSink, RestagingSinkEffectCapability):
     name = "database"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:70aba8010449fa68"
+    source_file_hash: str | None = "sha256:e81744135a73d19f"
     config_model = DatabaseSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.SQL
@@ -1138,7 +1125,7 @@ class DatabaseSink(BaseSink, RestagingSinkEffectCapability):
 
         inspector = inspect(self._engine)
         if not inspector.has_table(self._table_name):
-            return OutputValidationResult.success()  # Will create table
+            return OutputValidationResult.success()  # No columns to compare; effect inspection refuses a missing table
 
         # Get existing columns
         columns = inspector.get_columns(self._table_name)
@@ -1199,12 +1186,13 @@ class DatabaseSink(BaseSink, RestagingSinkEffectCapability):
             return PluginAssistance(
                 plugin_name="database",
                 issue_code=None,
-                summary="Write rows to a SQL table (Postgres, SQLite, SQL Server) via SQLAlchemy. Write behaviour is set by if_exists: 'append' (default) or 'replace'.",
+                summary="Append rows to an operator-provisioned SQLite or PostgreSQL table via SQLAlchemy, exactly once through a required target-side effect_ledger.",
                 composer_hints=(
-                    "if_exists: 'append' (default — insert into the existing table, creating it if missing) or 'replace' (drops and recreates the table on the FIRST write — destructive). These are the only two values; there is no insert/upsert mode.",
+                    "Only SQLite and PostgreSQL URLs are accepted; any other dialect fails validation.",
+                    "The target table must already exist with compatible columns: the sink performs no DDL and refuses a missing table. Ask the operator for a provisioned table name.",
+                    "effect_ledger is REQUIRED: declare the operator-provisioned ledger (table, schema_version, permissions insert/select) on the same database, or validation fails.",
+                    "if_exists must be 'append' (the default). 'replace' is not supported and fails validation; there is no insert/upsert mode.",
                     "url is sanitised and audit-recorded — never put credentials inline; use the secrets store.",
-                    "Schema fields map to column types: string→TEXT, int→Integer, float→Float, bool→Boolean. Other types need explicit type_coerce upstream.",
-                    "if_exists='replace' is irreversible — it drops the table on first write. Confirm with the operator before declaring 'replace' on existing data.",
                     "on_write_failure routes per-row constraint violations (UNIQUE / NOT NULL / CHECK / foreign-key) — the offending row is diverted and the rest of the batch commits. Batch-integrity failures (connection loss, lock timeout, bad SQL) are not row-attributable and crash the run.",
                 ),
             )
@@ -1230,6 +1218,6 @@ class DatabaseSink(BaseSink, RestagingSinkEffectCapability):
         hints: list[str] = []
         if config_snapshot.get("if_exists") == "replace":
             hints.append(
-                "if_exists: 'replace' DROPS and recreates the target table on the first write. Confirm with the operator that the existing data is expendable before running."
+                "if_exists: 'replace' is not supported and fails validation. Use if_exists: 'append' against an operator-provisioned table."
             )
         return tuple(hints)
