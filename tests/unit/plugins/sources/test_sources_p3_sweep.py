@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from elspeth.plugins.infrastructure.results import TransformResult
 from tests.fixtures.factories import make_source_context
 from tests.unit.plugins.sources.test_aws_s3_source import _source_for
 
@@ -139,3 +140,67 @@ class TestBlobCSVExpandDelimiterValidatedAtConfigTime:
 
         assert error is not None
         assert "delimiter" in error
+
+
+class _BoundedReadRecordingStore:
+    """Payload store double modelling retrieve_bounded's contract and recording every read."""
+
+    def __init__(self, content: bytes) -> None:
+        self.content = content
+        self.full_reads: list[str] = []
+        self.bounded_reads: list[tuple[str, int]] = []
+
+    def retrieve(self, content_hash: str) -> bytes:
+        self.full_reads.append(content_hash)
+        return self.content
+
+    def retrieve_bounded(self, content_hash: str, *, max_bytes: int) -> bytes | None:
+        self.bounded_reads.append((content_hash, max_bytes))
+        if len(self.content) > max_bytes:
+            return None
+        return self.content
+
+
+class TestBlobCSVExpandBoundsTheBlobRead:
+    """Sweep finding #52: max_blob_bytes must bound the read, not be checked after it."""
+
+    def _run(self, body: bytes, *, max_blob_bytes: int) -> tuple[TransformResult, _BoundedReadRecordingStore, str]:
+        import hashlib
+
+        from elspeth.plugins.transforms.blob_csv_expand import BlobCSVExpand
+        from elspeth.testing import make_pipeline_row
+        from tests.fixtures.factories import make_context
+
+        blob_ref = hashlib.sha256(body).hexdigest()
+        transform = BlobCSVExpand(
+            {
+                "schema": {"mode": "observed", "guaranteed_fields": ["blob_ref"]},
+                "blob_ref_field": "blob_ref",
+                "max_blob_bytes": max_blob_bytes,
+            }
+        )
+        store = _BoundedReadRecordingStore(body)
+        transform._payload_store = store
+        result = transform.process(make_pipeline_row({"blob_ref": blob_ref}), make_context())
+        return result, store, blob_ref
+
+    def test_oversized_blob_is_refused_without_a_full_read(self) -> None:
+        body = b"id,name\n" + b"1,alice\n" * 100
+        result, store, blob_ref = self._run(body, max_blob_bytes=16)
+
+        assert store.full_reads == []
+        assert store.bounded_reads == [(blob_ref, 16)]
+        assert result.status == "error"
+        assert result.reason is not None
+        assert result.reason["reason"] == "blob_too_large"
+        assert result.reason["max_blob_bytes"] == 16
+        # The bounded read stops past the cap, so no exact size is known to report.
+        assert "body_size" not in result.reason
+
+    def test_blob_within_limit_is_read_through_the_bounded_path(self) -> None:
+        body = b"id,name\n1,alice\n"
+        result, store, blob_ref = self._run(body, max_blob_bytes=1024)
+
+        assert store.full_reads == []
+        assert store.bounded_reads == [(blob_ref, 1024)]
+        assert result.status == "success"
