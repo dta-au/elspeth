@@ -6,6 +6,7 @@ code paths the finding describes and assert on the observable outcome.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import threading
 from types import SimpleNamespace
@@ -32,6 +33,8 @@ from tests.unit.plugins.transforms.azure.test_document_intelligence import _post
 from tests.unit.plugins.transforms.azure.test_document_intelligence import _Resp as _DIResp
 from tests.unit.plugins.transforms.azure.test_document_intelligence import _run_with_fake as _di_run_with_fake
 from tests.unit.plugins.transforms.azure.test_document_intelligence import _t_for_lro as _di_transform
+from tests.unit.plugins.transforms.azure.test_prompt_shield import _create_mock_http_response as _ps_response
+from tests.unit.plugins.transforms.azure.test_prompt_shield import _patch_httpx_client as _ps_patch_httpx_generator
 
 # ---------------------------------------------------------------------------
 # Finding #35: FORMS projection must carry checkbox selection state.
@@ -455,3 +458,55 @@ def test_f98_concurrent_follower_failure_is_marked_as_inherited() -> None:
         "error_type": "AccessDenied",
         "cache_status": "shared_failure",
     }
+
+
+# ---------------------------------------------------------------------------
+# Finding #114: no Azure safety field call may start after the row deadline.
+# ---------------------------------------------------------------------------
+
+
+_ps_patch_httpx_client = contextlib.contextmanager(_ps_patch_httpx_generator)
+
+
+class _F114Clock:
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def test_f114_remaining_fields_make_no_call_after_the_row_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    import elspeth.plugins.transforms.azure.base as azure_base
+    from elspeth.plugins.transforms.azure.prompt_shield import AzurePromptShield
+
+    clock = _F114Clock()
+    monkeypatch.setattr(azure_base, "time", clock)
+    safe = _ps_response({"userPromptAnalysis": {"attackDetected": False}, "documentsAnalysis": [{"attackDetected": False}]})
+
+    def slow_first_field_call(*_args: Any, **_kwargs: Any) -> Any:
+        # The first field's call succeeds only after the row's capacity
+        # budget (1 s) has elapsed, as a call that ran to its HTTP timeout.
+        clock.now += 30.0
+        return safe
+
+    with _ps_patch_httpx_client() as http:
+        http.post.side_effect = slow_first_field_call
+        transform = AzurePromptShield(
+            {
+                "endpoint": "https://test.cognitiveservices.azure.com",
+                "api_key": "test-key",
+                "fields": ["first", "second", "third"],
+                "max_capacity_retry_seconds": 1,
+                "schema": {"mode": "observed"},
+            }
+        )
+        ctx = make_context()
+        transform.on_start(ctx)
+        result = transform._process_single_with_state(make_pipeline_row({"first": "a", "second": "b", "third": "c"}), "state-1", ctx=ctx)
+
+    assert http.post.call_count == 1, "a field call started after the row deadline the batch waiter is sized for"
+    assert result.status == "error"
+    assert result.reason["reason"] == "retry_timeout"
+    assert result.reason["field"] == "second"
+    assert result.retryable is False
