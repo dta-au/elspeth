@@ -53,6 +53,7 @@ from elspeth.contracts.sink_effects import (
 from elspeth.contracts.url import SanitizedDatabaseUrl
 from elspeth.core.canonical import canonical_json
 from elspeth.plugins.infrastructure.base import BaseSink
+from elspeth.plugins.infrastructure.clients.retrieval.chroma import _collection_distance_space
 from elspeth.plugins.infrastructure.clients.retrieval.connection import (
     ChromaConnectionConfig,
     ChromaConnectionMode,
@@ -216,7 +217,7 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
     name = "chroma_sink"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:c08d757cf9512990"
+    source_file_hash: str | None = "sha256:4452cec0e1fd1b77"
     config_model = ChromaSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
@@ -351,10 +352,23 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
             )
             self._client.heartbeat()
 
-        self._collection = self._client.get_or_create_collection(
+        collection = self._client.get_or_create_collection(
             name=self._config.collection,
             metadata={"hnsw:space": self._config.distance_function},
         )
+        # get_or_create_collection returns an existing collection unchanged:
+        # its creation metadata is not applied. Refuse a collection built with
+        # another distance function rather than silently index into it (the
+        # retrieval provider refuses the same mismatch when reading).
+        actual_space = _collection_distance_space(collection.metadata, self._config.collection)
+        if actual_space != self._config.distance_function:
+            raise ValueError(
+                f"Chroma collection {self._config.collection!r} already exists with "
+                f"distance_function={actual_space!r}, but config specifies "
+                f"distance_function={self._config.distance_function!r}. Either change the "
+                f"config to match the existing collection, or use a different collection name."
+            )
+        self._collection = collection
 
     @staticmethod
     def _compute_payload_hash(
