@@ -426,7 +426,7 @@ class AzureBlobSource(BaseSource):
     name = "azure_blob"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b69c623109562e5e"
+    source_file_hash: str | None = "sha256:50003a51c8495a6b"
     config_model = AzureBlobSourceConfig
 
     usage_when_to_use: str = (
@@ -706,11 +706,7 @@ class AzureBlobSource(BaseSource):
         has_header = self._csv_options.has_header
         encoding = self._csv_options.encoding
 
-        # THEIR DATA: Parsing blob content - wrap operations
-        try:
-            text_data = blob_data.decode(encoding)
-        except UnicodeDecodeError as e:
-            error_msg = f"Failed to decode CSV blob as {encoding}: {e}"
+        def _quarantine_undecodable_file(error_msg: str) -> Iterator[SourceRow]:
             raw_row = {
                 "container": self._container,
                 "blob_path": self._blob_path,
@@ -729,7 +725,29 @@ class AzureBlobSource(BaseSource):
                     destination=self._on_validation_failure,
                     source_row_index=0,
                 )
+
+        # THEIR DATA: Parsing blob content - wrap operations.
+        # surrogateescape (as _load_jsonl does) keeps undecodable bytes as
+        # lone surrogates so each bad record is quarantined on its own line
+        # below instead of one byte discarding every decodable row. The
+        # strict fallback remains for the bytes surrogateescape cannot carry.
+        try:
+            text_data = blob_data.decode(encoding, errors="surrogateescape")
+        except UnicodeDecodeError as e:
+            yield from _quarantine_undecodable_file(f"Failed to decode CSV blob as {encoding}: {e}")
             return
+        # Header-level quarantine previews must never carry lone surrogates.
+        blob_preview = "".join("\ufffd" if _contains_surrogateescape_chars(char) else char for char in text_data[:200])
+
+        # Physical lines consumed by the record csv.reader is assembling; the
+        # reader pulls lines on demand, so after each next() this holds
+        # exactly that record's text.
+        record_lines: list[str] = []
+
+        def _tracked_lines() -> Iterator[str]:
+            for line in io.StringIO(text_data):
+                record_lines.append(line)
+                yield line
 
         # Parse CSV row-by-row using csv.reader for per-row error handling.
         # This allows quarantining individual bad rows instead of the entire file.
@@ -737,7 +755,7 @@ class AzureBlobSource(BaseSource):
         # the source boundary with a csv.Error — without it, data after a closing
         # quote is silently merged into adjacent fields and a field-count-preserving
         # corrupt row passes through with no quarantine and no audit record.
-        reader = csv.reader(io.StringIO(text_data), delimiter=delimiter, strict=True)
+        reader = csv.reader(_tracked_lines(), delimiter=delimiter, strict=True)
 
         # Track a peeked first data row (used for headerless CSV with no schema)
         first_data_row: list[str] | None = None
@@ -751,7 +769,7 @@ class AzureBlobSource(BaseSource):
             except csv.Error as e:
                 # Header parse failure at source boundary (Tier 3)
                 raw_row = {
-                    "__raw_blob_preview__": text_data[:200],
+                    "__raw_blob_preview__": blob_preview,
                     "__encoding__": encoding,
                 }
                 error_msg = f"CSV parse error in blob header: {e}"
@@ -773,7 +791,7 @@ class AzureBlobSource(BaseSource):
             if raw_headers is _ROW_EXHAUSTED:
                 # Empty file — quarantine as structural failure (Tier 3)
                 raw_row = {
-                    "__raw_blob_preview__": text_data[:200],
+                    "__raw_blob_preview__": blob_preview,
                     "__encoding__": encoding,
                 }
                 error_msg = "CSV parse error: empty file contains no header row"
@@ -792,6 +810,12 @@ class AzureBlobSource(BaseSource):
                     )
                 return
 
+            if _contains_surrogateescape_chars("".join(record_lines)):
+                yield from _quarantine_undecodable_file(
+                    f"Failed to decode CSV blob header as {encoding}: undecodable bytes in the header record"
+                )
+                return
+
             # External-header faults (normalization collision, empty/duplicate headers)
             # are Tier 3 (the blob's own header bytes are bad): record + quarantine/
             # discard like the sibling csv.Error header path above. Config faults (a bad
@@ -804,7 +828,7 @@ class AzureBlobSource(BaseSource):
                 )
             except ExternalHeaderError as e:
                 raw_row = {
-                    "__raw_blob_preview__": text_data[:200],
+                    "__raw_blob_preview__": blob_preview,
                     "__encoding__": encoding,
                 }
                 error_msg = f"CSV header could not be resolved: {e}"
@@ -873,6 +897,7 @@ class AzureBlobSource(BaseSource):
         row_source: Iterator[list[str]] = itertools.chain([first_data_row], reader) if first_data_row is not None else reader
         row_count = 0
         while True:
+            record_lines.clear()
             try:
                 # next(..., sentinel) makes end-of-file ordinary control flow;
                 # the csv.Error boundary handler below still fires on bad CSV.
@@ -915,6 +940,32 @@ class AzureBlobSource(BaseSource):
 
             row_count += 1
             physical_line = reader.line_num
+
+            # Undecodable bytes — quarantine this record only, with its exact
+            # raw bytes (mirrors _load_jsonl), and keep reading.
+            raw_record = "".join(record_lines)
+            if _contains_surrogateescape_chars(raw_record):
+                raw_bytes = _surrogateescape_line_to_bytes(raw_record.rstrip("\r\n"), encoding)
+                raw_row = {
+                    "__raw_bytes_hex__": raw_bytes.hex(),
+                    "__line_number__": str(physical_line),
+                    "__row_number__": str(row_count),
+                }
+                error_msg = f"CSV parse error at line {physical_line}: invalid {encoding} encoding"
+                ctx.record_validation_error(
+                    row=raw_row,
+                    error=error_msg,
+                    schema_mode="parse",
+                    destination=self._on_validation_failure,
+                )
+                if self._on_validation_failure != "discard":
+                    yield SourceRow.quarantined(
+                        row=raw_row,
+                        error=error_msg,
+                        destination=self._on_validation_failure,
+                        source_row_index=row_count - 1,
+                    )
+                continue
 
             # Column count validation — quarantine malformed rows individually
             if len(values) != expected_count:
