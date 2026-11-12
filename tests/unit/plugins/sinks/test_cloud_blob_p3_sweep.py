@@ -162,3 +162,35 @@ class TestFinding28S3ProbeChecksDisplayHeader:
 
         assert raised is None
         assert diverted == 0
+
+
+class TestFinding65AzureHeaderEncodeIsConfigError:
+    """#65: an unencodable Azure CSV header must not divert every clean row."""
+
+    @staticmethod
+    def _sink(**overrides: object) -> Any:
+        from tests.unit.plugins.sinks.test_remote_object_sink_effects import _azure, _AzureStore
+
+        config: dict[str, object] = {"blob_path": "out.csv", "format": "csv", "schema": _FIXED_NAME_SCHEMA}
+        config.update(overrides)
+        return _azure(_AzureStore(), **config)
+
+    def test_unencodable_custom_header_raises_config_error_without_diverting(self) -> None:
+        from elspeth.plugins.sinks.azure_blob_sink import AzureBlobRecordSerializationError
+
+        sink = self._sink(csv_options={"encoding": "ascii"}, headers={"name": "Prénom"})
+
+        raised, diverted = _preflight_outcome(sink, [{"name": "bob"}, {"name": "alice"}])
+
+        assert diverted == 0, "clean rows must not be diverted for a header (configuration) defect"
+        assert isinstance(raised, ValueError)
+        assert not isinstance(raised, AzureBlobRecordSerializationError)
+        assert "Prénom" not in str(raised)
+
+    def test_unencodable_row_value_is_still_diverted(self) -> None:
+        sink = self._sink(csv_options={"encoding": "ascii"})
+
+        raised, diverted = _preflight_outcome(sink, [{"name": "bob"}, {"name": "Zoë"}])
+
+        assert raised is None
+        assert diverted == 1
