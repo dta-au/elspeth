@@ -20,6 +20,7 @@ from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.templates import ALL_FIELDS
 from elspeth.plugins.transforms.llm.base import LLMConfig
+from elspeth.plugins.transforms.llm.image_inputs import ImageInputConfig, resolve_image_parts
 from elspeth.plugins.transforms.llm.langfuse import ActiveLangfuseTracer, LangfuseTracer, create_langfuse_tracer
 from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig, QuerySpec
 from elspeth.plugins.transforms.llm.provider import FinishReason, LLMProvider, LLMQueryResult
@@ -28,6 +29,7 @@ from elspeth.plugins.transforms.llm.tracing import LangfuseTracingConfig
 from elspeth.plugins.transforms.llm.transform import MultiQueryStrategy, SingleQueryStrategy
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_context
+from tests.unit.plugins.llm.test_image_inputs import FakePayloadStore
 
 
 def _raised_by(call: Callable[[], object]) -> BaseException | None:
@@ -253,3 +255,33 @@ class TestFinding139LangfuseResourceManagerSharedByPublicKey:
             assert isinstance(second, ActiveLangfuseTracer)
         finally:
             self._shutdown(first)
+
+
+class TestFinding148RequiredImageEmptyList:
+    """Sweep finding #148: a required image field holding no references must not send a text-only call."""
+
+    @pytest.mark.parametrize("empty", [[], ()], ids=["list", "tuple"])
+    def test_required_image_with_empty_reference_list_is_a_row_error(self, empty: list[str] | tuple[str, ...]) -> None:
+        store = FakePayloadStore(contents={})
+        result = resolve_image_parts(
+            make_pipeline_row({"pic": empty}),
+            payload_store=store,
+            specs=[ImageInputConfig(field="pic", format="png")],
+            max_image_bytes=10_000_000,
+            max_images_per_call=20,
+        )
+        assert isinstance(result, TransformResult), f"expected a row-level error, got {result!r}"
+        assert result.status == "error"
+        assert result.reason == {"reason": "invalid_input", "field": "pic", "error_type": "empty_image_list"}
+        assert result.retryable is False
+        assert store.retrieve_calls == []
+
+    def test_optional_image_with_empty_reference_list_resolves_to_no_parts(self) -> None:
+        result = resolve_image_parts(
+            make_pipeline_row({"pic": []}),
+            payload_store=FakePayloadStore(contents={}),
+            specs=[ImageInputConfig(field="pic", format="png", required=False)],
+            max_image_bytes=10_000_000,
+            max_images_per_call=20,
+        )
+        assert result == ()
