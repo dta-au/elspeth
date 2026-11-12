@@ -20,8 +20,11 @@ from elspeth.contracts.enums import RunMode
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.security.web import SSRFSafeRequest
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
+from elspeth.plugins.infrastructure.clients.retrieval.azure_search import AzureSearchProvider, AzureSearchProviderConfig
 from tests.fixtures.mock_audit import mock_audit_authority
 from tests.unit.plugins.clients.test_http import _CallRecorder, _ExecutionRepositoryFake
+from tests.unit.plugins.infrastructure.clients.retrieval.test_azure_search import _FakeExecutionRecorder as _AzureFakeExecutionRecorder
+from tests.unit.plugins.infrastructure.clients.retrieval.test_azure_search import _TelemetrySink as _AzureTelemetrySink
 
 _CLIENTS = "elspeth.plugins.infrastructure.clients"
 
@@ -221,3 +224,59 @@ class TestFinding23ReplayReraisesRecordedTransportFailure:
         )
         assert type(exc) is AuditIntegrityError
         assert execution.record_call.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Finding #86: Azure Search copied every returned field, including the
+# embedding vector and @search.* internals, into chunk metadata (and from
+# there into the RAG row's sources output).
+# ---------------------------------------------------------------------------
+
+
+def _azure_provider(**overrides: Any) -> AzureSearchProvider:
+    config_data: dict[str, Any] = {
+        "endpoint": "https://test.search.windows.net",
+        "index": "test-index",
+        "api_key": "test-key",
+    }
+    config_data.update(overrides)
+    execution: Any = _AzureFakeExecutionRecorder()
+    return AzureSearchProvider(
+        config=AzureSearchProviderConfig(**config_data),
+        execution=execution,
+        run_id="run-1",
+        telemetry_emit=_AzureTelemetrySink(),
+    )
+
+
+class TestFinding86AzureMetadataExcludesVectorAndInternals:
+    @pytest.mark.parametrize(
+        ("mode_options", "score_key"),
+        [
+            pytest.param({"search_mode": "hybrid"}, "@search.score", id="hybrid"),
+            pytest.param({"search_mode": "vector"}, "@search.score", id="vector"),
+            pytest.param({"search_mode": "semantic", "semantic_config": "cfg"}, "@search.rerankerScore", id="semantic"),
+        ],
+    )
+    def test_default_vector_field_and_search_internals_are_not_metadata(self, mode_options: dict[str, Any], score_key: str) -> None:
+        provider = _azure_provider(**mode_options)
+        embedding = [0.001 * i for i in range(1536)]
+        item = {
+            "@search.score": 0.03,
+            "@search.rerankerScore": 2.0,
+            "@search.highlights": {"content": ["<em>c</em>"]},
+            score_key: 0.03 if score_key == "@search.score" else 2.0,
+            "content": "chunk text",
+            "id": "d1",
+            "contentVector": embedding,
+            "category": "returns",
+        }
+        chunks, skipped = provider._parse_response({"value": [item]}, min_score=0.0)
+        assert skipped == []
+        assert dict(chunks[0].metadata) == {"category": "returns"}
+
+    def test_custom_vector_field_is_not_metadata(self) -> None:
+        provider = _azure_provider(search_mode="hybrid", vector_field="embedding")
+        item = {"@search.score": 0.03, "content": "c", "id": "d1", "embedding": [0.5, 0.25], "contentVector": "kept: not the vector field"}
+        chunks, _ = provider._parse_response({"value": [item]}, min_score=0.0)
+        assert dict(chunks[0].metadata) == {"contentVector": "kept: not the vector field"}
