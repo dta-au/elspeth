@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from functools import partial
 from types import MappingProxyType
 from typing import Any
 from unittest.mock import Mock
+from uuid import uuid4
 
+import httpx
 import pytest
 
 from elspeth.contracts.identity import TokenInfo
@@ -17,9 +20,11 @@ from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.templates import ALL_FIELDS
 from elspeth.plugins.transforms.llm.base import LLMConfig
+from elspeth.plugins.transforms.llm.langfuse import ActiveLangfuseTracer, LangfuseTracer, create_langfuse_tracer
 from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig, QuerySpec
 from elspeth.plugins.transforms.llm.provider import FinishReason, LLMProvider, LLMQueryResult
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
+from elspeth.plugins.transforms.llm.tracing import LangfuseTracingConfig
 from elspeth.plugins.transforms.llm.transform import MultiQueryStrategy, SingleQueryStrategy
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_context
@@ -183,3 +188,68 @@ class TestFinding45SuccessReasonFieldInventoryAndModel:
         assert "sentiment_served_model" in metadata, sorted(metadata)
         assert metadata["sentiment_served_model"] == "served-model"
         assert set(result.success_reason["fields_added"]) == _fields_written(result, {"text": "hello"})
+
+
+class TestFinding139LangfuseResourceManagerSharedByPublicKey:
+    """Sweep finding #139: a cached Langfuse resource manager must not redirect a later config's traces."""
+
+    @pytest.fixture
+    def isolated_langfuse(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+        """Real SDK client with an isolated tracer provider, exporter and HTTP transport (no egress)."""
+        import langfuse
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+        provider = TracerProvider()
+        http_client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json={})))
+        monkeypatch.setattr(
+            langfuse,
+            "Langfuse",
+            partial(langfuse.Langfuse, tracer_provider=provider, httpx_client=http_client, span_exporter=InMemorySpanExporter()),
+        )
+        yield
+        provider.shutdown()
+        http_client.close()
+
+    @staticmethod
+    def _shutdown(tracer: LangfuseTracer) -> None:
+        assert isinstance(tracer, ActiveLangfuseTracer)
+        tracer.client.shutdown()
+        resources = tracer.client._resources
+        assert resources is not None
+        resources.prompt_cache._task_manager.shutdown()
+
+    @pytest.mark.parametrize(
+        ("second_host", "second_secret"),
+        [
+            pytest.param("https://lf-b.example.invalid", "sk-a", id="different-host"),
+            pytest.param("https://lf-a.example.invalid", "sk-rotated", id="rotated-secret"),
+        ],
+    )
+    def test_second_config_with_same_public_key_is_refused(self, isolated_langfuse: None, second_host: str, second_secret: str) -> None:
+        public_key = f"pk-p3-{uuid4().hex}"
+        first = create_langfuse_tracer(
+            "first_transform",
+            LangfuseTracingConfig(public_key=public_key, secret_key="sk-a", host="https://lf-a.example.invalid"),
+        )
+        try:
+            raised = _raised_by(
+                lambda: create_langfuse_tracer(
+                    "second_transform",
+                    LangfuseTracingConfig(public_key=public_key, secret_key=second_secret, host=second_host),
+                )
+            )
+            assert isinstance(raised, RuntimeError), f"expected RuntimeError for a divergent config, got {raised!r}"
+            assert "public_key" in str(raised)
+            assert second_secret not in str(raised)
+        finally:
+            self._shutdown(first)
+
+    def test_identical_config_with_same_public_key_is_admitted(self, isolated_langfuse: None) -> None:
+        config = LangfuseTracingConfig(public_key=f"pk-p3-{uuid4().hex}", secret_key="sk-a", host="https://lf-a.example.invalid")
+        first = create_langfuse_tracer("first_transform", config)
+        try:
+            second = create_langfuse_tracer("second_transform", config)
+            assert isinstance(second, ActiveLangfuseTracer)
+        finally:
+            self._shutdown(first)
