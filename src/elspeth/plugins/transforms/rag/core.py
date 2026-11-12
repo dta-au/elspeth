@@ -145,7 +145,9 @@ class RetrievalOutputConfig(TransformDataConfig):
 
     @model_validator(mode="after")
     def validate_query_modes(self) -> Self:
-        if self.query_template and self.query_pattern:
+        # Presence, not truthiness: QueryBuilder picks the mode by
+        # ``is not None``, so an empty string still claims its mode.
+        if self.query_template is not None and self.query_pattern is not None:
             raise ValueError("query_template and query_pattern are mutually exclusive")
         return self
 
@@ -160,6 +162,8 @@ class RetrievalOutputConfig(TransformDataConfig):
         """
         if v is None:
             return None
+        if not v.strip():
+            raise ValueError("query_template cannot be empty: it would render an empty query for every row; omit it instead")
         try:
             SandboxedTemplate(v)
         except (TemplateSyntaxError, TemplateError) as exc:
@@ -297,6 +301,8 @@ class RetrievalOutputConfig(TransformDataConfig):
     @classmethod
     def validate_regex(cls, v: str | None) -> str | None:
         if v is not None:
+            if v == "":
+                raise ValueError("query_pattern cannot be empty: it has no capture group to extract a query; omit it instead")
             try:
                 re.compile(v)
             except re.error as e:
