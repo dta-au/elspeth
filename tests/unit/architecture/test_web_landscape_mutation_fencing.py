@@ -946,7 +946,14 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # Power Automate: measured against the release parent of 05af04770. One arrival:
 # PowerAutomateSource._reject_candidate -> ctx.record_validation_error. The remaining
 # 286 caller identities are unchanged (no departures or moves).
-_EXPECTED_CALL_COUNT = 287
+# P2 json-csv (#40/#80): 287 -> 283. Arrived 0, moved 0, departed 4:
+# JSONSource._load_json_array -> ctx.record_validation_error #1/#2/#3 (the
+# structural quarantines now go through the existing JSONSource._record_parse_error
+# caller so each records the row it yields), and CSVSource.load ->
+# ctx.record_validation_error #2 (the text-mode and in-reader decode handlers merge
+# into one now that decoding is strict and line-attributed). Measured by
+# scripts/fencing_inventory.py --baseline against a git archive of 08cc09dc.
+_EXPECTED_CALL_COUNT = 283
 # Release integration retains the ACA callers and the Dataverse lifecycle
 # wrapper: six validation writes move from load() to _load_rows().
 # AGG-ERROR-EDGE: 0b7a9382… -> d82c45a5…, the one caller added above.
@@ -963,7 +970,9 @@ _EXPECTED_CALL_COUNT = 287
 # a00408f8… (the arrival and departures named at _EXPECTED_CALL_COUNT).
 # QR merged with release/0.8.1: 72e3db35… (release) -> the value below, the arrival
 # and departures named at _EXPECTED_CALL_COUNT.
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "584288fd1e0aae2ff9dc879b809b169e3ef5cd06c062e603d3a762d1a79da2fc"
+# P2 json-csv: 584288fd… -> the value below, the four departures named at
+# _EXPECTED_CALL_COUNT.
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "87f23b4ef2f74fb698feec4987d6447aef4621a54d432f5617415edc718f96b3"
 # C4 (recorded FAILED verdict): 138 -> 143, d3b83b4c… -> the value below. Arrived:
 # ExecutionRepository.complete_aggregation_failure -> insert_batch_transform_errors_on,
 # -> NodeStateRepository.record_routing_event_on, -> NodeStateRepository.complete_node_state_on,
