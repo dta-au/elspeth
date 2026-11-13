@@ -45,7 +45,6 @@ def test_discovered_href_refuses_sensitive_parameter_after_semicolon(href: str) 
 def test_capability_query_keys_have_one_shared_definition() -> None:
     from elspeth.plugins.infrastructure.clients import fingerprinting
 
-    assert hasattr(fingerprinting, "is_capability_query_param")
     for key in ("session", "State", "cursor", "continuation", "next_token", "page_token"):
         assert fingerprinting.is_capability_query_param(key)
     assert not fingerprinting.is_capability_query_param("view")

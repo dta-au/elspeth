@@ -29,9 +29,3 @@ per_file_rules:
   reason: LLMResponse isinstance guard on raw_response — checks if already frozen before deep_freeze
   expires: null
   max_hits: 1
-- pattern: plugins/infrastructure/clients/replayer.py
-  rules:
-  - FG2
-  reason: ReplayedCall isinstance guards on response_data and error_data — checks if already frozen
-  expires: null
-  max_hits: 2
