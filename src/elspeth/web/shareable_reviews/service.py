@@ -417,12 +417,39 @@ class _InspectedFile:
         freeze_fields(self, "bindings")
 
 
+def _shared_content_refusal(inspected: Sequence[_InspectedFile]) -> str | None:
+    """Refuse two files with identical bytes but a different name or MIME type.
+
+    An import creates one blob per content hash and binds every site to it,
+    and a ``blob_rows`` source emits that blob's filename and MIME type as row
+    data. Two such files would therefore arrive under one name and type, and
+    the imported pipeline could produce different rows from the shared one.
+    """
+    first_by_hash: dict[str, BlobRecord] = {}
+    for item in inspected:
+        record = item.record
+        if record is None or record.content_hash is None:
+            continue
+        if record.content_hash not in first_by_hash:
+            first_by_hash[record.content_hash] = record
+            continue
+        first = first_by_hash[record.content_hash]
+        if (first.filename, first.mime_type) != (record.filename, record.mime_type):
+            return (
+                f"'{first.filename}' and '{record.filename}' have the same content but a different name or file type, "
+                "and an imported copy would carry one name and type for both; give them the same name and type, "
+                "or use one file in both places, before sharing for import"
+            )
+    return None
+
+
 def _manifest_entries(inspected: Sequence[_InspectedFile]) -> dict[str, ShareFileEntry]:
     """Build the ``files`` manifest entries for inspected files, keyed by content hash.
 
-    Every file must already have passed inspection. Two blobs with identical
-    bytes share one content address, so they become one entry carrying both
-    blobs' binding sites; the first blob's filename and MIME type name it.
+    Every file must already have passed inspection, including
+    :func:`_shared_content_refusal`. Two blobs with identical bytes, name and
+    MIME type share one content address, so they become one entry carrying
+    both blobs' binding sites.
     """
     entries: dict[str, ShareFileEntry] = {}
     for item in inspected:
@@ -431,7 +458,10 @@ def _manifest_entries(inspected: Sequence[_InspectedFile]) -> dict[str, ShareFil
             raise RuntimeError("manifest entry requested for a file that did not pass inspection")
         binding_json = [file_binding_to_json(binding) for binding in item.bindings]
         if record.content_hash in entries:
-            entries[record.content_hash]["bindings"].extend(binding_json)
+            entry = entries[record.content_hash]
+            if (entry["filename"], entry["mime_type"]) != (record.filename, record.mime_type):
+                raise RuntimeError("manifest entry requested for identical bytes under a different name or type")
+            entry["bindings"].extend(binding_json)
             continue
         entries[record.content_hash] = {
             "sha256": record.content_hash,
@@ -1160,6 +1190,8 @@ class ShareableReviewService:
                 label = _describe_use(binding)
                 if label not in view.used_by:
                     view.used_by.append(label)
+        if reason is None:
+            reason = _shared_content_refusal(inspected)
         return ShareableFilesResponse(
             files=list(views.values()),
             importable=reason is None,
@@ -1180,9 +1212,10 @@ class ShareableReviewService:
         naming the first file that cannot travel. Stores nothing: the caller
         stores the returned bytes only after every file has passed.
 
-        Two blobs with identical bytes share one content address, so they
-        become one manifest entry carrying both blobs' binding sites; the
-        first blob's filename and MIME type name it.
+        Two blobs with identical bytes, name and MIME type share one content
+        address, so they become one manifest entry carrying both blobs'
+        binding sites; identical bytes under a different name or type are
+        refused (:func:`_shared_content_refusal`).
         """
         inspected, collect_refusal = await self._inspect_bound_files(
             composition_state, session_operation_context=session_operation_context, read_content=True
@@ -1198,6 +1231,9 @@ class ShareableReviewService:
             if item.record is None or item.content is None or item.record.content_hash is None:
                 raise RuntimeError("_inspect_bound_files passed a blob without verified content")
             content_by_sha.setdefault(item.record.content_hash, item.content)
+        shared_content_refusal = _shared_content_refusal(inspected)
+        if shared_content_refusal is not None:
+            raise CompositionNotRunnableError(reason="file_not_shareable", detail=shared_content_refusal)
         entries = _manifest_entries(inspected)
         return tuple(_FrozenFile(content=content_by_sha[sha], entry=entries[sha]) for sha in sorted(entries))
 
