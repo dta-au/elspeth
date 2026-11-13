@@ -14,8 +14,8 @@ the same function the production call site uses:
   at the candidate reasoning effort;
 - ``hatch_terminal`` (only when the escape-hatch route resolves to a
   non-``none`` dialect): the planner's escape-hatch turn request on the
-  advisor model and endpoint, with the terminal stamped for that route, at
-  the candidate effort and capped at 16 reply tokens, a rejection check only;
+  advisor model and endpoint, with the full planner palette stamped for that
+  route, at the candidate effort and capped at 16 reply tokens, a rejection check only;
 - ``advisor``: the advisor checkpoint's structured-output request
   (:func:`~elspeth.web.composer.advisor_request.build_advisor_request_options`).
 
@@ -42,12 +42,10 @@ from elspeth.web.composer.advisor_request import build_advisor_request_options
 from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers, supports_anthropic_prompt_cache_markers
 from elspeth.web.composer.pipeline_planner import (
     build_planner_request_kwargs,
-    planner_terminal_tool_definition,
     planner_tool_definitions,
 )
 from elspeth.web.composer.protocol import ComposerSettings
 from elspeth.web.composer.provider_gateway import build_composer_loop_request_kwargs, composer_loop_tool_definitions
-from elspeth.web.composer.recovery_controls import recovery_tool_definitions
 from elspeth.web.composer.strict_transport import resolve_composer_tool_contract
 
 ComposerProbeSurface = Literal["loop_tools", "planner_tools", "hatch_terminal", "advisor"]
@@ -199,22 +197,19 @@ def build_composer_probe_requests(settings: ComposerSettings, *, env: Mapping[st
         api_key=primary_key,
     )
 
-    # The escape-hatch turn sends recovery controls and the terminal, stamped for the hatch
-    # route, to the advisor model and endpoint at candidate effort
-    # (``call_model`` on a hatch turn). Ruling 1: the reply is capped at 16
-    # tokens, a rejection check only; that cap is the one deliberate
-    # difference from a hatch turn's request. No cache markers: an
-    # Anthropic-family route always resolves to ``none`` (D8), so it never
-    # gets this request.
+    # The escape-hatch turn sends the full planner palette, stamped for the hatch
+    # route, to the advisor model and endpoint at candidate effort (``call_model``
+    # on a hatch turn). The probe has no request-specific discovery policy,
+    # so it covers the unfiltered superset. Ruling 1: the reply is capped at
+    # 16 tokens, a rejection check only, rather than the production reply cap.
+    # No cache markers: an Anthropic-family route always resolves to ``none``
+    # (D8), so it never gets this request.
     hatch_request: tuple[ComposerProbeRequest, ...] = ()
     if contract.hatch.dialect is not ToolContractDialect.NONE:
         hatch_kwargs = build_planner_request_kwargs(
             model=settings.composer_advisor_model,
             messages=[{"role": "user", "content": _PLANNER_PROBE_PROMPT}],
-            tools=[
-                *recovery_tool_definitions(contract.hatch.dialect),
-                planner_terminal_tool_definition(dialect=contract.hatch.dialect),
-            ],
+            tools=planner_tool_definitions(dialect=contract.hatch.dialect),
             max_completion_tokens=settings.composer_planner_max_completion_tokens,
             temperature=settings.composer_temperature,
             seed=settings.composer_seed,
