@@ -322,6 +322,8 @@ _SKILL_REWORK_0812_CANONICAL_BYTES = 3878
 # growth: the baseline, 10% band and prior headroom (zero before this change)
 # are preserved, with the exact-boundary / +1-byte overflow control.
 _FILE_INJECT_CATALOG_CANONICAL_BYTES = 867
+# 2026-11-13: validated-state diff teaching measured 140,458 -> 140,556 B.
+_VALIDATED_DIFF_BASELINE_CANONICAL_BYTES = 98
 # CDA-04 (2026-11-13): reviewed slots reach only node-template users, and
 # staging rejects any query override. The corrected teaching measures
 # 140,468 -> 140,621 B on both live and small catalogs (+153 B). Keep the
@@ -341,6 +343,7 @@ _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     + _SEMANTIC_REVIEW_GUIDANCE_CANONICAL_BYTES
     + _SKILL_REWORK_0812_CANONICAL_BYTES
     + _FILE_INJECT_CATALOG_CANONICAL_BYTES
+    + _VALIDATED_DIFF_BASELINE_CANONICAL_BYTES
     + _CDA04_REVIEWED_SLOT_CANONICAL_BYTES
 )
 
@@ -2612,6 +2615,8 @@ async def test_every_freeform_planner_discovery_tool_returns_admitted_state(
     assert len(tool_messages) == len(calls)
     for index, (name, _arguments) in enumerate(calls, start=1):
         content = tool_messages[f"call-{index}"]
+        if name == "diff_pipeline":
+            assert json.loads(content)["data"]["baseline_kind"] == "request_start"
         assert _VALIDATION_MESSAGE_CANARY in content
         assert _HIDDEN_CONNECTION_COMPONENT_CANARY in content
         assert _HIDDEN_EDGE_COMPONENT_CANARY in content

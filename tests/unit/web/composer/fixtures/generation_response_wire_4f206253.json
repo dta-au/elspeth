@@ -60,6 +60,14 @@
     "preview_structural": {
       "success": true,
       "data": "{\"preview_is_valid\": false, \"preview_errors\": [], \"edge_contracts\": [], \"proof_diagnostics\": [], \"sources\": {\"source\": {\"plugin\": \"csv\", \"on_success\": \"main\", \"has_schema_config\": true}}, \"node_count\": 0, \"output_count\": 1, \"nodes\": [], \"outputs\": [{\"name\": \"main\", \"plugin\": \"csv\"}], \"structural_preview\": {\"is_valid\": false, \"confidence\": \"equivalent\", \"masking_applied\": false, \"failing_checks\": [{\"name\": \"plugin_instantiation\", \"detail\": \"llm node 'summarize' rejected its configuration.\", \"outcome_code\": null, \"affected_nodes\": [\"summarize\"]}], \"errors\": [{\"component_id\": \"edge:summarize->main\", \"component_type\": \"edge\", \"message\": \"consumer requires ['colour'], producer guarantees (none)\", \"suggestion\": \"Declare the field on the producer.\", \"error_code\": null}], \"note\": \"The pending interpretation review required no placeholder substitution, so these findings were computed against the exact authored pipeline and are as reliable as a strict preflight. Repair any finding below before completing.\"}}"
+    },
+    "diff_request_start": {
+      "success": true,
+      "data": "{\"from_version\": 1, \"sources_changed\": false, \"metadata_changed\": false, \"nodes\": {\"added\": [], \"removed\": [], \"modified\": []}, \"edges\": {\"added\": [], \"removed\": [], \"modified\": []}, \"outputs\": {\"added\": [], \"removed\": [], \"modified\": []}, \"baseline_kind\": \"request_start\", \"warnings_introduced\": [], \"warnings_resolved\": [], \"total_changes\": 0}"
+    },
+    "diff_last_validated": {
+      "success": true,
+      "data": "{\"from_version\": 1, \"sources_changed\": false, \"metadata_changed\": false, \"nodes\": {\"added\": [], \"removed\": [], \"modified\": []}, \"edges\": {\"added\": [], \"removed\": [], \"modified\": []}, \"outputs\": {\"added\": [], \"removed\": [], \"modified\": []}, \"baseline_kind\": \"last_validated\", \"warnings_introduced\": [], \"warnings_resolved\": [], \"total_changes\": 0}"
     }
   }
 }

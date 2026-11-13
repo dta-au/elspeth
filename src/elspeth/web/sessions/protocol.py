@@ -3320,6 +3320,12 @@ class SessionServiceProtocol(Protocol):
         """
         ...
 
+    async def get_last_validated_state(
+        self, session_id: UUID, *, through_version: int, exclude_version: int
+    ) -> CompositionStateRecord | None:
+        """Newest strict-valid snapshot among all is_valid rows in scope."""
+        ...
+
     async def get_state_versions(
         self,
         session_id: UUID,
