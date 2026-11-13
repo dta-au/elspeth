@@ -22,11 +22,9 @@ from elspeth.web.composer.advisor_request import build_advisor_request_options
 from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers
 from elspeth.web.composer.pipeline_planner import (
     build_planner_request_kwargs,
-    planner_terminal_tool_definition,
     planner_tool_definitions,
 )
 from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
-from elspeth.web.composer.recovery_controls import recovery_tool_definitions
 from elspeth.web.config import WebSettings
 
 _PROBE_PROMPT = "This is a composer boot-time configuration smoke test. Please reply with ok."
@@ -139,7 +137,7 @@ def test_strict_counts_are_computed_from_a_stamped_list(settings_factory: Any) -
 
 
 def test_requests_include_hatch_terminal_on_a_forwarding_hatch(settings_factory: Any) -> None:
-    """D9 / ruling 1: the hatch route's terminal, sent as a 16-token rejection check to the advisor's endpoint.
+    """The unfiltered planner palette is a 16-token rejection check on the hatch route.
 
     Control: build it with the planner token cap and the ``max_tokens``
     assertion goes red.
@@ -158,10 +156,8 @@ def test_requests_include_hatch_terminal_on_a_forwarding_hatch(settings_factory:
     kwargs = hatch.to_litellm_kwargs()
     assert (hatch.role, hatch.model) == ("planner", "openrouter/z-ai/glm-5.3")
     assert kwargs["model"] == "openrouter/z-ai/glm-5.3"
-    assert kwargs["tools"] == [
-        *recovery_tool_definitions(ToolContractDialect.OPENAI_STRICT),
-        planner_terminal_tool_definition(dialect=ToolContractDialect.OPENAI_STRICT),
-    ]
+    expected_tools = planner_tool_definitions(dialect=ToolContractDialect.OPENAI_STRICT)
+    assert kwargs["tools"] == expected_tools
     assert kwargs["tools"][-1]["function"]["strict"] is False
     assert kwargs["max_tokens"] == bp.LOOP_PROBE_MAX_TOKENS == 16
     assert kwargs["api_base"] == "https://openrouter.ai/api/v1"
@@ -170,10 +166,7 @@ def test_requests_include_hatch_terminal_on_a_forwarding_hatch(settings_factory:
     expected = build_planner_request_kwargs(
         model="openrouter/z-ai/glm-5.3",
         messages=[{"role": "user", "content": _PROBE_PROMPT}],
-        tools=[
-            *recovery_tool_definitions(ToolContractDialect.OPENAI_STRICT),
-            planner_terminal_tool_definition(dialect=ToolContractDialect.OPENAI_STRICT),
-        ],
+        tools=expected_tools,
         max_completion_tokens=settings.composer_planner_max_completion_tokens,
         temperature=settings.composer_temperature,
         seed=settings.composer_seed,
@@ -183,7 +176,12 @@ def test_requests_include_hatch_terminal_on_a_forwarding_hatch(settings_factory:
     )
     expected["max_tokens"] = bp.LOOP_PROBE_MAX_TOKENS
     assert kwargs == expected
-    assert (hatch.strict_true_count, hatch.strict_false_count, hatch.strict_key_omitted) == (2, 1, 0)
+    assert hatch.tool_count == len(expected_tools)
+    assert (hatch.strict_true_count, hatch.strict_false_count, hatch.strict_key_omitted) == (
+        sum(tool["function"].get("strict") is True for tool in expected_tools),
+        sum(tool["function"].get("strict") is False for tool in expected_tools),
+        sum("strict" not in tool["function"] for tool in expected_tools),
+    )
 
 
 def test_no_hatch_terminal_when_the_hatch_route_resolves_none(settings_factory: Any) -> None:

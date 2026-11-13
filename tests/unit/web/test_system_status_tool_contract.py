@@ -25,6 +25,7 @@ from structlog.testing import capture_logs
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.web.app import create_app, lifespan
 from elspeth.web.composer.boot_probe import ComposerBootConfigError, ComposerProbeRequest
+from elspeth.web.composer.pipeline_planner import planner_tool_definitions
 from elspeth.web.composer.service import ComposerServiceImpl
 from tests.unit.web.test_app import _RecordingCounter, _RecordingHistogram, _settings, _StaticAsyncClient
 
@@ -160,7 +161,13 @@ async def test_each_sent_surface_logs_one_owned_boot_outcome(tmp_path: Path, mon
     }
     assert counts["loop_tools"] == (45, 35, 10, 0)
     assert counts["planner_tools"] == (23, 22, 1, 0)
-    assert counts["hatch_terminal"] == (3, 2, 1, 0)
+    expected_tools = planner_tool_definitions(dialect=ToolContractDialect.OPENAI_STRICT)
+    assert counts["hatch_terminal"] == (
+        len(expected_tools),
+        sum(tool["function"].get("strict") is True for tool in expected_tools),
+        sum(tool["function"].get("strict") is False for tool in expected_tools),
+        sum("strict" not in tool["function"] for tool in expected_tools),
+    )
     assert counts["advisor"] == (0, 0, 0, 0)
     rendered = repr(outcomes)
     assert _KEY_CANARY not in rendered
