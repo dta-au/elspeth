@@ -32,6 +32,14 @@ PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 source "$PROJECT_ROOT/examples/chaosllm_env.sh"
 
+# ro_query reads the audit DB through the sqlite3 CLI and swallows errors (the
+# DB may not exist yet), so a missing binary would surface only as a misleading
+# "leader exited before reaching RUNNING" failure. Refuse up front instead.
+if ! command -v sqlite3 >/dev/null 2>&1; then
+    echo "ERROR: this launcher requires the sqlite3 command-line tool (e.g. apt install sqlite3)." >&2
+    exit 2
+fi
+
 SETTINGS="examples/join_refused/settings.yaml"
 MISMATCHED="examples/join_refused/settings_mismatched.yaml"
 CHAOS_CONFIG="examples/join_refused/chaos_config.yaml"
