@@ -2744,6 +2744,126 @@ async def test_preview_lists_each_file_once_with_every_use(
     assert response.max_lifetime_seconds == _FakeSettings().shareable_link_lifetime_seconds
 
 
+_SAME_BYTES = b"id,name\n1,Ada\n"
+_METADATA_MISMATCHES = [
+    pytest.param({"filename": "suppliers.csv"}, id="filename"),
+    pytest.param({"mime_type": "text/plain"}, id="mime_type"),
+]
+
+
+def _two_blobs_same_bytes(session_record: _SessionRecord, **second: Any) -> tuple[_FakeBlobService, UUID, UUID]:
+    """Two blobs whose bytes are identical; ``second`` overrides the second blob's metadata."""
+    blob_service = _FakeBlobService()
+    first = blob_service.add(session_record.id, filename="customers.csv", content=_SAME_BYTES)
+    other = blob_service.add(session_record.id, **{"filename": "customers.csv", "content": _SAME_BYTES, **second})
+    return blob_service, first, other
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("second", _METADATA_MISMATCHES)
+async def test_preview_refuses_identical_bytes_under_different_names_or_types(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
+    second: dict[str, Any],
+):
+    """An import makes one blob per content, so one name and type would have to stand for both files."""
+    blob_service, first, other = _two_blobs_same_bytes(session_record, **second)
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=_file_bound_state(state_record, source_blob=first, node_value=_inline_marker(other)),
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+        blob_service=blob_service,
+    )
+
+    response = await service.preview_shareable_files(session_id=session_record.id, session_operation_context=session_operation_context)
+
+    assert response.importable is False
+    assert response.manifest_fingerprint is None
+    assert response.not_importable_reason is not None
+    assert "same content" in response.not_importable_reason
+    assert "customers.csv" in response.not_importable_reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("second", _METADATA_MISMATCHES)
+async def test_mark_ready_with_import_refuses_identical_bytes_under_different_names_or_types(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
+    monkeypatch: pytest.MonkeyPatch,
+    second: dict[str, Any],
+):
+    blob_service, first, other = _two_blobs_same_bytes(session_record, **second)
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=_file_bound_state(state_record, source_blob=first, node_value=_inline_marker(other)),
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+        blob_service=blob_service,
+    )
+    store_calls = _track_store(payload_store, monkeypatch)
+
+    await _assert_refused_without_side_effects(
+        service,
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        session_record=session_record,
+        session_operation_context=session_operation_context,
+        store_calls=store_calls,
+        reason="file_not_shareable",
+        detail_fragment="same content",
+    )
+
+
+@pytest.mark.asyncio
+async def test_identical_bytes_under_the_same_name_and_type_travel_as_one_file(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
+):
+    """Control: two blobs that differ in nothing an import keeps still share, deduplicated."""
+    blob_service, first, other = _two_blobs_same_bytes(session_record)
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=_file_bound_state(state_record, source_blob=first, node_value=_inline_marker(other)),
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+        blob_service=blob_service,
+    )
+
+    response = await service.mark_ready_for_review(
+        session_id=session_record.id,
+        user_id=session_record.user_id,
+        username=_OWNER_USERNAME,
+        session_operation_context=session_operation_context,
+        allow_import=True,
+        confirmed_file_manifest=await _previewed_manifest(service, session_record, session_operation_context),
+    )
+
+    (entry,) = _stored_snapshot(payload_store, response.payload_digest)["files"]
+    assert (entry["filename"], entry["mime_type"], len(entry["bindings"])) == ("customers.csv", "text/csv", 2)
+
+
 @pytest.mark.asyncio
 async def test_preview_reports_llm_authored_file_as_not_importable(
     session_engine_with_row,
