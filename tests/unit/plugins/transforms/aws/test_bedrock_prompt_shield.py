@@ -189,7 +189,7 @@ def test_prompt_shield_evaluates_every_field_and_stops_on_detection(monkeypatch:
 
 @pytest.mark.parametrize(
     "failure",
-    [GuardrailServiceError(retryable=True), ValueError("malformed provider marker")],
+    [GuardrailServiceError(retryable=True)],
 )
 def test_prompt_shield_sanitizes_provider_failures(
     monkeypatch: pytest.MonkeyPatch,

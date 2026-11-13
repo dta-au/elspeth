@@ -12,6 +12,7 @@ Uses BaseAzureSafetyTransform for shared batch infrastructure.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, TypedDict
 
 from pydantic import Field
@@ -113,9 +114,29 @@ class AzurePromptShield(BaseAzureSafetyTransform):
             )
         }
     )
+
+    @classmethod
+    def is_effective_blocking_control(
+        cls,
+        *,
+        capability: PluginCapability,
+        role: ControlRole,
+        options: Mapping[str, object],
+    ) -> bool:
+        if not super().is_effective_blocking_control(capability=capability, role=role, options=options):
+            return False
+        # A required PROMPT_SHIELD input control covers both attack classes, so
+        # only a shield running both analyses earns credit: user_prompt alone never
+        # runs indirect-injection detection and document alone never runs the
+        # direct-jailbreak classifier. An omitted key takes the config default.
+        if "analysis_type" not in options:
+            default_analysis_type: object = AzurePromptShieldConfig.model_fields["analysis_type"].default
+            return default_analysis_type == "both"
+        return options["analysis_type"] == "both"
+
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:c49c3e68304b81b6"
+    source_file_hash: str | None = "sha256:f4b81d89abde328e"
     config_model = AzurePromptShieldConfig
     passes_through_input = True
     capability_tags: tuple[str, ...] = ("azure", "prompt-shield", "security")
