@@ -338,7 +338,7 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8378e75e1630d489"
+    source_file_hash: str | None = "sha256:985091dfc97a79ff"
     determinism = Determinism.EXTERNAL_CALL
     config_model = DataverseSinkConfig
     idempotent = True  # PATCH upsert is idempotent — safe for retries and crash recovery (engine does not yet read this flag)
@@ -465,6 +465,7 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
             api_version=self._api_version,
             limiter=limiter,
             additional_domains=self._additional_domains,
+            shutdown_event=ctx.shutdown_event,
         )
 
     def config_named_input_columns(self) -> frozenset[str]:
@@ -711,7 +712,7 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
             raise FrameworkBugError("Dataverse client is unavailable — on_start() was not called")
         url, payload, descriptor = self._validate_member_effect(plan, member, effect_input)
         try:
-            self._client.upsert(url, payload)
+            response = self._client.upsert(url, payload)
         except DataverseClientError as exc:
             # Only explicitly row-attributable, non-retryable
             # responses divert; batch-integrity/unknown failures still raise so
@@ -734,9 +735,14 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
                 accepted_ordinals=tuple(item.ordinal for item in effect_input.members if item.ordinal != member.ordinal),
                 diverted_ordinals=(member.ordinal,),
             )
+        evidence = self._member_group_evidence(plan, "committed")
+        if response.throttle_waits:
+            # The client waited out throttled (429/503) PATCHes before this
+            # one succeeded; the attempt record names each wait it chose.
+            evidence["throttle_wait_ms"] = [round(wait * 1000) for wait in response.throttle_waits]
         return SinkEffectCommitResult(
             descriptor=descriptor,
-            evidence=self._member_group_evidence(plan, "committed"),
+            evidence=evidence,
             accepted_ordinals=tuple(item.ordinal for item in effect_input.members),
             diverted_ordinals=(),
         )

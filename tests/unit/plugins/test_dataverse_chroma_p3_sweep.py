@@ -274,10 +274,12 @@ class TestFinding76DataverseRetryAfterCarried:
         assert "retry_after" in vars(error)
         assert error.retry_after > 3000.0
 
-    def test_absent_retry_after_and_non_429_carry_none(self) -> None:
+    def test_absent_retry_after_and_non_throttle_status_carry_none(self) -> None:
+        # 503 is a throttle status and carries its Retry-After since #76's
+        # consumption landed (test_dataverse_retry_after.py); 500 does not.
         client = self._client()
         missing = client._classify_error(429, {}, 1.0)
-        server_error = client._classify_error(503, {"retry-after": "5"}, 1.0)
+        server_error = client._classify_error(500, {"retry-after": "5"}, 1.0)
         assert "retry_after" in vars(missing)
         assert missing.retry_after is None
         assert missing.retryable is True
