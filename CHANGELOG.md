@@ -41,6 +41,45 @@ These changes are breaking:
 - **Dataverse FetchXML runs recorded before this release cannot be replayed
   in verify mode.** The `Prefer` header is now part of the recorded request,
   so the earlier records no longer match. OData runs are unaffected.
+- **Plugin configs and inputs that used to load are now refused.** Each was
+  either a latent failure or silently wrong:
+  - `reference_join` reference data containing NaN, Infinity or integers
+    beyond 2^53.
+  - Dataverse endpoints that are not HTTPS origins, or that carry a path or
+    query; `select` entries that are not valid logical names; FetchXML with
+    zero or several entities; a sink lookup whose key is not mapped
+    (previously ignored).
+  - Azure blob `account_url` values with a query string or fragment; put a
+    SAS token in `sas_token`.
+  - `batch_classifier_metrics` with a `positive_label` whose type differs
+    from the data (for example `1.0` against integer labels), and baseline
+    labels in the paired-preference, effect-size and experiment-compare batch
+    transforms that relied on coercion (`2.0` no longer matches `2`).
+  - In observed mode, a row key the S3 or Azure blob sink cannot encode in
+    the CSV header is now a config error instead of a row failure.
+  - CSV sources and sinks with a non-text codec (base64, hex, zlib, rot13),
+    and CSV sinks with a `"`, newline or carriage-return delimiter. Such a
+    source could not read a row after the strict-decoding fix below.
+  - OpenRouter `base_url` values with a query string or fragment.
+  - A `web_scrape` `auth` setting, which previously failed every row, and a
+    JSON record column without a path.
+- **Some outputs and error shapes change.**
+  - `batch_paired_preference` 95% intervals use Student's t at n-1 degrees
+    of freedom instead of z = 1.96, so they widen for small samples (for
+    n = 3, ±0.34 becomes ±0.75).
+  - JSONL append in the `json` sink refuses an existing file that is not
+    newline-terminated or whose lines are not JSON objects; it previously
+    glued the first new record onto the last line.
+  - Azure blob JSONL output now ends every record with a newline, so
+    restaging a JSONL body written before this release fails closed.
+  - JSON, JSONL and blob inputs nested deeper than 64 levels are now
+    quarantined or routed as row errors.
+  - S3 JSONL objects with an oversized line now yield the rows after it.
+  - Azure and Bedrock LLM batch waits can be noticeably longer (see Plugins).
+  - The `blob_too_large` reason no longer carries `body_size`, and
+    `S3SinkPoisonedError` has been removed.
+  - The `OutputPort` protocol gains `fail_pending`; in-tree implementations
+    are updated, out-of-tree ones must add it.
 - **CI runs one Python 3.14 lane**, which is the coverage lane. Required
   status-check names change with it, for example
   `Test (Python 3.14, shard N)` and `Timing-sensitive tests (Python 3.14)`,
@@ -153,6 +192,139 @@ Each of these keeps the behaviour ELSPETH had under Python 3.13.
   (`{"k": 1}`). Consumers that compare the stored text byte-for-byte will see
   the difference.
 
+Sources:
+
+- **External JSON is bounded at 64 levels of nesting before it is decoded**
+  in the JSON source (JSON arrays and each JSONL line), the Azure blob
+  source, `blob_json_expand`, the schema value walker and LLM response
+  validation. Over-deep input is quarantined (for JSONL, that line only)
+  instead of exhausting recursion and crashing the run.
+- **JSON source:** `data_key` and non-array quarantines record the same row
+  they route, so the validation-error link is kept, and resume snapshots no
+  longer crash.
+- **CSV source:** the file is decoded strictly in binary, so a decode error
+  names the physical line and row holding the bad byte. A bad byte on the
+  header line still quarantines the whole file without a line number.
+- **S3 source:** an object that fails partway gives its error row the next
+  unused index and says rows were already emitted. A JSONL object resyncs
+  past an oversized line, quarantining it, and a CSV or JSONL read that stops
+  records that it stopped.
+- **Azure blob source:** CSV is decoded per record, so an undecodable row is
+  quarantined on its own with its raw bytes, line and row number. An
+  undecodable header still quarantines the whole file.
+- **Dataverse source:** formatted values are requested with a `Prefer`
+  header and their annotations stripped. `top` must be at least 1, and
+  FetchXML must have exactly one named entity; both are checked at config
+  time rather than at load.
+
+Transforms:
+
+- **`web_scrape`:**
+  - Pagination cycle detection compares canonical URLs, so a self-link that
+    canonicalisation rewrites is caught instead of fetched again.
+  - In replay and verify, a malformed URL fails the row with a scheme/shape
+    refusal instead of crashing; live behaviour is unchanged.
+  - An invalid `next_link_selector` is a config error.
+  - A discovered link is used exactly as validated, without re-encoding its
+    query. Links found in `href`s refuse the same cursor and session query
+    keys that Link-header links already did (`cursor`, `continuation`,
+    `next_token`, `page_token`, `session`, `state`), and the
+    sensitive-parameter check also splits on `;`.
+  - The `fingerprint_mode` description now says it hashes content only; the
+    behaviour is unchanged.
+- **`reference_join`** refuses non-canonical reference values at config load
+  (see Upgrade notes); the first matching row previously crashed the run or
+  was misrouted as a contract violation.
+- **`field_mapper`** runs its dotted-source collision check, so an existing
+  field is no longer silently overwritten when the executor collision gate is
+  off.
+- **`batch_replicate`** joins the output contract across all buffered rows;
+  the first row's contract previously won, so copies could carry a contract
+  that misdescribed their own values.
+- **Batch statistics transforms:**
+  - `batch_stats` records integer sums beyond 2^53-1 and overflowing or
+    non-finite float sums as a `float_overflow` error.
+  - `batch_classifier_metrics` fails the batch on a `positive_label` type
+    mismatch instead of reporting tp = fn = 0.
+  - Baseline labels in `batch_paired_preference`, `batch_effect_size` and
+    `batch_experiment_compare` are type-strict; blank and non-finite labels
+    are refused, and `batch_experiment_compare` baselines are no longer
+    string-only.
+  - The `batch_paired_preference` interval uses Student's t.
+  - `batch_data_quality_report` counts distinct values in linear time.
+  - The composer hints of the outlier, rank, paired-preference and
+    drift-compare transforms state their 4096-row flush cap.
+- **Batch transform engine:** a timed-out row's late failure is no longer
+  charged to the next row, and a dead release thread fails pending rows at
+  once instead of leaving them blocked until timeout.
+- **`blob_json_expand`, `blob_text`, `blob_csv`:** `max_blob_bytes` is enforced
+  while the blob is read, not after it is loaded. `blob_json_expand` splits
+  JSONL only on `\n` (one trailing `\r` stripped), so records containing
+  U+2028, U+2029 or U+0085 stay whole, and it rejects NaN and Infinity.
+- **`pdf_rasterize`:**
+  - The parent re-checks every page the worker reports and refuses bad
+    geometry, pages over `max_page_pixels`, text when `extract_text` is off,
+    and text over `max_page_text_bytes`.
+  - A memory error on one page refuses only that page.
+  - The temporary output directory is removed on every failure path.
+  - Multi-page replay works, and duplicate page rows are refused.
+  - The renderer identity check also accepts the macOS and Windows pdfium
+    library names.
+- **LLM transforms:**
+  - Replaying a recorded content-policy refusal raises the same error as the
+    live run, so the row is handled the same way.
+  - The Azure and Bedrock batch wait covers the whole batch: the budget plus
+    queries × request timeout plus 30 seconds.
+  - Tracing imports its instrumentor before configuring, refuses a second,
+    conflicting tracing policy in one process, and type-checks its boolean
+    flags and credentials.
+  - An empty Azure completion is classified by its finish reason: a content
+    filter raises a content-policy error, `length` a token-budget error, and
+    anything else a non-retryable error. Bedrock's readiness check validates
+    content and finish reason the same way.
+  - OpenRouter network errors use fixed text, so the URL no longer reaches
+    the audit trail or Langfuse.
+  - The LLM gateway rejects malformed usage when the `usage` capability is
+    required, and rejects a malformed readiness response.
+  - The OpenRouter and gateway source configs no longer show the API key in
+    their repr.
+
+Sinks and retrieval:
+
+- **Chroma sink:**
+  - An empty or duplicate document id in an effect group is diverted per row
+    at prepare; the whole effect previously failed, and an empty id was
+    recommitted forever.
+  - An upsert value error diverts the row.
+  - Startup refuses an existing collection whose `hnsw:space` differs from
+    `distance_function`.
+- **Chroma retrieval** records a failure in runtime preflight or deferred
+  initialisation as a failed call.
+- **Dataverse sink:**
+  - Reconciliation no longer treats a server echo of the same value as a
+    mismatch.
+  - Apostrophes in upsert alternate-key values are OData-escaped.
+  - A lookup whose key is not mapped is a config error.
+- **Dataverse client:** errors carry a typed `retry_after` parsed from
+  `Retry-After`; nothing uses it yet.
+- **S3 sink:** a closed sink refuses further requests, the CSV probe checks
+  the header it will actually write, and an unencodable header raises a
+  `ValueError`.
+- **Azure blob sink:** JSON and JSONL bodies are streamed in 64 KiB chunks.
+  The Azure blob sink and source close the service client and credential.
+- **CSV sink:** the delimiter is validated by building a real CSV writer, and
+  non-text encodings are refused. A new opt-in `neutralize_formulas` setting
+  (off by default, so output is byte-identical unless enabled) neutralises
+  spreadsheet formulas.
+- **Local file effects** admit storage per 64 KiB accumulated rather than per
+  chunk, with exact cumulative reservations.
+- **Audit-export bundles:** a bundle being built is held under an exclusive
+  lock, and the stale-scratch sweep skips locked trees, so it can no longer
+  delete a live bundle.
+- **`database` sink** composer guidance now matches what it supports:
+  SQLite or PostgreSQL, an existing table, no DDL, a required effect ledger,
+  and append only.
+
 ### Logging
 
 - **asyncio diagnostics that carry an exception are reduced to class and code
@@ -170,7 +342,21 @@ Each of these keeps the behaviour ELSPETH had under Python 3.13.
   stays skipped on 3.14: the model it checks predates PEP 649.
 - Four signed tier-model allowlist entries for
   `contracts/runtime_val_manifest.py` drift and await operator re-signing.
-  Keyless scans report them.
+  Keyless scans report them. Five more go stale with the plugin fixes: one
+  for the batch transform mixin and four for the S3 sink.
+- In pooled LLM mode, time a row spends queueing is still unbounded.
+- Bedrock's readiness check still requests 32 tokens, so reasoning models may
+  fail it. Recording an empty LLM completion as an ERROR call needs a
+  maintainer decision; only its classification has changed.
+- Seven allowlist entries for audit-export bundle effects also await
+  re-signing.
+- `azure-ai-inference` is not a declared dependency of LLM tracing, and if
+  `instrument()` fails the exporter is left running.
+- Dataverse sink errors are not yet diverted per row: which error codes are
+  attributable to a row needs a maintainer decision. Reconciliation does not
+  normalise decimal or datetime values.
+- The PostgreSQL testcontainer suite has not been run for the `database` sink
+  change.
 
 ### Publication and acceptance
 
