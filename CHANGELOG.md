@@ -112,6 +112,16 @@ These changes are breaking:
   `field_too_long`) instead of `api_call_failed`. Azure safety transforms
   stop with `retry_timeout` / `row_deadline_exceeded` once the row deadline
   has passed. Textract `blob_too_large` reports its actual size as `>max`.
+  AWS guardrail transforms no longer report `guardrail_service_error`: a
+  terminal failure is `malformed_response` or `service_error`, retryable
+  throttling, 5xx and transport failures go to the engine retry policy
+  (`transient_error_no_retry` without one), and a row can end as
+  `row_deadline_exceeded` or `shutdown_requested`.
+- **A Bedrock guardrail ARN that contradicts `region` is refused.**
+  `aws_bedrock_prompt_shield` and `aws_bedrock_content_safety` configs whose
+  guardrail ARN names another region or a non-`aws` partition now fail
+  config validation with `PluginConfigError`, as the operator profile
+  already did.
 - **CI runs one Python 3.14 lane**, which is the coverage lane. Required
   status-check names change with it, for example
   `Test (Python 3.14, shard N)` and `Timing-sensitive tests (Python 3.14)`,
@@ -318,7 +328,12 @@ Transforms:
   rows waiting on the same lookup get the shared failure, marked with
   `cache_status: shared_failure`.
 - **AWS guardrails** count botocore attempts as they are sent, so a transport
-  error reports the attempts actually made.
+  error reports the attempts actually made. They stop scanning at a 300 s row
+  deadline, honour shutdown between fields, and hand retryable failures to
+  the engine retry policy (AWS review #4). The response parser records a
+  wrong-typed `confidence`, `action` or `filterStrength` as a malformed
+  response instead of crashing with an unaudited `TypeError` (#5), and the
+  guardrail ARN is cross-checked against `region` (#8).
 - **Azure analyze transforms** (Document Intelligence, Content Understanding)
   retry network errors while polling until the poll deadline.
 - **LLM transforms:**
@@ -453,6 +468,10 @@ Sinks and retrieval:
   normalise decimal or datetime values.
 - The PostgreSQL testcontainer suite has not been run for the `database` sink
   change or the fork provenance fix (#365).
+- The 300 s guardrail row deadline is fixed, not configurable, and an engine
+  retry of a guardrail row re-scans, and re-bills, fields that already passed.
+  The guardrails client also awaits operator re-signing of three tier-model
+  allowlist entries for `BedrockGuardrailsClient.apply_guardrail`.
 - Fork copies made before the #365 fix stay VERBATIM; they are not rewritten.
   A fork interrupted mid-copy across the upgrade fails closed on retry with a
   modality mismatch. Pipeline `llm`-node output is still recorded VERBATIM
