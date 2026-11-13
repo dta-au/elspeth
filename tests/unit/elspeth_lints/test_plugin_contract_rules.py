@@ -588,3 +588,33 @@ def _write_hashed_plugin(tmp_path: Path, *, class_name: str, name: str, version:
         encoding="utf-8",
     )
     return plugin
+
+
+def test_plugin_hashes_scans_every_registered_plugin_class() -> None:
+    """Every plugin the runtime registry exposes must be one the rule checks.
+
+    PLUGIN_DIRS and the accepted base-class names are hand-maintained; when a
+    plugin lands in a new directory or behind a new shared base, the rule
+    silently skips it and its source_file_hash goes unchecked. This compares
+    the rule's view against the live registry instead of a count.
+    """
+    import inspect
+
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+    src_root = Path(__file__).resolve().parents[3] / "src" / "elspeth"
+    manager = get_shared_plugin_manager()
+    registered = {
+        (Path(inspect.getfile(plugin_cls)).resolve(), plugin_cls.__name__)
+        for plugin_cls in (*manager.get_sources(), *manager.get_transforms(), *manager.get_sinks())
+    }
+    scanned = {
+        (path.resolve(), attributes.class_name)
+        for path in discover_plugin_files(src_root)
+        for attributes in extract_plugin_attributes(path)
+    }
+
+    assert registered, "control: the registry exposed no plugins"
+    unscanned = sorted(f"{path.relative_to(src_root)}::{name}" for path, name in registered - scanned)
+    assert unscanned == []
+    assert len(registered) >= EXPECTED_PLUGIN_COUNT
