@@ -227,13 +227,15 @@ All of the following exited 0:
 | Command (worktree `PYTHONPATH`, `-n 2`) | Result |
 |---|---|
 | 21 skill/teaching/advisor test files: `test_skills_loader`, `test_capability_skill_identity`, `test_prompts`, `test_tall_dialog_fixture_prompt_hash_pin`, `test_planner_teaching_gate`, `test_l4_teaching_text_drift`, `test_tool_knob_teaching_gate`, `test_tool_result_envelope_gate`, `test_planner_authoring_aids`, `test_planner_capacity_and_attachment_clarification`, `test_advisor_*` (4), `test_compose_loop_interpretation_review_dispatch`, `test_explicit_provider_custody`, `test_provider_context`, `test_provider_quota_end_to_end`, `sessions/test_skill_markdown_history_authority`, `scripts/test_composer_wire_scorecard`, `test_tool_declarations` | exit 0: 953 passed, 1 skipped |
-| `test_service`, `test_pipeline_planner`, `test_prompt_guard_wiring`, `test_compose_service_structure`, `test_tutorial_service`, `test_tool_model_wire_parity`, `scripts/test_composer_wire_census`, plus 8 integration files (inline-source provenance, freeform proposal prevalidation, planner failure translation, prompt-review card e2e, pipeline custody, stated-threshold walk, composer-runtime agreement, interpretation runtime handoff) | see `RAW/pytest_service.log` (result in §5) |
+| `test_service`, `test_pipeline_planner`, `test_prompt_guard_wiring`, `test_compose_service_structure`, `test_tutorial_service`, `test_tool_model_wire_parity`, `scripts/test_composer_wire_census`, plus 8 integration files (inline-source provenance, freeform proposal prevalidation, planner failure translation, prompt-review card e2e, pipeline custody, stated-threshold walk, composer-runtime agreement, interpretation runtime handoff) | **exit 1: 1505 passed, 5 failed.** All 5 are `test_stated_threshold_data_full_walk.py::test_referential_planner_threshold_retirement_preserves_first_candidate[*]`, failing at `:214` `assert kwargs["messages"][0] == {"role": "system", "content": composer._composer_skill_text}`. That pin says the planner system message IS the freeform skill text, so the failure is expected and caused by the prototype (R1 changes exactly this). |
 | `generate_skill_inventory.py --check` | exit 0 |
 | `composer_wire_census.py --scorecard` | exit 0 |
 | `ruff check` / `ruff format --check` on the changed files | clean |
 
-**Nothing failed. That is itself the finding.** No existing gate pins what the
-planner is sent:
+Apart from that one integration pin, nothing failed, and that is itself the
+finding. The only test that pins what the planner is sent is
+`test_stated_threshold_data_full_walk.py:214`, which asserts it EQUALS the
+freeform text. No teaching gate measures the planner surface:
 
 - Every teaching gate derives its "taught" side from `build_system_prompt(None)`,
   the freeform/loop rendering:
@@ -336,13 +338,16 @@ direction:
 
    Otherwise the gates keep certifying the loop text while the planner text
    drifts.
-6. **Dead option.** `tool_surface="terminal_only"` (`capability_skill.py:193-219`)
+6. **Failing pin.** Re-point `tests/integration/web/composer/test_stated_threshold_data_full_walk.py:214`
+   (5 parametrised cases) at the planner rendering, for example
+   `composer._planner_skill_text`.
+7. **Dead option.** `tool_surface="terminal_only"` (`capability_skill.py:193-219`)
    is still dead; as the brief says, remove it or wire it.
-7. **Drift between overlays.** Review staging, the Reply Register,
+8. **Drift between overlays.** Review staging, the Reply Register,
    termination and decline rules now live in two overlays. Two options:
    - factor the shared rules into the core;
    - keep both, with a parity test on the rule anchors.
-8. **`invented_source` hand-authoring.** Both arms sometimes author this
+9. **`invented_source` hand-authoring.** Both arms sometimes author this
    backend-owned row (baseline s03, prototype s01) and it was accepted. Either
    the server tolerates it, or this is a teaching gap. Check
    `sessions.py` `_resolve_source_blob` behaviour before claiming the table
@@ -400,9 +405,7 @@ especially s10 and c03.
 - **Advisor.** Whether planner-turn advisor checkpoints should see the planner
   text is a product decision (§4 item 2).
 - **`invented_source`.** Whether the hand-authored `invented_source` row is
-  tolerated by design (§4 item 8).
-- **`RAW/pytest_service.log`.** The final exit code of the service and
-  integration batch is recorded at the end of that log.
+  tolerated by design (§4 item 9).
 
 ## Appendix: the overlay used (`src/elspeth/web/composer/skills/pipeline_planner.md` in the patch)
 
