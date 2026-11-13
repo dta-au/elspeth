@@ -101,6 +101,25 @@ These changes are breaking:
   `elspeth.plugins.infrastructure.clients`. `CallModeSession.verify_call` is
   the single verify authority, and replaying an unrecorded ordered query now
   raises `AuditIntegrityError`.
+- **`CallModeSession` gains `has_source_call`**, a read-only lookup used by
+  Textract replay and verify. Out-of-tree session implementations must add
+  it.
+- **Textract retries go through the engine.** Throttled and transient
+  Textract and S3 HeadBucket failures raise `PluginRetryableError` and
+  consume engine retry attempts; with no retry policy they end as the
+  engine's retry-exhausted row failure instead of `submit_failed` or
+  `analysis_failed`. `poll_timeout` stays a row error and is non-retryable.
+  SSL, proxy, response-streaming and HTTP-client botocore errors are now
+  retryable transport errors instead of a permanent `botocore_error`. In
+  verify mode a poll is admitted against the source job id instead of always
+  being refused.
+- **`aws_textract_inline_analysis` limits are capped.** `max_blocks`
+  (100000), `max_result_bytes` (50 MB), `request_timeout_seconds` (120) and
+  `batch_wait_timeout_seconds` (480) have ceilings, and a config above them
+  is refused at load. The `batch_wait_timeout_seconds` default rises from
+  420 to 480, the wait that was already in effect.
+- **A per-row Textract S3 key over 1024 UTF-8 bytes** fails locally as
+  `invalid_input` / `invalid_s3_key` instead of `submit_failed`.
 - **`request_ssrf_safe` refuses `follow_redirects=True`** except for a
   body-less GET, raising `ValueError` before any network I/O.
 - **An Azure prompt shield earns `PROMPT_SHIELD` control credit only with
@@ -343,6 +362,22 @@ Transforms:
   longer sets the engine's shutdown event. When a bucket-region lookup fails,
   rows waiting on the same lookup get the shared failure, marked with
   `cache_status: shared_failure`.
+  From the AWS review:
+  - Throttled and transient failures raise `PluginRetryableError`, so the
+    engine retry policy applies; a `retryable=True` row result used to be
+    silently ignored. Transient poll errors retry in place until the poll
+    deadline (#1).
+  - `aws_textract_document_analysis` replay no longer sleeps or races the
+    wall clock and ends polling from the archive; verify substitutes the
+    source job id and `next_token` fingerprint, and HeadBucket single-flight
+    leadership in replay follows the source run (#2, #3).
+  - Textract and S3 HeadBucket audit records carry the observed HTTP attempt
+    count for every botocore transport error, and SSL, proxy and streaming
+    failures are classified as retryable, as botocore does (#6).
+  - Inline analysis limits are capped (#7).
+  - Page projection is linear in the block count instead of quadratic (#9).
+  - Per-row bucket mode bounds S3 keys in UTF-8 bytes (1024), as
+    static-bucket mode does (#10).
 - **AWS guardrails** count botocore attempts as they are sent, so a transport
   error reports the attempts actually made. They stop scanning at a 300 s row
   deadline, honour shutdown between fields, and hand retryable failures to
@@ -506,6 +541,11 @@ Sinks and retrieval:
   normalise decimal or datetime values.
 - The PostgreSQL testcontainer suite has not been run for the `database` sink
   change or the fork provenance fix (#365).
+- Textract verify mode still compares responses and indexes `IN_PROGRESS`
+  polls per live run, so provider-generated `JobId` and `NextToken` values
+  are not yet normalised; replay residuals, a HeadBucket verify race, and
+  whether follower evidence should name the leader's state await
+  maintainer decisions.
 - The Dataverse 300 s throttle-wait budget is not configurable, and the
   client retries only 429 and 503; 500, 502, 504 and timeouts are not
   retried in the client.
