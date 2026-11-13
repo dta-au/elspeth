@@ -181,7 +181,7 @@ describe("TutorialFreeformShell", () => {
     {
       blocker: "the Composer replied without a pipeline",
       state: { compositionState: null },
-      instruction: "The Composer hasn't built a pipeline yet. Ask it to continue in the chat.",
+      instruction: "The Composer hasn't built a pipeline yet. Select Resend tutorial brief to try again.",
     },
   ])("says what to do next while $blocker, and describes the disabled Continue with it", async ({ state, instruction }) => {
     useSessionStore.setState({
