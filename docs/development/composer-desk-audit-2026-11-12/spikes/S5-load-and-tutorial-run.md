@@ -202,9 +202,104 @@ every turn. This happened to the shared account today.
   proxy and 0.15 s direct.
 - `project-999.html` returned 404 (control).
 - The scraper fetches from an IP-pinned address (SSRF defence,
-  `web_scrape.py:1323,1401`). So the demo host likely needs **direct** egress
-  to `dta-au.github.io:443`, not only an HTTP proxy (INFERRED; it works in
-  this container).
+  `web_scrape.py:1323,1401`, `clients/http.py:1913-1917`). Its client sets
+  `trust_env=False` unless the audit policy is GENERIC. So it neither uses
+  `HTTPS_PROXY` nor reads `SSL_CERT_FILE`.
+- **`curl` reachability is not evidence that the scraper will work.** §3.6
+  shows exactly that gap in this container.
+
+### 3.6 Tutorial end to end via the API (stage 1, EXECUTED, n=2)
+
+Raw files: `S5/tutorial/` (run 1) and `S5/tutorial-run1/` (run 2). Each holds
+`driver.log`, `http_log.json`, `timings.json` and the run record. Run 2
+also has `diagnostics.json`, `audit_story_failed_run.json`,
+`state_yaml.json` and `egress_relay_failures.jsonl`.
+
+| Step | Run 1 (main checkout) | Run 2 (worktree + TLS shim) |
+|---|---|---|
+| Create session, rename, `/sample` | 201 / 200 / 200, under 0.05 s each | same |
+| Send brief → planner turn completed | 202; **29.6 s**; 2 provider calls (7.1 s discovery, 20.2 s emission); reply "I prepared the requested pipeline and staged it for your review. It has interpretation review cards to resolve before it can run." | 202; **30.4 s**; 2 calls |
+| Accept proposal | 200, 0.40 s | 200, 0.40 s |
+| Review cards | 4 resolved with 200 (`llm_prompt_template`, `invented_source`, 2 × `pipeline_decision`); 0.9 s in total | same 4; 0.9 s |
+| `GET /api/tutorial/{id}/readiness` | 200 (state admitted) | 200 |
+| `POST /api/tutorial/run` | **409 after 36.4 s** | **409 after 36.0 s** |
+| Total wall time | 67.3 s | 67.6 s |
+
+**The 409 the user gets** (identical in both runs):
+
+```
+error_type: tutorial_live_run_failed
+status: completed_with_failures
+rows_processed: 3, rows_succeeded: 0, rows_failed: 3
+"The run produced no output rows. Open the run details to review row errors and source results."
+```
+
+**Why it failed** (from `diagnostics.json` and the Landscape `calls` table):
+
+- Each of the 3 rows failed in `web_scrape`: 3 attempts per row, about 2.2 s
+  each, with `NetworkError` "Connection error fetching the row's URL".
+- The audited call records `ConnectError: [Errno 104] Connection reset by peer`.
+- The rows were discarded (`on_error: discard`), so the LLM node never ran.
+  With 0 rows reaching the LLM, no summaries and no result rows exist.
+- `/audit-story` on the failed run still answers 200 (`llm_call_count: 1`,
+  `plugin_versions` for csv, web_scrape, llm, field_mapper and json).
+- **The cause is environmental.** This session's egress relay logged 18
+  `ws_closed_mid_exchange` failures, "tunnel closed (code 1006) after 2s;
+  1513 B sent, 39 B received", for host `185.199.11x.153:443` at exactly the
+  scrape timestamps (`egress_relay_failures.jsonl`).
+  - It is not the provider and not the product's composer path.
+  - I could **not** isolate it: a hand-built IP-pinned `httpx` GET to the same
+    IP, with SNI `dta-au.github.io`, the scraper's `X-Abuse-Contact` and
+    `X-Scraping-Reason` headers and the relay CA, returns 200 in 0.1–0.2 s.
+  - The TLS shim (trusting the relay CA) did not change the outcome.
+- **Not measured:**
+  - the run's LLM step;
+  - its duration;
+  - the result rows;
+  - a successful audit story.
+
+**What this means for the demo.** The tutorial's RUN step depends on the
+demo host's egress path doing exactly what this one failed to do:
+
+- an IP-pinned TLS connection to GitHub Pages;
+- no proxy;
+- the default (certifi) trust store.
+
+A TLS-inspecting corporate proxy, or an egress relay like this one, gives
+exactly this failure:
+
+- about 36 s of spinner (3 rows × 3 attempts × about 2.3 s, plus backoff);
+- then "The run produced no output rows".
+
+Runbook preflight step 3 (walk the tutorial through **run**, including the
+scrape, on the demo host) is therefore **mandatory**, not optional.
+
+### 3.7 Double-submit and per-user burst (stage 1, EXECUTED, n=1 each)
+
+Raw files: `S5/load/double.*`, `S5/load/burst25.*`.
+
+**Double-submit**, one user and one session:
+
+| Case | Result |
+|---|---|
+| First message (canary prompt) | 202; completed in 21.3 s; 3 provider calls; proposal staged |
+| Same `operation_id` resent 0.3 s later | 202: idempotent, returns the same operation, no new job or quota |
+| A second, different message while the first is running | **409** "This session already has a composer request in progress." |
+
+There were no lock errors and no Tracebacks in `web.log`. In the UI the
+frontend adopts the running operation (§3.1).
+
+**Burst**, one user, 25 first turns over 55 s, each to its own fresh session:
+
+| Messages | Result |
+|---|---|
+| #1–#20 | 202; each cancelled at once (`request_cancelled`); 0 provider calls |
+| #21–#25 | **429**, starting at 44 s: "Rate limit exceeded. Try again in 16 seconds." then 14, 12, 9 and 7 seconds |
+
+This matches probe B1 live: the limit is 20 per rolling 60 s, and
+`Retry-After` counts down to the oldest event's expiry. 5 × 429 appear in
+`web.log`. There were no provider 402 or 429 errors anywhere in stage 1
+(`provider_failures: 0` in every summary).
 
 ## 4. Recommendation for WP0
 
@@ -224,6 +319,15 @@ submits** if a p90 wait of about 60 s or less is acceptable. If waits up to
 the deadline are tolerable, the ceiling is about 40 for fast turns or about
 12 for p90 turns. The tutorial **RUN** for many users is a separate, harder
 limit: one pipeline run at a time per process, inside a 270 s held request.
+
+**The tutorial RUN step has still never been seen to succeed.**
+
+- In stage 1 the build half worked twice: brief → proposal → 4 cards →
+  readiness in about 31 s.
+- Run then failed in about 36 s because the scrape could not get out of this
+  container (§3.6).
+- Until the preflight walk passes **on the demo host**, treat Run as
+  unverified for both presenter and attendees.
 
 **What an operator must change for 80 people:**
 
@@ -268,8 +372,14 @@ limit: one pipeline run at a time per process, inside a 270 s held request.
    or attendees stop at "Continue to Run". The 270 s comes from
    `composer_transport_idle_ceiling_seconds`. Raising it requires every
    proxy hop to allow it.
-5. **Network.** The demo host needs direct HTTPS egress to `dta-au.github.io`
-   (IP-pinned fetch), as well as provider egress.
+5. **Network.** The demo host needs HTTPS egress to `dta-au.github.io`
+   that works for the scraper's IP-pinned, no-proxy, certifi-trusting
+   connection, as well as provider egress.
+   - A TLS-inspecting proxy breaks it, and so does this sandbox's relay
+     (§3.6).
+   - The symptom is about 36 s, then "The run produced no output rows".
+   - Verify it with the real tutorial Run on the demo host; a `curl`
+     check is not enough.
 6. **The per-user composer limit (20/min) needs no change.**
 
 **Proposed edits** (stated, not made):
@@ -284,7 +394,10 @@ limit: one pipeline run at a time per process, inside a 270 s held request.
   > `TRUSTED_PROXY_HOSTS`; pipeline runs are serial per process, so do not
   > have attendees press Run together (S5).
 
-  Also extend the **Network** bullet with "direct egress (IP-pinned fetch)".
+  Also extend the **Network** bullet with "egress usable by the IP-pinned,
+  no-proxy scraper; a curl check is not evidence (S5 §3.6)". In Preflight
+  step 3, add "pass = `POST /api/tutorial/run` returns 200 with 3 rows (or
+  `tutorial_run_driver.py` exits with `run_status` 200)".
 - **Preflight.**
   - Add step 0: "Provider credit and rate limit checked; a 5-token
     completion on the composer and advisor models succeeds".
@@ -304,6 +417,11 @@ limit: one pipeline run at a time per process, inside a 270 s held request.
 - **Live latency under concurrency.** Does DeepSeek or OpenRouter slow down
   or return 429 at 16 concurrent planner calls? If provider latency rises
   with concurrency, raising the worker count buys less than probe A shows.
+- **Why the scraper's connection is reset here when a hand-built pinned
+  request is not** (§3.6). If the cause is in the scraper's TLS or connection
+  setup rather than this sandbox's relay, it also affects real hosts. A
+  packet capture, or the scraper run under `S5_SPIKE_CA_FILE` with httpx
+  debug logging, would settle it.
 - **Tutorial run duration.** If one run takes about 15 s, Run serialisation
   caps simultaneous successful runs at about 18 per 270 s. If it takes
   about 5 s, the cap is about 54. This is the main unknown for hands-on Run.
@@ -315,31 +433,40 @@ limit: one pipeline run at a time per process, inside a 270 s held request.
 
 ## Not run, and resume commands
 
-Both items need a funded provider. Run them from `<repo root>`, with
-`source .venv/bin/activate` and the `ELSPETH_WEB__*` environment from the
-harness README.
+| Item | Status |
+|---|---|
+| Stage 1: tutorial via the API, double-submit, burst | **Done** (§3.6, §3.7). The tutorial RUN failed on this container's egress. |
+| Stage 2: live concurrency at N = 1, 5, 10, 20 | **NOT RUN.** The orchestrator is holding it while other spikes use the account. |
+| Tutorial RUN success path: duration, result rows, audit story | **NOT MEASURED.** It needs a host whose egress the scraper can use. |
+
+Run these from `<repo root>`, with `source .venv/bin/activate` and the
+`ELSPETH_WEB__*` environment from the harness README:
 
 ```bash
 S=.claude/lanes/composer-desk-audit-20261112/spikes/S5-load-and-tutorial-run
-# (1) concurrent load: N = 1, 5, 10, 20, then double-submit and the 25-in-a-minute burst
-evals/composer-live-audit/instance.sh 8531 S5-load        # users already exist (users.json)
+# Stage 2: concurrent load. 24 users already exist in runs/instances/S5-load/users.json
+evals/composer-live-audit/instance.sh 8531 S5-load
 for n in 1 5 10 20; do .venv/bin/python $S/load_driver.py --port 8531 --instance S5-load --n $n --label n$(printf %02d $n) --out $S/load; done
-.venv/bin/python $S/load_driver.py --port 8531 --instance S5-load --mode double --label double --out $S/load
-.venv/bin/python $S/load_driver.py --port 8531 --instance S5-load --mode burst --burst 25 --label burst25 --out $S/load
-# (2) tutorial through RUN on a fresh instance (driver written, never executed)
-evals/composer-live-audit/instance.sh 8532 S5-tutorial
-.venv/bin/python $S/tutorial_run_driver.py --port 8532 --instance S5-tutorial --out $S/tutorial
+# Tutorial RUN on a host with working egress (fresh instance)
+evals/composer-live-audit/instance.sh 8531 S5-tutorial-host
+.venv/bin/python $S/tutorial_run_driver.py --port 8531 --instance S5-tutorial-host --out $S/tutorial-host
 # stop each instance by the PID it prints
 ```
 
-`S5/mock_provider.py` is a loopback provider that replays the recorded tb1
-tutorial-planner responses. Pair it with
-`ELSPETH_WEB__COMPOSER_ENDPOINT_BASE_URL=http://127.0.0.1:8533/v1`.
+`--instance` also accepts an absolute instance directory; run 2 used the
+worktree's directory that way.
 
-- It was built after the 402 and stopped unused when live runs were halted.
-  It answered a single smoke request.
-- It could measure full-stack (HTTP + planner + SQLite) capacity without
-  provider spend.
-- It cannot measure provider behaviour.
+**Leftovers from this spike:**
 
-No worktree or prototype patch was created; no product code was changed.
+- **Worktree.** `.claude/worktrees/S5-load-and-tutorial-run` (branch
+  `spike/S5-load-and-tutorial-run`) holds only the measurement shim in
+  `S5/prototype.patch`. It makes the SSRF-safe client trust
+  `$S5_SPIKE_CA_FILE`. It is not for merge, and it did not change the
+  outcome.
+- **Mock provider.** `S5/mock_provider.py` is a loopback provider that
+  replays the recorded tb1 tutorial-planner responses (pair it with
+  `ELSPETH_WEB__COMPOSER_ENDPOINT_BASE_URL=http://127.0.0.1:8533/v1`).
+  - It was built during the 402 outage and never used for a measurement.
+  - It could measure full-stack capacity without provider spend.
+  - It cannot measure provider behaviour.
+- **Product code.** None was changed in the main checkout.
