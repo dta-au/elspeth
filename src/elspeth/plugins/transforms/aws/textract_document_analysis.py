@@ -86,6 +86,7 @@ from elspeth.plugins.transforms.aws.textract_result import (
 )
 
 _BUCKET_PATTERN = re.compile(r"^[0-9A-Za-z.\-_]*$")
+_SURROGATE_PATTERN = re.compile("[\ud800-\udfff]")
 _TEXTRACT_SDK_TIMEOUT_HEADROOM_SECONDS = 90.0
 # Poll-sleep slice: the plugin waits on the engine's shutdown event and
 # re-checks its private close() event at least this often.
@@ -347,7 +348,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:66ffa277493ed1c3"
+    source_file_hash: str | None = "sha256:ea328c39a24bfb22"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -700,7 +701,9 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 {"reason": "invalid_input", "field": bucket_field, "error_type": "invalid_s3_bucket"},
                 retryable=False,
             )
-        if not 1 <= len(key) <= 1024 or not key.strip() or "#" in key:
+        # S3 bounds keys in UTF-8 bytes, as the static-bucket branch checks; a
+        # lone surrogate has no UTF-8 encoding at all.
+        if not key.strip() or "#" in key or _SURROGATE_PATTERN.search(key) is not None or len(key.encode("utf-8")) > S3_MAX_KEY_BYTES:
             return TransformResult.error(
                 {"reason": "invalid_input", "field": self._key_field, "error_type": "invalid_s3_key"},
                 retryable=False,
