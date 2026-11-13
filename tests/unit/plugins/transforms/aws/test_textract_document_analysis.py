@@ -13,7 +13,7 @@ from tests.fixtures.factories import make_context
 from elspeth.contracts import AuditCharacteristic, CallType, Determinism, RunMode
 from elspeth.contracts.aws_textract import TextractProfiledAuditIdentity, textract_profiled_binding_fingerprint
 from elspeth.contracts.call_mode import CallModeSession, SourceCallParentIdentity
-from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.errors import FrameworkBugError, PluginRetryableError
 from elspeth.contracts.plugin_capabilities import WebConfigAuthority
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.engine.executors.declared_output_types import verify_produced_output_types
@@ -608,7 +608,7 @@ def test_bucket_region_mismatch_stops_before_request_token_or_textract() -> None
 def test_cached_bucket_region_verification_survives_submit_error() -> None:
     client = FakeTextractClient(
         pages=[],
-        start=TextractServiceError(code="ThrottlingException", retryable=True),
+        start=TextractServiceError(code="AccessDeniedException", retryable=False),
     )
     transform = _transform_for_client(client)
     transform._bucket_region_coordinator = FakeBucketRegionCoordinator(  # type: ignore[assignment]
@@ -692,7 +692,7 @@ def test_semantic_403_region_proof_is_safe_success_metadata() -> None:
 
 
 @pytest.mark.parametrize("retryable", [False, True])
-def test_unverified_bucket_region_stops_textract_and_preserves_retryability(retryable: bool) -> None:
+def test_unverified_bucket_region_stops_textract_and_routes_retryability_to_the_engine(retryable: bool) -> None:
     client = FakeTextractClient(pages=[])
     transform = _transform_for_client(client)
     transform._bucket_region_coordinator = FakeBucketRegionCoordinator(  # type: ignore[assignment]
@@ -700,14 +700,15 @@ def test_unverified_bucket_region_stops_textract_and_preserves_retryability(retr
     )
     transform._client_request_token = lambda **_kwargs: (_ for _ in ()).throw(AssertionError("token computed too early"))  # type: ignore[method-assign]
 
-    result = _run(transform)
-
-    assert result.status == "error"
-    assert result.reason == {
-        "reason": "bucket_region_unverified",
-        "error_type": "transport_error" if retryable else "NoSuchBucket",
-    }
-    assert result.retryable is retryable
+    if retryable:
+        # The engine retries only a raised PluginRetryableError (AWS review 2026-11-13 #1).
+        with pytest.raises(PluginRetryableError, match="transport_error"):
+            _run(transform)
+    else:
+        result = _run(transform)
+        assert result.status == "error"
+        assert result.reason == {"reason": "bucket_region_unverified", "error_type": "NoSuchBucket"}
+        assert result.retryable is False
     assert client.start_calls == []
 
 
@@ -883,7 +884,7 @@ def test_terminal_and_unknown_statuses_fail_closed(status: str, reason: str) -> 
     assert result.reason["reason"] == reason
 
 
-def test_poll_timeout_is_retryable() -> None:
+def test_poll_timeout_is_a_permanent_row_error() -> None:
     transform = _transform_for_client(FakeTextractClient(pages=[_page(status="IN_PROGRESS")]))
     transform._poll_timeout_seconds = 0.0
 
@@ -891,7 +892,7 @@ def test_poll_timeout_is_retryable() -> None:
 
     assert result.status == "error"
     assert result.reason["reason"] == "poll_timeout"
-    assert result.retryable is True
+    assert result.retryable is False
 
 
 def test_successful_get_returning_after_total_deadline_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -907,7 +908,7 @@ def test_successful_get_returning_after_total_deadline_is_rejected(monkeypatch: 
 
     assert result.status == "error"
     assert result.reason["reason"] == "poll_timeout"
-    assert result.retryable is True
+    assert result.retryable is False
 
 
 def test_shutdown_requested_during_successful_get_is_rejected() -> None:
@@ -1012,13 +1013,18 @@ def test_shutdown_during_poll_backoff_releases_no_output() -> None:
 
 
 @pytest.mark.parametrize("retryable", [False, True])
-def test_submit_service_error_preserves_retryability(retryable: bool) -> None:
+def test_submit_service_error_routes_retryability_to_the_engine(retryable: bool) -> None:
     error = TextractServiceError(code="ThrottlingException" if retryable else "AccessDeniedException", retryable=retryable)
-    result = _run(_transform_for_client(FakeTextractClient(pages=[], start=error)))
+    transform = _transform_for_client(FakeTextractClient(pages=[], start=error))
 
+    if retryable:
+        with pytest.raises(PluginRetryableError, match="ThrottlingException"):
+            _run(transform)
+        return
+    result = _run(transform)
     assert result.status == "error"
     assert result.reason["reason"] == "submit_failed"
-    assert result.retryable is retryable
+    assert result.retryable is False
 
 
 def test_submit_invalid_s3_object_classifies_access_scope_hint() -> None:
@@ -1050,14 +1056,23 @@ def test_submit_other_service_errors_carry_no_s3_scope_hint() -> None:
     assert "error" not in result.reason
 
 
-@pytest.mark.parametrize("retryable", [False, True])
-def test_poll_service_error_preserves_retryability(retryable: bool) -> None:
-    error = TextractServiceError(code="ThrottlingException" if retryable else "AccessDeniedException", retryable=retryable)
+def test_non_retryable_poll_service_error_is_a_permanent_poll_failure() -> None:
+    error = TextractServiceError(code="AccessDeniedException", retryable=False)
     result = _run(_transform_for_client(FakeTextractClient(pages=[error])))
 
     assert result.status == "error"
     assert result.reason["reason"] == "poll_failed"
-    assert result.retryable is retryable
+    assert result.retryable is False
+
+
+def test_retryable_poll_service_error_is_retried_in_place() -> None:
+    client = FakeTextractClient(pages=[TextractServiceError(code="ThrottlingException", retryable=True), _page(blocks=_basic_blocks())])
+
+    result = _run(_transform_for_client(client))
+
+    assert result.status == "success"
+    assert len(client.start_calls) == 1
+    assert len(client.get_calls) == 2
 
 
 @pytest.mark.parametrize("phase", ["start", "get"])
