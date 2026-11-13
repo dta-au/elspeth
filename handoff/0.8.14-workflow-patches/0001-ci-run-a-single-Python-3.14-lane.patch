@@ -1,0 +1,1411 @@
+From ef50ecce514f06babfc873f83c4c287bf706aed2 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 01:47:39 +0000
+Subject: [PATCH 1/4] ci: run a single Python 3.14 lane
+
+The test and timing-sensitive matrices, the landscape long-run proofs and
+every container job move to the digest-pinned python:3.14-bookworm
+image; the 3.12 lane and its evidence downloads and validation step are
+gone, and the 3.14 lane is the coverage lane. The live-provider, mutation
+and judge-gate workflows use 3.14 too. actionlint 1.7.12 (the pinned,
+checksum-verified release) is clean.
+
+scripts/ci_test_shards.py names its lanes once: COVERAGE_PYTHON_VERSION
+and SUPPORTED_PYTHON_VERSIONS (3.14 only) replace the 3.12/3.13
+literals. The cicd tests now build 3.14 evidence; the negative controls
+use an unsupported version (3.13), new ones refuse every non-3.14 lane,
+and re-admitting 3.13 in the script turns them red. Cases that existed
+only for the 3.12 non-coverage lane are removed. The "Run tests without
+coverage" steps can no longer run but are kept, as the activation
+contract still pins them.
+
+Required status-check contexts change with the job names, e.g.
+"Test (Python 3.14, shard N)" and "Timing-sensitive tests (Python 3.14)";
+the repository ruleset must be updated to match before this can merge.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Szt2FzuKZ4Y8WpNigvatoY
+---
+ .github/workflows/ci.yaml                     |  66 +--
+ .../enforce-allowlist-judge-gates.yaml        |   4 +-
+ .github/workflows/landscape-long-run.yml      |  33 +-
+ .github/workflows/mutation-testing.yaml       |   4 +-
+ .../workflows/state-engine-live-provider.yml  |  10 +-
+ docs/maintainer/ci-landscape-proof.md         |  18 +-
+ .../09-secure-development-lifecycle.md        |   8 +-
+ .../10-vulnerability-and-supply-chain.md      |   4 +-
+ docs/security-assurance/16-evidence-index.md  |   2 +-
+ scripts/ci_test_shards.py                     |  21 +-
+ tests/unit/cicd/test_ci_sharding.py           | 401 ++++++++++--------
+ tests/unit/cicd/test_ci_timing_sharding.py    |  85 ++--
+ .../test_workflow_supply_chain_closure.py     |   8 +-
+ 13 files changed, 345 insertions(+), 319 deletions(-)
+
+diff --git a/.github/workflows/ci.yaml b/.github/workflows/ci.yaml
+index 3b3d25e0..704b07d9 100644
+--- a/.github/workflows/ci.yaml
++++ b/.github/workflows/ci.yaml
+@@ -31,7 +31,7 @@ concurrency:
+   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/heads/release/') }}
+ 
+ env:
+-  PYTHON_VERSION: "3.13"
++  PYTHON_VERSION: "3.14"
+   UV_VERSION: "0.10.2"
+ 
+ permissions:
+@@ -55,7 +55,7 @@ jobs:
+     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+     container:
+-      image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
++      image: python:3.14-bookworm@sha256:3fe825da0a80fa8e2cd79baadeb76b03c0ddf3d6cdbc8346778a0208b9d6038c
+     env:
+       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-static-analysis
+     steps:
+@@ -393,19 +393,14 @@ jobs:
+       # retain capacity on the six trusted runners.
+       max-parallel: 4
+       matrix:
+-        python-version: ["3.12", "3.13"]
++        python-version: ["3.14"]
+         shard: [0, 1, 2, 3, 4, 5, 6, 7]
+-        # Coverage runs on Python 3.13 only because 3.13 is the release
+-        # interpreter for this branch. The Python 3.12 lane remains
+-        # dependency-compatibility signal and intentionally skips coverage so
+-        # one XML/threshold report is authoritative.
++        # Python 3.14 is the only supported interpreter, so its lane is also
++        # the coverage lane and its XML/threshold report is authoritative.
+         include:
+-          - python-version: "3.12"
+-            coverage: false
+-            ci-container-image: python:3.12-bookworm@sha256:dbbe4ceb97851e2e5fa83798b239811f871cb743b259ba3563737349f6bcfaa0
+-          - python-version: "3.13"
++          - python-version: "3.14"
+             coverage: true
+-            ci-container-image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
++            ci-container-image: python:3.14-bookworm@sha256:3fe825da0a80fa8e2cd79baadeb76b03c0ddf3d6cdbc8346778a0208b9d6038c
+ 
+     steps:
+       - name: Checkout code
+@@ -604,14 +599,11 @@ jobs:
+     strategy:
+       fail-fast: false
+       matrix:
+-        python-version: ["3.12", "3.13"]
++        python-version: ["3.14"]
+         include:
+-          - python-version: "3.12"
+-            coverage: false
+-            ci-container-image: python:3.12-bookworm@sha256:dbbe4ceb97851e2e5fa83798b239811f871cb743b259ba3563737349f6bcfaa0
+-          - python-version: "3.13"
++          - python-version: "3.14"
+             coverage: true
+-            ci-container-image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
++            ci-container-image: python:3.14-bookworm@sha256:3fe825da0a80fa8e2cd79baadeb76b03c0ddf3d6cdbc8346778a0208b9d6038c
+     steps:
+       - name: Checkout code
+         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+@@ -725,7 +717,7 @@ jobs:
+     timeout-minutes: 20
+     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+     container:
+-      image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
++      image: python:3.14-bookworm@sha256:3fe825da0a80fa8e2cd79baadeb76b03c0ddf3d6cdbc8346778a0208b9d6038c
+     needs: [test, landscape-proof, timing-sensitive]
+     # !cancelled(), not always(): see the timing-sensitive job. This still runs
+     # after failed shards, and no longer starts after a cancelled run.
+@@ -778,37 +770,21 @@ jobs:
+       # more than one; a lone match is unpacked straight into `path`, which the
+       # validator refuses. The timing shard is a single artifact, so it shares
+       # the ordinary shards' pattern. The validator refuses any unknown folder.
+-      - name: Download Python 3.12 ordinary and timing evidence
++      - name: Download Python 3.14 ordinary and timing evidence
+         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+         with:
+-          pattern: "*-shard-3.12-*"
+-          path: ${{ env.CI_CHECKOUT_PATH }}/proof-evidence/3.12
++          pattern: "*-shard-3.14-*"
++          path: ${{ env.CI_CHECKOUT_PATH }}/proof-evidence/3.14
+ 
+-      - name: Download Python 3.12 proof evidence
++      - name: Download Python 3.14 proof evidence
+         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+         with:
+-          pattern: landscape-proof-*-3.12-attempt-*
+-          path: ${{ env.CI_CHECKOUT_PATH }}/proof-evidence/3.12
++          pattern: landscape-proof-*-3.14-attempt-*
++          path: ${{ env.CI_CHECKOUT_PATH }}/proof-evidence/3.14
+ 
+-      - name: Download Python 3.13 ordinary and timing evidence
+-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+-        with:
+-          pattern: "*-shard-3.13-*"
+-          path: ${{ env.CI_CHECKOUT_PATH }}/proof-evidence/3.13
+-
+-      - name: Download Python 3.13 proof evidence
+-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+-        with:
+-          pattern: landscape-proof-*-3.13-attempt-*
+-          path: ${{ env.CI_CHECKOUT_PATH }}/proof-evidence/3.13
+-
+-      - name: Validate Python 3.12 ordinary and proof selection
+-        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+-        run: uv run python scripts/ci_test_shards.py --artifact-dir proof-evidence/3.12 --shard-count 8 --partitioned --python-version 3.12
+-
+-      - name: Validate Python 3.13 selection and combine coverage
++      - name: Validate Python 3.14 selection and combine coverage
+         working-directory: ${{ env.CI_CHECKOUT_PATH }}
+-        run: uv run python scripts/ci_test_shards.py --artifact-dir proof-evidence/3.13 --shard-count 8 --partitioned --python-version 3.13
++        run: uv run python scripts/ci_test_shards.py --artifact-dir proof-evidence/3.14 --shard-count 8 --partitioned --python-version 3.14
+ 
+       - name: Enforce overall and audit-critical coverage floors
+         working-directory: ${{ env.CI_CHECKOUT_PATH }}
+@@ -840,7 +816,7 @@ jobs:
+     timeout-minutes: 60
+     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+     container:
+-      image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
++      image: python:3.14-bookworm@sha256:3fe825da0a80fa8e2cd79baadeb76b03c0ddf3d6cdbc8346778a0208b9d6038c
+       # Same open-file limit as the Test job (see the note there).
+       options: --ulimit nofile=65536:524288
+     needs: [test]
+@@ -1214,7 +1190,7 @@ jobs:
+     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+     container:
+-      image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
++      image: python:3.14-bookworm@sha256:3fe825da0a80fa8e2cd79baadeb76b03c0ddf3d6cdbc8346778a0208b9d6038c
+     needs: [static-analysis]
+     env:
+       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-supply-chain-audit
+diff --git a/.github/workflows/enforce-allowlist-judge-gates.yaml b/.github/workflows/enforce-allowlist-judge-gates.yaml
+index 48324937..6f70262b 100644
+--- a/.github/workflows/enforce-allowlist-judge-gates.yaml
++++ b/.github/workflows/enforce-allowlist-judge-gates.yaml
+@@ -74,7 +74,7 @@ permissions:
+ # Every ``run`` step in this workflow is a bash script: the gate steps use
+ # ``set -o pipefail`` and the bash-only ``${PIPESTATUS[0]}`` to capture a
+ # command's exit status through a ``| tee`` pipe. Inside the
+-# ``python:3.13-bookworm`` container jobs, GitHub's shell auto-detection falls
++# ``python:3.14-bookworm`` container jobs, GitHub's shell auto-detection falls
+ # back to ``sh -e {0}`` (dash), which rejects ``set -o pipefail`` ("Illegal
+ # option") and has no ``PIPESTATUS`` — so the steps crashed before running their
+ # real check. Declaring bash explicitly (the image ships it) makes the shell
+@@ -93,7 +93,7 @@ jobs:
+     # Judge gates should fail fast if checkout/dependency/git plumbing hangs.
+     timeout-minutes: 15
+     container:
+-      image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
++      image: python:3.14-bookworm@sha256:3fe825da0a80fa8e2cd79baadeb76b03c0ddf3d6cdbc8346778a0208b9d6038c
+     env:
+       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-override-rate
+     steps:
+diff --git a/.github/workflows/landscape-long-run.yml b/.github/workflows/landscape-long-run.yml
+index d065cb77..8933e15f 100644
+--- a/.github/workflows/landscape-long-run.yml
++++ b/.github/workflows/landscape-long-run.yml
+@@ -37,46 +37,25 @@ jobs:
+         include:
+           - proof-case: no-escape
+             proof-nodeid: tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_no_mutation_alias_wrapper_dynamic_or_raw_write_escape_exists
+-            python-version: "3.12"
+-            coverage: false
+-            execution-timeout-seconds: 7200
+-            job-timeout-minutes: 150
+-            ci-container-image: python:3.12-bookworm@sha256:dbbe4ceb97851e2e5fa83798b239811f871cb743b259ba3563737349f6bcfaa0
+-          - proof-case: no-escape
+-            proof-nodeid: tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_no_mutation_alias_wrapper_dynamic_or_raw_write_escape_exists
+-            python-version: "3.13"
++            python-version: "3.14"
+             coverage: true
+             execution-timeout-seconds: 14400
+             job-timeout-minutes: 270
+-            ci-container-image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
+-          - proof-case: reserve-actual-sources
+-            proof-nodeid: tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_required_work_reserve_admission_on_actual_sources
+-            python-version: "3.12"
+-            coverage: false
+-            execution-timeout-seconds: 7200
+-            job-timeout-minutes: 150
+-            ci-container-image: python:3.12-bookworm@sha256:dbbe4ceb97851e2e5fa83798b239811f871cb743b259ba3563737349f6bcfaa0
++            ci-container-image: python:3.14-bookworm@sha256:3fe825da0a80fa8e2cd79baadeb76b03c0ddf3d6cdbc8346778a0208b9d6038c
+           - proof-case: reserve-actual-sources
+             proof-nodeid: tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_required_work_reserve_admission_on_actual_sources
+-            python-version: "3.13"
++            python-version: "3.14"
+             coverage: true
+             execution-timeout-seconds: 14400
+             job-timeout-minutes: 270
+-            ci-container-image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
+-          - proof-case: protected-formal-recovery
+-            proof-nodeid: tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_required_work_reserve_rejects_protected_instance_formal_recovery
+-            python-version: "3.12"
+-            coverage: false
+-            execution-timeout-seconds: 7200
+-            job-timeout-minutes: 150
+-            ci-container-image: python:3.12-bookworm@sha256:dbbe4ceb97851e2e5fa83798b239811f871cb743b259ba3563737349f6bcfaa0
++            ci-container-image: python:3.14-bookworm@sha256:3fe825da0a80fa8e2cd79baadeb76b03c0ddf3d6cdbc8346778a0208b9d6038c
+           - proof-case: protected-formal-recovery
+             proof-nodeid: tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_required_work_reserve_rejects_protected_instance_formal_recovery
+-            python-version: "3.13"
++            python-version: "3.14"
+             coverage: true
+             execution-timeout-seconds: 14400
+             job-timeout-minutes: 270
+-            ci-container-image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
++            ci-container-image: python:3.14-bookworm@sha256:3fe825da0a80fa8e2cd79baadeb76b03c0ddf3d6cdbc8346778a0208b9d6038c
+ 
+     steps:
+       - name: Explain long-run proof and provisional budgets
+diff --git a/.github/workflows/mutation-testing.yaml b/.github/workflows/mutation-testing.yaml
+index b57fbcd8..cbce9b0a 100644
+--- a/.github/workflows/mutation-testing.yaml
++++ b/.github/workflows/mutation-testing.yaml
+@@ -45,7 +45,7 @@ jobs:
+       - name: Set up Python
+         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+         with:
+-          python-version: '3.13'
++          python-version: '3.14'
+ 
+       - name: Install uv
+         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+@@ -106,7 +106,7 @@ jobs:
+       - name: Set up Python
+         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+         with:
+-          python-version: '3.13'
++          python-version: '3.14'
+ 
+       - name: Install uv
+         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+diff --git a/.github/workflows/state-engine-live-provider.yml b/.github/workflows/state-engine-live-provider.yml
+index efa10aba..1430a23f 100644
+--- a/.github/workflows/state-engine-live-provider.yml
++++ b/.github/workflows/state-engine-live-provider.yml
+@@ -60,7 +60,7 @@ jobs:
+       - name: Set up Python
+         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+         with:
+-          python-version: "3.13"
++          python-version: "3.14"
+       - name: Set up uv
+         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+         with:
+@@ -172,7 +172,7 @@ jobs:
+       - name: Set up Python
+         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+         with:
+-          python-version: "3.13"
++          python-version: "3.14"
+       - name: Set up uv
+         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+         with:
+@@ -268,7 +268,7 @@ jobs:
+         with: {ref: "${{ github.sha }}", persist-credentials: false}
+       - name: Set up Python
+         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+-        with: {python-version: "3.13"}
++        with: {python-version: "3.14"}
+       - name: Set up uv
+         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+         with: {version: "0.10.2", enable-cache: false, prune-cache: true}
+@@ -336,7 +336,7 @@ jobs:
+         with: {ref: "${{ github.sha }}", persist-credentials: false}
+       - name: Set up Python
+         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+-        with: {python-version: "3.13"}
++        with: {python-version: "3.14"}
+       - name: Set up uv
+         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+         with: {version: "0.10.2", enable-cache: false, prune-cache: true}
+@@ -429,7 +429,7 @@ jobs:
+         with: {ref: "${{ github.sha }}", persist-credentials: false}
+       - name: Set up Python
+         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+-        with: {python-version: "3.13"}
++        with: {python-version: "3.14"}
+       - name: Set up uv
+         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+         with: {version: "0.10.2", enable-cache: false, prune-cache: true}
+diff --git a/docs/maintainer/ci-landscape-proof.md b/docs/maintainer/ci-landscape-proof.md
+index 289f5326..f6852314 100644
+--- a/docs/maintainer/ci-landscape-proof.md
++++ b/docs/maintainer/ci-landscape-proof.md
+@@ -27,8 +27,8 @@ concurrently. Each proof job runs one of these existing cases serially:
+ All producers first collect `tests/` using normal marker selection. The
+ [partition helper](../../scripts/ci_test_shards.py) requires exactly these
+ three marked cases. Ordinary shards exclude them; each proof producer selects
+-exactly one. Local unsharded selection remains unchanged. Both Python 3.12
+-and 3.13 must pass; coverage is collected on 3.13.
++exactly one. Local unsharded selection remains unchanged. CI runs one
++interpreter lane, Python 3.14, which is also the coverage lane.
+ 
+ Ordinary assignment uses deterministic longest-estimated-first scheduling from
+ the [duration profile](../../config/cicd/pytest-duration-profile.json). Ties
+@@ -48,9 +48,9 @@ collection. Each proof must record a successful singleton call; pytest exit
+ zero alone is insufficient. Coverage databases must match finalized hashes
+ and contain executed source lines.
+ 
+-The consumer requires eight ordinary plus three proof producers **per
+-interpreter**, verifies their disjoint complete union, and re-derives the weighted
+-assignment. Only the 3.13 union is combined. Existing coverage floors remain
++The consumer requires eight ordinary plus three proof producers for the 3.14
++lane, verifies their disjoint complete union, re-derives the weighted
++assignment and combines that union's coverage. Existing coverage floors remain
+ 85% overall, 92% Landscape, 99% canonical, 90% orchestrator and 62% contracts.
+ Both the coverage job and `CI Success` require actual successful ordinary and
+ proof job results; neither missing evidence nor a skipped producer is success.
+@@ -76,13 +76,13 @@ returns `128 + signal`. Cancellation during publication invalidates terminal
+ evidence.
+ 
+ Proof concurrency is capped at two within its matrix, not across the host.
+-Provisional process caps are 7,200 seconds on 3.12 and 14,400 seconds on covered
+-3.13; job caps are 150 and 270 minutes. These are limits, not timing claims.
++The provisional process cap is 14,400 seconds on the covered 3.14 lane; the job
++cap is 270 minutes. These are limits, not timing claims.
+ Coordinate broad qualification with other host workloads and avoid launching a
+ duplicate local suite alongside candidate CI.
+ 
+ Focused tests cover partition identity, retry recovery, coverage binding,
+ failure propagation and process cleanup, with negative controls. Native
+-candidate CI must additionally establish collection parity, all six long proofs,
+-the complete 3.13 coverage union and every protected required context. Neither
++candidate CI must additionally establish collection parity, all three long proofs,
++the complete 3.14 coverage union and every protected required context. Neither
+ source review nor fixture-only tests establish those broader results.
+diff --git a/docs/security-assurance/09-secure-development-lifecycle.md b/docs/security-assurance/09-secure-development-lifecycle.md
+index 29514f38..45e4a317 100644
+--- a/docs/security-assurance/09-secure-development-lifecycle.md
++++ b/docs/security-assurance/09-secure-development-lifecycle.md
+@@ -203,10 +203,10 @@ these jobs reports `success` [EV-604]:
+ | Job | Content |
+ |---|---|
+ | `Static analysis` | actionlint, ruff, mypy, contract checks, elspeth-lints rules (§ 2.3) |
+-| `Test (Python 3.12, shard 0–3)`, `Test (Python 3.13, shard 0–3)` | Four deterministic shards per interpreter over the default pytest selection; 3.13 shards emit coverage data |
+-| `Combined coverage` | Requires ordinary, proof and timing-sensitive jobs; validates disjoint manifests for each interpreter, combines 3.13 coverage and enforces every coverage floor |
++| `Test (Python 3.14, shard 0–7)` | Eight deterministic shards over the default pytest selection on the single supported interpreter; every shard emits coverage data |
++| `Combined coverage` | Requires ordinary, proof and timing-sensitive jobs; validates disjoint manifests, combines 3.14 coverage and enforces every coverage floor |
+ | `Testcontainer (PostgreSQL contention proofs)` | `pytest tests/ -m testcontainer -n 0` against real PostgreSQL |
+-| `Timing-sensitive tests (Python 3.12)`, `Timing-sensitive tests (Python 3.13)` | Required serial timing-sensitive selection; default tests exclude it |
++| `Timing-sensitive tests (Python 3.14)` | Required serial timing-sensitive selection; default tests exclude it |
+ | `Host-runner unit (docker CLI, non-root filesystem)` | Tests that need a Docker CLI or a non-root user; required skips become failures |
+ | `State-engine catalog and selector validation` | Proof catalogues, plugin lifecycle matrix and documentation links |
+ | `Azure Container Apps Bicep bundle` | Compiles every Bicep template and parameter file; compiled-template contract test |
+@@ -243,7 +243,7 @@ on `main` (§ 1.3). Pre-commit hooks run on the contributor's machine once
+ | Composer skill inventory | The composer skill's tool list matches the registered tools | Pre-commit; CI `Static analysis` | Yes (`CI Success`) | `scripts/cicd/generate_skill_inventory.py` [EV-606] |
+ | `elspeth-lints` rules | Project-specific invariants (§ 2.3) | Pre-commit (per rule, on trigger paths); CI `Static analysis` | Yes (`CI Success`), except `trust_tier.tier_model` (§ 2.4) | [ADR-023](../architecture/adr/023-custom-python-ci-analyzer.md) [EV-606] [EV-608] [EV-610] |
+ | Lint migration parity | Shadow-mode comparison of migrated lint rules | CI `Static analysis` | Yes (`CI Success`) | `scripts/cicd/parity_harness.py` [EV-604] |
+-| Python tests (default selection) | Unit, integration, property, invariant and end-to-end tests (§ 3), on Python 3.12 and 3.13 | CI `Test` | Yes (`CI Success`) | [ci.yaml](../../.github/workflows/ci.yaml) [EV-604] [EV-618] |
++| Python tests (default selection) | Unit, integration, property, invariant and end-to-end tests (§ 3), on Python 3.14 | CI `Test` | Yes (`CI Success`) | [ci.yaml](../../.github/workflows/ci.yaml) [EV-604] [EV-618] |
+ | Coverage floors | Branch-enabled coverage ≥ 85 % overall; `core/landscape` ≥ 92 %, `core/canonical.py` ≥ 99 %, `engine/orchestrator` ≥ 90 %, `contracts` ≥ 62 % | CI `Combined coverage`, after all four Python 3.13 shards | Yes (`CI Success`) | as above [EV-621] |
+ | PostgreSQL testcontainer suite | Schema, SQL, locking and deployment acceptance against real PostgreSQL (660 tests, § 3.2) | CI `Testcontainer` | Yes (`CI Success`) | as above [EV-604] [EV-619] |
+ | Live-provider integration tests | Integration tests with a model API key | CI `Integration Tests`, push only | No — runs after merge; gates image publication (§ 6.2) | as above [EV-604] [EV-617] [EV-625] |
+diff --git a/docs/security-assurance/10-vulnerability-and-supply-chain.md b/docs/security-assurance/10-vulnerability-and-supply-chain.md
+index 8f2eb31a..42fb0ef2 100644
+--- a/docs/security-assurance/10-vulnerability-and-supply-chain.md
++++ b/docs/security-assurance/10-vulnerability-and-supply-chain.md
+@@ -626,8 +626,8 @@ Live-provider acceptance still runs in its configured cloud execution
+ environment and connects to the deployed PostgreSQL composition.
+ 
+ The static-analysis, push-only integration and supply-chain-audit jobs run in
+-digest-pinned Python 3.13 Bookworm images; the required test matrix runs in
+-digest-pinned Python 3.12 and 3.13 Bookworm images. All `setup-uv` steps use
++digest-pinned Python 3.14 Bookworm images; the required test matrix runs in
++the same digest-pinned Python 3.14 Bookworm image. All `setup-uv` steps use
+ exact version `0.10.2`, and mutation jobs install through `uv sync --frozen`
+ from the reviewed root lock. The PostgreSQL
+ testcontainer, host-runner, state-engine, Bicep, Playwright and frontend-unit
+diff --git a/docs/security-assurance/16-evidence-index.md b/docs/security-assurance/16-evidence-index.md
+index f1c1e05d..65bac061 100644
+--- a/docs/security-assurance/16-evidence-index.md
++++ b/docs/security-assurance/16-evidence-index.md
+@@ -192,7 +192,7 @@ Evidence IDs are stable public references. The current allocation is:
+ | EV-618 | Test estate: 2,220 test files; 61,841 collected and 61,039 in the default selection. Selected tiers: unit 55,518; integration 3,425; property 1,154; invariants 676; end-to-end 223; fixtures 40; gateway runtime 3. Tracked-file counts include files directly beneath each tier and were controlled against `find` | Command output | `pytest tests/ --collect-only -q -n 0` (exit 0); `git ls-files tests/<tier>` filtered by `test_*.py`, controlled with `find` | `487ac85a3`, measured 2026-10-01 | 09 § 3.1; 14 § 2 |
+ | EV-619 | Deselected markers: testcontainer 660, live_provider 56, performance 51, slow 37, stress 30 (802 distinct); addopts marker expression; strict markers and config | Command output, configuration | One controlled pytest collection enumerating item markers plus the default `pytest tests/ --collect-only -q -n 0` selection (both exit 0); `pyproject.toml` `[tool.pytest.ini_options]` | `487ac85a3`, measured 2026-10-01 | 09 § 3.2; 14 § 2 |
+ | EV-620 | Frontend tests: 238 Vitest files, 25 Playwright specs; `typecheck` over two TypeScript projects | Command output, configuration | `git ls-files` counts controlled with `find`; `src/elspeth/web/frontend/package.json` | `487ac85a3`, measured 2026-10-01 | 09 § 3.3; 14 § 2 |
+-| EV-621 | Coverage floors: 85 % overall (branch coverage on), landscape 92 %, canonical 99 %, orchestrator 90 %, contracts 62 %; all four Python 3.13 shard manifests must be complete and non-overlapping before coverage is combined | Configuration, test | [ci.yaml](../../.github/workflows/ci.yaml) (`Combined coverage`), `scripts/ci_test_shards.py`; `tests/unit/cicd/test_ci_sharding.py`; `pyproject.toml` `[tool.coverage.run]` | `487ac85a3`, reviewed 2026-10-01 | 09 § 2.2 |
++| EV-621 | Coverage floors: 85 % overall (branch coverage on), landscape 92 %, canonical 99 %, orchestrator 90 %, contracts 62 %; all eight Python 3.14 shard manifests must be complete and non-overlapping before coverage is combined | Configuration, test | [ci.yaml](../../.github/workflows/ci.yaml) (`Combined coverage`), `scripts/ci_test_shards.py`; `tests/unit/cicd/test_ci_sharding.py`; `pyproject.toml` `[tool.coverage.run]` | `487ac85a3`, reviewed 2026-10-01 | 09 § 2.2 |
+ | EV-622 | Test verification policy, measured-claims rule and full-suite gate script | Procedure | [AGENTS.md](../../AGENTS.md); `scripts/full-suite-gate.sh`, `scripts/branch-safety-check.sh` | `a2f0281ff` | 09 § 3.4, § 5 |
+ | EV-623 | Internal review inventory: 39 top-level Markdown records and 80 nested supporting records. The 2026-09-23 pre-publication review is explicitly scoped to judge-metadata custody/signatures, sentinel binding and affected export/persistence projections; it records passing focused/PostgreSQL checks and also records its failed frozen broad gate and missing operator signature verification | Review records | [docs/reviews/](https://github.com/dta-au/elspeth/tree/487ac85a377f135e012bb206e3769cd65f6fadb8/docs/reviews); [pre-publication review](https://github.com/dta-au/elspeth/blob/487ac85a377f135e012bb206e3769cd65f6fadb8/docs/reviews/2026-09-23-pre-publication-security-review.md); [web-tier review](https://github.com/dta-au/elspeth/blob/487ac85a377f135e012bb206e3769cd65f6fadb8/docs/reviews/2026-09-23-release-0.8.1-web-review/README.md) | `487ac85a3`, reviewed 2026-10-01 | 09 § 4.2; 14 § 1 |
+ | EV-624 | Red-team adversarial reviewer charter, seam trigger and reverted-guard detector | Code, procedure | `.claude/agents/red-team.md`; `scripts/red_team/` ([README](../../scripts/red_team/README.md)); `tests/unit/scripts/test_red_team_trigger.py`, `tests/unit/scripts/test_red_team_meta_check.py` | `a2f0281ff` | 09 § 4.3 |
+diff --git a/scripts/ci_test_shards.py b/scripts/ci_test_shards.py
+index 6b5fe18d..09dbde22 100644
+--- a/scripts/ci_test_shards.py
++++ b/scripts/ci_test_shards.py
+@@ -27,6 +27,11 @@ PROOF_MARKER = "landscape_long_run"
+ TIMING_MARKER = "timing_sensitive"
+ ASSIGNMENT_ALGORITHM = "duration-lpt-v1"
+ DURATION_PROFILE_PATH = Path("config/cicd/pytest-duration-profile.json")
++# The interpreter lanes CI produces evidence for, and the one whose shards carry
++# the authoritative coverage. Must match the python-version matrices in
++# .github/workflows/ci.yaml and landscape-long-run.yml.
++COVERAGE_PYTHON_VERSION = "3.14"
++SUPPORTED_PYTHON_VERSIONS = frozenset({COVERAGE_PYTHON_VERSION})
+ _PROOF_CALL_PASSED = pytest.StashKey[bool | None]()
+ _TIMING_CALL_OUTCOMES = pytest.StashKey[dict[str, str]]()
+ LONG_RUN_CASES = {
+@@ -450,7 +455,7 @@ def combine_shards(artifact_dir: Path, count: int, checkout: Path) -> None:
+     databases: list[str] = []
+     identity = evidence_identity(checkout)
+     for index in range(count):
+-        folder = artifact_dir / f"coverage-shard-3.13-{index}"
++        folder = artifact_dir / f"coverage-shard-{COVERAGE_PYTHON_VERSION}-{index}"
+         manifest = json.loads((folder / "shard-manifest.json").read_text(encoding="utf-8"))
+         # Downloads are confined to this native workflow run. Earlier producer
+         # attempts at the same SHA remain valid when rerunning only failed jobs.
+@@ -460,7 +465,7 @@ def combine_shards(artifact_dir: Path, count: int, checkout: Path) -> None:
+             or any(type(manifest.get(field)) is not int for field in ("schema_version", "shard_count", "shard_index", "exit_status"))
+             or manifest["schema_version"] != 2
+             or manifest.get("tested_commit") != identity["tested_commit"]
+-            or manifest.get("python_version") != "3.13"
++            or manifest.get("python_version") != COVERAGE_PYTHON_VERSION
+             or manifest.get("partition") != "all"
+             or manifest.get("github_run_id") != identity["github_run_id"]
+             or manifest.get("producer_job") != ("test" if identity["github_run_id"] is not None else None)
+@@ -515,7 +520,7 @@ def _combine_coverage(databases: list[str], checkout: Path) -> None:
+ 
+ 
+ def validate_long_run_shards(artifact_dir: Path, count: int, checkout: Path, python_version: str) -> dict[str, str]:
+-    """Validate ordinary/proof and disjoint timing evidence, combining covered 3.13.
++    """Validate ordinary/proof and disjoint timing evidence, combining coverage on the coverage lane.
+ 
+     Each artifact name binds a producer and attempt. Select the highest observed
+     attempt before reading its content; superseded content is irrelevant. Never
+@@ -525,8 +530,8 @@ def validate_long_run_shards(artifact_dir: Path, count: int, checkout: Path, pyt
+     """
+     if type(count) is not int:
+         raise ValueError("Supply a literal integer ordinary shard count")
+-    if count < 1 or python_version not in {"3.12", "3.13"}:
+-        raise ValueError("Supply a positive shard count and Python 3.12 or 3.13")
++    if count < 1 or python_version not in SUPPORTED_PYTHON_VERSIONS:
++        raise ValueError(f"Supply a positive shard count and a supported Python version: {sorted(SUPPORTED_PYTHON_VERSIONS)}")
+     profile = load_duration_profile(checkout)
+     identity = evidence_identity(checkout)
+     if identity["github_run_id"] is None:
+@@ -633,7 +638,7 @@ def validate_long_run_shards(artifact_dir: Path, count: int, checkout: Path, pyt
+             digests.add(digest)
+             selected.extend(nodeids)
+         resolved[producer] = folder.name
+-        if python_version == "3.13":
++        if python_version == COVERAGE_PYTHON_VERSION:
+             databases.append(_coverage_database(folder, manifest))
+     if len(selected) != len(set(selected)) or digests != {collection_digest(selected)}:
+         raise ValueError("Ordinary and proof collections overlap, differ, or omit selected tests")
+@@ -642,7 +647,7 @@ def validate_long_run_shards(artifact_dir: Path, count: int, checkout: Path, pyt
+     assignment = ordinary_assignment([node for group in ordinary_groups.values() for node in group], count, profile)
+     if any(assignment[node] != index for index, group in ordinary_groups.items() for node in group):
+         raise ValueError("Artifact union contains a misassigned ordinary test")
+-    if python_version == "3.13":
++    if python_version == COVERAGE_PYTHON_VERSION:
+         _combine_coverage(databases, checkout)
+     return resolved
+ 
+@@ -653,7 +658,7 @@ def main() -> None:
+     parser.add_argument("--shard-count", type=int, required=True)
+     parser.add_argument("--checkout", type=Path, default=Path.cwd())
+     parser.add_argument("--partitioned", action="store_true")
+-    parser.add_argument("--python-version", choices=("3.12", "3.13"))
++    parser.add_argument("--python-version", choices=sorted(SUPPORTED_PYTHON_VERSIONS))
+     args = parser.parse_args()
+     if args.partitioned:
+         if args.python_version is None:
+diff --git a/tests/unit/cicd/test_ci_sharding.py b/tests/unit/cicd/test_ci_sharding.py
+index e3462168..65ccf0b5 100644
+--- a/tests/unit/cicd/test_ci_sharding.py
++++ b/tests/unit/cicd/test_ci_sharding.py
+@@ -19,8 +19,10 @@ import pytest
+ import yaml
+ from scripts.ci_test_shards import (
+     ASSIGNMENT_ALGORITHM,
++    COVERAGE_PYTHON_VERSION,
+     DURATION_PROFILE_PATH,
+     LONG_RUN_CASES,
++    SUPPORTED_PYTHON_VERSIONS,
+     _publish_manifest,
+     build_long_run_manifest,
+     build_timing_manifest,
+@@ -37,6 +39,10 @@ from scripts.ci_test_shards import (
+ )
+ 
+ REPO_ROOT = Path(__file__).resolve().parents[3]
++# The single CI interpreter lane. It is also the coverage lane, so every
++# producer fixture below carries a coverage database. Pinned literally (not
++# read from production) so a silent production retarget turns these tests red.
++LANE = "3.14"
+ 
+ 
+ @pytest.fixture(autouse=True)
+@@ -511,7 +517,7 @@ def _artifacts(tmp_path: Path, count: int = 4) -> Path:
+         source.mkdir(parents=True)
+         module = source / "sample.py"
+         module.write_text("value = 1\nvalue += 1\n", encoding="utf-8")
+-        folder = artifacts / f"coverage-shard-3.13-{index}"
++        folder = artifacts / f"coverage-shard-{LANE}-{index}"
+         folder.mkdir(parents=True)
+         data = coverage.CoverageData(basename=str(folder / "coverage-data"))
+         data.add_lines({str(module): {1 if index < 2 else 2}})
+@@ -521,7 +527,7 @@ def _artifacts(tmp_path: Path, count: int = 4) -> Path:
+                 {
+                     "schema_version": 2,
+                     "tested_commit": commit,
+-                    "python_version": "3.13",
++                    "python_version": LANE,
+                     "github_run_id": None,
+                     "github_run_attempt": None,
+                     "producer_job": None,
+@@ -849,7 +855,7 @@ def test_coverage_combine_refuses_incomplete_or_inconsistent_shards(tmp_path: Pa
+     # Each negative control starts from evidence that successfully combines.
+     combine_shards(artifacts, 4, tmp_path)
+     (tmp_path / ".coverage").unlink()
+-    folder = artifacts / "coverage-shard-3.13-0"
++    folder = artifacts / f"coverage-shard-{LANE}-0"
+     report = folder / "shard-manifest.json"
+     manifest = json.loads(report.read_text(encoding="utf-8"))
+     if mutation == "missing_manifest":
+@@ -865,7 +871,8 @@ def test_coverage_combine_refuses_incomplete_or_inconsistent_shards(tmp_path: Pa
+     elif mutation == "wrong_commit":
+         manifest["tested_commit"] = "0" * 40
+     elif mutation == "wrong_version":
+-        manifest["python_version"] = "3.12"
++        # A real interpreter that is not the coverage lane must still be refused.
++        manifest["python_version"] = "3.13"
+     elif mutation == "wrong_run":
+         manifest["github_run_id"] = "9999"
+     elif mutation == "wrong_producer":
+@@ -890,7 +897,7 @@ def test_coverage_combine_refuses_incomplete_or_inconsistent_shards(tmp_path: Pa
+         with (folder / "coverage-data").open("ab") as stream:
+             stream.write(b"tampered")
+     elif mutation == "swapped_database":
+-        (folder / "coverage-data").write_bytes((artifacts / "coverage-shard-3.13-1" / "coverage-data").read_bytes())
++        (folder / "coverage-data").write_bytes((artifacts / f"coverage-shard-{LANE}-1" / "coverage-data").read_bytes())
+     elif mutation == "empty_database":
+         database = folder / "coverage-data"
+         database.unlink()
+@@ -944,7 +951,7 @@ def test_combine_binds_native_run_and_accepts_partial_rerun_attempts(
+     }.items():
+         monkeypatch.setenv(name, value)
+     for index in range(4):
+-        report = artifacts / f"coverage-shard-3.13-{index}" / "shard-manifest.json"
++        report = artifacts / f"coverage-shard-{LANE}-{index}" / "shard-manifest.json"
+         manifest = json.loads(report.read_text(encoding="utf-8"))
+         manifest.update(github_run_id="1234", github_run_attempt="1" if index < 2 else "2", producer_job="test")
+         report.write_text(json.dumps(manifest), encoding="utf-8")
+@@ -953,7 +960,7 @@ def test_combine_binds_native_run_and_accepts_partial_rerun_attempts(
+     (tmp_path / ".coverage").unlink()
+     if mutation is None:
+         return
+-    report = artifacts / "coverage-shard-3.13-0" / "shard-manifest.json"
++    report = artifacts / f"coverage-shard-{LANE}-0" / "shard-manifest.json"
+     manifest = json.loads(report.read_text(encoding="utf-8"))
+     if mutation == "wrong_run":
+         manifest["github_run_id"] = "9999"
+@@ -1308,7 +1315,8 @@ def test_active_no_call_refusal_is_visible_to_inner_finalizers(tmp_path: Path, c
+     assert manifest["proof_call_passed"] is False and manifest["exit_status"] == 1
+ 
+ 
+-def _long_run_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str, count: int = 4) -> Path:
++def _long_run_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, count: int = 4) -> Path:
++    version = LANE
+     artifacts = _artifacts(tmp_path, count)
+     nodeids = [f"test_sample.py::test_example[{index}]" for index in range(100)] + list(LONG_RUN_CASES.values())
+     profile = load_duration_profile(tmp_path)
+@@ -1324,7 +1332,7 @@ def _long_run_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version
+     }.items():
+         monkeypatch.setenv(name, value)
+     for index in range(count):
+-        folder = artifacts / f"coverage-shard-3.13-{index}"
++        folder = artifacts / f"coverage-shard-{LANE}-{index}"
+         report = folder / "shard-manifest.json"
+         manifest = json.loads(report.read_text(encoding="utf-8"))
+         attempt = "1" if index < 2 else "2"
+@@ -1341,9 +1349,6 @@ def _long_run_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version
+             github_run_attempt=attempt,
+             producer_job="test",
+         )
+-        if version == "3.12":
+-            (folder / "coverage-data").unlink()
+-            del manifest["coverage_sha256"]
+         report.write_text(json.dumps(manifest), encoding="utf-8")
+         folder.rename(artifacts / f"ordinary-shard-{version}-{index}-attempt-{attempt}")
+     for case, line in zip(LONG_RUN_CASES, [3, 4, 5], strict=True):
+@@ -1367,14 +1372,13 @@ def _long_run_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version
+             "exit_status": 0,
+             "proof_call_passed": True,
+         }
+-        if version == "3.13":
+-            source = tmp_path / f"producer-{case}" / "src" / "elspeth" / "sample.py"
+-            source.parent.mkdir(parents=True)
+-            source.write_text("value = 1\nvalue += 1\nno_escape = 3\nreserve = 4\nrecovery = 5\n", encoding="utf-8")
+-            data = coverage.CoverageData(basename=str(folder / "coverage-data"))
+-            data.add_lines({str(source): {line}})
+-            data.write()
+-            manifest["coverage_sha256"] = hashlib.sha256((folder / "coverage-data").read_bytes()).hexdigest()
++        source = tmp_path / f"producer-{case}" / "src" / "elspeth" / "sample.py"
++        source.parent.mkdir(parents=True)
++        source.write_text("value = 1\nvalue += 1\nno_escape = 3\nreserve = 4\nrecovery = 5\n", encoding="utf-8")
++        data = coverage.CoverageData(basename=str(folder / "coverage-data"))
++        data.add_lines({str(source): {line}})
++        data.write()
++        manifest["coverage_sha256"] = hashlib.sha256((folder / "coverage-data").read_bytes()).hexdigest()
+         (folder / "shard-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+     folder = artifacts / f"timing-shard-{version}-attempt-2"
+     folder.mkdir()
+@@ -1385,14 +1389,13 @@ def _long_run_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version
+     manifest["exit_status"] = 0
+     manifest["timing_call_outcomes"] = dict.fromkeys(timing_ids, "passed")
+     manifest["timing_passed_count"] = len(timing_ids)
+-    if version == "3.13":
+-        source = tmp_path / "producer-timing" / "src" / "elspeth" / "sample.py"
+-        source.parent.mkdir(parents=True)
+-        source.write_text("value = 1\nvalue += 1\nno_escape = 3\nreserve = 4\nrecovery = 5\ntiming = 6\n", encoding="utf-8")
+-        data = coverage.CoverageData(basename=str(folder / "coverage-data"))
+-        data.add_lines({str(source): {6}})
+-        data.write()
+-        manifest["coverage_sha256"] = hashlib.sha256((folder / "coverage-data").read_bytes()).hexdigest()
++    source = tmp_path / "producer-timing" / "src" / "elspeth" / "sample.py"
++    source.parent.mkdir(parents=True)
++    source.write_text("value = 1\nvalue += 1\nno_escape = 3\nreserve = 4\nrecovery = 5\ntiming = 6\n", encoding="utf-8")
++    data = coverage.CoverageData(basename=str(folder / "coverage-data"))
++    data.add_lines({str(source): {6}})
++    data.write()
++    manifest["coverage_sha256"] = hashlib.sha256((folder / "coverage-data").read_bytes()).hexdigest()
+     (folder / "shard-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+     monkeypatch.setenv("GITHUB_JOB", "coverage")
+     (tmp_path / "src" / "elspeth").mkdir(parents=True)
+@@ -1402,32 +1405,43 @@ def _long_run_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version
+     return artifacts
+ 
+ 
+-@pytest.mark.parametrize("version", ["3.12", "3.13"])
+-def test_long_run_consumer_requires_eight_producers_and_all_case_coverage(
+-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
+-) -> None:
+-    artifacts = _long_run_artifacts(tmp_path, monkeypatch, version)
++def test_ci_lane_is_the_single_supported_coverage_interpreter() -> None:
++    assert COVERAGE_PYTHON_VERSION == LANE
++    assert {LANE} == SUPPORTED_PYTHON_VERSIONS
++
++
++@pytest.mark.parametrize("version", ["3.12", "3.13", "3.15", "unknown"])
++def test_long_run_consumer_refuses_unsupported_interpreter_lane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str) -> None:
++    artifacts = _long_run_artifacts(tmp_path, monkeypatch)
++    # Control: the same evidence validates on the supported lane.
++    validate_long_run_shards(artifacts, 4, tmp_path, LANE)
++    (tmp_path / ".coverage").unlink()
++    for folder in list(artifacts.iterdir()):
++        folder.rename(artifacts / folder.name.replace(f"-{LANE}-", f"-{version}-"))
++    with pytest.raises(ValueError, match="supported Python version"):
++        validate_long_run_shards(artifacts, 4, tmp_path, version)
++    assert not (tmp_path / ".coverage").exists()
++
++
++def test_long_run_consumer_requires_eight_producers_and_all_case_coverage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++    version = LANE
++    artifacts = _long_run_artifacts(tmp_path, monkeypatch)
+     resolved = validate_long_run_shards(artifacts, 4, tmp_path, version)
+     assert len(resolved) == 8
+     for case in LONG_RUN_CASES:
+         assert resolved[f"landscape-proof-{case}-{version}"] == f"landscape-proof-{case}-{version}-attempt-2"
+     assert resolved[f"ordinary-shard-{version}-0"] == f"ordinary-shard-{version}-0-attempt-1"
+     databases = [folder / "coverage-data" for folder in artifacts.iterdir() if (folder / "coverage-data").exists()]
+-    if version == "3.13":
+-        assert len(databases) == 8
+-        for case, line in zip(LONG_RUN_CASES, [3, 4, 5], strict=True):
+-            data = coverage.CoverageData(basename=str(artifacts / resolved[f"landscape-proof-{case}-{version}"] / "coverage-data"))
+-            data.read()
+-            assert [data.lines(filename) for filename in data.measured_files()] == [[line]]
+-        combined = coverage.CoverageData(basename=str(tmp_path / ".coverage"))
+-        combined.read()
+-        assert combined.lines(str(tmp_path / "src" / "elspeth" / "sample.py")) == [1, 2, 3, 4, 5, 6]
+-    else:
+-        assert databases == []
+-        assert not (tmp_path / ".coverage").exists()
++    assert len(databases) == 8
++    for case, line in zip(LONG_RUN_CASES, [3, 4, 5], strict=True):
++        data = coverage.CoverageData(basename=str(artifacts / resolved[f"landscape-proof-{case}-{version}"] / "coverage-data"))
++        data.read()
++        assert [data.lines(filename) for filename in data.measured_files()] == [[line]]
++    combined = coverage.CoverageData(basename=str(tmp_path / ".coverage"))
++    combined.read()
++    assert combined.lines(str(tmp_path / "src" / "elspeth" / "sample.py")) == [1, 2, 3, 4, 5, 6]
+ 
+ 
+-@pytest.mark.parametrize("version", ["3.12", "3.13"])
+ @pytest.mark.parametrize("producer", ["ordinary", *LONG_RUN_CASES])
+ @pytest.mark.parametrize(
+     "mutation",
+@@ -1465,9 +1479,10 @@ def test_long_run_consumer_requires_eight_producers_and_all_case_coverage(
+     ],
+ )
+ def test_long_run_consumer_rejects_selected_invalid_evidence(
+-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str, producer: str, mutation: str
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, producer: str, mutation: str
+ ) -> None:
+-    artifacts = _long_run_artifacts(tmp_path, monkeypatch, version)
++    version = LANE
++    artifacts = _long_run_artifacts(tmp_path, monkeypatch)
+     validate_long_run_shards(artifacts, 4, tmp_path, version)
+     (tmp_path / ".coverage").unlink(missing_ok=True)
+     folder = artifacts / (
+@@ -1531,14 +1546,14 @@ def test_long_run_consumer_rejects_selected_invalid_evidence(
+ def test_long_run_consumer_validates_each_real_database(
+     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, producer: str, mutation: str
+ ) -> None:
+-    artifacts = _long_run_artifacts(tmp_path, monkeypatch, "3.13")
+-    validate_long_run_shards(artifacts, 4, tmp_path, "3.13")
++    artifacts = _long_run_artifacts(tmp_path, monkeypatch)
++    validate_long_run_shards(artifacts, 4, tmp_path, LANE)
+     (tmp_path / ".coverage").unlink()
+     if producer.startswith("ordinary-"):
+         index = int(producer.removeprefix("ordinary-"))
+-        folder = artifacts / f"ordinary-shard-3.13-{index}-attempt-{'1' if index < 2 else '2'}"
++        folder = artifacts / f"ordinary-shard-{LANE}-{index}-attempt-{'1' if index < 2 else '2'}"
+     else:
+-        folder = artifacts / f"landscape-proof-{producer}-3.13-attempt-2"
++        folder = artifacts / f"landscape-proof-{producer}-{LANE}-attempt-2"
+     database = folder / "coverage-data"
+     report = folder / "shard-manifest.json"
+     manifest = json.loads(report.read_text())
+@@ -1557,10 +1572,9 @@ def test_long_run_consumer_validates_each_real_database(
+         manifest["coverage_sha256"] = hashlib.sha256(database.read_bytes()).hexdigest()
+     report.write_text(json.dumps(manifest), encoding="utf-8")
+     with pytest.raises((ValueError, FileNotFoundError)):
+-        validate_long_run_shards(artifacts, 4, tmp_path, "3.13")
++        validate_long_run_shards(artifacts, 4, tmp_path, LANE)
+ 
+ 
+-@pytest.mark.parametrize("version", ["3.12", "3.13"])
+ @pytest.mark.parametrize("producer", ["ordinary", *LONG_RUN_CASES])
+ @pytest.mark.parametrize("selected", [False, True], ids=["superseded", "selected"])
+ @pytest.mark.parametrize(
+@@ -1586,9 +1600,10 @@ def test_long_run_consumer_validates_each_real_database(
+     ],
+ )
+ def test_long_run_consumer_retains_newest_attempt_content_policy(
+-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str, producer: str, selected: bool, damage: str
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, producer: str, selected: bool, damage: str
+ ) -> None:
+-    artifacts = _long_run_artifacts(tmp_path, monkeypatch, version)
++    version = LANE
++    artifacts = _long_run_artifacts(tmp_path, monkeypatch)
+     monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "3")
+     stem = f"ordinary-shard-{version}-0" if producer == "ordinary" else f"landscape-proof-{producer}-{version}"
+     older = artifacts / f"{stem}-attempt-{'1' if producer == 'ordinary' else '2'}"
+@@ -1609,19 +1624,16 @@ def test_long_run_consumer_retains_newest_attempt_content_policy(
+     elif damage == "non_object":
+         report.write_text("[]", encoding="utf-8")
+     elif damage in {"database", "wrong_hash", "tampered_database"}:
+-        if version == "3.13":
+-            database = folder / "coverage-data"
+-            if damage == "database":
+-                database.unlink()
+-            elif damage == "tampered_database":
+-                with database.open("ab") as stream:
+-                    stream.write(b"tampered")
+-            else:
+-                manifest = json.loads(report.read_text())
+-                manifest["coverage_sha256"] = "wrong"
+-                report.write_text(json.dumps(manifest), encoding="utf-8")
++        database = folder / "coverage-data"
++        if damage == "database":
++            database.unlink()
++        elif damage == "tampered_database":
++            with database.open("ab") as stream:
++                stream.write(b"tampered")
+         else:
+-            report.write_text("[]", encoding="utf-8")
++            manifest = json.loads(report.read_text())
++            manifest["coverage_sha256"] = "wrong"
++            report.write_text(json.dumps(manifest), encoding="utf-8")
+     else:
+         manifest = json.loads(report.read_text())
+         field, value = {
+@@ -1646,19 +1658,18 @@ def test_long_run_consumer_retains_newest_attempt_content_policy(
+         resolved = validate_long_run_shards(artifacts, 4, tmp_path, version)
+         assert len(resolved) == 8
+         assert resolved[stem] == newer.name
+-        if version == "3.13":
+-            data = coverage.CoverageData(basename=str(tmp_path / ".coverage"))
+-            data.read()
+-            assert data.lines(str(tmp_path / "src" / "elspeth" / "sample.py")) == [1, 2, 3, 4, 5, 6]
++        data = coverage.CoverageData(basename=str(tmp_path / ".coverage"))
++        data.read()
++        assert data.lines(str(tmp_path / "src" / "elspeth" / "sample.py")) == [1, 2, 3, 4, 5, 6]
+ 
+ 
+-@pytest.mark.parametrize("version", ["3.12", "3.13"])
+ @pytest.mark.parametrize("case", list(LONG_RUN_CASES))
+ @pytest.mark.parametrize("mutation", ["unknown", "alias", "future", "duplicate", "singleton_name", "actual_sha"])
+ def test_long_run_consumer_refuses_invalid_native_namespace(
+-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str, case: str, mutation: str
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str, mutation: str
+ ) -> None:
+-    artifacts = _long_run_artifacts(tmp_path, monkeypatch, version)
++    version = LANE
++    artifacts = _long_run_artifacts(tmp_path, monkeypatch)
+     validate_long_run_shards(artifacts, 4, tmp_path, version)
+     (tmp_path / ".coverage").unlink(missing_ok=True)
+     if mutation == "actual_sha":
+@@ -1681,17 +1692,15 @@ def test_long_run_consumer_refuses_invalid_native_namespace(
+ 
+ @pytest.mark.parametrize("count", [True, 4.0, 0, -1])
+ def test_long_run_consumer_requires_strict_shard_count(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, count: int) -> None:
+-    artifacts = _long_run_artifacts(tmp_path, monkeypatch, "3.12")
+-    validate_long_run_shards(artifacts, 4, tmp_path, "3.12")
++    artifacts = _long_run_artifacts(tmp_path, monkeypatch)
++    validate_long_run_shards(artifacts, 4, tmp_path, LANE)
+     with pytest.raises(ValueError):
+-        validate_long_run_shards(artifacts, count, tmp_path, "3.12")
++        validate_long_run_shards(artifacts, count, tmp_path, LANE)
+ 
+ 
+-@pytest.mark.parametrize("version", ["3.12", "3.13"])
+-def test_long_run_consumer_bucket_check_is_independent_of_union_digest(
+-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
+-) -> None:
+-    artifacts = _long_run_artifacts(tmp_path, monkeypatch, version)
++def test_long_run_consumer_bucket_check_is_independent_of_union_digest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++    version = LANE
++    artifacts = _long_run_artifacts(tmp_path, monkeypatch)
+     validate_long_run_shards(artifacts, 4, tmp_path, version)
+     reports = list(artifacts.glob("*/shard-manifest.json"))
+     manifests = {report: json.loads(report.read_text()) for report in reports}
+@@ -1707,11 +1716,9 @@ def test_long_run_consumer_bucket_check_is_independent_of_union_digest(
+         validate_long_run_shards(artifacts, 4, tmp_path, version)
+ 
+ 
+-@pytest.mark.parametrize("version", ["3.12", "3.13"])
+-def test_long_run_consumer_rederives_unequal_weights_instead_of_equal_defaults(
+-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
+-) -> None:
+-    artifacts = _long_run_artifacts(tmp_path, monkeypatch, version)
++def test_long_run_consumer_rederives_unequal_weights_instead_of_equal_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++    version = LANE
++    artifacts = _long_run_artifacts(tmp_path, monkeypatch)
+     validate_long_run_shards(artifacts, 4, tmp_path, version)
+     reports = list(artifacts.glob("*/shard-manifest.json"))
+     manifests = {report: json.loads(report.read_text()) for report in reports}
+@@ -1777,6 +1784,9 @@ def test_partitioned_validator_consumes_real_successful_pytest_producers(tmp_pat
+     }.items():
+         monkeypatch.setenv(name, value)
+     version = f"{sys.version_info.major}.{sys.version_info.minor}"
++    # The producers record the real interpreter, so only the CI lane can yield
++    # evidence the consumer admits; say so instead of failing inside it.
++    assert version == LANE, f"real-producer proof must run on the CI lane interpreter {LANE}, not {version}"
+     artifacts = tmp_path / "artifacts"
+     artifacts.mkdir()
+     producers = (
+@@ -1794,17 +1804,16 @@ def test_partitioned_validator_consumes_real_successful_pytest_producers(tmp_pat
+         folder.mkdir()
+         monkeypatch.setenv("GITHUB_JOB", "test" if partition == "ordinary" else "timing-sensitive" if partition == "timing" else "proof")
+         monkeypatch.setenv("COVERAGE_FILE", str(folder / "coverage-data"))
+-        extra = [f"--cov={source}", "--cov-config=/dev/null", "--cov-report=", "--cov-fail-under=0"] if version == "3.13" else []
++        extra = [f"--cov={source}", "--cov-config=/dev/null", "--cov-report=", "--cov-fail-under=0"]
+         extra += ["-m", "timing_sensitive" if partition == "timing" else "not timing_sensitive"]
+         result, report = _partition_run(tmp_path, partition, count, index, extra_args=extra, case=case)
+         assert result.returncode == 0, result.stdout + result.stderr
+         report.rename(folder / "shard-manifest.json")
+-        if version == "3.13":
+-            data = coverage.CoverageData(basename=str(folder / "coverage-data"))
+-            data.read()
+-            executed = set(data.lines(str(source / "sample.py")))
+-            expected = {10} if partition == "timing" else {2} if case is None else {dict(zip(LONG_RUN_CASES, [4, 6, 8], strict=True))[case]}
+-            assert executed & {2, 4, 6, 8, 10} == expected
++        data = coverage.CoverageData(basename=str(folder / "coverage-data"))
++        data.read()
++        executed = set(data.lines(str(source / "sample.py")))
++        expected = {10} if partition == "timing" else {2} if case is None else {dict(zip(LONG_RUN_CASES, [4, 6, 8], strict=True))[case]}
++        assert executed & {2, 4, 6, 8, 10} == expected
+     destination = tmp_path / "aggregate"
+     (destination / "src" / "elspeth").mkdir(parents=True)
+     (destination / "src" / "elspeth" / "sample.py").write_text(source_text, encoding="utf-8")
+@@ -1813,40 +1822,50 @@ def test_partitioned_validator_consumes_real_successful_pytest_producers(tmp_pat
+     shutil.copyfile(tmp_path / DURATION_PROFILE_PATH, profile)
+     resolved = validate_long_run_shards(artifacts, 8, destination, version)
+     assert len(resolved) == 12
+-    if version == "3.13":
+-        data = coverage.CoverageData(basename=str(destination / ".coverage"))
+-        data.read()
+-        assert data.lines(str(destination / "src" / "elspeth" / "sample.py")) == list(range(1, 11))
++    data = coverage.CoverageData(basename=str(destination / ".coverage"))
++    data.read()
++    assert data.lines(str(destination / "src" / "elspeth" / "sample.py")) == list(range(1, 11))
+ 
+ 
+ def test_partitioned_cli_returns_selected_attempt_provenance(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+-    artifacts = _long_run_artifacts(tmp_path, monkeypatch, "3.12")
+-    result = subprocess.run(
+-        [
+-            sys.executable,
+-            str(REPO_ROOT / "scripts" / "ci_test_shards.py"),
+-            "--artifact-dir",
+-            str(artifacts),
+-            "--shard-count",
+-            "4",
+-            "--checkout",
+-            str(tmp_path),
+-            "--partitioned",
+-            "--python-version",
+-            "3.12",
+-        ],
+-        cwd=tmp_path,
+-        capture_output=True,
+-        text=True,
+-        check=False,
+-        timeout=90,
+-    )
++    artifacts = _long_run_artifacts(tmp_path, monkeypatch)
++
++    def run_cli(version: str) -> subprocess.CompletedProcess[str]:
++        return subprocess.run(
++            [
++                sys.executable,
++                str(REPO_ROOT / "scripts" / "ci_test_shards.py"),
++                "--artifact-dir",
++                str(artifacts),
++                "--shard-count",
++                "4",
++                "--checkout",
++                str(tmp_path),
++                "--partitioned",
++                "--python-version",
++                version,
++            ],
++            cwd=tmp_path,
++            capture_output=True,
++            text=True,
++            check=False,
++            timeout=90,
++        )
++
++    result = run_cli(LANE)
+     assert result.returncode == 0, result.stdout + result.stderr
+     selected = json.loads(result.stdout)["selected_artifacts"]
+     assert len(selected) == 8
+-    assert selected["ordinary-shard-3.12-0"] == "ordinary-shard-3.12-0-attempt-1"
++    assert selected[f"ordinary-shard-{LANE}-0"] == f"ordinary-shard-{LANE}-0-attempt-1"
+     for case in LONG_RUN_CASES:
+-        assert selected[f"landscape-proof-{case}-3.12"] == f"landscape-proof-{case}-3.12-attempt-2"
++        assert selected[f"landscape-proof-{case}-{LANE}"] == f"landscape-proof-{case}-{LANE}-attempt-2"
++    assert (tmp_path / ".coverage").exists()
++    (tmp_path / ".coverage").unlink()
++    # The CLI refuses a retired interpreter lane before reading any evidence.
++    refused = run_cli("3.13")
++    assert refused.returncode == 2, refused.stdout + refused.stderr
++    assert "invalid choice" in refused.stderr
++    assert not (tmp_path / ".coverage").exists()
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -1867,7 +1886,7 @@ def test_all_mode_manifest_refuses_boolean_and_float_integer_substitutes(tmp_pat
+     (source / "sample.py").write_text("value = 1\nvalue += 1\n", encoding="utf-8")
+     combine_shards(artifacts, 4, tmp_path)
+     (tmp_path / ".coverage").unlink()
+-    report = artifacts / "coverage-shard-3.13-0" / "shard-manifest.json"
++    report = artifacts / f"coverage-shard-{LANE}-0" / "shard-manifest.json"
+     manifest = json.loads(report.read_text(encoding="utf-8"))
+     manifest[field] = value
+     report.write_text(json.dumps(manifest), encoding="utf-8")
+@@ -1927,7 +1946,7 @@ def _assert_activation_contract(jobs: dict[str, Any]) -> None:
+         assert "--ci-shard-report=shard-manifest.json" in args
+         assert not any(arg == "-m" or arg.startswith("--markexpr") or arg in {"-o", "--override-ini"} for arg in args)
+     upload = _activation_step(jobs["test"], "Upload shard coverage and selection evidence")
+-    assert upload["if"] == "always()"  # Both interpreters publish complete selection evidence.
++    assert upload["if"] == "always()"  # Every shard publishes complete selection evidence, even on failure.
+     assert upload["with"]["name"] == "ordinary-shard-${{ matrix.python-version }}-${{ matrix.shard }}-attempt-${{ github.run_attempt }}"
+     assert set(upload["with"]["path"].splitlines()) == {
+         "${{ env.CI_CHECKOUT_PATH }}/coverage-data",
+@@ -1944,38 +1963,42 @@ def _assert_activation_contract(jobs: dict[str, Any]) -> None:
+     for producer in ("test", "landscape-proof", "timing-sensitive"):
+         assert f'if [ "${{{{ needs.{producer}.result }}}}" != "success" ]; then' in gate["run"]
+     assert "continue-on-error" not in gate and "||" not in gate["run"]
+-    for version in ("3.12", "3.13"):
+-        for partition, pattern in (
+-            # The timing shard is one artifact. The action unpacks a lone match
+-            # straight into `path` with no folder of its own, which the validator
+-            # refuses, so the timing shard shares the ordinary shards' pattern.
+-            ("ordinary and timing", f"*-shard-{version}-*"),
+-            ("proof", f"landscape-proof-*-{version}-attempt-*"),
+-        ):
+-            download = _activation_step(aggregate, f"Download Python {version} {partition} evidence")
+-            assert download["uses"] == "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+-            assert download["with"] == {"pattern": pattern, "path": "${{ env.CI_CHECKOUT_PATH }}/proof-evidence/" + version}
+-        name = (
+-            "Validate Python 3.12 ordinary and proof selection"
+-            if version == "3.12"
+-            else "Validate Python 3.13 selection and combine coverage"
+-        )
+-        validation = _activation_step(aggregate, name)
+-        assert validation["working-directory"] == "${{ env.CI_CHECKOUT_PATH }}"
+-        assert shlex.split(validation["run"]) == [
+-            "uv",
+-            "run",
+-            "python",
+-            "scripts/ci_test_shards.py",
+-            "--artifact-dir",
+-            f"proof-evidence/{version}",
+-            "--shard-count",
+-            "8",
+-            "--partitioned",
+-            "--python-version",
+-            version,
+-        ]
+-        assert "if" not in validation and "continue-on-error" not in validation
++    # The test and timing matrices run exactly one lane, and it is the coverage lane.
++    for producer in ("test", "timing-sensitive"):
++        matrix = jobs[producer]["strategy"]["matrix"]
++        assert matrix["python-version"] == [LANE]
++        assert [(row["python-version"], row["coverage"]) for row in matrix["include"]] == [(LANE, True)]
++        assert matrix["include"][0]["ci-container-image"].startswith(f"python:{LANE}-bookworm@sha256:")
++    for partition, pattern in (
++        # The timing shard is one artifact. The action unpacks a lone match
++        # straight into `path` with no folder of its own, which the validator
++        # refuses, so the timing shard shares the ordinary shards' pattern.
++        ("ordinary and timing", f"*-shard-{LANE}-*"),
++        ("proof", f"landscape-proof-*-{LANE}-attempt-*"),
++    ):
++        download = _activation_step(aggregate, f"Download Python {LANE} {partition} evidence")
++        assert download["uses"] == "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
++        assert download["with"] == {"pattern": pattern, "path": "${{ env.CI_CHECKOUT_PATH }}/proof-evidence/" + LANE}
++    downloads = [step["name"] for step in aggregate["steps"] if str(step.get("uses", "")).startswith("actions/download-artifact@")]
++    assert len(downloads) == 2, f"unexpected evidence downloads: {downloads}"
++    validation = _activation_step(aggregate, f"Validate Python {LANE} selection and combine coverage")
++    assert validation["working-directory"] == "${{ env.CI_CHECKOUT_PATH }}"
++    assert shlex.split(validation["run"]) == [
++        "uv",
++        "run",
++        "python",
++        "scripts/ci_test_shards.py",
++        "--artifact-dir",
++        f"proof-evidence/{LANE}",
++        "--shard-count",
++        "8",
++        "--partitioned",
++        "--python-version",
++        LANE,
++    ]
++    assert "if" not in validation and "continue-on-error" not in validation
++    validations = [step["name"] for step in aggregate["steps"] if "scripts/ci_test_shards.py" in str(step.get("run", ""))]
++    assert validations == [validation["name"]], f"unexpected evidence validations: {validations}"
+     success = jobs["ci-success"]
+     assert {"landscape-proof", "timing-sensitive", "coverage"} <= set(success["needs"])
+     assert success["if"] == "always()"
+@@ -2001,7 +2024,23 @@ def test_active_workflow_binds_ordinary_proof_and_native_aggregate_contract() ->
+ 
+ @pytest.mark.parametrize(
+     "mutation",
+-    ["exclusion", "caller", "dropped_caller", "dependency", "native_result", "upload", "download", "version", "success_dependency"],
++    [
++        "exclusion",
++        "caller",
++        "dropped_caller",
++        "dependency",
++        "native_result",
++        "upload",
++        "download",
++        "download_retarget",
++        "version",
++        "artifact_dir",
++        "retired_lane_download",
++        "retired_lane_validation",
++        "matrix_lane",
++        "matrix_coverage",
++        "success_dependency",
++    ],
+ )
+ def test_activation_contract_refuses_disconnected_proof_paths(mutation: str) -> None:
+     jobs = copy.deepcopy(_activation_workflow_jobs())
+@@ -2020,10 +2059,33 @@ def test_activation_contract_refuses_disconnected_proof_paths(mutation: str) ->
+     elif mutation == "upload":
+         _activation_step(jobs["test"], "Upload shard coverage and selection evidence")["if"] = "matrix.coverage && always()"
+     elif mutation == "download":
+-        jobs["coverage"]["steps"].remove(_activation_step(jobs["coverage"], "Download Python 3.12 proof evidence"))
++        jobs["coverage"]["steps"].remove(_activation_step(jobs["coverage"], f"Download Python {LANE} proof evidence"))
++    elif mutation == "download_retarget":
++        step = _activation_step(jobs["coverage"], f"Download Python {LANE} proof evidence")
++        step["with"]["pattern"] = "landscape-proof-*-3.13-attempt-*"
+     elif mutation == "version":
+-        step = _activation_step(jobs["coverage"], "Validate Python 3.12 ordinary and proof selection")
+-        step["run"] = step["run"].replace("--python-version 3.12", "--python-version 3.13")
++        step = _activation_step(jobs["coverage"], f"Validate Python {LANE} selection and combine coverage")
++        step["run"] = step["run"].replace(f"--python-version {LANE}", "--python-version 3.13")
++    elif mutation == "artifact_dir":
++        step = _activation_step(jobs["coverage"], f"Validate Python {LANE} selection and combine coverage")
++        step["run"] = step["run"].replace(f"--artifact-dir proof-evidence/{LANE}", "--artifact-dir proof-evidence/3.13")
++    elif mutation == "retired_lane_download":
++        steps = jobs["coverage"]["steps"]
++        retired = copy.deepcopy(_activation_step(jobs["coverage"], f"Download Python {LANE} proof evidence"))
++        retired["name"] = "Download Python 3.13 proof evidence"
++        retired["with"] = {"pattern": "landscape-proof-*-3.13-attempt-*", "path": "${{ env.CI_CHECKOUT_PATH }}/proof-evidence/3.13"}
++        steps.insert(steps.index(_activation_step(jobs["coverage"], f"Download Python {LANE} proof evidence")) + 1, retired)
++    elif mutation == "retired_lane_validation":
++        steps = jobs["coverage"]["steps"]
++        validation = _activation_step(jobs["coverage"], f"Validate Python {LANE} selection and combine coverage")
++        retired = copy.deepcopy(validation)
++        retired["name"] = "Validate Python 3.13 ordinary and proof selection"
++        retired["run"] = retired["run"].replace(LANE, "3.13")
++        steps.insert(steps.index(validation), retired)
++    elif mutation == "matrix_lane":
++        jobs["test"]["strategy"]["matrix"]["python-version"].append("3.13")
++    elif mutation == "matrix_coverage":
++        jobs["timing-sensitive"]["strategy"]["matrix"]["include"][0]["coverage"] = False
+     elif mutation == "success_dependency":
+         jobs["ci-success"]["needs"].remove("landscape-proof")
+     with pytest.raises((AssertionError, KeyError)):
+@@ -2039,8 +2101,8 @@ def test_activation_contract_refuses_disconnected_timing_paths(mutation: str) ->
+         step = _activation_step(jobs["coverage"], "Require every test shard and exhaustive proof to pass")
+         step["run"] = step["run"].replace("needs.timing-sensitive.result", "needs.test.result")
+     elif mutation == "download":
+-        step = _activation_step(jobs["coverage"], "Download Python 3.12 ordinary and timing evidence")
+-        step["with"]["pattern"] = "ordinary-shard-3.12-*-attempt-*"
++        step = _activation_step(jobs["coverage"], f"Download Python {LANE} ordinary and timing evidence")
++        step["with"]["pattern"] = f"ordinary-shard-{LANE}-*-attempt-*"
+     elif mutation == "success_dependency":
+         jobs["ci-success"]["needs"].remove("timing-sensitive")
+     elif mutation == "success_result":
+@@ -2069,20 +2131,17 @@ def test_native_proof_result_must_succeed_before_evidence_or_ci_success(
+     assert completed.returncode == (0 if proof_result == "success" else 1), completed.stdout + completed.stderr
+ 
+ 
+-@pytest.mark.parametrize("version", ["3.12", "3.13"])
+ @pytest.mark.parametrize("omit_proof", [False, True])
+ def test_yaml_partition_validation_consumes_real_tiny_evidence_and_refuses_missing_proof(
+-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str, omit_proof: bool
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, omit_proof: bool
+ ) -> None:
+-    artifacts = _long_run_artifacts(tmp_path, monkeypatch, version, 8)
++    artifacts = _long_run_artifacts(tmp_path, monkeypatch, count=8)
+     root = tmp_path / "proof-evidence"
+     root.mkdir()
+-    artifacts.rename(root / version)
++    artifacts.rename(root / LANE)
+     if omit_proof:
+-        shutil.rmtree(root / version / f"landscape-proof-no-escape-{version}-attempt-2")
+-    name = (
+-        "Validate Python 3.12 ordinary and proof selection" if version == "3.12" else "Validate Python 3.13 selection and combine coverage"
+-    )
++        shutil.rmtree(root / LANE / f"landscape-proof-no-escape-{LANE}-attempt-2")
++    name = f"Validate Python {LANE} selection and combine coverage"
+     run = _activation_step(_activation_workflow_jobs()["coverage"], name)["run"]
+     tokens = shlex.split(run)
+     assert tokens[:4] == ["uv", "run", "python", "scripts/ci_test_shards.py"]
+@@ -2099,4 +2158,4 @@ def test_yaml_partition_validation_consumes_real_tiny_evidence_and_refuses_missi
+         assert "Missing producer evidence" in completed.stderr
+     else:
+         assert len(json.loads(completed.stdout)["selected_artifacts"]) == 12
+-    assert (tmp_path / ".coverage").exists() is (version == "3.13" and not omit_proof)
++    assert (tmp_path / ".coverage").exists() is (not omit_proof)
+diff --git a/tests/unit/cicd/test_ci_timing_sharding.py b/tests/unit/cicd/test_ci_timing_sharding.py
+index ccb0b345..fe275b60 100644
+--- a/tests/unit/cicd/test_ci_timing_sharding.py
++++ b/tests/unit/cicd/test_ci_timing_sharding.py
+@@ -17,7 +17,7 @@ from scripts.ci_test_shards import (
+     finalize_long_run_manifest,
+     validate_long_run_shards,
+ )
+-from tests.unit.cicd.test_ci_sharding import _init_checkout, _long_run_artifacts, _partition_run, _partition_suite
++from tests.unit.cicd.test_ci_sharding import LANE, _init_checkout, _long_run_artifacts, _partition_run, _partition_suite
+ 
+ 
+ @pytest.fixture(autouse=True)
+@@ -158,25 +158,34 @@ def test_timing_real_no_pass_evidence_is_refused(tmp_path: Path, monkeypatch: py
+     manifest = json.loads(report.read_text(encoding="utf-8"))
+     nodeids = ["tests/test_tiny_timing.py::test_timing"]
+     assert manifest["selected_nodeids"] == nodeids
+-    artifacts = _long_run_artifacts(tmp_path, monkeypatch, "3.12")
+-    validate_long_run_shards(artifacts, 4, tmp_path, "3.12")
+-    target = artifacts / "timing-shard-3.12-attempt-2" / "shard-manifest.json"
++    artifacts = _long_run_artifacts(tmp_path, monkeypatch)
++    validate_long_run_shards(artifacts, 4, tmp_path, LANE)
++    target = artifacts / f"timing-shard-{LANE}-attempt-2" / "shard-manifest.json"
+     # Supply only the native producer envelope from the artifact fixture. The
+     # collection and call evidence must come from the real subprocess above.
++    # On the coverage lane the envelope includes the fixture's coverage
++    # database, so its hash travels with the other producer identity fields.
+     envelope = json.loads(target.read_text(encoding="utf-8"))
+-    for field in ("tested_commit", "duration_profile_sha256", "python_version", "github_run_id", "github_run_attempt", "producer_job"):
++    for field in (
++        "tested_commit",
++        "duration_profile_sha256",
++        "python_version",
++        "github_run_id",
++        "github_run_attempt",
++        "producer_job",
++        "coverage_sha256",
++    ):
+         manifest[field] = envelope[field]
+     positive = {**manifest, "timing_call_outcomes": dict.fromkeys(nodeids, "passed"), "timing_passed_count": 1}
+     target.write_text(json.dumps(positive), encoding="utf-8")
+-    validate_long_run_shards(artifacts, 4, tmp_path, "3.12")
++    validate_long_run_shards(artifacts, 4, tmp_path, LANE)
+     target.write_text(json.dumps(manifest), encoding="utf-8")
+     with pytest.raises(ValueError, match="timing call"):
+-        validate_long_run_shards(artifacts, 4, tmp_path, "3.12")
++        validate_long_run_shards(artifacts, 4, tmp_path, LANE)
+     assert manifest["timing_call_outcomes"] == ({} if collect_only else {nodeids[0]: "skipped"})
+     assert manifest["timing_passed_count"] == 0
+ 
+ 
+-@pytest.mark.parametrize("version", ["3.12", "3.13"])
+ @pytest.mark.parametrize(
+     "mutation",
+     [
+@@ -191,10 +200,9 @@ def test_timing_real_no_pass_evidence_is_refused(tmp_path: Path, monkeypatch: py
+         "bool-count",
+     ],
+ )
+-def test_timing_consumer_requires_complete_calls_and_a_pass(
+-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str, mutation: str
+-) -> None:
+-    artifacts = _long_run_artifacts(tmp_path, monkeypatch, version)
++def test_timing_consumer_requires_complete_calls_and_a_pass(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str) -> None:
++    version = LANE
++    artifacts = _long_run_artifacts(tmp_path, monkeypatch)
+     report = artifacts / f"timing-shard-{version}-attempt-2" / "shard-manifest.json"
+     manifest = json.loads(report.read_text(encoding="utf-8"))
+     nodeids = ["test_sample.py::test_timing", "test_sample.py::test_other_timing"]
+@@ -251,31 +259,29 @@ def test_timing_partition_refuses_empty_or_unmarked_real_collection(tmp_path: Pa
+     assert "Timing evidence requires" in result.stdout + result.stderr
+ 
+ 
+-@pytest.mark.parametrize("version", ["3.12", "3.13"])
+-def test_timing_consumer_requires_its_producer_and_includes_covered_lines(
+-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
+-) -> None:
+-    artifacts = _long_run_artifacts(tmp_path, monkeypatch, version)
+-    resolved = validate_long_run_shards(artifacts, 4, tmp_path, version)
+-    assert resolved[f"timing-shard-{version}"] == f"timing-shard-{version}-attempt-2"
+-    if version == "3.13":
+-        data = coverage.CoverageData(basename=str(tmp_path / ".coverage"))
+-        data.read()
+-        assert data.lines(str(tmp_path / "src" / "elspeth" / "sample.py")) == [1, 2, 3, 4, 5, 6]
+-    shutil.rmtree(artifacts / resolved[f"timing-shard-{version}"])
++def test_timing_consumer_requires_its_producer_and_includes_covered_lines(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++    artifacts = _long_run_artifacts(tmp_path, monkeypatch)
++    resolved = validate_long_run_shards(artifacts, 4, tmp_path, LANE)
++    assert resolved[f"timing-shard-{LANE}"] == f"timing-shard-{LANE}-attempt-2"
++    data = coverage.CoverageData(basename=str(tmp_path / ".coverage"))
++    data.read()
++    assert data.lines(str(tmp_path / "src" / "elspeth" / "sample.py")) == [1, 2, 3, 4, 5, 6]
++    (tmp_path / ".coverage").unlink()
++    shutil.rmtree(artifacts / resolved[f"timing-shard-{LANE}"])
+     with pytest.raises(ValueError, match="Missing producer evidence"):
+-        validate_long_run_shards(artifacts, 4, tmp_path, version)
++        validate_long_run_shards(artifacts, 4, tmp_path, LANE)
++    assert not (tmp_path / ".coverage").exists()
+ 
+ 
+-@pytest.mark.parametrize("version", ["3.12", "3.13"])
+ @pytest.mark.parametrize(
+     "mutation",
+-    ["sha", "run", "attempt", "python", "role", "empty", "markers", "missing-markers", "duplicate", "overlap", "digest"],
++    ["sha", "run", "attempt", "python", "retired-python", "role", "empty", "markers", "missing-markers", "duplicate", "overlap", "digest"],
+ )
+ def test_timing_consumer_refuses_invalid_identity_collection_or_marker_evidence(
+-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str, mutation: str
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+ ) -> None:
+-    artifacts = _long_run_artifacts(tmp_path, monkeypatch, version)
++    version = LANE
++    artifacts = _long_run_artifacts(tmp_path, monkeypatch)
+     validate_long_run_shards(artifacts, 4, tmp_path, version)
+     report = artifacts / f"timing-shard-{version}-attempt-2" / "shard-manifest.json"
+     manifest = json.loads(report.read_text(encoding="utf-8"))
+@@ -284,6 +290,7 @@ def test_timing_consumer_refuses_invalid_identity_collection_or_marker_evidence(
+         "run": ("github_run_id", "9999"),
+         "attempt": ("github_run_attempt", "1"),
+         "python": ("python_version", "3.99"),
++        "retired-python": ("python_version", "3.13"),
+         "role": ("producer_job", "test"),
+         "digest": ("collection_digest", "0" * 64),
+     }
+@@ -314,9 +321,9 @@ def test_timing_consumer_refuses_invalid_identity_collection_or_marker_evidence(
+ 
+ @pytest.mark.parametrize("mutation", ["missing", "hash", "tampered", "empty", "foreign"])
+ def test_timing_consumer_verifies_its_coverage_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str) -> None:
+-    artifacts = _long_run_artifacts(tmp_path, monkeypatch, "3.13")
+-    validate_long_run_shards(artifacts, 4, tmp_path, "3.13")
+-    folder = artifacts / "timing-shard-3.13-attempt-2"
++    artifacts = _long_run_artifacts(tmp_path, monkeypatch)
++    validate_long_run_shards(artifacts, 4, tmp_path, LANE)
++    folder = artifacts / f"timing-shard-{LANE}-attempt-2"
+     database = folder / "coverage-data"
+     report = folder / "shard-manifest.json"
+     manifest = json.loads(report.read_text(encoding="utf-8"))
+@@ -335,24 +342,24 @@ def test_timing_consumer_verifies_its_coverage_database(tmp_path: Path, monkeypa
+         manifest["coverage_sha256"] = hashlib.sha256(database.read_bytes()).hexdigest()
+     report.write_text(json.dumps(manifest), encoding="utf-8")
+     with pytest.raises((ValueError, FileNotFoundError)):
+-        validate_long_run_shards(artifacts, 4, tmp_path, "3.13")
++        validate_long_run_shards(artifacts, 4, tmp_path, LANE)
+ 
+ 
+ @pytest.mark.parametrize("selected_damage", ["truncated", "missing"])
+ def test_timing_latest_attempt_supersedes_bad_older_evidence_without_falling_back(
+     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected_damage: str
+ ) -> None:
+-    artifacts = _long_run_artifacts(tmp_path, monkeypatch, "3.12")
+-    latest = artifacts / "timing-shard-3.12-attempt-2"
+-    older = artifacts / "timing-shard-3.12-attempt-1"
++    artifacts = _long_run_artifacts(tmp_path, monkeypatch)
++    latest = artifacts / f"timing-shard-{LANE}-attempt-2"
++    older = artifacts / f"timing-shard-{LANE}-attempt-1"
+     shutil.copytree(latest, older)
+     (older / "shard-manifest.json").write_text("{", encoding="utf-8")
+-    resolved = validate_long_run_shards(artifacts, 4, tmp_path, "3.12")
+-    assert resolved["timing-shard-3.12"] == latest.name
++    resolved = validate_long_run_shards(artifacts, 4, tmp_path, LANE)
++    assert resolved[f"timing-shard-{LANE}"] == latest.name
+     report = latest / "shard-manifest.json"
+     if selected_damage == "truncated":
+         report.write_text("{", encoding="utf-8")
+     else:
+         report.unlink()
+     with pytest.raises((ValueError, FileNotFoundError)):
+-        validate_long_run_shards(artifacts, 4, tmp_path, "3.12")
++        validate_long_run_shards(artifacts, 4, tmp_path, LANE)
+diff --git a/tests/unit/cicd/test_workflow_supply_chain_closure.py b/tests/unit/cicd/test_workflow_supply_chain_closure.py
+index e361543c..76109dde 100644
+--- a/tests/unit/cicd/test_workflow_supply_chain_closure.py
++++ b/tests/unit/cicd/test_workflow_supply_chain_closure.py
+@@ -207,7 +207,7 @@ def test_every_workflow_job_container_is_digest_pinned_including_matrix_mappings
+ 
+ 
+ def test_container_pin_validator_controls_literal_and_matrix_references() -> None:
+-    digest = "python:3.13-bookworm@sha256:" + "a" * 64
++    digest = "python:3.14-bookworm@sha256:" + "a" * 64
+     _assert_container_is_digest_pinned("literal", {"container": {"image": digest}})
+     _assert_container_is_digest_pinned(
+         "matrix",
+@@ -218,7 +218,7 @@ def test_container_pin_validator_controls_literal_and_matrix_references() -> Non
+     )
+ 
+     with pytest.raises(AssertionError, match="mutable"):
+-        _assert_container_is_digest_pinned("literal", {"container": {"image": "python:3.13-bookworm"}})
++        _assert_container_is_digest_pinned("literal", {"container": {"image": "python:3.14-bookworm"}})
+     with pytest.raises(AssertionError, match="no concrete mappings"):
+         _assert_container_is_digest_pinned(
+             "matrix",
+@@ -329,7 +329,7 @@ def test_active_long_run_target_remains_in_executable_supply_chain_inventory() -
+     workflow = workflows[PROOF_WORKFLOW]
+     job = workflow["jobs"]["proof"]
+     assert _executable_jobs(workflow) == [("proof", job)]
+-    assert len(job["strategy"]["matrix"]["include"]) == 6
++    assert len(job["strategy"]["matrix"]["include"]) == 3
+     _assert_container_is_digest_pinned("long-run proof", job)
+     assert _resolved_setup_uv_versions(workflow) == ["0.10.2"]
+     assert [step["uses"] for step in job["steps"] if "uses" in step] == [
+@@ -345,7 +345,7 @@ def test_active_long_run_target_remains_in_executable_supply_chain_inventory() -
+     assert "${{ secrets." not in json.dumps(workflow)
+ 
+ 
+-@pytest.mark.parametrize("row_index", range(6))
++@pytest.mark.parametrize("row_index", range(3))
+ def test_active_long_run_supply_chain_rejects_mutable_image_in_every_row(row_index: int) -> None:
+     workflow = _workflow(PROOF_WORKFLOW)
+     job = workflow["jobs"]["proof"]
+-- 
+2.43.0
+
