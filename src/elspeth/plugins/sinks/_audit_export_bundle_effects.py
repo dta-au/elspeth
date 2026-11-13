@@ -1132,7 +1132,11 @@ def reconcile_audit_export_bundle(plan: SinkEffectPlan) -> SinkEffectReconcileRe
                 if not parent.is_still_bound():
                     return SinkEffectReconcileResult.unknown(evidence={"reason": "parent_replaced"})
                 return SinkEffectReconcileResult.not_applied(evidence={"staging": "exact", "target": "absent"})
-            return SinkEffectReconcileResult.unknown(evidence={"staging": "divergent", "target": target_kind})
+            # Record the MEASURED staging state: a tree is called divergent
+            # only when it was compared against the plan (target absent).
+            staging_kind = _target_kind_at(parent.descriptor, staging.name)
+            staging_state = "divergent" if staging_kind == "directory" and target_kind == "absent" else staging_kind
+            return SinkEffectReconcileResult.unknown(evidence={"staging": staging_state, "target": target_kind})
         finally:
             parent.close()
     except OSError as exc:
@@ -1328,9 +1332,13 @@ def preflight_audit_export_bundle(target_path: Path) -> AuditExportBundlePreflig
         raise AuditExportBundlePreflightError("bundle filesystem statfs probe failed") from exc
     if filesystem_magic not in SUPPORTED_LOCAL_FILESYSTEM_MAGIC:
         raise AuditExportBundlePreflightError(f"bundle filesystem 0x{filesystem_magic:x} is not in the local allowlist")
+    # The publish rename (staging -> target) is only atomic within one device,
+    # so compare the parent the staging layout actually uses, not the target
+    # parent with itself.
+    staging_parent = _staging_path(target, "preflight").parent
     try:
         target_parent_device = _device_id(parent)
-        staging_parent_device = _device_id(parent)
+        staging_parent_device = _device_id(staging_parent)
     except OSError as exc:
         raise AuditExportBundlePreflightError("bundle parent device identity is unavailable") from exc
     if target_parent_device != staging_parent_device:
@@ -1402,7 +1410,15 @@ def preflight_audit_export_bundle(target_path: Path) -> AuditExportBundlePreflig
                 probe_cleanup_failures.append(f"{path.name}: {type(cleanup_exc).__name__}: {cleanup_exc}")
                 continue
             try:
-                _remove_scratch_path_at(pinned.descriptor, path.name)
+                # False also means "already absent" (e.g. ``source`` after the
+                # rename), so only a probe that is still present after the
+                # removal attempt is a cleanup failure.
+                if not _remove_scratch_path_at(pinned.descriptor, path.name):
+                    remaining = _target_kind_at(pinned.descriptor, path.name)
+                    if remaining != "absent":
+                        probe_cleanup_failures.append(f"{path.name}: {remaining} could not be removed")
+            except OSError as cleanup_exc:
+                probe_cleanup_failures.append(f"{path.name}: {type(cleanup_exc).__name__}: {cleanup_exc}")
             finally:
                 pinned.close()
     if probe_cleanup_failures:
