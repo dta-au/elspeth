@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Collection, Sequence
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, Final, TypedDict
 
 from pydantic import ValidationError
 
@@ -35,6 +35,14 @@ if TYPE_CHECKING:
 
 _OUT_OF_SCOPE_DATA_PLANE_CONTENT = "<data-plane-content>"
 _MALFORMED_TOOL_WIRE = object()
+_MODEL_OUTPUT_SURFACES: Final[frozenset[str]] = frozenset(
+    {"composer_provider_response", "composer_planner_response", "composer_advisor_response", "composer_provider_thinking"}
+)
+_MODEL_OUTPUT_CREDENTIAL_REFUSAL_DETAIL: Final[str] = (
+    "The model's output appears to contain a credential, so it was blocked. "
+    "If you gave the Composer a credential, store it through the secret service and use a secret reference instead. "
+    "Otherwise, retry your request."
+)
 
 
 class CredentialMaterialRefusalPayload(TypedDict):
@@ -54,13 +62,14 @@ class CredentialMaterialRefused(ComposerAdmissionRefused):
     def __init__(self, *, surface: str, finding: CredentialMaterialFinding) -> None:
         self.surface = surface
         self.finding = finding
-        super().__init__(CREDENTIAL_REFUSAL_DETAIL)
+        self.detail = _MODEL_OUTPUT_CREDENTIAL_REFUSAL_DETAIL if surface in _MODEL_OUTPUT_SURFACES else CREDENTIAL_REFUSAL_DETAIL
+        super().__init__(self.detail)
 
     def to_payload(self) -> CredentialMaterialRefusalPayload:
         return {
             "error_type": "credential_material_rejected",
             "failure_code": "credential_material_rejected",
-            "detail": CREDENTIAL_REFUSAL_DETAIL,
+            "detail": self.detail,
             "category": self.finding.category,
             "surface": self.surface,
             "detector_version": self.finding.detector_version,
