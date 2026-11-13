@@ -23,6 +23,7 @@ from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import stable_hash
 from elspeth.plugins.infrastructure.clients.base import AuditedClientBase, TelemetryEmitCallback
 from elspeth.plugins.transforms.aws.replay_sdk import require_replay_fields
+from elspeth.plugins.transforms.aws.textract_client import _observed_send_attempts, _record_send_attempt, _reset_send_attempts
 from elspeth.plugins.transforms.aws.textract_regions import is_supported_textract_region
 
 if TYPE_CHECKING:
@@ -107,7 +108,9 @@ def build_s3_head_bucket_sdk_client(
         kwargs["aws_secret_access_key"] = aws_secret_access_key
         if aws_session_token is not None:
             kwargs["aws_session_token"] = aws_session_token
-    return cast("S3HeadBucketSDKClient", boto3.client("s3", **kwargs))
+    client = boto3.client("s3", **kwargs)
+    client.meta.events.register("before-send.s3", _record_send_attempt)
+    return cast("S3HeadBucketSDKClient", client)
 
 
 @trust_boundary(
@@ -212,20 +215,23 @@ def _safe_provider_code(value: object) -> str:
     ),
     non_raising=True,
 )
-def _provider_outcome(error: Exception) -> tuple[BucketRegionProof | None, BucketRegionUnverifiedError, int]:
+def _provider_outcome(error: Exception, *, observed_attempts: int) -> tuple[BucketRegionProof | None, BucketRegionUnverifiedError, int]:
     """Classify one botocore exception into a proof-or-failure outcome.
 
     The exception's ``response`` envelope is vendor data: every member is read
     once, bounded, and re-asserted before it becomes part of the audit record.
     """
-    from botocore.exceptions import ClientError, ConnectionClosedError, ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError
+    from botocore.exceptions import ClientError, HTTPClientError
+    from botocore.exceptions import ConnectionError as BotocoreConnectionError
 
-    if isinstance(error, (ConnectTimeoutError, ConnectionClosedError, EndpointConnectionError, ReadTimeoutError)):
+    # botocore's standard retry mode retries exactly these two families
+    # (TransientRetryableChecker); the before-send hook observed every attempt.
+    if isinstance(error, (BotocoreConnectionError, HTTPClientError)):
         failure = BucketRegionUnverifiedError(code="transport_error", retryable=True)
-        return None, failure, 1
+        return None, failure, observed_attempts
     if not isinstance(error, ClientError):
         failure = BucketRegionUnverifiedError(code="botocore_error", retryable=False)
-        return None, failure, 1
+        return None, failure, observed_attempts
 
     response = error.response
     raw_error = response.get("Error")
@@ -326,13 +332,35 @@ class HeadBucketClient(AuditedClientBase):
                 exc_info=True,
             )
 
-    def verify_bucket_region(self, bucket: str, *, audit_identity: Mapping[str, str] | None = None) -> BucketRegionProof:
+    def _request_payload(self, bucket: str, audit_identity: Mapping[str, str] | None) -> RawCallPayload:
         # ``audit_identity`` substitutes the operator-safe location identity
         # (e.g. {"profile": alias}) for the literal bucket in the persisted
         # call record; the SDK request itself always uses the real bucket.
-        call_index = self._next_call_index()
         location_identity: Mapping[str, str | None] = {"bucket": bucket} if audit_identity is None else dict(audit_identity)
-        request_payload = RawCallPayload({"operation": "head_bucket_region", "configured_region": self._region, **location_identity})
+        return RawCallPayload({"operation": "head_bucket_region", "configured_region": self._region, **location_identity})
+
+    def source_made_head_bucket_call(self, bucket: str, *, audit_identity: Mapping[str, str] | None = None) -> bool:
+        """Replay only: whether this row's source state led the bucket's HeadBucket single-flight.
+
+        Which row leads is a thread race in the source run. A leader's
+        HeadBucket call is always the first call its row state records
+        (index 0); a follower or cache hit records none. The archive therefore
+        names the source leader exactly, independent of replay timing.
+        """
+        session = self._call_mode_session
+        if session is None or session.mode is not RunMode.REPLAY:
+            raise contract_errors.FrameworkBugError("HeadBucket source-leader lookup is replay-only")
+        return session.has_source_call(
+            call_type=CallType.HTTP,
+            request_data=self._request_payload(bucket, audit_identity).to_dict(),
+            current_state_id=self._state_id,
+            current_operation_id=self._operation_id,
+            current_call_index=0,
+        )
+
+    def verify_bucket_region(self, bucket: str, *, audit_identity: Mapping[str, str] | None = None) -> BucketRegionProof:
+        call_index = self._next_call_index()
+        request_payload = self._request_payload(bucket, audit_identity)
         session = self._call_mode_session
         replay_evidence: ReplayCallEvidence | None = None
         if session is not None and session.mode is RunMode.REPLAY:
@@ -417,13 +445,14 @@ class HeadBucketClient(AuditedClientBase):
         proof: BucketRegionProof | None = None
         terminal_error: BucketRegionUnverifiedError | None = None
         attempts = 1
+        _reset_send_attempts()
         try:
             raw_response = self._sdk_client.head_bucket(Bucket=bucket)
             proof, attempts = _success_proof(raw_response)
         except BucketRegionUnverifiedError as error:
             terminal_error = error
         except _provider_exception_types() as error:
-            proof, terminal_error, attempts = _provider_outcome(error)
+            proof, terminal_error, attempts = _provider_outcome(error, observed_attempts=_observed_send_attempts())
 
         latency_ms = (time.perf_counter() - started) * 1000
         http_status: int | None
@@ -559,6 +588,61 @@ class BucketRegionCoordinator:
         self._lock = threading.Lock()
         self._cache: dict[str, BucketRegionProof] = {}
         self._in_flight: dict[str, _InFlight] = {}
+        # Replay only: the latest sanitized failure of a source-led replayed
+        # HeadBucket per bucket, and a condition replay followers wait on.
+        self._replay_failures: dict[str, BucketRegionUnverifiedError] = {}
+        self._replay_settled = threading.Condition(self._lock)
+
+    def verify_replay(
+        self,
+        bucket: str,
+        replay_verify: Callable[[], BucketRegionProof],
+        *,
+        source_led: bool,
+        wait_seconds: float,
+    ) -> BucketRegionVerification:
+        """Replay the source run's leader/follower decision from the archive, not the clock.
+
+        ``source_led`` is whether this row's source state recorded the
+        HeadBucket call. A source leader always replays its own recorded call
+        (the success cache and single-flight are bypassed, since the source
+        run made that call); its outcome seeds the cache or the bucket's
+        latest failure. A source follower makes no call: it waits, up to
+        ``wait_seconds``, for a source leader's replayed outcome even when it
+        arrives first, and inherits it — a cached success, or the leader's
+        failure marked ``inherited``. No outcome in time means the archive
+        lacks the leader this follower depended on, which fails closed.
+        """
+        if source_led:
+            try:
+                proof = replay_verify()
+            except BucketRegionUnverifiedError as error:
+                with self._replay_settled:
+                    self._replay_failures[bucket] = error
+                    self._replay_settled.notify_all()
+                raise
+            with self._replay_settled:
+                self._cache[bucket] = proof
+                self._replay_settled.notify_all()
+            return BucketRegionVerification(proof.region, proof.source, proof.http_status, "live", proof.provider_code)
+
+        deadline = time.monotonic() + wait_seconds
+        with self._replay_settled:
+            while bucket not in self._cache and bucket not in self._replay_failures:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AuditIntegrityError("Replay HeadBucket follower found no source-led outcome for its bucket")
+                self._replay_settled.wait(timeout=remaining)
+            if bucket in self._cache:
+                cached = self._cache[bucket]
+                return BucketRegionVerification(cached.region, cached.source, cached.http_status, "cached", cached.provider_code)
+            failure = self._replay_failures[bucket]
+        raise BucketRegionUnverifiedError(
+            code=failure.code,
+            retryable=failure.retryable,
+            http_status=failure.http_status,
+            inherited=True,
+        ) from failure
 
     def _fail_flight(
         self,

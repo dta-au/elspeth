@@ -223,7 +223,7 @@
       },
       {
         "default": 3600.0,
-        "description": "Total submit-through-terminal-status deadline in seconds.",
+        "description": "Total submit-through-terminal-status deadline in seconds; transient poll failures are retried in place within it, and reaching it is a permanent poll_timeout row error.",
         "kind": "number-float",
         "label": "Poll Timeout Seconds",
         "name": "poll_timeout_seconds",

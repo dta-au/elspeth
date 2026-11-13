@@ -31,7 +31,7 @@ from elspeth.contracts.binary_documents import (
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.enums import AuditCharacteristic
-from elspeth.contracts.errors import FrameworkBugError, TransformErrorCategory
+from elspeth.contracts.errors import FrameworkBugError, PluginRetryableError, TransformErrorCategory
 from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.payload_store import PayloadNotFoundError, PayloadStore
@@ -74,6 +74,16 @@ _PAYLOAD_REF_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_INLINE_QUERIES = 15
 _TEXTRACT_SDK_CONNECT_TIMEOUT_SECONDS = 10.0
 _TEXTRACT_SDK_TIMEOUT_HEADROOM_SECONDS = 90.0
+# Configuration ceilings; each default sits at its ceiling, as in the async
+# transform. One synchronous AnalyzeDocument response for a <= 5 MiB document
+# is far below the block and byte ceilings; the two timeouts bound how long an
+# author can hold an inline worker on one request.
+MAX_INLINE_BLOCKS = 100_000
+MAX_INLINE_RESULT_BYTES = 50_000_000
+MAX_INLINE_REQUEST_TIMEOUT_SECONDS = 120.0
+# Every SDK attempt at the read-timeout ceiling plus scheduling headroom:
+# 3 * (120 s read + 10 s connect) + 90 s.
+MAX_INLINE_BATCH_WAIT_TIMEOUT_SECONDS = 480.0
 
 logger = structlog.get_logger(__name__)
 _warn_telemetry_before_start = make_warn_telemetry_before_start(logger)
@@ -166,14 +176,27 @@ class AWSTextractInlineAnalysisConfig(TransformDataConfig):
         le=BINARY_DOCUMENT_MAX_BYTES,
         description="Maximum accepted document byte length; may be reduced but never raised above the 5 MiB provider bound.",
     )
-    max_blocks: int = Field(default=100_000, gt=0, description="Maximum Textract block count for one document.")
-    max_result_bytes: int = Field(default=50_000_000, gt=0, description="Maximum canonical JSON bytes retained for one document result.")
-    request_timeout_seconds: float = Field(
-        default=120.0,
+    max_blocks: int = Field(
+        default=MAX_INLINE_BLOCKS, gt=0, le=MAX_INLINE_BLOCKS, description="Maximum Textract block count for one document."
+    )
+    max_result_bytes: int = Field(
+        default=MAX_INLINE_RESULT_BYTES,
         gt=0,
+        le=MAX_INLINE_RESULT_BYTES,
+        description="Maximum canonical JSON bytes retained for one document result.",
+    )
+    request_timeout_seconds: float = Field(
+        default=MAX_INLINE_REQUEST_TIMEOUT_SECONDS,
+        gt=0,
+        le=MAX_INLINE_REQUEST_TIMEOUT_SECONDS,
         description="SDK read timeout for one AnalyzeDocument attempt; the connect timeout remains 10 seconds.",
     )
-    batch_wait_timeout_seconds: float = Field(default=420.0, gt=0, description="Maximum engine wait for one pipelined document row.")
+    batch_wait_timeout_seconds: float = Field(
+        default=MAX_INLINE_BATCH_WAIT_TIMEOUT_SECONDS,
+        gt=0,
+        le=MAX_INLINE_BATCH_WAIT_TIMEOUT_SECONDS,
+        description="Maximum engine wait for one pipelined document row.",
+    )
 
     @field_validator("request_timeout_seconds", "batch_wait_timeout_seconds")
     @classmethod
@@ -260,7 +283,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_inline_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:19fad219cdcf149e"
+    source_file_hash: str | None = "sha256:10ce458bfa432bdf"
     config_model = AWSTextractInlineAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -581,9 +604,19 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
                 queries=self._query_requests,
             )
         except TextractServiceError as error:
+            if error.retryable:
+                # The audited client has already recorded the failed call. The
+                # engine retries only a raised PluginRetryableError; the row is
+                # retried when the pipeline configures retry, and each retry is
+                # a new, possibly billable AnalyzeDocument call (no idempotency
+                # token exists for the synchronous API).
+                raise PluginRetryableError(
+                    f"Amazon Textract AnalyzeDocument failed (transient): {error.code}",
+                    retryable=True,
+                ) from error
             return TransformResult.error(
                 {"reason": "analysis_failed", "error_type": "service_error", "code": error.code},
-                retryable=error.retryable,
+                retryable=False,
             )
         except TextractResponseError as error:
             response_reason: TransformErrorCategory = "result_too_large" if error.category == "response_too_large" else "malformed_response"
@@ -789,7 +822,8 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
                 "downstream node then sets blob_ref_field: page_blob_ref and document_format: png. Mixed formats "
                 "need homogeneous sources or branches with one transform instance per format.",
                 "Multipage, oversized, or already-S3 documents belong in aws_textract_document_analysis.",
-                "Synchronous AnalyzeDocument has no idempotency guarantee, so SDK and engine retries can each repeat a billable provider call.",
+                "Synchronous AnalyzeDocument has no idempotency guarantee: botocore's SDK retries, and engine row retries of a "
+                "throttled or transient failure when the pipeline configures retry, can each repeat a billable provider call.",
                 "For explicit AWS credentials, use ELSPETH markers such as {secret_ref: AWS_ACCESS_KEY_ID}.",
             ),
         )

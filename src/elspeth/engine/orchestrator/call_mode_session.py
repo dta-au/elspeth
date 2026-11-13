@@ -467,6 +467,27 @@ class AuditedCallModeSession:
             raise AuditIntegrityError(f"Source request {call.call_id} is unavailable")
         return ArchivedCallRequestEvidence(source_call_id=call.call_id, request_data=request.data)
 
+    def has_source_call(
+        self,
+        *,
+        call_type: CallType,
+        request_data: Mapping[str, Any],
+        current_state_id: str | None,
+        current_operation_id: str | None,
+        current_call_index: int,
+    ) -> bool:
+        if self._mode not in (RunMode.REPLAY, RunMode.VERIFY):
+            raise AuditIntegrityError("Source call existence requires replay or verify mode")
+        call = self._factory.execution.find_call_for_current_parent(
+            source_run_id=self._source_run_id,
+            call_type=call_type,
+            request_hash=stable_hash(request_data),
+            current_state_id=current_state_id,
+            current_operation_id=current_operation_id,
+            current_call_index=current_call_index,
+        )
+        return call is not None
+
     def admit_verify_call(
         self,
         *,

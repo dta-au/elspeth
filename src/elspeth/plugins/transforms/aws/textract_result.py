@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -258,15 +259,20 @@ def _project_pages(blocks: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any],
         ((index, block) for index, block in numbered_blocks if block["BlockType"] == "PAGE"),
         key=lambda item: _page(item[1], f"Blocks[{item[0]}]"),
     )
-    result: list[dict[str, Any]] = []
-    for page_index, page_block in page_blocks:
-        page_number = _page(page_block, f"Blocks[{page_index}]")
-        lines: list[dict[str, Any]] = []
+    numbered_pages = [(index, block, _page(block, f"Blocks[{index}]")) for index, block in page_blocks]
+    # One pass buckets LINE blocks by page number, in block order. Only pages
+    # that a PAGE block declares are projected; a LINE on any other page is
+    # Page-validated (when there is a page at all) but not projected.
+    lines_by_page: dict[int, list[dict[str, Any]]] = {page_number: [] for _index, _block, page_number in numbered_pages}
+    if lines_by_page:
         for block_index, block in numbered_blocks:
-            if block["BlockType"] != "LINE" or _page(block, f"Blocks[{block_index}]") != page_number:
+            if block["BlockType"] != "LINE":
                 continue
             line_path = f"Blocks[{block_index}]"
-            lines.append(
+            line_page = _page(block, line_path)
+            if line_page not in lines_by_page:
+                continue
+            lines_by_page[line_page].append(
                 {
                     "id": _required_str(block, "Id", line_path),
                     "text": _required_str(block, "Text", line_path),
@@ -274,6 +280,13 @@ def _project_pages(blocks: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any],
                     "geometry": _geometry(block, line_path),
                 }
             )
+    result: list[dict[str, Any]] = []
+    projected_pages: set[int] = set()
+    for page_index, page_block, page_number in numbered_pages:
+        # A repeated PAGE number gets its own copy of the lines, as when each
+        # PAGE block projected its lines independently.
+        lines = copy.deepcopy(lines_by_page[page_number]) if page_number in projected_pages else lines_by_page[page_number]
+        projected_pages.add(page_number)
         text = "\n".join(line["text"] for line in lines)
         result.append(
             {
