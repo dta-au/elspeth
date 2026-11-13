@@ -29,6 +29,8 @@ def collect():
     catalog = _mock_catalog()
     results = {}
     results["diff_empty"] = execute_tool("diff_pipeline", {}, state, catalog, baseline=state)
+    for kind in ("request_start", "last_validated"):
+        results[f"diff_{kind}"] = execute_tool("diff_pipeline", {}, state, catalog, baseline=state, baseline_kind=kind)
     results["diff_sources"] = execute_tool(
         "diff_pipeline",
         {},
@@ -152,6 +154,7 @@ def test_declaration_selects_producer_contract_before_egress(producer_results, t
     [
         ("diff_empty", ("nodes", "added"), [1]),
         ("diff_empty", ("total_changes",), True),
+        ("diff_request_start", ("baseline_kind",), "unknown"),
         ("explain_exact", ("explanation",), 7),
         ("models_summary", ("providers", "odd"), True),
         ("models_filter", ("models",), [False]),

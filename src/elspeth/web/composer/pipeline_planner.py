@@ -3820,6 +3820,7 @@ async def _plan_pipeline_inner(
         secret_wiring_policy=custody_config.secret_wiring_policy,
         user_id=originating_message.user_id,
         baseline=current_state,
+        baseline_kind="request_start",
         current_validation=current_validation.validation,
         runtime_preflight=custody_config.runtime_preflight,
         structural_preflight=custody_config.structural_preflight,
