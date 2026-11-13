@@ -318,20 +318,20 @@ entries:
     it only as an exact str matching the plain SQL identifier pattern, for a value-free
     diversion reason.
 - path: src/elspeth/plugins/sources/aws_s3_source.py
-  qualname: _admit_s3_body
+  qualname: _s3_body_member
   kind: getattr
-  occurrences: 2
+  occurrences: 1
   probe_shapes:
-  - 1a3e7660b9ee56e4703b5f0cd4dec69fe705c6ed726a0f40dd6e35dc187f4df1
-  - 977e7a4773e6e8d8ca977c9e69aaa929a49bbca84b616ca05ad6cbd12f8f0167
+  - e76cffb3b38a787ee174f50403f1365ef32f1a34d00c51ae9880522a16288d81
   classification: external-parse
   justification: ADR-032 admission of the SDK-owned S3 GetObject response Body (botocore
-    StreamingBody or any wrapper). read and close are each read once with a missing-value
-    sentinel and must be callable; only then is the frozen owned _AdmittedS3Body built,
-    and every read() result is still checked as exact bytes within the chunk bound.
-    A missing or non-callable member is InvalidS3Body (closing the body when its close
-    is callable). Replaces a runtime_checkable Protocol isinstance gate (plugin review
-    P4 finding 12).
+    StreamingBody or any wrapper). The name is the closed Literal read or close; each
+    is read once and an absent member returns a module sentinel (never a default value).
+    _admit_s3_body then requires both to be callable before building the frozen owned
+    _AdmittedS3Body, and every read() result is still checked as exact bytes within
+    the chunk bound. A missing or non-callable member is InvalidS3Body (closing the
+    body when its close is callable). Replaces a runtime_checkable Protocol isinstance
+    gate (plugin review P4 finding 12).
 - path: src/elspeth/plugins/transforms/aws/textract_document_analysis.py
   qualname: AWSTextractDocumentAnalysisConfig._consistency
   kind: getattr

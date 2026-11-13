@@ -289,16 +289,26 @@ class _AdmittedS3Body:
     close: Callable[[], object]
 
 
+_MISSING_BODY_MEMBER = object()
+
+
+def _s3_body_member(raw_body: object, name: Literal["read", "close"]) -> object:
+    """Read one member of the SDK-owned Body once; an absent member is a sentinel, never a default."""
+    try:
+        return getattr(raw_body, name)
+    except AttributeError:
+        return _MISSING_BODY_MEMBER
+
+
 def _admit_s3_body(raw_body: object) -> tuple[_AdmittedS3Body | None, Callable[[], object] | None]:
-    """Parse the SDK-owned Body at the boundary (ADR-032): sentinel getattr plus callable checks.
+    """Parse the SDK-owned Body at the boundary (ADR-032): sentinel read plus callable checks.
 
     Returns the admitted body, or ``None`` with the body's own callable
     ``close`` (when it has one) so the caller can release the stream it is
     rejecting.
     """
-    missing = object()
-    read = getattr(raw_body, "read", missing)
-    close = getattr(raw_body, "close", missing)
+    read = _s3_body_member(raw_body, "read")
+    close = _s3_body_member(raw_body, "close")
     usable_close = close if callable(close) else None
     if not callable(read) or usable_close is None:
         return None, usable_close
@@ -919,7 +929,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:22f25726b2940f33"
+    source_file_hash: str | None = "sha256:2053b8a8ff1fd1b1"
     config_model = AWSS3SourceConfig
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 
