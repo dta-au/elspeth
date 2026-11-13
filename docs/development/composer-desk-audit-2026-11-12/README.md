@@ -48,7 +48,7 @@ The failures cluster where a presenter or an audience is likely to go:
 |---|---|---|---|
 | F1 | Attach two files to a new session: "combine these" | 240 s spinner, then "The composer request timed out" | 1 session, both turns failed |
 | F2 | "Can you connect to SharePoint?" / "Can you read PDFs?" / "Is this safe on sensitive data?" | A correct answer replaced by "Verified checkpoint evidence covers 0 saved draft revisions…" and a "Completion advisory review did not clear" note | SharePoint 2/2; 4 of the 6 "not available here" answers withheld |
-| F18 | **Tutorial:** pressing Apply on "Consider adding error routing…" (offered on every tutorial build) | All cards done, Checks green, the chat says "your pipeline's ready", then **Continue to Run** refuses: "The saved tutorial pipeline does not match the supported tutorial plugin set." | 1/1 when Apply is pressed |
+| F18 | **Tutorial** (meant to be a fixed script): pressing Apply on "Consider adding error routing…" (offered on every build), or typing in the still-enabled chat box | All cards done, Checks green, the chat says "your pipeline's ready", then **Continue to Run** refuses: "The saved tutorial pipeline does not match the supported tutorial plugin set." | 1/1 when Apply is pressed |
 | F8 | Every follow-up edit or question | Each reply ends with a system note: "Checkpoint save status: Verified checkpoint evidence covers N saved draft revisions…" | 29 of 29 tool-loop replies |
 | F3 | "What changed since the version I accepted?" | "I couldn't produce a change list: this session has no comparison baseline loaded" | 4/4 tool calls failed |
 | F4 | Screen notes "for passwords or confidential material" | HTTP 422: "This control content appears to contain a credential" | 2/2 turns failed |
@@ -206,7 +206,27 @@ session, not reproduced) or **SUSPECTED**.
     proves existence, absence or prohibition, not capability details.
   - **R3:** user-facing copy, and carrying the withheld context forward.
 
-#### F18. Tutorial: one click on a suggested fix makes the tutorial pipeline unrunnable, with no actionable message
+#### F18. The tutorial is meant to be a fixed script, but its Build step lets the learner change the request; one click breaks it with no actionable message
+
+**Design intent** (ADR-031, confirmed by the maintainer 2026-11-13): the
+tutorial sends a **fixed** brief, and the learner is not meant to edit it.
+The brief is fixed "so a broken general Composer affordance cannot be hidden
+by rephrasing".
+
+**Gap.** After the brief is sent, the Build step mounts the ordinary
+freeform chat (`ChatPanelContent`), restricted only by `allowFork={false}`
+(`TutorialFreeformShell.tsx`). Six controls still send the composer
+something other than the script:
+
+- the free-text box with Send, and file upload (`ChatPanel.tsx:1323`);
+- **Apply** on validation suggestions (`ChatPanel.tsx:853-857`);
+- the repair-graph button (`:861`);
+- "Ask the composer about this" (`:863`);
+- "Edit the list" on the inline source (`:899-910`);
+- "Use as input" in the blob manager (`:935-941`).
+
+The browser canary (`tests/e2e/tutorial.spec.ts`) exercises none of them,
+so CI stays green. The case below is the one observed.
 
 - **Where.**
   - The tutorial's **Continue to Run** calls `GET /api/tutorial/{id}/readiness`.
@@ -238,12 +258,15 @@ session, not reproduced) or **SUSPECTED**.
 - **Without Apply** the composer chose "discard" with one output in 3 of 3
   sends of the same brief. In-process, those states pass the plugin-set and
   profile gates; the readiness endpoint itself was not called for them.
-- **Workaround** (observed once): "Remove the failed_rows output and discard
-  failures instead." It took one turn of about 26 s, after which readiness
-  returned 200.
+- **Recovery.** Typing "Remove the failed_rows output and discard failures
+  instead." fixed it in one ~26 s turn when tried once. That is itself an
+  edit of the fixed script, so the runbook says exit and restart the
+  tutorial instead.
 - Whether your 2026-11-13 session was this case is unverified; no capture of
   it exists.
-- **Fix.** R16.
+- **Fix.** R16: make the Build step script-only, so only card decisions are
+  possible after the brief, as ADR-031 intends. Name the difference in the
+  409, and make the e2e canary assert those controls are absent.
 
 ### HIGH
 

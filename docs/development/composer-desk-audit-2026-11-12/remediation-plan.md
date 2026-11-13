@@ -37,7 +37,7 @@ the rulings noted against them.
 | R13 | F14 | At staging, reject a node-level `vague_term` slot on an `llm` node where any query with its own template would not receive it, or make the resolver write into every query template that carries the slot (larger). **Replace**, not append, the teaching at `planner_authoring_aids.py:867-870` and `multi_query.py:248-249`. Include the effective per-query prompt in the attested hash. | S (reject) / M (rewrite) | The in-process repro (`evidence/llm-wiring-verification.md`) is rejected at `set_pipeline`, or shows `accepted_in_prompt=True` for every query. Also audit whether stored records already carry the defect. |
 | R14 | F16 | Recompute the turn-end preflight for every **wired** state (sources and outputs), matching today's blob behaviour, and apply the same rule at the review-handoff exit (`service.py:1883`). Separately decide whether a CLEAN verdict over a missing preflight may clear a prior block (`composition_completion.py:2582-2620`). **Costs:** each recompute resolves secrets and instantiates plugins. On question-only turns it can add repair turns or red suffixes on half-built drafts, and a preflight failure would fail a question. Measure before landing. | S–M | A deterministic unit test with a valid, unchanged, blob-free (`llm`-source) state yields a non-`None` preflight. A CLEAN verdict then clears. The s03 T4 / s09 T2 replays are not proofs. |
 | R15 | F17 | Reply Register rule: answer questions about checks, readiness or approvals with the user's next action in product terms; never show tool-call JSON or ask the user to run a tool or file a defect. Give the composer the current blocker detail in its context, so it stops guessing. Add the case to the END rubric **after** R3, otherwise it adds withholds. | XS–S | Ask "why can't I share this?" on an advisor-blocked session ×3: the reply names the step and action, with no tool names. |
-| R16 | F18 | (c) **Always:** the 409 `tutorial_plugin_set` detail names the extra output and the fix. The tutorial chat line waits for **tutorial readiness**, not workspace validity. Then pick one structural option. **Smallest:** stop counting optional suggestions as "decisions" and render Apply as secondary everywhere (not tutorial-specific). (a) Admit one extra failure-only `sink:json`. This **needs an ADR-031 ruling** and is larger than it looks: the run step's `_rows_from_artifacts` takes the newest non-empty artifact and could show failed rows as the result, and the discard count misses retained rows. (b) Hide Apply in the tutorial shell. UI-only and outside the composer, but reviewers split on whether it is a "tutorial-special path"; **needs an invariant-2 ruling.** | S | Browser walk: brief → Accept → Apply → cards → Continue to Run either proceeds, or the refusal names `failed_rows`; the chat never names a button the screen does not have. |
+| R16 | F18 | **Make the tutorial Build step script-only, as ADR-031 intends.** Give `ChatPanelContent` a script mode (alongside the existing `allowFork`). In that mode the tutorial hides the free-text input and upload, suggestion Apply, repair-graph, "Ask the composer about this", inline-source edit and "Use as input". It keeps only the card actions the script needs: Accept the proposal, Acknowledge, View prompt, Approve. This is frontend-only: the composer backend and the brief are unchanged, so it neither adds a tutorial-only composer path (invariant 2) nor changes the canary. **Also:** the 409 `tutorial_plugin_set` detail names what differs; the tutorial chat line waits for tutorial readiness rather than workspace validity; and the e2e tutorial spec asserts those controls are absent. The earlier options are superseded: relaxing the one-output admission rule would weaken the canary, and demoting Apply everywhere does not stop typing. | S | Browser walk: after the brief, no control can send a composer message other than card decisions; brief → Accept → cards → Continue to Run reaches Run. The e2e spec fails if a free-text input or Apply appears in the Build step. |
 | R17 | F19 | Make the boot probe send the real escape-hatch request (the 23-tool planner palette on the advisor endpoint), and correct its parity comment (`boot_probe.py:202-216`). Remove or wire up the dead `terminal_only` option (`capability_skill.py:193-219`). | XS | Probe output lists the hatch request with 23 tools. |
 
 **Overlaps.** R2 and R15 both edit the END rubric, and R3 and R14 both
@@ -93,7 +93,7 @@ Owner for every package is the maintainer; dates are set by the operator.
 | WP | Contents | When | Gate before merge |
 |---|---|---|---|
 | WP0: demo config | Runbook below | Before the demo | Preflight below passes on the demo host |
-| WP1a: low-risk copy and tutorial | R16(c) + tutorial-readiness-gated chat line, R3 (copy items 1, 2, 4), R9; optionally R11 | Before the demo, **only if** it lands before code freeze | Focused tests, frontend tests, one joint live re-run (≥3 repeats of s01, s02, s04, tutorial walk) |
+| WP1a: low-risk copy and tutorial | R16 (script-only tutorial Build step, 409 detail, readiness-gated chat line), R3 (copy items 1, 2, 4), R9; optionally R11 | Before the demo, **only if** it lands before code freeze | Focused tests, frontend tests, one joint live re-run (≥3 repeats of s01, s02, s04, tutorial walk) |
 | WP1b: advisor and gate behaviour | R2 + R15, R14 (+R3 item 3), R10, R5, R7 | After the demo | Full `pytest tests/` (shared runtime and wire shapes), testcontainer suite if persistence changes, joint live re-run |
 | WP2: planner surface | R1 (+P1), R4, R8, E3, R17 | After the demo | Per-surface crosscheck instrument, s10 live, full suite |
 | WP3: guard and integrity | R13 (promptly; integrity), R6 (after the decision) | R13 straight after the demo | Repro tests, full suite, audit of stored records for F14 |
@@ -178,16 +178,17 @@ Owner for every package is the maintainer; dates are set by the operator.
 
 ### Tutorial
 
-- Do **not** press Apply on "Consider adding error routing to a retention
-  output". It is offered on every tutorial build (F18). Accept the proposal,
-  acknowledge the cards, use View prompt then Approve on the prompt card,
-  then Continue to Run.
-- If Continue to Run says the pipeline "does not match the supported
-  tutorial plugin set", ask the Composer: "Remove the extra failures output
-  and discard failures instead." It worked in one ~26 s turn when tried once.
-  Otherwise exit the tutorial.
-- If attendees will do the tutorial **hands-on**, F18 becomes likely: land
-  R16 or brief them.
+- Until R16 lands, the tutorial is only as fixed as the presenter keeps it.
+  After **Send tutorial brief**, do not type in the chat box, and do not
+  press **Apply**, **Repair**, **Ask the composer about this**, **Edit the
+  list** or **Use as input**. Only Accept the proposal, Acknowledge the
+  cards, use View prompt then Approve on the prompt card, then Continue to
+  Run.
+- If Continue to Run refuses ("does not match the supported tutorial plugin
+  set"), the request was changed. Exit the tutorial and start it again. Do
+  not repair it by typing, which defeats the fixed script.
+- If attendees do the tutorial **hands-on**, any of those controls can break
+  it: land R16 first, or brief them explicitly.
 
 ### On a completion note
 
