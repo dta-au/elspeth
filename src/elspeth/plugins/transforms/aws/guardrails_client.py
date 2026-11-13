@@ -341,7 +341,7 @@ def parse_guardrail_response(
         raise GuardrailResponseError
 
     action = root["action"]
-    if action not in ("NONE", "GUARDRAIL_INTERVENED"):
+    if type(action) is not str or action not in ("NONE", "GUARDRAIL_INTERVENED"):
         raise GuardrailResponseError
     action_reason: object = None
     if "actionReason" in root:
@@ -378,12 +378,21 @@ def parse_guardrail_response(
         detected = item["detected"]
         if type(filter_type) is not str or filter_type not in ALLOWED_FILTERS or filter_type in seen:
             raise GuardrailResponseError
-        if confidence not in _FILTER_CONFIDENCE or filter_action not in _FILTER_ACTIONS or type(detected) is not bool:
+        # Type-check before membership: an unhashable provider value (list,
+        # dict) would raise TypeError from a frozenset test and escape the
+        # call's audit write instead of being refused as malformed.
+        if (
+            type(confidence) is not str
+            or confidence not in _FILTER_CONFIDENCE
+            or type(filter_action) is not str
+            or filter_action not in _FILTER_ACTIONS
+            or type(detected) is not bool
+        ):
             raise GuardrailResponseError
         strength: object = None
         if "filterStrength" in item:
             strength = item["filterStrength"]
-        if strength is not None and strength not in _FILTER_CONFIDENCE:
+        if strength is not None and (type(strength) is not str or strength not in _FILTER_CONFIDENCE):
             raise GuardrailResponseError
         if filter_action == "BLOCKED" and not detected:
             raise GuardrailResponseError

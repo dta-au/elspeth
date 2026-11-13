@@ -112,6 +112,18 @@ def validate_guardrail_region(value: str) -> str:
     return value
 
 
+def validate_guardrail_arn_binding(identifier: str, *, region: str) -> None:
+    """Reject a guardrail ARN whose partition or region contradicts ``region``.
+
+    Shared by the operator profile and the transform config so a YAML-authored
+    pipeline cannot bind an ARN the configured commercial region cannot reach.
+    A bare guardrail id carries no partition or region and is accepted.
+    """
+    match = _GUARDRAIL_ARN.fullmatch(identifier)
+    if match is not None and (match.group("partition") != "aws" or match.group("region") != region):
+        raise ValueError("guardrail ARN partition and region must match the configured commercial region")
+
+
 class BedrockGuardrailProfileSettings(BaseModel):
     """Frozen private binding selected through an opaque public alias."""
 
@@ -147,9 +159,7 @@ class BedrockGuardrailProfileSettings(BaseModel):
 
     @model_validator(mode="after")
     def _validate_arn_region(self) -> BedrockGuardrailProfileSettings:
-        match = _GUARDRAIL_ARN.fullmatch(self.guardrail_identifier)
-        if match is not None and (match.group("partition") != "aws" or match.group("region") != self.region):
-            raise ValueError("guardrail ARN partition and region must match the configured commercial region")
+        validate_guardrail_arn_binding(self.guardrail_identifier, region=self.region)
         return self
 
     def check_local_requirements(self) -> BedrockLocalRequirementResult:
