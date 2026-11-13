@@ -81,7 +81,7 @@ export interface InlineSourceCreatedTurnProps {
    * (full payload may need a separate fetch — that's the caller's
    * responsibility, not the widget's).
    */
-  onEdit: (summary: InlineSourceSummary) => void;
+  onEdit?: (summary: InlineSourceSummary) => void;
 }
 
 export function InlineSourceCreatedTurn({
@@ -133,7 +133,7 @@ export function InlineSourceCreatedTurn({
         </pre>
       </div>
 
-      {showEdit && (
+      {showEdit && onEdit !== undefined && (
         <div className="inline-source-created-turn-actions">
           {/* .link-button carries the visible affordance: this bare Button
               previously held only its bespoke token, which no stylesheet

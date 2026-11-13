@@ -231,6 +231,8 @@ test("Welcome → freeform Build → explicit Run → Audit → Graduation keeps
   await expect(page.getByRole("heading", { name: "Build with the Composer." })).toBeVisible();
   await page.getByRole("button", { name: "Send tutorial brief" }).click();
   await expect(page.getByRole("button", { name: "Continue to Run" })).toBeEnabled();
+  await expect(page.getByRole("textbox")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /Apply optional suggestion|Ask.*composer|Edit the list|Use as input|Upload/i })).toHaveCount(0);
   await page.getByRole("button", { name: "Continue to Run" }).click();
   await expect(page.getByRole("heading", { name: "Ready to run." })).toBeVisible();
   expect(fixture.runCount).toBe(0);
@@ -312,7 +314,8 @@ test("Build keeps its chrome out of the authoring pane and its Continue reachabl
   // Continue lives in the step header: it stays beside the composer here.
   await page.setViewportSize({ width: 390, height: 700 });
   await expect(page.getByRole("tab", { name: "Compose" })).toHaveAttribute("aria-selected", "true");
-  await expect(page.getByLabel("Message input")).toBeVisible();
+  await expect(page.getByLabel("Message input")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Stop composing" })).toBeVisible();
   await expect(continueButton).toBeVisible();
 });
 

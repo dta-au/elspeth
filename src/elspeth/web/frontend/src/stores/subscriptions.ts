@@ -8,6 +8,7 @@ import { useSessionStore } from "./sessionStore";
 import { useExecutionStore } from "./executionStore";
 import { useAuditReadinessStore } from "./auditReadinessStore";
 import { useAuthStore } from "./authStore";
+import { usePreferencesStore } from "./preferencesStore";
 import type { CompositionState, ValidationResult } from "@/types/index";
 import { hasCompositionContent } from "@/utils/compositionState";
 import { compositionContentEqual } from "@/lib/compositionContent";
@@ -456,9 +457,11 @@ export function initStoreSubscriptions(): void {
       // previousWasPendingReview so ordinary mid-compose valid results stay
       // quiet.
       previousWasPendingReview = false;
+      const tutorial = usePreferencesStore.getState();
+      const inTutorial = tutorial.tutorialStage === "build" && tutorial.tutorialSessionId === sessionStore.activeSessionId;
       sessionStore.injectSystemMessage(
         "Every card acknowledged — your pipeline's ready. Select " +
-          "**Run pipeline** to start it.",
+          (inTutorial ? "**Continue to Run** to review the run step." : "**Run pipeline** to start it."),
         VALIDATION_MSG_ID,
       );
     }

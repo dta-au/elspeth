@@ -85,6 +85,12 @@ describe("InlineSourceCreatedTurn", () => {
     expect(onEdit).toHaveBeenCalledWith(llmGenerated);
   });
 
+  it("retains generated source contents without an edit control when no handler is offered", () => {
+    render(<InlineSourceCreatedTurn summary={llmGenerated} />);
+    expect(screen.getByTestId("inline-source-preview").textContent).toBe(llmGenerated.contentPreview);
+    expect(screen.queryByRole("button", { name: /edit the list/i })).toBeNull();
+  });
+
   it("renders the SHA-256 hash inside a collapsed audit-info disclosure (F-21)", () => {
     render(<InlineSourceCreatedTurn summary={verbatim} onEdit={vi.fn()} />);
     const disclosure = screen.getByText(/show audit info/i);
