@@ -31,7 +31,7 @@ from elspeth.contracts.binary_documents import (
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.enums import AuditCharacteristic
-from elspeth.contracts.errors import FrameworkBugError, TransformErrorCategory
+from elspeth.contracts.errors import FrameworkBugError, PluginRetryableError, TransformErrorCategory
 from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.payload_store import PayloadNotFoundError, PayloadStore
@@ -260,7 +260,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_inline_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:19fad219cdcf149e"
+    source_file_hash: str | None = "sha256:eb22e71cfc4999d4"
     config_model = AWSTextractInlineAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -581,9 +581,19 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
                 queries=self._query_requests,
             )
         except TextractServiceError as error:
+            if error.retryable:
+                # The audited client has already recorded the failed call. The
+                # engine retries only a raised PluginRetryableError; the row is
+                # retried when the pipeline configures retry, and each retry is
+                # a new, possibly billable AnalyzeDocument call (no idempotency
+                # token exists for the synchronous API).
+                raise PluginRetryableError(
+                    f"Amazon Textract AnalyzeDocument failed (transient): {error.code}",
+                    retryable=True,
+                ) from error
             return TransformResult.error(
                 {"reason": "analysis_failed", "error_type": "service_error", "code": error.code},
-                retryable=error.retryable,
+                retryable=False,
             )
         except TextractResponseError as error:
             response_reason: TransformErrorCategory = "result_too_large" if error.category == "response_too_large" else "malformed_response"
@@ -789,7 +799,8 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
                 "downstream node then sets blob_ref_field: page_blob_ref and document_format: png. Mixed formats "
                 "need homogeneous sources or branches with one transform instance per format.",
                 "Multipage, oversized, or already-S3 documents belong in aws_textract_document_analysis.",
-                "Synchronous AnalyzeDocument has no idempotency guarantee, so SDK and engine retries can each repeat a billable provider call.",
+                "Synchronous AnalyzeDocument has no idempotency guarantee: botocore's SDK retries, and engine row retries of a "
+                "throttled or transient failure when the pipeline configures retry, can each repeat a billable provider call.",
                 "For explicit AWS credentials, use ELSPETH markers such as {secret_ref: AWS_ACCESS_KEY_ID}.",
             ),
         )

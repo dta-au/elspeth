@@ -13,7 +13,7 @@ from tests.fixtures.mock_audit import mock_item_audit_authority
 from elspeth.contracts import AuditCharacteristic, Determinism, RunMode
 from elspeth.contracts.binary_documents import BINARY_DOCUMENT_MAX_BYTES
 from elspeth.contracts.coordination import WorkerMembershipToken
-from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.errors import FrameworkBugError, PluginRetryableError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.payload_store import IntegrityError, PayloadNotFoundError
 from elspeth.contracts.plugin_capabilities import WebConfigAuthority
@@ -607,18 +607,23 @@ def test_every_declared_format_signature_is_accepted(document_format: str, conte
 
 
 @pytest.mark.parametrize("retryable", [True, False])
-def test_service_error_preserves_retryability(retryable: bool) -> None:
+def test_service_error_routes_retryability_to_the_engine(retryable: bool) -> None:
     client = FakeInlineClient(
         result=TextractServiceError(code="ThrottlingException" if retryable else "AccessDeniedException", retryable=retryable)
     )
     transform = _transform_for_client(client)
 
+    if retryable:
+        # The engine retries only a raised PluginRetryableError (AWS review 2026-11-13 #1).
+        with pytest.raises(PluginRetryableError, match="ThrottlingException"):
+            _run(transform)
+        return
     result = _run(transform)
 
     assert result.status == "error"
     assert result.reason["reason"] == "analysis_failed"
     assert result.reason["error_type"] == "service_error"
-    assert result.retryable is retryable
+    assert result.retryable is False
 
 
 @pytest.mark.parametrize(

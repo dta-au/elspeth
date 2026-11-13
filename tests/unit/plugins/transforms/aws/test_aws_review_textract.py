@@ -68,13 +68,13 @@ def _blocks() -> list[dict[str, object]]:
     ]
 
 
-def _page(*, status: str = "SUCCEEDED", next_token: str | None = None) -> AnalysisResultPage:
+def _page(*, status: str = "SUCCEEDED", next_token: str | None = None, blocks: list[dict[str, object]] | None = None) -> AnalysisResultPage:
     return AnalysisResultPage(
         semantic_response={
             "JobStatus": status,
             "DocumentMetadata": {"Pages": 1},
             "AnalyzeDocumentModelVersion": "1.0",
-            "Blocks": _blocks() if status == "SUCCEEDED" else [],
+            "Blocks": blocks if blocks is not None else (_blocks() if status == "SUCCEEDED" else []),
         },
         next_token=next_token,
     )
@@ -206,7 +206,7 @@ def test_f1_retryable_poll_error_during_pagination_repeats_the_same_page_request
         pages=[
             _page(next_token="page-2"),
             TextractServiceError(code="ThrottlingException", retryable=True),
-            _page(),
+            _page(blocks=[]),
         ]
     )
 

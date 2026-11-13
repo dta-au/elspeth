@@ -31,6 +31,7 @@ from elspeth.contracts.errors import (
     AuditIntegrityError,
     BucketRegionVerificationEvidence,
     FrameworkBugError,
+    PluginRetryableError,
     TransformErrorCategory,
     TransformErrorReason,
 )
@@ -203,7 +204,10 @@ class AWSTextractDocumentAnalysisConfig(TransformDataConfig):
         default=MAX_POLL_TIMEOUT_SECONDS,
         gt=0,
         le=MAX_POLL_TIMEOUT_SECONDS,
-        description="Total submit-through-terminal-status deadline in seconds.",
+        description=(
+            "Total submit-through-terminal-status deadline in seconds; transient poll failures are retried in place "
+            "within it, and reaching it is a permanent poll_timeout row error."
+        ),
     )
     batch_wait_timeout_seconds: float = Field(
         default=MAX_BATCH_WAIT_TIMEOUT_SECONDS,
@@ -343,7 +347,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a97410d662ec7aa7"
+    source_file_hash: str | None = "sha256:0e7af16858c73555"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -822,10 +826,18 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 lambda: self._verify_bucket_region_live(bucket, state_id=state_id, token_id=token_id, ctx=ctx),
             )
         except BucketRegionUnverifiedError as error:
+            if error.retryable:
+                # A transient HeadBucket failure (throttle, 5xx, transport) is
+                # an engine row retry: the engine reads only a raised
+                # PluginRetryableError, never TransformResult.retryable.
+                raise PluginRetryableError(
+                    f"Amazon S3 HeadBucket could not verify the bucket region (transient): {error.code}",
+                    retryable=True,
+                ) from error
             unverified_reason: TransformErrorReason = {"reason": "bucket_region_unverified", "error_type": error.code}
             if error.inherited:
                 unverified_reason["cache_status"] = "shared_failure"
-            return TransformResult.error(unverified_reason, retryable=error.retryable)
+            return TransformResult.error(unverified_reason, retryable=False)
         result = self._process_verified_document(
             row,
             state_id=state_id,
@@ -903,11 +915,20 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         except TextractIdempotencyInvariantError as error:
             raise FrameworkBugError("Amazon Textract idempotency invariant failed") from error
         except TextractServiceError as error:
+            if error.retryable:
+                # The audited client has already recorded the failed call. A
+                # row retry resubmits with the same deterministic
+                # ClientRequestToken, so Textract re-attaches to any job this
+                # attempt started instead of starting (and billing) another.
+                raise PluginRetryableError(
+                    f"Amazon Textract StartDocumentAnalysis failed (transient): {error.code}",
+                    retryable=True,
+                ) from error
             submit_error: TransformErrorReason = {"reason": "submit_failed", "error_type": "service_error", "code": error.code}
             if error.code == _S3_OBJECT_UNREADABLE_CODE:
                 submit_error["cause"] = _S3_OBJECT_UNREADABLE_CAUSE
                 submit_error["error"] = _S3_OBJECT_UNREADABLE_HINT
-            return TransformResult.error(submit_error, retryable=error.retryable)
+            return TransformResult.error(submit_error, retryable=False)
         except TextractResponseError as error:
             submit_reason: TransformErrorCategory = "result_too_large" if error.category == "response_too_large" else "malformed_response"
             return TransformResult.error({"reason": submit_reason, "error_type": "submit_response"}, retryable=False)
@@ -992,6 +1013,21 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         *,
         started_at: float,
     ) -> tuple[Mapping[str, Any], ...] | TransformResult:
+        """Poll the accepted job to a terminal status and collect every result page.
+
+        Deadline policy (AWS review 2026-11-13, finding 1):
+
+        - ``poll_timeout`` — the job did not reach a terminal status within the
+          author's ``poll_timeout_seconds`` — is a permanent row error. The
+          deadline is the author's own bound on worker occupancy; an engine
+          retry would silently multiply it by the retry budget.
+        - A retryable ``GetDocumentAnalysis`` failure (throttle, 5xx,
+          transport) is retried in place against the same job and the same
+          page request, never by resubmitting. Only one that is still failing
+          when the deadline arrives escalates to an engine row retry
+          (``PluginRetryableError``); that retry resubmits with the same
+          deterministic ClientRequestToken and so re-attaches to this job.
+        """
         deadline = started_at + self._poll_timeout_seconds
         interval = self._poll_interval_seconds
         next_token: str | None = None
@@ -999,28 +1035,45 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         pages: list[Mapping[str, Any]] = []
         block_count = 0
         retained_result_bytes = 0
+        transient: TextractServiceError | None = None
         while True:
             if self._shutdown_requested():
                 return TransformResult.error({"reason": "shutdown_requested"}, retryable=False)
             if time.monotonic() >= deadline:
-                return TransformResult.error({"reason": "poll_timeout"}, retryable=True)
+                if transient is not None:
+                    raise self._transient_poll_escalation(transient)
+                return TransformResult.error({"reason": "poll_timeout"}, retryable=False)
             try:
                 page = client.get_document_analysis(job_id=receipt.job_id, next_token=next_token)
             except TextractIdempotencyInvariantError as error:
                 raise FrameworkBugError("Amazon Textract idempotency invariant failed") from error
             except TextractServiceError as error:
-                return TransformResult.error(
-                    {"reason": "poll_failed", "error_type": "service_error", "code": error.code},
-                    retryable=error.retryable,
-                )
+                if not error.retryable:
+                    return TransformResult.error(
+                        {"reason": "poll_failed", "error_type": "service_error", "code": error.code},
+                        retryable=False,
+                    )
+                # The audited client recorded the failed poll. Retry the same
+                # request in place after the poll backoff; the accepted job
+                # keeps running, so resubmitting would only add risk.
+                transient = error
+                now = time.monotonic()
+                if now >= deadline:
+                    raise self._transient_poll_escalation(error) from error
+                sleep_seconds = min(interval, deadline - now)
+                if sleep_seconds > 0 and self._wait_for_shutdown(sleep_seconds):
+                    return TransformResult.error({"reason": "shutdown_requested"}, retryable=False)
+                interval = min(interval * self._poll_backoff_multiplier, self._poll_max_interval_seconds)
+                continue
             except TextractResponseError as error:
                 poll_reason: TransformErrorCategory = "result_too_large" if error.category == "response_too_large" else "malformed_response"
                 return TransformResult.error({"reason": poll_reason, "error_type": "poll_response"}, retryable=False)
+            transient = None
 
             if self._shutdown_requested():
                 return TransformResult.error({"reason": "shutdown_requested"}, retryable=False)
             if time.monotonic() >= deadline:
-                return TransformResult.error({"reason": "poll_timeout"}, retryable=True)
+                return TransformResult.error({"reason": "poll_timeout"}, retryable=False)
 
             semantic_response = page.semantic_response
             if "JobStatus" not in semantic_response or type(semantic_response["JobStatus"]) is not str:
@@ -1031,7 +1084,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                     return TransformResult.error({"reason": "malformed_response", "error_type": "premature_next_token"}, retryable=False)
                 now = time.monotonic()
                 if now >= deadline:
-                    return TransformResult.error({"reason": "poll_timeout"}, retryable=True)
+                    return TransformResult.error({"reason": "poll_timeout"}, retryable=False)
                 sleep_seconds = min(interval, deadline - now)
                 if sleep_seconds > 0 and self._wait_for_shutdown(sleep_seconds):
                     return TransformResult.error({"reason": "shutdown_requested"}, retryable=False)
@@ -1076,6 +1129,13 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             if len(pages) >= self._max_result_pages:
                 return TransformResult.error({"reason": "pagination_limit_exceeded"}, retryable=False)
             next_token = returned_token
+
+    @staticmethod
+    def _transient_poll_escalation(error: TextractServiceError) -> PluginRetryableError:
+        return PluginRetryableError(
+            f"Amazon Textract GetDocumentAnalysis still failing (transient) at the poll deadline: {error.code}",
+            retryable=True,
+        )
 
     def _build_enriched_result(
         self,
