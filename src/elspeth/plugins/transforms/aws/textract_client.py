@@ -299,12 +299,16 @@ def _provider_error(error: Exception, *, observed_attempts: int) -> tuple[str, b
     The exception's ``response`` envelope is vendor data: every member is read
     once, bounded, and re-asserted before it becomes part of the audit record.
     """
-    from botocore.exceptions import ClientError, ConnectionClosedError, ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError
+    from botocore.exceptions import ClientError, HTTPClientError
+    from botocore.exceptions import ConnectionError as BotocoreConnectionError
 
-    if isinstance(error, (ConnectTimeoutError, ConnectionClosedError, EndpointConnectionError, ReadTimeoutError)):
+    # botocore's standard retry mode retries exactly these two families
+    # (TransientRetryableChecker), so they are transport failures whose every
+    # started HTTP attempt was observed by the before-send hook.
+    if isinstance(error, (BotocoreConnectionError, HTTPClientError)):
         return "transport_error", True, observed_attempts, False
     if not isinstance(error, ClientError):
-        return "botocore_error", False, 1, False
+        return "botocore_error", False, observed_attempts, False
 
     error_data = error.response.get("Error")
     code = "unknown"

@@ -24,6 +24,7 @@ from elspeth.plugins.transforms.aws.textract_bucket_region import (
     _success_proof,
     build_s3_head_bucket_sdk_client,
 )
+from elspeth.plugins.transforms.aws.textract_client import _record_send_attempt
 
 
 @dataclass
@@ -263,7 +264,10 @@ def test_bucket_region_coordinator_caches_per_bucket() -> None:
 
 def test_s3_builder_uses_textract_retry_timeout_and_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
-    sdk = SimpleNamespace()
+    registrations: list[tuple[str, Any]] = []
+    sdk = SimpleNamespace(
+        meta=SimpleNamespace(events=SimpleNamespace(register=lambda event, handler: registrations.append((event, handler)))),
+    )
 
     def fake_client(service: str, **kwargs: Any) -> object:
         captured["service"] = service
@@ -291,6 +295,7 @@ def test_s3_builder_uses_textract_retry_timeout_and_credentials(monkeypatch: pyt
     assert config.read_timeout == 30
     assert config.retries["mode"] == "standard"
     assert config.retries["total_max_attempts"] == 3
+    assert registrations == [("before-send.s3", _record_send_attempt)]
 
 
 def test_head_bucket_audit_identity_projects_request_payload() -> None:

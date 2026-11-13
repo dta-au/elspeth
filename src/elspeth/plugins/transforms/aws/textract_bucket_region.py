@@ -23,6 +23,7 @@ from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import stable_hash
 from elspeth.plugins.infrastructure.clients.base import AuditedClientBase, TelemetryEmitCallback
 from elspeth.plugins.transforms.aws.replay_sdk import require_replay_fields
+from elspeth.plugins.transforms.aws.textract_client import _observed_send_attempts, _record_send_attempt, _reset_send_attempts
 from elspeth.plugins.transforms.aws.textract_regions import is_supported_textract_region
 
 if TYPE_CHECKING:
@@ -107,7 +108,9 @@ def build_s3_head_bucket_sdk_client(
         kwargs["aws_secret_access_key"] = aws_secret_access_key
         if aws_session_token is not None:
             kwargs["aws_session_token"] = aws_session_token
-    return cast("S3HeadBucketSDKClient", boto3.client("s3", **kwargs))
+    client = boto3.client("s3", **kwargs)
+    client.meta.events.register("before-send.s3", _record_send_attempt)
+    return cast("S3HeadBucketSDKClient", client)
 
 
 @trust_boundary(
@@ -212,20 +215,23 @@ def _safe_provider_code(value: object) -> str:
     ),
     non_raising=True,
 )
-def _provider_outcome(error: Exception) -> tuple[BucketRegionProof | None, BucketRegionUnverifiedError, int]:
+def _provider_outcome(error: Exception, *, observed_attempts: int) -> tuple[BucketRegionProof | None, BucketRegionUnverifiedError, int]:
     """Classify one botocore exception into a proof-or-failure outcome.
 
     The exception's ``response`` envelope is vendor data: every member is read
     once, bounded, and re-asserted before it becomes part of the audit record.
     """
-    from botocore.exceptions import ClientError, ConnectionClosedError, ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError
+    from botocore.exceptions import ClientError, HTTPClientError
+    from botocore.exceptions import ConnectionError as BotocoreConnectionError
 
-    if isinstance(error, (ConnectTimeoutError, ConnectionClosedError, EndpointConnectionError, ReadTimeoutError)):
+    # botocore's standard retry mode retries exactly these two families
+    # (TransientRetryableChecker); the before-send hook observed every attempt.
+    if isinstance(error, (BotocoreConnectionError, HTTPClientError)):
         failure = BucketRegionUnverifiedError(code="transport_error", retryable=True)
-        return None, failure, 1
+        return None, failure, observed_attempts
     if not isinstance(error, ClientError):
         failure = BucketRegionUnverifiedError(code="botocore_error", retryable=False)
-        return None, failure, 1
+        return None, failure, observed_attempts
 
     response = error.response
     raw_error = response.get("Error")
@@ -439,13 +445,14 @@ class HeadBucketClient(AuditedClientBase):
         proof: BucketRegionProof | None = None
         terminal_error: BucketRegionUnverifiedError | None = None
         attempts = 1
+        _reset_send_attempts()
         try:
             raw_response = self._sdk_client.head_bucket(Bucket=bucket)
             proof, attempts = _success_proof(raw_response)
         except BucketRegionUnverifiedError as error:
             terminal_error = error
         except _provider_exception_types() as error:
-            proof, terminal_error, attempts = _provider_outcome(error)
+            proof, terminal_error, attempts = _provider_outcome(error, observed_attempts=_observed_send_attempts())
 
         latency_ms = (time.perf_counter() - started) * 1000
         http_status: int | None
