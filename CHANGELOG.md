@@ -122,6 +122,17 @@ These changes are breaking:
   guardrail ARN names another region or a non-`aws` partition now fail
   config validation with `PluginConfigError`, as the operator profile
   already did.
+- **A mistyped landscape export sink is refused for every run.** A `FRESH`
+  run now refuses a `landscape.export` sink name that is not in `sinks`, as
+  some run purposes already did, and `${VAR}` references in
+  `landscape.export` are expanded before that check.
+- **Column options accept a header's spelling.** Column-keyed transform
+  options such as Truncate's `fields` match the canonical header name as
+  well as the normalised name, so a config that used to be refused when the
+  plugin was built may now be accepted.
+- **A missing core dependency stops plugin discovery.** Only `jinja2` is
+  treated as optional; a missing `chromadb`, `bs4` or `html2text` now raises
+  instead of silently dropping plugins from the catalog.
 - **CI runs one Python 3.14 lane**, which is the coverage lane. Required
   status-check names change with it, for example
   `Test (Python 3.14, shard N)` and `Timing-sensitive tests (Python 3.14)`,
@@ -410,6 +421,23 @@ Sinks and retrieval:
 - **`database` sink** composer guidance now matches what it supports:
   SQLite or PostgreSQL, an existing table, no DDL, a required effect ledger,
   and append only.
+- **Plugin infrastructure:**
+  - `PluginManager.create_*` builds the plugin class from its own registry
+    and validates config against that same class (#126).
+  - Plugin discovery raises on a missing core dependency (#129).
+  - The Chroma readiness probe reports a persistent path that is not an
+    existing directory as unreachable, without creating a client (#149).
+  - An unknown landscape export sink is refused for every run purpose,
+    `landscape.export` values are expanded before eligibility checks, and a
+    deferred Key Vault reference defers the raw-settings gate, in the CLI
+    preflight as well (#104).
+  - Fixed-schema checks accept the canonical header spelling in column-keyed
+    options such as Truncate `fields` (#0).
+  - A template render timeout is classified by worker CPU time: a template
+    that used its 2 s CPU budget is a row `TemplateError`, anything else a
+    retryable worker-lost error (#6).
+  - Parallel LLM multi-query records the pool execution context in
+    `context_after` (#100).
 
 ### Composer
 
