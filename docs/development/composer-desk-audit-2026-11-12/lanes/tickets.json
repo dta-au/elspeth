@@ -198,7 +198,8 @@
    "src/elspeth/web/composer/tools/sessions.py",
    "src/elspeth/web/composer/tools/sources.py",
    "src/elspeth/web/sessions/proposal_blob_refs.py",
-   "src/elspeth/web/composer/tools/_common.py"
+   "src/elspeth/web/composer/tools/_common.py",
+   "src/elspeth/web/composer/tools/state_responses.py"
   ],
   "test_files": [
    "tests/unit/web/composer/test_named_sources_blob_binding.py"

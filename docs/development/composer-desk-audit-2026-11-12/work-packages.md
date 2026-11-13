@@ -557,6 +557,10 @@ pytest only.
     creation and does not protect the blobs from deletion.
   - `src/elspeth/web/composer/tools/_common.py`
     (`_serialize_set_pipeline_arguments`).
+  - `src/elspeth/web/composer/tools/state_responses.py`: the
+    `get_pipeline_state` response check refused named-source `blob_id`
+    values. The S3 live run crashed with HTTP 500 on the first follow-up turn
+    until this was fixed (regression test in the prototype).
   - Start from S3's prototype (`evals/composer-live-audit/spikes/S3-multifile-custody/prototype.patch`;
     144 source lines across 5 files).
 - **Conditions.**
@@ -582,6 +586,11 @@ pytest only.
 - **No compatibility.** Do not add migration, dual-shape reading or shims
   for older stored states (D2).
 - **Also run.** The testcontainer suite, if persistence code changes.
+- **Live evidence (S3, n=2).** With the prototype, the planner authored a
+  valid two-source pipeline with the `quarter` column on its first proposal,
+  in 10.8 s and 29.3 s. The audit baseline was a 240 s timeout. Acceptance:
+  s10 builds on the first or second proposal, and the follow-up turn ("only
+  keep invoices over 1000") completes without error.
 - **Size.** 0.5–1 agent-day (S3).
 - **Depends on.** CDA-12.
 

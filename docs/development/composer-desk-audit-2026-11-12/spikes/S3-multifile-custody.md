@@ -33,10 +33,12 @@ with the tool loop's state shape.
   - seq 10 and seq 12: DeepSeek authored two named sources with `blob_id`;
   - seq 11: it tried `options.path: blobs/q1.csv` instead.
   - The seq-12 document is extracted verbatim to `SP/s10_seq12_pipeline.json`.
-- **Prototype** in the worktree (`SP/prototype.patch`, 783 lines; 5 source
-  files plus 1 new test file).
+- **Prototype** in the worktree (`SP/prototype.patch`, 858 lines; 6 source
+  files plus 1 new test file). The sixth file, `tools/state_responses.py`, was
+  added after the first live run found a crash (§3.4).
 - **Test first.** I wrote
-  `tests/unit/web/composer/test_named_sources_blob_binding.py` (15 tests)
+  `tests/unit/web/composer/test_named_sources_blob_binding.py` (15 tests, plus
+  a 16th regression test added after live run 1)
   before the code and ran it against the base tree and the prototype.
   - Instrument control: my first base run reported 15 passed. That was
     false: `pyproject.toml:482` sets `pythonpath = ["src", …]`, so pytest
@@ -47,9 +49,22 @@ with the tool loop's state shape.
 - **Blast radius.** I ran 23 neighbouring test files (`-n 2`), ruff, mypy, the
   two teaching gates and a keyless `elspeth-lints` corpus diff between base
   and prototype.
-- **Live s10 run: NOT RUN.** OpenRouter credit was exhausted (HTTP 402; the
-  coordinator's instruction). Spend: **US$0.00** (no provider calls). See §5
-  for the resume command.
+- **Live s10: n = 2 runs, EXECUTED** after credit was restored. Composer
+  DeepSeek v4.1 Flash, advisor GLM-5.3. Each instance was started from the
+  worktree with `PYTHONPATH` exported.
+  - `.venv/bin/python -c 'import elspeth'` printed the worktree path.
+  - `/proc/<pid>/environ` of each server carried the worktree `PYTHONPATH`.
+  - The capture shows the model emitting `sources.<n>.blob_id`, which the base
+    schema rejects, and the server accepting it.
+  - Run 1: port 8511, the prototype as first delivered. Run 2: port 8512, the
+    prototype plus the `state_responses.py` fix.
+  - The proposed teaching paragraph was **already part of the prototype**, so
+    both runs include it. No schema-only run was made: run 1 built, so the
+    "retry with teaching" branch of the brief did not apply.
+  - Spend, summed from OpenRouter's per-response `usage.cost` in the captures:
+    **US$0.29** (run 1 $0.037 over 4 calls; run 2 $0.255 over 16 calls,
+    including 2 GLM advisor calls). The account-level `usage_daily` delta is
+    not attributable, because other spikes share the account.
 
 ## 3. Results
 
@@ -59,6 +74,7 @@ with the tool loop's state shape.
 |---|---|---|
 | Base tree (`c987b2b2`, pythonpath overridden to the main checkout) | exit 1, **14 failed, 1 passed** | `SP/pytest_base_final.log` |
 | Prototype | exit 0, **15 passed** | `SP/pytest_proto_final.log` |
+| Prototype + `state_responses.py` fix, with `test_state_response_contracts.py` | exit 0, **90 passed** (16 + 74) | `SP/pytest_proto_final2.log` |
 
 The one test that passes on base is the negative control
 `test_named_inline_blob_stays_out_of_named_sources`, which must stay green. On
@@ -136,6 +152,48 @@ Gates:
 Not run: the full suite and the testcontainer suite. No SQL, schema,
 persistence-layer or lock code changed; `proposal_blob_refs.py` only reads
 JSON that is already stored.
+
+### 3.4 Live s10 (EXECUTED, n = 2)
+
+Raw captures:
+- `SP/live/run1/`, `SP/live/run2/`: each holds `s10-two-files/` (per-turn
+  `llm_calls.json`, `state.json`, `proposals.json`, `summary.json`),
+  `web.log` and `llm_calls.jsonl`.
+
+| Run | Turn | Wall clock | Provider calls | Proposal attempts | Outcome |
+|---|---|---|---|---|---|
+| 1 | T1 "combine… quarter column" | **10.8 s** | 3 (DeepSeek: `list_blobs`+`list_composer_blobs`; `inspect_source` ×2; `emit_pipeline_proposal`) | **1, accepted first time** | Committed (auto-commit after a green runtime preflight); `validation_is_valid=true` |
+| 1 | T2 "only keep invoices over 1000" (tool loop) | 34.3 s | 1 | — | **HTTP 500 `composer_plugin_error`**, `FrameworkBugError` (see below) |
+| 2 | T1 | **29.3 s** | 3 (`list_blobs`+`list_composer_blobs`; `get_plugin_schema` ×2 + `inspect_source` ×2; `emit_pipeline_proposal`) | **1, accepted first time** | Committed; `validation_is_valid=true` |
+| 2 | T2 (tool loop) | 68.6 s | 13 (11 DeepSeek, 2 GLM advisor) | — | Completed. A gate `row['amount'] > 1000` was added per branch; valid |
+
+**T1 authored the target shape both times** (from `turn01/state.json`):
+- named sources `q1` and `q2`, each `csv` with the server-resolved
+  `blob_ref`/`path`/`mode: bind_source`;
+- one `value_transform` per source, `quarter = 'Q1'` / `'Q2'`;
+- both branches' `on_success` pointing at one csv sink
+  (`main` in run 1, `combined_quarters` in run 2);
+- no queue in either run.
+
+Against the audit baseline (n = 1, the s10 capture): 9 completed calls
+(DeepSeek, then a GLM escape-hatch call), 3 proposal attempts, a 504 at the
+240 s deadline, and no pipeline.
+
+**The live run found a defect the in-process tests missed.**
+- Run 1 T2's first tool-loop call was
+  `get_pipeline_state(component="set_pipeline_arguments")`.
+- The prototype's serializer change now emits `sources.<n>.blob_id`, but the
+  get_pipeline_state response contract (`tools/state_responses.py`,
+  `_authoring_source(..., named=True)` → `_require(not named)`) refused
+  `blob_id` on a named source with `FrameworkBugError` → HTTP 500.
+- I reproduced it in-process (`SP/live_t2_repro.log`). The fix drops the
+  `named` restriction, which is 6 lines.
+- Regression test: `test_get_pipeline_state_authoring_payload_admits_named_blob_ids`
+  (red before the fix with the same traceback, green after).
+- Run 2's T2 did not call that component, so the fix is proven **in-process
+  only, not live**.
+- No existing test pinned the old refusal: `test_state_response_contracts.py`
+  stayed green, 74/74.
 
 ## 4. Recommendation for CDA-13
 
@@ -232,6 +290,8 @@ JSON that is already stored.
 - `src/elspeth/web/composer/tools/sessions.py`
 - `src/elspeth/web/composer/tools/_common.py`
 - `src/elspeth/web/sessions/proposal_blob_refs.py`
+- `src/elspeth/web/composer/tools/state_responses.py` (the get_pipeline_state
+  response contract must admit named `blob_id`; the live run found this)
 - `src/elspeth/web/composer/skills/pipeline_capabilities.md`
 - the new test file
 
@@ -251,7 +311,7 @@ JSON that is already stored.
 
 **Small to medium: about 0.5 to 1 engineer-day.**
 
-- The prototype changes 144 source lines (5 files, `git diff --shortstat -- src`: 116 insertions, 28 deletions) and is complete apart from
+- The prototype changes 156 source lines (6 files, `git diff --shortstat -- src`: 122 insertions, 34 deletions) and is complete apart from
   the cleanup in §4.1 items 5 and 6.
 - The rest is the two pin flips, the budget constant, extractor test cases and
   one full-suite run, since the change touches the shared `set_pipeline`
@@ -261,7 +321,9 @@ JSON that is already stored.
 ### 4.5 Edits to `work-packages.md` CDA-13 (stated, not made)
 
 - **Files:** add `src/elspeth/web/sessions/proposal_blob_refs.py`
-  (retention/ownership extractor; required) and
+  (retention/ownership extractor; required),
+  `src/elspeth/web/composer/tools/state_responses.py` (response contract;
+  required, or tool-loop turns on a multi-file state crash) and
   `src/elspeth/web/composer/tools/_common.py` (`_serialize_set_pipeline_arguments`).
 - **Conditions:** add "Define precedence: a hash-matched reviewed binding plus
   `blob_id` is `source_binding_ambiguous`" in place of "Define precedence
@@ -284,25 +346,18 @@ JSON that is already stored.
 
 ## 5. Open questions and limits
 
-- **Live s10 not run.** OpenRouter returned 402 for every call. The capture
-  already shows DeepSeek authoring this exact shape unprompted (seq 10 and
-  12), but whether it repairs the queue/sink name collision within the repair
-  budget is UNMEASURED. Resume command from the worktree root, after
-  re-funding (cap US$2):
-
-  ```bash
-  cd <repo root>/.claude/worktrees/S3-multifile-custody && \
-    export PYTHONPATH=$PWD/src:$PWD/elspeth-lints/src && \
-    evals/composer-live-audit/instance.sh 8511 S3-proto && \
-    evals/composer-live-audit/run_scenarios.sh 8511 S3-proto s10-two-files
-  ```
-
-  Run it n≥3 and record per-run terminal status, repair count and wall
-  clock. Kill the instance PID afterwards.
+- **Live coverage is n = 2.** T1 built on the first proposal in both runs,
+  with the teaching paragraph present. Not measured:
+  - whether the schema change **without** the teaching paragraph is enough;
+  - other composer models;
+  - more phrasings than s10's;
+  - the `state_responses.py` fix in a live turn. Run 2's tool loop never read
+    `set_pipeline_arguments`; the fix is covered by the in-process
+    regression test.
 - **What would change the recommendation:**
-  - If live runs show the model keeps naming the queue and the sink the same,
-    the fix is teaching or rejection text (already partly in the paragraph),
-    not custody.
+  - If later live runs show the model naming the queue and the sink the
+    same, as in the audit capture, the fix is teaching or rejection text,
+    not custody. Both runs here avoided the queue entirely.
   - If CDA-12 restructures the planner overlay, re-place the paragraph and
     re-measure the byte budget.
 - **Not measured:**

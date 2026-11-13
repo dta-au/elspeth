@@ -246,6 +246,57 @@ index dfa69465..40a52df3 100644
                          "options": {
                              "type": "object",
                              "description": "Plugin-specific source config." + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+diff --git a/src/elspeth/web/composer/tools/state_responses.py b/src/elspeth/web/composer/tools/state_responses.py
+index cfc645df..82b9ca5b 100644
+--- a/src/elspeth/web/composer/tools/state_responses.py
++++ b/src/elspeth/web/composer/tools/state_responses.py
+@@ -372,24 +372,24 @@ def _owned_sources(value: object) -> Mapping[str, SourceSpec]:
+     return _sources(value)
+ 
+ 
+-def _authoring_source(value: object, *, named: bool) -> AuthoringSource:
++def _authoring_source(value: object) -> AuthoringSource:
++    # Named sources bind uploads by blob_id exactly like the singular source
++    # (spike S3 / CDA-13), so blob_id is admitted on both.
+     if type(value) is AuthoringSource:
+         _require(type(value.source) is SourceSpec)
+-        _require(value.blob_id is None or not named)
+         blob_id = _optional_text(value.blob_id)
+         _require(blob_id is None or bool(blob_id.strip()))
+         return AuthoringSource(_source(value.source), blob_id)
+     wire = dict(_mapping(value))
+     blob_id = None
+     if "blob_id" in wire:
+-        _require(not named)
+         blob_id = _text(wire.pop("blob_id"))
+         _require(bool(blob_id.strip()))
+     return AuthoringSource(_source(wire), blob_id)
+ 
+ 
+ def _authoring_sources(value: object) -> Mapping[str, AuthoringSource]:
+-    return MappingProxyType({name: _authoring_source(item, named=True) for name, item in _mapping(value).items()})
++    return MappingProxyType({name: _authoring_source(item) for name, item in _mapping(value).items()})
+ 
+ 
+ def _parse(value: object) -> PipelineStateResponse:
+@@ -431,7 +431,7 @@ def _parse(value: object) -> PipelineStateResponse:
+             tuple(_edge(item) for item in value.edges),
+             tuple(_output(item) for item in value.outputs),
+             _metadata(value.metadata),
+-            None if value.source is None else _authoring_source(value.source, named=False),
++            None if value.source is None else _authoring_source(value.source),
+             None if value.sources is None else _authoring_sources(value.sources),
+         )
+         SetPipelineArgumentsModel.model_validate(_encode(result), strict=True)
+@@ -459,7 +459,7 @@ def _parse(value: object) -> PipelineStateResponse:
+         tuple(_edge(item) for item in _array(wire["edges"])),
+         tuple(_output(item) for item in _array(wire["outputs"])),
+         _metadata(wire["metadata"]),
+-        _authoring_source(wire["source"], named=False) if "source" in wire else None,
++        _authoring_source(wire["source"]) if "source" in wire else None,
+         _authoring_sources(wire["sources"]) if "sources" in wire else None,
+     )
+     SetPipelineArgumentsModel.model_validate(_encode(result), strict=True)
 diff --git a/src/elspeth/web/sessions/proposal_blob_refs.py b/src/elspeth/web/sessions/proposal_blob_refs.py
 index 67bfc883..1ab5f5c6 100644
 --- a/src/elspeth/web/sessions/proposal_blob_refs.py
@@ -294,10 +345,10 @@ index 67bfc883..1ab5f5c6 100644
      value = arguments["blob_id"] if "blob_id" in arguments else None
 diff --git a/tests/unit/web/composer/test_named_sources_blob_binding.py b/tests/unit/web/composer/test_named_sources_blob_binding.py
 new file mode 100644
-index 00000000..458ebb98
+index 00000000..a21d0314
 --- /dev/null
 +++ b/tests/unit/web/composer/test_named_sources_blob_binding.py
-@@ -0,0 +1,483 @@
+@@ -0,0 +1,507 @@
 +"""Named ``sources.<name>.blob_id`` binds uploaded blobs through the existing resolver.
 +
 +Spike S3 (composer desk audit 2026-11-12, finding F1, lane CDA-13). The
@@ -781,3 +832,27 @@ index 00000000..458ebb98
 +    pipeline["sources"]["source"]["blob_id"] = str(blobs[0].id)
 +    candidate = build_set_pipeline_candidate(pipeline, _empty_state(), context)
 +    assert _codes(candidate) == [("source_binding_ambiguous", "source")]
++
++
++def test_get_pipeline_state_authoring_payload_admits_named_blob_ids(tmp_path: Path, two_uploads: Any) -> None:
++    """Live s10 turn 2 crashed (FrameworkBugError) when the response contract refused named blob_id."""
++    from elspeth.web.composer.tools.state_responses import parse_pipeline_state_response
++
++    engine, session_id, q1, q2 = two_uploads
++    context = _context(tmp_path, engine, session_id)
++    state = build_set_pipeline_candidate(
++        _direct_fan_in(_s10_pipeline(str(q1.id), str(q2.id))), _empty_state(), context
++    ).result.updated_state
++    result = execute_tool(
++        "get_pipeline_state",
++        {"component": "set_pipeline_arguments"},
++        state,
++        context.catalog,
++        plugin_snapshot=context.plugin_snapshot,
++        data_dir=context.data_dir,
++        session_engine=engine,
++        session_id=session_id,
++    )
++    assert result.success
++    parsed = parse_pipeline_state_response(result.data)
++    assert type(parsed).__name__ == "AuthoringStateResponse"
