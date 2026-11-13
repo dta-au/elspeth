@@ -189,7 +189,9 @@ async def test_diagnostics_malformed_response_credential_metadata_is_refused_bef
 
     assert caught.value.surface == "composer_provider_response"
     assert caught.value.to_payload()["detail"] == (
-        "This control content appears to contain a credential. Store the value through the secret service and use a secret reference."
+        "The model's output appears to contain a credential, so it was blocked. "
+        "If you gave the Composer a credential, store it through the secret service and use a secret reference instead. "
+        "Otherwise, retry your request."
     )
     assert len(requests) == 1
     assert len(recorder.llm_calls) == 1
