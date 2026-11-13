@@ -9,6 +9,14 @@ The submit/poll/retry/audit machinery is shared with azure_content_understanding
 in ``analyze_lro``; this module owns the Document Intelligence request and
 result shapes.
 
+RETRY OWNERSHIP:
+- A network error on the submit POST is a retryable row error: the engine
+  retries the row, which submits the document again.
+- A network error on an ``Operation-Location`` poll GET, after Azure accepted
+  the analysis, is retried in place within the poll budget (like a 429/503),
+  so it never resubmits the document or starts a second billed analysis;
+  only one that outlasts ``poll_timeout_seconds`` escalates to a row retry.
+
 SECURITY:
 - A SAS token embedded in a ``urlSource`` value is forwarded to Azure verbatim;
   the audited request records the URL with its credential-shaped query values
@@ -260,7 +268,7 @@ class AzureDocumentIntelligence(AzureAnalyzeTransform):
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
     # Placeholder must be a sha256: literal so the hash normalizer matches it; recomputed by scripts/cicd/plugin_hash.
-    source_file_hash: str | None = "sha256:f63417b46f907d54"
+    source_file_hash: str | None = "sha256:af3c39691fe2f540"
     config_model = AzureDocumentIntelligenceConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED

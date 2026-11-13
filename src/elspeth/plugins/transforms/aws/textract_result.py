@@ -478,6 +478,7 @@ def _project_forms(blocks: Sequence[Mapping[str, Any]], index: Mapping[str, Mapp
 
         value_block: Mapping[str, Any] | None = None
         value_id: str | None = None
+        value_selection_status: str | None = None
         if value_ids:
             value_id = value_ids[0]
             value_block = index[value_id]
@@ -486,12 +487,25 @@ def _project_forms(blocks: Sequence[Mapping[str, Any]], index: Mapping[str, Mapp
                 _malformed(key_path, "VALUE relationship must target a KEY_VALUE_SET VALUE block")
             if _page(value_block, value_path) != _page(key_block, key_path):
                 _malformed(value_path, "VALUE Page must match its KEY")
+            # A checkbox VALUE's CHILD is a SELECTION_ELEMENT, which
+            # ``_text_from_children`` renders as "", so its state is projected
+            # here, validated exactly as a table cell's selection_status.
+            for selection_id in _child_ids(value_block, value_path):
+                selection = index[selection_id]
+                if selection["BlockType"] != "SELECTION_ELEMENT":
+                    continue
+                if value_selection_status is not None:
+                    _malformed(value_path, "VALUE block contains multiple selection elements")
+                value_selection_status = _required_str(selection, "SelectionStatus", f"block {selection_id!r}")
+                if value_selection_status not in {"SELECTED", "NOT_SELECTED"}:
+                    _malformed(f"block {selection_id!r}.SelectionStatus", "must be SELECTED or NOT_SELECTED")
 
         result.append(
             {
                 "page": _page(key_block, key_path),
                 "key": _text_from_children(key_block, index, path=key_path),
                 "value": None if value_block is None else _text_from_children(value_block, index, path=f"block {value_id!r}"),
+                "value_selection_status": value_selection_status,
                 "key_block_id": _required_str(key_block, "Id", key_path),
                 "value_block_id": value_id,
                 "key_confidence": _confidence(key_block, key_path),

@@ -25,6 +25,7 @@ from elspeth.plugins.transforms.aws.guardrail_profiles import (
     validate_guardrail_version,
 )
 from elspeth.plugins.transforms.aws.guardrails_client import (
+    MAX_REQUEST_TEXT_CHARS,
     BedrockGuardrailsClient,
     GuardrailPartialCoverageError,
     GuardrailResponseError,
@@ -238,6 +239,15 @@ class BedrockGuardrailTransformBase(BaseTransform, ABC):
                     {"reason": "non_string_field", "field": field_name, "actual_type": type(value).__name__},
                     retryable=False,
                 )
+            # The client refuses empty and over-long text before allocating a
+            # call; reject it here as row data so it is never reported as a
+            # Guardrail service failure with no call behind it.
+            if not value:
+                return TransformResult.error({"reason": "invalid_input", "field": field_name, "error_type": "empty_field"}, retryable=False)
+            if len(value) > MAX_REQUEST_TEXT_CHARS:
+                return TransformResult.error(
+                    {"reason": "invalid_input", "field": field_name, "error_type": "field_too_long"}, retryable=False
+                )
             try:
                 decision = client.apply_guardrail(
                     text=value,
@@ -260,7 +270,10 @@ class BedrockGuardrailTransformBase(BaseTransform, ABC):
                     },
                     retryable=False,
                 )
-            except (GuardrailServiceError, GuardrailResponseError, ValueError):
+            except (GuardrailServiceError, GuardrailResponseError):
+                # Only sanitized provider failures. A ValueError from the client
+                # is an internal invariant (source / required_filters ClassVars)
+                # and must crash, not become a per-row error.
                 return TransformResult.error(
                     {
                         "reason": "api_call_failed",

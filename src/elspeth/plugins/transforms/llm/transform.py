@@ -499,9 +499,18 @@ class SingleQueryStrategy:
             PipelineRow(output, output_contract),
             success_reason={
                 "action": "enriched",
-                "fields_added": [self.response_field, *(field.suffix for field in self.output_fields)],
+                # Every field written above: the structured outputs plus the
+                # response and the operational fields populate_llm_operational_fields
+                # writes (get_llm_guaranteed_fields names exactly those).
+                "fields_added": [
+                    *(field.suffix for field in self.output_fields),
+                    *get_llm_guaranteed_fields(self.response_field),
+                ],
+                # ``model`` is the configured model in both modes; the model
+                # the provider actually served is recorded separately.
                 "metadata": {
-                    "model": result.model,
+                    "model": self.model,
+                    "served_model": result.model,
                     "finish_reason": _serialize_finish_reason(result.finish_reason),
                     **result.usage.to_dict(),
                     **audit_metadata,
@@ -861,6 +870,9 @@ class MultiQueryStrategy:
         # Record finish_reason so audit trail distinguishes None (absent) from
         # STOP (confirmed completion). See Bug elspeth-393d2459aa.
         audit_metadata[f"{spec.name}_finish_reason"] = _serialize_finish_reason(result.finish_reason)
+        # The strategy-level ``model`` key is the configured model; record the
+        # model the provider actually served for this query beside it.
+        audit_metadata[f"{spec.name}_served_model"] = result.model
 
         return self._QuerySuccess(fields=partial, audit_metadata=audit_metadata)
 
@@ -1252,7 +1264,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0e12f0bdebf60583"
+    source_file_hash: str | None = "sha256:3c60f14ba869b372"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -2207,7 +2219,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     "Multi-query input_fields maps variables to upstream columns by default. Explicit query_input_mode=ordered needs list-form named queries and pool_size=1; exact bindings may name earlier validated generated fields, never self/forward.",
                     "Per-query output_fields default to <queryname>_<suffix>.",
                     "Per-query structured_output_prefix: null/omitted retains the query-name stem; empty string emits bare suffixes; a nonempty ASCII identifier (at most 64 characters) emits <stem>_<suffix>.",
-                    "structured_output_prefix leaves JSON response keys and raw/usage/model names unchanged. Any non-null override requires unique final generated names across every query; ordered mode always rejects collisions.",
+                    "structured_output_prefix leaves JSON response keys and raw/usage/model names unchanged. Final generated names, including raw/usage/model fields, must be unique across every query in every query_input_mode.",
                     "A separate semantic reviewer query must bind the actual earlier generated fields and relevant original evidence explicitly. A Boolean verdict plus result_checks can reject before downstream release.",
                     "Separate model calls are not a certification of semantic correctness; both prompts and authored judgment semantics still need ordinary review.",
                     "Ordered mode preserves original-only source_row/images and atomic final output. Later failure routes the original entry row; prior calls/charges remain. Node-level restart may repeat calls; no durable mid-node resume or exactly-once guarantee.",
