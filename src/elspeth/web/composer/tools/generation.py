@@ -1166,6 +1166,11 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "resolved_prompt_template_hash); each shell carries only {kind, user_term, draft} plus optional display_title.",
     ),
     (
+        r"vague_term_query_override|Pending vague_term review is bypassed by a query template",
+        "A query on the node has its own template, so the node-level reviewed slot would not reach it.",
+        "Remove the per-query template(s) or move the reviewed term to a node whose queries all use the node-level template.",
+    ),
+    (
         r"vague_term_unwired|Pending vague_term review is not wired for resolution",
         "The pipeline stages a pending vague_term interpretation requirement that nothing can resolve: no "
         "prompt_template_parts interpretation_ref references the requirement's id. A legacy "
@@ -1526,6 +1531,7 @@ _LEGACY_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # gate blocked Run forever. The staging tool's guard now also runs at the
     # node-authoring doors, and its rejection carries this code.
     "vague_term_unwired",
+    "vague_term_query_override",
     # ── Authoritative review reconciliation (session f33fa7c3, 2026-09-01) ─
     # Ten invariants inside reconcile_authoritative_reviews shared one opaque
     # message and no code, so explain_validation_error fell through to its

@@ -37,6 +37,7 @@ import elspeth.web.external_state_startup as external_state_startup_module
 import elspeth.web.operator_telemetry as operator_telemetry_module
 from elspeth import __version__
 from elspeth.contracts import RunStatus
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.session_operation import SessionOperationKind
@@ -60,6 +61,7 @@ from elspeth.web.auth.providers import get_profile
 from elspeth.web.auth.sso import SsoAuthProvider, SsoRuntime
 from elspeth.web.aws_ecs_startup import AwsEcsSchemaNotReadyError, AwsEcsStartupContractError
 from elspeth.web.composer.boot_probe import ComposerBootConfigError, ComposerProbeRequest
+from elspeth.web.composer.pipeline_planner import planner_tool_definitions
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
 from elspeth.web.config import _JSON_COLLECTION_FIELDS, WebSettings, settings_from_env
 from elspeth.web.coordination.membership_lifecycle import (
@@ -2523,11 +2525,12 @@ class TestLifespanShutdown:
             assert event["probed_surface"] == "hatch_terminal"
             assert event["probed_role"] == "planner"
             assert event["model"] == "openrouter/z-ai/glm-5.3"
+            expected_tools = planner_tool_definitions(dialect=ToolContractDialect.OPENAI_STRICT)
             assert (event["tool_count"], event["strict_true_count"], event["strict_false_count"], event["strict_key_omitted"]) == (
-                3,
-                2,
-                1,
-                0,
+                len(expected_tools),
+                sum(tool["function"].get("strict") is True for tool in expected_tools),
+                sum(tool["function"].get("strict") is False for tool in expected_tools),
+                sum("strict" not in tool["function"] for tool in expected_tools),
             )
             assert "hatch" in event["action"]
             assert "rejected by" not in repr(event)

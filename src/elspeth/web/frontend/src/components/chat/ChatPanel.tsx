@@ -220,6 +220,8 @@ interface ChatPanelProps {
   onOpenSecrets?: () => void;
   /** Embedded flows may need to keep their current session binding. */
   allowFork?: boolean;
+  /** Scripted flows expose decisions and cancellation without freeform authoring. */
+  scriptMode?: boolean;
 }
 
 
@@ -244,6 +246,7 @@ export function ChatPanel(props: ChatPanelProps) {
 export function ChatPanelContent({
   onOpenSecrets,
   allowFork = true,
+  scriptMode = false,
   composer,
 }: ChatPanelProps & { composer: ReturnType<typeof useComposer> }) {
   const messages = useSessionStore((s) => s.messages);
@@ -993,9 +996,10 @@ export function ChatPanelContent({
         applyDisabledReason={decisionApplyDisabledReason}
         phraseFor={decisionPhraseFor}
         stepLabelFor={decisionStepLabelFor}
-        onApplySuggestion={handleApplySuggestion}
-        onAskAboutBlocker={handleAskAboutBlocker}
-        onRepairGraph={handleRepairGraph}
+        scriptMode={scriptMode}
+        onApplySuggestion={scriptMode ? undefined : handleApplySuggestion}
+        onAskAboutBlocker={scriptMode ? undefined : handleAskAboutBlocker}
+        onRepairGraph={scriptMode ? undefined : handleRepairGraph}
         askDisabledReason={decisionAskDisabledReason}
         onOpenChecks={handleOpenChecks}
         onAcceptProposal={acceptProposal}
@@ -1152,12 +1156,12 @@ export function ChatPanelContent({
                       message={repr}
                       isComposing={isComposing}
                       onRetry={turn.kind === "user" ? retryMessage : undefined}
-                      onFork={allowFork && turn.kind === "user" ? handleFork : undefined}
+                      onFork={!scriptMode && allowFork && turn.kind === "user" ? handleFork : undefined}
                       proposalsByToolCallId={proposalsByToolCallId}
                       compositionState={compositionState}
                       staleProposalIds={staleProposalIds}
                       sourcesCreated={sourcesForThisTurn}
-                      onEditInlineSource={handleEditInlineSource}
+                      onEditInlineSource={scriptMode ? undefined : handleEditInlineSource}
                       pendingReviewCreatedAt={pendingReviewCreatedAt}
                     />
                     {turn.kind === "user" && failureOutcomes.filter((item) => item.user_message_id === repr.id || item.operation_id === repr.operation_id).map((outcome) => (
@@ -1202,7 +1206,7 @@ export function ChatPanelContent({
             <InlineSourceCreatedTurn
               key={summary.blobId}
               summary={summary}
-              onEdit={handleEditInlineSource}
+              onEdit={scriptMode ? undefined : handleEditInlineSource}
             />
           ))}
           {sourceProjectionFailure?.sessionId === activeSessionId &&
@@ -1313,14 +1317,20 @@ export function ChatPanelContent({
         )}
 
         {/* Blob manager drawer */}
-        {showBlobManager && <BlobManager onUseAsInput={handleUseAsInput} />}
+        {!scriptMode && showBlobManager && <BlobManager onUseAsInput={handleUseAsInput} />}
 
         {decisionPanel}
           {approvalReadiness}
       </div>
 
       {/* Input */}
-      <ChatInput
+      {scriptMode ? (
+        isComposing && (
+          <div className="chat-input">
+            <Button onClick={cancelComposition} aria-label="Stop composing">Cancel</Button>
+          </div>
+        )
+      ) : <ChatInput
         onSend={handleSend}
         disabled={isComposing}
         onCancel={isComposing ? cancelComposition : undefined}
@@ -1332,7 +1342,7 @@ export function ChatPanelContent({
         onChange={setInputText}
         onBlobUploadCompleted={handleFreeformBlobUploadCompleted}
         onBlobUploadRejected={handleFreeformBlobUploadRejected}
-      />
+      />}
     </div>
   );
 }

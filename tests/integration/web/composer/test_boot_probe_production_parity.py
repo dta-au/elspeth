@@ -38,6 +38,7 @@ from sqlalchemy.pool import StaticPool
 
 import elspeth.web.composer.pipeline_planner as planner_module
 import elspeth.web.composer.provider_gateway as gateway_module
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.plugins.transforms.llm.providers.openrouter import OPENROUTER_APP_REFERER, OPENROUTER_APP_TITLE
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
 from elspeth.web.composer.boot_probe import build_composer_probe_requests, probe_composer_config
@@ -488,9 +489,12 @@ async def test_description_and_production_have_the_same_strict_flags_on_a_forwar
         "restore_parked_graph": True,
         "emit_pipeline_proposal": False,
     }
-    probe_hatch_strict = _strict_map(probe["hatch_terminal"]["tools"])
-    assert probe_hatch_strict == {"handoff_to_user": True, "restore_parked_graph": True, "emit_pipeline_proposal": False}
-    assert probe_hatch_strict == {name: hatch_strict[name] for name in probe_hatch_strict}
+    expected_hatch_tools = planner_module.planner_tool_definitions(dialect=ToolContractDialect.OPENAI_STRICT)
+    assert probe["hatch_terminal"]["tools"] == expected_hatch_tools
+    assert probe["hatch_terminal"]["tools"] == _hatch_request(planner_requests)["tools"]
+    assert _without(probe["hatch_terminal"], "messages", "max_tokens") == _without(
+        _hatch_request(planner_requests), "messages", "max_tokens"
+    )
 
 
 @pytest.mark.asyncio
@@ -555,16 +559,15 @@ async def test_hatch_probe_and_hatch_turn_follow_the_hatch_route_when_only_the_h
     assert set(_strict_map(probe_ii["loop_tools"]["tools"]).values()) == {"omitted"}
     assert set(_strict_map(probe_ii["planner_tools"]["tools"]).values()) == {"omitted"}
     assert "api_base" not in probe_ii["hatch_terminal"]
-    assert _strict_map(probe_ii["hatch_terminal"]["tools"]) == {
-        "handoff_to_user": True,
-        "restore_parked_graph": True,
-        "emit_pipeline_proposal": False,
-    }
+    expected_hatch_tools = planner_module.planner_tool_definitions(dialect=ToolContractDialect.OPENAI_STRICT)
+    assert probe_ii["hatch_terminal"]["tools"] == expected_hatch_tools
     recorded_ii = _record_planner_llm_calls(monkeypatch)
     requests_ii, _composer_ii, _result_ii = await _run_production_turn(
         tmp_path, monkeypatch, settings_ii, message="Build a CSV to JSONL pipeline.", reach_the_hatch=True
     )
     hatch_ii = _hatch_request(requests_ii)
+    assert probe_ii["hatch_terminal"]["tools"] == hatch_ii["tools"]
+    assert _without(probe_ii["hatch_terminal"], "messages", "max_tokens") == _without(hatch_ii, "messages", "max_tokens")
     assert "api_base" not in hatch_ii
     assert _strict_map(hatch_ii["tools"]) == {
         **dict.fromkeys(PLANNER_DISCOVERY_TOOL_NAMES, True),

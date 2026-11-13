@@ -563,6 +563,12 @@ describe("MessageBubble", () => {
       expect(screen.queryByText("Sources created (1)")).not.toBeInTheDocument();
     });
 
+    it("does not offer inline editing without a handler", () => {
+      render(<MessageBubble message={makeMessage({ role: "assistant", content: "Done." })} sourcesCreated={[makeSummary()]} />);
+      expect(screen.getByTestId("inline-source-created-turn")).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Edit the list" })).toBeNull();
+    });
+
     it("heading is NOT a button — no click affordance, no aria-expanded", () => {
       // Source creation is a notification, not a disclosure. The label
       // exists to name what follows, not to invite a toggle. Pinning the
