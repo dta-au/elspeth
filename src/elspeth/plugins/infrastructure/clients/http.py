@@ -97,6 +97,55 @@ def _sanitize_http_error_message(message: str) -> str:
     return _HTTP_URL_IN_TEXT.sub(sanitize_match, message)
 
 
+# Transport failures a live call records as ERROR with no response payload
+# (``HTTPCallError(type=type(e).__name__, message=...)``) and that replay can
+# rebuild as the same exception class from the recorded name and message
+# alone. Anything outside this closed set (for example an SSRF refusal, whose
+# ``kind`` is never recorded) cannot be reconstructed faithfully and is
+# refused as before.
+_REPLAYABLE_TRANSPORT_ERRORS: Mapping[str, type[httpx.TransportError]] = MappingProxyType(
+    {
+        cls.__name__: cls
+        for cls in (
+            httpx.ConnectTimeout,
+            httpx.ReadTimeout,
+            httpx.WriteTimeout,
+            httpx.PoolTimeout,
+            httpx.ConnectError,
+            httpx.ReadError,
+            httpx.WriteError,
+            httpx.CloseError,
+            httpx.ProxyError,
+            httpx.UnsupportedProtocol,
+            httpx.LocalProtocolError,
+            httpx.RemoteProtocolError,
+        )
+    }
+)
+
+
+def _recorded_transport_failure(
+    evidence: ReplayCallEvidence, *, request: httpx.Request
+) -> tuple[httpx.TransportError, RawCallPayload] | None:
+    """Rebuild a recorded transport failure and its error evidence, or None when the evidence is not one.
+
+    A transport failure is an ERROR call with no response payload whose error
+    evidence is exactly ``{"type", "message"}`` naming a class in
+    ``_REPLAYABLE_TRANSPORT_ERRORS``. Re-raising it routes the row as the
+    source run did, matching AuditedLLMClient's replay of classified errors.
+    """
+    if evidence.status is not CallStatus.ERROR or evidence.response_data is not None or evidence.error_data is None:
+        return None
+    error = evidence.error_data
+    if set(error) != {"type", "message"}:
+        return None
+    error_type = error["type"]
+    message = error["message"]
+    if type(error_type) is not str or type(message) is not str or error_type not in _REPLAYABLE_TRANSPORT_ERRORS:
+        return None
+    return _REPLAYABLE_TRANSPORT_ERRORS[error_type](message, request=request), RawCallPayload(error)
+
+
 if TYPE_CHECKING:
     from elspeth.contracts import Call
     from elspeth.contracts.audit_protocols import CallRecorder
@@ -614,6 +663,26 @@ class AuditedHTTPClient(AuditedClientBase):
             current_call_index=call_index,
         )
         expected_url = str(httpx.Request(method, full_url, params=params).url)
+        recorded_failure = _recorded_transport_failure(evidence, request=httpx.Request(method, expected_url))
+        if recorded_failure is not None:
+            transport_failure, recorded_error = recorded_failure
+            failure_payload = recorded_error
+            if response_admission is not None and not response_admission(failure_payload, b""):
+                raise AuditIntegrityError("HTTP replay error violates the current audit admission policy")
+            self._record_and_emit(
+                call_index=call_index,
+                full_url=full_url,
+                request_data=request_data,
+                response=None,
+                response_data=None,
+                error_data=failure_payload,
+                latency_ms=evidence.latency_ms or 0.0,
+                call_status=evidence.status,
+                request_payload=request_dto,
+                token_id_override=token_id,
+                source_call_id=evidence.source_call_id,
+            )
+            raise transport_failure
         response = self._restore_replay_response(evidence, method=method, expected_url=expected_url, request_headers=request_headers)
         if response_admission is not None:
             candidate, _ = self._build_response_payload(response, full_url)
@@ -713,6 +782,22 @@ class AuditedHTTPClient(AuditedClientBase):
         )
         if archived_request_id is not None and evidence.source_call_id != archived_request_id:
             raise AuditIntegrityError("Archived HTTP credential does not belong to the replayed source call")
+        recorded_failure = _recorded_transport_failure(evidence, request=httpx.Request(method, request.connection_url, params=params))
+        if recorded_failure is not None:
+            transport_failure, recorded_error = recorded_failure
+            self._record_and_emit(
+                call_index=call_index,
+                full_url=str(httpx.Request(method, request.original_url, params=params).url),
+                request_data=audit_request_data,
+                response=None,
+                response_data=None,
+                error_data=recorded_error,
+                latency_ms=evidence.latency_ms or 0.0,
+                call_status=evidence.status,
+                request_payload=audit_request_payload,
+                source_call_id=evidence.source_call_id,
+            )
+            raise transport_failure
         payload = evidence.response_data
         if payload is None or "transport" not in payload:
             raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} lacks transport")
@@ -1793,7 +1878,9 @@ class AuditedHTTPClient(AuditedClientBase):
             headers: Additional headers for this request
             json: JSON body for POST requests.
             params: Query parameters for the request.
-            follow_redirects: Whether to follow HTTP redirects (default: False)
+            follow_redirects: Whether to follow HTTP redirects (default: False).
+                Only a body-less GET may follow redirects; every hop is
+                re-sent as a GET, so any other method or a body is refused.
             max_redirects: Maximum redirect hops when follow_redirects=True
             allowed_ranges: IP networks that may bypass the default SSRF
                 blocklist when validating redirect targets. This must match
@@ -1818,6 +1905,11 @@ class AuditedHTTPClient(AuditedClientBase):
         method_upper = method.upper()
         if self._audit_policy is HTTPAuditPolicy.POWER_AUTOMATE_V1 and follow_redirects:
             raise ValueError("Power Automate HTTP policy refuses redirects")
+        if follow_redirects and (method_upper != "GET" or json is not None or form is not None or multipart_body is not None):
+            # _follow_redirects_safe re-sends every hop as a body-less GET, so
+            # following a redirect for any other request would silently answer
+            # a POST/PUT (or drop its body on 307/308) with a GET response.
+            raise ValueError("redirect following requires a body-less GET request")
         if form is not None:
             if method_upper != "POST" or json is not None or multipart_body is not None:
                 raise ValueError("form requires POST without a JSON body")

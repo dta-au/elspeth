@@ -169,7 +169,9 @@ def test_shutdown_after_a_preserves_atomic_failure_and_stops_b(prefix: str | Non
 
 @pytest.mark.parametrize("prefix", [None, "", "published"])
 def test_replay_miss_on_b_propagates_without_live_fallback_or_repeating_a(prefix: str | None) -> None:
-    from elspeth.plugins.infrastructure.clients.replayer import ReplayMissError
+    # The engine's replay authority (CallModeSession.replay_call) raises
+    # AuditIntegrityError for a current call with no matching source call.
+    from elspeth.contracts.errors import AuditIntegrityError
 
     transform = make_transform(prefix)
     provider = _make_provider([{"score": 5}])
@@ -177,11 +179,11 @@ def test_replay_miss_on_b_propagates_without_live_fallback_or_repeating_a(prefix
 
     def missing_b(messages, **kwargs):
         if messages[-1].content.startswith("score="):
-            raise ReplayMissError("synthetic-missing-b", {"messages": [message.content for message in messages]})
+            raise AuditIntegrityError("synthetic-missing-b: no recorded source call")
         return execute(messages, **kwargs)
 
     provider.execute_query.side_effect = missing_b
     transform._provider = provider
-    with pytest.raises(ReplayMissError):
+    with pytest.raises(AuditIntegrityError, match="synthetic-missing-b"):
         transform._process_row(make_pipeline_row({"text": "entry"}), make_context())
     assert provider.execute_query.call_count == 2
