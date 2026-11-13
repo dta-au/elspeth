@@ -25,7 +25,7 @@ from pydantic import Field, field_validator
 from elspeth.contracts import Determinism
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.contexts import LifecycleContext, LimiterProtocol, TransformContext
-from elspeth.contracts.errors import CapacityError, FrameworkBugError, PluginRetryableError, is_capacity_error
+from elspeth.contracts.errors import CapacityError, FrameworkBugError, PluginRetryableError, TransformSuccessReason, is_capacity_error
 from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.contracts.schema_contract import PipelineRow
@@ -37,7 +37,7 @@ from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.infrastructure.telemetry import make_warn_telemetry_before_start
 from elspeth.plugins.transforms.azure.errors import MalformedResponseError
-from elspeth.plugins.transforms.safety_utils import get_fields_to_scan
+from elspeth.plugins.transforms.safety_utils import get_fields_to_scan, unscanned_field_warnings
 from elspeth.plugins.transforms.safety_utils import validate_fields_not_empty as _validate_fields
 
 logger = structlog.get_logger(__name__)
@@ -404,10 +404,16 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
             if violation is not None:
                 return violation
 
-        # Pass through unchanged, under the node's declared contract.
+        # Pass through unchanged, under the node's declared contract. In
+        # "all" mode, name the non-string fields that were never sent for
+        # analysis so "validated" does not read as a whole-row verdict.
+        success_reason: TransformSuccessReason = {"action": "validated"}
+        unscanned = unscanned_field_warnings(self._fields, row)
+        if unscanned:
+            success_reason["validation_warnings"] = unscanned
         return TransformResult.success(
             PipelineRow(row.to_dict(), self._align_output_contract(self._apply_declared_output_field_contracts(row.contract))),
-            success_reason={"action": "validated"},
+            success_reason=success_reason,
         )
 
     def _analyze_field_once(
