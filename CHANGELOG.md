@@ -396,6 +396,16 @@ Sinks and retrieval:
   SQLite or PostgreSQL, an existing table, no DDL, a required effect ledger,
   and append only.
 
+### Composer
+
+- **A forked session's copy of a model-written file stays model-written**
+  (#365). Forking used to record the copy as VERBATIM, which let a session
+  fork turn LLM-generated text into a file the composer would accept as
+  prompt text. The copy now keeps its source's creation modality and the
+  `creating_*` provenance fields, anchored to the child session's own
+  `session_fork` audit row, so the prompt-surface guard, blob admission and
+  share checks treat it as model-written through forks of forks as well.
+
 ### Logging
 
 - **asyncio diagnostics that carry an exception are reduced to class and code
@@ -442,7 +452,11 @@ Sinks and retrieval:
   attributable to a row needs a maintainer decision. Reconciliation does not
   normalise decimal or datetime values.
 - The PostgreSQL testcontainer suite has not been run for the `database` sink
-  change.
+  change or the fork provenance fix (#365).
+- Fork copies made before the #365 fix stay VERBATIM; they are not rewritten.
+  A fork interrupted mid-copy across the upgrade fails closed on retry with a
+  modality mismatch. Pipeline `llm`-node output is still recorded VERBATIM
+  and has not been checked as a route to model-written prompt text.
 
 ### Publication and acceptance
 
