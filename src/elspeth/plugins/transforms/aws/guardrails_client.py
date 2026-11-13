@@ -5,11 +5,12 @@ from __future__ import annotations
 import hashlib
 import hmac
 import re
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 import structlog
 
@@ -65,7 +66,9 @@ _FILTER_CONFIDENCE = frozenset({"NONE", "LOW", "MEDIUM", "HIGH"})
 _MAX_USAGE_UNITS = 2**31 - 1
 _MAX_OUTPUTS = 8
 _MAX_OUTPUT_TEXT = 4096
-_MAX_REQUEST_TEXT = 1_000_000
+# ApplyGuardrail text bound; the transform checks it per field so an over-long
+# field is a row-data error, not a client-side refusal reported as a service failure.
+MAX_REQUEST_TEXT_CHARS = 1_000_000
 _MAX_ACTION_REASON = 4096
 _MAX_LONG = 2**63 - 1
 _APPLIED_GUARDRAIL_ID = re.compile(r"[a-z0-9]+\Z")
@@ -73,6 +76,36 @@ _APPLIED_GUARDRAIL_VERSION = re.compile(r"(?:[1-9][0-9]{0,7}|DRAFT)\Z")
 _APPLIED_GUARDRAIL_ARN = re.compile(r"arn:aws(?:-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:guardrail/[a-z0-9]+\Z")
 _GUARDRAIL_ORIGINS = frozenset({"REQUEST", "ACCOUNT_ENFORCED", "ORGANIZATION_ENFORCED"})
 _GUARDRAIL_OWNERSHIP = frozenset({"SELF", "CROSS_ACCOUNT"})
+SDK_TOTAL_MAX_ATTEMPTS = 3
+
+
+class _SendAttempts(threading.local):
+    """Per-thread count of started botocore HTTP attempts for the in-flight call.
+
+    botocore's standard retry handler retries transport failures inside one
+    SDK call and the exception carries no attempt count, so the audited
+    figure for a terminal transport failure comes from counting
+    ``before-send`` events. The class attribute is the per-thread initial
+    value, so the slot exists on every thread before its first event fires.
+    """
+
+    count: int = 0
+
+
+_send_attempts = _SendAttempts()
+
+
+def _record_send_attempt(**_: Any) -> None:
+    """Count one started HTTP attempt; registered on botocore's before-send event."""
+    _send_attempts.count += 1
+
+
+def _reset_send_attempts() -> None:
+    _send_attempts.count = 0
+
+
+def _observed_send_attempts() -> int:
+    return max(1, _send_attempts.count)
 
 
 class GuardrailResponseError(ValueError):
@@ -398,7 +431,7 @@ def parse_guardrail_response(
     ),
     non_raising=True,
 )
-def _provider_error(error: Exception) -> tuple[bool, int]:
+def _provider_error(error: Exception, *, observed_attempts: int) -> tuple[bool, int]:
     """Classify one botocore exception into (retryable, attempts).
 
     The exception's ``response`` envelope is vendor data: every member is read
@@ -407,9 +440,9 @@ def _provider_error(error: Exception) -> tuple[bool, int]:
     from botocore.exceptions import ClientError, ConnectionClosedError, ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError
 
     if isinstance(error, (ConnectTimeoutError, ConnectionClosedError, EndpointConnectionError, ReadTimeoutError)):
-        return True, 1
+        return True, observed_attempts
     if not isinstance(error, ClientError):
-        return False, 1
+        return False, observed_attempts
     attempts = 1
     response_metadata = error.response.get("ResponseMetadata")
     if isinstance(response_metadata, Mapping):
@@ -574,7 +607,7 @@ class BedrockGuardrailsClient(AuditedClientBase):
         source: GuardrailSource,
         required_filters: tuple[str, ...],
     ) -> GuardrailDecision:
-        if type(text) is not str or not 1 <= len(text) <= _MAX_REQUEST_TEXT:
+        if type(text) is not str or not 1 <= len(text) <= MAX_REQUEST_TEXT_CHARS:
             raise ValueError("guardrail text must be a bounded non-empty string")
         if source not in ("INPUT", "OUTPUT"):
             raise ValueError("guardrail source must be INPUT or OUTPUT")
@@ -719,6 +752,7 @@ class BedrockGuardrailsClient(AuditedClientBase):
         terminal_error: Exception | None = None
         attempts = 1
         try:
+            _reset_send_attempts()
             response = self._sdk_client.apply_guardrail(
                 guardrailIdentifier=self._guardrail_identifier,
                 guardrailVersion=self._guardrail_version,
@@ -771,7 +805,7 @@ class BedrockGuardrailsClient(AuditedClientBase):
             error_payload = RawCallPayload({"type": "malformed_response", "retryable": False})
             decision = None
         except _bedrock_provider_exception_types() as error:
-            retryable, attempts = _provider_error(error)
+            retryable, attempts = _provider_error(error, observed_attempts=_observed_send_attempts())
             terminal_error = GuardrailServiceError(retryable=retryable)
             response_payload = RawCallPayload({"operation": "apply_guardrail", "status": "service_error", "attempts": attempts})
             call_status = CallStatus.ERROR
@@ -812,15 +846,14 @@ def build_bedrock_runtime_client(region: str) -> BedrockRuntimeClient:
     import boto3
     from botocore.config import Config
 
-    return cast(
-        "BedrockRuntimeClient",
-        boto3.client(
-            "bedrock-runtime",
-            region_name=region,
-            config=Config(
-                retries={"mode": "standard", "total_max_attempts": 3},
-                connect_timeout=5,
-                read_timeout=15,
-            ),
+    client = boto3.client(
+        "bedrock-runtime",
+        region_name=region,
+        config=Config(
+            retries={"mode": "standard", "total_max_attempts": SDK_TOTAL_MAX_ATTEMPTS},
+            connect_timeout=5,
+            read_timeout=15,
         ),
     )
+    client.meta.events.register("before-send.bedrock-runtime", _record_send_attempt)
+    return cast("BedrockRuntimeClient", client)

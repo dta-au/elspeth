@@ -64,11 +64,15 @@ class BucketRegionVerification:
 class BucketRegionUnverifiedError(RuntimeError):
     """Sanitized HeadBucket outcome that did not prove one supported region."""
 
-    def __init__(self, *, code: str, retryable: bool, http_status: int | None = None) -> None:
+    def __init__(self, *, code: str, retryable: bool, http_status: int | None = None, inherited: bool = False) -> None:
         super().__init__("Amazon S3 bucket region is unverified")
         self.code = code
         self.retryable = retryable
         self.http_status = http_status
+        # True when a single-flight follower re-raises the leader's outcome:
+        # the HeadBucket call that produced it was recorded on another row's
+        # state, not this one.
+        self.inherited = inherited
 
 
 class S3HeadBucketSDKClient(Protocol):
@@ -543,6 +547,9 @@ class _InFlight:
     completed: threading.Event
     proof: BucketRegionProof | None = None
     error: BaseException | None = None
+    # The leader's sanitized HeadBucket outcome, kept apart from ``error`` so
+    # followers can re-raise it as an inherited, marked outcome.
+    unverified: BucketRegionUnverifiedError | None = None
 
 
 class BucketRegionCoordinator:
@@ -552,6 +559,22 @@ class BucketRegionCoordinator:
         self._lock = threading.Lock()
         self._cache: dict[str, BucketRegionProof] = {}
         self._in_flight: dict[str, _InFlight] = {}
+
+    def _fail_flight(
+        self,
+        bucket: str,
+        flight: _InFlight,
+        error: BaseException,
+        *,
+        unverified: BucketRegionUnverifiedError | None,
+    ) -> None:
+        with self._lock:
+            flight.error = error
+            flight.unverified = unverified
+            # Only the leader inserts and removes its own flight, so an absent
+            # entry here is an invariant break, not a race.
+            del self._in_flight[bucket]
+            flight.completed.set()
 
     def verify(self, bucket: str, live_verify: Callable[[], BucketRegionProof]) -> BucketRegionVerification:
         with self._lock:
@@ -568,13 +591,11 @@ class BucketRegionCoordinator:
         if leader:
             try:
                 proof = live_verify()
+            except BucketRegionUnverifiedError as error:
+                self._fail_flight(bucket, flight, error, unverified=error)
+                raise
             except BaseException as error:
-                with self._lock:
-                    flight.error = error
-                    # Only the leader inserts and removes its own flight, so
-                    # an absent entry here is an invariant break, not a race.
-                    del self._in_flight[bucket]
-                    flight.completed.set()
+                self._fail_flight(bucket, flight, error, unverified=None)
                 raise
             with self._lock:
                 self._cache[bucket] = proof
@@ -584,6 +605,15 @@ class BucketRegionCoordinator:
             return BucketRegionVerification(proof.region, proof.source, proof.http_status, "live", proof.provider_code)
 
         flight.completed.wait()
+        if flight.unverified is not None:
+            # A distinct, marked error per follower: the leader's object is
+            # not shared, and the caller can say the outcome was inherited.
+            raise BucketRegionUnverifiedError(
+                code=flight.unverified.code,
+                retryable=flight.unverified.retryable,
+                http_status=flight.unverified.http_status,
+                inherited=True,
+            ) from flight.unverified
         if flight.error is not None:
             raise flight.error
         if flight.proof is None:

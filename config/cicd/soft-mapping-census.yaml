@@ -532,6 +532,7 @@ files:
     boundary: 2
     dict[str, Any]: 1
   src/elspeth/plugins/transforms/azure/prompt_shield.py:
+    Mapping[str, object]: 1
     dict[str, Any]: 2
   src/elspeth/plugins/transforms/batch_classifier_metrics.py:
     dict[str, Any]: 2
@@ -1111,9 +1112,9 @@ files:
     dict[str, object]: 1
 totals:
   Mapping[str, Any]: 796
-  Mapping[str, object]: 317
+  Mapping[str, object]: 318
   MutableMapping[str, Any]: 8
   boundary: 70
   dict[str, Any]: 1124
   dict[str, object]: 401
-  soft: 2646
+  soft: 2647
