@@ -723,9 +723,12 @@ def _serve_request(source: str, payload: bytes, value_free: bool) -> tuple[str, 
     bug too: the template sees only plain row values (``TemplateRow``), never
     owned framework API, so it cannot come from row data (``render_tier1``).
     A read of a field the node does not declare is reported with its own
-    value-free text (``undeclared_field``). Any other failure is this row's
-    and is reported by its class alone, whatever ``value_free`` says, because
-    its message can quote row data.
+    value-free text (``undeclared_field``). Any other failure is reported by
+    its class alone when ``value_free`` is set, because its message can quote
+    row data; otherwise its bounded message is returned. The parent sets
+    ``value_free`` for every context that carries a ``TemplateRow``
+    (``_BoundedTemplate.render``), so only an operator-only context (no row)
+    ever gets the raw message.
     """
     try:
         # RLIMIT_CPU is cumulative over a process lifetime. Give each
@@ -1035,8 +1038,13 @@ class _BoundedTemplate:
         _check_template_source(self._source)
         _WORKER_SLOTS.acquire()
         try:
-            transport = _pack_context_value(context)
-            return _run_template_worker(self._source, pickle.dumps(transport, protocol=5), value_free=self._value_free)
+            packed: dict[int, Any] = {}
+            transport = _pack_context_value(context, memo=packed)
+            # A render failure's message can quote row data, so a context that
+            # carries a row always renders value-free, whatever the environment
+            # was built with; raw messages are kept for operator-only contexts.
+            value_free = self._value_free or any(type(value) is _RowTransport for value in packed.values())
+            return _run_template_worker(self._source, pickle.dumps(transport, protocol=5), value_free=value_free)
         finally:
             _WORKER_SLOTS.release()
 
@@ -1275,6 +1283,8 @@ def create_sandboxed_environment(*, value_free: bool = False) -> ImmutableSandbo
 
     Args:
         value_free: Render failures use only operator-authored keys and types.
+            A render whose context carries a ``TemplateRow`` is value-free
+            whatever this says; the flag decides only operator-only contexts.
 
     Returns:
         A sandboxed Jinja2 environment that:
