@@ -38,10 +38,10 @@ Status: **READY** (a lane exists), **DECISION** (blocked on the maintainer),
 | Advisor cache 52% | P2 investigation | READY (after CDA-07) | CDA-16 |
 | Hatch deadline / output-cap exits | P5 | READY (after CDA-12) | CDA-17 |
 | Budget/timeout warning | P6 | RESOLVED (D5: presenter scripts turns to fit the budget) | — |
-| F4b credential guard refuses ordinary prose with a "Credentials:" label (S4) | Narrow `credential_assignment` | DECISION D6 | CDA-19 (proposed) |
-| Provider 429 not retried; the user sees "model unavailable" at once (S5) | Retry with backoff inside the deadline | DECISION D7 (changes audit retry semantics) | — |
+| F4b credential guard refuses ordinary prose with a "Credentials:" label (S4) | Narrow `credential_assignment` | READY (D6 approved) | CDA-19 |
+| Provider 429 not retried; the user sees "model unavailable" at once (S5) | Retry with backoff inside the deadline | READY (D7 approved) | CDA-20 |
 | `/api/system/status` reports the composer available while the provider refuses for credit (S5) | Runbook credit check now; status probe later | READY (runbook) / proposed | — |
-| Queue time counts against the 240 s deadline (S5) | Count the deadline from admission | Optional; DECISION with D7 | — |
+| Queue time counts against the 240 s deadline (S5) | Count the deadline from worker claim, not submission | READY (D7 approved) | CDA-21 |
 | Planner `authoring_aids` unmarked for Anthropic prompt caching (S4) | Cache marker | READY | CDA-16 |
 | Skip advisor on chat turns | P3 | NOT FIXING (loses real catches, e.g. s03 T4) | — |
 | Register as a gated artifact | E2 | Optional, only with E3 | — |
@@ -73,16 +73,16 @@ Status: **READY** (a lane exists), **DECISION** (blocked on the maintainer),
 - **D5 resolved without code.** The presenter scripts the demo turns to fit
   the configured budget. P6 is not a lane.
 
-Open, raised by the spikes:
+Raised by the spikes, **both approved 2026-11-13**:
 
-- **D6. F4b (S4).** The `credential_assignment` pattern
+- **D6 approved. F4b (S4).** The `credential_assignment` pattern
   (`contracts/credential_material.py:85`) refuses visible prose such as
   "**Credentials:** managed by the operator…". This was reproduced
   in-process. Sonnet's ordinary answer to "Is this safe to run on sensitive
   data?" failed with 422. Narrow the pattern so the value must be a
   credential-shaped token rather than prose (proposed CDA-19, after CDA-18),
   or keep it and accept the false positive?
-- **D7. Provider 429s (S5).** Retry with backoff inside the turn deadline
+- **D7 approved. Provider 429s (S5).** Retry with backoff inside the turn deadline
   (`provider_errors.py`), which changes audit retry semantics; and, with it,
   whether the deadline should count from admission rather than submission.
 
@@ -106,6 +106,9 @@ parallelism per lane (for example `-n 4`); CPUs do not multiply across lanes.
 | 3b | CDA-12 | After CDA-10 and CDA-07 (`pipeline_planner.py` message builder, advisor system text, skills) |
 | 4 | CDA-14, CDA-15, CDA-16, CDA-17 | Polish and performance; CDA-17 after CDA-12 |
 | 3c | CDA-13 | After CDA-12 (planner custody and schema) |
+| 2a′ (also) | CDA-19 | After CDA-06 (`credential_material.py`); parallel with CDA-18 |
+| 4 (also) | CDA-21 | Coordination and worker only; after wave 3 |
+| 4b | CDA-20 | After CDA-17 (`pipeline_planner.py` call path) |
 
 Only wave 1 plus CDA-07 and CDA-08 matter before the demo, and only if they
 land before the code freeze (remediation plan, WP1a).
@@ -627,6 +630,79 @@ the marker is a trivial fix candidate; measure it.
   Change only the assertions about reasoning-only hits.
 - **Test command.** `pytest tests/unit/web/composer/test_reasoning_credential_scrub.py tests/unit/web/test_credential_guard.py -n 0 -q`.
 - **Depends on.** CDA-06.
+
+### CDA-19: Credential guard stops refusing label-style prose (F4b; D6 approved)
+
+- **Goal.** Visible prose such as "**Credentials:** managed by the operator
+  through the secret store." or "Credentials: managed by your operator, never
+  stored in the pipeline." passes. Real assignments still fail:
+  `password: hunter2`, `api_key = sk-…`, `"password": "Tr0ub4dor&3"`.
+- **Files.** `src/elspeth/contracts/credential_material.py`. Narrow the
+  `credential_assignment` pattern (~L85 onwards) so the value must be a
+  credential-shaped token, not purely markdown or punctuation, and not
+  followed by further prose words. Keep the detector version semantics:
+  bump `detector_version` if the stored contract requires it.
+- **Test files.** `tests/unit/web/test_credential_label_prose.py` (new).
+  - Both label sentences above pass.
+  - The S4 Sonnet reply (in the S4 note) passes.
+  - `password: hunter2`, the s06 reasoning sample and every existing
+    positive in `tests/unit/contracts/test_credential_material.py` still
+    refuse.
+- **Test command.** `pytest tests/unit/web/test_credential_label_prose.py tests/unit/contracts/test_credential_material.py -n 0 -q`.
+- **Also run.** `tests/unit/web/test_credential_guard.py` and
+  `tests/unit/web/test_credential_boundary_inventory.py`. This is a security
+  control, so add a negative control for every relaxed case.
+- **Depends on.** CDA-06.
+
+### CDA-20: Retry provider 429s with backoff inside the turn deadline (D7 approved)
+
+- **Goal.** A provider 429 (or other `retryable` failure per
+  `provider_errors.classify_provider_failure`) on a composer or planner call
+  is retried with bounded exponential backoff and jitter, honouring
+  `Retry-After`, only while the remaining turn deadline allows. Each attempt
+  is recorded as its own LLM call record with an attempt index; no attempt is
+  hidden from the audit trail. A non-retryable failure is unchanged.
+- **Files.**
+  - `src/elspeth/web/composer/provider_gateway.py`: a shared retry helper
+    around `_litellm_acompletion` (~L451-569).
+  - `src/elspeth/web/composer/provider_errors.py`: retry-after extraction.
+  - If the planner calls `_litellm_acompletion` directly
+    (`pipeline_planner.py` ~L3189, ~L3789), route it through the helper.
+  - The advisor already retries twice (`advisor_checkpoint.py:1348`); align
+    it or document why not.
+- **Test files.** `tests/unit/web/composer/test_provider_rate_limit_retry.py`
+  (new). With a fake provider that returns 429 twice and then succeeds:
+  - the turn succeeds;
+  - the audit holds 3 call records;
+  - the backoff respects `Retry-After`;
+  - with too little deadline left, the turn fails with today's message and
+    no extra attempt.
+- **Test command.** `pytest tests/unit/web/composer/test_provider_rate_limit_retry.py tests/unit/web/composer/test_provider_errors.py -n 0 -q`.
+- **Depends on.** CDA-17.
+
+### CDA-21: The turn deadline starts at worker claim, not submission (D7 approved)
+
+- **Goal.** Time a turn spends queued no longer consumes its
+  `composer_timeout_seconds`. The deadline is set when a worker claims the
+  operation. Keep a separate, generous queue-wait bound, so a request cannot
+  wait forever and the user sees a distinct "queued too long" outcome. Today
+  `deadline_at` is fixed at submission
+  (`coordination/composer_operation_authority.py` ~L401).
+- **Files.**
+  - `src/elspeth/web/coordination/composer_operation_authority.py`
+    (insert ~L380-405, `claim_next` ~L497).
+  - `src/elspeth/web/sessions/composer_async_worker.py`: deadline reads
+    (~L448, L760, L947, L1402-1432).
+  - The frontend's `deadline_remaining_ms` consumers, only if the wire
+    meaning changes.
+- **Test files.** `tests/unit/web/coordination/test_composer_operation_authority.py`.
+  - An operation queued for longer than the timeout still gets the full
+    timeout once claimed.
+  - An operation that exceeds the queue-wait bound fails with its own
+    outcome.
+- **Test command.** `pytest tests/unit/web/coordination/test_composer_operation_authority.py -n 0 -q`.
+- **Also run.** `pytest tests/ -m testcontainer -n 0`: this changes
+  persistence and claim/lease behaviour under contention.
 
 ### CDA-17: Planner deadline reserve and output-cap handling (P5)
 
