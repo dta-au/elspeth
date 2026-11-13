@@ -327,6 +327,62 @@ def test_structured_refusal_contains_only_closed_evidence() -> None:
     assert candidate not in repr(payload)
 
 
+@pytest.mark.parametrize(
+    "surface",
+    ["composer_provider_response", "composer_planner_response", "composer_advisor_response", "composer_provider_thinking"],
+)
+def test_model_output_refusal_identifies_model_and_keeps_evidence_closed(surface: str) -> None:
+    candidate = "sk-" + "a" * 24
+
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        require_no_credential_material({"ordinary": candidate}, surface=surface)
+
+    detail = (
+        "The model's output appears to contain a credential, so it was blocked. "
+        "If you gave the Composer a credential, store it through the secret service and use a secret reference instead. "
+        "Otherwise, retry your request."
+    )
+    assert str(caught.value) == detail
+    assert caught.value.to_payload() == {
+        "error_type": "credential_material_rejected",
+        "failure_code": "credential_material_rejected",
+        "detail": detail,
+        "category": "token_shape",
+        "surface": surface,
+        "detector_version": "1",
+    }
+    assert candidate not in repr(caught.value)
+    assert candidate not in repr(caught.value.to_payload())
+
+
+@pytest.mark.parametrize(
+    "surface",
+    [
+        "composer_provider_request",
+        "composer_state_before_provider",
+        "composer_yaml_import",
+        "web_message_ingress",
+        "web_fork_message_ingress",
+        "session_title",
+        "blob_filename",
+        "composer_tool_arguments",
+        "composer_tool_wire",
+        "composer_tool_batch",
+        "composer_mcp_tool_arguments",
+        "composer_prompt_guard_request",
+        "composer_recovery_reply",
+        "composer_unknown_response",
+    ],
+)
+def test_non_model_output_surfaces_keep_original_refusal_copy(surface: str) -> None:
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        require_no_credential_material("sk-" + "a" * 24, surface=surface)
+
+    detail = "This control content appears to contain a credential. Store the value through the secret service and use a secret reference."
+    assert str(caught.value) == detail
+    assert caught.value.to_payload()["detail"] == detail
+
+
 def test_structured_refusal_never_returns_a_user_controlled_mapping_key() -> None:
     candidate_key = "sk-" + "b" * 24
 
