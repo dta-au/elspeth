@@ -63,6 +63,18 @@ These changes are breaking:
   - OpenRouter `base_url` values with a query string or fragment.
   - A `web_scrape` `auth` setting, which previously failed every row, and a
     JSON record column without a path.
+  - Multi-query LLM configs whose generated field names collide across
+    queries, including the raw, `_usage` and `_model` fields. Uniqueness used
+    to be checked only when a query set `structured_output_prefix`; the
+    legacy precedence mode is removed.
+  - LLM pool delay settings that contradict each other (minimum above
+    maximum, or AIMD settings that cannot hold when `pool_size` is above 1).
+  - A tracing config that sets other keys while its provider is `none` or
+    omitted; those keys were previously ignored.
+- **Single-query LLM `metadata.model` is now the configured model.** The
+  model the provider actually served is in `metadata.served_model`
+  (`<query>_served_model` for multi-query). Readers that treated
+  `metadata.model` as the served model must switch fields.
 - **Some outputs and error shapes change.**
   - `batch_paired_preference` 95% intervals use Student's t at n-1 degrees
     of freedom instead of z = 1.96, so they widen for small samples (for
@@ -322,6 +334,12 @@ Transforms:
     required, and rejects a malformed readiness response.
   - The OpenRouter and gateway source configs no longer show the API key in
     their repr.
+  - Single-query `fields_added` declares the `<response_field>_usage` and
+    `<response_field>_model` fields the transform already wrote.
+  - The Langfuse tracer refuses a cached client whose base URL or secret key
+    differs from the one requested, and a conflicting `LANGFUSE_BASE_URL`.
+  - A required image field holding an empty list is an `invalid_input` row
+    error (`empty_image_list`).
 
 Sinks and retrieval:
 
