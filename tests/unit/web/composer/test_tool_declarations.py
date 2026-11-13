@@ -584,8 +584,8 @@ class TestStep3DiscoveryTierMigration:
     def test_diff_pipeline(self) -> None:
         assert self._get("diff_pipeline") == {
             "name": "diff_pipeline",
-            "description": "Compare pipeline states. Web loop `baseline_kind`: `last_accepted` "
-            "(newest committed proposal), else `request_start`; planner: `request_start`. "
+            "description": "Compare with the newest validated state other than the working state. `baseline_kind`: `last_validated` "
+            "or `request_start` if none exists (including never validated). In-request edits can compare with request start; planner: `request_start`. "
             "`data`: `from_version` (baseline; current is envelope `version`), `sources_changed`, "
             "`metadata_changed`, `total_changes`, `warnings_introduced`, "
             "`warnings_resolved`, and per-collection `added` / `removed` / `modified` "

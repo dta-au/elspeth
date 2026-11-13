@@ -1142,7 +1142,7 @@ def diff_states(
     current: CompositionState,
     *,
     baseline_validation: ValidationSummary | None = None,
-    baseline_kind: Literal["request_start", "last_accepted"] | None = None,
+    baseline_kind: Literal["request_start", "last_validated"] | None = None,
     current_validation: ValidationSummary | None = None,
 ) -> dict[str, Any]:
     """Compare two composition states and return a structured change summary.
@@ -3859,7 +3859,7 @@ class ToolContext:
     secret_wiring_policy: SecretWiringPolicy | None = None
     user_id: str | None = None
     baseline: CompositionState | None = None
-    baseline_kind: Literal["request_start", "last_accepted"] | None = None
+    baseline_kind: Literal["request_start", "last_validated"] | None = None
     current_validation: ValidationSummary | None = None
     runtime_preflight: RuntimePreflight | None = None
     structural_preflight: RuntimePreflight | None = None

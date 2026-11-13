@@ -304,6 +304,7 @@ class TurnEvidence:
         "_registration_revision",
         "_retained_history",
         "diff_baseline",
+        "diff_request_start_valid",
         "effects",
         "operation_id",
         "request_hash",
@@ -333,7 +334,8 @@ class TurnEvidence:
             raise AuditIntegrityError("Turn evidence session differs from its actual operation fence")
         self.session_id = session_id
         # Lazily resolved on the first diff dispatch; retained across provider rounds.
-        self.diff_baseline: tuple[CompositionState | None, Literal["request_start", "last_accepted"]] | None = None
+        self.diff_request_start_valid = False
+        self.diff_baseline: tuple[CompositionState | None, Literal["request_start", "last_validated"]] | None = None
         self.operation_id = session_operation_context.fence.operation_id if session_operation_context is not None else None
         self.request_id = request_id
         self.request_hash = stable_hash(request)

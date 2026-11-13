@@ -1101,7 +1101,7 @@ async def run_tool_batch(
     admitted_batch = completion.tool_batch
     assistant_tool_calls = admitted_batch.calls
     diff_baseline = ctx.turn_evidence.effects.initial_state if ctx.turn_evidence is not None else None
-    diff_baseline_kind: Literal["request_start", "last_accepted"] = "request_start"
+    diff_baseline_kind: Literal["request_start", "last_validated"] = "request_start"
     diff_baseline_resolved = False
     if ctx.turn_evidence is not None and ctx.turn_evidence.diff_baseline is not None:
         diff_baseline, diff_baseline_kind = ctx.turn_evidence.diff_baseline
@@ -3251,23 +3251,42 @@ async def run_tool_batch(
             if _unapplied_admission is not None:
                 return _unapplied_admission.result
             # Resolve only inside audited dispatch, after response credential
-            # admission. One fresh listing also supplies the held-edit hint.
-            diff_proposals = (
-                await turn_sessions_service.list_composition_proposals(turn_session_uuid)
-                if _tool_name == "diff_pipeline" and turn_sessions_service is not None and turn_session_uuid is not None
-                else ()
-            )
+            # admission. Cache history reads independently of in-request edits.
             if _tool_name == "diff_pipeline" and not diff_baseline_resolved:
-                committed_proposals = [proposal for proposal in diff_proposals if proposal.status == "committed"]
-                if committed_proposals:
-                    # Selection follows proposal creation order, not acceptance time.
-                    committed_state_id = committed_proposals[-1].committed_state_id
-                    if committed_state_id is None:
-                        raise AuditIntegrityError("Committed composition proposal has no committed state")
-                    assert turn_sessions_service is not None and turn_session_uuid is not None
-                    loaded_baseline = state_from_record(
-                        await turn_sessions_service.get_state_in_session(committed_state_id, turn_session_uuid)
-                    )
+                initial = diff_baseline
+                candidate = None
+                if initial is not None and turn_sessions_service is not None and turn_session_uuid is not None:
+                    initial_id = ctx.turn_evidence.effects.initial_state_id if ctx.turn_evidence is not None else None
+                    if initial_id is not None:
+                        initial_record = await turn_sessions_service.get_state_in_session(UUID(initial_id), turn_session_uuid)
+                        initial_meta = initial_record.composer_meta
+                        initial_valid = initial_record.is_valid and (
+                            initial_meta is None or "validation_lane" not in initial_meta or initial_meta["validation_lane"] == "strict"
+                        )
+                    else:
+                        initial_valid = ctx.policy_catalog.validate_composition_state(initial).validation.is_valid
+                        if initial_valid:
+                            initial_preflight = await ctx.preflight.cached_runtime_preflight(
+                                initial,
+                                user_id=user_id,
+                                session_id=session_id,
+                                cache=runtime_preflight_cache,
+                                initial_version=ctx.initial_version,
+                                session_scope=ctx.session_scope,
+                                llm_calls=ctx.recorder.llm_calls,
+                                plugin_snapshot=ctx.plugin_snapshot,
+                                session_operation_context=ctx.session_operation_context,
+                                deadline=ctx.deadline,
+                            )
+                            initial_valid = initial_preflight.is_valid
+                    if ctx.turn_evidence is not None:
+                        ctx.turn_evidence.diff_request_start_valid = initial_valid
+                    if not (initial_valid and initial.version != _state.version):
+                        candidate = await turn_sessions_service.get_last_validated_state(
+                            turn_session_uuid, through_version=initial.version, exclude_version=initial.version
+                        )
+                if candidate is not None:
+                    loaded_baseline = state_from_record(candidate)
                     env_ref_names = (
                         frozenset(item.name for item in ctx.custody.secret_service.list_refs(user_id))
                         if ctx.custody.secret_service is not None and user_id is not None
@@ -3281,7 +3300,7 @@ async def run_tool_batch(
                         )
                     except CredentialMaterialRefused:
                         # Keep the request alive, but never substitute request start
-                        # for an accepted baseline that failed credential admission.
+                        # for a validated baseline that failed credential admission.
                         diff_baseline = None
                         await emit_progress(
                             progress,
@@ -3295,10 +3314,19 @@ async def run_tool_batch(
                         )
                     else:
                         diff_baseline = loaded_baseline
-                    diff_baseline_kind = "last_accepted"
+                    diff_baseline_kind = "last_validated"
                 diff_baseline_resolved = True
                 if ctx.turn_evidence is not None:
                     ctx.turn_evidence.diff_baseline = (diff_baseline, diff_baseline_kind)
+            call_baseline, call_baseline_kind = diff_baseline, diff_baseline_kind
+            if (
+                _tool_name == "diff_pipeline"
+                and ctx.turn_evidence is not None
+                and ctx.turn_evidence.diff_request_start_valid
+                and ctx.turn_evidence.effects.initial_state.version != _state.version
+            ):
+                call_baseline = ctx.turn_evidence.effects.initial_state
+                call_baseline_kind = "last_validated"
             dispatched_result = await run_sync_in_worker(
                 execute_tool,
                 _tool_name,
@@ -3306,8 +3334,8 @@ async def run_tool_batch(
                 _state,
                 ctx.policy_catalog,
                 plugin_snapshot=ctx.plugin_snapshot,
-                baseline=diff_baseline,
-                baseline_kind=diff_baseline_kind,
+                baseline=call_baseline,
+                baseline_kind=call_baseline_kind,
                 data_dir=ctx.custody.data_dir,
                 session_engine=ctx.custody.session_engine,
                 session_id=session_id,
@@ -3353,7 +3381,7 @@ async def run_tool_batch(
             ):
                 # Neither baseline includes held edits that are not applied, so a
                 # pending proposal is invisible to it. Say so rather than let "0 changes" mislead.
-                pending = [proposal for proposal in diff_proposals if proposal.status == "pending"]
+                pending = await turn_sessions_service.list_composition_proposals(turn_session_uuid, status="pending")
                 if pending:
                     dispatched_result = replace(
                         dispatched_result,
