@@ -866,7 +866,7 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     "entry defaults to <query_key>_<suffix>. Per-query structured_output_prefix null/omitted keeps that default; "
     "empty string publishes the bare suffix; a nonempty ASCII identifier stem (at most 64 characters) publishes <stem>_<suffix>. "
     "This changes only structured row-field names, never response JSON keys or raw/usage/model names. "
-    "Any non-null override requires unique final generated names across ALL queries, including raw/usage/model fields. "
+    "Final generated names must be unique across ALL queries, including raw/usage/model fields, whatever the stem. "
     "Downstream mappers and sinks reference the exact published names.",
     # run-4 E1: the CLOSED per-query key set + namespace arbitration.
     # run-5 P2 correction: the run-4 set omitted response_format, max_tokens,

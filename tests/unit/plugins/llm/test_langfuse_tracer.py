@@ -98,6 +98,12 @@ class FakeLangfuseSDK:
     secret_key: str
     host: str
     tracing_enabled: bool
+    # Models the SDK's per-public_key resource manager: a fresh key binds the
+    # exporter to exactly this client's host and secret_key.
+    _resources: SimpleNamespace = field(init=False)
+
+    def __post_init__(self) -> None:
+        self._resources = SimpleNamespace(base_url=self.host, secret_key=self.secret_key)
 
 
 # ── Factory tests ──────────────────────────────────────────────────

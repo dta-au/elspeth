@@ -156,6 +156,19 @@ def resolve_image_parts(
                 return TransformResult.error(missing_reason, retryable=False)
             continue
 
+        # A required field holding an empty reference collection would
+        # otherwise contribute no parts, and the call would go out text-only
+        # for a row whose required image was never sent.
+        if isinstance(row[spec.field], (list, tuple)) and not row[spec.field]:
+            if spec.required:
+                empty_list_reason: TransformErrorReason = {
+                    "reason": "invalid_input",
+                    "field": spec.field,
+                    "error_type": "empty_image_list",
+                }
+                return TransformResult.error(empty_list_reason, retryable=False)
+            continue
+
         image_format = _resolve_format(spec, row)
         if isinstance(image_format, TransformResult):
             return image_format
