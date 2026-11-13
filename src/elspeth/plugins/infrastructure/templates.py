@@ -85,6 +85,13 @@ _MAX_WORKER_ADDRESS_GROWTH = 256 * 1024 * 1024
 # The render's wall clock. It starts when the request reaches a worker that
 # has reported ready, so interpreter start and imports are never charged to a row.
 _WORKER_TIMEOUT_SECONDS = 5.0
+# CPU seconds each request may use beyond what the worker had already used:
+# the soft RLIMIT_CPU a request runs under (``_serve_request``). It also
+# decides whose a wall-clock timeout is: a template can neither sleep nor do
+# I/O in the sandbox, so a worker that used less than this when the clock ran
+# out was off-CPU (a contended host, swapping, a stopped process), which says
+# nothing about the row (``_render_timeout_error``).
+_RENDER_CPU_BUDGET_SECONDS = 2
 # How long a new worker may take to report ready. Starting ELSPETH's own
 # worker is not row work: one that never becomes ready is ELSPETH's failure.
 _WORKER_START_TIMEOUT_SECONDS = 60.0
@@ -726,7 +733,7 @@ def _serve_request(source: str, payload: bytes, value_free: bool) -> tuple[str, 
         # worker lifts the soft limit back to that bound after the render.
         _, hard_limit = resource.getrlimit(resource.RLIMIT_CPU)
         usage = resource.getrusage(resource.RUSAGE_SELF)
-        cpu_limit = math.ceil(usage.ru_utime + usage.ru_stime + 2)
+        cpu_limit = math.ceil(usage.ru_utime + usage.ru_stime + _RENDER_CPU_BUDGET_SECONDS)
         if hard_limit != resource.RLIM_INFINITY and cpu_limit > hard_limit:
             return "worker_spent", ""
         resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, hard_limit))
@@ -888,13 +895,52 @@ def _start_worker(index: int) -> tuple[Any, Any]:
     return process, parent
 
 
+def _process_cpu_seconds(pid: int) -> float:
+    """User plus system CPU seconds a live (or unreaped) process has used.
+
+    Read from ``/proc/<pid>/stat`` (the worker already relies on ``/proc``):
+    fields 14 and 15, counted after the parenthesised command name, which may
+    itself contain spaces or parentheses.
+    """
+    stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    fields = stat[stat.rindex(")") + 2 :].split()
+    return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+
+
+def _render_timeout_error(*, cpu_used_seconds: float) -> Exception:
+    """Classify a render whose wall clock ran out, by the CPU it used.
+
+    A worker that used its request's CPU budget ran the row's template for
+    that long: the row's ``TemplateError`` (RLIMIT_CPU's SIGXCPU is about to
+    end it anyway). One that used less was off-CPU for most of the wall clock
+    (host contention, swapping, a stopped process), which says nothing about
+    the row: ``TemplateWorkerLostError``, which the run retries on a new worker.
+    The text names only times, never row data.
+    """
+    if cpu_used_seconds >= _RENDER_CPU_BUDGET_SECONDS:
+        return TemplateError("Template exceeded the execution time limit")
+    return TemplateWorkerLostError(
+        f"Template worker did not reply within {_WORKER_TIMEOUT_SECONDS:g} s of wall clock "
+        f"after using {cpu_used_seconds:.2f} s of its {_RENDER_CPU_BUDGET_SECONDS} s CPU budget"
+    )
+
+
 def _exchange(entry: tuple[Any, Any], source: str, payload: bytes, value_free: bool) -> tuple[str, str]:
     """Send one request to a running worker and read its reply."""
     process, parent = entry
     try:
+        cpu_before = _process_cpu_seconds(process.pid)
+    except OSError as exc:
+        # No /proc entry: the worker has already been reaped.
+        raise _worker_death(process, rendering=False) from exc
+    try:
         parent.send((source, payload, value_free))
         if not parent.poll(_WORKER_TIMEOUT_SECONDS):
-            raise TemplateError("Template exceeded the execution time limit")
+            try:
+                cpu_used = _process_cpu_seconds(process.pid) - cpu_before
+            except OSError as exc:
+                raise _worker_death(process, rendering=True) from exc
+            raise _render_timeout_error(cpu_used_seconds=cpu_used)
         status, value = parent.recv()
     except (EOFError, BrokenPipeError, ConnectionResetError) as exc:
         # A worker that ended with the request still unread resets the
