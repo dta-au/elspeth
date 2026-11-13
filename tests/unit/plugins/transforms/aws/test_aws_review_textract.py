@@ -1025,3 +1025,36 @@ def test_f9_project_pages_keeps_lines_of_unknown_pages_out_and_duplicates_in() -
     assert [page["page"] for page in pages] == [1, 2]
     assert all(line["id"] != "orphan" for page in pages for line in page["lines"])
     assert pages[1]["text"] == "p2 l0\np2 l1"
+
+
+# --- finding 10: per-row bucket mode bounds the key in UTF-8 bytes ---------------
+
+
+def _per_row_location(key: str) -> object:
+    transform = AWSTextractDocumentAnalysis(_async_config())
+    row = make_pipeline_row({"document_bucket": "docs", "document_key": key})
+    return _outcome(lambda: transform._read_document_location(row))
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "é" * 600,  # 600 characters, 1200 UTF-8 bytes
+        "scans/\ud800.pdf",  # lone surrogate: not encodable as UTF-8
+    ],
+    ids=["two-byte-chars-over-1024-bytes", "lone-surrogate"],
+)
+def test_f10_per_row_key_is_bounded_in_utf8_bytes(key: str) -> None:
+    result = _expect_result(_per_row_location(key))
+
+    assert result.status == "error"
+    assert result.reason is not None
+    assert result.reason["reason"] == "invalid_input"
+    assert result.reason["error_type"] == "invalid_s3_key"
+    assert result.retryable is False
+
+
+def test_f10_per_row_key_at_exactly_1024_bytes_is_accepted() -> None:
+    key = "a" * 1022 + "é"  # 1023 characters, 1024 UTF-8 bytes
+
+    assert _per_row_location(key) == ("docs", key, None)
