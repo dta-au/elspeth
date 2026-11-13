@@ -904,3 +904,60 @@ def test_f6_head_bucket_ssl_error_records_every_observed_attempt_and_is_retryabl
     assert exc_info.value.retryable is True
     assert exc_info.value.code == "transport_error"
     assert recorder.calls[0]["response_data"].to_dict()["attempts"] == 3
+
+
+# --- finding 7: inline configuration ceilings -----------------------------------
+
+
+def _inline_review_config(**overrides: object) -> dict[str, object]:
+    config: dict[str, object] = {
+        "region": "ap-southeast-2",
+        "document_format": "png",
+        "feature_types": ["FORMS"],
+        "text_field": "textract_text",
+        "schema": {"mode": "observed"},
+    }
+    config.update(overrides)
+    return config
+
+
+def _load_inline(**overrides: object) -> object:
+    from elspeth.plugins.transforms.aws.textract_inline_analysis import AWSTextractInlineAnalysisConfig
+
+    return AWSTextractInlineAnalysisConfig.from_dict(_inline_review_config(**overrides), plugin_name="aws_textract_inline_analysis")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_blocks", 10**12),
+        ("max_result_bytes", 10**15),
+        ("request_timeout_seconds", 1e9),
+        ("batch_wait_timeout_seconds", 1e12),
+    ],
+)
+def test_f7_inline_config_rejects_values_above_the_ceiling(field: str, value: object) -> None:
+    from elspeth.plugins.infrastructure.config_base import PluginConfigError
+
+    with pytest.raises(PluginConfigError, match=field):
+        _load_inline(**{field: value})
+
+
+def test_f7_inline_defaults_sit_at_the_ceilings() -> None:
+    from elspeth.plugins.transforms.aws import textract_inline_analysis as module
+
+    for name in (
+        "MAX_INLINE_BLOCKS",
+        "MAX_INLINE_RESULT_BYTES",
+        "MAX_INLINE_REQUEST_TIMEOUT_SECONDS",
+        "MAX_INLINE_BATCH_WAIT_TIMEOUT_SECONDS",
+    ):
+        assert name in vars(module), name
+    cfg = vars(_load_inline())
+    assert cfg["max_blocks"] == vars(module)["MAX_INLINE_BLOCKS"]
+    assert cfg["max_result_bytes"] == vars(module)["MAX_INLINE_RESULT_BYTES"]
+    assert cfg["request_timeout_seconds"] == vars(module)["MAX_INLINE_REQUEST_TIMEOUT_SECONDS"]
+    assert cfg["batch_wait_timeout_seconds"] == vars(module)["MAX_INLINE_BATCH_WAIT_TIMEOUT_SECONDS"]
+    # The batch-wait ceiling still covers every SDK attempt at the read-timeout ceiling.
+    transform = AWSTextractInlineAnalysis(_inline_review_config())
+    assert vars(transform)["_effective_batch_wait_timeout_seconds"] == vars(module)["MAX_INLINE_BATCH_WAIT_TIMEOUT_SECONDS"]
