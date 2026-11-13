@@ -545,6 +545,25 @@ Planner turns that end in text are written by the model. Fix: E1.
 plugins; the compiler's required core (`plugin_policy/compiler.py:17-40`)
 has 14.
 
+#### F21. The configured discovery budget does not apply after the first turn
+
+- **Where.** `composer_max_discovery_turns` (required setting; 24 in this
+  audit's environment, 10 in the shipped profiles) is enforced only by the
+  empty-session planner (`pipeline_planner.py:4858`). The tool loop counts
+  discovery-only rounds (`service.py` ~L1809, `discovery_turns_used`) but
+  never compares them with a limit: `service.py` holds no discovery maximum,
+  only `_max_composition_turns` (~L664, ~L2181). The
+  `convergence_discovery_budget` terminal the frontend and battery know about
+  is reachable only from the planner.
+- **What happens (READ; also raised independently by the hot-path recon).**
+  On a non-empty session, a model that keeps calling discovery tools is bound
+  only by the wall-clock deadline. Every round pays the validation and
+  bookkeeping costs in the remediation plan's efficiency table. The battery
+  never hit it (max 9 provider calls per tool-loop turn), so this is a guard
+  gap, not an observed failure.
+- **Fix.** CDA-22, after decision D8. The startup budget warning already
+  counts discovery turns as if they applied to both surfaces.
+
 #### F20. Run-state copy ignores which screen the user is on
 
 The panel copy "Run pipeline is blocked." (`DecisionPanel.tsx:99-101`) and

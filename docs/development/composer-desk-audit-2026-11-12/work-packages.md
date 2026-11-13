@@ -43,6 +43,8 @@ Status: **READY** (a lane exists), **DECISION** (blocked on the maintainer),
 | `/api/system/status` reports the composer available while the provider refuses for credit (S5) | Runbook credit check now; status probe later | READY (runbook) / proposed | — |
 | Queue time counts against the 240 s deadline (S5) | Count the deadline from worker claim, not submission | READY (D7 approved) | CDA-21 |
 | Planner `authoring_aids` unmarked for Anthropic prompt caching (S4) | Cache marker | READY | CDA-16 |
+| F21 discovery budget not enforced in the tool loop (also hot-path recon) | Enforce `composer_max_discovery_turns` in the loop | DECISION D8 | CDA-22 (proposed) |
+| Composer efficiency (hot-path recon): validate ≥3×/mutation, Stage-2 per mutation with reviews pending, rounds² context serialisation, provider-call bookkeeping, repeated fence proofs | P7–P10, E7 (remediation plan § Composer efficiency) | Plan of record governs; measure first. P10's snapshot-row skip needs a ruling | — |
 | Skip advisor on chat turns | P3 | NOT FIXING (loses real catches, e.g. s03 T4) | — |
 | Register as a gated artifact | E2 | Optional, only with E3 | — |
 
@@ -86,6 +88,15 @@ Raised by the spikes, **both approved 2026-11-13**:
   (`provider_errors.py`), which changes audit retry semantics; and, with it,
   whether the deadline should count from admission rather than submission.
 
+Open, from the hot-path recon:
+
+- **D8. F21.** Should the tool loop enforce `composer_max_discovery_turns`, as
+  the planner does and as the setting's name implies? Enforcing it adds a
+  terminal state (`convergence_discovery_budget`) to follow-up turns. The
+  alternative is to document that the setting is planner-only.
+- **P10 ruling.** May the composer skip writing a state snapshot row whose
+  content hash equals the previous row's?
+
 R16 is also decided: you confirmed the tutorial is a fixed prompt the learner
 cannot edit (ADR-031). CDA-01 enforces that in the frontend only.
 
@@ -109,6 +120,11 @@ parallelism per lane (for example `-n 4`); CPUs do not multiply across lanes.
 | 2a′ (also) | CDA-19 | After CDA-06 (`credential_material.py`); parallel with CDA-18 |
 | 4 (also) | CDA-21 | Coordination and worker only; after wave 3 |
 | 4b | CDA-20 | After CDA-17 (`pipeline_planner.py` call path) |
+
+**Cost coupling (hot-path recon).** CDA-09 adds Stage-2 validation to
+question-only turns, and CDA-20 multiplies per-call bookkeeping on retries.
+Both must report their measured added cost in `report.md`. CDA-12 reduces
+context serialisation cost, so measure P-14 again after it.
 
 Only wave 1 plus CDA-07 and CDA-08 matter before the demo, and only if they
 land before the code freeze (remediation plan, WP1a).

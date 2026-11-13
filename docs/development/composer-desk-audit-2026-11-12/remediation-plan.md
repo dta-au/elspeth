@@ -60,6 +60,31 @@ R8 and P5 do not.
 | P5 | A wall-clock-aware planner exit: hand off before the operation deadline instead of dying at 504. The planner and operation deadlines are equal today, so add a reserve. Add a rule for output-cap truncation (`finish_reason=length`) in the hatch. | No 240 s spinners. |
 | P6 | Address `composer_turn_budget_underfunded` (34 configured turns, about 16 fundable at 240 s): **D5:** for the demo, the presenter scripts turns to fit the configured budget; no code change. Size budgets to the timeout in the general product later. | Budgets that can actually be spent. |
 
+### Composer efficiency: the hot-path recon and the plan of record
+
+[composer-performance-remediation.md](../composer-performance-remediation.md)
+is the plan of record for composer performance. Its fixes and S-/P- items
+govern; nothing here supersedes them.
+
+A separate hot-path recon reached us on 2026-11-13: `docs/development/hot-path-recon.md`
+on branch `claude/admiring-bardeen-oj57gv` (commit `bf8adf06`), appendices C
+and D. Its composer findings are **static reading, one reader each, not
+cross-checked**, with line numbers valid at `1a7ff0e6`. They are leads to
+measure, not measurements. The table maps each one to the plan of record and
+to this audit.
+
+| Recon finding (composer) | Plan of record | Interaction with this audit | Proposed action |
+|---|---|---|---|
+| Whole-graph `validate()` runs ≥3× per **mutating** tool call (`tools/_common.py:1756, :3849, :3956`). A rejected mutation pays 2; a read-only call pays 2 even on a discovery-cache hit. Each walk instantiates a plugin per node; about 65 ms for 50 nodes, linear. | S-6 covers discovery tools only | Every CDA lane that adds a tool call pays this | **P7:** extend S-6 to the mutation path: compute once per state version and carry the result forward (the governing rule). Profile `_check_schema_contracts` (`composer/state.py:4790`, the heavy half) within it. |
+| Full Stage-2 validation runs after every valid mutation while reviews are pending (`tool_batch.py:3278`), and before every `preview_pipeline`, twice when handoff-shaped (`:2845`, `:2894`). It misses cache on each new version; `validation_memo.py` serves `/validate` and readiness only. | Fix 2B/2C memo (not the loop) | **CDA-09 (R14) adds more:** recomputing the turn-end preflight for every wired state puts Stage-2 on question-only turns | **P8:** measure Stage-2 per tool round. CDA-09 must reuse the per-turn cache and in-flight coalescing (`composer_preflight.py:152, :210-215`) and report the added cost. That is already in its brief; the cost now has a known size. |
+| Each LLM round re-serialises the full context at least 4× and keeps one canonical copy per call, so CPU and stored bytes grow with rounds² per turn | P-14, Fix 4 | **CDA-12 (R1)** cut the planner's prompt by 50% in S2. Smaller context compounds here. | Fold into Fix 4/P-14. Measure P-14 again after CDA-12. |
+| Each provider call is wrapped by 3 DB writes and 1 prompt-guard HTTP call; the Azure guard opens a new `httpx.AsyncClient` per inspection | S-4 (client reuse) | **CDA-20** retries multiply this per attempt | **P9:** batch the per-call bookkeeping writes, after S-4's client reuse. CDA-20 must keep each attempt auditable. |
+| About 20–24 SQL statements per mutating call (9–11 otherwise), mostly the same fence proof repeated on one connection. A full state snapshot row per mutation, even when content equals the last. | Fix 13 (review-card path only) | — | **P10:** prove the fence once per transaction. Skipping an identical snapshot row changes audit-row semantics, so **it needs a ruling.** |
+| Deepcopy, canonical JSON and redaction run on the event loop shared with HTTP and every turn | S-3 | **S5's hands-on settings:** raising `composer_async_worker_concurrency` to 16 multiplies event-loop stalls for everyone | Runbook caveat (below). Raise S-3's priority if attendees will use the composer hands-on. |
+| The freeform loop has no discovery-turn cap; `composer_max_discovery_turns` binds the planner only | — | **F21**, a behavioural finding (README) | **CDA-22**, after decision D8 |
+| No composer or web path has coverage under `tests/performance` | — | — | **E7:** a composer validate benchmark (50-node baseline, about 65 ms) as a guard for P7/P8 |
+| Advisor transcript rescans; credential scan per call; full transcript load per turn | S-8; Fix 11; S-5 | — | Covered by the plan of record; no new action |
+
 ## Enhancements
 
 | ID | Change |
@@ -150,6 +175,12 @@ Owner for every package is the maintainer; dates are set by the operator.
     set the trusted-proxy hosts if a whole room shares one network.
   - Pipeline runs execute one at a time per process: do not have attendees
     press Run together.
+- **Concurrency versus the event loop.** Composer turns share the serving
+  event loop, and heavy CPU work (deepcopy, canonical JSON, redaction) runs on
+  it (plan of record S-3; hot-path recon). Raising concurrency from 4 to 16
+  admits more turns but also makes every user's stream and HTTP calls stall
+  more. Measure p90 at the chosen setting during the preflight; do not assume
+  16 is safe.
 - **Provider credit.** When the provider refuses for credit, every turn fails
   with "The composer model is unavailable", while `/api/system/status` still
   reports the composer available (S5). Pre-fund the account and check the
