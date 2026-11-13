@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -274,6 +275,18 @@ def test_launch_blocker_admits_this_deployments_control_transforms() -> None:
     # A missing base transform is still rejected.
     incomplete = blocker_for(state_with("web_scrape", "llm"))
     assert incomplete is not None and incomplete[0] == "tutorial_plugin_set"
+    assert "field_mapper" in incomplete[1]
+
+    base = state_with("web_scrape", "llm", "field_mapper")
+    extra_output = blocker_for(
+        replace(
+            base,
+            outputs=(*base.outputs, OutputSpec(name="failed_rows", plugin="json", options={}, on_write_failure="discard")),
+        )
+    )
+    assert extra_output is not None and extra_output[0] == "tutorial_plugin_set"
+    assert "failed_rows" in extra_output[1]
+    assert "json" in extra_output[1]
 
 
 @pytest.mark.asyncio

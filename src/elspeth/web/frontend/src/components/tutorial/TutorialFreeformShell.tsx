@@ -3,6 +3,7 @@ import { getTutorialReadiness, getTutorialSample } from "@/api/client";
 import { ChatPanelContent } from "@/components/chat/ChatPanel";
 import { Button } from "@/components/ui";
 import { useComposer } from "@/hooks/useComposer";
+import { isComposePermanentRefusal, isComposeRefreshOnlyFailureCode } from "@/config/composer";
 import {
   interpretationMutationInFlight,
   useInterpretationEventsStore,
@@ -70,7 +71,7 @@ function buildBlocker(progress: BuildProgress): string | null {
   if (progress.decisionApplying) return "Applying your decision…";
   if (progress.decisionPending) return "A decision is waiting for you in the chat. Answer it before you continue.";
   if (!progress.hasPipeline) {
-    return "The Composer hasn't built a pipeline yet. Ask it to continue in the chat.";
+    return "The Composer hasn't built a pipeline yet. Select Resend tutorial brief to try again.";
   }
   return null;
 }
@@ -108,6 +109,7 @@ export function TutorialFreeformShell({
   const checkingRef = useRef(false);
   const instructionId = useId();
   const hasUserMessage = messages.some((message) => message.role === "user");
+  const storedBrief = [...messages].reverse().find((message) => message.role === "user");
   const pendingProposal = proposals.some((proposal) => proposal.status === "pending");
 
   useEffect(() => {
@@ -143,12 +145,30 @@ export function TutorialFreeformShell({
     return () => { active = false; };
   }, [sessionId, onSessionMissing, sampleRetry]);
 
+  const sendScriptedBrief = (): void => {
+    if (sampleUrls !== null) void composer.sendMessage(tutorialBrief(sampleUrls));
+  };
+
   const onSendBrief = (): void => {
     if (sentRef.current || sampleUrls === null || hasUserMessage || isComposing ||
         !composeTimeoutReady || activeSessionId !== sessionId) return;
     sentRef.current = true;
     setSent(true);
-    void composer.sendMessage(tutorialBrief(sampleUrls));
+    sendScriptedBrief();
+  };
+
+  const onResendBrief = (): void => {
+    if (storedBrief === undefined || sampleUrls === null || activeSessionId !== sessionId ||
+        !compositionStateLoaded || compositionState !== null || isComposing || pendingProposal ||
+        proposalActionPendingIds.length > 0 || pendingReviewCount > 0 || reviewApplying) return;
+    const hasReply = messages.slice(messages.indexOf(storedBrief) + 1)
+      .some((message) => message.role === "assistant" && !message.tool_calls?.length);
+    if (hasReply || isComposePermanentRefusal(storedBrief.local_failure_code) ||
+        isComposeRefreshOnlyFailureCode(storedBrief.local_failure_code)) {
+      sendScriptedBrief();
+    } else {
+      void composer.retryMessage(storedBrief.id);
+    }
   };
 
   const onContinue = (): void => {
@@ -207,6 +227,16 @@ export function TutorialFreeformShell({
           ? <p role="alert" className="tutorial-error">{readinessError}</p>
           : undefined,
         actions: sampleUrls !== null && chatVisible ? (
+          <>
+          {storedBrief !== undefined && compositionState === null && !isComposing && (
+            <Button
+              disabled={activeSessionId !== sessionId || !compositionStateLoaded ||
+                pendingProposal || proposalActionPendingIds.length > 0 || pendingReviewCount > 0 || reviewApplying}
+              onClick={onResendBrief}
+            >
+              Resend tutorial brief
+            </Button>
+          )}
           <Button
             variant="primary"
             onClick={onContinue}
@@ -215,6 +245,7 @@ export function TutorialFreeformShell({
           >
             {checking ? "Checking pipeline…" : "Continue to Run"}
           </Button>
+          </>
         ) : undefined,
       }}
     >
@@ -236,7 +267,7 @@ export function TutorialFreeformShell({
             )}
           </div>
         )}
-        {chatVisible && <ChatPanelContent composer={composer} allowFork={false} />}
+        {chatVisible && <ChatPanelContent composer={composer} allowFork={false} scriptMode />}
       </div>
     </TutorialWorkspaceFrame>
   );

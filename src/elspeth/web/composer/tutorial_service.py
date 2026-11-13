@@ -166,7 +166,7 @@ def _tutorial_launch_blocker(
         transform_ids = tuple(PluginId("transform", node.plugin) for node in state.nodes if node.plugin is not None)
         output_ids = tuple(PluginId("sink", output.plugin) for output in state.outputs)
     except ValueError:
-        return ("tutorial_plugin_set", "The saved tutorial pipeline does not match the supported tutorial plugin set.")
+        return ("tutorial_plugin_set", "The saved tutorial pipeline contains an invalid source, transform, or output plugin identifier.")
     source_valid = len(source_ids) == 1 and source_ids[0] in {
         PluginId("source", "csv"),
         PluginId("source", "json"),
@@ -192,7 +192,26 @@ def _tutorial_launch_blocker(
         or not (transform_set - _TUTORIAL_BASE_TRANSFORMS) <= _tutorial_control_transforms(snapshot)
         or any(node.plugin is None for node in state.nodes)
     ):
-        return ("tutorial_plugin_set", "The saved tutorial pipeline does not match the supported tutorial plugin set.")
+        differences: list[str] = []
+        if not source_valid:
+            sources = ", ".join(f"{name} ({source.plugin})" for name, source in state.sources.items()) or "none"
+            differences.append(f"Expected one csv or json source; found: {sources}.")
+        if not output_valid:
+            outputs = ", ".join(f"{output.name} ({output.plugin})" for output in state.outputs) or "none"
+            differences.append(f"Expected exactly one json output; found: {outputs}.")
+        missing = _TUTORIAL_BASE_TRANSFORMS - transform_set
+        if missing:
+            differences.append(f"Missing required transforms: {', '.join(sorted(str(plugin) for plugin in missing))}.")
+        unsupported = transform_set - _TUTORIAL_BASE_TRANSFORMS - _tutorial_control_transforms(snapshot)
+        if unsupported:
+            differences.append(f"Unsupported transforms: {', '.join(sorted(str(plugin) for plugin in unsupported))}.")
+        duplicates = {plugin for plugin in transform_ids if transform_ids.count(plugin) > 1}
+        if duplicates:
+            differences.append(f"Repeated transforms: {', '.join(sorted(str(plugin) for plugin in duplicates))}.")
+        structural_nodes = [node.id for node in state.nodes if node.plugin is None]
+        if structural_nodes:
+            differences.append(f"Unsupported non-plugin steps: {', '.join(structural_nodes)}.")
+        return ("tutorial_plugin_set", " ".join(differences))
     if not {*source_ids, *transform_ids, *output_ids} <= snapshot.available:
         return ("tutorial_plugin_unavailable", "One or more tutorial plugins are not currently available.")
     if tutorial_profile is None:
