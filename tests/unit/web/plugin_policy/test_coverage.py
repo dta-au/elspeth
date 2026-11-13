@@ -173,16 +173,19 @@ def _shield(
     input_stream: str,
     on_success: str,
     *,
-    detect_only: bool = False,
+    analysis_type: str = "both",
     fields: tuple[str, ...] = ("prompt",),
     plugin: str = "azure_prompt_shield",
 ) -> NodeSpec:
+    options: dict[str, object] = {"fields": list(fields)}
+    if plugin == "azure_prompt_shield":
+        options["analysis_type"] = analysis_type
     return _node(
         node_id,
         plugin,
         input_stream,
         on_success,
-        options={"detect_only": detect_only, "fields": list(fields)},
+        options=options,
     )
 
 
@@ -191,13 +194,13 @@ def _safety(
     input_stream: str,
     on_success: str,
     *,
-    detect_only: bool = False,
+    threshold: int = 4,
     fields: tuple[str, ...] = ("llm_response",),
     plugin: str = "azure_content_safety",
 ) -> NodeSpec:
-    options: dict[str, object] = {"detect_only": detect_only, "fields": list(fields)}
+    options: dict[str, object] = {"fields": list(fields)}
     if plugin == "azure_content_safety":
-        options["thresholds"] = {"hate": 4, "violence": 4, "sexual": 4, "self_harm": 4}
+        options["thresholds"] = {"hate": threshold, "violence": threshold, "sexual": threshold, "self_harm": threshold}
     return _node(
         node_id,
         plugin,
@@ -250,8 +253,8 @@ def test_power_automate_source_to_llm_keeps_ordinary_shield_requirement() -> Non
         (_state(_safety("wrong_role", "raw", "llm_in"), _llm(), source_target="raw"), False),
         # A shield after the LLM is too late.
         (_state(_llm(on_success="shield_in"), _shield("shield", "shield_in", "main")), False),
-        # Detect-only metadata cannot receive blocking credit.
-        (_state(_shield("shield", "raw", "llm_in", detect_only=True), _llm(), source_target="raw"), False),
+        # A single-analysis shield (a real non-blocking config) cannot receive blocking credit.
+        (_state(_shield("shield", "raw", "llm_in", analysis_type="user_prompt"), _llm(), source_target="raw"), False),
         # An external-call result after a shield reintroduces untrusted content.
         (
             _state(
@@ -494,7 +497,7 @@ def test_prompt_shield_input_coverage_fails_closed_for_dotted_mapper_source(
 ) -> None:
     shield = replace(
         _shield("shield", "raw", "mapped_in"),
-        options={"detect_only": False, "fields": shield_fields},
+        options={"fields": shield_fields},
     )
     llm = _node(
         "judge",
@@ -762,7 +765,8 @@ def test_extracted_graph_preserves_error_stream_producers() -> None:
         (_state(_llm(on_success="shield_in"), _shield("wrong_role", "shield_in", "main")), False),
         # A safety control before the LLM does not post-dominate its output.
         (_state(_safety("safety", "raw", "llm_in"), _llm(), source_target="raw"), False),
-        (_state(_llm(on_success="safe_in"), _safety("safety", "safe_in", "main", detect_only=True)), False),
+        # No-op thresholds (all 6) are a real non-blocking config: no credit.
+        (_state(_llm(on_success="safe_in"), _safety("safety", "safe_in", "main", threshold=6)), False),
         # Multiple effective controls remain valid.
         (
             _state(
@@ -914,7 +918,7 @@ def test_llm_source_malformed_options_are_unprovable_and_fail_closed(
 ) -> None:
     safety = replace(
         _safety("safety", "safe_in", "main"),
-        options={"detect_only": False, "fields": "all"},
+        options={"fields": "all"},
     )
     state = _llm_source_state(safety, on_success="safe_in")
     state = replace(
@@ -1265,7 +1269,6 @@ def test_content_safety_no_op_thresholds_do_not_receive_blocking_coverage_credit
     no_op = replace(
         no_op,
         options={
-            "detect_only": False,
             "thresholds": {"hate": 6, "violence": 6, "sexual": 6, "self_harm": 6},
         },
     )
@@ -1500,7 +1503,7 @@ def _all_fields_shield(node_id: str, input_stream: str, on_success: str) -> Node
         "azure_prompt_shield",
         input_stream,
         on_success,
-        options={"detect_only": False, "fields": "all"},
+        options={"fields": "all"},
     )
 
 
@@ -1774,7 +1777,7 @@ def test_all_fields_control_is_credited_for_output_coverage_too() -> None:
             "azure_content_safety",
             "safe_in",
             "main",
-            options={"detect_only": False, "fields": "all", "thresholds": {"hate": 4, "violence": 4, "sexual": 4, "self_harm": 4}},
+            options={"fields": "all", "thresholds": {"hate": 4, "violence": 4, "sexual": 4, "self_harm": 4}},
         ),
     )
 
@@ -1839,7 +1842,7 @@ def _self_publishing_state(node_type: str, *, guarded: bool) -> CompositionState
                 "azure_content_safety",
                 node_id,
                 "main",
-                options={"detect_only": False, "fields": "all", "thresholds": {"hate": 4, "violence": 4, "sexual": 4, "self_harm": 4}},
+                options={"fields": "all", "thresholds": {"hate": 4, "violence": 4, "sexual": 4, "self_harm": 4}},
             )
         )
     return _state(*nodes)
