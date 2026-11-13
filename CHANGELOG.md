@@ -130,6 +130,11 @@ These changes are breaking:
   options such as Truncate's `fields` match the canonical header name as
   well as the normalised name, so a config that used to be refused when the
   plugin was built may now be accepted.
+- **Dataverse throttling waits instead of failing.** A retryable 429 or 503
+  now waits and re-sends, up to 300 s of throttle waits per request; a 429
+  whose `Retry-After` exceeds 60 s still fails immediately. The source
+  records one extra ERROR call per waited-out throttle, so call indexes for
+  that page shift, and sink commit evidence may carry `throttle_wait_ms`.
 - **A missing core dependency stops plugin discovery.** Only `jinja2` is
   treated as optional; a missing `chromadb`, `bs4` or `html2text` now raises
   instead of silently dropping plugins from the catalog.
@@ -403,7 +408,12 @@ Sinks and retrieval:
   - Apostrophes in upsert alternate-key values are OData-escaped.
   - A lookup whose key is not mapped is a config error.
 - **Dataverse client:** errors carry a typed `retry_after` parsed from
-  `Retry-After`; nothing uses it yet.
+  `Retry-After`. The Dataverse source and sink honour it on 429 and 503
+  throttling: the client waits at least `Retry-After` (with an exponential
+  backoff floor and a 300 s throttle-wait budget per request, cancellable on
+  shutdown) and re-sends instead of failing the run. Each waited-out
+  throttled call is recorded with its `retry_wait_ms`, and sink commit
+  evidence names the waits as `throttle_wait_ms` (#76).
 - **S3 sink:** a closed sink refuses further requests, the CSV probe checks
   the header it will actually write, and an unencodable header raises a
   `ValueError`.
@@ -496,6 +506,9 @@ Sinks and retrieval:
   normalise decimal or datetime values.
 - The PostgreSQL testcontainer suite has not been run for the `database` sink
   change or the fork provenance fix (#365).
+- The Dataverse 300 s throttle-wait budget is not configurable, and the
+  client retries only 429 and 503; 500, 502, 504 and timeouts are not
+  retried in the client.
 - The 300 s guardrail row deadline is fixed, not configurable, and an engine
   retry of a guardrail row re-scans, and re-bills, fields that already passed.
   The guardrails client also awaits operator re-signing of three tier-model
