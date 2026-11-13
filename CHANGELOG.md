@@ -212,6 +212,14 @@ Sources:
 - **Azure blob source:** CSV is decoded per record, so an undecodable row is
   quarantined on its own with its raw bytes, line and row number. An
   undecodable header still quarantines the whole file.
+- **S3 CSV** skips blank records before header discovery; a blank-only
+  object raises the existing empty-file error.
+- **JSON source:** an undecodable UTF-16 or UTF-32 JSONL line is quarantined
+  on its own, with its true line number and raw bytes, instead of the whole
+  file. This registers a namespaced codec error handler,
+  `elspeth.source_byte_escape`, process-wide on import. UTF-8 input accepts
+  a leading byte-order mark; a mid-file U+FEFF is still data.
+- **Text source:** undecodable lines are quarantined one at a time.
 - **Dataverse source:** formatted values are requested with a `Prefer`
   header and their annotations stripped. `top` must be at least 1, and
   FetchXML must have exactly one named entity; both are checked at config
@@ -258,7 +266,8 @@ Transforms:
   charged to the next row, and a dead release thread fails pending rows at
   once instead of leaving them blocked until timeout.
 - **`blob_json_expand`, `blob_text`, `blob_csv`:** `max_blob_bytes` is enforced
-  while the blob is read, not after it is loaded. `blob_json_expand` splits
+  while the blob is read, not after it is loaded. `blob_csv_expand` validates
+  its delimiter the same way the CSV sink does. `blob_json_expand` splits
   JSONL only on `\n` (one trailing `\r` stripped), so records containing
   U+2028, U+2029 or U+0085 stay whole, and it rejects NaN and Infinity.
 - **`pdf_rasterize`:**
