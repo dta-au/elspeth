@@ -65,8 +65,9 @@ def _get_providers() -> dict[str, _ProviderEntry]:
         # its own import — a missing transitive dependency, a broken wheel —
         # or a missing first-party module propagates: the remediation for an
         # absent provider ("install elspeth[rag]") is wrong for a broken one.
-        missing = exc.name or ""
-        if missing != "chromadb" and not missing.startswith("chromadb."):
+        # A missing "chromadb.<submodule>" means chromadb itself imported, so
+        # it is that broken-install case and propagates too.
+        if exc.name != "chromadb":
             raise
 
     return providers
@@ -84,7 +85,12 @@ class RAGRetrievalConfig(RetrievalOutputConfig):
     @model_validator(mode="after")
     def validate_provider_config(self) -> Self:
         if self.provider not in PROVIDERS:
-            raise ValueError(f"Unknown provider: {self.provider!r}. Available: {sorted(PROVIDERS)}")
+            # provider is a RetrievalProviderName literal, so a value missing
+            # from the registry is a known provider whose optional SDK is absent.
+            raise ValueError(
+                f"Retrieval provider {self.provider!r} is not installed: it requires the elspeth[rag] extra "
+                f"(pip install 'elspeth[rag]'). Installed providers: {sorted(PROVIDERS)}"
+            )
         config_cls, _ = PROVIDERS[self.provider]
         config_cls(**self.provider_config)
         return self
