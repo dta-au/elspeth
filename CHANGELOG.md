@@ -86,6 +86,15 @@ These changes are breaking:
   raises `AuditIntegrityError`.
 - **`request_ssrf_safe` refuses `follow_redirects=True`** except for a
   body-less GET, raising `ValueError` before any network I/O.
+- **An Azure prompt shield earns `PROMPT_SHIELD` control credit only with
+  `analysis_type: both`** (explicit or as the configured default). A pipeline
+  that requires a `PROMPT_SHIELD` control and uses a shield set to
+  `user_prompt` or `document` alone is now refused at admission.
+- **Guardrail and safety error reasons change.** AWS guardrail transforms
+  report empty or over-length text as `invalid_input` (`empty_field`,
+  `field_too_long`) instead of `api_call_failed`. Azure safety transforms
+  stop with `retry_timeout` / `row_deadline_exceeded` once the row deadline
+  has passed. Textract `blob_too_large` reports its actual size as `>max`.
 - **CI runs one Python 3.14 lane**, which is the coverage lane. Required
   status-check names change with it, for example
   `Test (Python 3.14, shard N)` and `Timing-sensitive tests (Python 3.14)`,
@@ -285,6 +294,16 @@ Transforms:
   - Multi-page replay works, and duplicate page rows are refused.
   - The renderer identity check also accepts the macOS and Windows pdfium
     library names.
+- **Textract:** FORMS entries carry `value_selection_status` (`SELECTED`,
+  `NOT_SELECTED` or none), and a malformed selection fails closed. Inline
+  analysis reads its input with a size bound. Closing a Textract transform no
+  longer sets the engine's shutdown event. When a bucket-region lookup fails,
+  rows waiting on the same lookup get the shared failure, marked with
+  `cache_status: shared_failure`.
+- **AWS guardrails** count botocore attempts as they are sent, so a transport
+  error reports the attempts actually made.
+- **Azure analyze transforms** (Document Intelligence, Content Understanding)
+  retry network errors while polling until the poll deadline.
 - **LLM transforms:**
   - Replaying a recorded content-policy refusal raises the same error as the
     live run, so the row is handled the same way.
@@ -362,9 +381,15 @@ Sinks and retrieval:
   stays skipped on 3.14: the model it checks predates PEP 649.
 - Four signed tier-model allowlist entries for
   `contracts/runtime_val_manifest.py` drift and await operator re-signing.
-  Keyless scans report them. Five more go stale with the plugin fixes: one
-  for the batch transform mixin and four for the S3 sink.
+  Keyless scans report them. The plugin fixes leave more awaiting re-signing:
+  one for the batch transform mixin, four for the S3 sink, and the signed
+  `http.py` entries after the client changes.
 - In pooled LLM mode, time a row spends queueing is still unbounded.
+- The plugin source-hash lint now checks the AWS transforms, which it had
+  skipped: it did not scan `plugins/transforms/aws` or recognise the Bedrock
+  guardrail base. The stale `aws_bedrock_prompt_shield` hash it then found is
+  re-pinned, and a test now requires the rule to cover every registered
+  plugin.
 - Bedrock's readiness check still requests 32 tokens, so reasoning models may
   fail it. Recording an empty LLM completion as an ERROR call needs a
   maintainer decision; only its classification has changed.
