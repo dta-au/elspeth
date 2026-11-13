@@ -623,6 +623,14 @@ class TextractClient(_TextractAuditedClient):
             call_mode_session=call_mode_session,
         )
         self._sdk_client = sdk_client
+        # Parent-local index of this adapter's latest call. A row state's
+        # Textract calls are sequential on one worker thread, so the next
+        # call takes the following index; replay uses it to ask the archive
+        # whether the source run made that call.
+        self._last_call_index: int | None = None
+        # Verify mode: the source run's provider-generated job id, pinned at
+        # the row's first poll so every later poll must name the same job.
+        self._source_job_id: str | None = None
 
     def start_document_analysis(
         self,
@@ -654,6 +662,7 @@ class TextractClient(_TextractAuditedClient):
             sdk_request["QueriesConfig"] = {"Queries": query_requests}
 
         call_index = self._next_call_index()
+        self._last_call_index = call_index
         location_identity: Mapping[str, str | None] = {"bucket": bucket, "key": key} if audit_identity is None else dict(audit_identity)
         request_payload = RawCallPayload(
             {
@@ -799,22 +808,92 @@ class TextractClient(_TextractAuditedClient):
         assert receipt is not None
         return receipt
 
-    def get_document_analysis(self, *, job_id: str, next_token: str | None) -> AnalysisResultPage:
-        sdk_request: dict[str, Any] = {"JobId": job_id, "MaxResults": 1000}
-        next_token_fingerprint = None
-        if next_token is not None:
-            sdk_request["NextToken"] = next_token
-            next_token_fingerprint = _fingerprint(next_token)
-        call_index = self._next_call_index()
-        request_payload = RawCallPayload(
+    @staticmethod
+    def _poll_request_payload(*, job_id: str, next_token: str | None) -> RawCallPayload:
+        return RawCallPayload(
             {
                 "operation": "get_document_analysis",
                 "job_id": job_id,
                 "next_token_present": next_token is not None,
-                "next_token_fingerprint": next_token_fingerprint,
+                "next_token_fingerprint": None if next_token is None else _fingerprint(next_token),
                 "max_results": 1000,
             }
         )
+
+    def source_has_next_poll(self, *, job_id: str, next_token: str | None) -> bool:
+        """Replay only: whether the source run made this poll as the row's next call.
+
+        The source run ended its poll loop on a wall-clock deadline (or a
+        shutdown); replay answers each poll at once, so the clock cannot
+        reproduce that decision. The archive can: the replayed job id and
+        page tokens are the source run's, so the next poll's request is
+        exactly the one the source would have recorded at the next index.
+        """
+        session = self._call_mode_session
+        if session is None or session.mode is not RunMode.REPLAY:
+            raise contract_errors.FrameworkBugError("Textract source poll lookup is replay-only")
+        if self._last_call_index is None:
+            raise contract_errors.FrameworkBugError("Textract source poll lookup before the start call")
+        return session.has_source_call(
+            call_type=CallType.HTTP,
+            request_data=self._poll_request_payload(job_id=job_id, next_token=next_token).to_dict(),
+            current_state_id=self._state_id,
+            current_operation_id=self._operation_id,
+            current_call_index=self._last_call_index + 1,
+        )
+
+    def _verify_poll_lookup(self, *, call_index: int, request_payload: RawCallPayload) -> RawCallPayload:
+        """Verify only: the live poll request with the source run's provider-generated identities.
+
+        A verify run's ClientRequestToken derives from the verify run id, so
+        Textract starts a new job: the live JobId and every NextToken differ
+        from the source run's and cannot be derived. They are substituted
+        from the archived source request at this index, as the start call
+        substitutes the source token fingerprint; every other request member
+        (operation, next-token presence, page size) is still compared exactly.
+        The source job id is pinned at the row's first poll and must not change.
+        """
+        session = self._call_mode_session
+        assert session is not None
+        archived = session.archived_call_request(
+            call_type=CallType.HTTP,
+            current_state_id=self._state_id,
+            current_operation_id=self._operation_id,
+            current_call_index=call_index,
+        ).request_data
+        if "operation" not in archived or archived["operation"] != "get_document_analysis":
+            raise AuditIntegrityError(f"Textract verify source call at index {call_index} is not a GetDocumentAnalysis poll")
+        source_job_id = archived["job_id"] if "job_id" in archived else None
+        if type(source_job_id) is not str or not 1 <= len(source_job_id) <= _MAX_JOB_ID_LENGTH:
+            raise AuditIntegrityError(f"Textract verify source poll at index {call_index} has no valid job id")
+        if self._source_job_id is None:
+            self._source_job_id = source_job_id
+        elif source_job_id != self._source_job_id:
+            raise AuditIntegrityError("Textract verify source job id changed within one row")
+        live = request_payload.to_dict()
+        if "next_token_fingerprint" not in archived:
+            raise AuditIntegrityError(f"Textract verify source poll at index {call_index} has no next-token fingerprint member")
+        source_fingerprint = archived["next_token_fingerprint"]
+        if live["next_token_present"]:
+            if (
+                type(source_fingerprint) is not str
+                or len(source_fingerprint) != 64
+                or any(char not in "0123456789abcdef" for char in source_fingerprint)
+            ):
+                raise AuditIntegrityError(f"Textract verify source poll at index {call_index} has no next-token fingerprint")
+        elif source_fingerprint is not None:
+            raise AuditIntegrityError(f"Textract verify source poll at index {call_index} paginates where the live poll does not")
+        live["job_id"] = source_job_id
+        live["next_token_fingerprint"] = source_fingerprint
+        return RawCallPayload(live)
+
+    def get_document_analysis(self, *, job_id: str, next_token: str | None) -> AnalysisResultPage:
+        sdk_request: dict[str, Any] = {"JobId": job_id, "MaxResults": 1000}
+        if next_token is not None:
+            sdk_request["NextToken"] = next_token
+        call_index = self._next_call_index()
+        self._last_call_index = call_index
+        request_payload = self._poll_request_payload(job_id=job_id, next_token=next_token)
         telemetry_request = RawCallPayload(
             {
                 "operation": "get_document_analysis",
@@ -866,7 +945,11 @@ class TextractClient(_TextractAuditedClient):
                 operation="get_document_analysis",
             )
             return AnalysisResultPage(semantic_response=semantic, next_token=token)
-        self._admit_verify_call(call_index=call_index, request_payload=request_payload)
+        lookup_request: RawCallPayload | None = None
+        session = self._call_mode_session
+        if session is not None and session.mode is RunMode.VERIFY:
+            lookup_request = self._verify_poll_lookup(call_index=call_index, request_payload=request_payload)
+        self._admit_verify_call(call_index=call_index, request_payload=request_payload, lookup_request=lookup_request)
         started = time.perf_counter()
         terminal_error: Exception | None = None
         attempts = 1
@@ -938,6 +1021,7 @@ class TextractClient(_TextractAuditedClient):
             response_payload=response_payload,
             error_payload=error_payload,
             latency_ms=latency_ms,
+            lookup_request=lookup_request,
         )
         self._emit_after_audit(
             status=call_status,

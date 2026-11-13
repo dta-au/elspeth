@@ -52,6 +52,14 @@ class Session:
         if self.admission_error is not None:
             raise self.admission_error
 
+    def archived_call_request(self, **kwargs: Any) -> object:
+        # A verify poll reads the archived source request (to substitute the
+        # source job id) before admission; an invalid source call refuses here.
+        del kwargs
+        if self.admission_error is not None:
+            raise self.admission_error
+        raise AssertionError("this fake archives no source request")
+
 
 def _evidence(
     payload: dict[str, Any] | None, *, status: CallStatus = CallStatus.SUCCESS, error: dict[str, Any] | None = None
@@ -477,7 +485,9 @@ def test_verify_invalid_source_call_prevents_all_aws_sdk_construction_and_dispat
         head_bucket.verify_bucket_region("docs")
     with pytest.raises(AuditIntegrityError, match=admission_message):
         guardrail.apply_guardrail(text="private text", source="INPUT", required_filters=("PROMPT_ATTACK",))
-    assert len(session.admissions) == 5
+    # The Textract poll refuses at the archived-request read (source job id
+    # substitution), one step before admission; the other four refuse at admission.
+    assert len(session.admissions) == 4
     assert builds == []
     assert recorder.calls == []
 

@@ -635,6 +635,7 @@ def test_f3_session_answers_source_call_existence_without_reading_payloads() -> 
     session = AuditedCallModeSession(
         factory, current_run_id="current", source_run_id="source", mode=RunMode.REPLAY, coordination_token=_CURRENT_TOKEN
     )
+    factory.execution.get_call_request_data.reset_mock()
     request = {"operation": "get_document_analysis"}
 
     factory.execution.find_call_for_current_parent.return_value = call
@@ -693,12 +694,29 @@ def _replay_transform(client: _ReplayRowClient) -> AWSTextractDocumentAnalysis:
     return transform
 
 
+def _run_replay_verified(transform: AWSTextractDocumentAnalysis) -> object:
+    """Drive the post-verification path; the replayed HeadBucket role has its own tests."""
+    verification = BucketRegionVerification(region="ap-southeast-2", source="response_header", http_status=200, cache_status="live")
+    return _outcome(
+        lambda: transform._process_verified_document(
+            _row(),
+            state_id="state-1",
+            token_id="token-1",
+            bucket="docs",
+            key="invoice.pdf",
+            version=None,
+            verification=verification,
+            ctx=make_context(run_id="run-1"),
+        )
+    )
+
+
 def test_f3_replay_poll_loop_ends_from_the_archive_without_sleeping() -> None:
     client = _ReplayRowClient(pages=[_page(status="IN_PROGRESS")] * 10, source_polls=3)
     transform = _replay_transform(client)
     started = time.monotonic()
 
-    result = _expect_result(_run_async(transform))
+    result = _expect_result(_run_replay_verified(transform))
 
     assert time.monotonic() - started < 5.0
     assert result.reason is not None
@@ -711,7 +729,7 @@ def test_f3_replay_poll_loop_reaches_success_without_real_sleeps() -> None:
     transform = _replay_transform(client)
     started = time.monotonic()
 
-    result = _expect_result(_run_async(transform))
+    result = _expect_result(_run_replay_verified(transform))
 
     assert time.monotonic() - started < 5.0
     assert result.status == "success", result.reason
@@ -722,7 +740,7 @@ def test_f3_replay_poll_loop_reproduces_a_transient_escalation_at_archive_end() 
     transform = _replay_transform(client)
     started = time.monotonic()
 
-    error = _expect_retryable(_run_async(transform))
+    error = _expect_retryable(_run_replay_verified(transform))
 
     assert time.monotonic() - started < 5.0
     assert "ThrottlingException" in str(error)

@@ -347,7 +347,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0e7af16858c73555"
+    source_file_hash: str | None = "sha256:66ffa277493ed1c3"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -469,6 +469,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         self._row_clients_lock = threading.Lock()
         self._shutdown = threading.Event()
         self._run_shutdown: threading.Event | None = None
+        self._run_mode: RunMode | None = None
         self._batch_initialized = False
 
     def _bind_profiled_audit_identity(
@@ -536,6 +537,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         # event is only ever read.
         self._shutdown = threading.Event()
         self._run_shutdown = ctx.shutdown_event
+        self._run_mode = ctx.run_mode
         self._bucket_region_coordinator = BucketRegionCoordinator()
         created_s3 = False
         created_textract = False
@@ -821,10 +823,22 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             return location
         bucket, key, version = location
         try:
-            verification = self._bucket_region_coordinator.verify(
-                bucket,
-                lambda: self._verify_bucket_region_live(bucket, state_id=state_id, token_id=token_id, ctx=ctx),
-            )
+            if self._run_mode is RunMode.REPLAY:
+                # Finding 3: in replay the source run's leader/follower split
+                # comes from the archive, not from which thread wins the lock.
+                head_bucket = self._head_bucket_client(state_id=state_id, token_id=token_id, ctx=ctx)
+                audit_identity = self._audit_location_identity(None)
+                verification = self._bucket_region_coordinator.verify_replay(
+                    bucket,
+                    lambda: head_bucket.verify_bucket_region(bucket, audit_identity=audit_identity),
+                    source_led=head_bucket.source_made_head_bucket_call(bucket, audit_identity=audit_identity),
+                    wait_seconds=S3_HEAD_BUCKET_SDK_ALLOWANCE_SECONDS,
+                )
+            else:
+                verification = self._bucket_region_coordinator.verify(
+                    bucket,
+                    lambda: self._verify_bucket_region_live(bucket, state_id=state_id, token_id=token_id, ctx=ctx),
+                )
         except BucketRegionUnverifiedError as error:
             if error.retryable:
                 # A transient HeadBucket failure (throttle, 5xx, transport) is
@@ -933,7 +947,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             submit_reason: TransformErrorCategory = "result_too_large" if error.category == "response_too_large" else "malformed_response"
             return TransformResult.error({"reason": submit_reason, "error_type": "submit_response"}, retryable=False)
 
-        collected = self._poll_and_collect(client, receipt, started_at=started_at)
+        collected = self._poll_and_collect(client, receipt, started_at=started_at, replay=self._run_mode is RunMode.REPLAY)
         if isinstance(collected, TransformResult):
             return collected
         result_pages = collected
@@ -991,6 +1005,11 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         return result
 
     def _verify_bucket_region_live(self, bucket: str, *, ctx: TransformContext, state_id: str, token_id: str) -> BucketRegionProof:
+        return self._head_bucket_client(state_id=state_id, token_id=token_id, ctx=ctx).verify_bucket_region(
+            bucket, audit_identity=self._audit_location_identity(None)
+        )
+
+    def _head_bucket_client(self, *, ctx: TransformContext, state_id: str, token_id: str) -> HeadBucketClient:
         if self._recorder is None or self._s3_sdk_client is None or not self._run_id:
             raise FrameworkBugError("Amazon Textract bucket verification used before on_start")
         return HeadBucketClient(
@@ -1004,7 +1023,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             sdk_client=self._s3_sdk_client,
             token_id=token_id,
             call_mode_session=ctx.call_mode_session,
-        ).verify_bucket_region(bucket, audit_identity=self._audit_location_identity(None))
+        )
 
     def _poll_and_collect(
         self,
@@ -1012,6 +1031,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         receipt: StartAnalysisReceipt,
         *,
         started_at: float,
+        replay: bool = False,
     ) -> tuple[Mapping[str, Any], ...] | TransformResult:
         """Poll the accepted job to a terminal status and collect every result page.
 
@@ -1027,6 +1047,15 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
           when the deadline arrives escalates to an engine row retry
           (``PluginRetryableError``); that retry resubmits with the same
           deterministic ClientRequestToken and so re-attaches to this job.
+
+        Replay (finding 3): the source run's deadline was wall-clock time,
+        which replay cannot reproduce because it answers each poll at once.
+        In replay the loop never sleeps, and "the deadline arrived" means "the
+        source run made no further poll" (``source_has_next_poll``), so the
+        replayed call sequence and outcome are the archived ones. Known
+        residual: a final SUCCEEDED page that arrived after the source
+        deadline (source outcome ``poll_timeout``) replays as success, since
+        the call archive does not record that the deadline had passed.
         """
         deadline = started_at + self._poll_timeout_seconds
         interval = self._poll_interval_seconds
@@ -1039,7 +1068,10 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         while True:
             if self._shutdown_requested():
                 return TransformResult.error({"reason": "shutdown_requested"}, retryable=False)
-            if time.monotonic() >= deadline:
+            deadline_reached = (
+                not client.source_has_next_poll(job_id=receipt.job_id, next_token=next_token) if replay else time.monotonic() >= deadline
+            )
+            if deadline_reached:
                 if transient is not None:
                     raise self._transient_poll_escalation(transient)
                 return TransformResult.error({"reason": "poll_timeout"}, retryable=False)
@@ -1057,6 +1089,8 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 # request in place after the poll backoff; the accepted job
                 # keeps running, so resubmitting would only add risk.
                 transient = error
+                if replay:
+                    continue
                 now = time.monotonic()
                 if now >= deadline:
                     raise self._transient_poll_escalation(error) from error
@@ -1072,7 +1106,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
 
             if self._shutdown_requested():
                 return TransformResult.error({"reason": "shutdown_requested"}, retryable=False)
-            if time.monotonic() >= deadline:
+            if not replay and time.monotonic() >= deadline:
                 return TransformResult.error({"reason": "poll_timeout"}, retryable=False)
 
             semantic_response = page.semantic_response
@@ -1082,6 +1116,8 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             if status == "IN_PROGRESS":
                 if page.next_token is not None:
                     return TransformResult.error({"reason": "malformed_response", "error_type": "premature_next_token"}, retryable=False)
+                if replay:
+                    continue
                 now = time.monotonic()
                 if now >= deadline:
                     return TransformResult.error({"reason": "poll_timeout"}, retryable=False)
@@ -1248,6 +1284,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         prior_clients = self._row_clients
         prior_shutdown = self._shutdown
         prior_run_shutdown = self._run_shutdown
+        prior_run_mode = self._run_mode
         try:
             self._recorder = ctx.landscape
             self._run_id = ctx.run_id
@@ -1260,6 +1297,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             self._row_clients = {}
             self._shutdown = threading.Event()
             self._run_shutdown = None
+            self._run_mode = None
             state_id = ctx.state_id or "textract-invariant-probe-state"
             token_id = ctx.token.token_id if ctx.token is not None else "textract-invariant-probe-token"
             return self._process_single_with_state(probe_rows[0], state_id, token_id=token_id, ctx=ctx)
@@ -1275,6 +1313,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             self._row_clients = prior_clients
             self._shutdown = prior_shutdown
             self._run_shutdown = prior_run_shutdown
+            self._run_mode = prior_run_mode
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:
