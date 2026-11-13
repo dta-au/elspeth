@@ -1,24 +1,27 @@
 # S5: concurrent composer load and the tutorial RUN stage (spike, 2026-11-13)
 
 Spike for **WP0, the demo-day runbook** ([remediation-plan.md](../remediation-plan.md#demo-day-runbook-wp0)).
-Code baseline: `main` at `c987b2b2`. Raw files are in
+Code baseline: `main` at `c987b2b2` for the morning work, and `c1eb6b29`
+for stage 1 (13:23–13:31Z). Raw files are in
 `.claude/lanes/composer-desk-audit-20261112/spikes/S5-load-and-tutorial-run/`
 (abbreviated `S5/` below).
 
-> **The live parts were NOT RUN.** The shared OpenRouter account ran out of
-> credit at about 08:44Z. `/api/v1/credits` reported `total_credits 1240` and
-> `total_usage 1240.70` (later 1241.16). Every completion returned
-> HTTP 402 "Insufficient credits", including a 5-token control request. The
-> orchestrator stopped live runs. This note therefore reports:
+> **Status.**
 >
-> - **code-level** findings: where the limits are enforced and what users see;
-> - **no-provider measurements**: the real admission, worker, queue and SQLite
->   code with a fake provider;
-> - **reachability** of `dta-au.github.io`.
->
-> Live latency, provider 429 behaviour under real load, and the tutorial run
-> itself are listed under [Not run](#not-run-and-resume-commands), with the
-> commands to resume them.
+> - **Morning (08:40–09:00Z): live work stopped.** The shared OpenRouter
+>   account ran out of credit (HTTP 402), so the morning produced only:
+>   - code-level findings;
+>   - no-provider measurements of the admission, worker, queue and SQLite
+>     code (§3.1–3.5).
+> - **Stage 1 (13:23Z, after the credit was restored): RUN.**
+>   - The tutorial ran end to end over the API, 2 runs (§3.6).
+>   - The double-submit and 25-in-a-minute burst tests ran (§3.7).
+>   - **The tutorial RUN step failed in this container.** The scrape could not
+>     reach the pages through this sandbox's egress relay, so the LLM step and
+>     the result rows were never reached.
+> - **Stage 2, the live concurrency load test at N = 1, 5, 10 and 20, is
+>   still NOT RUN.** It is held by the orchestrator while other spikes use the
+>   account. See [Not run](#not-run-and-resume-commands).
 
 ## 1. Question and why it matters
 
@@ -41,6 +44,8 @@ will use the system hands-on. WP0 needs two answers:
 | B quota and contention probe | `S5/test_s5_sqlite_probe.py`. **B1:** the real `RepositoryRateLimitAuthority`, one user, 25 admissions against a limit of 20, with a second user as the negative control. **B2:** N threads released by a barrier perform the full durable admission (session lock, queue count, job insert and quota event in one `BEGIN IMMEDIATE`). | B1 ×1; B2 N=20/80/160 ×1 | none |
 | C reachability | `curl` of the three tutorial pages, 3 rounds through the proxy, 1 direct (`--noproxy '*'`), plus a 404 control | 10 requests | none |
 | D classifier | `classify_provider_failure` run on constructed litellm `RateLimitError(429)`, `APIError(402)` and `ServiceUnavailableError(503)` | 1 each | none |
+| T1 tutorial, stage 1 | `S5/tutorial_run_driver.py` against a fresh instance on 8531. It mirrors the frontend: create the session, rename it to the pending title, GET `/sample`, send the fixed brief, accept the proposal, resolve every pending card, GET `/readiness`, POST `/api/tutorial/run`, then GET `/audit-story`. Run 1 used the main checkout (`S5-tutorial`). Run 2 used worktree `.claude/worktrees/S5-load-and-tutorial-run` with a measurement-only TLS shim (`S5/prototype.patch`); the shim did not change the outcome (§3.6). | 2 | DeepSeek v4.1 Flash composer; **the run's LLM step was never reached** |
+| T2 double-submit and burst, stage 1 | `load_driver.py --mode double` and `--mode burst --burst 25` (one user; a fresh session per burst message, spaced 2.2 s apart; each admitted operation is cancelled at once) | 1 each | DeepSeek v4.1 Flash |
 
 **Turn durations used in probe A** (all EXECUTED earlier):
 
@@ -48,11 +53,18 @@ will use the system hands-on. WP0 needs two answers:
 - **62 s:** the audit's planner-turn p90 (remediation-plan runbook).
 - **Deadline 240 s:** `ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS` in this environment.
 
-**Spend.** This spike used **US$0.0024**: the boot probe ($0.00013) and one
-planner call ($0.00227), taken from `usage.cost` in
-`runs/instances/S5-load/capture/llm_calls.jsonl`. The three 402s were not
-billed. The account-level delta (`S5/spend.log`) is shared with other spikes
-and is not attributable to this one.
+**Spend.** Total **US$0.047**, summed from `usage.cost` in each instance's
+`capture/llm_calls.jsonl`:
+
+| Phase | Calls | Cost |
+|---|---|---|
+| Morning: boot probe + one planner call | 2 (the three 402s were not billed) | $0.0024 |
+| Stage 1, `S5-tutorial`: tutorial run 1 + double-submit | 5 | $0.0317 |
+| Stage 1, `S5-tutorial-run`: tutorial run 2 | 2 | $0.0126 |
+
+The burst made no provider calls, because every operation was cancelled
+before it started. The account-level delta in `S5/spend.log` is shared with
+other spikes and is not attributable to this one.
 
 **Instrument caveats.**
 
