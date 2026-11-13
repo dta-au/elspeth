@@ -394,6 +394,12 @@ def test_content_policy_requires_exact_approved_filter_set() -> None:
         lambda value: value["usage"].update(contentPolicyUnits=-1),
         lambda value: value["usage"].pop("topicPolicyUnits"),
         lambda value: value.update(outputs=[{"text": "unexpected"}]),
+        # Wrong-typed (and unhashable) provider members must be refused as
+        # malformed, not escape the parser as TypeError (AWS review 2026-11-13 #5).
+        lambda value: value["assessments"][0]["contentPolicy"]["filters"][0].update(confidence=["HIGH"]),
+        lambda value: value["assessments"][0]["contentPolicy"]["filters"][0].update(action=["NONE"]),
+        lambda value: value["assessments"][0]["contentPolicy"]["filters"][0].update(filterStrength={"HIGH": 1}),
+        lambda value: value.update(action=["NONE"]),
     ],
 )
 def test_malformed_responses_fail_closed(mutator: Any) -> None:
