@@ -13,6 +13,8 @@ Read alongside:
 
 - [remediation-plan.md](remediation-plan.md): fixes, performance work and
   enhancements, sequenced into work packages, plus the demo-day runbook.
+- [work-packages.md](work-packages.md): the fix list and subagent lanes
+  (with [lanes/tickets.json](lanes/tickets.json) for the lane-manager CLI).
 - [tool-call-register.md](tool-call-register.md): every tool on every surface,
   generated from the live registries and joined with live call outcomes.
 - [evidence/](evidence/): turn table, per-surface teaching cross-check,

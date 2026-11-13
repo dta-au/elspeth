@@ -3,7 +3,8 @@
 Findings (F*) are in [README.md](README.md); the tool inventory is in
 [tool-call-register.md](tool-call-register.md). Items are grouped as fixes
 (R), performance (P) and enhancements (E), then sequenced into work packages
-with gates. This revision applies the seven-reviewer adversarial review
+with gates. Subagent-ready lanes for these items are in
+[work-packages.md](work-packages.md). This revision applies the seven-reviewer adversarial review
 (`evidence/review/`).
 
 Every proof that uses live behaviour runs at least 3 repeats on the **demo
@@ -15,8 +16,8 @@ Composer invariants apply throughout:
 - the LLM authors all pipeline structure;
 - there is no tutorial-only composer path.
 
-R2 and R14 add server-side evidence or validation only. R16(b) and (a) need
-the rulings noted against them.
+R2 and R14 add server-side evidence or validation only. R16 is frontend-only:
+it enforces the fixed script that ADR-031 already requires.
 
 ## Fixes
 

@@ -1,0 +1,193 @@
+[
+ {
+  "ticket": "CDA-01",
+  "title": "Tutorial Build step is script-only (R16, F18, F20)",
+  "files": [
+   "src/elspeth/web/frontend/src/components/chat/ChatPanel.tsx",
+   "src/elspeth/web/frontend/src/components/tutorial/TutorialFreeformShell.tsx",
+   "src/elspeth/web/frontend/src/stores/subscriptions.ts",
+   "src/elspeth/web/frontend/src/components/chat/DecisionPanel.tsx",
+   "src/elspeth/web/composer/tutorial_service.py"
+  ],
+  "test_files": [
+   "tests/unit/web/composer/test_tutorial_service.py"
+  ],
+  "test_command": "pytest tests/unit/web/composer/test_tutorial_service.py -n 0 -q",
+  "description": "Wave 1. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-01). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Report to report.md, return one line."
+ },
+ {
+  "ticket": "CDA-02",
+  "title": "diff_pipeline gets a baseline in the web tool loop (R5, F3)",
+  "files": [
+   "src/elspeth/web/composer/tool_batch.py",
+   "src/elspeth/web/composer/tools/generation.py"
+  ],
+  "test_files": [
+   "tests/unit/web/composer/test_diff_pipeline_baseline.py"
+  ],
+  "test_command": "pytest tests/unit/web/composer/test_diff_pipeline_baseline.py -n 0 -q",
+  "description": "Wave 1. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-02). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Report to report.md, return one line."
+ },
+ {
+  "ticket": "CDA-03",
+  "title": "report_assemble declares output semantics; docs list fixed (R11, F11, F15)",
+  "files": [
+   "src/elspeth/plugins/transforms/report_assemble.py",
+   "src/elspeth/plugins/sinks/document_sink.py",
+   "docs/reference/environment-variables.md"
+  ],
+  "test_files": [
+   "tests/unit/plugins/transforms/test_report_assemble.py"
+  ],
+  "test_command": "pytest tests/unit/plugins/transforms/test_report_assemble.py -n 0 -q",
+  "description": "Wave 1. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-03). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Report to report.md, return one line."
+ },
+ {
+  "ticket": "CDA-04",
+  "title": "Reject node-level vague_term slots a multi-query node never renders (R13, F14)",
+  "files": [
+   "src/elspeth/web/interpretation_state.py",
+   "src/elspeth/plugins/transforms/llm/multi_query.py"
+  ],
+  "test_files": [
+   "tests/unit/web/composer/test_state_multi_query_contract.py"
+  ],
+  "test_command": "pytest tests/unit/web/composer/test_state_multi_query_contract.py -n 0 -q",
+  "description": "Wave 1. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-04). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Report to report.md, return one line."
+ },
+ {
+  "ticket": "CDA-05",
+  "title": "Boot probe sends the real escape-hatch request (R17, F19)",
+  "files": [
+   "src/elspeth/web/composer/boot_probe.py"
+  ],
+  "test_files": [
+   "tests/unit/web/composer/test_boot_probe.py",
+   "tests/integration/web/composer/test_boot_probe_production_parity.py"
+  ],
+  "test_command": "pytest tests/unit/web/composer/test_boot_probe.py tests/integration/web/composer/test_boot_probe_production_parity.py -n 0 -q",
+  "description": "Wave 1. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-05). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Report to report.md, return one line."
+ },
+ {
+  "ticket": "CDA-06",
+  "title": "Credential refusal copy for model-produced content (R6c, F4)",
+  "files": [
+   "src/elspeth/contracts/credential_material.py"
+  ],
+  "test_files": [
+   "tests/unit/web/test_credential_guard.py"
+  ],
+  "test_command": "pytest tests/unit/web/test_credential_guard.py -n 0 -q",
+  "description": "Wave 1. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-06). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Report to report.md, return one line."
+ },
+ {
+  "ticket": "CDA-07",
+  "title": "Advisor capability facts; repair and withhold flow (R2, R9, R15 rubric, R3.3; F2, F9, F17)",
+  "files": [
+   "src/elspeth/web/composer/turn_effects.py",
+   "src/elspeth/web/composer/composition_completion.py",
+   "src/elspeth/web/composer/planning_application.py",
+   "src/elspeth/web/composer/advisor_checkpoint.py",
+   "src/elspeth/web/composer/advisor_context.py"
+  ],
+  "test_files": [
+   "tests/unit/web/composer/test_advisor_capability_evidence.py"
+  ],
+  "test_command": "pytest tests/unit/web/composer/test_advisor_capability_evidence.py tests/unit/web/composer/test_turn_effects.py tests/unit/web/composer/test_advisor_checkpoint.py -n 4 -q",
+  "description": "Wave 2a. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-07). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Report to report.md, return one line."
+ },
+ {
+  "ticket": "CDA-08",
+  "title": "Withheld-reply and receipt presentation (R3.1-2; F2, F8)",
+  "files": [
+   "src/elspeth/web/composer/turn_effects.py",
+   "src/elspeth/web/composer/no_tool_policy.py",
+   "src/elspeth/web/frontend/src/components/chat/MessageBubble.tsx"
+  ],
+  "test_files": [
+   "tests/unit/web/composer/test_checkpoint_receipts.py"
+  ],
+  "test_command": "pytest tests/unit/web/composer/test_checkpoint_receipts.py tests/unit/web/composer/test_no_tool_policy_segments.py -n 0 -q",
+  "description": "Wave 2b. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-08). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Report to report.md, return one line."
+ },
+ {
+  "ticket": "CDA-09",
+  "title": "Turn-end preflight for every wired state (R14, F16)",
+  "files": [
+   "src/elspeth/web/composer/composer_preflight.py",
+   "src/elspeth/web/composer/service.py",
+   "src/elspeth/web/composer/composition_completion.py"
+  ],
+  "test_files": [
+   "tests/unit/web/composer/test_preflight_recompute_wired_state.py"
+  ],
+  "test_command": "pytest tests/unit/web/composer/test_preflight_recompute_wired_state.py tests/unit/web/composer/test_runtime_preflight_pending_review_verification.py -n 0 -q",
+  "description": "Wave 2c. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-09). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Report to report.md, return one line."
+ },
+ {
+  "ticket": "CDA-10",
+  "title": "Planner notices, rejection legibility, multi-file hand-off (R10, R12, R4b)",
+  "files": [
+   "src/elspeth/web/composer/pipeline_planner.py",
+   "src/elspeth/web/composer/tools/_dispatch.py",
+   "src/elspeth/web/composer/tools/declarations.py"
+  ],
+  "test_files": [
+   "tests/unit/web/composer/test_pipeline_planner.py"
+  ],
+  "test_command": "pytest tests/unit/web/composer/test_pipeline_planner.py tests/unit/web/composer/test_agent_tooling.py -n 4 -q",
+  "description": "Wave 3a. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-10). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Report to report.md, return one line."
+ },
+ {
+  "ticket": "CDA-11",
+  "title": "list_models returns only what this deployment can use (R7 handler, F5)",
+  "files": [
+   "src/elspeth/web/composer/tools/generation.py"
+  ],
+  "test_files": [
+   "tests/unit/web/composer/test_list_models_profiles.py"
+  ],
+  "test_command": "pytest tests/unit/web/composer/test_list_models_profiles.py -n 0 -q",
+  "description": "Wave 3a. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-11). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Report to report.md, return one line."
+ },
+ {
+  "ticket": "CDA-12",
+  "title": "Per-surface teaching (R1, P1, R8, E3; teaching halves of R7, R13, R15)",
+  "files": [
+   "src/elspeth/web/composer/prompts.py",
+   "src/elspeth/web/composer/capability_skill.py",
+   "src/elspeth/web/composer/skills/pipeline_composer.md",
+   "src/elspeth/web/composer/planner_authoring_aids.py",
+   "src/elspeth/web/composer/pipeline_planner.py"
+  ],
+  "test_files": [
+   "tests/unit/web/composer/test_surface_teaching_parity.py"
+  ],
+  "test_command": "pytest tests/unit/web/composer/test_surface_teaching_parity.py tests/unit/web/composer/test_planner_authoring_aids.py tests/unit/web/composer/test_skills_loader.py tests/unit/web/composer/test_capability_skill_identity.py -n 4 -q",
+  "description": "Wave 3b. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-12). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Report to report.md, return one line."
+ },
+ {
+  "ticket": "CDA-15",
+  "title": "Add demo-shaped cases to the battery corpus (E4)",
+  "files": [
+   "evals/composer-battery/corpus.md"
+  ],
+  "test_files": [
+   "tests/unit/evals/composer_battery/test_corpus.py"
+  ],
+  "test_command": "pytest tests/unit/evals/composer_battery -n 0 -q",
+  "description": "Wave 4. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-15). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Report to report.md, return one line."
+ },
+ {
+  "ticket": "CDA-17",
+  "title": "Planner deadline reserve and output-cap handling (P5)",
+  "files": [
+   "src/elspeth/web/composer/pipeline_planner.py"
+  ],
+  "test_files": [
+   "tests/unit/web/composer/test_pipeline_planner.py"
+  ],
+  "test_command": "pytest tests/unit/web/composer/test_pipeline_planner.py -n 4 -q",
+  "description": "Wave 4. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-17). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Report to report.md, return one line."
+ }
+]
