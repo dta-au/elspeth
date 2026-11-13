@@ -630,11 +630,13 @@ record.
 ## Not covered
 
 - The tutorial **run** stage, which scrapes `dta-au.github.io`; pipeline
-  execution after Run; results and run diagnostics.
+  execution after Run; results and run diagnostics. S5 reached Run twice,
+  but this container's egress reset every scrape.
 - Prompt guard in `required` mode (every instance ran
   `debug-when-unconfigured`).
-- The demo's actual model and provider pair.
-- Concurrent multi-user load.
+- The demo's actual model and provider pair (S4 ran Sonnet 5.5 and GPT-5.6
+  Luna as alternatives, once per scenario).
+- Concurrent multi-user load beyond S5's measurements.
 - Real review-card handling time (the driver auto-accepted).
 - Attaching files to a non-empty session.
 - YAML import and sharing; PostgreSQL stores.
@@ -643,6 +645,19 @@ record.
 - Whether F14 has affected stored records.
 - Dollar cost per turn. The battery spent about US$4.8 on OpenRouter for this
   pair.
+
+## Design spikes (2026-11-13)
+
+Five spikes measured the hardest fixes before any lane starts. Notes are in
+[spikes/](spikes/); instruments in `evals/composer-live-audit/spikes/`.
+
+| Spike | Question | Answer |
+|---|---|---|
+| [S1](spikes/S1-advisor-evidence.md) | Does a capability record fix F2? | Yes, in replay: withheld-correct answers 25/30 → 30/30 admitted; planted false existence claims 20/20 withheld. Capability over-claims about real plugins are not caught (1/5). CDA-07. |
+| [S2](spikes/S2-planner-overlay.md) | Does a planner-only overlay fix F7? | Partly. A short overlay cut missing-tool reasoning 33% → 2% and prompt tokens 36%, and turned s10 into an honest 10 s decline, but regressed harder builds (rejections 3 → 8). The overlay must be a rewrite of the planner-relevant policy, and the advisor must see it. CDA-12. |
+| [S3](spikes/S3-multifile-custody.md) | Can named sources bind uploads (F1)? | Yes. With the prototype the planner built the two-file pipeline on its first proposal (10.8 s, 29.3 s; baseline 240 s timeout). Found a follow-up crash in `state_responses.py`. CDA-13. |
+| [S4](spikes/S4-cross-model.md) | Are the findings DeepSeek-specific? | No. F3, F5, F8, F10 and F18 reproduce on Sonnet 5.5 and GPT-5.6 Luna; F1 and F2 on at least one. New F4 trigger in OpenAI's opaque reasoning blob. Sonnet is the strongest composer measured but not worth switching to before CDA-07 and CDA-19. |
+| [S5](spikes/S5-load-and-tutorial-run.md) | Will it hold a room, and does the tutorial run? | About 8–10 simultaneous senders on defaults (modelled). Tutorial build ~31 s; Run blocked by this container's egress, so the run stage is still unmeasured. Double-submit and per-user rate limits behave. |
 
 ## Independent review
 

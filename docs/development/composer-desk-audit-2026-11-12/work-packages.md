@@ -43,6 +43,9 @@ Status: **READY** (a lane exists), **DECISION** (blocked on the maintainer),
 | `/api/system/status` reports the composer available while the provider refuses for credit (S5) | Runbook credit check now; status probe later | READY (runbook) / proposed | — |
 | Queue time counts against the 240 s deadline (S5) | Count the deadline from worker claim, not submission | READY (D7 approved) | CDA-21 |
 | Planner `authoring_aids` unmarked for Anthropic prompt caching (S4) | Cache marker | READY | CDA-16 |
+| Advisor demands a mutation on a read-only question; the composer then edits (S4, Sonnet r01 T2) | END rubric sentence | READY | CDA-07 |
+| Advisor reviews planner turns against the tool-loop policy, so an honest planner decline is withheld (S2, S4: s10 on every model) | Advisor gets the planner text and palette | READY | CDA-12 |
+| Opaque encrypted reasoning pattern-scanned; an `sk-` run inside OpenAI's blob failed a turn (S4, Luna, 1/37) | Never scan opaque reasoning fields | READY (D1 approved) | CDA-18 |
 | F21 discovery budget not enforced in the tool loop (also hot-path recon) | Enforce `composer_max_discovery_turns` in the loop | DECISION D8 | CDA-22 (proposed) |
 | Composer efficiency (hot-path recon): validate ≥3×/mutation, Stage-2 per mutation with reviews pending, rounds² context serialisation, provider-call bookkeeping, repeated fence proofs | P7–P10, E7 (remediation plan § Composer efficiency) | Plan of record governs; measure first. P10's snapshot-row skip needs a ruling | — |
 | Skip advisor on chat turns | P3 | NOT FIXING (loses real catches, e.g. s03 T4) | — |
@@ -341,6 +344,10 @@ pytest only.
       `_ADVISOR_END_PUBLICATION_INSTRUCTIONS`.
     - A reply that shows tool-call JSON or asks the user to file a defect is
       FLAGGED (R15).
+    - On a read-only question ("What changed?", "Explain…"), the advisor
+      must not demand a pipeline change; a missing control is reported in
+      the reply, not by editing (S4: Sonnet r01 T2 edited the pipeline after
+      the advisor asked for a prompt-injection shield).
   - `composition_completion.py`, the "Completion advisory review — BLOCKING"
     repair instruction:
     - drop "Correct the reply's…";
@@ -376,6 +383,8 @@ pytest only.
     Teams and "is this safe" are admitted. The withhold rate depends on
     phrasing (S4: Sonnet 0/3, Luna 2/2, DeepSeek 4/6), and a live ×3 alone
     passes an unfixed build about 42% of the time, so the replay is the gate.
+  - **Read-only questions:** an r01 T2-shaped replay ("What changed?") is
+    ADMITTED without a mutation demand, on at least two composer models.
   - **Non-goal:** false claims about what a real plugin can do (C4, "csv reads
     xlsx") are not caught by the record (S1: 1 of 5). Document this.
 - **Size.** About 1 agent-day (S1).
@@ -448,6 +457,12 @@ pytest only.
     - a `canonical_schema` rejection names the key.
   - `tests/unit/web/composer/test_agent_tooling.py`: a discovery-failure
     ordering test.
+- **First check (S4).** Verify whether the empty-session planner request
+  names the session's attached files. S4's captures show none, but its
+  driver uploads files without mentioning them in the message, so confirm
+  what the real frontend sends before changing anything (Luna asked the user
+  to upload files that were already attached). R4(b)'s hand-off must also
+  survive the advisor; that half is CDA-12's advisor change.
 - **Test command.** `pytest tests/unit/web/composer/test_pipeline_planner.py tests/unit/web/composer/test_agent_tooling.py -n 4 -q`.
 - **Depends on.** Wave 1 merged.
 
@@ -488,14 +503,25 @@ pytest only.
   - `src/elspeth/web/composer/pipeline_planner.py`: the message builder
     (~L3494-3514) uses the planner overlay.
   - `advisor_checkpoint.py` (~L453-454): the advisor still reviews planner
-    turns against the freeform policy. Give it the planner text for planner
-    turns.
+    turns against the freeform policy. Give it the planner text and a
+    statement of the planner's palette for planner turns. This is required,
+    not optional: in S2 both arms' honest s10 declines were WITHHELD because
+    the policy names `set_source_from_blobs`, and S4 saw the same on Sonnet.
   - `src/elspeth/web/composer/service.py` (~L751-801): render the planner text,
     assert its on-disk hash, pass it to `PlanningApplication`, and **archive
     it in `skill_markdown_history`**. Today only the tool-loop text is
     archived, so planner proposals would cite an unarchived skill hash (S2).
   - `src/elspeth/web/composer/skills/pipeline_planner.md` (new): the planner
-    overlay. Start from S2's prototype (`evals/composer-live-audit/spikes/S2-planner-overlay/prototype.patch`).
+    overlay. Take the **wiring** from S2's prototype
+    (`evals/composer-live-audit/spikes/S2-planner-overlay/prototype.patch`),
+    not its text. S2's live A/B showed the 7.3k condensation drops material
+    the planner really uses (field-naming rules, the detailed LLM review
+    rules, the repair table): s09 failed with `planner_repair_exhausted`,
+    s08 hit the output cap twice and lost the shield card, and 2 of 15 runs
+    put data in named `sources`. Build the overlay by **moving and
+    rewriting** the planner-relevant parts of the freeform policy (about
+    30–50k characters), and do not mention named `sources` until CDA-13
+    lands.
   - Drift: review staging, the Reply Register, termination and decline rules
     now live in two overlays. Factor shared rules into the core, or pin them
     with the E3 test.
@@ -530,15 +556,27 @@ pytest only.
     - strict palette-confusion rate below 5%, using `strict_hits` in
       `evals/composer-live-audit/spikes/S2-planner-overlay/analyse.py`
       (controlled; 32/110 on the audit corpus);
-    - first-call planner prompt at most 35k tokens on DeepSeek (S2 measured
-      31.4k, against 52.5k);
-    - no increase in proposal rejections or invalid proposals against a
-      same-day baseline;
-    - a human reviews the s10 and c03 replies for honesty: the multi-file limit
-      is stated and no tool names appear.
-  - **S2's early read** (4 pairs, n=1): prompt tokens −50%, latency 78→46 s,
-    rejections 2→0.
-- **Size.** 1.5–2 agent-days (S2; R1 plus E3 is 0.5–1 day).
+    - first-call planner prompt at most 45k tokens on DeepSeek (HEAD 52.5k;
+      the short overlay measured 31.4k, and a fuller one needs the room);
+    - **no increase in proposal rejections or `planner_repair_exhausted`
+      against a same-day baseline on s05, s08, s09, s12 and s13, n ≥ 3 per
+      arm.** These are where S2's short overlay regressed (3 → 8 rejections,
+      1 failure). This is the decisive measurement;
+    - the same review cards as the baseline on s08, s09 and s13, including
+      `prompt_injection_shield_recommendation` where the baseline stages it;
+    - the s10 reply reaches the user (not WITHHELD), states the
+      one-uploaded-file limit with workable options, and shows no field keys
+      or tool names (S2's overlay reply leaked `source.blob_id`);
+    - c03 answered, not WITHHELD, in at least 2 of 3 runs;
+    - a human reviews the s10 and c03 replies for honesty.
+  - **S2 live A/B** (15 first turns per arm, n=1–2): missing-tool reasoning
+    14/43 → 1/43 planner calls; prompt tokens −36%; s10 183 s/US$0.37 →
+    10 s/US$0.08; but rejections excluding s10 rose 3 → 8 and failed or
+    withheld turns 1 → 3.
+- **Size.** 2.5–3.5 agent-days (S2). R1 plus E3 plus the advisor half is
+  1.5–2 days, including at least one overlay iteration against live
+  evidence. Consider splitting: **CDA-12a** (wiring, archive, advisor text,
+  E3, overlay) and **CDA-12b** (R7, R8, R13 and R15 text).
 - **Depends on.** CDA-07, CDA-10.
 
 ### CDA-13: Multi-file sources on the planner (R4(a), F1). D2 approved, no compatibility
@@ -637,6 +675,11 @@ the marker is a trivial fix candidate; measure it.
   - A hit in `thinking_blocks` (replayed, signature-bound), visible content or
     tool arguments still fails exactly as today.
   - This applies to planner, tool-loop and advisor calls.
+  - **Opaque fields are never pattern-scanned** (S4): `reasoning_details`
+    items of type `reasoning.encrypted` and signature fields carry base64url
+    text. Keep or drop them by provider contract. On GPT-5.6 Luna an `sk-`
+    run inside one such blob failed r01 T3 ("Run it.") with 422 (1 of 37
+    blobs).
 - **Files.**
   - `src/elspeth/web/composer/llm_response_parsing.py`
     (`build_llm_call_record`, ~L740-770): the scan point.
@@ -648,7 +691,10 @@ the marker is a trivial fix candidate; measure it.
   - the call record has the reasoning removed;
   - a scrub event is recorded;
   - no exception is raised;
-  - the same string in tool arguments still raises.
+  - the same string in tool arguments still raises;
+  - the Luna blob shape (`reasoning.encrypted` whose `data` holds `sk-` plus
+    20 or more base64url characters) does not fail the turn and is not
+    reported as a credential hit.
 - **Pinned tests to update.** `tests/unit/web/test_credential_guard.py`
   (~L520-560), `tests/unit/web/composer/test_pipeline_planner.py` (~L5385)
   and `tests/unit/web/composer/test_compose_loop_persistence.py` (~L796-806).

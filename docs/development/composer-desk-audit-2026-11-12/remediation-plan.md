@@ -158,7 +158,12 @@ Owner for every package is the maintainer; dates are set by the operator.
   administration path. The audit used a test fixture, which is not an
   operator procedure.
 - **Network.** The tutorial's run step scrapes `dta-au.github.io`; the demo
-  host needs outbound access to it.
+  host needs outbound access to it that the scraper itself can use. In S5
+  every scrape from the audit container was reset by the outbound relay, and
+  Run failed after about 36 s with "The run produced no output rows", while
+  a hand-built `curl` to the same address returned 200. A TLS-inspecting
+  corporate proxy is likely to do the same. A `curl` check is not evidence;
+  only a real tutorial Run on the demo host is.
 - **Concurrency (hands-on only; spike S5).** One instance runs 4 composer
   turns at once (`composer_async_worker_concurrency`, default 4, max 16).
   Queued turns spend their own 240 s deadline, which starts at submission,
@@ -190,13 +195,17 @@ Owner for every package is the maintainer; dates are set by the operator.
 
 ### Preflight
 
+0. A 5-token completion on the composer model and on the advisor model
+   succeeds through the configured provider, and the account balance covers
+   the day.
 1. On the demo host, with the demo model pair and the guard in `required`
    mode, run `evals/composer-live-audit` scenarios s01, s02, s03, s05, s20 and
    r01 ×3.
 2. Run `turn_table.py` on the results. **Pass** = no FAILED, WITHHELD or
    GATE-NOT-CLEARED labels on any prompt you intend to use.
 3. Walk the tutorial in a browser through the **run** stage, including the
-   scrape.
+   scrape. **Pass** = Run returns result rows (3 in S5's script), not "The
+   run produced no output rows".
 4. Check the provider account balance covers the day (S5).
 5. Pre-warm one throwaway session per demo flow.
 
@@ -216,7 +225,9 @@ Owner for every package is the maintainer; dates are set by the operator.
   - "Why did you choose that design?" can end with a "completion advisory
     review did not clear" note. The answer still shows, and Run still works.
 - **Avoid until fixed:**
-  - two or more files attached to an empty session (F1);
+  - two or more files attached to an empty session (F1). Even when the
+    composer explains the limit honestly, the advisor withholds that reply
+    on every model tested (S2, S4);
   - "Can you connect to X?" / "Can you read PDFs?" / "Is this safe on
     sensitive data?" (F2; SharePoint withheld 2 of 2);
   - "What changed since…?" (F3);
