@@ -7,29 +7,41 @@ Each section names the review finding it pins
 from __future__ import annotations
 
 import hashlib
+import threading
+import time
+from types import SimpleNamespace
 from typing import Any, cast
 
 from sqlalchemy import select
 from tests.fixtures.base_classes import as_sink, as_source, as_transform
 from tests.fixtures.factories import make_context
 from tests.fixtures.landscape import make_landscape_db
+from tests.fixtures.mock_audit import mock_item_audit_authority
 from tests.fixtures.plugins import CollectSink, ListSource
+from tests.unit.engine.orchestrator.test_call_mode_session import _CURRENT_TOKEN
+from tests.unit.engine.orchestrator.test_call_mode_session import _factory as _session_factory
 
-from elspeth.contracts import RunStatus
-from elspeth.contracts.errors import PluginRetryableError
+from elspeth.contracts import CallType, RunMode, RunStatus
+from elspeth.contracts.call_mode import ArchivedCallRequestEvidence, CallModeSession
+from elspeth.contracts.errors import AuditIntegrityError, PluginRetryableError
 from elspeth.contracts.payload_store import PayloadStore
 from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.core.canonical import stable_hash
 from elspeth.core.config import ElspethSettings, RetrySettings, SinkSettings, SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.wiring import WiredTransform
 from elspeth.core.landscape.schema import calls_table, node_states_table
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
+from elspeth.engine.orchestrator.call_mode_session import AuditedCallModeSession
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.transforms.aws.replay_sdk import ReplayOnlySDK
 from elspeth.plugins.transforms.aws.textract_bucket_region import (
     BucketRegionCoordinator,
+    BucketRegionProof,
     BucketRegionUnverifiedError,
     BucketRegionVerification,
+    HeadBucketClient,
     S3HeadBucketSDKClient,
 )
 from elspeth.plugins.transforms.aws.textract_client import (
@@ -460,3 +472,340 @@ def test_f1_engine_retries_a_throttled_submit_and_reattaches_to_the_same_job(tmp
     first_attempt_calls = [call for call in calls if call.state_id == states[0].state_id]
     # The failed attempt's throttled submit is in the audit trail before the retry.
     assert [call.status for call in first_attempt_calls] == ["success", "error"]  # HeadBucket, throttled submit
+
+
+# --- Findings 2 and 3 (P2): verify / replay determinism -------------------------
+
+
+class _Recorder:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def allocate_call_index(self, _state_id: str, **_kwargs: object) -> int:
+        return len(self.calls)
+
+    def record_call(self, **kwargs: Any) -> SimpleNamespace:
+        self.calls.append(kwargs)
+        return SimpleNamespace(call_id=f"new-{len(self.calls)}")
+
+
+class _VerifySession:
+    """Verify session whose admission is hash-exact like AuditedCallModeSession."""
+
+    mode = RunMode.VERIFY
+    source_run_id = "source-run"
+
+    def __init__(self, archive: dict[int, dict[str, Any]]) -> None:
+        self.archive = archive
+        self.admissions: list[dict[str, Any]] = []
+        self.verifications: list[dict[str, Any]] = []
+
+    def archived_call_request(
+        self, *, call_type: CallType, current_state_id: str | None, current_operation_id: str | None, current_call_index: int
+    ) -> ArchivedCallRequestEvidence:
+        del call_type, current_state_id, current_operation_id
+        if current_call_index not in self.archive:
+            raise AuditIntegrityError("Exact source request is missing")
+        return ArchivedCallRequestEvidence(source_call_id=f"source-{current_call_index}", request_data=self.archive[current_call_index])
+
+    def admit_verify_call(self, **kwargs: Any) -> str:
+        self.admissions.append(kwargs)
+        archived = self.archive.get(kwargs["current_call_index"])
+        if archived is None or stable_hash(archived) != stable_hash(kwargs["request_data"]):
+            raise AuditIntegrityError("No exact source http call at parent-local index")
+        return f"source-{kwargs['current_call_index']}"
+
+    def verify_call(self, **kwargs: Any) -> None:
+        self.verifications.append(kwargs)
+
+
+class _PollSDK:
+    def __init__(self, *responses: dict[str, Any]) -> None:
+        self.responses = list(responses)
+
+    def get_document_analysis(self, **kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        return self.responses.pop(0)
+
+    def start_document_analysis(self, **kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("not used")
+
+    def close(self) -> None:
+        return None
+
+
+def _textract_client(session: object, sdk: object, recorder: _Recorder) -> TextractClient:
+    return TextractClient(
+        **mock_item_audit_authority("run-1"),
+        execution=recorder,
+        state_id="state-1",
+        run_id="run-1",
+        telemetry_emit=lambda _event: None,
+        region="ap-southeast-2",
+        sdk_client=cast("TextractSDKClient", sdk),
+        max_response_bytes=100_000,
+        call_mode_session=cast("CallModeSession", session),
+    )
+
+
+def _poll_request(*, job_id: str, next_token: str | None) -> dict[str, Any]:
+    return {
+        "operation": "get_document_analysis",
+        "job_id": job_id,
+        "next_token_present": next_token is not None,
+        "next_token_fingerprint": None if next_token is None else hashlib.sha256(next_token.encode("utf-8")).hexdigest(),
+        "max_results": 1000,
+    }
+
+
+def _sdk_page(*, status: str = "SUCCEEDED", next_token: str | None = None) -> dict[str, Any]:
+    page: dict[str, Any] = {"JobStatus": status, "Blocks": [], "ResponseMetadata": {"RetryAttempts": 0, "RequestId": "req"}}
+    if next_token is not None:
+        page["NextToken"] = next_token
+    return page
+
+
+def test_f2_verify_poll_admission_substitutes_the_source_job_id_and_next_token_fingerprint() -> None:
+    session = _VerifySession(
+        {
+            0: _poll_request(job_id="source-job", next_token=None),
+            1: _poll_request(job_id="source-job", next_token="source-token"),
+        }
+    )
+    recorder = _Recorder()
+    client = _textract_client(session, _PollSDK(_sdk_page(next_token="live-token"), _sdk_page()), recorder)
+
+    first = _outcome(lambda: client.get_document_analysis(job_id="live-job", next_token=None))
+    assert not isinstance(first, Exception), first
+    second = _outcome(lambda: client.get_document_analysis(job_id="live-job", next_token="live-token"))
+    assert not isinstance(second, Exception), second
+
+    assert [admission["request_data"] for admission in session.admissions] == [session.archive[0], session.archive[1]]
+    assert [verification["request_data"] for verification in session.verifications] == [session.archive[0], session.archive[1]]
+    # The persisted call record keeps the live identity it actually sent.
+    assert [call["request_data"].to_dict()["job_id"] for call in recorder.calls] == ["live-job", "live-job"]
+
+
+def test_f2_verify_poll_refuses_a_source_job_id_that_changes_within_the_row() -> None:
+    session = _VerifySession(
+        {
+            0: _poll_request(job_id="source-job", next_token=None),
+            1: _poll_request(job_id="other-source-job", next_token=None),
+        }
+    )
+    client = _textract_client(session, _PollSDK(_sdk_page(status="IN_PROGRESS"), _sdk_page()), _Recorder())
+
+    first = _outcome(lambda: client.get_document_analysis(job_id="live-job", next_token=None))
+    assert not isinstance(first, Exception), first
+    second = _outcome(lambda: client.get_document_analysis(job_id="live-job", next_token=None))
+
+    assert isinstance(second, AuditIntegrityError), second
+    assert len(session.admissions) == 1
+
+
+def test_f2_verify_poll_refuses_an_archived_request_of_another_operation() -> None:
+    archived = _poll_request(job_id="source-job", next_token=None)
+    archived["operation"] = "start_document_analysis"
+    session = _VerifySession({0: archived})
+    client = _textract_client(session, _PollSDK(_sdk_page()), _Recorder())
+
+    outcome = _outcome(lambda: client.get_document_analysis(job_id="live-job", next_token=None))
+
+    assert isinstance(outcome, AuditIntegrityError), outcome
+    assert session.admissions == []
+
+
+class _ReplayExistenceSession:
+    mode = RunMode.REPLAY
+    source_run_id = "source-run"
+
+    def __init__(self, existing: dict[int, dict[str, Any]]) -> None:
+        self.existing = existing
+        self.queries: list[dict[str, Any]] = []
+
+    def has_source_call(self, **kwargs: Any) -> bool:
+        self.queries.append(kwargs)
+        index = kwargs["current_call_index"]
+        return index in self.existing and stable_hash(self.existing[index]) == stable_hash(kwargs["request_data"])
+
+
+def test_f3_session_answers_source_call_existence_without_reading_payloads() -> None:
+    assert "has_source_call" in vars(AuditedCallModeSession)
+    factory, call = _session_factory()
+    session = AuditedCallModeSession(
+        factory, current_run_id="current", source_run_id="source", mode=RunMode.REPLAY, coordination_token=_CURRENT_TOKEN
+    )
+    request = {"operation": "get_document_analysis"}
+
+    factory.execution.find_call_for_current_parent.return_value = call
+    assert (
+        session.has_source_call(
+            call_type=CallType.HTTP, request_data=request, current_state_id="state", current_operation_id=None, current_call_index=3
+        )
+        is True
+    )
+    lookup = factory.execution.find_call_for_current_parent.call_args.kwargs
+    assert lookup["request_hash"] == stable_hash(request)
+    assert lookup["current_call_index"] == 3
+    factory.execution.find_call_for_current_parent.return_value = None
+    assert (
+        session.has_source_call(
+            call_type=CallType.HTTP, request_data=request, current_state_id="state", current_operation_id=None, current_call_index=4
+        )
+        is False
+    )
+    factory.execution.get_call_request_data.assert_not_called()
+
+
+def test_f3_replay_client_reports_whether_the_source_made_the_next_poll() -> None:
+    assert "source_has_next_poll" in vars(TextractClient)
+    session = _ReplayExistenceSession({1: _poll_request(job_id="job-1", next_token=None)})
+    recorder = _Recorder()
+    recorder.calls.append({"call_index": 0})  # the replayed start call
+    client = _textract_client(session, _PollSDK(), recorder)
+    client._last_call_index = 0
+
+    assert client.source_has_next_poll(job_id="job-1", next_token=None) is True
+    assert client.source_has_next_poll(job_id="job-1", next_token="other") is False
+    assert [query["current_call_index"] for query in session.queries] == [1, 1]
+
+
+class _ReplayRowClient(_FakeAsyncClient):
+    def __init__(self, *, pages: list[AnalysisResultPage | Exception], source_polls: int) -> None:
+        super().__init__(pages=pages)
+        self.source_polls = source_polls
+
+    def source_has_next_poll(self, *, job_id: str, next_token: str | None) -> bool:
+        del job_id, next_token
+        return len(self.get_calls) < self.source_polls
+
+
+def _replay_transform(client: _ReplayRowClient) -> AWSTextractDocumentAnalysis:
+    transform = _async_transform(client)
+    transform._run_mode = RunMode.REPLAY
+    transform._poll_interval_seconds = 30.0
+    transform._poll_max_interval_seconds = 30.0
+
+    def _no_sleep(timeout: float) -> bool:
+        raise AssertionError(f"replay slept {timeout}s between polls")
+
+    transform._wait_for_shutdown = _no_sleep  # replay must never wait on the clock
+    return transform
+
+
+def test_f3_replay_poll_loop_ends_from_the_archive_without_sleeping() -> None:
+    client = _ReplayRowClient(pages=[_page(status="IN_PROGRESS")] * 10, source_polls=3)
+    transform = _replay_transform(client)
+    started = time.monotonic()
+
+    result = _expect_result(_run_async(transform))
+
+    assert time.monotonic() - started < 5.0
+    assert result.reason is not None
+    assert result.reason["reason"] == "poll_timeout"
+    assert len(client.get_calls) == 3
+
+
+def test_f3_replay_poll_loop_reaches_success_without_real_sleeps() -> None:
+    client = _ReplayRowClient(pages=[_page(status="IN_PROGRESS"), _page(status="IN_PROGRESS"), _page()], source_polls=3)
+    transform = _replay_transform(client)
+    started = time.monotonic()
+
+    result = _expect_result(_run_async(transform))
+
+    assert time.monotonic() - started < 5.0
+    assert result.status == "success", result.reason
+
+
+def test_f3_replay_poll_loop_reproduces_a_transient_escalation_at_archive_end() -> None:
+    client = _ReplayRowClient(pages=[TextractServiceError(code="ThrottlingException", retryable=True)] * 5, source_polls=2)
+    transform = _replay_transform(client)
+    started = time.monotonic()
+
+    error = _expect_retryable(_run_async(transform))
+
+    assert time.monotonic() - started < 5.0
+    assert "ThrottlingException" in str(error)
+    assert len(client.get_calls) == 2
+
+
+def _proof() -> BucketRegionProof:
+    return BucketRegionProof(region="ap-southeast-2", source="response_header", http_status=200)
+
+
+def test_f3_replay_follower_waits_for_the_source_leader_even_when_it_arrives_first() -> None:
+    assert "verify_replay" in vars(BucketRegionCoordinator)
+    coordinator = BucketRegionCoordinator()
+    outcomes: list[object] = []
+    follower = threading.Thread(
+        target=lambda: outcomes.append(
+            _outcome(lambda: coordinator.verify_replay("docs", lambda: _proof(), source_led=False, wait_seconds=10.0))
+        )
+    )
+    follower.start()
+    time.sleep(0.05)
+    leader = coordinator.verify_replay("docs", lambda: _proof(), source_led=True, wait_seconds=10.0)
+    follower.join(timeout=10.0)
+
+    assert leader.cache_status == "live"
+    [follower_outcome] = outcomes
+    assert isinstance(follower_outcome, BucketRegionVerification), follower_outcome
+    assert follower_outcome.cache_status == "cached"
+    assert follower_outcome.region == "ap-southeast-2"
+
+
+def test_f3_replay_source_leader_always_replays_its_own_head_bucket_call() -> None:
+    assert "verify_replay" in vars(BucketRegionCoordinator)
+    coordinator = BucketRegionCoordinator()
+    calls: list[str] = []
+    coordinator.verify_replay("docs", lambda: calls.append("first") or _proof(), source_led=True, wait_seconds=1.0)
+
+    second = coordinator.verify_replay("docs", lambda: calls.append("second") or _proof(), source_led=True, wait_seconds=1.0)
+
+    assert calls == ["first", "second"]
+    assert second.cache_status == "live"
+
+
+def test_f3_replay_follower_inherits_the_source_leader_failure() -> None:
+    assert "verify_replay" in vars(BucketRegionCoordinator)
+    coordinator = BucketRegionCoordinator()
+
+    def failing() -> BucketRegionProof:
+        raise BucketRegionUnverifiedError(code="NoSuchBucket", retryable=False, http_status=404)
+
+    leader = _outcome(lambda: coordinator.verify_replay("docs", failing, source_led=True, wait_seconds=1.0))
+    follower = _outcome(lambda: coordinator.verify_replay("docs", lambda: _proof(), source_led=False, wait_seconds=1.0))
+
+    assert isinstance(leader, BucketRegionUnverifiedError) and leader.inherited is False
+    assert isinstance(follower, BucketRegionUnverifiedError), follower
+    assert follower.inherited is True
+    assert follower.code == "NoSuchBucket"
+
+
+def test_f3_replay_follower_without_a_source_leader_fails_closed() -> None:
+    assert "verify_replay" in vars(BucketRegionCoordinator)
+    coordinator = BucketRegionCoordinator()
+
+    outcome = _outcome(lambda: coordinator.verify_replay("docs", lambda: _proof(), source_led=False, wait_seconds=0.05))
+
+    assert isinstance(outcome, AuditIntegrityError), outcome
+
+
+def test_f3_head_bucket_client_reads_the_leader_role_from_the_archive() -> None:
+    assert "source_made_head_bucket_call" in vars(HeadBucketClient)
+    request = {"operation": "head_bucket_region", "configured_region": "ap-southeast-2", "bucket": "docs"}
+    session = _ReplayExistenceSession({0: request})
+    client = HeadBucketClient(
+        **mock_item_audit_authority("run-1"),
+        execution=_Recorder(),
+        state_id="state-1",
+        run_id="run-1",
+        telemetry_emit=lambda _event: None,
+        region="ap-southeast-2",
+        sdk_client=cast("S3HeadBucketSDKClient", ReplayOnlySDK()),
+        call_mode_session=cast("CallModeSession", session),
+    )
+
+    assert client.source_made_head_bucket_call("docs") is True
+    assert client.source_made_head_bucket_call("other-bucket") is False
+    assert [query["current_call_index"] for query in session.queries] == [0, 0]
