@@ -1023,7 +1023,12 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # bounds nesting before decode; its manifest provenance token moved
 # 204c8485e712dc75 -> 35519150141e19b9, the manifest's only changed byte run.
 # Captured from this file's parity failure (previous pin b14d1da8...).
-EXPECTED_CASE_REGISTRY_SHA256 = "70bb6809b9fa28b1888034ce64774a2a6c7f2116697bff9a41c746915704cab9"
+# Integrator follow-up (CSVSource refuses non-text codecs at config): its
+# fifteen manifest provenance tokens moved 94e4e14b6d89d7e1 -> 4299e6110527265e,
+# and reopen-resume's resumed_full_projection_sha256 moved d9f57ba0... ->
+# 1bf3705a..., measured by the production harness. Captured from this file's
+# parity failure (previous pin 70bb6809...).
+EXPECTED_CASE_REGISTRY_SHA256 = "e9d24134f78ce200fe15b9c29eb513fef183fee3c3fd8b4fda39f2f072bce5ca"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
