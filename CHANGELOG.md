@@ -80,6 +80,12 @@ These changes are breaking:
     `S3SinkPoisonedError` has been removed.
   - The `OutputPort` protocol gains `fail_pending`; in-tree implementations
     are updated, out-of-tree ones must add it.
+- **`CallVerifier` and `CallReplayer` are removed** from
+  `elspeth.plugins.infrastructure.clients`. `CallModeSession.verify_call` is
+  the single verify authority, and replaying an unrecorded ordered query now
+  raises `AuditIntegrityError`.
+- **`request_ssrf_safe` refuses `follow_redirects=True`** except for a
+  body-less GET, raising `ValueError` before any network I/O.
 - **CI runs one Python 3.14 lane**, which is the coverage lane. Required
   status-check names change with it, for example
   `Test (Python 3.14, shard N)` and `Timing-sensitive tests (Python 3.14)`,
@@ -307,6 +313,11 @@ Sinks and retrieval:
   - An upsert value error diverts the row.
   - Startup refuses an existing collection whose `hnsw:space` differs from
     `distance_function`.
+- **HTTP replay** re-raises a recorded transport failure and records the
+  replay call as an error; other recorded failure types still raise
+  `AuditIntegrityError`.
+- **Azure Search** result metadata excludes the vector field and
+  `@search.*` keys.
 - **Chroma retrieval** records a failure in runtime preflight or deferred
   initialisation as a failed call.
 - **Dataverse sink:**
