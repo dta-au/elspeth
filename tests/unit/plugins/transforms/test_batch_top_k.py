@@ -165,10 +165,12 @@ class TestBatchTopK:
         assert result.reason["reason"] == "invalid_input"
         assert result.reason["error_type"] == "wrong_type"
         assert result.reason["field"] == "label"
-        assert result.reason["expected"] == "a scalar top-k value (str, int, float, bool, or None)"
+        assert result.reason["expected"] == "a scalar top-k value (str, int, float, bool, Decimal, datetime, or None)"
         assert result.reason["actual_type"] == frozen_type
         assert "in row 1" in result.reason["error"]
-        assert f"must be a scalar top-k value (str, int, float, bool, or None), got {frozen_type}" in result.reason["error"]
+        assert (
+            f"must be a scalar top-k value (str, int, float, bool, Decimal, datetime, or None), got {frozen_type}" in result.reason["error"]
+        )
         # The offending VALUE is row content and must not reach the audit trail.
         assert "leaked" not in repr(sorted(result.reason.items()))
 

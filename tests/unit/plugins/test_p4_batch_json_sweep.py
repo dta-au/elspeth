@@ -309,11 +309,11 @@ class TestEvictSubmissionRefusedKeepsTracking:
 
         def slow(row: PipelineRow, ctx: TransformContext) -> TransformResult:
             assert release_a.wait(timeout=5)
-            return TransformResult.success(row, success_reason={"action": "a"})
+            return TransformResult.success(row, success_reason={"action": "test"})
 
         def fast(row: PipelineRow, ctx: TransformContext) -> TransformResult:
             b_done.set()
-            return TransformResult.success(row, success_reason={"action": "b"})
+            return TransformResult.success(row, success_reason={"action": "test"})
 
         collector = CollectorOutputPort()
         transform = _Harness()
