@@ -1503,8 +1503,10 @@ authorize resuming an old run with changed code.
 
 A per-query `template` may not contain `{{interpretation:...}}` tokens —
 interpretation review rewrites only the node-level `prompt_template`, so a token
-here would survive to the run and fail as a Jinja error. Put reviewed slots in
-the node-level template.
+here would survive to the run and fail as a Jinja error. A node-level reviewed
+slot reaches only queries using that template. Composer rejects the slot at
+staging if any query has its own template; place the reviewed term on a node
+where all queries use the node-level template.
 
 Each query contributes `<query_name>_<response_field>` plus
 `<query_name>_<response_field>_usage` and `<query_name>_<response_field>_model`,

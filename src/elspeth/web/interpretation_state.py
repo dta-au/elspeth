@@ -192,6 +192,7 @@ PROMPT_SHIELD_LOCAL_CONTENT_AVAILABLE_DRAFT: Final[str] = (
 # tools are second doors into the same state and enforce it via
 # :func:`composition_review_contract_error` (session 4c42a794, 2026-09-01).
 VAGUE_TERM_UNWIRED_PREFIX: Final[str] = "Pending vague_term review is not wired for resolution"
+VAGUE_TERM_QUERY_OVERRIDE_PREFIX: Final[str] = "Pending vague_term review is bypassed by a query template"
 
 # Honest-provenance sentinel prefix for interpretation event rows written by a
 # BACKEND surfacer (finalization PT auto-surface, kind-general settlement
@@ -674,6 +675,12 @@ def unwired_vague_term_error(state: CompositionState) -> str | None:
             if vague_term_wiring_count(node.options, user_term=user_term) == 1:
                 continue
             requirement_id = requirement["id"] if "id" in requirement and isinstance(requirement["id"], str) else user_term
+            query_error = vague_term_query_override_error(node.options["queries"]) if "queries" in node.options else None
+            if query_error is not None:
+                return (
+                    f"{VAGUE_TERM_QUERY_OVERRIDE_PREFIX} on node {node.id!r}: requirement {requirement_id!r} "
+                    f"(user term {user_term!r}). {query_error}"
+                )
             return (
                 f"{VAGUE_TERM_UNWIRED_PREFIX} on node {node.id!r}: requirement {requirement_id!r} "
                 f"(user term {user_term!r}) has no resolvable prompt wiring. Wire exactly one "
@@ -2932,6 +2939,23 @@ def _legacy_terms(prompt_template: str) -> tuple[str, ...]:
     return tuple(match.group(1).strip() for match in INTERPRETATION_PLACEHOLDER_RE.finditer(prompt_template))
 
 
+def vague_term_query_override_error(queries: Any) -> str | None:
+    """Explain which queries bypass a node-level reviewed slot.
+
+    Use the same mapping/list admission as the prompt surface, without parsing
+    prompt parts: malformed parts remain the wiring gate's non-raising case.
+    Missing and null templates use the node template; any other value does not.
+    """
+    names = tuple(name for name, entry in _well_formed_query_entries(queries) if "template" in entry and entry["template"] is not None)
+    if not names:
+        return None
+    return (
+        f"Query templates for {', '.join(repr(name) for name in names)} bypass the node-level template. "
+        "A node-level reviewed slot is rejected at staging when any query has its own template. "
+        "Place the reviewed term on a node where all queries use the node-level template."
+    )
+
+
 @trust_boundary(
     tier=3,
     source="NodeSpec.options['interpretation_requirements'] / ['prompt_template_parts'] / "
@@ -2970,6 +2994,10 @@ def vague_term_wiring_count(options: Mapping[str, Any], *, user_term: str) -> in
     for repair, rather than crashing the request. Strict offensive validation
     lives at the resolve boundary, where the operator-approved mutation runs.
     """
+    # A syntactically wired slot is not delivered to a query with an override.
+    # Reject mixed surfaces too: every query on the node must receive the term.
+    if "queries" in options and vague_term_query_override_error(options["queries"]) is not None:
+        return 0
     normalized_user_term = user_term.strip()
     requirements = options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in options else None
     matching_ids: list[str] = []

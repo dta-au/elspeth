@@ -464,181 +464,186 @@
     },
     {
       "ordinal": 92,
-      "pattern": "vague_term_unwired|Pending vague_term review is not wired for resolution",
+      "pattern": "vague_term_query_override|Pending vague_term review is bypassed by a query template",
       "occurrence": 0
     },
     {
       "ordinal": 93,
-      "pattern": "interpretation_review_draft_malformed|cleanup review draft is malformed",
+      "pattern": "vague_term_unwired|Pending vague_term review is not wired for resolution",
       "occurrence": 0
     },
     {
       "ordinal": 94,
-      "pattern": "interpretation_review_contract_unsatisfied|drops web-scrape raw field",
+      "pattern": "interpretation_review_draft_malformed|cleanup review draft is malformed",
       "occurrence": 0
     },
     {
       "ordinal": 95,
-      "pattern": "file_sink_write_policy_invalid|must set collision_policy explicitly|must set mode explicitly",
+      "pattern": "interpretation_review_contract_unsatisfied|drops web-scrape raw field",
       "occurrence": 0
     },
     {
       "ordinal": 96,
-      "pattern": "no_source_configured|No source configured",
+      "pattern": "file_sink_write_policy_invalid|must set collision_policy explicitly|must set mode explicitly",
       "occurrence": 0
     },
     {
       "ordinal": 97,
-      "pattern": "no_sinks_configured|No sinks configured",
+      "pattern": "no_source_configured|No source configured",
       "occurrence": 0
     },
     {
       "ordinal": 98,
-      "pattern": "source_name_invalid",
+      "pattern": "no_sinks_configured|No sinks configured",
       "occurrence": 0
     },
     {
       "ordinal": 99,
-      "pattern": "reserved_node_id|Reserved node id|reserved source producer namespace",
+      "pattern": "source_name_invalid",
       "occurrence": 0
     },
     {
       "ordinal": 100,
-      "pattern": "duplicate_node_id|Duplicate node ID",
+      "pattern": "reserved_node_id|Reserved node id|reserved source producer namespace",
       "occurrence": 0
     },
     {
       "ordinal": 101,
-      "pattern": "duplicate_output_name|Duplicate output name",
+      "pattern": "duplicate_node_id|Duplicate node ID",
       "occurrence": 0
     },
     {
       "ordinal": 102,
-      "pattern": "duplicate_edge_id|Duplicate edge ID",
+      "pattern": "duplicate_output_name|Duplicate output name",
       "occurrence": 0
     },
     {
       "ordinal": 103,
-      "pattern": "edge_unknown_node|references unknown node",
+      "pattern": "duplicate_edge_id|Duplicate edge ID",
       "occurrence": 0
     },
     {
       "ordinal": 104,
-      "pattern": "duplicate_connection_producer|Duplicate producer for connection",
+      "pattern": "edge_unknown_node|references unknown node",
       "occurrence": 0
     },
     {
       "ordinal": 105,
-      "pattern": "duplicate_connection_consumer|Duplicate consumer for connection",
+      "pattern": "duplicate_connection_producer|Duplicate producer for connection",
       "occurrence": 0
     },
     {
       "ordinal": 106,
-      "pattern": "connection_sink_name_overlap|Connection names overlap with sink names|collides with a sink of the same name",
+      "pattern": "duplicate_connection_consumer|Duplicate consumer for connection",
       "occurrence": 0
     },
     {
       "ordinal": 107,
-      "pattern": "gate_condition_invalid",
+      "pattern": "connection_sink_name_overlap|Connection names overlap with sink names|collides with a sink of the same name",
       "occurrence": 0
     },
     {
       "ordinal": 108,
-      "pattern": "aggregation_missing_on_error|Aggregation '(.+)' is missing required field 'on_error'",
+      "pattern": "gate_condition_invalid",
       "occurrence": 0
     },
     {
       "ordinal": 109,
-      "pattern": "aggregation_output_mode_invalid",
+      "pattern": "aggregation_missing_on_error|Aggregation '(.+)' is missing required field 'on_error'",
       "occurrence": 0
     },
     {
       "ordinal": 110,
-      "pattern": "batch_transform_misplaced",
+      "pattern": "aggregation_output_mode_invalid",
       "occurrence": 0
     },
     {
       "ordinal": 111,
-      "pattern": "batch_required_fields_invalid",
+      "pattern": "batch_transform_misplaced",
       "occurrence": 0
     },
     {
       "ordinal": 112,
-      "pattern": "batch_value_field_not_numeric",
+      "pattern": "batch_required_fields_invalid",
       "occurrence": 0
     },
     {
       "ordinal": 113,
-      "pattern": "queue_config_invalid",
+      "pattern": "batch_value_field_not_numeric",
       "occurrence": 0
     },
     {
       "ordinal": 114,
-      "pattern": "structural_node_plugin_forbidden",
+      "pattern": "queue_config_invalid",
       "occurrence": 0
     },
     {
       "ordinal": 115,
-      "pattern": "queue_no_consumer",
+      "pattern": "structural_node_plugin_forbidden",
       "occurrence": 0
     },
     {
       "ordinal": 116,
-      "pattern": "queue_name_collision|collides with a source of the same name",
+      "pattern": "queue_no_consumer",
       "occurrence": 0
     },
     {
       "ordinal": 117,
-      "pattern": "aggregation_trigger_invalid|trigger is invalid",
+      "pattern": "queue_name_collision|collides with a source of the same name",
       "occurrence": 0
     },
     {
       "ordinal": 118,
-      "pattern": "web_scrape_http_identity_invalid",
+      "pattern": "aggregation_trigger_invalid|trigger is invalid",
       "occurrence": 0
     },
     {
       "ordinal": 119,
-      "pattern": "prompt_template_unbound_variables|prompt render context does not define",
+      "pattern": "web_scrape_http_identity_invalid",
       "occurrence": 0
     },
     {
       "ordinal": 120,
-      "pattern": "query_template_unbound_row_fields|input_fields binds only",
+      "pattern": "prompt_template_unbound_variables|prompt render context does not define",
       "occurrence": 0
     },
     {
       "ordinal": 121,
-      "pattern": "prompt_template_undeclared_row_fields|required_input_fields does not declare",
+      "pattern": "query_template_unbound_row_fields|input_fields binds only",
       "occurrence": 0
     },
     {
       "ordinal": 122,
-      "pattern": "plugin_not_enabled",
+      "pattern": "prompt_template_undeclared_row_fields|required_input_fields does not declare",
       "occurrence": 0
     },
     {
       "ordinal": 123,
-      "pattern": "plugin_not_installed",
+      "pattern": "plugin_not_enabled",
       "occurrence": 0
     },
     {
       "ordinal": 124,
-      "pattern": "plugin_unavailable",
+      "pattern": "plugin_not_installed",
       "occurrence": 0
     },
     {
       "ordinal": 125,
-      "pattern": "credential_unavailable",
+      "pattern": "plugin_unavailable",
       "occurrence": 0
     },
     {
       "ordinal": 126,
-      "pattern": "profile_unavailable",
+      "pattern": "credential_unavailable",
       "occurrence": 0
     },
     {
       "ordinal": 127,
+      "pattern": "profile_unavailable",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 128,
       "pattern": "plugin_not_allowed_on_web",
       "occurrence": 0
     }
@@ -745,6 +750,7 @@
     "interpretation_review_contract_unsatisfied",
     "interpretation_review_draft_malformed",
     "vague_term_unwired",
+    "vague_term_query_override",
     "review_reconciliation_failed",
     "file_sink_write_policy_invalid",
     "gate_condition_ignores_stated_threshold",

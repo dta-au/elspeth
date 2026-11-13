@@ -322,6 +322,12 @@ _SKILL_REWORK_0812_CANONICAL_BYTES = 3878
 # growth: the baseline, 10% band and prior headroom (zero before this change)
 # are preserved, with the exact-boundary / +1-byte overflow control.
 _FILE_INJECT_CATALOG_CANONICAL_BYTES = 867
+# CDA-04 (2026-11-13): reviewed slots reach only node-template users, and
+# staging rejects any query override. The corrected teaching measures
+# 140,468 -> 140,621 B on both live and small catalogs (+153 B). Keep the
+# delivery limit, refusal condition and repair together; the rest of this
+# teaching unit is unchanged. Preserve existing headroom and boundary controls.
+_CDA04_REVIEWED_SLOT_CANONICAL_BYTES = 153
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
@@ -335,6 +341,7 @@ _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     + _SEMANTIC_REVIEW_GUIDANCE_CANONICAL_BYTES
     + _SKILL_REWORK_0812_CANONICAL_BYTES
     + _FILE_INJECT_CATALOG_CANONICAL_BYTES
+    + _CDA04_REVIEWED_SLOT_CANONICAL_BYTES
 )
 
 

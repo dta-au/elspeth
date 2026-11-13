@@ -55,6 +55,8 @@ def _wire_pending_tone_review(node: dict[str, Any]) -> None:
 
 def _pending_arguments(tmp_path: Path, container: str) -> dict[str, Any]:
     arguments = _structured_llm_args(tmp_path)
+    for query in arguments["nodes"][0]["options"]["queries"]:
+        query.pop("template", None)
     _wire_pending_tone_review(arguments["nodes"][0])
     source = arguments["source"]
     source["options"][INTERPRETATION_REQUIREMENTS_KEY] = [
