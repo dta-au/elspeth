@@ -95,7 +95,7 @@ def _transform_config(**overrides: object) -> dict[str, object]:
 def test_shared_arn_binding_validator_exists() -> None:
     from elspeth.plugins.transforms.aws import guardrail_profiles
 
-    assert hasattr(guardrail_profiles, "validate_guardrail_arn_binding")
+    assert "validate_guardrail_arn_binding" in vars(guardrail_profiles)
 
 
 @pytest.mark.parametrize("arn_name", sorted(_MISMATCHED_ARNS))
@@ -126,7 +126,7 @@ def test_transform_config_accepts_matching_arn_and_bare_identifier() -> None:
 def test_profile_and_transform_share_the_arn_binding_message(arn_name: str) -> None:
     from elspeth.plugins.transforms.aws import guardrail_profiles
 
-    assert hasattr(guardrail_profiles, "validate_guardrail_arn_binding")
+    assert "validate_guardrail_arn_binding" in vars(guardrail_profiles)
     with pytest.raises(ValueError, match="partition and region"):
         guardrail_profiles.validate_guardrail_arn_binding(_MISMATCHED_ARNS[arn_name], region="us-east-1")
 
@@ -172,10 +172,10 @@ def _row(**values: str) -> Any:
 def test_guardrail_row_deadline_symbols_exist() -> None:
     from elspeth.plugins.transforms.aws import _guardrail_transform
 
-    assert hasattr(_guardrail_transform, "GUARDRAIL_ROW_DEADLINE_SECONDS")
+    assert "GUARDRAIL_ROW_DEADLINE_SECONDS" in vars(_guardrail_transform)
     transform, _context = _started_guardrail(["prompt"])
-    assert hasattr(transform, "_row_deadline_seconds")
-    assert hasattr(transform, "_monotonic")
+    assert "_row_deadline_seconds" in vars(transform)
+    assert "_monotonic" in vars(transform)
 
 
 def test_row_deadline_stops_scanning_remaining_fields(monkeypatch: pytest.MonkeyPatch) -> None:
