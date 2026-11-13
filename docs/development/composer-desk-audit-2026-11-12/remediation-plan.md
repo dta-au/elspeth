@@ -134,6 +134,26 @@ Owner for every package is the maintainer; dates are set by the operator.
   operator procedure.
 - **Network.** The tutorial's run step scrapes `dta-au.github.io`; the demo
   host needs outbound access to it.
+- **Concurrency (hands-on only; spike S5).** One instance runs 4 composer
+  turns at once (`composer_async_worker_concurrency`, default 4, max 16).
+  Queued turns spend their own 240 s deadline, which starts at submission,
+  and the 65th waiting turn is refused with "The composer is busy".
+  - Modelled with the real admission code: 80 people sending the tutorial
+    brief together on defaults gives 44 completions (p90 202 s), 20 timeouts
+    and 16 "busy". About 8–10 simultaneous senders is the safe ceiling on
+    defaults.
+  - For more, set `ELSPETH_WEB__COMPOSER_ASYNC_WORKER_CONCURRENCY=16`,
+    `ELSPETH_WEB__COMPOSER_ASYNC_MAX_QUEUED_OPERATIONS` ≥ 128 and
+    `ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS` ≥ 420.
+  - Local-auth logins are limited per client IP
+    (`ELSPETH_WEB__AUTH_RATE_LIMIT_PER_MINUTE`, default 20). Raise it, and
+    set the trusted-proxy hosts if a whole room shares one network.
+  - Pipeline runs execute one at a time per process: do not have attendees
+    press Run together.
+- **Provider credit.** When the provider refuses for credit, every turn fails
+  with "The composer model is unavailable", while `/api/system/status` still
+  reports the composer available (S5). Pre-fund the account and check the
+  balance in preflight.
 - **Timeout.** Consider raising `ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS` (P6).
   Planner turns ran p90 62 s, max 242 s.
 
@@ -146,7 +166,8 @@ Owner for every package is the maintainer; dates are set by the operator.
    GATE-NOT-CLEARED labels on any prompt you intend to use.
 3. Walk the tutorial in a browser through the **run** stage, including the
    scrape.
-4. Pre-warm one throwaway session per demo flow.
+4. Check the provider account balance covers the day (S5).
+5. Pre-warm one throwaway session per demo flow.
 
 ### Prompts
 

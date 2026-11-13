@@ -1,0 +1,139 @@
+{
+ "edges": [],
+ "metadata": {
+  "description": "Combine the uploaded Q1 and Q2 invoice files into one CSV, tagging each row with the quarter it came from.",
+  "name": "Combined quarterly invoices"
+ },
+ "nodes": [
+  {
+   "description": "Tag each Q1 row with its quarter.",
+   "id": "tag_q1",
+   "input": "q1_rows",
+   "node_type": "transform",
+   "on_error": "discard",
+   "on_success": "combined",
+   "options": {
+    "operations": [
+     {
+      "expression": "'Q1'",
+      "target": "quarter"
+     }
+    ],
+    "schema": {
+     "fields": [
+      "invoice: str",
+      "supplier: str",
+      "amount: str",
+      "quarter: str"
+     ],
+     "guaranteed_fields": [
+      "invoice",
+      "supplier",
+      "amount",
+      "quarter"
+     ],
+     "mode": "flexible"
+    }
+   },
+   "plugin": "value_transform"
+  },
+  {
+   "description": "Tag each Q2 row with its quarter.",
+   "id": "tag_q2",
+   "input": "q2_rows",
+   "node_type": "transform",
+   "on_error": "discard",
+   "on_success": "combined",
+   "options": {
+    "operations": [
+     {
+      "expression": "'Q2'",
+      "target": "quarter"
+     }
+    ],
+    "schema": {
+     "fields": [
+      "invoice: str",
+      "supplier: str",
+      "amount: str",
+      "quarter: str"
+     ],
+     "guaranteed_fields": [
+      "invoice",
+      "supplier",
+      "amount",
+      "quarter"
+     ],
+     "mode": "flexible"
+    }
+   },
+   "plugin": "value_transform"
+  },
+  {
+   "description": "Gather the tagged Q1 and Q2 rows into one shared stream.",
+   "id": "combined",
+   "input": "combined",
+   "node_type": "queue"
+  }
+ ],
+ "outputs": [
+  {
+   "description": "Write the combined Q1 and Q2 rows to one CSV file.",
+   "on_write_failure": "discard",
+   "options": {
+    "collision_policy": "auto_increment",
+    "delimiter": ",",
+    "encoding": "utf-8",
+    "mode": "write",
+    "path": "outputs/combined_quarters.csv",
+    "schema": {
+     "fields": [
+      "invoice: str",
+      "supplier: str",
+      "amount: str",
+      "quarter: str"
+     ],
+     "mode": "fixed"
+    }
+   },
+   "plugin": "csv",
+   "sink_name": "combined"
+  }
+ ],
+ "sources": {
+  "q1": {
+   "blob_id": "64ec0d4f-6543-4730-9cee-af7a260c7679",
+   "description": "Load the Q1 invoice rows uploaded as q1.csv.",
+   "on_success": "q1_rows",
+   "on_validation_failure": "discard",
+   "options": {
+    "schema": {
+     "fields": [
+      "invoice: str",
+      "supplier: str",
+      "amount: str"
+     ],
+     "mode": "flexible"
+    }
+   },
+   "plugin": "csv"
+  },
+  "q2": {
+   "blob_id": "e66b975d-8655-487f-888a-9bb69935644b",
+   "description": "Load the Q2 invoice rows uploaded as q2.csv.",
+   "on_success": "q2_rows",
+   "on_validation_failure": "discard",
+   "options": {
+    "schema": {
+     "fields": [
+      "invoice: str",
+      "supplier: str",
+      "amount: str"
+     ],
+     "mode": "flexible"
+    }
+   },
+   "plugin": "csv"
+  }
+ }
+}

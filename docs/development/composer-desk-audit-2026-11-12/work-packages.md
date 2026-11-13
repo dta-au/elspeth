@@ -38,6 +38,11 @@ Status: **READY** (a lane exists), **DECISION** (blocked on the maintainer),
 | Advisor cache 52% | P2 investigation | READY (after CDA-07) | CDA-16 |
 | Hatch deadline / output-cap exits | P5 | READY (after CDA-12) | CDA-17 |
 | Budget/timeout warning | P6 | RESOLVED (D5: presenter scripts turns to fit the budget) | — |
+| F4b credential guard refuses ordinary prose with a "Credentials:" label (S4) | Narrow `credential_assignment` | DECISION D6 | CDA-19 (proposed) |
+| Provider 429 not retried; the user sees "model unavailable" at once (S5) | Retry with backoff inside the deadline | DECISION D7 (changes audit retry semantics) | — |
+| `/api/system/status` reports the composer available while the provider refuses for credit (S5) | Runbook credit check now; status probe later | READY (runbook) / proposed | — |
+| Queue time counts against the 240 s deadline (S5) | Count the deadline from admission | Optional; DECISION with D7 | — |
+| Planner `authoring_aids` unmarked for Anthropic prompt caching (S4) | Cache marker | READY | CDA-16 |
 | Skip advisor on chat turns | P3 | NOT FIXING (loses real catches, e.g. s03 T4) | — |
 | Register as a gated artifact | E2 | Optional, only with E3 | — |
 
@@ -67,6 +72,19 @@ Status: **READY** (a lane exists), **DECISION** (blocked on the maintainer),
   text).
 - **D5 resolved without code.** The presenter scripts the demo turns to fit
   the configured budget. P6 is not a lane.
+
+Open, raised by the spikes:
+
+- **D6. F4b (S4).** The `credential_assignment` pattern
+  (`contracts/credential_material.py:85`) refuses visible prose such as
+  "**Credentials:** managed by the operator…". This was reproduced
+  in-process. Sonnet's ordinary answer to "Is this safe to run on sensitive
+  data?" failed with 422. Narrow the pattern so the value must be a
+  credential-shaped token rather than prose (proposed CDA-19, after CDA-18),
+  or keep it and accept the false positive?
+- **D7. Provider 429s (S5).** Retry with backoff inside the turn deadline
+  (`provider_errors.py`), which changes audit retry semantics; and, with it,
+  whether the deadline should count from admission rather than submission.
 
 R16 is also decided: you confirmed the tutorial is a fixed prompt the learner
 cannot edit (ADR-031). CDA-01 enforces that in the frontend only.
@@ -115,6 +133,14 @@ land before the code freeze (remediation plan, WP1a).
   `scripts/cicd/composer_wire_census.py --scorecard`, plus the planner
   teaching gates under `tests/unit/web/composer/`. Skill-hash consumers will
   change; that churn is expected.
+- **Worktree test trap (S3).** In a worktree, pytest's configured
+  `pythonpath` (`pyproject.toml`) silently overrides an exported
+  `PYTHONPATH`. When proving a test red on base, pass
+  `-o pythonpath=<root>/src` and check `elspeth.__file__`.
+- **Spike artifacts.** Design notes are in
+  `docs/development/composer-desk-audit-2026-11-12/spikes/`. Instruments and
+  prototype patches are in `evals/composer-live-audit/spikes/` (see its
+  README). Start CDA-07, CDA-12 and CDA-13 from them.
 - **Delivery.** Write `report.md` in the lane directory and return one line.
 
 ## 5. Lanes
@@ -281,7 +307,19 @@ pytest only.
   - `advisor_checkpoint.py` / `advisor_context.py`: END rubric sentences.
     - The record proves existence, absence or prohibition, not what a plugin
       can do.
-    - Reword the reused "absence does not establish…" scope sentence.
+    - Keep the record bytes identical to `advisor_abandonment.py:109-119`,
+      through one shared renderer. Do **not** reword the scope sentence; S1
+      measured it harmless.
+    - Carry the record on `AdvisorPublicationReview` from `TurnEvidence` (one
+      snapshot per request). Render it as its own section in
+      `_advisor_user_sections` (`advisor_context.py:314`), immediately before
+      the candidate/request projection.
+      `advisor_user_content_parts` (`advisor_context.py:526-625`) counts
+      sections by position and must count the new one.
+    - Bind `snapshot_hash` into `binding` and `semantic_repair_key`
+      (`turn_effects.py:851, :863`), as the abandonment path does.
+    - Append the rubric sentence as the last bullet of
+      `_ADVISOR_END_PUBLICATION_INSTRUCTIONS`.
     - A reply that shows tool-call JSON or asks the user to file a defect is
       FLAGGED (R15).
   - `composition_completion.py`, the "Completion advisory review — BLOCKING"
@@ -300,12 +338,28 @@ pytest only.
       capability record;
     - a planted "SharePoint source exists" claim against a snapshot without it
       yields a rubric/evidence pair that makes the claim unsupported.
+    - the `AdvisorPublicationReview` binding changes when only
+      `snapshot_hash` changes;
+    - the rendered END user message contains the record section exactly
+      once, before the projection section;
+    - the record text equals the abandonment record for the same snapshot.
   - `tests/unit/web/composer/test_turn_effects.py`.
   - `tests/unit/web/composer/test_advisor_checkpoint.py`.
 - **Test command.** `pytest tests/unit/web/composer/test_advisor_capability_evidence.py tests/unit/web/composer/test_turn_effects.py tests/unit/web/composer/test_advisor_checkpoint.py -n 4 -q`.
-- **Acceptance (live, by the orchestrator after merge).** On the demo model
-  pair, ×3 each: SharePoint, PDF, Teams and "is this safe" are admitted. A
-  planted false capability claim is withheld.
+- **Acceptance (orchestrator, after merge).**
+  - **Replay** (`evals/composer-live-audit/spikes/S1-advisor-replay/replay.py`,
+    cases W1–W4, K1, K2, n=5 each, arm built from the new code path): at least
+    29 of 30 ADMIT.
+  - **Planted false existence or prohibition claims** (C1, C2, C3, C5, n=5
+    each): 20 of 20 WITHHOLD. Also replay the natural S4 case (Luna p01 T2:
+    "Yes. I can read PDFs when you upload one"): it must be FLAGGED.
+  - **Live**, ×3 each on the demo model and one other model: SharePoint, PDF,
+    Teams and "is this safe" are admitted. The withhold rate depends on
+    phrasing (S4: Sonnet 0/3, Luna 2/2, DeepSeek 4/6), and a live ×3 alone
+    passes an unfixed build about 42% of the time, so the replay is the gate.
+  - **Non-goal:** false claims about what a real plugin can do (C4, "csv reads
+    xlsx") are not caught by the record (S1: 1 of 5). Document this.
+- **Size.** About 1 agent-day (S1).
 
 ### CDA-08: Withheld-reply and receipt presentation (R3 items 1–2; F2, F8)
 
@@ -326,6 +380,8 @@ pytest only.
   - Vitest: `MessageBubble.test.tsx`.
 - **Test command.** `pytest tests/unit/web/composer/test_checkpoint_receipts.py tests/unit/web/composer/test_no_tool_policy_segments.py -n 0 -q`.
   Vitest by hand: `npm --prefix src/elspeth/web/frontend run test -- MessageBubble`.
+- **Acceptance.** The receipt is never duplicated, including on the
+  advisor-unavailable withhold (S4: Luna s06 T2).
 - **Depends on.** CDA-07.
 
 ### CDA-09: Turn-end preflight for every wired state (R14, F16)
@@ -412,8 +468,18 @@ pytest only.
     - R13: **replace** L867-870 teaching.
   - `src/elspeth/web/composer/pipeline_planner.py`: the message builder
     (~L3494-3514) uses the planner overlay.
-  - `advisor_checkpoint.py` (~L453-454): state which skill text the advisor
-    receives.
+  - `advisor_checkpoint.py` (~L453-454): the advisor still reviews planner
+    turns against the freeform policy. Give it the planner text for planner
+    turns.
+  - `src/elspeth/web/composer/service.py` (~L751-801): render the planner text,
+    assert its on-disk hash, pass it to `PlanningApplication`, and **archive
+    it in `skill_markdown_history`**. Today only the tool-loop text is
+    archived, so planner proposals would cite an unarchived skill hash (S2).
+  - `src/elspeth/web/composer/skills/pipeline_planner.md` (new): the planner
+    overlay. Start from S2's prototype (`evals/composer-live-audit/spikes/S2-planner-overlay/prototype.patch`).
+  - Drift: review staging, the Reply Register, termination and decline rules
+    now live in two overlays. Factor shared rules into the core, or pin them
+    with the E3 test.
 - **Test files.**
   - `tests/unit/web/composer/test_surface_teaching_parity.py` (new; this is
     E3). For each surface, scan the **whole** outbound request: system text,
@@ -423,12 +489,37 @@ pytest only.
   - `tests/unit/web/composer/test_skills_loader.py`.
   - `tests/unit/web/composer/test_capability_skill_identity.py`.
   - `tests/unit/web/composer/test_planner_authoring_aids.py`.
+  - `tests/unit/web/sessions/test_skill_markdown_history_authority.py`: the
+    planner hash is archived and resolvable.
+  - A planner-rendering case in `test_capability_skill_identity.py`.
+  - Surface parameterisation of `test_tool_result_envelope_gate.py` and
+    `composer_wire_census.py`. Today no teaching gate reads what the planner
+    is sent (S2).
+  - Re-point `test_stated_threshold_data_full_walk.py:214`, which asserts the
+    planner gets the freeform text.
+  - A test that the deployment overlay reaches the planner rendering.
 - **Test command.** `pytest tests/unit/web/composer/test_surface_teaching_parity.py tests/unit/web/composer/test_planner_authoring_aids.py tests/unit/web/composer/test_skills_loader.py tests/unit/web/composer/test_capability_skill_identity.py -n 4 -q`.
 - **Also run.** `generate_skill_inventory.py --check`,
   `composer_wire_census.py --scorecard`, and the planner teaching gates.
   Composer invariant 1 applies: teaching only, no server structure.
-- **Acceptance (live, orchestrator).** On the demo pair, ×3 runs of
-  s01–s20: the strict palette-confusion rate (crosscheck pattern) is below 5%.
+- **Acceptance.**
+  - **E3 baseline:** 129 unoffered-tool mentions in the whole planner request
+    at HEAD; 23 after R1 alone (S2). The rest belong to R8 and R13 and to the
+    schema text. Allowlist the core's 3 conditional mentions.
+  - **Live, orchestrator,** on the demo pair, ×3 runs of s01–s20 plus s10 and
+    c03:
+    - strict palette-confusion rate below 5%, using `strict_hits` in
+      `evals/composer-live-audit/spikes/S2-planner-overlay/analyse.py`
+      (controlled; 32/110 on the audit corpus);
+    - first-call planner prompt at most 35k tokens on DeepSeek (S2 measured
+      31.4k, against 52.5k);
+    - no increase in proposal rejections or invalid proposals against a
+      same-day baseline;
+    - a human reviews the s10 and c03 replies for honesty: the multi-file limit
+      is stated and no tool names appear.
+  - **S2's early read** (4 pairs, n=1): prompt tokens −50%, latency 78→46 s,
+    rejections 2→0.
+- **Size.** 1.5–2 agent-days (S2; R1 plus E3 is 0.5–1 day).
 - **Depends on.** CDA-07, CDA-10.
 
 ### CDA-13: Multi-file sources on the planner (R4(a), F1). D2 approved, no compatibility
@@ -436,20 +527,43 @@ pytest only.
 - **Files.**
   - `src/elspeth/web/composer/tools/sessions.py` (~L2188): the canonical
     named-sources schema.
-  - Planner custody: named sources resolve `blob_id` through the existing
-    `_resolve_source_blob(source_name=…)`.
+  - Planner custody: each named `sources.<name>.blob_id` resolves through the
+    existing `_resolve_source_blob(source_name=<name>,
+    rejection_operation=CANDIDATE)`. This is the resolver the singular
+    `source.blob_id` and the tool loop's `set_source_from_blob` already use,
+    so it produces the identical state shape (S3).
+  - `src/elspeth/web/sessions/proposal_blob_refs.py`: **required.** The
+    pending-proposal blob extractor reads only `source.blob_id`. Without the
+    fix, a planner proposal over two files skips the ownership check at
+    creation and does not protect the blobs from deletion.
+  - `src/elspeth/web/composer/tools/_common.py`
+    (`_serialize_set_pipeline_arguments`).
+  - Start from S3's prototype (`evals/composer-live-audit/spikes/S3-multifile-custody/prototype.patch`;
+    144 source lines across 5 files).
 - **Conditions.**
-  - Keep `inline_blob` out of named sources.
-  - Define precedence against reviewed-source custody.
-  - Reject `blob_id` together with `path`.
-  - Update the pinned canonical field inventory.
+  - Keep `inline_blob` out of named sources (schema-rejected).
+  - Reject `blob_id` together with `options.path`/`options.file` as
+    `source_binding_ambiguous`.
+  - A hash-matched reviewed binding plus `blob_id` is also
+    `source_binding_ambiguous`, rather than one silently winning.
+  - The proposal blob-reference extractor collects `sources.<n>.blob_id`.
+  - Update the pinned canonical field inventory (`named_source` row in
+    `pipeline_capabilities.md`).
 - **Test files.** `tests/unit/web/composer/test_named_sources_blob_binding.py`
-  (new). Two uploaded blobs bound as two named sources build, and a row-union
-  combining topology validates.
+  (new). The s10 combining topology passes `build_set_pipeline_candidate`
+  and `validate_pipeline_for_trained_operator`: two named csv sources, a
+  per-source `value_transform` literal (`quarter`) into one sink, plus the
+  queue → passthrough variant. Do **not** use `row_union`: it is a barrier
+  over fork branches, not a fan-in of independent sources. Use
+  `s10_seq12_pipeline.json` (the model's own attempt) as a fixture.
+- **Pinned tests that change.** Two cases in `test_set_pipeline_candidate.py`
+  now round-trip. The planner fixed-scaffolding byte budget in
+  `test_pipeline_planner.py` is exceeded by 911 bytes; re-baseline it.
 - **Test command.** `pytest tests/unit/web/composer/test_named_sources_blob_binding.py -n 0 -q`.
 - **No compatibility.** Do not add migration, dual-shape reading or shims
   for older stored states (D2).
 - **Also run.** The testcontainer suite, if persistence code changes.
+- **Size.** 0.5–1 agent-day (S3).
 - **Depends on.** CDA-12.
 
 ### CDA-14: Show the proposal's own description on the first turn (E1, F13)
@@ -480,6 +594,11 @@ Read-only investigation, with a fix only if it is trivial. The question is why
 the advisor's cache hit is 52% against the composer's 92–94%. Check whether
 per-turn evidence precedes stable text in `advisor_checkpoint.py:453-495`.
 Deliver measurements and a proposed change in `report.md`.
+
+Also (S4): on Anthropic routes the planner's byte-stable `authoring_aids`
+message has no cache marker, so about 20k tokens per planner call are billed
+uncached (Sonnet planner cache hit 74%, against 99% in the edit loop). Adding
+the marker is a trivial fix candidate; measure it.
 
 ### CDA-18: Drop credential-shaped reasoning instead of failing the turn (R6(a), F4; D1 approved)
 

@@ -1,0 +1,15 @@
+Short answer: not in this deployment. There's no SharePoint connector in the live catalogue here — SharePoint connectors are prohibited by this deployment's standing security policy, so it isn't something an operator can enable. I only ever answer that from what the catalogue actually offers, and right now the available data inputs are:
+
+- **File sources** — CSV, JSON/JSONL, or plain-text/line-oriented files, either a file you upload/paste or one resolved from session storage.
+- **A URL fetch step** — fetches a public HTTP(S) URL's bytes into the run payload store. It has no origin-authentication option, so it can't log in to SharePoint (or any authenticated) site with your credentials.
+- **A prompt-driven source** — generates a single row from an authored prompt.
+
+So I can't sign in to SharePoint, traverse a site/library, or read a list directly. What I *can* do is work from SharePoint data you export:
+
+1. In SharePoint, export/download the list or library view as **CSV**, **JSON**, or a **text file** (or paste the rows into chat).
+2. Attach or paste it here.
+3. I'll build the full pipeline around it — transformations, calculated fields, LLM classification/scoring/summarisation, branching and routing, batch aggregations, and CSV/JSON/text outputs.
+
+If the export is something you'll refresh regularly, say so and I'll shape the pipeline around a re-uploaded file each run.
+
+Two things worth telling me next: **what the exported columns are** (or just attach the file and I'll inspect the headers), and **what each step should produce**. Then I'll draft it and show you the graph before anything runs.

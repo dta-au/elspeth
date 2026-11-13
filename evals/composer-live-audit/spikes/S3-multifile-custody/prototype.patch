@@ -1,0 +1,783 @@
+diff --git a/src/elspeth/web/composer/redaction.py b/src/elspeth/web/composer/redaction.py
+index d9dce894..e4ea2412 100644
+--- a/src/elspeth/web/composer/redaction.py
++++ b/src/elspeth/web/composer/redaction.py
+@@ -1777,10 +1777,12 @@ class _InlineBlobModel(BaseModel):
+ class _SetPipelineNamedSourceModel(BaseModel):
+     """Typed fields shared by every named ``set_pipeline.sources`` root.
+ 
+-    Named sources deliberately exclude ``blob_id`` and ``inline_blob``:
+-    those custody-bearing fields are supported only by the legacy singular
+-    ``source`` branch. Keeping a distinct runtime model makes that semantic
+-    boundary visible to the advertised-schema compatibility guard.
++    Named sources may bind an existing ready session blob through
++    ``blob_id`` (resolved per source name by ``_resolve_source_blob``, the
++    same resolver as the singular ``source.blob_id``). They deliberately
++    exclude ``inline_blob``: creating a blob is supported only by the
++    singular ``source`` branch. Keeping a distinct runtime model makes that
++    semantic boundary visible to the advertised-schema compatibility guard.
+     """
+ 
+     plugin: str
+@@ -1791,6 +1793,7 @@ class _SetPipelineNamedSourceModel(BaseModel):
+     # like _PipelineEdgeModel.label — structurally not a leak surface, so no
+     # Sensitive marker (the §4.4.2 walker admits closed-list scalars).
+     description: str | None = None
++    blob_id: str | None = None
+ 
+     model_config = ConfigDict(extra="forbid")
+ 
+@@ -1840,7 +1843,6 @@ class _SetPipelineSourceModel(_SetPipelineNamedSourceModel):
+     shapes (type vs semantic).
+     """
+ 
+-    blob_id: str | None = None
+     inline_blob: _InlineBlobModel | None = None
+ 
+ 
+diff --git a/src/elspeth/web/composer/skills/pipeline_capabilities.md b/src/elspeth/web/composer/skills/pipeline_capabilities.md
+index 049ac2a4..d001bfa5 100644
+--- a/src/elspeth/web/composer/skills/pipeline_capabilities.md
++++ b/src/elspeth/web/composer/skills/pipeline_capabilities.md
+@@ -245,7 +245,7 @@ inspection records, not a substitute for exact `set_pipeline_arguments`.
+ | --- | --- |
+ | pipeline | `source`, `sources`, `nodes`, `edges`, `outputs`, `metadata` |
+ | source | `plugin`, `blob_id`, `options`, `on_success`, `on_validation_failure`, `description`, `inline_blob` |
+-| named_source | `plugin`, `options`, `on_success`, `on_validation_failure`, `description` |
++| named_source | `plugin`, `blob_id`, `options`, `on_success`, `on_validation_failure`, `description` |
+ | inline_blob | `filename`, `mime_type`, `content`, `description` |
+ | node | `id`, `node_type`, `plugin`, `input`, `on_success`, `on_error`, `options`, `condition`, `routes`, `fork_to`, `branches`, `policy`, `merge`, `trigger`, `output_mode`, `expected_output_count`, `timeout_seconds`, `description`, `scope_name`, `scope_opener`, `scope_policy` |
+ | trigger | `count`, `timeout_seconds`, `condition` |
+@@ -256,7 +256,14 @@ inspection records, not a substitute for exact `set_pipeline_arguments`.
+ <!-- taught:end -->
+ 
+ Named sources use the same routing semantics as the singular source without
+-inline custody fields.
++inline custody fields. A named source binds an uploaded session file with its
++own `blob_id`, resolved exactly like `source.blob_id`; never pair `blob_id`
++with `options.path` or `options.file`. For two or more uploaded files, author
++one named source per file, each with its own `blob_id` and `on_success`. To
++combine them into one output, give each source's rows any per-file field the
++user asked for (for example a `value_transform` setting a literal `quarter`)
++and point every branch's `on_success` at the same sink; a `queue` fan-in must
++be consumed by a downstream node, never by a sink of the same name.
+ 
+ Use `source` only for the canonical single-source custody shape; use `sources`
+ for plural named roots. Use stable, descriptive source/node/output ids. Edges
+diff --git a/src/elspeth/web/composer/tools/_common.py b/src/elspeth/web/composer/tools/_common.py
+index d0d52e2e..853661d5 100644
+--- a/src/elspeth/web/composer/tools/_common.py
++++ b/src/elspeth/web/composer/tools/_common.py
+@@ -4083,7 +4083,7 @@ def _serialize_set_pipeline_arguments(state: CompositionState) -> tuple[dict[str
+         try:
+             source_payload, error = _serialize_set_pipeline_source(
+                 source,
+-                allow_blob_binding=False,
++                allow_blob_binding=True,
+             )
+         except (KeyError, TypeError, ValueError):
+             return None, "resolved authoring review state is not safely reconstructible"
+diff --git a/src/elspeth/web/composer/tools/sessions.py b/src/elspeth/web/composer/tools/sessions.py
+index dfa69465..40a52df3 100644
+--- a/src/elspeth/web/composer/tools/sessions.py
++++ b/src/elspeth/web/composer/tools/sessions.py
+@@ -972,6 +972,9 @@ def build_set_pipeline_candidate(
+ 
+     source_specs: dict[str, SourceSpec] = {}
+     resolved_source_blob: _ResolvedSourceBlob | None = None
++    # Named ``sources.<name>.blob_id`` bindings, resolved per name by the same
++    # resolver as the singular ``source.blob_id`` (spike S3 / CDA-13).
++    resolved_named_source_blobs: dict[str, _ResolvedSourceBlob] = {}
+ 
+     def _legacy_source_rejection() -> SetPipelineCandidate | None:
+         """Validate the single legacy ``source`` block; return its rejection.
+@@ -1299,6 +1302,21 @@ def build_set_pipeline_candidate(
+             src_plugin = source_model.plugin
+             src_options = dict(source_model.options)
+             src_on_vf = source_failure_routes[source_name]
++            source_blob_id = source_model.blob_id
++            if source_blob_id is not None and ("path" in src_options or "file" in src_options):
++                # The resolver derives path from the blob record; an authored
++                # path beside blob_id would be silently overwritten. Refuse it
++                # as the singular branch refuses blob_id beside inline_blob.
++                _record_component_rejection(
++                    _failure_result(
++                        state,
++                        f"set_pipeline sources.{source_name} must bind either blob_id or options.path/file, not both. "
++                        "Keep blob_id and remove the path: the server derives the file location from the blob.",
++                        error_code="source_binding_ambiguous",
++                        rejected_component=source_ref,
++                    )
++                )
++                continue
+             reviewed_options = _reviewed_source_options(
+                 source_name=source_name,
+                 plugin=src_plugin,
+@@ -1306,6 +1324,20 @@ def build_set_pipeline_candidate(
+                 on_validation_failure=src_on_vf,
+             )
+             reviewed_source = reviewed_options is not None
++            if reviewed_source and source_blob_id is not None:
++                # Precedence (spike S3): a hash-matched reviewed binding is the
++                # source's custody authority; blob_id never silently overrides
++                # it and is never silently dropped in its favour.
++                _record_component_rejection(
++                    _failure_result(
++                        state,
++                        f"set_pipeline sources.{source_name} matches a reviewed source binding and also sets blob_id. "
++                        "Re-supply the reviewed binding unchanged without blob_id, or rebind with blob_id alone.",
++                        error_code="source_binding_ambiguous",
++                        rejected_component=source_ref,
++                    )
++                )
++                continue
+             if reviewed_source:
+                 authority = context.reviewed_source_authority
+                 assert type(authority) is ReviewedSourceAuthority
+@@ -1376,6 +1408,34 @@ def build_set_pipeline_candidate(
+                         src_options,
+                     )
+                 )
++            blob_bound = False
++            if source_blob_id is not None:
++                resolved_named = _resolve_source_blob(
++                    blob_id=source_blob_id,
++                    explicit_plugin=src_plugin,
++                    caller_options=src_options,
++                    rejection_operation=_RejectionOperation.CANDIDATE,
++                    on_validation_failure=src_on_vf,
++                    state=state,
++                    context=context,
++                    session_engine=session_engine,
++                    session_id=session_id,
++                    tool_name="set_pipeline",
++                    source_name=source_name,
++                    existing_options=stored_source_options,
++                )
++                # Same owned closed-union discrimination as the singular arm.
++                if isinstance(resolved_named, ToolResult):
++                    _record_component_rejection(_candidate(resolved_named))
++                    continue
++                resolved_named_source_blobs[source_name] = resolved_named
++                src_plugin = resolved_named.plugin
++                src_options = dict(resolved_named.options)
++                blob_bound = True
++            # Resolver output carries server-owned blob_ref/source_authoring and
++            # was guarantee-checked with the blob's real creation modality, so
++            # the manual-key gates below apply only to unbound, unreviewed sources.
++            resolver_owned = reviewed_source or blob_bound
+             canonical_error = _canonical_interpretation_requirement_error(
+                 src_options,
+                 tool_name="set_pipeline",
+@@ -1402,13 +1462,13 @@ def build_set_pipeline_candidate(
+             if plugin_error is not None:
+                 _record_component_rejection(_plugin_policy_failure(state, plugin_error, rejected_component=source_ref))
+                 continue
+-            manual_blob_ref_error = None if reviewed_source else _reject_manual_source_blob_ref(src_options, tool_name="set_pipeline")
++            manual_blob_ref_error = None if resolver_owned else _reject_manual_source_blob_ref(src_options, tool_name="set_pipeline")
+             if manual_blob_ref_error is not None:
+                 _record_component_rejection(
+                     _failure_result(state, manual_blob_ref_error, error_code="plugin_options_invalid", rejected_component=source_ref)
+                 )
+                 continue
+-            manual_authoring_error = None if reviewed_source else _reject_manual_source_authoring(src_options, tool_name="set_pipeline")
++            manual_authoring_error = None if resolver_owned else _reject_manual_source_authoring(src_options, tool_name="set_pipeline")
+             if manual_authoring_error is not None:
+                 _record_component_rejection(
+                     _failure_result(
+@@ -1418,7 +1478,7 @@ def build_set_pipeline_candidate(
+                 continue
+             guarantee_stamp_error = (
+                 None
+-                if reviewed_source
++                if resolver_owned
+                 else _planner_guarantee_stamp_error(
+                     src_options,
+                     stored_options=stored_source_options,
+@@ -1431,7 +1491,7 @@ def build_set_pipeline_candidate(
+                     _failure_result(state, guarantee_stamp_error, error_code="source_data_contract_required", rejected_component=source_ref)
+                 )
+                 continue
+-            manual_blobs_error = None if reviewed_source else _reject_manual_source_blobs(src_options, tool_name="set_pipeline")
++            manual_blobs_error = None if resolver_owned else _reject_manual_source_blobs(src_options, tool_name="set_pipeline")
+             if manual_blobs_error is not None:
+                 _record_component_rejection(
+                     _failure_result(state, manual_blobs_error, error_code="plugin_options_invalid", rejected_component=source_ref)
+@@ -2039,6 +2099,9 @@ def build_set_pipeline_candidate(
+     if resolved_source_blob is not None:
+         source_blob_payload = {"source_blob": resolved_source_blob.payload}
+         data = source_blob_payload if data is None else {**data, **source_blob_payload}
++    if resolved_named_source_blobs:
++        named_payload = {"named_source_blobs": {name: resolved.payload for name, resolved in resolved_named_source_blobs.items()}}
++        data = named_payload if data is None else {**data, **named_payload}
+     if echoed_metadata_notes:
+         # De-duplicated in first-seen order: one advisory per note kind, no
+         # matter how many components echoed.
+@@ -2130,6 +2193,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
+                 "description": (
+                     "Source configuration. Use blob_id to bind an already uploaded session blob, or "
+                     "inline_blob to materialize user-provided literal data atomically with the pipeline. "
++                    "For two or more uploaded files, use named sources instead, one blob_id each. "
+                     "null carries NO meaning — it is not 'keep the existing source'. Every call must "
+                     "supply source or sources as a real object: on a full rebuild, re-supply the "
+                     "complete existing source block, including blob_id only when that block carries one."
+@@ -2185,14 +2249,22 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
+                 "type": "object",
+                 "description": (
+                     "Named source roots keyed by stable source name; use instead of source for multi-source "
+-                    "pipelines. Values share source's shape minus blob_id/inline_blob. null carries NO "
+-                    "meaning; every call must supply source or sources as a real object."
++                    "pipelines, including one source per uploaded file. Values share source's shape minus "
++                    "inline_blob. null carries NO meaning; every call must supply source or sources as a "
++                    "real object."
+                 ),
+                 "additionalProperties": {
+                     "type": "object",
+                     "additionalProperties": False,
+                     "properties": {
+                         "plugin": {"type": "string"},
++                        "blob_id": {
++                            "type": ["string", "null"],
++                            "description": (
++                                "Existing ready session blob ID to bind as this named source (resolved exactly "
++                                "like source.blob_id). Do not also set options.path or options.file."
++                            ),
++                        },
+                         "options": {
+                             "type": "object",
+                             "description": "Plugin-specific source config." + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+diff --git a/src/elspeth/web/sessions/proposal_blob_refs.py b/src/elspeth/web/sessions/proposal_blob_refs.py
+index 67bfc883..1ab5f5c6 100644
+--- a/src/elspeth/web/sessions/proposal_blob_refs.py
++++ b/src/elspeth/web/sessions/proposal_blob_refs.py
+@@ -138,20 +138,27 @@ def proposal_blob_reference_ids(tool_name: str, arguments: Mapping[str, Any]) ->
+                     )
+             return tuple(dict.fromkeys(collected))
+         source = arguments["source"] if "source" in arguments else None
+-        if source is None:
+-            return ()
+-        if type(source) is not dict:
+-            raise ValueError("set_pipeline source must be a mapping when present")
+-        blob_id = source["blob_id"] if "blob_id" in source else None
+-        if blob_id is not None:
+-            if type(blob_id) is not str or not blob_id:
+-                raise ValueError("set_pipeline source.blob_id must be a non-empty string when present")
+-            collected.append(blob_id)
+-        options = source["options"] if "options" in source else None
+-        if options is not None:
+-            if type(options) is not dict:
+-                raise ValueError("set_pipeline source.options must be a mapping when present")
+-            _collect_option_blob_references(options, position="source.options", into=collected)
++        named_sources = arguments["sources"] if "sources" in arguments else None
++        authored: list[tuple[str, Any]] = []
++        if source is not None:
++            authored.append(("source", source))
++        if named_sources is not None:
++            if type(named_sources) is not dict:
++                raise ValueError("set_pipeline sources must be a mapping when present")
++            authored.extend((f"sources[{name!r}]", named) for name, named in named_sources.items())
++        for position, authored_source in authored:
++            if type(authored_source) is not dict:
++                raise ValueError(f"set_pipeline {position} must be a mapping when present")
++            blob_id = authored_source["blob_id"] if "blob_id" in authored_source else None
++            if blob_id is not None:
++                if type(blob_id) is not str or not blob_id:
++                    raise ValueError(f"set_pipeline {position}.blob_id must be a non-empty string when present")
++                collected.append(blob_id)
++            options = authored_source["options"] if "options" in authored_source else None
++            if options is not None:
++                if type(options) is not dict:
++                    raise ValueError(f"set_pipeline {position}.options must be a mapping when present")
++                _collect_option_blob_references(options, position=f"{position}.options", into=collected)
+         return tuple(dict.fromkeys(collected))
+ 
+     value = arguments["blob_id"] if "blob_id" in arguments else None
+diff --git a/tests/unit/web/composer/test_named_sources_blob_binding.py b/tests/unit/web/composer/test_named_sources_blob_binding.py
+new file mode 100644
+index 00000000..458ebb98
+--- /dev/null
++++ b/tests/unit/web/composer/test_named_sources_blob_binding.py
+@@ -0,0 +1,483 @@
++"""Named ``sources.<name>.blob_id`` binds uploaded blobs through the existing resolver.
++
++Spike S3 (composer desk audit 2026-11-12, finding F1, lane CDA-13). The
++pipeline document below is the exact proposal DeepSeek authored in the live
++s10 capture (turn 1, seq 12) — two uploaded quarters, a per-row ``quarter``
++literal, a queue fan-in and one CSV sink — with the live blob ids replaced by
++this test's blobs. On the base tree it is rejected at the canonical schema
++(``sources/item additionalProperties``).
++"""
++
++from __future__ import annotations
++
++import asyncio
++from copy import deepcopy
++from datetime import UTC, datetime
++from pathlib import Path
++from types import SimpleNamespace
++from typing import Any
++from uuid import UUID, uuid4
++
++import pytest
++from sqlalchemy import insert
++from sqlalchemy.pool import StaticPool
++
++from elspeth.contracts.blobs import BlobRecord
++from elspeth.contracts.composer_interpretation import InterpretationKind
++from elspeth.contracts.session_operation import SessionOperationKind
++from elspeth.web.blobs.service import BlobServiceImpl
++from elspeth.web.catalog.policy_view import PolicyCatalogView
++from elspeth.web.composer import yaml_generator
++from elspeth.web.composer.pipeline_proposal import reviewed_anchor_hash
++from elspeth.web.composer.protocol import ToolArgumentError
++from elspeth.web.composer.reviewed_source_authority import resolve_reviewed_source_authority
++from elspeth.web.composer.state import CompositionState, PipelineMetadata
++from elspeth.web.composer.tools import ToolContext, build_set_pipeline_candidate, execute_tool
++from elspeth.web.composer.tools._common import _serialize_set_pipeline_arguments
++from elspeth.web.composer.tools.blobs import _execute_create_blob
++from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
++from elspeth.web.dependencies import create_catalog_service
++from elspeth.web.execution.validation import validate_pipeline_for_trained_operator
++from elspeth.web.interpretation_state import interpretation_sites
++from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
++from elspeth.web.sessions.engine import create_session_engine
++from elspeth.web.sessions.models import chat_messages_table, sessions_table
++from elspeth.web.sessions.proposal_blob_refs import proposal_blob_reference_ids, validate_proposal_blob_references
++from elspeth.web.sessions.schema import initialize_session_schema
++from tests.fixtures.identities import ensure_test_identity
++from tests.helpers.composer_fences import fenced_tool_context
++from tests.helpers.session_fences import fenced_operation_context
++
++Q1 = b"invoice,supplier,amount\nQ1-001,Globex,5261.07\nQ1-002,Globex,711.99\nQ1-003,Acme,8507.66\n"
++Q2 = b"invoice,supplier,amount\nQ2-001,Globex,7994.66\nQ2-002,Globex,300.81\n"
++
++
++def _s10_pipeline(q1_blob_id: str, q2_blob_id: str) -> dict[str, Any]:
++    """The live s10 turn-1 seq-12 proposal, blob ids substituted."""
++    tag_schema = {
++        "fields": ["invoice: str", "supplier: str", "amount: str", "quarter: str"],
++        "guaranteed_fields": ["invoice", "supplier", "amount", "quarter"],
++        "mode": "flexible",
++    }
++    source_schema = {"fields": ["invoice: str", "supplier: str", "amount: str"], "mode": "flexible"}
++    return {
++        "edges": [],
++        "metadata": {
++            "description": "Combine the uploaded Q1 and Q2 invoice files into one CSV, tagging each row with the quarter it came from.",
++            "name": "Combined quarterly invoices",
++        },
++        "nodes": [
++            {
++                "description": "Tag each Q1 row with its quarter.",
++                "id": "tag_q1",
++                "input": "q1_rows",
++                "node_type": "transform",
++                "on_error": "discard",
++                "on_success": "combined",
++                "options": {"operations": [{"expression": "'Q1'", "target": "quarter"}], "schema": deepcopy(tag_schema)},
++                "plugin": "value_transform",
++            },
++            {
++                "description": "Tag each Q2 row with its quarter.",
++                "id": "tag_q2",
++                "input": "q2_rows",
++                "node_type": "transform",
++                "on_error": "discard",
++                "on_success": "combined",
++                "options": {"operations": [{"expression": "'Q2'", "target": "quarter"}], "schema": deepcopy(tag_schema)},
++                "plugin": "value_transform",
++            },
++            {
++                "description": "Gather the tagged Q1 and Q2 rows into one shared stream.",
++                "id": "combined",
++                "input": "combined",
++                "node_type": "queue",
++            },
++        ],
++        "outputs": [
++            {
++                "description": "Write the combined Q1 and Q2 rows to one CSV file.",
++                "on_write_failure": "discard",
++                "options": {
++                    "collision_policy": "auto_increment",
++                    "delimiter": ",",
++                    "encoding": "utf-8",
++                    "mode": "write",
++                    "path": "outputs/combined_quarters.csv",
++                    "schema": {"fields": ["invoice: str", "supplier: str", "amount: str", "quarter: str"], "mode": "fixed"},
++                },
++                "plugin": "csv",
++                "sink_name": "combined",
++            }
++        ],
++        "sources": {
++            "q1": {
++                "blob_id": q1_blob_id,
++                "description": "Load the Q1 invoice rows uploaded as q1.csv.",
++                "on_success": "q1_rows",
++                "on_validation_failure": "discard",
++                "options": {"schema": deepcopy(source_schema)},
++                "plugin": "csv",
++            },
++            "q2": {
++                "blob_id": q2_blob_id,
++                "description": "Load the Q2 invoice rows uploaded as q2.csv.",
++                "on_success": "q2_rows",
++                "on_validation_failure": "discard",
++                "options": {"schema": deepcopy(source_schema)},
++                "plugin": "csv",
++            },
++        },
++    }
++
++
++def _errors(candidate: Any) -> list[tuple[str | None, str | None, str]]:
++    return [(entry.error_code, entry.rejected_component, entry.message) for entry in candidate.result.validation.errors]
++
++
++def _empty_state() -> CompositionState:
++    return CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
++
++
++def _engine_with_sessions(*session_ids: str) -> Any:
++    engine = create_session_engine("sqlite:///:memory:", poolclass=StaticPool, connect_args={"check_same_thread": False})
++    initialize_session_schema(engine)
++    now = datetime.now(UTC)
++    with engine.begin() as conn:
++        ensure_test_identity(conn, identity_id="s3-user")
++        for session_id in session_ids:
++            conn.execute(
++                insert(sessions_table).values(
++                    id=session_id, user_id="s3-user", auth_provider_type="local", title="s3", created_at=now, updated_at=now
++                )
++            )
++    return engine
++
++
++def _upload(engine: Any, data_dir: Path, session_id: str, filename: str, content: bytes) -> BlobRecord:
++    service = BlobServiceImpl(engine, data_dir)
++    with fenced_operation_context(engine, session_id, operation_kind=SessionOperationKind.CREATE) as operation_context:
++        return asyncio.run(
++            service.create_blob(UUID(session_id), filename, content, "text/csv", session_operation_context=operation_context)
++        )
++
++
++def _context(data_dir: Path, engine: Any, session_id: str, **kwargs: Any) -> ToolContext:
++    catalog = create_catalog_service()
++    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
++    return ToolContext(
++        catalog=PolicyCatalogView.for_trained_operator(catalog, snapshot),
++        plugin_snapshot=snapshot,
++        data_dir=str(data_dir),
++        session_engine=engine,
++        session_id=session_id,
++        **kwargs,
++    )
++
++
++@pytest.fixture
++def two_uploads(tmp_path: Path) -> tuple[Any, str, BlobRecord, BlobRecord]:
++    session_id = str(uuid4())
++    engine = _engine_with_sessions(session_id)
++    q1 = _upload(engine, tmp_path, session_id, "q1.csv", Q1)
++    q2 = _upload(engine, tmp_path, session_id, "q2.csv", Q2)
++    return engine, session_id, q1, q2
++
++
++# --- (0) schema surface ------------------------------------------------------
++
++
++def test_canonical_named_source_schema_admits_blob_id_but_not_inline_blob() -> None:
++    named = canonical_set_pipeline_schema()["properties"]["sources"]["additionalProperties"]
++    assert named["additionalProperties"] is False
++    assert "blob_id" in named["properties"]
++    assert "inline_blob" not in named["properties"]
++
++
++# --- (1) the s10 document builds and passes the runtime preflight ------------
++
++
++def test_verbatim_s10_document_now_fails_only_on_ordinary_graph_naming(tmp_path: Path, two_uploads: Any) -> None:
++    """Custody settles; what remains is the model's queue/sink name collision, which the repair loop names."""
++    engine, session_id, q1, q2 = two_uploads
++    candidate = build_set_pipeline_candidate(_s10_pipeline(str(q1.id), str(q2.id)), _empty_state(), _context(tmp_path, engine, session_id))
++    assert sorted(code for code, _component, _message in _errors(candidate)) == [
++        "connection_sink_name_overlap",
++        "node_id_collides_with_source_or_sink",
++        "queue_no_consumer",
++    ]
++
++
++def _direct_fan_in(pipeline: dict[str, Any]) -> dict[str, Any]:
++    """Repair 1: drop the queue; both tag transforms publish straight to the sink."""
++    pipeline["nodes"] = [node for node in pipeline["nodes"] if node["node_type"] != "queue"]
++    return pipeline
++
++
++def _queue_fan_in(pipeline: dict[str, Any]) -> dict[str, Any]:
++    """Repair 2: keep an explicit queue, consumed by a passthrough that feeds the sink."""
++    for node in pipeline["nodes"]:
++        if node["node_type"] == "transform":
++            node["on_success"] = "all_quarters"
++        if node["node_type"] == "queue":
++            node.update(id="all_quarters", input="all_quarters")
++    pipeline["nodes"].append(
++        {
++            "id": "write_all",
++            "node_type": "transform",
++            "plugin": "passthrough",
++            "input": "all_quarters",
++            "on_success": "combined",
++            "on_error": "discard",
++            "options": {"schema": {"mode": "observed"}},
++        }
++    )
++    return pipeline
++
++
++@pytest.mark.parametrize("repair", [_direct_fan_in, _queue_fan_in], ids=["direct", "queue"])
++def test_s10_two_uploaded_quarters_build_and_pass_runtime_preflight(tmp_path: Path, two_uploads: Any, repair: Any) -> None:
++    engine, session_id, q1, q2 = two_uploads
++    pipeline = repair(_s10_pipeline(str(q1.id), str(q2.id)))
++    candidate = build_set_pipeline_candidate(pipeline, _empty_state(), _context(tmp_path, engine, session_id))
++
++    assert candidate.acceptable, _errors(candidate)
++    assert candidate.prepared_inline_blob is None
++    state = candidate.result.updated_state
++    for name, blob in (("q1", q1), ("q2", q2)):
++        options = state.sources[name].options
++        assert options["path"] == blob.storage_path
++        assert options["blob_ref"] == str(blob.id)
++        assert options["mode"] == "bind_source"
++    assert candidate.result.data["named_source_blobs"]["q2"]["blob_id"] == str(q2.id)
++
++    records = {q1.id: (q1, Q1), q2.id: (q2, Q2)}
++
++    result = validate_pipeline_for_trained_operator(
++        state,
++        SimpleNamespace(data_dir=tmp_path),
++        yaml_generator,
++        blob_get_metadata=lambda blob_id: records[blob_id][0] if blob_id in records else None,
++        blob_get_content=lambda blob_id: records[blob_id],
++        session_id=session_id,
++    )
++    assert result.is_valid, result.errors
++
++
++# --- (2) custody parity with the singular path and the tool loop -------------
++
++
++def test_named_blob_binding_matches_tool_loop_set_source_from_blob(tmp_path: Path, two_uploads: Any) -> None:
++    engine, session_id, q1, q2 = two_uploads
++    context = _context(tmp_path, engine, session_id)
++    pipeline = _direct_fan_in(_s10_pipeline(str(q1.id), str(q2.id)))
++    planner_state = build_set_pipeline_candidate(pipeline, _empty_state(), context).result.updated_state
++
++    loop_state = _empty_state()
++    for name in ("q1", "q2"):
++        authored = pipeline["sources"][name]
++        result = execute_tool(
++            "set_source_from_blob",
++            {
++                "blob_id": authored["blob_id"],
++                "source_name": name,
++                "plugin": authored["plugin"],
++                "on_success": authored["on_success"],
++                "on_validation_failure": authored["on_validation_failure"],
++                "options": deepcopy(authored["options"]),
++            },
++            loop_state,
++            context.catalog,
++            plugin_snapshot=context.plugin_snapshot,
++            data_dir=context.data_dir,
++            session_engine=engine,
++            session_id=session_id,
++        )
++        assert result.success, result.to_dict()
++        loop_state = result.updated_state
++
++    for name in ("q1", "q2"):
++        assert planner_state.sources[name].plugin == loop_state.sources[name].plugin
++        assert planner_state.sources[name].on_success == loop_state.sources[name].on_success
++        assert planner_state.sources[name].on_validation_failure == loop_state.sources[name].on_validation_failure
++        assert planner_state.sources[name].options == loop_state.sources[name].options
++
++
++def test_named_blob_binding_options_match_singular_blob_binding(tmp_path: Path, two_uploads: Any) -> None:
++    engine, session_id, q1, _q2 = two_uploads
++    context = _context(tmp_path, engine, session_id)
++    pipeline = _direct_fan_in(_s10_pipeline(str(q1.id), str(q1.id)))
++    named = build_set_pipeline_candidate(pipeline, _empty_state(), context).result.updated_state.sources["q1"]
++
++    singular_doc = deepcopy(pipeline)
++    singular_doc["source"] = singular_doc.pop("sources")["q1"]
++    singular_doc["nodes"] = [n for n in singular_doc["nodes"] if n["id"] != "tag_q2"]
++    singular = build_set_pipeline_candidate(singular_doc, _empty_state(), context)
++    assert singular.acceptable, _errors(singular)
++    assert named.options == singular.result.updated_state.sources["source"].options
++
++
++def test_proposal_blob_references_cover_named_sources(tmp_path: Path, two_uploads: Any) -> None:
++    engine, session_id, q1, q2 = two_uploads
++    pipeline = _s10_pipeline(str(q1.id), str(q2.id))
++    # Pending-proposal retention (blob delete guard) and proposal-creation
++    # ownership checks both read this extractor.
++    assert proposal_blob_reference_ids("set_pipeline", pipeline) == (str(q1.id), str(q2.id))
++    with engine.begin() as conn:
++        validate_proposal_blob_references(conn, session_id=session_id, tool_name="set_pipeline", arguments=pipeline)
++
++    other_session = str(uuid4())
++    with engine.begin() as conn:
++        now = datetime.now(UTC)
++        conn.execute(
++            insert(sessions_table).values(
++                id=other_session, user_id="s3-user", auth_provider_type="local", title="other", created_at=now, updated_at=now
++            )
++        )
++    foreign = _upload(engine, tmp_path, other_session, "foreign.csv", Q2)
++    pipeline["sources"]["q2"]["blob_id"] = str(foreign.id)
++    with engine.begin() as conn, pytest.raises(ValueError, match="not owned by this session"):
++        validate_proposal_blob_references(conn, session_id=session_id, tool_name="set_pipeline", arguments=pipeline)
++
++
++def test_named_blob_bound_state_round_trips_through_set_pipeline_arguments(tmp_path: Path, two_uploads: Any) -> None:
++    engine, session_id, q1, q2 = two_uploads
++    context = _context(tmp_path, engine, session_id)
++    state = build_set_pipeline_candidate(
++        _direct_fan_in(_s10_pipeline(str(q1.id), str(q2.id))), _empty_state(), context
++    ).result.updated_state
++    serialized, error = _serialize_set_pipeline_arguments(state)
++    assert error is None
++    assert serialized is not None
++    assert serialized["sources"]["q1"]["blob_id"] == str(q1.id)
++    assert "path" not in serialized["sources"]["q1"]["options"]
++    again = build_set_pipeline_candidate(serialized, state, context)
++    assert again.acceptable, _errors(again)
++    assert again.result.updated_state.sources == state.sources
++
++
++# --- (3) rejections, precedence, review --------------------------------------
++
++
++def _codes(candidate: Any) -> list[tuple[str | None, str | None]]:
++    return [(entry.error_code, entry.rejected_component) for entry in candidate.result.validation.errors]
++
++
++def test_named_blob_id_with_path_is_ambiguous(tmp_path: Path, two_uploads: Any) -> None:
++    engine, session_id, q1, q2 = two_uploads
++    pipeline = _s10_pipeline(str(q1.id), str(q2.id))
++    pipeline["sources"]["q1"]["options"]["path"] = q1.storage_path
++    candidate = build_set_pipeline_candidate(pipeline, _empty_state(), _context(tmp_path, engine, session_id))
++    assert not candidate.acceptable
++    assert _codes(candidate) == [("source_binding_ambiguous", "source:q1")]
++
++
++def test_named_inline_blob_stays_out_of_named_sources(tmp_path: Path, two_uploads: Any) -> None:
++    engine, session_id, q1, q2 = two_uploads
++    pipeline = _s10_pipeline(str(q1.id), str(q2.id))
++    del pipeline["sources"]["q2"]["blob_id"]
++    pipeline["sources"]["q2"]["inline_blob"] = {"filename": "q2.csv", "mime_type": "text/csv", "content": Q2.decode()}
++    with pytest.raises(ToolArgumentError):
++        build_set_pipeline_candidate(pipeline, _empty_state(), _context(tmp_path, engine, session_id))
++
++
++def test_named_foreign_or_unknown_blob_is_refused_per_component(tmp_path: Path, two_uploads: Any) -> None:
++    engine, session_id, q1, _q2 = two_uploads
++    pipeline = _s10_pipeline(str(q1.id), str(uuid4()))
++    candidate = build_set_pipeline_candidate(pipeline, _empty_state(), _context(tmp_path, engine, session_id))
++    assert _codes(candidate) == [("source_blob_unavailable", "source:q2")]
++
++
++def test_named_blob_id_with_manual_blob_ref_is_refused(tmp_path: Path, two_uploads: Any) -> None:
++    engine, session_id, q1, q2 = two_uploads
++    pipeline = _s10_pipeline(str(q1.id), str(q2.id))
++    pipeline["sources"]["q2"]["options"]["blob_ref"] = str(q1.id)
++    candidate = build_set_pipeline_candidate(pipeline, _empty_state(), _context(tmp_path, engine, session_id))
++    assert _codes(candidate) == [("plugin_options_invalid", "source:q2")]
++
++
++def test_uploaded_blobs_stage_no_invented_source_review(tmp_path: Path, two_uploads: Any) -> None:
++    engine, session_id, q1, q2 = two_uploads
++    state = build_set_pipeline_candidate(
++        _direct_fan_in(_s10_pipeline(str(q1.id), str(q2.id))), _empty_state(), _context(tmp_path, engine, session_id)
++    ).result.updated_state
++    assert [site for site in interpretation_sites(state) if site.kind is InterpretationKind.INVENTED_SOURCE] == []
++
++
++def test_llm_authored_blob_on_named_source_stages_invented_source_review(tmp_path: Path, two_uploads: Any) -> None:
++    """An LLM-authored blob (tool-loop create_blob) bound by name gets the INVENTED_SOURCE gate on source:q2."""
++    engine, session_id, q1, _q2 = two_uploads
++    message_id = str(uuid4())
++    with engine.begin() as conn:
++        conn.execute(
++            insert(chat_messages_table).values(
++                id=message_id,
++                session_id=session_id,
++                role="user",
++                content="make up a few Q2 invoice rows",
++                raw_content=None,
++                tool_calls=None,
++                tool_call_id=None,
++                sequence_no=1,
++                writer_principal="route_user_message",
++                created_at=datetime.now(UTC),
++                composition_state_id=None,
++                parent_assistant_id=None,
++            )
++        )
++    policy = _context(tmp_path, engine, session_id)
++    with fenced_tool_context(
++        catalog=policy.catalog,
++        plugin_snapshot=policy.plugin_snapshot,
++        session_engine=engine,
++        session_id=session_id,
++        data_dir=str(tmp_path),
++        user_message_id=message_id,
++        user_message_content="make up a few Q2 invoice rows",
++        composer_model_identifier="test-model",
++        composer_model_version="v1",
++        composer_provider="test",
++        composer_skill_hash="0" * 64,
++        tool_arguments_hash="1" * 64,
++    ) as context:
++        created = _execute_create_blob(
++            {"filename": "q2.csv", "mime_type": "text/csv", "content": Q2.decode()},
++            _empty_state(),
++            context,
++        )
++        assert created.success, created.to_dict()
++        invented_id = created.data["blob_id"]
++        candidate = build_set_pipeline_candidate(_direct_fan_in(_s10_pipeline(str(q1.id), invented_id)), _empty_state(), context)
++    assert candidate.acceptable, _errors(candidate)
++    state = candidate.result.updated_state
++    assert "source_authoring" in state.sources["q2"].options
++    assert "source_authoring" not in state.sources["q1"].options
++    sites = [site for site in interpretation_sites(state) if site.kind is InterpretationKind.INVENTED_SOURCE]
++    assert [site.component_id for site in sites] == ["source:q2"]
++
++
++def test_reviewed_source_binding_and_named_blob_id_are_ambiguous(tmp_path: Path) -> None:
++    """A hash-matched reviewed binding is never silently overridden by blob_id."""
++    from tests.unit.web.composer.test_set_pipeline_candidate import (
++        _named_reviewed_pipeline,
++        _reviewed_source_facts,
++        _reviewed_source_harness,
++    )
++
++    engine, session_id, _other, blobs = _reviewed_source_harness(tmp_path)
++    facts = _reviewed_source_facts(blob_id=str(blobs[0].id))
++    authority = resolve_reviewed_source_authority(
++        engine=engine,
++        session_id=session_id,
++        user_id="review-owner",
++        reviewed_facts=facts,
++        expected_reviewed_anchor_hash=reviewed_anchor_hash(facts),
++    )
++    pipeline = _named_reviewed_pipeline(tmp_path, facts)
++    context = _context(tmp_path, engine, session_id, user_id="review-owner", reviewed_source_authority=authority)
++    control = build_set_pipeline_candidate(deepcopy(pipeline), _empty_state(), context)
++    assert control.acceptable, _errors(control)
++
++    pipeline["sources"]["source"]["blob_id"] = str(blobs[0].id)
++    candidate = build_set_pipeline_candidate(pipeline, _empty_state(), context)
++    assert _codes(candidate) == [("source_binding_ambiguous", "source")]

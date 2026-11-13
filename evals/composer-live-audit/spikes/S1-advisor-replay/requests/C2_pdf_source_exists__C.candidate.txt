@@ -1,0 +1,1 @@
+Yes — PDF parsing is supported here via the pdf source. Attach the PDFs and I'll set the pdf source as the pipeline input; it extracts each page's text and tables into rows, which I can then classify, summarise, route or aggregate downstream and write to CSV or JSON. Tell me what the documents contain and what you want out the other end, and I'll draft the pipeline.

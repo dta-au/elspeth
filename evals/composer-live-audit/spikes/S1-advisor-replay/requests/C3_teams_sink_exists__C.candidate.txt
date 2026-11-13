@@ -1,0 +1,1 @@
+Yes — this deployment has a Microsoft Teams sink, so I can send the results straight to your channel. Give me the channel (or its incoming-webhook reference) and I'll add a Teams output that posts each result row there, alongside a CSV copy if you want one. What results should the pipeline produce?
