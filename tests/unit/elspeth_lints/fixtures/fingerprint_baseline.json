@@ -4284,10 +4284,6 @@
       "fingerprint": "dae48c6eb2231303"
     },
     {
-      "file_path": "plugins/infrastructure/clients/replayer.py",
-      "fingerprint": "2b6db21e30195d4a"
-    },
-    {
       "file_path": "plugins/infrastructure/clients/retrieval/azure_search.py",
       "fingerprint": "01e194557dd8e7b6"
     },

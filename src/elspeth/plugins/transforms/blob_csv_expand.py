@@ -26,6 +26,7 @@ from elspeth.plugins.infrastructure.config_base import (
     NormalizedColumnsOption,
     NormalizedFieldMappingOption,
     TransformDataConfig,
+    validate_csv_delimiter,
 )
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
@@ -109,9 +110,7 @@ class BlobCSVExpandConfig(TransformDataConfig):
     @field_validator("delimiter")
     @classmethod
     def _validate_delimiter(cls, value: str) -> str:
-        if len(value) != 1:
-            raise ValueError(f"delimiter must be a single character, got {value!r}")
-        return value
+        return validate_csv_delimiter(value)
 
     @field_validator("encoding")
     @classmethod
@@ -307,7 +306,7 @@ class BlobCSVExpand(BaseTransform):
     name = "blob_csv_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:645858af23f9cf25"
+    source_file_hash: str | None = "sha256:36274db08c825a1e"
     config_model = BlobCSVExpandConfig
     usage_when_to_use: str = (
         "Use when each input row carries a payload-store reference to a CSV blob and you need to "
@@ -453,10 +452,15 @@ class BlobCSVExpand(BaseTransform):
         """
 
         class _InvariantPayloadStore:
-            def retrieve(self, ref: str) -> bytes:
+            # Mirrors PayloadStore.retrieve_bounded: a negative cap is refused,
+            # an unknown ref is not found, an oversize payload yields None.
+            def retrieve_bounded(self, ref: str, *, max_bytes: int) -> bytes | None:
+                if max_bytes < 0:
+                    raise ValueError("max_bytes must be nonnegative")
                 if ref != _INVARIANT_PROBE_BLOB_REF:
                     raise PayloadNotFoundError(ref)
-                return _INVARIANT_PROBE_CSV_TEXT.encode("utf-8")
+                body = _INVARIANT_PROBE_CSV_TEXT.encode("utf-8")
+                return body if len(body) <= max_bytes else None
 
         had_payload_store = "_payload_store" in self.__dict__
         original_payload_store: Any = None
@@ -610,7 +614,10 @@ class BlobCSVExpand(BaseTransform):
             )
 
         try:
-            body = self._payload_store.retrieve(blob_ref)
+            # Bounded read: the store stops after max_blob_bytes + 1 bytes and
+            # returns None for an oversize blob, so the cap limits memory, not
+            # just the accepted size (contracts/payload_store.py).
+            body = self._payload_store.retrieve_bounded(blob_ref, max_bytes=self._max_blob_bytes)
         # ORDER IS LOAD-BEARING. A corrupt payload is not a missing payload: it
         # must crash the run rather than be quarantined as a routed row error,
         # because silently routing it would let a pipeline continue past
@@ -635,14 +642,12 @@ class BlobCSVExpand(BaseTransform):
                 )
             ) from exc
 
-        body_size = len(body)
-        if body_size > self._max_blob_bytes:
+        if body is None:
             raise _BlobCSVParseError(
                 _csv_error_reason(
                     "blob_too_large",
                     field=self._blob_ref_field,
                     blob_ref=blob_ref,
-                    body_size=body_size,
                     max_blob_bytes=self._max_blob_bytes,
                 )
             )

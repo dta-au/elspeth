@@ -426,8 +426,9 @@ def test_csv_proof_already_reports_known_nontext_codec_failure(tmp_path: Path, e
         load_runtime=False,
     )
     assert any(item["severity"] == "blocking" for item in diagnostics)
-    runtime = CSVSource(
-        {"path": str(tmp_path / "source.csv"), "schema": {"mode": "observed"}, "encoding": encoding, "on_validation_failure": "discard"}
-    )
-    with pytest.raises(LookupError):
-        list(runtime.load(Mock(spec=SourceContext)))
+    # The runtime refuses the codec at config, as CSVSink does: the incremental
+    # decoder load() uses would otherwise accept it and crash mid-read.
+    with pytest.raises(PluginConfigError, match="not a text encoding"):
+        CSVSource(
+            {"path": str(tmp_path / "source.csv"), "schema": {"mode": "observed"}, "encoding": encoding, "on_validation_failure": "discard"}
+        )
