@@ -1,95 +1,100 @@
-# Composer tool-call register (snapshot 2026-11-12, `main` @ `1a7ff0e6`)
+# Composer tool-call register (snapshot 2026-11-12, `main` @ `1a7ff0e6`; revised 2026-11-13)
 
-Every tool any composer surface can call, generated from the live
-registries, joined with live provider captures from the desk-audit battery
-(about 290 provider calls over 74 turns, DeepSeek v4.1 Flash composer and
-GLM-5.3 advisor).
+Every tool any composer surface can call. Static columns are generated from
+the live registries. Live columns are joined from 302 captured provider
+requests: the 258-call battery, an s04 re-run, the smoke-edit session and a
+10-case smoke run. The composer was DeepSeek v4.1 Flash and the advisor
+GLM-5.3.
 
 Surfaces:
 
-- **Loop**: the tool loop on a non-empty session, built by
-  `provider_gateway.composer_loop_tool_definitions`.
-- **Planner**: the empty-session proposal planner, built by
-  `pipeline_planner.planner_tool_definitions`.
-- **Hatch**: the planner's escape-hatch turn (recovery controls plus the
-  terminal).
-- The advisor is offered no tools.
+| Surface | Model | Tools |
+|---|---|---|
+| **Loop** (tool loop, non-empty session) | composer | `provider_gateway.composer_loop_tool_definitions`: registry tools plus the 2 recovery controls |
+| **Planner** (empty session) | composer | `pipeline_planner.planner_tool_definitions`: discovery palette, recovery controls and the terminal `emit_pipeline_proposal` |
+| **Planner escape hatch** | **advisor** | The same planner palette (`pipeline_planner.py:4275`). Not a separate tool set, so it has no column. |
+| **Reply stage** (after review cards are staged) | composer | Only the recovery controls (`recovery_controls.recovery_tool_definitions`, `service.py:1968-1993`) |
+| Advisor | advisor | No tools |
 
 How this is generated:
 
 ```bash
-.venv/bin/python evals/composer-live-audit/build_register.py out.json <capture.jsonl ...>
+ELSPETH_WEB__COMPOSER_ADVISOR_MODEL=openrouter/z-ai/glm-5.3 \
+  .venv/bin/python evals/composer-live-audit/build_register.py out.json <capture.jsonl ...>
 .venv/bin/python evals/composer-live-audit/render_register.py out.json out.md
 ```
 
 How each column is sourced:
 
-- **Required / optional arguments** come from the non-strict registry
-  definitions, because the strict wire marks every key required.
+- **Required / optional arguments** are the registry (dispatch) arguments
+  from the non-strict definitions.
+  - On the wire, `set_pipeline` takes a single `pipeline` envelope.
+  - Under the strict dialect, no-argument tools carry `_elspeth_no_arguments`.
 - **Skill mentions** are word-boundary counts in `render_system_prompt()`,
-  the text all three roles receive today. The matcher was controlled against
-  a known positive and a known negative.
-- **Live columns** are observational. Tools with no live calls were simply
-  not exercised by the scenarios.
+  the text all roles receive today. The matcher was controlled against a known
+  positive and a known negative.
+- **Live columns** are observational. Tools with no live calls were not
+  exercised. Results are deduplicated by tool-call id, and calls whose result
+  was never re-sent to the model show as "unseen".
 
 The plan to make this a generated, gated artifact is in
 [remediation-plan.md](remediation-plan.md#tool-call-register-plan). Raw data
 is in [evidence/tool-call-register.json](evidence/tool-call-register.json).
 
-Live tool counts: tool loop **45**, planner **23**, escape hatch **3**, execute_tool registry **43**. Rendered skill: 135,863 characters.
+Live tool counts: tool loop **45**, planner **23**, escape-hatch turn **23** (the planner palette, sent to the advisor model), reply stage **2**, execute_tool registry **43**. Rendered skill: 135,863 characters.
 
 ## Register
 
-| Tool | Kind | Loop | Planner | Hatch | Required args | Optional args | Skill mentions | Live calls (surface:n) | Results seen ok/fail* |
+| Tool | Kind | Loop | Planner | Reply stage | Required args | Optional args | Skill mentions | Live calls (surface:n) | Results ok/fail (unseen)* |
 |---|---|---|---|---|---|---|---|---|---|
-| `diff_pipeline` | discovery | ✓ | ✓ | — | — | — | 1 | tool_loop:4 | 0/4 |
-| `explain_validation_error` | discovery | ✓ | ✓ | — | `error_text` | — | 5 | planner:1 | — |
-| `get_audit_info` | discovery | ✓ | ✓ | — | — | — | 2 | planner:2 | 2/0 |
-| `get_blob_content` | discovery | ✓ | ✓ | — | `blob_id` | `offset_chars`, `expected_content_hash` | 7 | planner:4, tool_loop:1 | 2/1 |
-| `get_blob_metadata` | discovery | ✓ | ✓ | — | `blob_id` | — | 3 | planner:5 | 7/0 |
+| `diff_pipeline` | discovery | ✓ | ✓ | — | — | — | 1 | tool_loop:4 | 0/4 (0) |
+| `explain_validation_error` | discovery | ✓ | ✓ | — | `error_text` | — | 5 | planner_hatch:1 | 0/0 (1) |
+| `get_audit_info` | discovery | ✓ | ✓ | — | — | — | 2 | planner:2 | 2/0 (0) |
+| `get_blob_content` | discovery | ✓ | ✓ | — | `blob_id` | `offset_chars`, `expected_content_hash` | 7 | planner:2, planner_hatch:2, tool_loop:1 | 2/1 (2) |
+| `get_blob_metadata` | discovery | ✓ | ✓ | — | `blob_id` | — | 3 | planner:5 | 5/0 (0) |
 | `get_expression_grammar` | discovery | ✓ | ✓ | — | — | — | 4 | — | — |
-| `get_pipeline_state` | discovery | ✓ | ✓ | — | — | `component` | 15 | tool_loop:11 | 11/0 |
-| `get_plugin_assistance` | discovery | ✓ | ✓ | — | `plugin_type`, `plugin_name` | `issue_code` | 7 | planner:13, tool_loop:2 | 14/1 |
-| `get_plugin_schema` | discovery | ✓ | ✓ | — | `plugin_type`, `name` | — | 7 | planner:99, tool_loop:18 | 113/4 |
-| `inspect_source` | discovery | ✓ | ✓ | — | `blob_id` | `encoding` | 6 | planner:13 | 11/2 |
-| `list_blobs` | discovery | ✓ | ✓ | — | — | — | 5 | planner:9 | 9/0 |
-| `list_composer_blobs` | discovery | ✓ | ✓ | — | — | — | 2 | planner:8 | 8/0 |
-| `list_models` | discovery | ✓ | ✓ | — | — | `provider`, `limit` | 3 | planner:2, tool_loop:5 | 7/0 |
+| `get_pipeline_state` | discovery | ✓ | ✓ | — | — | `component` | 15 | tool_loop:11 | 11/0 (0) |
+| `get_plugin_assistance` | discovery | ✓ | ✓ | — | `plugin_type`, `plugin_name` | `issue_code` | 7 | planner:13, tool_loop:2 | 14/1 (0) |
+| `get_plugin_schema` | discovery | ✓ | ✓ | — | `plugin_type`, `name` | — | 7 | planner:98, planner_hatch:1, tool_loop:18 | 113/4 (0) |
+| `inspect_source` | discovery | ✓ | ✓ | — | `blob_id` | `encoding` | 6 | planner:13 | 11/2 (0) |
+| `list_blobs` | discovery | ✓ | ✓ | — | — | — | 5 | planner:9 | 9/0 (0) |
+| `list_composer_blobs` | discovery | ✓ | ✓ | — | — | — | 2 | planner:8 | 8/0 (0) |
+| `list_models` | discovery | ✓ | ✓ | — | — | `provider`, `limit` | 3 | planner:2, tool_loop:5 | 7/0 (0) |
 | `list_secret_refs` | discovery | ✓ | ✓ | — | — | — | 2 | — | — |
-| `list_sinks` | discovery | ✓ | ✓ | — | — | — | 4 | planner:2 | 2/0 |
-| `list_sources` | discovery | ✓ | ✓ | — | — | — | 4 | planner:3 | 4/0 |
-| `list_transforms` | discovery | ✓ | ✓ | — | — | — | 4 | planner:3 | 3/0 |
-| `preview_pipeline` | discovery | ✓ | ✓ | — | — | — | 5 | tool_loop:16 | 16/0 |
+| `list_sinks` | discovery | ✓ | ✓ | — | — | — | 4 | planner:2 | 2/0 (0) |
+| `list_sources` | discovery | ✓ | ✓ | — | — | — | 4 | planner:3 | 3/0 (0) |
+| `list_transforms` | discovery | ✓ | ✓ | — | — | — | 4 | planner:3 | 3/0 (0) |
+| `preview_pipeline` | discovery | ✓ | ✓ | — | — | — | 5 | tool_loop:16 | 16/0 (0) |
 | `read_attachment` | discovery | ✓ | ✓ | — | `blob_id` | `expected_content_hash` | 16 | — | — |
 | `validate_secret_ref` | discovery | ✓ | ✓ | — | `name` | — | 1 | — | — |
 | `clear_source` | mutation | ✓ | — ⚠ | — | — | `source_name` | 1 | — | — |
 | `create_blob` | mutation | ✓ | — ⚠ | — | `filename`, `mime_type`, `content` | `description` | 8 | — | — |
 | `delete_blob` | mutation | ✓ | — ⚠ | — | `blob_id` | — | 1 | — | — |
-| `patch_node_options` | mutation | ✓ | — ⚠ | — | `node_id`, `patch` | — | 5 | tool_loop:6 | 5/1 |
-| `patch_output_options` | mutation | ✓ | — ⚠ | — | `sink_name`, `patch` | — | 2 | tool_loop:6 | 4/2 |
+| `patch_node_options` | mutation | ✓ | — ⚠ | — | `node_id`, `patch` | — | 5 | tool_loop:6 | 5/1 (0) |
+| `patch_output_options` | mutation | ✓ | — ⚠ | — | `sink_name`, `patch` | — | 2 | tool_loop:6 | 4/2 (0) |
 | `patch_source_options` | mutation | ✓ | — ⚠ | — | `patch` | `source_name` | 2 | — | — |
 | `remove_edge` | mutation | ✓ | — ⚠ | — | `id` | — | 1 | — | — |
-| `remove_node` | mutation | ✓ | — ⚠ | — | `id` | — | 2 | tool_loop:1 | 1/0 |
-| `remove_output` | mutation | ✓ | — ⚠ | — | `sink_name` | — | 1 | tool_loop:1 | 1/0 |
-| `set_metadata` | mutation | ✓ | — ⚠ | — | `patch` | — | 1 | tool_loop:4 | 4/0 |
-| `set_output` | mutation | ✓ | — ⚠ | — | `sink_name`, `plugin`, `options` | `on_write_failure`, `description` | 2 | tool_loop:6 | 6/0 |
-| `set_pipeline` | mutation | ✓ | — ⚠ | — | `nodes`, `edges`, `outputs` | `source`, `sources`, `metadata` | 34 | tool_loop:6 | 5/1 |
+| `remove_node` | mutation | ✓ | — ⚠ | — | `id` | — | 2 | tool_loop:1 | 1/0 (0) |
+| `remove_output` | mutation | ✓ | — ⚠ | — | `sink_name` | — | 1 | tool_loop:1 | 1/0 (0) |
+| `set_metadata` | mutation | ✓ | — ⚠ | — | `patch` | — | 1 | tool_loop:4 | 4/0 (0) |
+| `set_output` | mutation | ✓ | — ⚠ | — | `sink_name`, `plugin`, `options` | `on_write_failure`, `description` | 2 | tool_loop:6 | 6/0 (0) |
+| `set_pipeline` | mutation | ✓ | — ⚠ | — | `nodes`, `edges`, `outputs` | `source`, `sources`, `metadata` | 34 | tool_loop:6 | 5/1 (0) |
 | `set_source` | mutation | ✓ | — ⚠ | — | `plugin`, `on_success`, `options` | `source_name`, `on_validation_failure`, `description` | 4 | — | — |
 | `set_source_from_blob` | mutation | ✓ | — ⚠ | — | `blob_id`, `on_success` | `source_name`, `plugin`, `on_validation_failure`, `options` | 5 | — | — |
 | `set_source_from_blobs` | mutation | ✓ | — ⚠ | — | `blob_ids`, `on_success` | `source_name`, `on_validation_failure`, `options` | 3 | — | — |
 | `splice_transform` | mutation | ✓ | — ⚠ | — | `predecessor_id`, `successor_id`, `node` | — | 2 | — | — |
 | `update_blob` | mutation | ✓ | — ⚠ | — | `blob_id`, `content` | — | 1 | — | — |
 | `upsert_edge` | mutation | ✓ | — ⚠ | — | `id`, `from_node`, `to_node`, `edge_type` | `label` | 5 | — | — |
-| `upsert_node` | mutation | ✓ | — ⚠ | — | `id`, `node_type`, `input` | `plugin`, `on_success`, `on_error`, `options`, `condition`, `routes`, `fork_to`, `branches`, `policy`, `merge`, `trigger`, `output_mode`, `expected_output_count`, `timeout_seconds`, `description`, `scope_name`, `scope_opener`, `scope_policy` | 4 | tool_loop:17 | 17/0 |
+| `upsert_node` | mutation | ✓ | — ⚠ | — | `id`, `node_type`, `input` | `plugin`, `on_success`, `on_error`, `options`, `condition`, `routes`, `fork_to`, `branches`, `policy`, `merge`, `trigger`, `output_mode`, `expected_output_count`, `timeout_seconds`, `description`, `scope_name`, `scope_opener`, `scope_policy` | 4 | tool_loop:17 | 17/0 (0) |
 | `wire_blob_inline_ref` | mutation | ✓ | — ⚠ | — | `field_path`, `blob_id` | `encoding` | 2 | — | — |
 | `wire_secret_ref` | mutation | ✓ | — ⚠ | — | `name`, `target`, `option_key` | `target_id` | 1 | — | — |
-| `request_interpretation_review` | session-aware | ✓ | — ⚠ | — | `affected_node_id`, `kind`, `user_term` | `llm_draft` | 19 | tool_loop:11 | 1/1 |
-| `request_advisor_hint` | advisor | ✓ | — ⚠ | — | `trigger`, `problem_summary`, `recent_errors`, `attempted_actions` | `schema_excerpt` | 3 | tool_loop:1 | 0/0 |
-| `emit_pipeline_proposal` | planner-terminal | — | ✓ | ✓ | `pipeline` | — | 0 | planner:53 | 0/16 |
+| `request_interpretation_review` | session-aware | ✓ | — ⚠ | — | `affected_node_id`, `kind`, `user_term` | `llm_draft` | 19 | tool_loop:11 | 1/1 (9) |
+| `request_advisor_hint` | advisor | ✓ | — ⚠ | — | `trigger`, `problem_summary`, `recent_errors`, `attempted_actions` | `schema_excerpt` | 3 | tool_loop:1 | 0/0 (0) |
+| `emit_pipeline_proposal` | planner-terminal | — | ✓ | — | `pipeline` | — | 0 | planner:52, planner_hatch:1 | 0/16 (37) |
 | `handoff_to_user` | recovery-control | ✓ | ✓ | ✓ | `action`, `message` | — | 7 | — | — |
 | `restore_parked_graph` | recovery-control | ✓ | ✓ | ✓ | `park_id`, `message` | — | 3 | — | — |
 
-*Results are tool results observed in captured provider requests; a retried request can count a result twice.
+*Each tool result is counted once (deduplicated by tool-call id). A result is visible only when a later provider request re-sends it, so results of a turn's final calls (notably `emit_pipeline_proposal`, `request_interpretation_review`) are often unseen; the bracketed number is calls whose result was never observed. Surfaces are classified from the offered tool set and the model (planner-palette calls on the advisor model are the escape hatch).
 
 ⚠ = the tool is taught in the system prompt the planner receives, but the planner is not offered it (the planner is sent the full tool-loop skill).
 

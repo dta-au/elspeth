@@ -1,166 +1,197 @@
-# Composer remediation plan (from the 2026-11-12 desk audit)
+# Composer remediation plan (from the 2026-11-12 desk audit, revised 2026-11-13)
 
 Findings (F*) are in [README.md](README.md); the tool inventory is in
 [tool-call-register.md](tool-call-register.md). Items are grouped as fixes
-(R), performance (P) and enhancements (E), then sequenced into work packages.
-Every item names how to prove it landed: re-run the live battery in
-`evals/composer-live-audit/` and the static per-surface cross-check.
+(R), performance (P) and enhancements (E), then sequenced into work packages
+with gates. This revision applies the seven-reviewer adversarial review
+(`evidence/review/`).
 
-Composer invariants apply to every item. The LLM authors all structure, and
-there are no tutorial-only paths. None of the items below routes around the
-provider or synthesises structure on the server. R2 and R6 add server-side
-evidence or validation only.
+Every proof that uses live behaviour runs at least 3 repeats on the **demo
+model pair** with `evals/composer-live-audit/`. It is judged on the turn
+table's deterministic labels (`turn_table.py`), not on prose.
+
+Composer invariants apply throughout:
+
+- the LLM authors all pipeline structure;
+- there is no tutorial-only composer path.
+
+R2 and R14 add server-side evidence or validation only. R16(b) and (a) need
+the rulings noted against them.
 
 ## Fixes
 
 | ID | Fixes | Change | Size | Proof |
 |---|---|---|---|---|
-| R1 | F7, F1 | Render the system prompt **per surface**. The planner gets planner text: `emit_pipeline_proposal` named as its terminal; "stage the requirement in node options" instead of `request_interpretation_review`; no mutation-tool names. The loop keeps today's text. Mechanism: tag loop-only passages in `pipeline_composer.md`, as the autogen and `taught:` blocks already do, and strip them in the planner renderer. Plugin hints (`blob_rows.py:176`) need a surface-neutral wording or a per-surface variant. | M | Per-surface cross-check: planner mentions of unoffered tools go from 109 to 0, and `emit_pipeline_proposal` is named. Battery: planner reasoning about the missing palette falls well below 60%. |
-| R2 | F2 | Give the advisor the capability facts the composer answered from. Thread `plugin_snapshot` into `TurnEvidence.review_candidate` from its four call sites. Add a "current deployment capabilities" record (available ids, prohibited ids, usable profile aliases), bound by snapshot hash and reusing `advisor_abandonment.py:109-129`. Add one sentence to the END rubric naming it as the source of the composer's digest. | S–M | s04 T2, p01 T2 and p01 T3 admitted on 5 of 5 repeats each. A hallucinated capability ("yes, there is a SharePoint source") still gets WITHHOLD. |
-| R3 | F2, F8 | User-facing copy for withheld and receipt states. Use `advisor_policy.py:451-455`-style wording for withheld replies, and keep the saved-scope receipt out of chat or behind a details toggle. For informational turns with zero saved revisions, show no receipt. Fix the duplicate sentence on withheld tool-loop turns. | S | Screenshot review of s04 T2, s01 T7 and s09 T2. |
-| R4 | F1 | Make multi-file sources expressible on the planner, or deliberately not. Options, in order of preference: (a) let named `sources` entries carry a session `blob_id`, settled by planner custody exactly like the singular `source.blob_id`; (b) give the planner terminal a `blobs` binding equivalent to `set_source_from_blobs`; (c) at minimum, teach the planner to hand off ("I'll set up the first file; ask me to add the second"). Separately, add a no-progress guard so a planner turn hands off before the wall-clock deadline instead of returning a 504. | M (a), S (c) | s10 builds in under 60 s, or hands off with a clear message within the turn. |
-| R5 | F3 | Pass `baseline` into tool-loop dispatch: request-start state by default, and the last accepted or committed state when the user asks about "since I accepted". Reword `diff_baseline_unavailable` so it never says "load or create a session". | S | "What changed since the version I accepted?" lists the real change in r01–r03. |
-| R6 | F4 | **Needs operator decision.** The credential guard on reasoning content hard-fails the turn. Options: (a) when the hit is in reasoning only (not tool arguments or visible content), drop the reasoning from persistence and replay, record the event, and continue; (b) re-ask the model once with a note not to reproduce credential-shaped strings; (c) keep the hard fail but replace the user copy, which wrongly implies the user supplied a credential. Option (a) keeps the control on everything that is persisted or executed. | S–M | s06 T1 builds; a real credential pasted by the user is still refused. |
-| R7 | F5 | Make the skill's model-binding paragraph (`pipeline_composer.md` ~L892-903, the `llm_model_choice` row at ~L1236) conditional on the served schema exposing `model`. For the web profile-only projection, teach "profiles only; to change models, ask your operator". Filter `list_models` to the deployment's profiles (alias to provider/model where disclosure policy allows), or remove it from the web palette. | S | s02 T4 and p01 T1 replies stop citing the litellm catalog. |
-| R8 | F6 | Plugin `not_for`, purpose and hint text should name only plugins that are available in the current policy snapshot. Otherwise say "an operator can enable X". Apply at digest render time. | S | c01 reasoning no longer finds a contradiction. |
-| R9 | F9 | In the advisor-repair instruction, add: "The user has not seen your previous draft. Write the reply as the first and only message; do not call it a correction." | XS | s02 T3 and s20 T2 replies stop opening with "Correction". |
-| R10 | F10 | Reword `_ALL_INFORMATION_GAPS_CLOSED_NOTICE` as information: "The schemas you asked for are now in context. When you have what you need, emit the proposal; otherwise continue discovery or reply in text." | XS | Battery: no reasoning conflicts with the notice. |
-| R11 | F11, F15 | `report_assemble` declares `output_semantics()` (STR, unconstrained framing). Fix the `document` sink example, whose `schema.mode: fixed` errors after `report_assemble`. Correct the always-authorized list in `docs/reference/environment-variables.md` (9 listed vs 14 in `plugin_policy/compiler.py`). | S | s08 / s14 validate with no high warnings. |
-| R14 | F16 | In `composer_preflight.reuse_or_recompute_runtime_preflight`, return a computed (cached per version) runtime preflight for every non-empty state, not only invalid or blob-bearing ones. The advisor gate then always has a real base: a green pipeline takes the completion-only `advisor_signoff_pending_validation` path, never the "unverified" one. In the UI copy, replace "after your next pipeline change" with the actual next step, and de-duplicate the repeated sentence. | S | s03 T4 and s09 T2 replays: no "not re-verified" text; a valid graph with an advisor FLAG shows completion-pending only. A unit test pins a valid, unchanged, no-preview turn to a non-`None` preflight. |
-| R15 | F17 | Reply Register addition: questions about checks, readiness or approval state are answered with the user's next action in product terms. Never show tool-call JSON or ask the user to run a tool or file a defect. Add the case to the advisor END rubric so a reply that does either is flagged. | XS | Ask "why can't I share this?" on an advisor-blocked session: the reply names the step and action, with no tool names. |
-| R16 | F18 | **Decision needed.** Tutorial dead end after "Apply" adds a failure-retention output. Options: (a) let `_tutorial_launch_blocker` (`tutorial_service.py:154-215`) admit one additional `sink:json` that receives only failure routes; (b) hide suggestion Apply in `TutorialFreeformShell` (UI-only; composer untouched); (c) make the 409 `tutorial_plugin_set` detail name the extra output and the fix. Do (c) regardless. Also make the "Every card acknowledged… Select Run pipeline" chat line say "Continue to Run" inside the tutorial. | S | Browser walk: brief → Accept → Apply → acknowledge all cards → Continue to Run either proceeds (a) or the Apply control is absent (b); the 409 text names `failed_rows` (c). |
-| R13 | F14 | At staging, reject a `vague_term` wired at node level on an `llm` node where no query falls back to the node-level template. Alternatively, make the resolver write into every query template that carries the slot. Add one teaching line to the multi-query section. | S | In-process repro from the wiring report: either rejected at `set_pipeline`, or `accepted_in_prompt=True` for every query. |
-| R12 | F12 | Tool-result legibility. For discovery tools, put the tool's own error first and omit whole-pipeline validation. Make sibling argument names agree (`get_plugin_assistance.plugin_name` vs `get_plugin_schema.name`), or accept both with one deprecated. Name the offending property in `canonical_schema` rejections ("unexpected key `nodes` under `source`"). | S | Proposal rejection rate below 16 of 53. |
+| R1 | F7 (contributes to F1) | Render the planner's skill per surface: the existing capability core plus a planner-specific overlay instead of the freeform tool-loop policy (mechanism: `capability_skill.py:155`). Also decide the advisor's skill text (`advisor_checkpoint.py:454`), a per-surface skill hash, and how the deployment overlay applies. The shared core legitimately names `set_pipeline` as the *document shape*, so the target is "no unoffered tool named as something to call", not zero mentions. | M | A committed instrument scans the **whole** outbound planner request (system, tool schemas, `authoring_aids`, `instruction`). Unoffered tools named as callable: 0. Strict palette-confusion rate (crosscheck pattern) below 5% over ≥3 runs of s01–s20. |
+| R2 | F2 | Give the END advisor the capability facts the composer answered from. Store the plugin snapshot on `TurnEvidence` when it is built, so all **five** `review_candidate` call sites agree (including `composition_completion.py:949`). Render a compact "current deployment capabilities" record (available ids, prohibited ids, usable profile aliases; reuse `advisor_abandonment.py:109-129`), bound by snapshot hash. Add a rubric sentence saying the record proves existence, absence or prohibition of a plugin, not what a plugin can do. Reword the reused scope sentence ("absence does not establish…"), which works against admitting true absence claims. | S–M | SharePoint, PDF, Teams and "is this safe" (L:s04 T2, L:p01 T2/T3, R:s04 T5) are admitted on ≥3 repeats each. A planted false claim ("yes, there is a SharePoint source") is still WITHHELD. |
+| R3 | F2, F8, F20 | User-facing copy for withheld and receipt states. (1) Render a withheld replacement as a system notice, not "ELSPETH said:", using the `advisor_policy.py:451-455` wording. (2) Keep the checkpoint receipt, the only backend check against a hallucinated "I updated X", but restyle it as a collapsed or secondary line. Never show it twice (s09 T2). (3) Carry the withheld turn's context forward so the next turn does not lose its own answer (s04 T4). (4) Derive run-state copy (`DecisionPanel.tsx:99-101`, `subscriptions.ts:458-463`) from the screen the user is on. | S–M | Screenshot review of s04 T2, s01 T7, s09 T2. After a withhold, a follow-up question gets a consistent answer. |
+| R4 | F1 | Make multi-file sources expressible on the planner. (a) Let named `sources` entries carry a session `blob_id`, resolved through the existing `_resolve_source_blob(source_name=…)`. Keep `inline_blob` out of named sources; define precedence against reviewed-source custody; reject `blob_id` together with `path`; update the pinned canonical field inventory. **Compatibility note:** this changes the persisted `sources` shape and needs a stated support boundary. (b) Until (a) lands: make the rejection name the problem ("named sources cannot bind uploaded files; bind one file per request or…") and teach the planner to hand off. | M (a), S (b) | s10 builds in under 60 s with the two-source combining topology, or hands off with a clear message within the turn. Test the review path for an LLM-authored blob on a named source. |
+| R5 | F3 | Supply a baseline to tool-loop dispatch, and say in the wire result **which** baseline was used (request start, or last accepted). There is no recorded "accepted version" yet, so record one at accept/commit. Reword `diff_baseline_unavailable`, and stop reporting `is_valid: false` on a valid pipeline in that failure. A request-start baseline alone would turn an honest "I couldn't" into a wrong "nothing changed". | S–M | s01 T6 replay lists the GST/unit-price/filter changes since acceptance; r02's no-change case still says "nothing has changed". |
+| R6 | F4 | **Decision needed.** (c) **Now:** user copy that does not imply the user supplied a credential. (a) **Later, if approved:** when a hit is only in `reasoning_content`/`reasoning_details`, which the web tree neither replays nor stores durably, drop that reasoning from the call record, record the event, and continue. A hit in replayed Anthropic `thinking_blocks`, content or tool arguments must still fail. Applies on planner, tool-loop and advisor paths. This reverses behaviour pinned by `test_credential_guard.py:520-560`, `test_pipeline_planner.py` (~L5385) and `test_compose_loop_persistence.py:796-806`, and removes reasoning from the audit record for that call; both must be stated. | S | s06 T1/T2 build; a credential pasted by the user is still refused; a planted hit in tool arguments still fails. |
+| R7 | F5 | No web configuration exposes `options.model`, so do not make the paragraph conditional. State "profiles only; to change models ask your operator" in the skill, and remove the `model_catalog` reference. Remove `list_models` from both web palettes. Disclosing which model a profile maps to is an operator decision. | S | p01 T1, s08 T2, s02 T4 replies make no slug-pinning claim and cite no catalog. |
+| R8 | F6 | Name only plugins available in the current policy snapshot: in the digest, the `authoring_aids` text and the on-demand hints. Otherwise say "an operator can enable X". | S | In-process: a default-policy planner request names 0 unavailable plugins. The live c01 check passes even today, so it cannot be the proof. |
+| R9 | F9 | Reword the advisor-repair instruction. Drop "Correct the reply's…", and say: "The user has not seen your previous draft. Write the reply as the first and only message." | XS | s02 T3 / s20 T2 replays do not open with "Correction". |
+| R10 | F10 | Reword `_ALL_INFORMATION_GAPS_CLOSED_NOTICE` as information, not a command. Append it at most once per request, and only when the model's own pending discovery (not just declared keys) is closed. 6 tests pin the string. | XS–S | ≤1 copy per request; s02/s09 inspect attachments before emitting. |
+| R11 | F11, F15 | `report_assemble` declares `output_semantics()` (STR, unconstrained framing). **Compatibility:** `report_assemble` → `text` becomes a hard error instead of a warning. Fix the `document` sink example, whose `schema.mode: fixed` errors after `report_assemble`. Review the same warning class on `json_explode` (s12). Correct the always-authorized list in `environment-variables.md` (9 vs 14). | S | s08 validates with no high warnings. (s14 writes json, so it is not a proof.) |
+| R12 | F12 | Lead discovery failures with the tool's own error and omit whole-pipeline validation. For `canonical_schema`, name the offending key only when it is in the schema's closed vocabulary; this keeps the value-free design and covers all observed cases. Align `get_plugin_assistance` / `get_plugin_schema` argument naming in the next tool-contract revision; until then, state the name explicitly in both descriptions (no alias). For `patch_output_options`, say where `description` belongs. | S | Battery proposal rejections drop below 13 of 40. |
+| R13 | F14 | At staging, reject a node-level `vague_term` slot on an `llm` node where any query with its own template would not receive it, or make the resolver write into every query template that carries the slot (larger). **Replace**, not append, the teaching at `planner_authoring_aids.py:867-870` and `multi_query.py:248-249`. Include the effective per-query prompt in the attested hash. | S (reject) / M (rewrite) | The in-process repro (`evidence/llm-wiring-verification.md`) is rejected at `set_pipeline`, or shows `accepted_in_prompt=True` for every query. Also audit whether stored records already carry the defect. |
+| R14 | F16 | Recompute the turn-end preflight for every **wired** state (sources and outputs), matching today's blob behaviour, and apply the same rule at the review-handoff exit (`service.py:1883`). Separately decide whether a CLEAN verdict over a missing preflight may clear a prior block (`composition_completion.py:2582-2620`). **Costs:** each recompute resolves secrets and instantiates plugins. On question-only turns it can add repair turns or red suffixes on half-built drafts, and a preflight failure would fail a question. Measure before landing. | S–M | A deterministic unit test with a valid, unchanged, blob-free (`llm`-source) state yields a non-`None` preflight. A CLEAN verdict then clears. The s03 T4 / s09 T2 replays are not proofs. |
+| R15 | F17 | Reply Register rule: answer questions about checks, readiness or approvals with the user's next action in product terms; never show tool-call JSON or ask the user to run a tool or file a defect. Give the composer the current blocker detail in its context, so it stops guessing. Add the case to the END rubric **after** R3, otherwise it adds withholds. | XS–S | Ask "why can't I share this?" on an advisor-blocked session ×3: the reply names the step and action, with no tool names. |
+| R16 | F18 | (c) **Always:** the 409 `tutorial_plugin_set` detail names the extra output and the fix. The tutorial chat line waits for **tutorial readiness**, not workspace validity. Then pick one structural option. **Smallest:** stop counting optional suggestions as "decisions" and render Apply as secondary everywhere (not tutorial-specific). (a) Admit one extra failure-only `sink:json`. This **needs an ADR-031 ruling** and is larger than it looks: the run step's `_rows_from_artifacts` takes the newest non-empty artifact and could show failed rows as the result, and the discard count misses retained rows. (b) Hide Apply in the tutorial shell. UI-only and outside the composer, but reviewers split on whether it is a "tutorial-special path"; **needs an invariant-2 ruling.** | S | Browser walk: brief → Accept → Apply → cards → Continue to Run either proceeds, or the refusal names `failed_rows`; the chat never names a button the screen does not have. |
+| R17 | F19 | Make the boot probe send the real escape-hatch request (the 23-tool planner palette on the advisor endpoint), and correct its parity comment (`boot_probe.py:202-216`). Remove or wire up the dead `terminal_only` option (`capability_skill.py:193-219`). | XS | Probe output lists the hatch request with 23 tools. |
+
+**Overlaps.** R2 and R15 both edit the END rubric, and R3 and R14 both
+touch the gate copy, so land each pair together. All prompt and rubric
+changes (R1, R2, R7, R9, R10, R15) need one joint live re-run, because the
+items are not independent.
+
+**Dependencies.** Only R4(b)'s hand-off teaching and E3 depend on R1. R4(a),
+R8 and P5 do not.
 
 ## Performance
 
 | ID | Change | Expected effect |
 |---|---|---|
-| P1 | Per-surface prompts (R1) also shrink the planner and advisor system text. Today all three roles receive the 136k-char skill. | Fewer prompt tokens on the planner and advisor; less reasoning spent working out the palette. |
-| P2 | Advisor caching: only 45% of advisor prompt tokens hit the cache versus about 90% on the primary. Put the stable skill prefix first with a cache marker; put per-turn evidence last. | Lower advisor latency and cost. |
-| P3 | Skip or lighten the END advisor on turns with no saved effects and no capability claims ("Thanks", "Explain this"), or use a smaller advisor budget there. Leave mutation turns untouched. Weigh this against the advisor's real catches (F9). **Decision needed.** | Saves 1 call (~4 s, ~55k tokens) per conversational turn. |
-| P4 | Reduce proposal rejections (R12) and remove the "emit now" pressure (R10). 16 of 53 proposals were rejected, each a full planner call of 8–25 s. | Fewer planner calls; first-turn p50 below 27 s. |
-| P5 | Wall-clock-aware planner exit (in R4): hand off before `composer_timeout_seconds` instead of letting the operation die at 504. | No 240 s spinners. |
-| P6 | Address the startup warning `composer_turn_budget_underfunded` (34 configured turns, about 16 fundable at 240 s). Either size the budgets to the timeout or raise the timeout for the demo profile. | Budgets that can actually be spent. |
+| P1 | Per-surface prompts (R1) shrink the planner's system text. The advisor half needs its own mechanism; decide it in R1. | Fewer planner prompt tokens; less reasoning spent working out the palette. Measure the cache impact, because the shared prefix changes. |
+| P2 | Advisor caching is **already** structured (`advisor_checkpoint.py:453-454, 491-495`), yet the measured hit rate is 52% against 92–94% on the composer. Investigate whether per-turn evidence precedes stable text. | Lower advisor latency and cost. |
+| P3 | ~~Skip the advisor on chat-only turns.~~ **Not recommended.** "No capability claims" cannot be decided without classifying the prose, and skipping would have lost the real s03 T4 catch. | — |
+| P4 | Reduce proposal rejections (R12) and the "emit now" pressure (R10). In the battery 13 of 40 proposals were rejected, each a full planner call. | Fewer planner calls per first turn. |
+| P5 | A wall-clock-aware planner exit: hand off before the operation deadline instead of dying at 504. The planner and operation deadlines are equal today, so add a reserve. Add a rule for output-cap truncation (`finish_reason=length`) in the hatch. | No 240 s spinners. |
+| P6 | Address `composer_turn_budget_underfunded` (34 configured turns, about 16 fundable at 240 s): size the budgets to the timeout, or raise the timeout for the demo profile. | Budgets that can actually be spent. |
 
 ## Enhancements
 
 | ID | Change |
 |---|---|
-| E1 | First-turn reply says what was built. Keep the verdict constant and prepend a short model-written summary that the advisor can check, as tool-loop replies already do. |
-| E2 | Promote the tool-call register to a generated, gated artifact (next section). |
-| E3 | Add the per-surface teaching cross-check as a CI test: for each surface, prompt mentions of tools that surface is not offered = 0, and every offered tool is taught. This is the exact "the skill says X but I don't have X" guard. |
-| E4 | Add the live battery's demo-shaped scenarios (multi-file, capability questions, "what changed", security screening, "use GPT-4o") to `evals/composer-battery/corpus.md`. The current corpus covers none of them. |
-| E5 | A "Run it" hint. The composer cannot start a run and says so in three different ways (r01–r03). Teach one sentence naming the UI control. |
-| E6 | Refresh `docs/reference/composer-tools.md`. It documents 31 of 46 live tools, has no planner surface, and its budget table hardcodes 10/15 turns, while the budgets are required deployment settings. This audit adds a pointer to the register; the full rewrite should follow R1. |
+| E1 | Show the proposal's model-written `metadata.description` under the fixed first-turn sentence (F13). It keeps the composer invariant and the verdict constant. |
+| E2 | Promote the tool-call register to a generated, gated artifact (next section). Marginal under the delivery-posture test; do it only with E3. |
+| E3 | A CI test of per-surface teaching: across the **whole** outbound request for each surface, no unoffered tool is named as callable, and every offered tool is taught. This guards against "the skill says X but I don't have X". |
+| E4 | Add the demo-shaped scenarios to `evals/composer-battery/corpus.md`: multi-file, capability questions, "what changed", security screening, "use GPT-4o", and the tutorial brief. |
+| E5 | A one-sentence "Run it" hint naming the UI control. The composer answered "Run it." three different ways (r01–r03). |
+| E6 | Rewrite `docs/reference/composer-tools.md` after R1. It documents 30 of 46 model-facing tools (`generate_yaml` is a CLI MCP export, not a web tool). This audit added the surfaces table and a pointer to the register. |
 
 ## Tool-call register: plan
 
-The register in [tool-call-register.md](tool-call-register.md) is a snapshot.
-To keep it true:
-
 1. **Generator.** Move `evals/composer-live-audit/build_register.py` and
-   `render_register.py` to `scripts/cicd/composer_tool_register.py`. They
-   already read only live objects: `composer_loop_tool_definitions`,
-   `planner_tool_definitions`, recovery and terminal definitions,
-   `get_tool_definitions`, `_registry`, the redaction `MANIFEST` and
-   `render_system_prompt`.
-2. **Columns to add.**
-   - A per-surface rendered prompt once R1 exists, so mention counts are per
-     surface.
-   - Budget class per tool: discovery, composition or free.
-   - Result shape: the response TypedDict and redaction admitted keys, from
-     `composer_wire_census`.
-   - FRONTEND projection.
+   `render_register.py` to `scripts/cicd/composer_tool_register.py`. They read
+   only live objects and contain no lint suppressions.
+2. **Columns to add.** A per-surface rendered prompt (after R1), budget class,
+   result shape (from `composer_wire_census`), and FRONTEND projection. The
+   hatch reuses the planner palette on the advisor model; the reply stage has
+   2 tools.
 3. **Gate.** `--check` regenerates and diffs the static columns. Live columns
-   (call counts, failure samples) come from the battery and are excluded from
-   the diff.
-4. **Ownership.** Any change to a `TOOLS_IN_MODULE` tuple, a tool
-   description or a skill passage regenerates the register in the same
-   commit, as `generate_skill_inventory.py` already does for the inventory
-   block.
-5. **Live join.** `evals/composer-live-audit/run_battery.sh` produces the
-   captures. Re-run before each release candidate and before any external
-   demo.
+   come from the battery and are excluded from the diff.
+4. **Ownership.** A change to a `TOOLS_IN_MODULE` tuple, a tool description or
+   a skill passage regenerates the register in the same commit.
+5. **Live join.** Run `evals/composer-live-audit/run_scenarios.sh` before each
+   release candidate and before any external demo.
 
-## Work packages and order
+## Work packages, gates and order
 
-| WP | Contents | When |
-|---|---|---|
-| WP0: demo config (no code) | Runbook below | Before the demo |
-| WP1: stop the visible failures | R16(c), R2, R3, R5, R9, R10, R14, R15 | Before the demo if possible; each is small and independent |
-| WP2: planner surface | R1 (+P1), R4, R8, E3 | After the demo; R1 first because R4 and R8 build on it |
-| WP3: model binding and guard | R6 (after decision), R7 | After WP1 |
-| WP3b: integrity | R13 | With WP1; it is a correctness bug in approved review content, independent of the demo |
-| WP4: legibility and performance | R11, R12, P2–P6, E1 | Ongoing |
-| WP5: register and corpus | E2, E4, E6 | Alongside WP2 |
+Owner for every package is the maintainer; dates are set by the operator.
 
-Each package ends with: focused unit tests, the whole-tree gates its inputs
-touch (see CONTRIBUTING), the per-surface cross-check, and one live battery
-run compared against this audit's turn table.
+| WP | Contents | When | Gate before merge |
+|---|---|---|---|
+| WP0: demo config | Runbook below | Before the demo | Preflight below passes on the demo host |
+| WP1a: low-risk copy and tutorial | R16(c) + tutorial-readiness-gated chat line, R3 (copy items 1, 2, 4), R9; optionally R11 | Before the demo, **only if** it lands before code freeze | Focused tests, frontend tests, one joint live re-run (≥3 repeats of s01, s02, s04, tutorial walk) |
+| WP1b: advisor and gate behaviour | R2 + R15, R14 (+R3 item 3), R10, R5, R7 | After the demo | Full `pytest tests/` (shared runtime and wire shapes), testcontainer suite if persistence changes, joint live re-run |
+| WP2: planner surface | R1 (+P1), R4, R8, E3, R17 | After the demo | Per-surface crosscheck instrument, s10 live, full suite |
+| WP3: guard and integrity | R13 (promptly; integrity), R6 (after the decision) | R13 straight after the demo | Repro tests, full suite, audit of stored records for F14 |
+| WP4: legibility and performance | R12, P2, P4–P6, E1 | Ongoing | Focused tests and battery comparison |
+| WP5: register and corpus | E3, E4, E6 (E2 optional) | Alongside WP2 | `--check` gate green |
 
-## Demo-day runbook (WP0, no code changes)
+- **Code freeze:** set it at least 3 working days before the demo. After
+  freeze, only WP0 changes.
+- **Rollback:** tag the demo build. If any WP1a change regresses the
+  preflight, revert to the tag.
+- **Abort criteria on the day:** the preflight shows a FAILED or WITHHELD
+  label on a safe-list prompt, or the composer reports unavailable. If so,
+  present from recorded sessions.
 
-### Configuration
+## Demo-day runbook (WP0)
 
-- **Prompt guard.** The default `ELSPETH_WEB__COMPOSER_PROMPT_GUARD_MODE=required`
-  needs both Azure Prompt Shields mounts, otherwise
-  `/api/system/status` reports `composer_available: false` ("required prompt
-  guard configuration is missing for composer, advisor"). Confirm on the demo
-  host.
-- **Plugin allowlist.** Add the plugins the demo uses, at least
-  `transform:type_coerce`, `transform:value_transform`, `transform:passthrough`,
-  `transform:truncate`, `transform:keyword_filter`,
-  `transform:report_assemble`, `sink:document`, and the batch plugins if
-  aggregation is shown (F6). Restart, then check the
-  `plugin_policy_readiness` rows.
+### Configuration (on the demo host)
+
+- **Prompt guard.** In the default `ELSPETH_WEB__COMPOSER_PROMPT_GUARD_MODE=required`,
+  set both `ELSPETH_WEB__COMPOSER_PROMPT_GUARD` and
+  `ELSPETH_WEB__COMPOSER_ADVISOR_PROMPT_GUARD` (Azure Prompt Shields).
+  Otherwise `/api/system/status` reports `composer_available: false`.
+  **None of this audit's timings were measured with the guard on;** preflight
+  must be.
+- **Plugin allowlist.** Set `ELSPETH_WEB__PLUGIN_ALLOWLIST` to the optional
+  plugins the demo uses, at least `transform:type_coerce` and
+  `transform:value_transform` for computed fields (F6), plus
+  `transform:passthrough`, `transform:truncate`, `transform:keyword_filter`
+  and the batch plugins if shown. `report_assemble`, `line_explode`,
+  `reference_join` and `sink:document` are already in the required core.
+  Restart, then check the `plugin_policy_readiness` rows.
 - **LLM profile.** At least one `ELSPETH_WEB__LLM_PROFILES` entry plus
-  `ELSPETH_WEB__DEFAULT_LLM_PROFILE`. With none, no LLM nodes can be authored.
-- **Users.** The presenter account needs a deployment-wide `user` role,
-  otherwise creating a session returns 403 `user_role_required`.
-- **Timeout.** Consider raising `ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS` for the
-  demo (P6). First turns ran p90 57 s, max 242 s.
+  `ELSPETH_WEB__DEFAULT_LLM_PROFILE`.
+- **Users.** Presenter accounts need the deployment-wide `user` role (else
+  403 `user_role_required`). Grant it through your deployment's
+  administration path. The audit used a test fixture, which is not an
+  operator procedure.
+- **Network.** The tutorial's run step scrapes `dta-au.github.io`; the demo
+  host needs outbound access to it.
+- **Timeout.** Consider raising `ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS` (P6).
+  Planner turns ran p90 62 s, max 242 s.
 
 ### Preflight
 
-1. Re-run `evals/composer-live-audit` scenarios s01, s02, s03, s05, s09 and
-   s20 against the demo host with the demo models. Every turn should complete
-   and `validate` should pass.
-2. Pre-warm: one throwaway session per demo flow, so caches are hot.
+1. On the demo host, with the demo model pair and the guard in `required`
+   mode, run `evals/composer-live-audit` scenarios s01, s02, s03, s05, s20 and
+   r01 ×3.
+2. Run `turn_table.py` on the results. **Pass** = no FAILED, WITHHELD or
+   GATE-NOT-CLEARED labels on any prompt you intend to use.
+3. Walk the tutorial in a browser through the **run** stage, including the
+   scrape.
+4. Pre-warm one throwaway session per demo flow.
 
 ### Prompts
 
-- **Safe**, all validated live:
-  - "Here's our feedback export … classify complaint / compliment /
-    question … one-line summary … CSV" with one attached CSV;
-  - "Also put the complaints in their own separate file";
+- **Safe in every run** (with this model pair):
+  - "Here's our feedback export … classify complaint / compliment / question
+    … one-line summary … CSV", with one attached CSV;
   - "Change the threshold to 500";
   - "Explain what this pipeline does in two sentences";
-  - "Why did you choose that design?";
   - "Undo that last change";
   - "What can you do?";
-  - "Build me a pipeline." (it asks good questions);
-  - "Is this safe to run on sensitive data?".
+  - "Build me a pipeline." (it asks good questions).
+- **Usable with care:**
+  - "Also put the complaints in their own separate file" worked, but took
+    110 s.
+  - "Why did you choose that design?" can end with a "completion advisory
+    review did not clear" note. The answer still shows, and Run still works.
 - **Avoid until fixed:**
-  - attaching two or more files to an empty session (F1);
-  - "Can you connect to X?" or "Can you read PDFs?" (F2, a coin flip);
+  - two or more files attached to an empty session (F1);
+  - "Can you connect to X?" / "Can you read PDFs?" / "Is this safe on
+    sensitive data?" (F2; SharePoint withheld 2 of 2);
   - "What changed since…?" (F3);
   - prompts that ask to screen for passwords or secrets (F4);
-  - "Use GPT-4o" or "which models" (F5);
-  - arithmetic without the allowlist above (F6).
-- **Expect** every first build of made-up data to show interpretation review
-  cards; that is by design.
-- **Tutorial:** do **not** click "Apply" on the "Consider adding error
-  routing to a retention output" suggestion (F18). Accept the proposal,
+  - "Use GPT-4o" / "Which models can I use?" (F5);
+  - the many-rows → one-briefing shape unless R11 lands (F11, a HIGH warning
+    on screen).
+- **Audience capability questions:** answer them verbally; do not type them
+  into the composer.
+- **Expect review cards** on every first build of made-up data. By design,
+  the tutorial needs 5 learner decisions.
+
+### Tutorial
+
+- Do **not** press Apply on "Consider adding error routing to a retention
+  output". It is offered on every tutorial build (F18). Accept the proposal,
   acknowledge the cards, use View prompt then Approve on the prompt card,
-  then Continue to Run. In the browser walk the build took about 40 s to the
-  first card, and the tutorial needed 4 decisions. If "Continue to Run" says
-  the pipeline "does not match the supported tutorial plugin set", ask the
-  Composer to "Remove the failed_rows output and discard failures instead."
-  (verified: one 28 s turn, then tutorial readiness returned 200), or exit
-  the tutorial.
-- **If the panel says "Completion advisory review did not clear"** on a valid
-  pipeline, Run still works ("Advisory checks don't block Run"). Click Run.
-  Do not ask the composer about the gate on stage (F16, F17). To clear it,
-  ask for a small real change, or ask it to "check the pipeline is ready to
-  run", which normally makes it call `preview_pipeline`.
+  then Continue to Run.
+- If Continue to Run says the pipeline "does not match the supported
+  tutorial plugin set", ask the Composer: "Remove the extra failures output
+  and discard failures instead." It worked in one ~26 s turn when tried once.
+  Otherwise exit the tutorial.
+- If attendees will do the tutorial **hands-on**, F18 becomes likely: land
+  R16 or brief them.
+
+### On a completion note
+
+If a valid pipeline shows "Completion advisory review did not clear", the
+Run button stays enabled (verified in a browser; execution itself was not
+exercised in this audit). Do not ask the composer about the gate on stage
+(F16, F17).

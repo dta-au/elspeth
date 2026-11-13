@@ -36,15 +36,16 @@ Every mutation tool returns a `ToolResult` containing the full validation state,
 
 ### Surfaces
 
-Three model surfaces are offered different tool sets:
+The model surfaces are offered different tool sets:
 
 | Surface | When | Tools |
 |---------|------|-------|
 | **Tool loop** | A message to a session that already has a pipeline | 45: the 43 registry tools below plus `handoff_to_user` and `restore_parked_graph` |
 | **Proposal planner** | A message to an empty session | 23: read-only discovery, blob and secret lookups, the two recovery controls, and the terminal `emit_pipeline_proposal`, whose argument is one complete `set_pipeline` document. The planner has no mutation tools and does not call `request_interpretation_review`; it stages review requirements inside the proposal's node options. |
-| **Escape hatch** | A planner turn that has run out of budget | 3: the recovery controls and `emit_pipeline_proposal` |
+| **Planner escape hatch** | A planner turn whose repair or discovery budget is exhausted, or that is malformed | The same 23-tool planner palette, sent to the **advisor** model |
+| **Reply stage** | After review cards are staged in a tool-loop turn | 2: `handoff_to_user` and `restore_parked_graph` |
 
-This page documents 31 tools. The complete per-surface inventory, with
+This page documents 30 of the 46 model-facing tools (`generate_yaml` below is a CLI MCP export, not a web composer tool). The complete per-surface inventory, with
 arguments and live call outcomes, including the tools not yet described here
 (`create_blob`, `update_blob`, `delete_blob`, `read_attachment`,
 `inspect_source`, `set_source_from_blobs`, `splice_transform`,

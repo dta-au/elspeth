@@ -62,7 +62,14 @@ class Capture(CustomLogger):
 
 litellm.callbacks = [Capture()]
 
-from elspeth.cli import app  # noqa: E402
 
-sys.argv = ["elspeth", "web", "--host", "127.0.0.1", "--port", os.environ.get("AUDIT_PORT", "8451")]
-app()
+def main() -> None:
+    # Imported only after the capture callback is installed, so every provider call is recorded.
+    from elspeth.cli import app
+
+    sys.argv = ["elspeth", "web", "--host", "127.0.0.1", "--port", os.environ.get("AUDIT_PORT", "8451")]
+    app()
+
+
+if __name__ == "__main__":
+    main()

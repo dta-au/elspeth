@@ -9,6 +9,7 @@ usage: mine_sessions.py <sessions dir> <out.md> <out.json>
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from collections import Counter
@@ -25,12 +26,22 @@ CONFUSION = re.compile(
 )
 
 
-def surface(tool_names: list[str]) -> str:
-    if "emit_pipeline_proposal" in tool_names and "set_pipeline" not in tool_names:
-        return "planner"
-    if "set_pipeline" in tool_names:
+ADVISOR_MODEL = os.environ.get("ELSPETH_WEB__COMPOSER_ADVISOR_MODEL", "").split("/", 1)[-1]
+REPLY_STAGE_TOOLS = frozenset({"handoff_to_user", "restore_parked_graph"})
+
+
+def surface(tool_names: list[str], model: str | None = None) -> str:
+    """Classify a captured request by offered tools and model (see build_register.py)."""
+    offered = frozenset(tool_names)
+    if not offered:
+        return "advisor"
+    if offered == REPLY_STAGE_TOOLS:
+        return "reply_stage"
+    if "emit_pipeline_proposal" in offered and "set_pipeline" not in offered:
+        return "planner_hatch" if ADVISOR_MODEL and model and model.endswith(ADVISOR_MODEL) else "planner"
+    if "set_pipeline" in offered:
         return "tool_loop"
-    return "hatch" if tool_names else "advisor"
+    return "other"
 
 
 def sentences_with_markers(text: str) -> list[str]:
@@ -61,7 +72,7 @@ def main() -> int:
             reply = (t["assistant_reply"] or "") if t["assistant_reply"] else json.dumps(t["error"])[:600]
             md.append(f"- USER SAW: {reply[:700]!r}")
             for c in calls:
-                surf = surface(c["tool_names"])
+                surf = surface(c["tool_names"], c.get("model"))
                 data["totals"][surf] += 1
                 resp = c.get("response") or {}
                 msg = ((resp.get("choices") or [{}])[0]).get("message") or {}

@@ -58,4 +58,5 @@ the headline flow.
 | `drive_session.py` | One multi-turn session over the HTTP API, plus per-turn capture slicing |
 | `run_scenarios.sh` | Serial scenario queue, then mine and register |
 | `mine_sessions.py` | Digest of reasoning markers, tool failures and advisor verdicts |
-| `build_register.py`, `render_register.py` | Tool-call register from live registries, joined with captures |
+| `build_register.py`, `render_register.py` | Tool-call register from live registries, joined with captures (set `ELSPETH_WEB__COMPOSER_ADVISOR_MODEL` so escape-hatch calls are told apart) |
+| `turn_table.py` | Deterministic turn table and per-surface performance summary (labels from API terminals and backend notices; nearest-rank percentiles) |
