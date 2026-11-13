@@ -293,6 +293,20 @@ def create_langfuse_tracer(
             host=tracing_config.host,
             tracing_enabled=tracing_config.tracing_enabled,
         )
+        # The SDK caches its resource manager (span exporter base_url and
+        # secret_key) per process keyed only by public_key, so a client built
+        # for a different host or a rotated secret_key silently reuses the
+        # first one's exporter. The validated host is a credential-egress
+        # destination: refuse a divergence rather than export row data to a
+        # host this config never named. Values are not echoed.
+        resources = client._resources
+        if resources is not None and (resources.base_url != tracing_config.host or resources.secret_key != tracing_config.secret_key):
+            raise RuntimeError(
+                "Langfuse tracing config refused: this public_key is already bound in this process to a "
+                "different host or secret_key (the Langfuse SDK shares one exporter per public_key), or "
+                "LANGFUSE_BASE_URL overrides the configured host. Use the same host and secret_key for every "
+                "plugin sharing a public_key, or a distinct public_key per Langfuse destination."
+            )
         return ActiveLangfuseTracer(transform_name=transform_name, client=client)
     except ImportError as exc:
         # User explicitly configured Langfuse tracing but the package is missing.

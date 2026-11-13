@@ -50,8 +50,8 @@ def test_renamed_ordered_binding_is_shared_by_composer_and_runtime(prefix: str) 
     assert _validate_multi_query_generated_input_requirements(_state(options).nodes[0]) == ()
 
 
-@pytest.mark.parametrize("override", [False, True])
-def test_upstream_override_collision_refusal_matches_plugin_without_changing_legacy(override: bool) -> None:
+@pytest.mark.parametrize("override", [False, True], ids=["default-stem", "explicit-stem"])
+def test_upstream_collision_refusal_matches_plugin_for_every_stem(override: bool) -> None:
     options = _options(
         ["body"],
         {
@@ -65,14 +65,11 @@ def test_upstream_override_collision_refusal_matches_plugin_without_changing_leg
     )
     if override:
         options["queries"]["first"]["structured_output_prefix"] = "first"
-        with pytest.raises(ValidationError, match="collision") as exc:
-            LLMConfig.model_validate(options)
-        errors = _validate_multi_query_generated_input_requirements(_state(options).nodes[0])
-        assert len(errors) == 1 and errors[0].message in str(exc.value)
-        assert errors[0].error_code == "plugin_options_invalid"
-    else:
+    with pytest.raises(ValidationError, match="collision") as exc:
         LLMConfig.model_validate(options)
-        assert _validate_multi_query_generated_input_requirements(_state(options).nodes[0]) == ()
+    errors = _validate_multi_query_generated_input_requirements(_state(options).nodes[0])
+    assert len(errors) == 1 and errors[0].message in str(exc.value)
+    assert errors[0].error_code == "plugin_options_invalid"
 
 
 def test_ordered_forward_binding_is_refused_by_stage_one_with_plugin_message() -> None:
