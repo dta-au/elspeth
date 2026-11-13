@@ -4868,7 +4868,7 @@ def _execute_diff_pipeline(
             state,
             (
                 "No baseline available. The comparison state was refused by the credential policy; saved revisions may still exist."
-                if context.baseline_kind == "last_accepted"
+                if context.baseline_kind == "last_validated"
                 else "No baseline available. This surface supplied no comparison state; saved revisions may still exist."
             ),
             error_code="diff_baseline_unavailable",
@@ -4900,8 +4900,8 @@ _DIFF_PIPELINE_DECLARATION = ToolDeclaration(
     response_contract=DIFF_PIPELINE_RESPONSE_CONTRACT,
     handler=_execute_diff_pipeline,
     kind=ToolKind.DISCOVERY,
-    description="Compare pipeline states. Web loop `baseline_kind`: `last_accepted` "
-    "(newest committed proposal), else `request_start`; planner: `request_start`. "
+    description="Compare with the newest validated state other than the working state. `baseline_kind`: `last_validated` "
+    "or `request_start` if none exists (including never validated). In-request edits can compare with request start; planner: `request_start`. "
     "`data`: `from_version` (baseline; current is envelope `version`), `sources_changed`, "
     "`metadata_changed`, `total_changes`, `warnings_introduced`, "
     "`warnings_resolved`, and per-collection `added` / `removed` / `modified` "

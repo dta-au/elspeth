@@ -610,7 +610,13 @@ approval. A refused mutation there returns as an ordinary failure to repair,
 with no approval card.
 
 `preview_pipeline` reports structure and contract verdicts, never row data: do
-not present rows you composed yourself as preview output. If `diff_pipeline`
+not present rows you composed yourself as preview output. `diff_pipeline` compares
+against the newest state that cleared strict validation, excluding the current
+working state (`baseline_kind`: `last_validated`). With in-request edits this
+can be the request-start state; with no edits it is the validated state before
+the current one. If no candidate exists, including a pipeline that has never
+validated, it compares against request start (`baseline_kind`: `request_start`).
+Planner and commit routes use `request_start`. If `diff_pipeline`
 refuses with `diff_baseline_unavailable`, this surface gave it no usable baseline: do
 not retry it, describe the change from this turn's own results, and never tell
 the user that earlier versions do not exist.

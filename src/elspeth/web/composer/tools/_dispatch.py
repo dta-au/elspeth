@@ -809,7 +809,7 @@ def execute_tool(
     secret_wiring_policy: SecretWiringPolicy | None = None,
     user_id: str | None = None,
     baseline: CompositionState | None = None,
-    baseline_kind: Literal["request_start", "last_accepted"] | None = None,
+    baseline_kind: Literal["request_start", "last_validated"] | None = None,
     prior_validation: ValidationSummary | None = None,
     runtime_preflight: RuntimePreflight | None = None,
     structural_preflight: RuntimePreflight | None = None,

@@ -29,7 +29,7 @@ def collect():
     catalog = _mock_catalog()
     results = {}
     results["diff_empty"] = execute_tool("diff_pipeline", {}, state, catalog, baseline=state)
-    for kind in ("request_start", "last_accepted"):
+    for kind in ("request_start", "last_validated"):
         results[f"diff_{kind}"] = execute_tool("diff_pipeline", {}, state, catalog, baseline=state, baseline_kind=kind)
     results["diff_sources"] = execute_tool(
         "diff_pipeline",

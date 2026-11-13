@@ -65,9 +65,9 @@
       "success": true,
       "data": "{\"from_version\": 1, \"sources_changed\": false, \"metadata_changed\": false, \"nodes\": {\"added\": [], \"removed\": [], \"modified\": []}, \"edges\": {\"added\": [], \"removed\": [], \"modified\": []}, \"outputs\": {\"added\": [], \"removed\": [], \"modified\": []}, \"baseline_kind\": \"request_start\", \"warnings_introduced\": [], \"warnings_resolved\": [], \"total_changes\": 0}"
     },
-    "diff_last_accepted": {
+    "diff_last_validated": {
       "success": true,
-      "data": "{\"from_version\": 1, \"sources_changed\": false, \"metadata_changed\": false, \"nodes\": {\"added\": [], \"removed\": [], \"modified\": []}, \"edges\": {\"added\": [], \"removed\": [], \"modified\": []}, \"outputs\": {\"added\": [], \"removed\": [], \"modified\": []}, \"baseline_kind\": \"last_accepted\", \"warnings_introduced\": [], \"warnings_resolved\": [], \"total_changes\": 0}"
+      "data": "{\"from_version\": 1, \"sources_changed\": false, \"metadata_changed\": false, \"nodes\": {\"added\": [], \"removed\": [], \"modified\": []}, \"edges\": {\"added\": [], \"removed\": [], \"modified\": []}, \"outputs\": {\"added\": [], \"removed\": [], \"modified\": []}, \"baseline_kind\": \"last_validated\", \"warnings_introduced\": [], \"warnings_resolved\": [], \"total_changes\": 0}"
     }
   }
 }
