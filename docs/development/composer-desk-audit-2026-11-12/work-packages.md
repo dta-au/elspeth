@@ -16,12 +16,12 @@ Status: **READY** (a lane exists), **DECISION** (blocked on the maintainer),
 | F18 tutorial is not script-only | R16 | READY | CDA-01 |
 | F20 run-state copy ignores screen | R3 item 4 | READY | CDA-01 |
 | F3 `diff_pipeline` has no baseline | R5 | READY | CDA-02 |
-| F11 `report_assemble` → `document` warning | R11 | READY (confirm compat note) | CDA-03 |
+| F11 `report_assemble` → `document` warning | R11 | READY (D3: config-derived framing, recommended) | CDA-03 |
 | F15 stale always-authorized list | R11 docs | READY | CDA-03 |
 | F14 approved interpretation not in multi-query prompts | R13 (reject at staging) | READY | CDA-04 |
 | F19 boot probe does not test the real hatch | R17 | READY | CDA-05 |
 | F4 credential refusal blames the user | R6(c) copy | READY | CDA-06 |
-| F4 reasoning-only hit fails the turn | R6(a) | DECISION D1 | — |
+| F4 reasoning-only hit fails the turn | R6(a) | READY (D1 approved) | CDA-18 |
 | F2 advisor lacks capability facts; context lost after withhold | R2, R3 item 3 | READY | CDA-07 |
 | F9 "Correction to my previous message" | R9 | READY | CDA-07 |
 | F17 composer explains internals (rubric half) | R15 (END rubric, blocker detail in context) | READY | CDA-07 |
@@ -30,36 +30,45 @@ Status: **READY** (a lane exists), **DECISION** (blocked on the maintainer),
 | F10 "emit now" notice | R10 | READY | CDA-10 |
 | F12 tool-result legibility | R12 | READY | CDA-10 |
 | F1 multi-file on the planner (interim: name the problem, hand off) | R4(b) | READY | CDA-10 |
-| F1 multi-file on the planner (expressible) | R4(a) | DECISION D2 | CDA-13 |
+| F1 multi-file on the planner (expressible) | R4(a) | READY (D2 approved, no compatibility) | CDA-13 |
 | F5 `list_models` unfiltered | R7 (handler) | READY | CDA-11 |
 | F7 planner taught the tool-loop policy; F5/F17/F14 teaching text; F6 cross-references | R1, R7 skill text, R15 skill text, R13 teaching, R8, E3 | READY (after wave 3a) | CDA-12 |
 | F13 generic first-turn reply | E1 | READY | CDA-14 |
 | Battery corpus gaps | E4 | READY | CDA-15 |
 | Advisor cache 52% | P2 investigation | READY (after CDA-07) | CDA-16 |
 | Hatch deadline / output-cap exits | P5 | READY (after CDA-12) | CDA-17 |
-| Budget/timeout warning | P6 | DECISION D5 (config, not code) | — |
+| Budget/timeout warning | P6 | RESOLVED (D5: presenter scripts turns to fit the budget) | — |
 | Skip advisor on chat turns | P3 | NOT FIXING (loses real catches, e.g. s03 T4) | — |
 | Register as a gated artifact | E2 | Optional, only with E3 | — |
 
-## 2. Decisions needed before the blocked lanes
+## 2. Decisions (maintainer, 2026-11-13)
 
-- **D1. R6(a), credential guard on reasoning.** Approve dropping
-  reasoning-only hits from the call record instead of failing the turn.
-  - The scope is `reasoning_content` and `reasoning_details` only, never the
-    replayed `thinking_blocks`, content or tool arguments.
-  - It reverses behaviour pinned by tests.
-  - That reasoning would then be missing from the audit record for the call.
-- **D2. R4(a), multi-file sources.** Allow `blob_id` on named `sources`
-  entries. This changes the persisted `sources` shape, so it needs a stated
-  compatibility boundary under the delivery posture.
-- **D3. R11 compatibility.** With `output_semantics()`, `report_assemble` →
-  `text` becomes a hard error instead of a warning. Confirm this is intended.
-- **D4. R7 disclosure.** May the composer tell users which concrete model a
-  profile maps to? Until you decide, CDA-11 lists profile aliases only.
-- **D5. P6 demo budgets.** Raise the timeout, or size the turn budgets to it
-  (configuration only).
+- **D1 approved.** R6(a): a credential-shaped hit found **only** in
+  `reasoning_content`/`reasoning_details` drops that reasoning from the call
+  record, records the event, and continues. A hit in replayed
+  `thinking_blocks`, content or tool arguments still fails. Few models expose
+  reasoning, so the main beneficiary is a model that does. Lane: CDA-18.
+- **D2 approved, with no compatibility.** Named `sources` may bind
+  uploaded blobs. Make it work with the new system only. Do not add migration,
+  dual-shape reading or compatibility shims for older stored states. Lane:
+  CDA-13.
+- **D3 walked through; recommendation recorded.**
+  - `report_assemble` declares its output framing from its own configuration:
+    `COMPACT` when the result can only be one line (no title, `join_with`
+    without CR/LF); otherwise newline-framed text.
+  - Effect on `document`: the HIGH warning goes away.
+  - Effect on `text`: a multi-line report becomes a validation **error**.
+    Today that pipeline validates with a warning and then writes nothing,
+    because the text sink diverts every value containing a newline.
+  - A single-line configuration still works.
+  - Lane: CDA-03. Pending the maintainer's OK on the walk-through.
+- **D4 approved.** The composer may and should say which provider and model
+  a profile uses when asked. Lanes: CDA-11 (tool result) and CDA-12 (skill
+  text).
+- **D5 resolved without code.** The presenter scripts the demo turns to fit
+  the configured budget. P6 is not a lane.
 
-R16 is decided: you confirmed the tutorial is a fixed prompt the learner
+R16 is also decided: you confirmed the tutorial is a fixed prompt the learner
 cannot edit (ADR-031). CDA-01 enforces that in the frontend only.
 
 ## 3. Waves
@@ -71,13 +80,14 @@ parallelism per lane (for example `-n 4`); CPUs do not multiply across lanes.
 | Wave | Lanes | Why serial |
 |---|---|---|
 | 1 | CDA-01, CDA-02, CDA-03, CDA-04, CDA-05, CDA-06 | Independent, small, mostly demo-relevant |
+| 2a′ | CDA-18 | Parallel with CDA-07; after CDA-06 (`test_credential_guard.py`) |
 | 2a | CDA-07 | Shares `composition_completion.py`, `turn_effects.py` and `planning_application.py` with 2b and 2c |
 | 2b | CDA-08 | After CDA-07 (`turn_effects.py`, `no_tool_policy.py`) |
 | 2c | CDA-09 | After CDA-08 (`composition_completion.py` gate clearing) |
 | 3a | CDA-10, CDA-11 | `pipeline_planner.py` and the tool handlers respectively; CDA-11 waits for CDA-02 (`tools/generation.py`) |
 | 3b | CDA-12 | After CDA-10 and CDA-07 (`pipeline_planner.py` message builder, advisor system text, skills) |
 | 4 | CDA-14, CDA-15, CDA-16, CDA-17 | Polish and performance; CDA-17 after CDA-12 |
-| — | CDA-13 | After D2 and CDA-12 |
+| 3c | CDA-13 | After CDA-12 (planner custody and schema) |
 
 Only wave 1 plus CDA-07 and CDA-08 matter before the demo, and only if they
 land before the code freeze (remediation plan, WP1a).
@@ -184,8 +194,15 @@ pytest only.
 
 - **Files.**
   - `src/elspeth/plugins/transforms/report_assemble.py`: add
-    `output_semantics()` (value type STR, unconstrained framing; see
-    `report_assemble.py:247`).
+    `output_semantics()` for `output_field` (value type STR; see
+    `report_assemble.py:247`). Framing is derived from configuration:
+    - `COMPACT` when the result is always one line: no `title`, and a
+      `join_with` with no CR/LF;
+    - otherwise `NEWLINE_FRAMED`.
+
+    Follow `line_explode.py:422` and the `TextFraming` doctrine in
+    `contracts/plugin_semantics.py:84-110`; do not use `UNCONSTRAINED` as a
+    shortcut.
   - `src/elspeth/plugins/sinks/document_sink.py` (~L131, ~L453-455): fix the
     example's `schema.mode: fixed`, which errors after `report_assemble`.
   - `docs/reference/environment-variables.md` (~L587-592): list the 14
@@ -193,7 +210,9 @@ pytest only.
 - **Test files.** `tests/unit/plugins/transforms/test_report_assemble.py`.
   - `report_assemble` → `document` validates with no high-severity
     semantic-contract warning.
-  - `report_assemble` → `text` behaviour is pinned (decision D3).
+  - `report_assemble` → `text` with the default `join_with="\n"` is a
+    semantic CONFLICT (validation error).
+  - With `join_with=" "` and no title, it is allowed.
 - **Test command.** `pytest tests/unit/plugins/transforms/test_report_assemble.py -n 0 -q`.
 - **Report.** Whether `json_explode` (seen in s12) needs the same treatment.
   Do not change it in this lane.
@@ -361,11 +380,13 @@ pytest only.
 
 - **Files.** `src/elspeth/web/composer/tools/generation.py` (the
   `list_models` handler): on the web, return the usable operator profile
-  aliases, not litellm's catalog. Whether to disclose the model behind a
-  profile follows decision D4; until then, aliases only.
+  aliases, each with its provider and model (D4 approved), not litellm's
+  catalog. Never include credential refs, endpoints or keys
+  (`LLM_PROFILE_PRIVATE_FIELDS` stays private except `provider` and `model`).
 - **Test files.** `tests/unit/web/composer/test_list_models_profiles.py` (new).
-  With one profile `standard` configured, the result contains only that
-  alias, and no `1024-x-1024` or `openai/gpt-4o`.
+  With one profile `standard` → openrouter `deepseek/deepseek-v4.1-flash`
+  configured, the result contains exactly that alias, provider and model, and
+  no `1024-x-1024`, `openai/gpt-4o` or credential reference.
 - **Test command.** `pytest tests/unit/web/composer/test_list_models_profiles.py -n 0 -q`.
 - **Depends on.** CDA-02 (same file). The skill-text half of R7 is in CDA-12.
 
@@ -380,8 +401,9 @@ pytest only.
     (~L193-219).
   - `src/elspeth/web/composer/skills/pipeline_composer.md`,
     `pipeline_capabilities.md`:
-    - R7: profiles only; "to change models ask your operator"; remove the
-      `model_catalog` reference.
+    - R7: models are bound through operator profiles. When asked, name the
+      profile's provider and model from `list_models` (D4). Changing the model
+      is an operator change. Remove the `model_catalog` reference.
     - R15 Reply Register rule: answer check, readiness and approval questions
       with the user's next action; never show tool-call JSON or suggest
       filing a defect.
@@ -409,7 +431,7 @@ pytest only.
   s01–s20: the strict palette-confusion rate (crosscheck pattern) is below 5%.
 - **Depends on.** CDA-07, CDA-10.
 
-### CDA-13: Multi-file sources on the planner (R4(a), F1). BLOCKED on D2
+### CDA-13: Multi-file sources on the planner (R4(a), F1). D2 approved, no compatibility
 
 - **Files.**
   - `src/elspeth/web/composer/tools/sessions.py` (~L2188): the canonical
@@ -425,7 +447,10 @@ pytest only.
   (new). Two uploaded blobs bound as two named sources build, and a row-union
   combining topology validates.
 - **Test command.** `pytest tests/unit/web/composer/test_named_sources_blob_binding.py -n 0 -q`.
+- **No compatibility.** Do not add migration, dual-shape reading or shims
+  for older stored states (D2).
 - **Also run.** The testcontainer suite, if persistence code changes.
+- **Depends on.** CDA-12.
 
 ### CDA-14: Show the proposal's own description on the first turn (E1, F13)
 
@@ -455,6 +480,34 @@ Read-only investigation, with a fix only if it is trivial. The question is why
 the advisor's cache hit is 52% against the composer's 92–94%. Check whether
 per-turn evidence precedes stable text in `advisor_checkpoint.py:453-495`.
 Deliver measurements and a proposed change in `report.md`.
+
+### CDA-18: Drop credential-shaped reasoning instead of failing the turn (R6(a), F4; D1 approved)
+
+- **Goal.** A credential-shaped string found only in `reasoning_content` or
+  `reasoning_details` removes that reasoning from the call record. The event
+  is recorded with surface and detector category, never the value, and the
+  turn continues.
+  - A hit in `thinking_blocks` (replayed, signature-bound), visible content or
+    tool arguments still fails exactly as today.
+  - This applies to planner, tool-loop and advisor calls.
+- **Files.**
+  - `src/elspeth/web/composer/llm_response_parsing.py`
+    (`build_llm_call_record`, ~L740-770): the scan point.
+  - `src/elspeth/web/credential_guard.py` (~L91-126): the
+    reasoning-specific helper.
+- **Test files.** `tests/unit/web/composer/test_reasoning_credential_scrub.py`
+  (new). Using the s06 shape (`"password": "Client emailed the admin pass…"`
+  in reasoning only):
+  - the call record has the reasoning removed;
+  - a scrub event is recorded;
+  - no exception is raised;
+  - the same string in tool arguments still raises.
+- **Pinned tests to update.** `tests/unit/web/test_credential_guard.py`
+  (~L520-560), `tests/unit/web/composer/test_pipeline_planner.py` (~L5385)
+  and `tests/unit/web/composer/test_compose_loop_persistence.py` (~L796-806).
+  Change only the assertions about reasoning-only hits.
+- **Test command.** `pytest tests/unit/web/composer/test_reasoning_credential_scrub.py tests/unit/web/test_credential_guard.py -n 0 -q`.
+- **Depends on.** CDA-06.
 
 ### CDA-17: Planner deadline reserve and output-cap handling (P5)
 
