@@ -353,9 +353,6 @@ files:
     dict[str, Any]: 1
   src/elspeth/plugins/infrastructure/clients/power_automate.py:
     Mapping[str, object]: 3
-  src/elspeth/plugins/infrastructure/clients/replayer.py:
-    Mapping[str, Any]: 2
-    dict[str, Any]: 6
   src/elspeth/plugins/infrastructure/clients/retrieval/azure_search.py:
     boundary: 1
     dict[str, Any]: 7
@@ -367,9 +364,6 @@ files:
     dict[str, Any]: 1
   src/elspeth/plugins/infrastructure/clients/vendor_logging.py:
     Mapping[str, object]: 1
-  src/elspeth/plugins/infrastructure/clients/verifier.py:
-    Mapping[str, Any]: 12
-    dict[str, Any]: 2
   src/elspeth/plugins/infrastructure/config_base.py:
     dict[str, Any]: 2
   src/elspeth/plugins/infrastructure/config_content.py:
@@ -538,6 +532,7 @@ files:
     boundary: 2
     dict[str, Any]: 1
   src/elspeth/plugins/transforms/azure/prompt_shield.py:
+    Mapping[str, object]: 1
     dict[str, Any]: 2
   src/elspeth/plugins/transforms/batch_classifier_metrics.py:
     dict[str, Any]: 2
@@ -1116,10 +1111,10 @@ files:
   src/elspeth/web/shareable_reviews/service.py:
     dict[str, object]: 1
 totals:
-  Mapping[str, Any]: 810
-  Mapping[str, object]: 317
+  Mapping[str, Any]: 796
+  Mapping[str, object]: 318
   MutableMapping[str, Any]: 8
   boundary: 70
-  dict[str, Any]: 1132
+  dict[str, Any]: 1124
   dict[str, object]: 401
-  soft: 2668
+  soft: 2647

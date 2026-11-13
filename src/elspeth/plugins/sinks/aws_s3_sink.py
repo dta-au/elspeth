@@ -22,7 +22,6 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from elspeth.contracts import ArtifactDescriptor, CallType, Determinism, PluginSchema
 from elspeth.contracts.contexts import SinkContext
 from elspeth.contracts.diversion import SinkWriteResult
-from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.header_modes import HeaderMode, parse_header_mode
 from elspeth.contracts.plugin_assistance import PluginAssistance
@@ -316,6 +315,22 @@ class S3RecordSizeLimitError(S3RecordSerializationError):
         ValueError.__init__(self, "S3 output record exceeds configured character limit.")
 
 
+class S3HeaderSerializationError(ValueError):
+    """The configured CSV header record cannot be written.
+
+    The header is derived from the schema, the header mode and the configured
+    encoding and record limit, so this is a configuration defect: it is
+    deliberately NOT an ``S3RecordSerializationError`` and is never diverted
+    as a row failure. The message is static so no header label is echoed.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "S3 CSV header record cannot be written with the configured csv_options.encoding "
+            "and max_record_chars; correct the header labels or the CSV options."
+        )
+
+
 @dataclass(slots=True)
 class _SerializedObject:
     """Own a rewound temporary object and its stable integrity metadata."""
@@ -368,6 +383,7 @@ class _BoundedBinaryWriter:
 class _EncodedTextWriter:
     def __init__(self, writer: _BoundedBinaryWriter, encoding: str) -> None:
         self._writer = writer
+        self._failure: type[S3RecordSerializationError] | type[S3HeaderSerializationError] = S3RecordSerializationError
         try:
             self._encoder = codecs.getincrementalencoder(encoding)(errors="strict")
         except (LookupError, TypeError, UnicodeError, ValueError):
@@ -385,8 +401,12 @@ class _EncodedTextWriter:
         except (LookupError, TypeError, UnicodeError, ValueError):
             encoding_failed = True
         if encoding_failed or type(encoded) is not bytes:
-            raise S3RecordSerializationError from None
+            raise self._failure from None
         return encoded
+
+    def fail_as(self, failure: type[S3RecordSerializationError] | type[S3HeaderSerializationError]) -> None:
+        """Select the static failure raised for the text written next."""
+        self._failure = failure
 
     def write(self, value: str) -> int:
         self._writer.write(self._encode(value, final=False))
@@ -542,8 +562,12 @@ def _serialize_rows_to_spool(
             if csv_options.include_header:
                 header_values = list(fieldnames) if header_fields is None else list(header_fields)
                 if _csv_record_chars(header_values, csv_options.delimiter) > max_record_chars:
-                    raise S3RecordSizeLimitError
+                    raise S3HeaderSerializationError
+                # An encoding failure while writing the header is the header
+                # (configuration) failure, not a row failure.
+                text_writer.fail_as(S3HeaderSerializationError)
                 csv_writer.writerow(header_values)
+                text_writer.fail_as(S3RecordSerializationError)
             for row in rows:
                 if set(row) - set(fieldnames):
                     raise S3RecordSerializationError
@@ -621,32 +645,19 @@ class S3WriteOutcomeUnknownError(RuntimeError):
         super().__init__("S3 object write outcome is unknown; reconciliation is required.")
 
 
-class S3SinkPoisonedError(RuntimeError):
-    """The sink cannot safely make another cumulative request."""
-
-
 class S3SinkClosedError(RuntimeError):
     """The sink has already released its provider resources."""
+
+    def __init__(self) -> None:
+        super().__init__("AWSS3Sink is closed; no further S3 requests may be made.")
 
 
 class S3ClientCloseError(RuntimeError):
     """The detached S3 client failed during close."""
 
 
-def _raise_conditional_rejected() -> Never:
-    raise S3ConditionalWriteRejectedError from None
-
-
-def _raise_sink_write_rejected() -> Never:
-    raise S3SinkWriteError from None
-
-
 def _raise_outcome_unknown() -> Never:
     raise S3WriteOutcomeUnknownError from None
-
-
-def _raise_audit_integrity(error_type: str) -> Never:
-    raise AuditIntegrityError(f"Failed to record S3 call in the audit trail ({error_type}).") from None
 
 
 def _s3_provider_exception_types() -> tuple[type[Exception], ...]:
@@ -736,7 +747,7 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
     name = "aws_s3"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:5d0aa08060d18093"
+    source_file_hash: str | None = "sha256:9f0d21a6ac2e98ed"
     config_model = AWSS3SinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP
@@ -824,6 +835,10 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
         set_resume_field_resolution(self, resolution_mapping)
 
     def _get_s3_client(self) -> _S3Client:
+        # close() released the client; building a replacement would let a
+        # post-close inspect/commit/reconcile silently reopen provider access.
+        if self._closed:
+            raise S3SinkClosedError
         if self._s3_client is None:
             self._s3_client = cast("_S3Client", build_s3_client(self._region_name, self._endpoint_url))
         return self._s3_client
@@ -971,6 +986,11 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
             row = deep_thaw(member.row)
             probe_fields = self._get_fieldnames_from_schema_or_rows([row])
             probe_rows = apply_display_headers(self, [row]) if self._format in {"json", "jsonl"} else [row]
+            # The probe writes the same display header the final object
+            # carries, so header encoding and record-length defects surface
+            # here (as configuration errors) rather than only in the
+            # whole-object write.
+            probe_header = self._display_fieldnames(probe_fields) if self._format == "csv" else None
             try:
                 serialized = _serialize_rows_to_spool(
                     probe_rows,
@@ -979,6 +999,7 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
                     fieldnames=probe_fields,
                     max_object_bytes=1024 * 1024 * 1024,
                     max_record_chars=self._max_record_chars,
+                    header_fields=probe_header,
                 )
             except S3RecordSizeLimitError:
                 reason = "record exceeds configured character limit"

@@ -6167,7 +6167,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "3e92055687329a54",
         1,
         None,
-        line=506,
+        line=493,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -6178,7 +6178,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "cb69520a77f4030e",
         1,
         None,
-        line=934,
+        line=921,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -6189,7 +6189,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "f259e8651bc82bb6",
         1,
         None,
-        line=954,
+        line=941,
         connection_escape=True,
     ),
     # ``with LandscapeDB.from_url(...) as database`` then ``database.engine

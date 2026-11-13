@@ -385,6 +385,13 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
         capacity_retry_deadline = capacity_retry_started_at + float(self._max_capacity_retry_seconds)
 
         for field_name, value in validated_fields:
+            # The batch waiter allows the capacity budget plus ONE HTTP call
+            # (``_effective_batch_wait_timeout_seconds``). Every field shares
+            # this row deadline, so no field's call may start once it has
+            # passed; otherwise each remaining field adds another HTTP timeout
+            # and the waiter evicts a row whose worker is still calling Azure.
+            if time.monotonic() >= capacity_retry_deadline:
+                return self._row_deadline_result(field_name, capacity_retry_started_at)
             violation = self._analyze_field_with_capacity_retry(
                 value,
                 field_name,
@@ -490,6 +497,21 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
             {
                 "reason": "shutdown_requested",
                 "error": "Azure safety capacity retry stopped because transform shutdown was requested",
+                "elapsed_seconds": elapsed,
+                "max_seconds": self._max_capacity_retry_seconds,
+            },
+            retryable=False,
+        )
+
+    def _row_deadline_result(self, field_name: str, started_at: float) -> TransformResult:
+        """Build the row result for a field left unscanned because the row deadline passed."""
+        elapsed = time.monotonic() - started_at
+        return TransformResult.error(
+            {
+                "reason": "retry_timeout",
+                "error": "Azure safety row deadline passed before this field was scanned",
+                "error_type": "row_deadline_exceeded",
+                "field": field_name,
                 "elapsed_seconds": elapsed,
                 "max_seconds": self._max_capacity_retry_seconds,
             },

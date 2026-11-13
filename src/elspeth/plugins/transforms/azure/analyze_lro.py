@@ -467,7 +467,15 @@ class AzureAnalyzeTransform(BaseTransform, BatchTransformMixin):
             reason["cause"] = inner_code
         return TransformResult.error(reason, retryable=False)
 
-    def _http_call_with_capacity_retry(self, do_call: Callable[[], Any], *, deadline: float, started_at: float, error_type: str) -> Any:
+    def _http_call_with_capacity_retry(
+        self,
+        do_call: Callable[[], Any],
+        *,
+        deadline: float,
+        started_at: float,
+        error_type: str,
+        network_retry_deadline: float | None = None,
+    ) -> Any:
         """Run one HTTP call with capacity (429/503) retry and return the 2xx response.
 
         ``deadline`` bounds this call's capacity retrying (clamped to the poll
@@ -476,8 +484,17 @@ class AzureAnalyzeTransform(BaseTransform, BatchTransformMixin):
         longer than the remaining budget ends the row at once instead of sleeping
         the budget away first.
         Non-capacity HTTP errors end the row in the ``api_error`` category with
-        ``error_type`` as the sub-label. Raises PluginRetryableError on network
-        errors (engine retries the row).
+        ``error_type`` as the sub-label.
+
+        A network error (``httpx.RequestError``) with no
+        ``network_retry_deadline`` (the submit POST) raises
+        PluginRetryableError: the engine retries the row, which resubmits.
+        With a ``network_retry_deadline`` (a poll GET, after Azure accepted the
+        analyze request) the call is retried in place with the same backoff,
+        bounded by that deadline and the shutdown event, so a dropped
+        connection does not discard the accepted operation and start a second
+        billed analysis. Only a network error that outlasts the deadline
+        escalates to a row retry.
         """
         delay = self._CAPACITY_RETRY_INITIAL_DELAY_SECONDS
         while True:
@@ -516,7 +533,15 @@ class AzureAnalyzeTransform(BaseTransform, BatchTransformMixin):
                     raise _RowFailed(self._retry_timeout_result(status_code, started_at)) from e
                 delay = min(delay * 2.0, self._CAPACITY_RETRY_MAX_DELAY_SECONDS)
             except httpx.RequestError as e:
-                raise PluginRetryableError(f"{self.service_label} network error: {e}", retryable=True) from e
+                if network_retry_deadline is None:
+                    raise PluginRetryableError(f"{self.service_label} network error: {e}", retryable=True) from e
+                now = time.monotonic()
+                if now >= network_retry_deadline:
+                    raise PluginRetryableError(f"{self.service_label} network error: {e}", retryable=True) from e
+                sleep_seconds = min(delay, network_retry_deadline - now)
+                if sleep_seconds > 0 and self._shutdown.wait(timeout=sleep_seconds):
+                    raise _RowFailed(self._shutdown_result(started_at)) from e
+                delay = min(delay * 2.0, self._CAPACITY_RETRY_MAX_DELAY_SECONDS)
 
     def _submit(
         self,
@@ -587,7 +612,11 @@ class AzureAnalyzeTransform(BaseTransform, BatchTransformMixin):
 
             call_capacity_deadline = time.monotonic() + float(self._max_capacity_retry_seconds)
             resp = self._http_call_with_capacity_retry(
-                do_call, deadline=min(call_capacity_deadline, poll_deadline), started_at=started_at, error_type="poll_request_failed"
+                do_call,
+                deadline=min(call_capacity_deadline, poll_deadline),
+                started_at=started_at,
+                error_type="poll_request_failed",
+                network_retry_deadline=poll_deadline,
             )
             if time.monotonic() >= poll_deadline:
                 raise _RowFailed(self._poll_timeout_result(started_at))

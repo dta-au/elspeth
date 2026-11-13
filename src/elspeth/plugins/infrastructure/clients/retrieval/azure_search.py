@@ -604,10 +604,13 @@ class AzureSearchProvider:
                 skipped_items.append({"reason": "missing_id", "keys": list(item.keys())})
                 continue
 
+            # The embedding (vector_field) and Azure's @search.* annotations are
+            # retrieval internals, not document metadata: copying them would put
+            # a full embedding into every chunk and the row's sources output.
             metadata: dict[str, Any] = {
                 k: str(v) if not isinstance(v, (str, int, float, bool, type(None), list, dict)) else v
                 for k, v in item.items()
-                if k not in (self._score_key, content_field, id_field)
+                if k not in (self._score_key, content_field, id_field, self._config.vector_field) and not k.startswith("@search.")
             }
             # Citation fields under provider-neutral names. A missing or
             # non-string value is omitted, never fabricated.

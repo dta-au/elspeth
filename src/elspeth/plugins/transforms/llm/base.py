@@ -18,6 +18,7 @@ from elspeth.contracts.schema_contract import declared_type_name_admits
 from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.pooling import PoolConfig
+from elspeth.plugins.infrastructure.pooling.config import validate_pool_delay_invariants
 from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment, find_runtime_unbound_variables
 from elspeth.plugins.transforms.llm import LLM_GUARANTEED_SUFFIXES, _llm_created_output_fields
 from elspeth.plugins.transforms.llm.image_inputs import ImageInputConfig
@@ -468,6 +469,26 @@ class LLMConfig(TransformDataConfig):
             max_capacity_retry_seconds=self.max_capacity_retry_seconds,
         )
 
+    @model_validator(mode="after")
+    def _validate_pool_knobs(self) -> LLMConfig:
+        """Enforce PoolConfig's cross-field invariants inside ``model_validate``.
+
+        The flat pool fields are range-checked individually, but PoolConfig's
+        cross-field rules used to run only when ``pool_config`` was first read
+        (``LLMTransform.__init__``), so a contradiction escaped ``from_dict`` and
+        later surfaced as a raw PoolConfig ValidationError echoing the input.
+        A minimum delay above the maximum is contradictory whatever the pool
+        size, so it is refused in sequential mode too; the AIMD viability rules
+        apply only when a pool will be built (``pool_size > 1``).
+        """
+        validate_pool_delay_invariants(
+            min_dispatch_delay_ms=self.min_dispatch_delay_ms,
+            max_dispatch_delay_ms=self.max_dispatch_delay_ms,
+            recovery_step_ms=self.recovery_step_ms,
+            pooled=self.pool_size > 1,
+        )
+        return self
+
     @field_validator("max_tokens", mode="before")
     @classmethod
     def reject_boolean_max_tokens(cls, value: object) -> object:
@@ -594,15 +615,14 @@ class LLMConfig(TransformDataConfig):
         Only *validation* moves earlier; the frozen ``QuerySpec`` runtime
         resolution still happens in ``LLMTransform.__init__`` (the second call is
         idempotent). This validator is deliberately scoped to config-shape errors:
-        it resolves typed queries and, for explicit prefix overrides, checks the
-        complete generated-name inventory. It does not catch or reshape any
+        it resolves typed queries and checks the complete generated-name
+        inventory (structured, raw-response and operational names) under every
+        query mode and structured stem. It does not catch or reshape any
         exception, so a genuine framework failure would still propagate.
         """
         if self.queries is None:
             return self
-        specs = self.resolved_queries()
-        if any(spec.structured_output_prefix is not None for spec in specs):
-            unique_query_generated_fields(tuple(specs), self.response_field)
+        unique_query_generated_fields(tuple(self.resolved_queries()), self.response_field)
         return self
 
     @model_validator(mode="after")

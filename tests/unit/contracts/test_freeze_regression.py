@@ -463,35 +463,6 @@ class TestPluginContextNestedMutationRejected:
             ctx.config["nested"]["key"] = "mutated"
 
 
-class TestReplayedCallNestedMutationRejected:
-    """ReplayedCall deep-freezes response_data and error_data."""
-
-    def test_response_data_nested_mutation_raises(self) -> None:
-        from elspeth.plugins.infrastructure.clients.replayer import ReplayedCall
-
-        call = ReplayedCall(
-            response_data={"body": {"content": "hello"}},
-            original_latency_ms=50.0,
-            request_hash="abc123",
-        )
-        with pytest.raises(TypeError):
-            call.response_data["body"]["content"] = "mutated"
-
-    def test_error_data_nested_mutation_raises(self) -> None:
-        from elspeth.plugins.infrastructure.clients.replayer import ReplayedCall
-
-        call = ReplayedCall(
-            response_data={"status": "error"},
-            original_latency_ms=50.0,
-            request_hash="abc123",
-            was_error=True,
-            error_data={"detail": {"code": 500}},
-        )
-        assert call.error_data is not None
-        with pytest.raises(TypeError):
-            call.error_data["detail"]["code"] = 999
-
-
 # ── deep_freeze must leave dataclasses discriminable by ``type(x) is C`` ─────
 
 

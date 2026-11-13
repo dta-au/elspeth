@@ -557,7 +557,7 @@ class TestDataverseSourceConfigValidation:
         with pytest.raises(PluginConfigError, match="placeholder"):
             DataverseSourceConfig.from_dict(_base_config(select=[select_field]))
 
-    @pytest.mark.parametrize("select_field", ["todo", "unknown", "unset", "required", "<literal>"])
+    @pytest.mark.parametrize("select_field", ["todo", "unknown", "unset", "required"])
     def test_plain_placeholder_words_can_be_select_fields(self, select_field: str) -> None:
         from elspeth.plugins.sources.dataverse import DataverseSourceConfig
 
@@ -1800,30 +1800,17 @@ class TestDataverseSourceLoadFetchXML:
         assert not rows[0].is_quarantined
 
     def test_fetchxml_missing_entity_element(self) -> None:
-        """FetchXML without <entity> element raises RuntimeError."""
-        source = _make_source_for_load(
-            [],
-            _fetchxml_config(
-                fetch_xml="<fetch><all-attributes/></fetch>",
-            ),
-        )
-        ctx = _mock_source_context()
-
-        with pytest.raises(RuntimeError, match="missing <entity> element"):
-            list(source.load(ctx))
+        """FetchXML without <entity> element is refused at config time, before any client exists."""
+        with pytest.raises(PluginConfigError, match="exactly one <entity> element"):
+            _make_source_for_load([], _fetchxml_config(fetch_xml="<fetch><all-attributes/></fetch>"))
 
     def test_fetchxml_entity_missing_name_attribute(self) -> None:
-        """FetchXML <entity> without name attribute raises RuntimeError."""
-        source = _make_source_for_load(
-            [],
-            _fetchxml_config(
-                fetch_xml="<fetch><entity><attribute name='fullname'/></entity></fetch>",
-            ),
-        )
-        ctx = _mock_source_context()
-
-        with pytest.raises(RuntimeError, match="missing 'name' attribute"):
-            list(source.load(ctx))
+        """FetchXML <entity> without name attribute is refused at config time."""
+        with pytest.raises(PluginConfigError, match="'name' attribute"):
+            _make_source_for_load(
+                [],
+                _fetchxml_config(fetch_xml="<fetch><entity><attribute name='fullname'/></entity></fetch>"),
+            )
 
     def test_fetchxml_uses_paginate_fetchxml(self) -> None:
         """FetchXML resolves its logical name and preserves the original XML."""

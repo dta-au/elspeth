@@ -387,12 +387,14 @@ class TestSerialization:
     def test_non_text_codec_runtime_failure_is_static_and_cause_free(self, encoding: str) -> None:
         from elspeth.plugins.sinks.aws_s3_sink import (
             CSVWriteOptions,
-            S3RecordSerializationError,
+            S3HeaderSerializationError,
             _serialize_rows_to_spool,
         )
 
+        # The codec first fails on the header record, which is a configuration
+        # defect (sweep finding #28), not a row failure.
         options = CSVWriteOptions.model_construct(delimiter=",", encoding=encoding, include_header=True)
-        with pytest.raises(S3RecordSerializationError) as captured:
+        with pytest.raises(S3HeaderSerializationError) as captured:
             _serialize_rows_to_spool(
                 [{"id": 1}],
                 format="csv",

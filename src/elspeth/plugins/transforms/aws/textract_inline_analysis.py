@@ -260,7 +260,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_inline_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:229d85c78907213d"
+    source_file_hash: str | None = "sha256:19fad219cdcf149e"
     config_model = AWSTextractInlineAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -370,6 +370,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         self._row_clients: dict[str, TextractInlineClient] = {}
         self._row_clients_lock = threading.Lock()
         self._shutdown = threading.Event()
+        self._run_shutdown: threading.Event | None = None
         self._batch_initialized = False
 
     def created_output_fields(self) -> tuple[FieldDefinition, ...]:
@@ -389,8 +390,11 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         self._telemetry_emit = ctx.telemetry_emit
         self._limiter = ctx.rate_limit_registry.get_limiter(self.name) if ctx.rate_limit_registry is not None else None
         self._payload_store = ctx.payload_store
-        if ctx.shutdown_event is not None:
-            self._shutdown = ctx.shutdown_event
+        # A fresh private event per start: close() sets it, so a restarted
+        # instance must not inherit the previous run's stop. The engine's
+        # event is only ever read.
+        self._shutdown = threading.Event()
+        self._run_shutdown = ctx.shutdown_event
         if self._sdk_client is None and ctx.run_mode is RunMode.REPLAY:
             self._sdk_client = ReplayOnlySDK()
         elif self._sdk_client is None and ctx.run_mode is RunMode.VERIFY:
@@ -508,26 +512,29 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         store = self._payload_store
         if store is None:
             raise FrameworkBugError("Amazon Textract inline transform requires a payload store")
+        # A bounded read stops after max_document_bytes + 1 bytes, so an
+        # oversized blob is rejected without any worker holding its whole
+        # body; the exact size is therefore unknown and reported as ">max".
         try:
-            content = store.retrieve(payload_ref)
+            content = store.retrieve_bounded(payload_ref, max_bytes=self._max_document_bytes)
         except PayloadNotFoundError:
             return TransformResult.error(
                 {"reason": "blob_not_found", "field": field_name, "blob_ref": payload_ref},
                 retryable=False,
             )
-        if not content:
-            return TransformResult.error(
-                {"reason": "invalid_input", "field": field_name, "error_type": "empty_document"},
-                retryable=False,
-            )
-        if len(content) > self._max_document_bytes:
+        if content is None:
             return TransformResult.error(
                 {
                     "reason": "blob_too_large",
                     "field": field_name,
                     "max_blob_bytes": self._max_document_bytes,
-                    "actual": str(len(content)),
+                    "actual": f">{self._max_document_bytes}",
                 },
+                retryable=False,
+            )
+        if not content:
+            return TransformResult.error(
+                {"reason": "invalid_input", "field": field_name, "error_type": "empty_document"},
                 retryable=False,
             )
         if not binary_document_signature_matches(self._document_format, content):
@@ -542,12 +549,22 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
             )
         return payload_ref, content
 
+    def _shutdown_requested(self) -> bool:
+        """Whether close() (private event) or the engine (run event) asked work to stop.
+
+        The engine's ``ctx.shutdown_event`` is read-only to this plugin:
+        close() stops this plugin's workers through the private
+        ``_shutdown`` event and never raises the run-wide cancellation signal.
+        """
+        run_shutdown = self._run_shutdown
+        return self._shutdown.is_set() or (run_shutdown is not None and run_shutdown.is_set())
+
     def _process_single_with_state(
         self, row: PipelineRow, state_id: str, *, ctx: TransformContext, token_id: str | None
     ) -> TransformResult:
         if not self._run_id or not self._node_id or token_id is None:
             raise FrameworkBugError("Amazon Textract inline processing requires run, node, and token identity")
-        if self._shutdown.is_set():
+        if self._shutdown_requested():
             return TransformResult.error({"reason": "shutdown_requested"}, retryable=False)
         document = self._read_document_bytes(row)
         if isinstance(document, TransformResult):
@@ -726,6 +743,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         prior_payload_store = self._payload_store
         prior_clients = self._row_clients
         prior_shutdown = self._shutdown
+        prior_run_shutdown = self._run_shutdown
         try:
             self._recorder = ctx.landscape
             self._run_id = ctx.run_id
@@ -736,6 +754,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
             self._payload_store = _ProbePayloadStore()
             self._row_clients = {}
             self._shutdown = threading.Event()
+            self._run_shutdown = None
             state_id = ctx.state_id or "textract-inline-invariant-probe-state"
             token_id = ctx.token.token_id if ctx.token is not None else "textract-inline-invariant-probe-token"
             return self._process_single_with_state(probe_rows[0], state_id, token_id=token_id, ctx=ctx)
@@ -749,6 +768,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
             self._payload_store = prior_payload_store
             self._row_clients = prior_clients
             self._shutdown = prior_shutdown
+            self._run_shutdown = prior_run_shutdown
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:

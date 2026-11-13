@@ -352,9 +352,10 @@ class BedrockLLMProvider:
             call_mode_session=self._call_mode_session,
         )
         redacted_error: LLMClientError | None = None
+        response = None
         try:
             try:
-                client.chat_completion(
+                response = client.chat_completion(
                     model=model,
                     messages=smoke_messages,
                     temperature=temperature,
@@ -366,6 +367,16 @@ class BedrockLLMProvider:
             client.close()
         if redacted_error is not None:
             raise redacted_error from None
+        if response is None:
+            raise RuntimeError("Bedrock preflight response absent without a typed client error")
+        # A completed call is not readiness: execute_query rejects empty
+        # content and tool_calls for every row, so a smoke reply that would
+        # fail there must fail here too (same checks as the Azure preflight).
+        if not response.content.strip():
+            raise ContentPolicyError("Bedrock preflight returned empty content")
+        finish_reason = finish_reason_from_raw_response(response.raw_response)
+        if finish_reason not in (None, FinishReason.STOP):
+            raise LLMClientError("Bedrock preflight returned an unusable finish reason", retryable=False)
 
     def _get_underlying_client(self) -> _LiteLLMSDKAdapter:
         with self._underlying_client_lock:
