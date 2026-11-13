@@ -245,8 +245,9 @@ class QueryDefinition(BaseModel):
             raise ValueError(
                 "queries.*.template cannot carry {{interpretation:...}} tokens: "
                 "interpretation review resolution rewrites only the node-level "
-                "prompt_template/prompt_template_parts. Put reviewed slots in the "
-                "node-level template and reference plain row variables here."
+                "prompt_template/prompt_template_parts. A node-level reviewed slot is rejected at staging "
+                "if any query has its own template. Place the reviewed term on a node where all queries "
+                "use the node-level template, and reference plain row variables here."
             )
         try:
             PromptTemplate(v)

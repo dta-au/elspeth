@@ -59,6 +59,17 @@ def _empty_state() -> CompositionState:
     return CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
 
 
+def test_reviewed_slots_teaching_requires_all_queries_to_render_node_template() -> None:
+    view, _snapshot = _trained_view()
+    rendered = "\n".join(build_planner_authoring_aids(view)["llm_output_contract"]["rules"])
+    assert "Reviewed slots belong in the node-level template." not in rendered
+    assert "all queries use the node-level template" in rendered
+    assert "rejected at staging" in rendered
+    assert "NEVER put {{interpretation:...}} tokens inside a queries.*.template" in rendered
+    assert "{{ row.<variable> }}" in rendered
+    assert "{{ lookup.<key> }}" in rendered
+
+
 def _trained_view() -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
     catalog = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
