@@ -117,11 +117,11 @@ parallelism per lane (for example `-n 4`); CPUs do not multiply across lanes.
 | 2a | CDA-07 | Shares `composition_completion.py`, `turn_effects.py` and `planning_application.py` with 2b and 2c |
 | 2b | CDA-08 | After CDA-07 (`turn_effects.py`, `no_tool_policy.py`) |
 | 2c | CDA-09 | After CDA-08 (`composition_completion.py` gate clearing) |
-| 3a | CDA-10, CDA-11 | `pipeline_planner.py` and the tool handlers respectively; CDA-11 waits for CDA-02 (`tools/generation.py`) |
+| 3a | CDA-11, then CDA-10 | CDA-11 waits for CDA-02 (`tools/generation.py`). CDA-10 and CDA-11 both change `tools/generation.py` (hunks about 150 lines apart): run them in parallel but merge CDA-11 first and rebase CDA-10 |
 | 3b | CDA-12 | After CDA-10 and CDA-07 (`pipeline_planner.py` message builder, advisor system text, skills) |
 | 4 | CDA-14, CDA-15, CDA-16, CDA-17 | Polish and performance; CDA-17 after CDA-12 |
-| 3c | CDA-13 | After CDA-12 (planner custody and schema) |
-| 2a′ (also) | CDA-19 | After CDA-06 (`credential_material.py`); parallel with CDA-18 |
+| 3c | CDA-13 | After CDA-12 (planner custody and schema); before CDA-17, because both change `test_pipeline_planner.py` (CDA-13 re-baselines the byte budget) |
+| 2a″ | CDA-19 | After CDA-18: both change `tests/unit/web/test_credential_guard.py` |
 | 4 (also) | CDA-21 | Coordination and worker only; after wave 3 |
 | 4b | CDA-20 | After CDA-17 (`pipeline_planner.py` call path) |
 | 4 (also) | CDA-22 | After CDA-12 (`composer/service.py`); parallel with CDA-21 |
@@ -143,7 +143,15 @@ land before the code freeze (remediation plan, WP1a).
   - Run every whole-tree gate whose scanned inputs you change.
 - **Composer invariants.**
   - No server-authored pipeline structure.
-  - No tutorial-only composer (backend) path; CDA-01 is frontend-only.
+  - No tutorial-only composer (backend) path. CDA-01 adds no new backend
+    path; its one backend edit is rejection copy in the existing admission
+    check (`tutorial_service.py:169, :195`).
+- **Standing review trigger (AGENTS.md, 2026-09-02).** A latency or cost
+  change on the rootless or tutorial entry path gets per-**transition**
+  provider-call scrutiny before it lands. This applies to CDA-12, CDA-16
+  (cache marker), CDA-17 and CDA-20: `report.md` lists each planner
+  transition the lane touched and shows that every proposal still comes from
+  a provider call.
 - **Test first.** Write the failing test in the named test file first. It
   must fail at an assertion on the base commit, not by crashing. Assert that
   new symbols exist (`importlib.util.find_spec`, `hasattr` in the test only)
@@ -160,7 +168,8 @@ land before the code freeze (remediation plan, WP1a).
 - **Worktree test trap (S3).** In a worktree, pytest's configured
   `pythonpath` (`pyproject.toml`) silently overrides an exported
   `PYTHONPATH`. When proving a test red on base, pass
-  `-o pythonpath=<root>/src` and check `elspeth.__file__`.
+  `-o pythonpath=<root>/src:<root>/elspeth-lints/src` and check both
+  `elspeth.__file__` and `elspeth_lints.__file__`.
 - **Spike artifacts.** Design notes are in
   `docs/development/composer-desk-audit-2026-11-12/spikes/`. Instruments and
   prototype patches are in `evals/composer-live-audit/spikes/` (see its
@@ -253,7 +262,9 @@ pytest only.
     Follow `line_explode.py:422` and the `TextFraming` doctrine in
     `contracts/plugin_semantics.py:84-110`; do not use `UNCONSTRAINED` as a
     shortcut.
-  - `src/elspeth/plugins/sinks/document_sink.py` (~L131, ~L453-455): fix the
+  - `src/elspeth/plugins/sinks/document_sink.py` (the `mode: fixed` example
+    at ~L142 and ~L158; related assistance and error text at ~L131 and
+    ~L455): fix the
     example's `schema.mode: fixed`, which errors after `report_assemble`.
   - `docs/reference/environment-variables.md` (~L587-592): list the 14
     always-authorized plugins from `plugin_policy/compiler.py:17-40`.
@@ -285,7 +296,10 @@ pytest only.
 - **Also report (read-only).** A query listing stored sessions whose
   committed states carry this wiring, so the maintainer can judge whether any
   records were affected. Do not modify data.
-- **Out of scope.** `planner_authoring_aids.py` teaching, which is CDA-12.
+- **Also replace** the teaching at `planner_authoring_aids.py:867-873`
+  ("reviewed slots belong in the node-level template") in this lane.
+  Otherwise, between wave 1 and wave 3b, the planner is taught exactly the
+  wiring this lane starts rejecting. CDA-12 then only rewrites around it.
 
 ### CDA-05: Boot probe sends the real escape-hatch request (R17, F19)
 
@@ -316,7 +330,7 @@ pytest only.
     copy.
   - A user-message rejection keeps today's copy.
 - **Test command.** `pytest tests/unit/web/test_credential_guard.py -n 0 -q`.
-- **Out of scope.** R6(a), which is blocked on decision D1.
+- **Out of scope.** R6(a), which is CDA-18 (D1 approved).
 
 ### CDA-07: Advisor gets the capability facts; repair and withhold flow (R2, R9, R15 rubric, R3 item 3; F2, F9, F17)
 
@@ -446,11 +460,14 @@ pytest only.
   - `src/elspeth/web/composer/tools/_dispatch.py` / `tools/_common.py`: a
     discovery-tool failure leads with the tool's own error and omits
     whole-pipeline validation.
-  - Tool descriptions (`tools/declarations.py` or the generation
-    declarations):
-    - `get_plugin_assistance` states its `plugin_name` argument explicitly
-      (no alias);
-    - `patch_output_options` says where `description` belongs.
+  - Tool descriptions:
+    - `get_plugin_assistance` (`tools/generation.py:2382-2392`) states its
+      `plugin_name` argument explicitly (no alias);
+    - `patch_output_options` (`tools/outputs.py:370-375`) says where
+      `description` belongs.
+    - `tools/declarations.py` holds no descriptions; do not edit it.
+    - `tools/generation.py` is also CDA-11's file in wave 3a. The hunks are
+      about 150 lines apart; merge CDA-11 first and rebase CDA-10.
 - **Test files.**
   - `tests/unit/web/composer/test_pipeline_planner.py`: update the 6 tests
     pinning the notice string, then add:
@@ -501,7 +518,8 @@ pytest only.
       filing a defect.
   - `src/elspeth/web/composer/planner_authoring_aids.py`:
     - R8: name only available plugins, in the digest, the aids and the hints;
-    - R13: **replace** L867-870 teaching.
+    - R13: the L867-873 teaching is replaced by CDA-04 in wave 1; keep it
+      consistent when rewriting around it.
   - `src/elspeth/web/composer/pipeline_planner.py`: the message builder
     (~L3494-3514) uses the planner overlay.
   - `advisor_checkpoint.py` (~L453-454): the advisor still reviews planner
@@ -601,8 +619,14 @@ pytest only.
     `get_pipeline_state` response check refused named-source `blob_id`
     values. The S3 live run crashed with HTTP 500 on the first follow-up turn
     until this was fixed (regression test in the prototype).
+  - `src/elspeth/web/composer/redaction.py`: `blob_id` moves onto
+    `_SetPipelineNamedSourceModel` (`extra="forbid"`), so the redacted
+    argument shape admits it (S3 §4.2).
+  - `tools/sources.py` is **not** changed: `_resolve_source_blob`
+    (`sources.py:797`) is reused as is.
   - Start from S3's prototype (`evals/composer-live-audit/spikes/S3-multifile-custody/prototype.patch`;
-    144 source lines across 5 files).
+    about 145 changed lines across 5 `.py` files plus 11 in
+    `pipeline_capabilities.md`; it applies cleanly at `58e31760`).
 - **Conditions.**
   - Keep `inline_blob` out of named sources (schema-rejected).
   - Reject `blob_id` together with `options.path`/`options.file` as
@@ -618,7 +642,9 @@ pytest only.
   per-source `value_transform` literal (`quarter`) into one sink, plus the
   queue → passthrough variant. Do **not** use `row_union`: it is a barrier
   over fork branches, not a fan-in of independent sources. Use
-  `s10_seq12_pipeline.json` (the model's own attempt) as a fixture.
+  `s10_seq12_pipeline.json` (the model's own attempt) as a fixture. Also add
+  named-source cases to `tests/unit/web/sessions/test_proposal_blob_refs.py`
+  (S3 §4.3).
 - **Pinned tests that change.** Two cases in `test_set_pipeline_candidate.py`
   now round-trip. The planner fixed-scaffolding byte budget in
   `test_pipeline_planner.py` is exceeded by 911 bytes; re-baseline it.
@@ -682,11 +708,23 @@ the marker is a trivial fix candidate; measure it.
     text. Keep or drop them by provider contract. On GPT-5.6 Luna an `sk-`
     run inside one such blob failed r01 T3 ("Run it.") with 422 (1 of 37
     blobs).
-- **Files.**
-  - `src/elspeth/web/composer/llm_response_parsing.py`
-    (`build_llm_call_record`, ~L740-770): the scan point.
-  - `src/elspeth/web/credential_guard.py` (~L91-126): the
-    reasoning-specific helper.
+- **Files.** The decision lives in one place; every caller applies it.
+  - `src/elspeth/web/credential_guard.py:91`
+    (`require_no_credential_material_in_llm_metadata`): split reasoning-only
+    hits from the rest and return a scrub outcome instead of raising for
+    them. It has three direct callers, and all three must apply the outcome:
+    - `src/elspeth/web/composer/provider_gateway.py:272`, reached from
+      `_require_no_credential_material_in_completion_fields` (L83, L157,
+      L188, L654, L703, L724, L734, L817, L1013). This is the path the pinned
+      `test_credential_guard.py:521` and S4's Luna failure took (surface
+      `composer_provider_response`), so a fix confined to the call record
+      would not stop the turn failing;
+    - `src/elspeth/web/composer/tool_batch.py:1015`;
+    - `src/elspeth/web/composer/llm_response_parsing.py:754`
+      (`build_llm_call_record`), which the advisor path reaches
+      (`advisor_checkpoint.py:579`).
+  - Do not edit `advisor_checkpoint.py`: CDA-07 owns it in the parallel
+    wave. If the advisor path needs a change there, stop and report.
 - **Test files.** `tests/unit/web/composer/test_reasoning_credential_scrub.py`
   (new). Using the s06 shape (`"password": "Client emailed the admin pass…"`
   in reasoning only):
@@ -781,7 +819,11 @@ the marker is a trivial fix candidate; measure it.
 
 - **Files.** `src/elspeth/web/composer/pipeline_planner.py`:
   - hand off before the operation deadline, keeping a reserve (the planner
-    and operation deadlines are equal today);
+    and operation deadlines are equal today). **Hand-off target:** a final
+    provider call restricted to the existing `handoff_to_user` terminal, so
+    the model writes the user-facing explanation. If the reserve cannot fit
+    that call, end with the existing deadline error. Never author a
+    proposal or reply text server-side (composer invariant 1);
   - add a rule for `finish_reason=length` in the hatch.
 - **Test files.** `tests/unit/web/composer/test_pipeline_planner.py`: a fake
   clock past the reserve yields a hand-off, not a deadline error.
@@ -805,8 +847,9 @@ the marker is a trivial fix candidate; measure it.
   - if that call still returns tool calls, raise
     `ComposerConvergenceError.capture(budget_exhausted="discovery", …)`,
     which already maps to `convergence_discovery_budget`
-    (`composer/protocol.py:546-553`, `sessions/routes/_helpers.py:3115`) and
-    to the frontend's `ComposerProgressReason`;
+    (`composer/protocol.py:545-553`) and to the frontend's
+    `ComposerProgressReason`. (`sessions/routes/_helpers.py:3115` is the
+    planner's `DISCOVERY_EXHAUSTED` mapping, not this one);
   - read the limit in `__init__` beside `_max_composition_turns` (~L664);
   - replace the comment at ~L2173 ("Discovery counts are diagnostic…",
     from `854297e0`), which records the old choice.
@@ -814,9 +857,7 @@ the marker is a trivial fix candidate; measure it.
     `test_discovery_result_does_not_inject_removed_budget_pressure`
     (`test_pipeline_planner.py:6732`) pins that for the planner, and the same
     rule holds here. The cap is enforced, not narrated.
-  - Advisor-only turns stay uncharged (`test_advisor_tool.py:614`). A failed
-    discovery call keeps its current charging
-    (`test_service.py:3586`).
+  - Advisor-only turns stay uncharged (`test_advisor_tool.py:614`).
 - **Files.** `src/elspeth/web/composer/service.py`. Nothing in the planner.
 - **Test files.** `tests/unit/web/composer/test_service.py`:
   - a scripted loop with `composer_max_discovery_turns=2` and a model that
@@ -829,7 +870,19 @@ the marker is a trivial fix candidate; measure it.
     today;
   - the existing `test_turn_budget_convergence_detail_names_the_tool_call_loop`
     (~L7989) covers the discovery wording on the loop surface.
-- **Test command.** `pytest tests/unit/web/composer/test_service.py tests/unit/web/composer/test_progress.py tests/unit/web/composer/test_advisor_tool.py -n 4 -q`.
+- **Pinned tests that change** (they assert the old "no aggregate cap"
+  design; update each to the new behaviour and say so in `report.md`):
+  - `test_service.py:3586` `test_failed_discovery_does_not_charge_composition_budget`
+    (`composer_max_discovery_turns=1`, two discovery rounds then mutations,
+    expects `composition`). Keep its point (failed discovery does not charge
+    composition) with a discovery limit high enough not to fire;
+  - `test_service.py:3367` `test_discovery_continues_beyond_configured_hint`
+    (docstring "Discovery has no aggregate cap"): invert it;
+  - `test_service.py:5442` `test_discovery_continues_until_timeout_emits_failure_event`;
+  - `tests/unit/web/composer/test_discovery_terminal_preview.py:97`
+    `test_preview_keeps_authoring_available_until_the_real_deadline`
+    (`composer_max_discovery_turns=1`, at least the `tools` case).
+- **Test command.** `pytest tests/unit/web/composer/test_service.py tests/unit/web/composer/test_discovery_terminal_preview.py tests/unit/web/composer/test_progress.py tests/unit/web/composer/test_advisor_tool.py -n 4 -q`.
 - **Acceptance.** The battery never exceeded 9 provider calls per tool-loop
   turn, so with the shipped profiles' value of 10 no battery scenario
   should change. Re-run s01, s04 and r01 once and confirm no new terminal.

@@ -13,7 +13,7 @@
    "tests/unit/web/composer/test_tutorial_service.py"
   ],
   "test_command": "pytest tests/unit/web/composer/test_tutorial_service.py -n 0 -q",
-  "description": "Wave 1. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-01). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src when proving red on base. Report to report.md, return one line."
+  "description": "Wave 1. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-01). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src:<root>/elspeth-lints/src when proving red on base. Report to report.md, return one line."
  },
  {
   "ticket": "CDA-02",
@@ -26,7 +26,7 @@
    "tests/unit/web/composer/test_diff_pipeline_baseline.py"
   ],
   "test_command": "pytest tests/unit/web/composer/test_diff_pipeline_baseline.py -n 0 -q",
-  "description": "Wave 1. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-02). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src when proving red on base. Report to report.md, return one line."
+  "description": "Wave 1. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-02). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src:<root>/elspeth-lints/src when proving red on base. Report to report.md, return one line."
  },
  {
   "ticket": "CDA-03",
@@ -40,20 +40,21 @@
    "tests/unit/plugins/transforms/test_report_assemble.py"
   ],
   "test_command": "pytest tests/unit/plugins/transforms/test_report_assemble.py -n 0 -q",
-  "description": "Wave 1. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-03). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src when proving red on base. Report to report.md, return one line."
+  "description": "Wave 1. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-03). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src:<root>/elspeth-lints/src when proving red on base. Report to report.md, return one line."
  },
  {
   "ticket": "CDA-04",
   "title": "Reject node-level vague_term slots a multi-query node never renders (R13, F14)",
   "files": [
    "src/elspeth/web/interpretation_state.py",
-   "src/elspeth/plugins/transforms/llm/multi_query.py"
+   "src/elspeth/plugins/transforms/llm/multi_query.py",
+   "src/elspeth/web/composer/planner_authoring_aids.py"
   ],
   "test_files": [
    "tests/unit/web/composer/test_state_multi_query_contract.py"
   ],
   "test_command": "pytest tests/unit/web/composer/test_state_multi_query_contract.py -n 0 -q",
-  "description": "Wave 1. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-04). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src when proving red on base. Report to report.md, return one line."
+  "description": "Wave 1. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-04). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src:<root>/elspeth-lints/src when proving red on base. Report to report.md, return one line."
  },
  {
   "ticket": "CDA-05",
@@ -66,7 +67,7 @@
    "tests/integration/web/composer/test_boot_probe_production_parity.py"
   ],
   "test_command": "pytest tests/unit/web/composer/test_boot_probe.py tests/integration/web/composer/test_boot_probe_production_parity.py -n 0 -q",
-  "description": "Wave 1. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-05). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src when proving red on base. Report to report.md, return one line."
+  "description": "Wave 1. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-05). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src:<root>/elspeth-lints/src when proving red on base. Report to report.md, return one line."
  },
  {
   "ticket": "CDA-06",
@@ -78,7 +79,7 @@
    "tests/unit/web/test_credential_guard.py"
   ],
   "test_command": "pytest tests/unit/web/test_credential_guard.py -n 0 -q",
-  "description": "Wave 1. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-06). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src when proving red on base. Report to report.md, return one line."
+  "description": "Wave 1. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-06). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src:<root>/elspeth-lints/src when proving red on base. Report to report.md, return one line."
  },
  {
   "ticket": "CDA-07",
@@ -86,15 +87,14 @@
   "files": [
    "src/elspeth/web/composer/turn_effects.py",
    "src/elspeth/web/composer/composition_completion.py",
-   "src/elspeth/web/composer/planning_application.py",
-   "src/elspeth/web/composer/advisor_checkpoint.py",
-   "src/elspeth/web/composer/advisor_context.py"
+   "src/elspeth/web/composer/advisor_context.py",
+   "src/elspeth/web/composer/pipeline_planner.py"
   ],
   "test_files": [
    "tests/unit/web/composer/test_advisor_capability_evidence.py"
   ],
   "test_command": "pytest tests/unit/web/composer/test_advisor_capability_evidence.py tests/unit/web/composer/test_turn_effects.py tests/unit/web/composer/test_advisor_checkpoint.py -n 4 -q",
-  "description": "Wave 2a. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-07). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src when proving red on base. Report to report.md, return one line."
+  "description": "Wave 2a. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-07). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src:<root>/elspeth-lints/src when proving red on base. Report to report.md, return one line."
  },
  {
   "ticket": "CDA-08",
@@ -108,7 +108,7 @@
    "tests/unit/web/composer/test_checkpoint_receipts.py"
   ],
   "test_command": "pytest tests/unit/web/composer/test_checkpoint_receipts.py tests/unit/web/composer/test_no_tool_policy_segments.py -n 0 -q",
-  "description": "Wave 2b. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-08). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src when proving red on base. Report to report.md, return one line."
+  "description": "Wave 2b. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-08). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src:<root>/elspeth-lints/src when proving red on base. Report to report.md, return one line."
  },
  {
   "ticket": "CDA-09",
@@ -122,7 +122,7 @@
    "tests/unit/web/composer/test_preflight_recompute_wired_state.py"
   ],
   "test_command": "pytest tests/unit/web/composer/test_preflight_recompute_wired_state.py tests/unit/web/composer/test_runtime_preflight_pending_review_verification.py -n 0 -q",
-  "description": "Wave 2c. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-09). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src when proving red on base. Report to report.md, return one line."
+  "description": "Wave 2c. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-09). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src:<root>/elspeth-lints/src when proving red on base. Report to report.md, return one line."
  },
  {
   "ticket": "CDA-10",
@@ -130,13 +130,14 @@
   "files": [
    "src/elspeth/web/composer/pipeline_planner.py",
    "src/elspeth/web/composer/tools/_dispatch.py",
-   "src/elspeth/web/composer/tools/declarations.py"
+   "src/elspeth/web/composer/tools/generation.py",
+   "src/elspeth/web/composer/tools/outputs.py"
   ],
   "test_files": [
    "tests/unit/web/composer/test_pipeline_planner.py"
   ],
   "test_command": "pytest tests/unit/web/composer/test_pipeline_planner.py tests/unit/web/composer/test_agent_tooling.py -n 4 -q",
-  "description": "Wave 3a. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-10). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src when proving red on base. Report to report.md, return one line."
+  "description": "Wave 3a. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-10). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src:<root>/elspeth-lints/src when proving red on base. Report to report.md, return one line."
  },
  {
   "ticket": "CDA-11",
@@ -148,7 +149,7 @@
    "tests/unit/web/composer/test_list_models_profiles.py"
   ],
   "test_command": "pytest tests/unit/web/composer/test_list_models_profiles.py -n 0 -q",
-  "description": "Wave 3a. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-11). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src when proving red on base. Report to report.md, return one line."
+  "description": "Wave 3a. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-11). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src:<root>/elspeth-lints/src when proving red on base. Report to report.md, return one line."
  },
  {
   "ticket": "CDA-12",
@@ -165,7 +166,7 @@
    "tests/unit/web/composer/test_surface_teaching_parity.py"
   ],
   "test_command": "pytest tests/unit/web/composer/test_surface_teaching_parity.py tests/unit/web/composer/test_planner_authoring_aids.py tests/unit/web/composer/test_skills_loader.py tests/unit/web/composer/test_capability_skill_identity.py -n 4 -q",
-  "description": "Wave 3b. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-12). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src when proving red on base. Report to report.md, return one line."
+  "description": "Wave 3b. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-12). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src:<root>/elspeth-lints/src when proving red on base. Report to report.md, return one line."
  },
  {
   "ticket": "CDA-15",
@@ -177,7 +178,7 @@
    "tests/unit/evals/composer_battery/test_corpus.py"
   ],
   "test_command": "pytest tests/unit/evals/composer_battery -n 0 -q",
-  "description": "Wave 4. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-15). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src when proving red on base. Report to report.md, return one line."
+  "description": "Wave 4. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-15). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src:<root>/elspeth-lints/src when proving red on base. Report to report.md, return one line."
  },
  {
   "ticket": "CDA-17",
@@ -189,36 +190,39 @@
    "tests/unit/web/composer/test_pipeline_planner.py"
   ],
   "test_command": "pytest tests/unit/web/composer/test_pipeline_planner.py -n 4 -q",
-  "description": "Wave 4. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-17). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src when proving red on base. Report to report.md, return one line."
+  "description": "Wave 4. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-17). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src:<root>/elspeth-lints/src when proving red on base. Report to report.md, return one line."
  },
  {
   "ticket": "CDA-13",
   "title": "Multi-file sources on the planner (R4a, F1; D2 approved, no compatibility)",
   "files": [
    "src/elspeth/web/composer/tools/sessions.py",
-   "src/elspeth/web/composer/tools/sources.py",
    "src/elspeth/web/sessions/proposal_blob_refs.py",
    "src/elspeth/web/composer/tools/_common.py",
-   "src/elspeth/web/composer/tools/state_responses.py"
+   "src/elspeth/web/composer/tools/state_responses.py",
+   "src/elspeth/web/composer/redaction.py"
   ],
   "test_files": [
-   "tests/unit/web/composer/test_named_sources_blob_binding.py"
+   "tests/unit/web/composer/test_named_sources_blob_binding.py",
+   "tests/unit/web/sessions/test_proposal_blob_refs.py"
   ],
   "test_command": "pytest tests/unit/web/composer/test_named_sources_blob_binding.py -n 0 -q",
-  "description": "Wave 3c. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-13). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src when proving red on base. Report to report.md, return one line."
+  "description": "Wave 3c. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-13). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src:<root>/elspeth-lints/src when proving red on base. Report to report.md, return one line."
  },
  {
   "ticket": "CDA-18",
   "title": "Drop credential-shaped reasoning instead of failing the turn (R6a, F4; D1 approved)",
   "files": [
-   "src/elspeth/web/composer/llm_response_parsing.py",
-   "src/elspeth/web/credential_guard.py"
+   "src/elspeth/web/credential_guard.py",
+   "src/elspeth/web/composer/provider_gateway.py",
+   "src/elspeth/web/composer/tool_batch.py",
+   "src/elspeth/web/composer/llm_response_parsing.py"
   ],
   "test_files": [
    "tests/unit/web/composer/test_reasoning_credential_scrub.py"
   ],
   "test_command": "pytest tests/unit/web/composer/test_reasoning_credential_scrub.py tests/unit/web/test_credential_guard.py -n 0 -q",
-  "description": "Wave 2a'. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-18). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src when proving red on base. Report to report.md, return one line."
+  "description": "Wave 2a'. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-18). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src:<root>/elspeth-lints/src when proving red on base. Report to report.md, return one line."
  },
  {
   "ticket": "CDA-19",
@@ -230,7 +234,7 @@
    "tests/unit/web/test_credential_label_prose.py"
   ],
   "test_command": "pytest tests/unit/web/test_credential_label_prose.py tests/unit/contracts/test_credential_material.py -n 0 -q",
-  "description": "Wave 2a'. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-19). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src when proving red on base. Report to report.md, return one line."
+  "description": "Wave 2a'. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-19). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src:<root>/elspeth-lints/src when proving red on base. Report to report.md, return one line."
  },
  {
   "ticket": "CDA-20",
@@ -243,7 +247,7 @@
    "tests/unit/web/composer/test_provider_rate_limit_retry.py"
   ],
   "test_command": "pytest tests/unit/web/composer/test_provider_rate_limit_retry.py tests/unit/web/composer/test_provider_errors.py -n 0 -q",
-  "description": "Wave 4b. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-20). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src when proving red on base. Report to report.md, return one line."
+  "description": "Wave 4b. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-20). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src:<root>/elspeth-lints/src when proving red on base. Report to report.md, return one line."
  },
  {
   "ticket": "CDA-21",
@@ -256,7 +260,7 @@
    "tests/unit/web/coordination/test_composer_operation_authority.py"
   ],
   "test_command": "pytest tests/unit/web/coordination/test_composer_operation_authority.py -n 0 -q",
-  "description": "Wave 4. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-21). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src when proving red on base. Report to report.md, return one line."
+  "description": "Wave 4. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-21). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src:<root>/elspeth-lints/src when proving red on base. Report to report.md, return one line."
  },
  {
   "ticket": "CDA-22",
@@ -265,9 +269,10 @@
    "src/elspeth/web/composer/service.py"
   ],
   "test_files": [
-   "tests/unit/web/composer/test_service.py"
+   "tests/unit/web/composer/test_service.py",
+   "tests/unit/web/composer/test_discovery_terminal_preview.py"
   ],
-  "test_command": "pytest tests/unit/web/composer/test_service.py tests/unit/web/composer/test_progress.py tests/unit/web/composer/test_advisor_tool.py -n 4 -q",
-  "description": "Wave 4, after CDA-12. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-22). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src when proving red on base. Report to report.md, return one line."
+  "test_command": "pytest tests/unit/web/composer/test_service.py tests/unit/web/composer/test_discovery_terminal_preview.py tests/unit/web/composer/test_progress.py tests/unit/web/composer/test_advisor_tool.py -n 4 -q",
+  "description": "Wave 4, after CDA-12. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-22). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src:<root>/elspeth-lints/src when proving red on base. Report to report.md, return one line."
  }
 ]

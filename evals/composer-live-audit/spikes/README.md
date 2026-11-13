@@ -16,5 +16,5 @@ notes are in `docs/development/composer-desk-audit-2026-11-12/spikes/`.
 
 Re-measuring a red-on-base test from a worktree: pytest's configured
 `pythonpath` (`pyproject.toml`) silently overrides an exported `PYTHONPATH`.
-Pass `-o pythonpath=<root>/src` (as `scripts/full-suite-gate.sh` does), and
-check `elspeth.__file__`.
+Pass `-o pythonpath=<root>/src:<root>/elspeth-lints/src`, and check
+`elspeth.__file__` and `elspeth_lints.__file__`.
