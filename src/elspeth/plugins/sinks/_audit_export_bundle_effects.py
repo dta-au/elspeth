@@ -1402,25 +1402,22 @@ def preflight_audit_export_bundle(target_path: Path) -> AuditExportBundlePreflig
         for path in paths:
             try:
                 pinned = _open_pinned_bundle_parent(path)
+                try:
+                    # False also means "already absent" (e.g. ``source`` after
+                    # the rename), so only a probe still present after the
+                    # removal attempt is a cleanup failure.
+                    if not _remove_scratch_path_at(pinned.descriptor, path.name):
+                        remaining = _target_kind_at(pinned.descriptor, path.name)
+                        if remaining != "absent":
+                            probe_cleanup_failures.append(f"{path.name}: {remaining} could not be removed")
+                finally:
+                    pinned.close()
             except OSError as cleanup_exc:
                 # Recorded, then surfaced as the function's own failure below.
                 # When a probe failure is already propagating out of the try it
                 # stays primary; a preflight that cannot even pin the parent it
-                # just probed has failed either way.
+                # just probed, or measure what it left, has failed either way.
                 probe_cleanup_failures.append(f"{path.name}: {type(cleanup_exc).__name__}: {cleanup_exc}")
-                continue
-            try:
-                # False also means "already absent" (e.g. ``source`` after the
-                # rename), so only a probe that is still present after the
-                # removal attempt is a cleanup failure.
-                if not _remove_scratch_path_at(pinned.descriptor, path.name):
-                    remaining = _target_kind_at(pinned.descriptor, path.name)
-                    if remaining != "absent":
-                        probe_cleanup_failures.append(f"{path.name}: {remaining} could not be removed")
-            except OSError as cleanup_exc:
-                probe_cleanup_failures.append(f"{path.name}: {type(cleanup_exc).__name__}: {cleanup_exc}")
-            finally:
-                pinned.close()
     if probe_cleanup_failures:
         raise AuditExportBundlePreflightError(
             "bundle preflight probes succeeded but probe cleanup failed: " + "; ".join(probe_cleanup_failures)
