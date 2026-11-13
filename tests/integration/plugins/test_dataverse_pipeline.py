@@ -55,6 +55,7 @@ class FakeLifecycleContext:
         self.landscape = None
         self.payload_store = None
         self.concurrency_config = None
+        self.shutdown_event = None
 
 
 class FakeSourceContext:

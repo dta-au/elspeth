@@ -10,6 +10,7 @@ This is the ONLY place in the pipeline where coercion is allowed.
 from __future__ import annotations
 
 import re
+import threading
 import urllib.parse
 import xml.etree.ElementTree as ET
 from collections.abc import Iterator, Mapping
@@ -301,7 +302,7 @@ class DataverseSource(BaseSource):
     _normalizes_external_names = True
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:c84e1f8a147d4255"
+    source_file_hash: str | None = "sha256:d95b4c4ee2aedc4c"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 
@@ -378,6 +379,10 @@ class DataverseSource(BaseSource):
         self._client: DataverseClient | None = None
         self._source_limiter: LimiterProtocol | None = None
         self._pending_verify_source_call_id: str | None = None
+        # Run shutdown signal (ends a throttle wait early) and the load
+        # context throttled calls are recorded against while load() runs.
+        self._shutdown_event: threading.Event | None = None
+        self._throttle_ctx: SourceContext | None = None
         self._pages_fetched = 0
         self._rows_yielded = 0
         self._quarantine_count = 0
@@ -396,6 +401,7 @@ class DataverseSource(BaseSource):
         # Obtain rate limiter (with null guard per spec)
         limiter = ctx.rate_limit_registry.get_limiter("dataverse_source") if ctx.rate_limit_registry is not None else None
         self._source_limiter = limiter
+        self._shutdown_event = ctx.shutdown_event
 
         # VERIFY first binds the source-load operation to an archived call.
         # Credential and HTTP client construction are deferred until load().
@@ -415,6 +421,26 @@ class DataverseSource(BaseSource):
             api_version=self._api_version,
             limiter=limiter,
             additional_domains=self._additional_domains,
+            shutdown_event=self._shutdown_event,
+            on_throttle=self._record_throttled_call,
+        )
+
+    def _record_throttled_call(self, error: DataverseClientError, wait_seconds: float) -> None:
+        """Record a throttled (429/503) call the client is about to wait out and re-send.
+
+        Without this the retried response would be the only recorded call, so
+        the throttled call and the wait chosen for it would vanish from the
+        audit trail.
+        """
+        ctx = self._throttle_ctx
+        if ctx is None:
+            raise FrameworkBugError("Dataverse client throttled outside load() — no source context to record against")
+        self._record_page_call(
+            ctx,
+            url=error.request_url,
+            error=error,
+            error_reason=error.error_category,
+            retry_wait_ms=round(wait_seconds * 1000),
         )
 
     def _metadata_url(self, logical_name: str) -> str:
@@ -784,6 +810,7 @@ class DataverseSource(BaseSource):
         page: DataversePageResponse | None = None,
         error: DataverseClientError | None = None,
         error_reason: str | None = None,
+        retry_wait_ms: int | None = None,
     ) -> None:
         """Record a page fetch in the audit trail.
 
@@ -796,6 +823,8 @@ class DataverseSource(BaseSource):
             page: Response page (for success)
             error: DataverseClientError (for errors)
             error_reason: Additional error context
+            retry_wait_ms: For a throttled call the client re-sends, the wait
+                (ms) it chose before the re-send
         """
         # After page 1 the url IS the server-supplied @odata.nextLink (Tier-3
         # data), so every persisted copy rides fingerprint_url like the
@@ -851,6 +880,8 @@ class DataverseSource(BaseSource):
                 "status_code": error.status_code,
                 "reason": error_reason,
             }
+            if retry_wait_ms is not None:
+                error_data["retry_wait_ms"] = retry_wait_ms
             try:
                 recorded_call = ctx.record_call(
                     call_type=CallType.HTTP,
@@ -895,6 +926,7 @@ class DataverseSource(BaseSource):
         Yields SourceRow.valid() for validated rows and
         SourceRow.quarantined() for rows failing schema validation.
         """
+        self._throttle_ctx = ctx
         # Instance-level flag — NOT reset per page (spec: schema lock scoping)
         self._first_valid_row_processed = False
         is_first_row = True
@@ -924,6 +956,8 @@ class DataverseSource(BaseSource):
                 limiter=self._source_limiter,
                 additional_domains=self._additional_domains,
                 before_request=lambda url, extra_headers: self._preflight_verify_request(ctx, url, extra_headers),
+                shutdown_event=self._shutdown_event,
+                on_throttle=self._record_throttled_call,
             )
 
         entity_set_name = self._resolve_entity_set_name(ctx, logical_name)

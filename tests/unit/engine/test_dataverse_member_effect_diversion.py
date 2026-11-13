@@ -64,7 +64,7 @@ class _RowRejectingClient:
         start = url.index("emailaddress1='") + len("emailaddress1='")
         return urllib.parse.unquote(url[start : url.index("'", start)])
 
-    def upsert(self, url: str, payload: dict[str, Any]) -> None:
+    def upsert(self, url: str, payload: dict[str, Any]) -> DataversePageResponse:
         del payload
         key = self._key_from_url(url)
         self.upserted[key] = self.upserted.get(key, 0) + 1
@@ -76,6 +76,17 @@ class _RowRejectingClient:
                 error_category="row_data_error",
             )
         self.stored.add(key)
+        return DataversePageResponse(
+            status_code=204,
+            rows=[],
+            latency_ms=1.0,
+            headers={},
+            request_headers={},
+            request_url=url,
+            next_link=None,
+            paging_cookie=None,
+            more_records=None,
+        )
 
     def get_page(self, url: str, *, annotations: tuple[str, ...] = ()) -> DataversePageResponse:
         del annotations
