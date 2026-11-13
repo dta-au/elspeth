@@ -214,3 +214,56 @@ All READ.
 - CDA-14, CDA-15, CDA-16 and CDA-17 anchors beyond those listed; the frontend files beyond existence and the three cited line ranges.
 - README findings F1–F21 beyond F4, F20 and F21 and the spike table; `evidence/surface-teaching-crosscheck.md` and the two verification reports were not sampled.
 - Raw captures behind the spike numbers; I compared the plan to the spike notes, not the notes to their data.
+
+## Re-check (39d86b3a)
+
+Re-checked 2026-11-13 at HEAD `39d86b3a`. Read-only; no tests run. `git diff --stat 58e31760 HEAD -- src tests` is empty (EXECUTED), so every code anchor from the first pass still holds.
+
+**Verdict: CLEARS.** No BLOCKER. The nine original FIXes are applied and correct against the code, with three follow-on FIXes and four NITs below.
+
+### Remaining FIX
+
+**R-FIX-1. CDA-04: the range `planner_authoring_aids.py:867-873` is the wrong unit, and the replacement is unspecified.**
+
+- L867 is a comment; the string literal runs L868-876 (READ). L873 falls mid-literal.
+- Only one sentence conflicts with CDA-04: "Reviewed slots belong in the node-level template." (L871-872).
+- The rest of the literal stays true after CDA-04 and must survive: "NEVER put {{interpretation:...}} tokens inside a queries.*.template" (L868-871) and the `{{ row.<variable> }}` rule with its session reference (L872-876).
+- The brief does not say what to teach instead. From `interpretation_state.py:2805-2807`, the node-level template reaches only queries without their own template; say that.
+- CDA-04's test command and `test_files` are unchanged, and §4's teaching rule still lists only "CDA-07, 10, 12". A planner teaching edit should also run `test_planner_authoring_aids.py` and the planner byte-budget test in `test_pipeline_planner.py`.
+- No conflict with CDA-12: it now says CDA-04 owns this text, and the two lanes are in different waves. No test pins the sentence (EXECUTED grep over `tests`, `src`, `scripts`; it found the source file, so the grep works).
+
+**R-FIX-2. CDA-17: `handoff_to_user` exists, but no palette restricts the planner to it.**
+
+- It is a planner recovery control, not the terminal: `PLANNER_RECOVERY_TOOL_NAMES = ("handoff_to_user", "restore_parked_graph")`, `PLANNER_TERMINAL_TOOL_NAME = "emit_pipeline_proposal"` (READ `capability_skill.py:39-40`; schema at `recovery_controls.py:21-46`, with a `message` field).
+- The planner manifest check accepts only `full` or `terminal_only`, and `terminal_only` is exactly the three tools handoff, restore and emit (READ `capability_skill.py:200-219`). A handoff-only call fails that check unless `capability_skill.py` changes, and that file is not in CDA-17's list.
+- CDA-12 is told to "remove or wire the dead `terminal_only` option". If it removes it, CDA-17 loses the nearest existing palette.
+- Fix: either name the `terminal_only` palette as the hand-off call and tell CDA-12 to keep it, or add `capability_skill.py` to CDA-17 for a handoff-only surface.
+
+**R-FIX-3. Two "Depends on" lines and two ticket descriptions were not updated with the wave table.**
+
+- CDA-19 still says "Depends on. CDA-06" (`work-packages.md:786`); the table says after CDA-18. Its ticket description still says "Wave 2a'".
+- CDA-17 still says "Depends on. CDA-12" (`:850`); the table says after CDA-13. The wave-4 row still reads "CDA-17 after CDA-12" and the ticket says "Wave 4", so a dispatcher starting wave 4 after 3b would run CDA-17 beside CDA-13.
+- Every other "Depends on" agrees with the table (READ all 12).
+
+### NIT
+
+1. **CDA-18 advisor attribution.** `advisor_checkpoint.py:579` calls the gateway wrapper and so reaches `provider_gateway.py:272`; it is `:646` that reaches `llm_response_parsing.py:754`. The conclusion is unaffected.
+2. **CDA-13 test command** still runs only `test_named_sources_blob_binding.py`, though `test_proposal_blob_refs.py` is now a required test file.
+3. **CDA-10 ticket** makes `tools/_dispatch.py` a mandatory change while the brief says "`_dispatch.py` / `_common.py`".
+4. **CDA-23** is now READY with a full brief but is not in `tickets.json`, while `work-packages.md:1252` says the file holds every READY lane. I did not review the CDA-23 brief.
+
+### The seven requested checks
+
+| Check | Result |
+|---|---|
+| (a) CDA-18: three direct callers of `credential_guard.py:91` | Pass. Exactly `provider_gateway.py:272`, `tool_batch.py:1015`, `llm_response_parsing.py:754` (EXECUTED grep) |
+| (a) Advisor path needs no edit to `advisor_checkpoint.py` | Pass, inferred from reading. `:579` discards the wrapper's return and uses only the reply text; the call record is built at `:646` through `:754`, where the scrub applies. NIT 1 on the citation |
+| (b) CDA-22 pinned tests and command | Pass. All four tests are at the cited lines; `test_discovery_terminal_preview.py` is in both the command and `test_files` |
+| (c) CDA-13 files versus `prototype.patch` | Pass. The five `.py` files match `git apply --stat` exactly; `sources.py` is gone. NIT 2 |
+| (d) CDA-10 anchors | Pass. `generation.py:2382` is `name="get_plugin_assistance"` with the description following; `outputs.py:370-375` is the `patch_output_options` declaration and description |
+| (e) CDA-04 teaching replacement | **R-FIX-1** |
+| (f) Same-wave overlaps in `tickets.json` | Pass. Pairwise intersection over all 20 tickets (EXECUTED) shows one same-wave overlap, CDA-10/CDA-11 on `generation.py`, which the table now orders. The script found 18 cross-wave overlaps, so it can detect one |
+| (f) Reorderings versus "Depends on" | **R-FIX-3** |
+| (g) CDA-17 hand-off target | **R-FIX-2** |
+
+Plan and runbook edits checked: R2 now keeps the scope sentence; R7's "remove `list_models`" is gone; the 50% figure is now −36% and −40%, matching S2; preflight includes s04. All pass (READ diff).

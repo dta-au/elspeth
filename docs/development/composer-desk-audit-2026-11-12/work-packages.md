@@ -138,7 +138,7 @@ parallelism per lane (for example `-n 4`); CPUs do not multiply across lanes.
 | 2c | CDA-09 | After CDA-08 (`composition_completion.py` gate clearing) |
 | 3a | CDA-11, then CDA-10 | CDA-11 waits for CDA-02 (`tools/generation.py`). CDA-10 and CDA-11 both change `tools/generation.py` (hunks about 150 lines apart): run them in parallel but merge CDA-11 first and rebase CDA-10 |
 | 3b | CDA-12 | After CDA-10 and CDA-07 (`pipeline_planner.py` message builder, advisor system text, skills) |
-| 4 | CDA-14, CDA-15, CDA-16, CDA-17 | Polish and performance; CDA-17 after CDA-12 |
+| 4 | CDA-14, CDA-15, CDA-16, CDA-17 | Polish and performance; CDA-17 after CDA-12 **and CDA-13** (wave 3c) |
 | 3c | CDA-13 | After CDA-12 (planner custody and schema); before CDA-17, because both change `test_pipeline_planner.py` (CDA-13 re-baselines the byte budget) |
 | 2a″ | CDA-19 | After CDA-18: both change `tests/unit/web/test_credential_guard.py` |
 | 4 (also) | CDA-21 | Coordination and worker only; after wave 3 |
@@ -180,7 +180,7 @@ land before the code freeze (remediation plan, WP1a).
   - Raw live captures are on the maintainer's machine under
     `.claude/lanes/composer-desk-audit-20261112/`, which is not in git.
   - Reproduce from code, not from captures.
-- **Prompt and teaching changes** (CDA-07, 10, 12): run
+- **Prompt and teaching changes** (CDA-04, 07, 10, 12): run
   `scripts/cicd/generate_skill_inventory.py --check` and
   `scripts/cicd/composer_wire_census.py --scorecard`, plus the planner
   teaching gates under `tests/unit/web/composer/`. Skill-hash consumers will
@@ -312,14 +312,29 @@ pytest only.
 - **Test files.** `tests/unit/web/composer/test_state_multi_query_contract.py`.
   Use the repro from `evidence/llm-wiring-verification.md`: `set_pipeline`
   must reject it, with a message naming the query.
-- **Test command.** `pytest tests/unit/web/composer/test_state_multi_query_contract.py -n 0 -q`.
+- **Test command.** `pytest tests/unit/web/composer/test_state_multi_query_contract.py tests/unit/web/composer/test_planner_authoring_aids.py -n 2 -q`.
 - **Also report (read-only).** A query listing stored sessions whose
   committed states carry this wiring, so the maintainer can judge whether any
   records were affected. Do not modify data.
-- **Also replace** the teaching at `planner_authoring_aids.py:867-873`
-  ("reviewed slots belong in the node-level template") in this lane.
-  Otherwise, between wave 1 and wave 3b, the planner is taught exactly the
-  wiring this lane starts rejecting. CDA-12 then only rewrites around it.
+- **Also correct the planner teaching** in this lane, so that between wave 1
+  and wave 3b the planner is not taught the wiring this lane starts
+  rejecting:
+  - The unit is the string at `planner_authoring_aids.py:868-876` (L867 is
+    its comment). Change **only** the sentence "Reviewed slots belong in
+    the node-level template." (L871-872). Keep the rest: the "NEVER put
+    {{interpretation:...}} tokens inside a queries.*.template" rule and the
+    `{{ row.<variable> }}` / `{{ lookup.<key> }}` guidance are still true.
+  - Replacement meaning (word it from the code you change, after checking
+    in `multi_query.py` which queries render the node-level template):
+    a reviewed slot in the node-level template reaches only the queries
+    that render that template; if any query on the node has its own
+    `template`, a node-level reviewed slot is rejected at staging, so give
+    the reviewed term to a node whose queries all use the node-level
+    template.
+  - Make the same correction in the `multi_query.py` validator message
+    (~L248-249), which says "Put reviewed slots in the node-level template".
+  - There is no conflict with CDA-12, which later rewrites around this
+    sentence.
 
 ### CDA-05: Boot probe sends the real escape-hatch request (R17, F19)
 
@@ -333,8 +348,8 @@ pytest only.
     the hatch probe's tools equal `planner_tool_definitions(...)` for the
     hatch dialect.
 - **Test command.** `pytest tests/unit/web/composer/test_boot_probe.py tests/integration/web/composer/test_boot_probe_production_parity.py -n 0 -q`.
-- **Out of scope.** The dead `terminal_only` option in `capability_skill.py`,
-  which is CDA-12.
+- **Out of scope.** The `terminal_only` palette in `capability_skill.py`,
+  which CDA-12 keeps and CDA-17 uses.
 
 ### CDA-06: Credential refusal copy for model-produced content (R6(c), F4)
 
@@ -477,7 +492,8 @@ pytest only.
       schema's closed vocabulary (~L2742-2749 keeps the value-free design);
     - a named-`sources` entry carrying `blob_id`/`inline_blob` gets a specific
       rejection: "named sources cannot bind uploaded files on this surface…".
-  - `src/elspeth/web/composer/tools/_dispatch.py` / `tools/_common.py`: a
+  - `src/elspeth/web/composer/tools/_dispatch.py` (and `tools/_common.py`
+    only if the ordering lives there): a
     discovery-tool failure leads with the tool's own error and omits
     whole-pipeline validation.
   - Tool descriptions:
@@ -526,8 +542,9 @@ pytest only.
 - **Files.**
   - `src/elspeth/web/composer/prompts.py`, `capability_skill.py`: render the
     capability core plus a planner overlay instead of the freeform policy, and
-    a per-surface skill hash. Remove or wire the dead `terminal_only` option
-    (~L193-219).
+    a per-surface skill hash. **Keep** the `terminal_only` palette
+    (~L193-219): the escape-hatch overtime turn uses it, and CDA-17 uses it
+    for the deadline hand-off.
   - `src/elspeth/web/composer/skills/pipeline_composer.md`,
     `pipeline_capabilities.md`:
     - R7: models are bound through operator profiles. When asked, name the
@@ -741,8 +758,10 @@ the marker is a trivial fix candidate; measure it.
       would not stop the turn failing;
     - `src/elspeth/web/composer/tool_batch.py:1015`;
     - `src/elspeth/web/composer/llm_response_parsing.py:754`
-      (`build_llm_call_record`), which the advisor path reaches
-      (`advisor_checkpoint.py:579`).
+      (`build_llm_call_record`).
+    - The advisor reaches both: `advisor_checkpoint.py:579` goes through
+      `provider_gateway.py:272`, and `advisor_checkpoint.py:646` through
+      `llm_response_parsing.py:754`.
   - Do not edit `advisor_checkpoint.py`: CDA-07 owns it in the parallel
     wave. If the advisor path needs a change there, stop and report.
 - **Test files.** `tests/unit/web/composer/test_reasoning_credential_scrub.py`
@@ -783,7 +802,7 @@ the marker is a trivial fix candidate; measure it.
 - **Also run.** `tests/unit/web/test_credential_guard.py` and
   `tests/unit/web/test_credential_boundary_inventory.py`. This is a security
   control, so add a negative control for every relaxed case.
-- **Depends on.** CDA-06.
+- **Depends on.** CDA-06 and CDA-18 (both change `tests/unit/web/test_credential_guard.py`).
 
 ### CDA-20: Retry provider 429s with backoff inside the turn deadline (D7 approved)
 
@@ -840,14 +859,19 @@ the marker is a trivial fix candidate; measure it.
 - **Files.** `src/elspeth/web/composer/pipeline_planner.py`:
   - hand off before the operation deadline, keeping a reserve (the planner
     and operation deadlines are equal today). **Hand-off target:** a final
-    provider call restricted to the existing `handoff_to_user` terminal, so
-    the model writes the user-facing explanation. If the reserve cannot fit
+    provider call on the existing `terminal_only` palette
+    (`capability_skill.py:193-219`: `handoff_to_user`,
+    `restore_parked_graph` and `emit_pipeline_proposal`), with an
+    instruction to stop discovery and either hand off or propose. The model
+    writes the user-facing explanation. `handoff_to_user` is a recovery
+    control (`capability_skill.py:39-40`), and no palette restricts a call
+    to it alone; do not add one. If the reserve cannot fit
     that call, end with the existing deadline error. Never author a
     proposal or reply text server-side (composer invariant 1);
   - add a rule for `finish_reason=length` in the hatch.
 - **Test files.** `tests/unit/web/composer/test_pipeline_planner.py`: a fake
   clock past the reserve yields a hand-off, not a deadline error.
-- **Depends on.** CDA-12.
+- **Depends on.** CDA-12 and CDA-13 (both change `test_pipeline_planner.py`; CDA-13 re-baselines the byte budget).
 
 ### CDA-22: The tool loop enforces the discovery budget (F21; D8 approved)
 
