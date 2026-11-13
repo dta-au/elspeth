@@ -405,6 +405,15 @@ Sinks and retrieval:
   every event loop in the process. Records without an exception are
   unchanged.
 
+### Examples
+
+- **The `multi_worker`, `multi_worker_showcase` and `join_refused` launchers
+  require the `sqlite3` command-line tool** and exit 2 with a clear message
+  when it is missing. Without it they used to fail as a misleading "leader
+  never reached RUNNING" timeout. `examples/AGENTS.md` lists `sqlite3` as a
+  prerequisite and documents `reference_join_chain`, which ends PARTIAL with
+  exit 1 by design.
+
 ### Known limits
 
 - Ruff still targets `py313`, so that the formatter does not rewrite 169 files
