@@ -611,7 +611,7 @@ with no approval card.
 
 `preview_pipeline` reports structure and contract verdicts, never row data: do
 not present rows you composed yourself as preview output. If `diff_pipeline`
-refuses with `diff_baseline_unavailable`, this surface gave it no baseline: do
+refuses with `diff_baseline_unavailable`, this surface gave it no usable baseline: do
 not retry it, describe the change from this turn's own results, and never tell
 the user that earlier versions do not exist.
 

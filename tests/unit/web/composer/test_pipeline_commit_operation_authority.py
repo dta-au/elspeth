@@ -211,6 +211,41 @@ async def _prepare(
 
 
 @pytest.mark.asyncio
+async def test_commit_contexts_report_request_start_diff(proposal: _Proposal, monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.web.composer.tools._common import ToolContext
+    from elspeth.web.composer.tools._dispatch import execute_discovery_tool_with_context
+
+    build_candidate = pipeline_commit.build_set_pipeline_candidate
+    dispatch = pipeline_commit.execute_tool
+    labels: list[str] = []
+
+    def inspect_candidate(arguments: Any, state: CompositionState, context: ToolContext) -> Any:
+        diff = execute_discovery_tool_with_context("diff_pipeline", {}, state, context)
+        labels.append(diff.data["baseline_kind"])
+        return build_candidate(arguments, state, context)
+
+    def inspect_dispatch(name: str, arguments: Any, state: CompositionState, catalog: Any, **kwargs: Any) -> Any:
+        diff = dispatch("diff_pipeline", {}, state, catalog, **kwargs)
+        labels.append(diff.data["baseline_kind"])
+        return dispatch(name, arguments, state, catalog, **kwargs)
+
+    monkeypatch.setattr(pipeline_commit, "build_set_pipeline_candidate", inspect_candidate)
+    monkeypatch.setattr(pipeline_commit, "execute_tool", inspect_dispatch)
+    operations = proposal.service.session_operation_authority
+    context = operations.acquire(
+        session_id=proposal.authority.row.session_id,
+        operation_kind=SessionOperationKind.PROPOSAL,
+        owner_instance_id=proposal.service.session_operation_owner_instance_id,
+        lease_seconds=300,
+    )
+    try:
+        await _prepare(proposal, context)
+    finally:
+        operations.release(context)
+    assert labels == ["request_start", "request_start"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("recovery", ["fresh", "matching", "mismatch", "missing_pair"])
 async def test_equal_candidate_only_rejects_after_recovery_integrity(proposal: _Proposal, recovery: str) -> None:
     operations = proposal.service.session_operation_authority

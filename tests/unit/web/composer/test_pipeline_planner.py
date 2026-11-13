@@ -2605,6 +2605,8 @@ async def test_every_freeform_planner_discovery_tool_returns_admitted_state(
     assert len(tool_messages) == len(calls)
     for index, (name, _arguments) in enumerate(calls, start=1):
         content = tool_messages[f"call-{index}"]
+        if name == "diff_pipeline":
+            assert json.loads(content)["data"]["baseline_kind"] == "request_start"
         assert _VALIDATION_MESSAGE_CANARY in content
         assert _HIDDEN_CONNECTION_COMPONENT_CANARY in content
         assert _HIDDEN_EDGE_COMPONENT_CANARY in content

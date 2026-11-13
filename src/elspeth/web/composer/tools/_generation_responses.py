@@ -88,6 +88,7 @@ class ChangeSet(_ResponseRecord):
 
 class DiffResponse(_ResponseRecord):
     from_version: int
+    baseline_kind: Literal["request_start", "last_accepted"] | None = None
     sources_changed: bool
     metadata_changed: bool
     nodes: ChangeSet

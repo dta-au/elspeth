@@ -180,8 +180,11 @@ from elspeth.web.composer.tools.generation import MalformedSourceProofClaim, _ad
 from elspeth.web.composer.tools.sessions import ADVISOR_TRIGGER_CANNOT_COMPLETE, RequestAdvisorHintArgumentsModel
 from elspeth.web.composer.tools.wire_projection import _WIRE_TOOL_DEFS, decode_wire_arguments, encode_semantic_arguments
 from elspeth.web.credential_guard import (
+    CREDENTIAL_REFUSAL_DETAIL,
+    CredentialMaterialRefused,
     require_no_credential_material,
     require_no_credential_material_in_llm_metadata,
+    require_no_credential_material_in_state,
     require_no_credential_material_in_tool_wire,
 )
 from elspeth.web.execution.schemas import ValidationResult
@@ -191,6 +194,7 @@ from elspeth.web.interpretation_state import (
     interpretation_sites,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.proposal_blob_refs import (
     PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE,
     MalformedProposalBlobReferenceError,
@@ -1096,6 +1100,12 @@ async def run_tool_batch(
     raw_assistant_content = assistant_message.content
     admitted_batch = completion.tool_batch
     assistant_tool_calls = admitted_batch.calls
+    diff_baseline = ctx.turn_evidence.effects.initial_state if ctx.turn_evidence is not None else None
+    diff_baseline_kind: Literal["request_start", "last_accepted"] = "request_start"
+    diff_baseline_resolved = False
+    if ctx.turn_evidence is not None and ctx.turn_evidence.diff_baseline is not None:
+        diff_baseline, diff_baseline_kind = ctx.turn_evidence.diff_baseline
+        diff_baseline_resolved = True
     mixed_abandonment_batch = False
     if len(assistant_tool_calls) > 1:
         for candidate_call in assistant_tool_calls:
@@ -2251,7 +2261,8 @@ async def run_tool_batch(
                         state,
                         ctx.policy_catalog,
                         plugin_snapshot=ctx.plugin_snapshot,
-                        baseline=ctx.turn_evidence.effects.initial_state if ctx.turn_evidence is not None else None,
+                        baseline=diff_baseline,
+                        baseline_kind=diff_baseline_kind,
                         data_dir=ctx.custody.data_dir,
                         session_engine=ctx.custody.session_engine,
                         session_id=session_id,
@@ -3234,10 +3245,60 @@ async def run_tool_batch(
             _unapplied_admission: _UnappliedAdmission | None = unapplied_admission,
             _preproposal_exception: BaseException | None = preproposal_exception,
         ) -> Any:
+            nonlocal diff_baseline, diff_baseline_kind, diff_baseline_resolved
             if _preproposal_exception is not None:
                 raise _preproposal_exception
             if _unapplied_admission is not None:
                 return _unapplied_admission.result
+            # Resolve only inside audited dispatch, after response credential
+            # admission. One fresh listing also supplies the held-edit hint.
+            diff_proposals = (
+                await turn_sessions_service.list_composition_proposals(turn_session_uuid)
+                if _tool_name == "diff_pipeline" and turn_sessions_service is not None and turn_session_uuid is not None
+                else ()
+            )
+            if _tool_name == "diff_pipeline" and not diff_baseline_resolved:
+                committed_proposals = [proposal for proposal in diff_proposals if proposal.status == "committed"]
+                if committed_proposals:
+                    # Selection follows proposal creation order, not acceptance time.
+                    committed_state_id = committed_proposals[-1].committed_state_id
+                    if committed_state_id is None:
+                        raise AuditIntegrityError("Committed composition proposal has no committed state")
+                    assert turn_sessions_service is not None and turn_session_uuid is not None
+                    loaded_baseline = state_from_record(
+                        await turn_sessions_service.get_state_in_session(committed_state_id, turn_session_uuid)
+                    )
+                    env_ref_names = (
+                        frozenset(item.name for item in ctx.custody.secret_service.list_refs(user_id))
+                        if ctx.custody.secret_service is not None and user_id is not None
+                        else frozenset()
+                    )
+                    try:
+                        require_no_credential_material_in_state(
+                            loaded_baseline,
+                            surface="composer_state_before_provider",
+                            env_ref_names=env_ref_names,
+                        )
+                    except CredentialMaterialRefused:
+                        # Keep the request alive, but never substitute request start
+                        # for an accepted baseline that failed credential admission.
+                        diff_baseline = None
+                        await emit_progress(
+                            progress,
+                            ComposerProgressEvent(
+                                phase="using_tools",
+                                headline="The comparison baseline was refused by the admission policy.",
+                                evidence=(CREDENTIAL_REFUSAL_DETAIL,),
+                                likely_next="ELSPETH will continue without this comparison baseline.",
+                                reason="admission_refused",
+                            ),
+                        )
+                    else:
+                        diff_baseline = loaded_baseline
+                    diff_baseline_kind = "last_accepted"
+                diff_baseline_resolved = True
+                if ctx.turn_evidence is not None:
+                    ctx.turn_evidence.diff_baseline = (diff_baseline, diff_baseline_kind)
             dispatched_result = await run_sync_in_worker(
                 execute_tool,
                 _tool_name,
@@ -3245,7 +3306,8 @@ async def run_tool_batch(
                 _state,
                 ctx.policy_catalog,
                 plugin_snapshot=ctx.plugin_snapshot,
-                baseline=ctx.turn_evidence.effects.initial_state if ctx.turn_evidence is not None else None,
+                baseline=diff_baseline,
+                baseline_kind=diff_baseline_kind,
                 data_dir=ctx.custody.data_dir,
                 session_engine=ctx.custody.session_engine,
                 session_id=session_id,
@@ -3289,13 +3351,9 @@ async def run_tool_batch(
                 and turn_sessions_service is not None
                 and turn_session_uuid is not None
             ):
-                # The diff baseline is request-start state and held edits are not applied, so a
+                # Neither baseline includes held edits that are not applied, so a
                 # pending proposal is invisible to it. Say so rather than let "0 changes" mislead.
-                pending = [
-                    proposal
-                    for proposal in await turn_sessions_service.list_composition_proposals(turn_session_uuid)
-                    if proposal.status == "pending"
-                ]
+                pending = [proposal for proposal in diff_proposals if proposal.status == "pending"]
                 if pending:
                     dispatched_result = replace(
                         dispatched_result,

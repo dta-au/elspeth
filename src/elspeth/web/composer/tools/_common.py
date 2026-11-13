@@ -1142,6 +1142,7 @@ def diff_states(
     current: CompositionState,
     *,
     baseline_validation: ValidationSummary | None = None,
+    baseline_kind: Literal["request_start", "last_accepted"] | None = None,
     current_validation: ValidationSummary | None = None,
 ) -> dict[str, Any]:
     """Compare two composition states and return a structured change summary.
@@ -1151,6 +1152,7 @@ def diff_states(
 
     Args:
         baseline_validation: Pre-computed validation for the baseline state.
+        baseline_kind: Surface-selected baseline label; omitted on MCP.
         current_validation: Pre-computed validation for the current state.
     """
     # No ``to_version``: the handler passes ``current`` as the result's state,
@@ -1166,6 +1168,9 @@ def diff_states(
         "edges": {"added": [], "removed": [], "modified": []},
         "outputs": {"added": [], "removed": [], "modified": []},
     }
+
+    if baseline_kind is not None:
+        changes["baseline_kind"] = baseline_kind
 
     if baseline.sources != current.sources:
         changes["sources_changed"] = True
@@ -3790,6 +3795,7 @@ class ToolContext:
             posture, never an allow.
         user_id: Current user ID. Required for secret tools.
         baseline: Baseline state for ``diff_pipeline`` comparisons.
+        baseline_kind: Optional surface label for that comparison state.
         current_validation: Pre-computed validation of the live state, used
             by ``diff_pipeline`` so its delta is computed against the same
             ValidationSummary the caller is already holding.
@@ -3853,6 +3859,7 @@ class ToolContext:
     secret_wiring_policy: SecretWiringPolicy | None = None
     user_id: str | None = None
     baseline: CompositionState | None = None
+    baseline_kind: Literal["request_start", "last_accepted"] | None = None
     current_validation: ValidationSummary | None = None
     runtime_preflight: RuntimePreflight | None = None
     structural_preflight: RuntimePreflight | None = None

@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import Any, Final, cast
+from typing import Any, Final, Literal, cast
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
@@ -809,6 +809,7 @@ def execute_tool(
     secret_wiring_policy: SecretWiringPolicy | None = None,
     user_id: str | None = None,
     baseline: CompositionState | None = None,
+    baseline_kind: Literal["request_start", "last_accepted"] | None = None,
     prior_validation: ValidationSummary | None = None,
     runtime_preflight: RuntimePreflight | None = None,
     structural_preflight: RuntimePreflight | None = None,
@@ -861,6 +862,7 @@ def execute_tool(
             denies every wiring — deny-by-default, never an allow.
         user_id: Current user ID. Required for secret tools.
         baseline: Baseline state for diff_pipeline comparisons.
+        baseline_kind: Optional surface label for that comparison state.
         prior_validation: Pre-computed validation for the current state.
             When provided, mutation tools reuse this instead of calling
             state.validate() for the pre-mutation delta. Callers should
@@ -965,6 +967,7 @@ def execute_tool(
         secret_wiring_policy=secret_wiring_policy,
         user_id=user_id,
         baseline=baseline,
+        baseline_kind=baseline_kind,
         current_validation=current_validation,
         runtime_preflight=runtime_preflight,
         structural_preflight=structural_preflight,

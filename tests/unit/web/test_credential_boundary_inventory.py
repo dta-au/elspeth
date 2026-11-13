@@ -589,6 +589,7 @@ def test_common_tool_owners_hold_the_guard_for_new_tools_automatically() -> None
 
 
 _STATE_GUARD_DISPOSITIONS = {
+    "src/elspeth/web/composer/tool_batch.py:run_tool_batch._do_dispatch": "provider_serialization",
     "src/elspeth/composer_mcp/server.py:_dispatch_tool": "mcp_dispatch",
     "src/elspeth/web/composer/graph_recovery.py:qualify_editable_checkpoint": "recovery_checkpoint",
     "src/elspeth/web/composer/service.py:ComposerServiceImpl.compose": "provider_serialization",
@@ -601,6 +602,9 @@ _STATE_GUARD_DISPOSITIONS = {
     "src/elspeth/web/sessions/routes/workflow/library.py:create_library_router.publish_entry": "library_publication",
 }
 _STATE_MATERIALIZATION_DISPOSITIONS = {
+    # Diff publishes baseline component ids/names and resolved warning messages;
+    # the loaded state receives the same guard as request-start provider state.
+    "src/elspeth/web/composer/tool_batch.py:run_tool_batch._do_dispatch.state_from_record": "direct_state_guard",
     # The nominal committed witness is checked against this session/fence;
     # materialization compares authored hashes and effects, not a new input.
     "src/elspeth/web/composer/turn_effects.py:TurnEvidence.accept_checkpoint.state_from_record": "committed_checkpoint_comparison",
