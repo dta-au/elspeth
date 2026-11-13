@@ -267,3 +267,102 @@ Re-checked 2026-11-13 at HEAD `39d86b3a`. Read-only; no tests run. `git diff --s
 | (g) CDA-17 hand-off target | **R-FIX-2** |
 
 Plan and runbook edits checked: R2 now keeps the scope sentence; R7's "remove `list_models`" is gone; the 50% figure is now −36% and −40%, matching S2; preflight includes s04. All pass (READ diff).
+
+## Final check (6523b3d3)
+
+Checked 2026-11-13 at HEAD `6523b3d3`. Read-only; no pytest runs. The only thing executed against data was `p10_measure.py` under `python3 -I`, opening each database read-only.
+
+**Verdict: CLEARS.** No BLOCKER. The three FIXes and four NITs from the re-check are resolved. CDA-23 passes its spot-check. Two small FIXes and two NITs remain.
+
+### Remaining FIX
+
+**F-FIX-1. CDA-12 gives a false reason for keeping `terminal_only`.**
+
+- The brief (`work-packages.md:545`) says "the escape-hatch overtime turn uses it".
+- Nothing passes `tool_surface="terminal_only"`. The only caller passes `"full"` (`pipeline_planner.py:3634`); every other hit is inside `capability_skill.py` itself (EXECUTED grep over `src/elspeth`).
+- The instruction to keep it is right, because CDA-17 will be its first user. The reason should say so, and CDA-17 should be told it must pass `tool_surface="terminal_only"` at the manifest call for the hand-off request, or the manifest check validates it against the full palette.
+- `remediation-plan.md` R17 (line 42) still says "Remove or wire up the dead `terminal_only` option".
+
+**F-FIX-2. CDA-21 changes two sha-pinned files and its brief does not say so.**
+
+- `_reserve_CANCEL_CONSUMERS` pins the sha256 of `sessions/composer_async_worker.py` (READ `test_web_landscape_mutation_fencing.py:5821-5825`).
+- `reviewed-full-source-guards.json` has a key for `coordination/composer_operation_authority.py` (EXECUTED: loaded the JSON and listed its keys).
+- CDA-23's brief names both as the reason it waits for CDA-21. CDA-21's own brief mentions neither, and its test command runs only `test_composer_operation_authority.py`, so the lane meets the red pins only in the full suite.
+- Fix: name the two pin files in CDA-21 and add the two `tests/unit/architecture` files to its command, as CDA-23 does.
+
+### NIT
+
+1. **CDA-23 has no compatibility line.** It changes what is persisted (fewer `composition_states` rows, a new audit `_kind`) and, in 23b, adds a wire enum value. AGENTS.md asks for the compatibility decision to be stated. The design needs no migration; say that.
+2. **CDA-04's `test_files`** now makes `test_planner_authoring_aids.py` a mandatory changed file, so the lane must add a test there for the reworded sentence. The brief implies this but does not say it.
+
+### 1. Earlier fixes
+
+| Item | Result |
+|---|---|
+| CDA-04 teaching edit | Pass. The unit is now L868-876 with only the L871-872 sentence changed, which matches the code. The replacement meaning is stated |
+| CDA-04 test command and §4 rule | Pass. The command adds `test_planner_authoring_aids.py`; §4 lists CDA-04. NIT 2 |
+| CDA-17 hand-off on `terminal_only` | Pass on the palette: it is the three tools the manifest check accepts (`capability_skill.py:217-219`). **F-FIX-1** on the stated reason |
+| CDA-05 and CDA-12 keep `terminal_only` | Pass; both say keep |
+| CDA-17 and CDA-19 "Depends on", wave-4 row, ticket descriptions | Pass. All four now agree with the table (READ diff; EXECUTED ticket diff) |
+| CDA-18 advisor citations | Pass. `:579` to `provider_gateway.py:272`, `:646` to `llm_response_parsing.py:754` |
+| CDA-13 test command | Pass. It now runs `test_proposal_blob_refs.py` |
+| CDA-10 `_dispatch.py` wording | Pass. `_common.py` is now conditional, matching the ticket |
+
+### 2. CDA-23 spot-check
+
+**Anchors (all READ at HEAD).**
+
+| Anchor | Result |
+|---|---|
+| `sessions/service.py:1921` `persist_compose_turn`; stale guard ~L2095-2113; `_reserve_sequence_range` at L2115; insert loop from L2142 | Pass |
+| `service.py:2261-2265` `no_new_checkpoint` disposition | Pass |
+| `service.py:6385` `save_composition_state`; `:6450` `..._with_interpretations`; `:7146` `_effective_state_record_on_connection` | Pass |
+| `service.py:7201-7208` absent gate fact treated as no gate withheld | Pass |
+| `service.py:8429-8436` fork copy filter on `_kind` | Pass |
+| `service.py:3628` versus `:3757` hash equivalence; `pipeline_proposal.py:746`; `proposal_authority.py:222` | Pass |
+| Out-of-scope writers: `:8020` revert, `:8685` fork, `:5141` resolve, `:3582` settlement; `repository.py:858` `append_state`, `:4206` `insert_child_state` | Pass |
+| `composer_turn.py:840` `_run_composer_turn`; L1245 saving copy; L1259 `provenance="post_compose"`; L1284 review branch on `compose_base_state_id`; L1358 headline | Pass |
+| `turn_audit.py:583-603` witness check picks the last bumped outcome; `:147-151` mid-turn meta has no gates | Pass |
+| `test_web_landscape_mutation_fencing.py:5821-5825` pins `composer_turn.py` | Pass |
+| `reviewed-full-source-guards.json` has keys for `sessions/service.py` and `sessions/protocol.py` | Pass (EXECUTED) |
+
+**Pinned tests.**
+
+- `test_persist_compose_turn.py:131`: passes the same `data` in two tool rows and asserts `witness.state.version == 2` (READ). Pass.
+- `test_persist_compose_turn.py:1481`: uses `CompositionStateData()` repeatedly and asserts versions `[1, 2]` (READ). Pass.
+- The brief's "both pass today, exit=0" is its own claim; I did not run them.
+
+**Test files and command.** Five of the six files in the command exist; `test_snapshot_noop.py` is new, as stated. The testcontainer file and `evals/lib/composer_rgr_score.py` exist (EXECUTED).
+
+**The 20/166 measurement.** Reproduced exactly (EXECUTED over the 11 `sessions.db` files under `evals/composer-live-audit/runs/instances/`):
+
+- 166 rows: 82 `tool_call`, 67 `interpretation_resolve`, 17 `post_compose`.
+- 20 equal their predecessor's content: 17 `tool_call→post_compose` and 3 `tool_call→tool_call`.
+- No duplicate comes from any out-of-scope writer, as the brief says.
+- 1 row equals an older, non-adjacent row (A→B→A), which the rule keeps.
+- The script printed both an identical and a different example pair, so it can tell the two apart.
+- `runs/` is gitignored, so this corpus exists only on this machine.
+
+**"Shares no source file with any other lane."** Holds.
+
+- Against `tickets.json`: CDA-23's files and test files intersect no other ticket (EXECUTED pairwise intersection; the same script reports 18 overlaps elsewhere).
+- Against the briefs: outside the CDA-23 section, the only mention of its files is CDA-22's note that `routes/_helpers.py:3115` is *not* its mapping (EXECUTED grep).
+- Two lanes could have needed the sessions service and do not: CDA-02 can read committed proposals through the existing `list_composition_proposals` (`protocol.py:2811`), and CDA-12's archive uses the existing `upsert_skill_markdown_history` (`protocol.py:2957`).
+
+**Invariants and delivery posture.**
+
+- No provider call is added or removed and there is no tutorial branch; the brief makes that an acceptance item. Pass.
+- Audit integrity: a skipped write is recorded as an audit row bound to the head, following the `AdvisorGraphReviewFact` precedent; the predicate fails toward minting. Pass.
+- Out-of-scope writers keep minting, with a pinned test for two of them. Pass.
+- No migration, reset or data change is proposed. NIT 1 on stating that.
+
+### 3. New issues from the edits
+
+Only F-FIX-1 and F-FIX-2 above. `git diff --stat 39d86b3a HEAD` touches docs and the new `P10-snapshot-skip` instruments only; no `src` or `tests` file changed (EXECUTED).
+
+### Not checked
+
+- D9a–c, as instructed.
+- The P10 spike note beyond its measurement section; the four other `p10_*.py` scripts.
+- The frontend anchors for 23b.
+- Whether other lanes' files are sha-pinned. The paths of `composer/service.py`, `composer/pipeline_planner.py` and `composer/tutorial_service.py` appear in the fencing test, but I did not establish that they are hash-pinned.

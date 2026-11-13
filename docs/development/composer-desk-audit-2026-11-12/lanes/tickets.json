@@ -260,7 +260,7 @@
   "test_files": [
    "tests/unit/web/coordination/test_composer_operation_authority.py"
   ],
-  "test_command": "pytest tests/unit/web/coordination/test_composer_operation_authority.py -n 0 -q",
+  "test_command": "pytest tests/unit/web/coordination/test_composer_operation_authority.py tests/unit/architecture/test_web_landscape_mutation_fencing.py tests/unit/architecture/test_web_reserve_reviewed_contracts.py -n 2 -q",
   "description": "Wave 4. Full brief: docs/development/composer-desk-audit-2026-11-12/work-packages.md \u00a7 5 (CDA-21). Evidence: docs/development/composer-desk-audit-2026-11-12/README.md and evidence/. Read AGENTS.md and CONTRIBUTING.md \u00a7 Whole-tree gates first; no lint suppressions or dynamic-attribute sites; composer invariants apply. Write the failing test first in the named test file (fail at an assertion on base, not a crash). Spike notes: docs/development/composer-desk-audit-2026-11-12/spikes/; instruments and prototype patches: evals/composer-live-audit/spikes/. In a worktree pass -o pythonpath=<root>/src:<root>/elspeth-lints/src when proving red on base. Report to report.md, return one line."
  },
  {

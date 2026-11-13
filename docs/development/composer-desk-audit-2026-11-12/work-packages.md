@@ -335,6 +335,10 @@ pytest only.
     (~L248-249), which says "Put reviewed slots in the node-level template".
   - There is no conflict with CDA-12, which later rewrites around this
     sentence.
+  - Add a test in `tests/unit/web/composer/test_planner_authoring_aids.py`
+    that the rendered aids no longer say reviewed slots belong in the
+    node-level template unconditionally, and still carry the "NEVER put
+    {{interpretation:...}} tokens inside a queries.*.template" rule.
 
 ### CDA-05: Boot probe sends the real escape-hatch request (R17, F19)
 
@@ -543,8 +547,9 @@ pytest only.
   - `src/elspeth/web/composer/prompts.py`, `capability_skill.py`: render the
     capability core plus a planner overlay instead of the freeform policy, and
     a per-surface skill hash. **Keep** the `terminal_only` palette
-    (~L193-219): the escape-hatch overtime turn uses it, and CDA-17 uses it
-    for the deadline hand-off.
+    (~L193-219). Nothing passes it today (the only caller passes `"full"`,
+    `pipeline_planner.py:3634`); CDA-17 becomes its first user, for the
+    deadline hand-off.
   - `src/elspeth/web/composer/skills/pipeline_composer.md`,
     `pipeline_capabilities.md`:
     - R7: models are bound through operator profiles. When asked, name the
@@ -850,7 +855,13 @@ the marker is a trivial fix candidate; measure it.
     timeout once claimed.
   - An operation that exceeds the queue-wait bound fails with its own
     outcome.
-- **Test command.** `pytest tests/unit/web/coordination/test_composer_operation_authority.py -n 0 -q`.
+- **Pinned source hashes.** Both files are sha-pinned by whole-tree gates:
+  `composer_async_worker.py` in `_reserve_CANCEL_CONSUMERS`
+  (`tests/unit/architecture/test_web_landscape_mutation_fencing.py:5821-5825`),
+  and `composer_operation_authority.py` as a key in
+  `tests/helpers/required_work_reserve_recipes/reviewed-full-source-guards.json`.
+  Re-pin them only after the reviewed change, never to turn a red green.
+- **Test command.** `pytest tests/unit/web/coordination/test_composer_operation_authority.py tests/unit/architecture/test_web_landscape_mutation_fencing.py tests/unit/architecture/test_web_reserve_reviewed_contracts.py -n 2 -q`.
 - **Also run.** `pytest tests/ -m testcontainer -n 0`: this changes
   persistence and claim/lease behaviour under contention.
 
@@ -859,9 +870,10 @@ the marker is a trivial fix candidate; measure it.
 - **Files.** `src/elspeth/web/composer/pipeline_planner.py`:
   - hand off before the operation deadline, keeping a reserve (the planner
     and operation deadlines are equal today). **Hand-off target:** a final
-    provider call on the existing `terminal_only` palette
+    provider call with `tool_surface="terminal_only"`
     (`capability_skill.py:193-219`: `handoff_to_user`,
-    `restore_parked_graph` and `emit_pipeline_proposal`), with an
+    `restore_parked_graph` and `emit_pipeline_proposal`; today the only
+    caller passes `"full"` at `pipeline_planner.py:3634`), with an
     instruction to stop discovery and either hand off or propose. The model
     writes the user-facing explanation. `handoff_to_user` is a recovery
     control (`capability_skill.py:39-40`), and no palette restricts a call
@@ -1241,6 +1253,11 @@ the marker is a trivial fix candidate; measure it.
     predicate, the audit row, the eval, re-pinning the gates, and the PG run.
   - **23b (SPA `unchanged` outcome):** about 0.5 agent-day.
   - One lane, or 23a then 23b. 23a alone delivers the header fix, F1.
+- **Compatibility (delivery posture).** No migration, reset or backfill.
+  Existing duplicate rows stay as they are; only new saves are skipped.
+  Readers must tolerate both histories. 23b adds an `unchanged` value to the
+  tool-call outcome wire enum: the frontend decoder must accept it, and an
+  older frontend must not crash on it (state this in `report.md`).
 - **Risks.**
   - **Effective versus stored gates on the head.** The predicate must read
     gates through `_effective_state_record_on_connection`, because a
