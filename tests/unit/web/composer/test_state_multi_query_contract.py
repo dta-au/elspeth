@@ -10,6 +10,7 @@ author see one wording.
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -28,6 +29,102 @@ from elspeth.web.composer.state import (
 from elspeth.web.composer.tools.generation import _CLOSED_VALIDATION_ERROR_CODES, explain_validation_code
 
 _CODE = "query_input_columns_undeclared"
+
+
+@pytest.mark.parametrize("list_form", [False, True])
+@pytest.mark.parametrize("overrides", [(), ("second",), ("first", "second")])
+def test_multi_query_review_requires_every_query_to_use_node_template(tmp_path: Path, list_form: bool, overrides: tuple[str, ...]) -> None:
+    from elspeth.web.composer.tools import build_set_pipeline_candidate
+    from tests.unit.web.composer.test_set_pipeline_candidate import _empty_state, _structured_llm_args, _trained_context
+    from tests.unit.web.composer.test_set_pipeline_review_finalization import _wire_pending_tone_review
+
+    arguments = _structured_llm_args(tmp_path)
+    node = arguments["nodes"][0]
+    _wire_pending_tone_review(node)
+    queries = {
+        name: {"input_fields": {"text": "text"}, **({"template": "Independent prompt"} if name in overrides else {})}
+        for name in ("first", "second")
+    }
+    node["options"]["queries"] = [{"name": name, **query} for name, query in queries.items()] if list_form else queries
+    candidate = build_set_pipeline_candidate(arguments, _empty_state(), _trained_context(data_dir=tmp_path))
+    if overrides:
+        assert not candidate.acceptable
+        message = " ".join(error.message for error in candidate.result.validation.errors)
+        assert "node-level" in message
+        for name in overrides:
+            assert repr(name) in message
+    else:
+        assert candidate.acceptable, candidate.result.to_dict()
+
+
+@pytest.mark.parametrize("structured", [False, True])
+@pytest.mark.parametrize("template", [None, "Own prompt", "", 42])
+def test_vague_term_wiring_counts_only_effective_node_templates(structured: bool, template: Any) -> None:
+    from elspeth.web.interpretation_state import vague_term_wiring_count
+
+    options = _options(["body"], {"override": {"input_fields": {}, "template": template}}, "{{interpretation:tone}}")
+    if structured:
+        options["interpretation_requirements"] = [{"id": "tone", "kind": "vague_term", "status": "pending", "user_term": "tone"}]
+        options["prompt_template_parts"] = [{"kind": "interpretation_ref", "requirement_id": "tone"}]
+    assert vague_term_wiring_count(options, user_term="tone") == (1 if template is None else 0)
+
+
+def test_review_handoff_refuses_query_that_bypasses_reviewed_slot() -> None:
+    from elspeth.web.composer.protocol import ToolArgumentError
+    from elspeth.web.composer.tools.sessions import _assert_affected_component
+    from elspeth.web.interpretation_state import InterpretationKind
+    from tests.unit.web.composer.test_request_interpretation_review_tool import _state_with, _structured_llm_node
+
+    node = _structured_llm_node()
+    options = dict(node.options)
+    options["queries"] = {"independent": {"input_fields": {"text": "text"}, "template": "Own prompt"}}
+    with pytest.raises(ToolArgumentError, match="pending vague_term requirement with no resolvable prompt wiring"):
+        _assert_affected_component(_state_with(replace(node, options=options)), node.id, InterpretationKind.VAGUE_TERM, "cool")
+
+
+def test_query_override_feedback_gives_the_actual_repair(tmp_path: Path) -> None:
+    from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
+    from elspeth.web.composer.tools import build_set_pipeline_candidate
+    from elspeth.web.composer.tools.generation import build_validation_guidance
+    from tests.unit.web.composer.test_set_pipeline_candidate import _empty_state, _structured_llm_args, _trained_context
+    from tests.unit.web.composer.test_set_pipeline_review_finalization import _wire_pending_tone_review
+
+    arguments = _structured_llm_args(tmp_path)
+    _wire_pending_tone_review(arguments["nodes"][0])
+    candidate = build_set_pipeline_candidate(arguments, _empty_state(), _trained_context(data_dir=tmp_path))
+    assert not candidate.acceptable
+    (entry,) = _allowlisted_candidate_feedback(candidate.result)["validation"]["errors"]
+    assert entry["error_code"] == "vague_term_query_override"
+    assert "own template" in entry["explanation"]
+    assert "Remove the per-query template(s)" in entry["suggested_fix"]
+    assert "queries all use the node-level template" in entry["suggested_fix"]
+    assert "the repair is wiring" not in str(entry)
+    guidance = build_validation_guidance(error.error_code for error in candidate.result.validation.errors)
+    assert guidance is not None
+    assert "vague_term_query_override" in str(guidance)
+    assert "vague_term_unwired" not in str(guidance)
+    assert "the repair is wiring" not in str(guidance)
+
+
+@pytest.mark.parametrize("door", ["upsert_node", "splice_transform", "patch_node_options"])
+def test_query_override_code_at_each_node_mutation_door(tmp_path: Path, door: str) -> None:
+    from tests.unit.web.composer.test_set_pipeline_candidate import _structured_llm_args
+    from tests.unit.web.composer.test_set_pipeline_review_finalization import _wire_pending_tone_review
+    from tests.unit.web.composer.tools.test_interpretation_requirement_admission import _catalog, _node_writer_result
+
+    node = _structured_llm_args(tmp_path)["nodes"][0]
+    node["id"] = {"upsert_node": "candidate", "splice_transform": "inserted", "patch_node_options": "existing"}[door]
+    _wire_pending_tone_review(node)
+    options = dict(node["options"])
+    requirements = options.pop("interpretation_requirements")
+    result, state = _node_writer_result(door, "llm", requirements, catalog=_catalog(), extra_options=options)
+
+    assert not result.success
+    assert result.updated_state == state
+    codes = [error.error_code for error in result.validation.errors]
+    assert "vague_term_query_override" in codes
+    assert "interpretation_review_contract_unsatisfied" not in codes
+    assert "vague_term_unwired" not in codes
 
 
 def test_ordered_prior_binding_is_admitted_by_stage_one() -> None:

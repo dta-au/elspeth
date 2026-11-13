@@ -835,6 +835,17 @@ class TestClosedCodeCatalogueInvariants:
         )
         assert any(re.search(pattern, message) for pattern, _e, _f in _VALIDATION_ERROR_PATTERNS)
 
+    def test_vague_term_query_override_is_closed_and_actionable(self) -> None:
+        code = "vague_term_query_override"
+        assert code in _CLOSED_VALIDATION_ERROR_CODES
+        guidance = explain_validation_code(code)
+        assert guidance is not None
+        explanation, fix = guidance
+        assert "own template" in explanation
+        assert "Remove the per-query template(s)" in fix
+        assert "queries all use the node-level template" in fix
+        assert "the repair is wiring" not in fix
+
     def test_vague_term_unwired_is_closed_and_actionable(self) -> None:
         """The unwired-vague_term rejection must be explainable on both surfaces.
 
