@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import inspect
 import shutil
 from collections.abc import Callable
 from dataclasses import replace
@@ -136,10 +135,21 @@ def test_sink_validation_passes_config_and_reports_dispatch_rejection() -> None:
     assert errors == [ValidationError(field="provider", message="Unknown provider 'nope'", value=None)]
 
 
-def test_sink_config_model_lookup_accepts_config() -> None:
-    from elspeth.plugins.infrastructure.validation import get_sink_config_model
+def test_sink_validation_through_the_shared_manager_passes_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ``plugin_cls is None`` path resolves through the shared manager and still threads config."""
+    from elspeth.plugins.infrastructure import manager as manager_module
+    from elspeth.plugins.infrastructure.validation import ValidationError, validate_sink_config
 
-    assert "config" in inspect.signature(get_sink_config_model).parameters
+    class _Manager:
+        def get_sink_by_name(self, name: str) -> Any:
+            assert name == "dispatching"
+            return _DispatchingSink
+
+    monkeypatch.setattr(manager_module, "get_shared_plugin_manager", _Manager)
+    _DispatchingSink.seen.clear()
+    errors = validate_sink_config("dispatching", {"provider": "nope"})
+    assert _DispatchingSink.seen == [{"provider": "nope"}]
+    assert errors == [ValidationError(field="provider", message="Unknown provider 'nope'", value=None)]
 
 
 # ---------------------------------------------------------------------------
