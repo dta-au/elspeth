@@ -83,6 +83,7 @@ from elspeth.web.composer.tools.declarations import (
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_TEMPLATE_PARTS_KEY,
+    VAGUE_TERM_QUERY_OVERRIDE_PREFIX,
     approved_prompt_artifact_hash_from_options,
     composition_review_contract_error,
     reconcile_authoritative_reviews,
@@ -933,7 +934,14 @@ def _execute_upsert_node(
     review_contract_error = composition_review_contract_error(new_state)
     if review_contract_error is not None:
         return _saved_graph_rejection_result(
-            state, review_contract_error, error_code="interpretation_review_contract_unsatisfied", rejected_component=None
+            state,
+            review_contract_error,
+            error_code=(
+                "vague_term_query_override"
+                if review_contract_error.startswith(VAGUE_TERM_QUERY_OVERRIDE_PREFIX)
+                else "interpretation_review_contract_unsatisfied"
+            ),
+            rejected_component=None,
         )
 
     # Affected: the node itself plus nodes with edges referencing it
@@ -1455,7 +1463,14 @@ def _execute_splice_transform(
     review_contract_error = composition_review_contract_error(reconciled)
     if review_contract_error is not None:
         return _saved_graph_rejection_result(
-            state, review_contract_error, error_code="interpretation_review_contract_unsatisfied", rejected_component=None
+            state,
+            review_contract_error,
+            error_code=(
+                "vague_term_query_override"
+                if review_contract_error.startswith(VAGUE_TERM_QUERY_OVERRIDE_PREFIX)
+                else "interpretation_review_contract_unsatisfied"
+            ),
+            rejected_component=None,
         )
     profile_validation = context.catalog.validate_composition_state(reconciled)
     if not profile_validation.validation.is_valid:
@@ -1991,7 +2006,14 @@ def _execute_patch_node_options(
     review_contract_error = composition_review_contract_error(new_state)
     if review_contract_error is not None:
         return _saved_graph_rejection_result(
-            state, review_contract_error, error_code="interpretation_review_contract_unsatisfied", rejected_component=None
+            state,
+            review_contract_error,
+            error_code=(
+                "vague_term_query_override"
+                if review_contract_error.startswith(VAGUE_TERM_QUERY_OVERRIDE_PREFIX)
+                else "interpretation_review_contract_unsatisfied"
+            ),
+            rejected_component=None,
         )
     echo_note = _echoed_metadata_note(requirement_echo=requirement_echo)
     return _mutation_result(
