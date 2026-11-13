@@ -307,7 +307,7 @@ class BlobCSVExpand(BaseTransform):
     name = "blob_csv_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:1acd00adc3de5f4e"
+    source_file_hash: str | None = "sha256:cf01f535d5cb8e99"
     config_model = BlobCSVExpandConfig
     usage_when_to_use: str = (
         "Use when each input row carries a payload-store reference to a CSV blob and you need to "
@@ -453,10 +453,15 @@ class BlobCSVExpand(BaseTransform):
         """
 
         class _InvariantPayloadStore:
-            def retrieve(self, ref: str) -> bytes:
+            # Mirrors PayloadStore.retrieve_bounded: a negative cap is refused,
+            # an unknown ref is not found, an oversize payload yields None.
+            def retrieve_bounded(self, ref: str, *, max_bytes: int) -> bytes | None:
+                if max_bytes < 0:
+                    raise ValueError("max_bytes must be nonnegative")
                 if ref != _INVARIANT_PROBE_BLOB_REF:
                     raise PayloadNotFoundError(ref)
-                return _INVARIANT_PROBE_CSV_TEXT.encode("utf-8")
+                body = _INVARIANT_PROBE_CSV_TEXT.encode("utf-8")
+                return body if len(body) <= max_bytes else None
 
         had_payload_store = "_payload_store" in self.__dict__
         original_payload_store: Any = None
