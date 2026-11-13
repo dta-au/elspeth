@@ -12,6 +12,7 @@ import time
 from types import SimpleNamespace
 from typing import Any, cast
 
+import pytest
 from sqlalchemy import select
 from tests.fixtures.base_classes import as_sink, as_source, as_transform
 from tests.fixtures.factories import make_context
@@ -827,3 +828,79 @@ def test_f3_head_bucket_client_reads_the_leader_role_from_the_archive() -> None:
     assert client.source_made_head_bucket_call("docs") is True
     assert client.source_made_head_bucket_call("other-bucket") is False
     assert [query["current_call_index"] for query in session.queries] == [0, 0]
+
+
+# --- finding 6: attempt counts for every transport-class BotoCoreError ----------
+
+
+def _fail_every_send(sdk_client: object, error: Exception) -> list[int]:
+    """Make a real botocore client's HTTP layer raise ``error`` on every attempt."""
+    sends: list[int] = []
+
+    def send(_request: object) -> object:
+        sends.append(1)
+        raise error
+
+    endpoint = vars(sdk_client)["_endpoint"]
+    vars(endpoint)["http_session"] = SimpleNamespace(send=send, close=lambda: None)
+    return sends
+
+
+def _ssl_error() -> Exception:
+    from botocore.exceptions import SSLError
+
+    error: Exception = SSLError(endpoint_url="https://private.example.invalid", error="handshake failure")
+    return error
+
+
+def test_f6_textract_ssl_error_records_every_observed_attempt_and_is_retryable() -> None:
+    from elspeth.plugins.transforms.aws.textract_client import build_textract_sdk_client
+
+    sdk = build_textract_sdk_client(
+        region="ap-southeast-2",
+        aws_access_key_id="AKIDEXAMPLE",
+        aws_secret_access_key="example-secret",  # secret-scan: allow-this-line
+        aws_session_token=None,
+    )
+    sends = _fail_every_send(sdk, _ssl_error())
+    recorder = _Recorder()
+    client = _textract_client(None, sdk, recorder)
+
+    with pytest.raises(TextractServiceError) as exc_info:
+        client.get_document_analysis(job_id="job-1", next_token=None)
+
+    assert len(sends) == 3
+    assert exc_info.value.retryable is True
+    assert exc_info.value.code == "transport_error"
+    assert recorder.calls[0]["response_data"].to_dict()["attempts"] == 3
+    assert "private.example.invalid" not in repr((exc_info.value, recorder.calls))
+
+
+def test_f6_head_bucket_ssl_error_records_every_observed_attempt_and_is_retryable() -> None:
+    from elspeth.plugins.transforms.aws.textract_bucket_region import build_s3_head_bucket_sdk_client
+
+    sdk = build_s3_head_bucket_sdk_client(
+        region="ap-southeast-2",
+        aws_access_key_id="AKIDEXAMPLE",
+        aws_secret_access_key="example-secret",  # secret-scan: allow-this-line
+        aws_session_token=None,
+    )
+    sends = _fail_every_send(sdk, _ssl_error())
+    recorder = _Recorder()
+    client = HeadBucketClient(
+        **mock_item_audit_authority("run-1"),
+        execution=recorder,
+        state_id="state-1",
+        run_id="run-1",
+        telemetry_emit=lambda _event: None,
+        region="ap-southeast-2",
+        sdk_client=sdk,
+    )
+
+    with pytest.raises(BucketRegionUnverifiedError) as exc_info:
+        client.verify_bucket_region("docs")
+
+    assert len(sends) == 3
+    assert exc_info.value.retryable is True
+    assert exc_info.value.code == "transport_error"
+    assert recorder.calls[0]["response_data"].to_dict()["attempts"] == 3
