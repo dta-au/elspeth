@@ -5,10 +5,10 @@ Status: **plan only — nothing here has landed.** It covers every finding in
 the engine, the Landscape, canonical hashing, the payload store,
 checkpointing, the sink phase, plugins and the performance test harness.
 Mechanisms were re-verified, and most were measured, at `1a7ff0e6`
-(measurement runs at `bf8adf06`, a docs-only commit on top of it), SQLite,
-one process. This is a working document: update the status column as items
-land, and delete it when it stops being useful. Line numbers are valid for
-that commit only.
+(measurement runs on docs-only commits on top of it), SQLite, one process.
+This is a working document: update the status column as items land, and
+delete it when it stops being useful. Line numbers are valid for that commit
+only.
 
 Web-tier findings (web-run LLM governance, the run-progress websocket poll,
 per-request auth, the web validation trunk) are out of scope here, as is the
@@ -17,12 +17,22 @@ composer, which has its own plan in
 
 ## How to read this
 
-The summary sections below are the plan of record: the fix list, the rulings
-it needs, and the order. Appendices L1–L5 hold the full design of each item
-in one format (finding, verified mechanism, evidence, change, what must not
-change, risk, ruling, verification, expected saving). Each appendix is one
-investigator's report, reproduced with only heading levels changed, and each
-ends with its own list of what was not verified.
+The summary sections are the working plan: the fix list, the confirmations
+and rulings it needs, and the order. Appendices L1–L6 hold the full design of
+each item in one format (finding, verified mechanism, evidence, change, what
+must not change, risk, ruling, verification, expected saving). Each appendix
+is one investigator's report, reproduced with only heading levels changed,
+and each ends with its own list of what was not verified.
+
+**Where the summary and an appendix disagree, the summary governs.** The
+summary was revised after an independent review (see "Review" below); the
+appendices were not. The section "Where this summary overrides an appendix"
+lists each difference.
+
+The appendices cite scripts, traces and logs under `.claude/lanes/`. That
+directory is gitignored and does not survive the session that produced it;
+treat those citations as a description of how a number was obtained, not as
+files you can open. Committing the instruments is items H-1 and H-2.
 
 | Appendix | Scope |
 |---|---|
@@ -31,6 +41,7 @@ ends with its own list of what was not verified.
 | L3 | Payload store, checkpointing and the end-of-run sink phase |
 | L4 | Engine control flow, startup, cross-row concurrency and the performance test harness |
 | L5 | Plugins and the external-call path |
+| L6 | Findings the first five lanes left uncovered: external-call recording, sink member re-derivation, remaining row copies, fork-path verbs |
 
 ## Relationship to the earlier executor review
 
@@ -43,13 +54,13 @@ branch. This plan was written with that review in hand:
 - Where a finding is the same item, this plan **adopts that review's ID**
   (`E-*` ready fixes, `R-*` rulings, `M-*` measurements, `H-*`
   housekeeping) and re-verifies the mechanism at this commit.
-- Items that review does not have carry a lane ID (`L1-n` … `L5-n`).
+- Items that review does not have carry a lane ID (`L1-n` … `L6-n`).
 - Where the two disagree, the disagreement is listed in the next section
   with the evidence.
 
-The two documents should be folded into one before either is treated as the
-plan of record. Which branch and release that belongs to is the
-maintainer's decision; it has not been made here.
+Neither document is the plan of record yet. They should be folded into one
+first; which branch and release that belongs to is the maintainer's
+decision and has not been made here.
 
 ## Corrections to the earlier documents
 
@@ -65,13 +76,13 @@ edited from here.
 | Prebuilding "changes no SQL text" | Earlier review | True on SQLite; on PostgreSQL the placeholder names change (L1) |
 | R-13 (node-state timestamps on the process clock) may be a defect | Earlier review | Not a defect: ADR-047 explicitly leaves `node_states` timestamps on the process clock (L1) |
 | E-11 may need an index | Earlier review | The index exists; SQLite picks a bad join order and a query rewrite fixes it with no schema change (L4) |
-| The external-call path adds nothing above the measured floor | Earlier review, Limits | An Azure LLM row adds 16 statements, 3 commits and 2 payload files; an OpenRouter row adds 31, 6 and 4, because HTTP-transport providers record two calls per query (L5) |
+| The external-call path adds nothing above the measured floor | Earlier review, Limits | An Azure LLM row adds 16 statements, 3 commits and 2 payload files; an OpenRouter row adds 31, 6 and 4, because HTTP-transport providers record two calls per query (L5, L6) |
 | Canonical JSON and hashing is 11.5–16.2% of per-row time | Recon § 1 | A cProfile bucket that over-weights small Python calls. Removing about half of those calls changed CPU by −4.6% (gate) and −0.3% (transform) on narrow rows; it reaches −17% at 100 columns (L2) |
 | Three `to_dict()` thaws per token × transform | Recon Appendix A | Seven in engine code plus one or two in the plugin (L2) |
-| Five canonical serialisations per token at the sink | Recon Appendix B | At least twelve; `SinkEffectMember` is built seven times per row and re-verifies each time (L2, L3-9) |
+| Five canonical serialisations per token at the sink | Recon Appendix B | At least twelve; `SinkEffectMember` is built seven times per row and re-derives each time (L2, L6) |
 | Three read transactions per sink member | Recon Appendix B | Four; 16 statements and 4 commits per token measured (L3, E-4) |
 | Ingest is 28 statements with 9 leader-fence and 5 clock reads | Recon Appendix B | 29 statements plus `BEGIN IMMEDIATE`, with 7 leader-fence updates and 7 clock reads (L1) |
-| The gate profile includes the default checkpoint cost | Recon (implicit) | The shipped gate example sets `every_n: 100`. At the default `every_row` a checkpoint costs 9 statements and 1 commit per sink-written token, about 7.8% of CPU (L3-4) |
+| The gate profile includes the default checkpoint cost | Recon (implicit) | The shipped gate example sets `every_n: 100`. At the default `every_row` a checkpoint costs 9 statements and 1 commit per sink-written token (L3-4) |
 | CSV sink re-hashes the output once per effect, effects per run unknown | Recon § 3 item 7 | One effect per sink per run in the common case, so the item is downgraded. With many distinct error hashes on one sink it becomes a failure (L3-8) |
 | A 30-thread pool holds one row at a time | Recon § 3 item 3 | The default of 30 is capped by `max_workers` and overridden by `pool_size` (default 1); one worker thread ran in the measured runs. The conclusion — no two rows' calls overlap — is confirmed by measurement (L4-5, L5) |
 | Retry wrapper and per-node traversal loop are hot | Recon Appendix A top-10 | 11.65 µs per token × node and under 0.4% of profiled time; not worth fixing (L4-2, L4-3) |
@@ -80,22 +91,30 @@ edited from here.
 ## Two things that are defects, not costs
 
 These surfaced during verification and should not wait for a performance
-argument.
+argument. The independent review reproduced the first and confirmed the
+second from the code.
 
 - **L2-6 — a `set` inside a row is hashed non-deterministically.**
   `stable_hash` of a `PipelineRow` holding a `set` gave three different
   hashes under three `PYTHONHASHSEED` values, so the recorded hash cannot be
-  reproduced. The same value in a plain dict is refused. Whether any shipped
-  plugin can put a `set` in a row is not verified. Needs a ruling on where to
-  refuse it.
+  reproduced. The same value in a plain dict is refused. It needs a
+  transform that emits a set; no source can. Shipped transforms were not
+  surveyed for one. Needs a ruling on where to refuse it.
 - **L3-8 — a run fails when one sink receives more than 257 distinct error
   hashes.** The sink phase mints one sink effect per distinct
-  (outcome, path, error hash) group, each rebuilt from all its predecessors,
-  and the 258th raises `LandscapeRecordError` after every transform has
-  already run. This was reproduced only with a harness that forces
-  row-specific error reasons; whether real provider error text varies per row
-  after scrubbing is not verified, though the LLM transform does put the
-  exception text in its reason. Needs a ruling on the grouping.
+  (outcome, path, error hash) group, each rebuilt from all its predecessors;
+  the cap is at `engine/executors/sink_effects.py:1179-1181` and the 258th
+  effect raises `LandscapeRecordError` after every transform has already
+  run. The error hash is the hash of the transform's reason text, and
+  shipped plugins put row-specific values in that text deterministically:
+  `plugins/transforms/pdf_rasterize.py:608-616` (blob reference and body
+  size), `plugins/transforms/llm/image_inputs.py:116-120`, and
+  `plugins/transforms/aws/textract_inline_analysis.py:529,599`. So a PDF or
+  image pipeline with an `on_error` sink and more than 257 failing inputs of
+  differing size reaches the cap with no provider text involved. That
+  reachability is from reading the code; the failure itself was reproduced
+  only with a harness that forces distinct reasons. Needs a ruling on the
+  grouping.
 
 ## Governing rule
 
@@ -106,22 +125,29 @@ executor the retained thing is one of: a compiled SQL statement, a fence
 already taken on this connection in this transaction, a row the transaction
 itself just wrote, or the canonical hash of a frozen row.
 
-Two constraints bound every item:
+Three constraints bound every item:
 
 - **Audit integrity outranks speed.** A change that alters a recorded value,
-  a hash, a fence, a clock sample or what a crash leaves behind is a ruling,
-  never a silent optimisation. Every "ready" item below was checked against
-  that test and states what must not change.
+  a hash, a fence, a clock sample, how often an integrity check runs, or
+  what a crash leaves behind is a confirmation or a ruling, never a silent
+  optimisation.
 - **Ownership is proved by who constructed the object, not by its container
-  type.** A memo keyed on a mutable mapping is a correctness bug. Memos live
-  on frozen instances; a module-level `lru_cache` on contract hashing is
-  additionally refused by the runtime VAL manifest at run start (L2).
+  type.** A memo keyed on a mutable mapping is a correctness bug, and a
+  boolean parameter saying "the caller already checked" is a trust
+  statement, not a proof. Pass the verified object as the witness instead.
+  Memos live on frozen instances; a module-level `lru_cache` on contract
+  hashing is additionally refused by the runtime VAL manifest at run start.
+- **Do not feed both sides of a divergence check from one retained value.**
+  That turns the check into a tautology. A comparison between two
+  independently derived values stays.
 
 ## Master fix list
 
 Status is `open` for every row. Savings are per-item estimates on SQLite and
 overlap heavily — removing a statement also removes its construction cost —
-so they do not add up. "TC" marks items that owe the PostgreSQL testcontainer
+so they do not add up. Unless a row says "measured end to end", a CPU
+percentage is a per-row count multiplied by a micro-benchmark delta taken on
+a loaded shared box. "TC" marks items that owe the PostgreSQL testcontainer
 suite as well as the default one.
 
 ### A. Instruments first
@@ -131,54 +157,75 @@ any of them.
 
 | ID | Item | Risk | Appendix |
 |---|---|---|---|
-| L4-8 | Pin exact per-row counts (SQL statements, commits, canonical-JSON and hash calls) on a small linear and a small fork pipeline through the production entry, plus a linearity oracle that names any function whose call count grows faster than rows. Prototyped: 68 statements / 8 commits per row linear, 381 / 51 fork; a mutant goes red | Low | L4 |
+| L4-8 | Pin exact per-row counts (SQL statements, commits, canonical-JSON and hash calls) on a small linear and a small fork pipeline through the production entry, plus a linearity oracle that names any function whose call count grows faster than rows. Prototyped: 68 statements / 8 commits per row linear, 381 / 51 fork; a mutant goes red. Build the PostgreSQL-parametrised variant at the same time | Low | L4 |
 | L1-2 | Statement-identity, per-row statement-budget and bind-equivalence guards for the Landscape verbs. Overlaps L4-8's statement pins; build as one instrument | Low | L1 |
+| M-1 | Take the PostgreSQL baseline (and one with a follower worker) **before** any SQL item lands. Needs a Docker host; none of the lanes had one | Low | L1, L4 |
 | L4-6 | Rewrite the stale benchmarks and stress fixtures against the current repository API | Low | L4 |
-| L4-7 | Type-check the performance tests' repository calls and smoke-run them at tiny N so they cannot rot again | Low | L4 |
-| H-1, H-2 | Commit the measurement harness and a workload generator. Use `scripts/perf/`; the earlier review's `notes/` destination is gitignored | Low | L4 |
+| H-1, H-2 | Commit the measurement harness, the workload generator and the scripts each ready item names as its before/after instrument. Use `scripts/perf/`; the earlier review's `notes/` destination is gitignored | Low | L4 |
+| — | Run both source gates in full against a private copy carrying E-3a, E-3b, E-10 and L1-1 before starting any of them. The lanes probed only the prebuilt-statement variants; whether the mutation-fencing gate accepts `RETURNING` on fenced DML, a new connection method or a read-then-insert arm is unknown | Low | L1 |
 
 ### B. Ready to fix — no ruling needed
 
 | ID | Fix | Risk | Expected saving | TC | Appendix |
 |---|---|---|---|---|---|
-| L3-1 | Stop rebuilding the locked-id tuple on every lock in sink reservation; stop evaluating the backend pid per iteration | Low | Removes a quadratic term: about 1.3 s per 2,000-member sink, projected minutes at 100k | — | L3 |
-| E-11 | Rewrite the run-end orphan sweep to drive from `token_parents` | Low | 225 → 2 ms at 800 fork rows; removes a rows² term | TC | L4 |
-| E-5 | Record a transform's output contract once per distinct contract, keyed on the contract value | Low | One write transaction per transform per row; −11% CPU measured on the transform workload | — | L1, L2 |
-| E-6a | Memoise `SchemaContract.version_hash()` on the frozen instance | Low | Linear in field count: 0.3–0.6 ms/row narrow, 5–12 ms/row at 100 columns | — | L2 |
-| E-6b | Stop rebuilding equal contracts per row: intern on the plugin side, share the hash on the engine side | Low | Remaining contract hashes per transform row → 0; enables E-5 and E-6a | — | L2, L5 |
+| L3-1 | Stop rebuilding the locked-id tuple on every lock in sink reservation; stop evaluating the backend pid per iteration | Low | Removes a quadratic term: about 1.3 s per 2,000-member sink, projected minutes at 100k | TC | L3 |
+| E-11 | Rewrite the run-end orphan sweep to drive from `token_parents`. The review checked the rewrite is logically identical, including NULL handling | Low | 225 → 2 ms at 800 fork rows; removes a rows² term | TC | L4 |
+| E-6a | Memoise `SchemaContract.version_hash()` on the frozen instance. Editing this code changes the runtime VAL manifest, so a run interrupted before the upgrade is refused on resume after it — the existing refuse contract, stated here so it is not a surprise | Low | Linear in field count: 0.3–0.6 ms/row narrow, 5–12 ms/row at 100 columns | — | L2 |
+| E-6b | Share the version hash across equal contracts on the engine side (value interning in the engine; no plugin edit). This is Appendix L2's design. The plugin-side interning in Appendix L5 is tracked separately as L5-11 | Low | Remaining contract hashes per transform row → 0 | — | L2 |
 | E-1a part 1 | Prebuild the membership fence statement | Low | ≈1.6% gate, ≈2.5% transform | TC | L1 |
-| L1-1 | Stop recompiling the two dialect-specific inserts on every row | Low | ≈0.5–1% | TC | L1 |
-| E-3a | Return after-images with `RETURNING` instead of selecting them back | Low–Med | 7 statements per gate row | TC | L1 |
-| E-3b | Skip re-validation and repeated work-item selects when the same transaction wrote the rows | Low–Med | 6 statements per source row | TC | L1 |
-| E-10 | Plain read transaction for engine-internal reads | Low–Med | 10 statements per gate row, 52 per fork row | TC | L1 |
-| E-1b part 1 | Prebuild the by-key selects | Low | ≈1.5% after E-3 | TC | L1 |
-| E-4 | Batch the sink-flush lineage loads | Low–Med | 16 statements and 4 transactions per sink token, about 6% of gate CPU | TC | L3 |
-| L3-2 | Take the reservation witness locks in ordered chunks | Medium | 2 statements per sink row on SQLite, 4 round trips on PostgreSQL | TC | L3 |
-| E-9a | Compute the topology hash once per run | Low | 1.1–1.5% at the default checkpoint cadence | — | L3 |
-| L3-6 | Write the source-row blob before the ingest transaction opens | Low–Med | Two fsyncs per row leave the write-lock hold | — | L3 |
-| L4-1 | Do not probe the Landscape for a coalesce group the leader holds open in memory | Low | 2 probes per fork row | — | L4 |
+| L1-1 | Stop recompiling the two dialect-specific inserts on every row. After the change the SQLite arm no longer exercises `ON CONFLICT`, so add a testcontainer replay test for the conflict path | Low to Low–Med | ≈0.5–1% | TC | L1 |
+| E-3a | Return after-images with `RETURNING` instead of selecting them back — six of the seven read-backs. The seventh, the post-insert routing-group ownership assertion, is split out as E-3a-own in section C1 | Low–Med | 6 statements per gate row | TC | L1 |
+| E-3b | Skip re-validation and repeated work-item selects when the same transaction wrote the rows. **Amended design:** pass the `(Row, Token)` records returned by the insert verb as the witness and compare `row_id`, `token_id` and `ingest_sequence` in memory; do not add "written by this transaction" booleans. Foreign keys back only the run-ownership check; the other equalities become by-construction and the item must say which | Low–Med | 6 statements per source row | TC | L1 |
+| E-1b part 1 | Prebuild the by-key selects, including `pending_sink_bundle_clause()` if L6 places it here | Low | ≈1.5% after E-3 | TC | L1 |
+| E-4 | Batch the sink-flush lineage loads on the enforced read-only connection | Low–Med | 16 statements and 4 transactions per sink token | TC | L3 |
+| E-9a | Compute the topology hash once per run. The design adds a new `OrchestrationInvariantError` on the interrupt path if the graph hash changes mid-run; today that case writes the new hash silently | Low | 1.1–1.5% at the default checkpoint cadence | — | L3 |
+| L4-1 | Do not probe the Landscape for a coalesce group the leader holds open in memory. **Amended invariant:** any removal from `_completed_keys` — FIFO eviction, restore replacement, or the `flush_pending` clear at `engine/coalesce_executor.py:1594-1599` — falsifies exactness. Add a test for an arrival after `flush_pending`. Read `row_union_executor.py` before extending the shape to it | Low | 2 probes per fork row | — | L4 |
 | L2-3 | Drop the gate executor's duplicate input hash (the Fix 9 change, applied to gates) | Low | One canonicalisation per token × gate | — | L2 |
-| L2-2 | Hash the source row once for its source node state | Low | One per source row | — | L2 |
-| L2-1 | Serialise once where one object is both hashed and stored (ingest, calls, operations) | Low | One per source row, two per external call | — | L2 |
+| L2-2 | Hash the source row once for its source node state | Low | One per source row | TC | L2 |
+| L2-1 | Serialise once where one object is both hashed and stored (ingest, calls, operations) | Low | One per source row, two per external call | TC | L2 |
 | L2-10 | Serialise the source contract once per contract | Low | ~60 µs/row after E-6a | — | L2 |
-| L2-5 | Canonicalise a row from its frozen data without thawing | Low | 8–9% of each row hash | — | L2 |
-| L2-7 | Cut engine thaws per token × transform from seven to two | Low | Five deep copies per token × transform | — | L2 |
-| L2-8 | Make the second normalisation walk non-copying and hash bytes directly | Low–Med | 10–35% of each remaining canonicalisation | — | L2 |
-| L3-9 | Serialise each sink member row once | Low | Small; only alongside the L2 row-hash work | — | L3 |
-| L1-3 | Halve the cost of a scheduler event's identity | Low | ≈0.3% | — | L1 |
-| E-8a | Compute the model-catalog digest without importing litellm | Low–Med | About 2.2 s CPU per non-LLM CLI run | — | L4 |
+| L2-5 | Canonicalise a row from its frozen data without thawing. Waits for the L2-6 answer, because it must reproduce the frozenset arm that L2-6 asks to remove | Low | 8–9% of each row hash | — | L2 |
+| L2-7 | Cut engine thaws per token × transform. **Amended:** the value handed to the declared-output-type check keeps its thawed form (or frozen container types are mapped back to their thawed names before recording), because a violation records the container's type name and frozen data would record `tuple` or `mappingproxy` where `list` or `dict` is recorded today. Add a test pinning `actual_type` for a container under a declared scalar type. The `emitted.keys()` change is safe as designed | Low | Up to five deep copies per token × transform; fewer with the retained thaw | — | L2 |
+| L2-8 | Make the second normalisation walk non-copying and hash bytes directly. Keep the policy in `contracts/hashing.py` | Low–Med | 10–35% of each remaining canonicalisation | — | L2 |
+| L1-3 | Halve the cost of a scheduler event's identity, through the contracts-layer hashing primitive only — no second direct `rfc8785` call site. Its saving is the same one L2-8 counts for event dicts | Low | ≈0.3% | — | L1 |
+| E-8a | Compute the model-catalog digest without importing litellm. The digest is an audit column and the shortcut reads a file whose shape litellm owns, so the equality test must run in the default suite against the locked litellm version | Low–Med | About 2.2 s CPU per non-LLM CLI run | — | L4 |
 | L4-4 | Keep heavy SDK imports out of plugin module import | Low–Med | About 1.0–1.1 s CPU per CLI run | — | L4 |
-| L5-2 | Build the pooled HTTP client only when a pooled request is made | Low | 7 ms CPU per `web_scrape` / `blob_fetch` row | — | L5 |
-| L5-1 | Share one HTTP transport per provider instead of one per row | Medium | 6–7 ms CPU per row plus a TLS handshake per row on real endpoints. Confirm the cookie policy before landing | — | L5 |
-| L5-4 | Take the telemetry hashes from the recorded call | Low | 0.08–0.25 ms per call | — | L5 |
-| L5-5 | Memoise the template's contract hash | Low | 55–355 µs per query. Open question: two computed hashes have no reader | — | L5 |
+| L5-2 | Build the pooled HTTP client only when a pooled request is made. Must not change: Power Automate stays refused by the separate check at `plugins/infrastructure/clients/http.py:1463-1464` | Low | 7 ms CPU per `web_scrape` / `blob_fetch` row | — | L5 |
+| L5-4 | Take the telemetry hashes from the recorded call — LLM-client success path only. The image-rejection branch and the HTTP client would change an emitted telemetry value and are not included | Low | 0.08–0.25 ms per call | — | L5 |
+| L5-5 | Memoise the template's contract hash. With engine-side E-6b alone the memo hits only when the transform is fed the source contract object; it hits on every row only after L5-11. Open question: two computed hashes have no reader | Low | 55–355 µs per query when it hits | — | L5 |
 | L5-7 | Build the output-declaration stamp table once per transform | Low–Med | ~40 µs per row per transform; 32 call sites in 24 modules | — | L5 |
-| E-9b | Derive `ValueTransform` created fields and expression kinds once | Low | 36 µs per row beyond L5-7 | — | L5 |
+| E-9b | Derive `ValueTransform` created fields and expression kinds once | Low | 36 µs per row beyond L5-7. The earlier review's 1.7% was not reproduced | — | L5 |
+| L5-11 | Intern equal emitted contracts in `BaseTransform` (Appendix L5's "E-6b, plugin side"). After L5-7, which edits the same function; owes the full default suite | Low | Enables the identity-keyed memos downstream of field-adding transforms | — | L5 |
+| L6-1 | Allocate the call index inside the record transaction at the four sites where no external effect separates the two (the logical call of HTTP-transport providers, operation calls). The pre-effect allocation in the audited clients stays: its fence is the only item-lease check before the external call | Low | 4 statements, 1 commit, ~1.3 ms CPU per OpenRouter or Gateway query; none for Azure | TC | L6 |
+| L6-4 | `SinkEffectMember`: verify content once, then rebind ordinals without re-deriving. Leaves the real cross-checks in place | Low–Med | 12 of 14 canonicalisations per sink row: 250 µs at 5 columns, 1.9 ms at 100 | — | L6 |
+| L6-6 | Build `pending_sink_bundle_clause()` once. Independent of E-1b and of the clock-authority gate | Low | ~0.3–0.4 ms per row, about 1% | TC | L6 |
+| L6-7 | Carry `ingest_sequence` from the claim instead of reading it per continuation | Low | 16 statements and 4 read transactions per fork row | TC | L6 |
+| L6-8 | Resolve token ownership once, inside the fork, coalesce or expand transaction | Low–Med | 22 statements and 6 read transactions per fork row (10 statements after E-10) | TC | L6 |
+| L6-5 | Remove the plugin double copy (`copy.deepcopy(row.to_dict())`) in `value_transform`, `type_coerce`, `truncate`, `passthrough`, `reference_join` and `batch_replicate` — only as a ride-along with E-9b and L5-7, never on its own (see the plugin-hash rule below) | Low | 2.5–6 µs per row per transform | — | L6 |
 
-### C. Needs a ruling first
+### C1. Needs a short maintainer confirmation
+
+Each of these is a small, well-understood change that nevertheless narrows a
+check or changes what a failure leaves behind. They need a yes, not a design
+debate.
+
+| ID | Change | What to confirm | Saving | TC | Appendix |
+|---|---|---|---|---|---|
+| E-5 | Record a transform's output contract once per distinct contract. **One design:** a memo on the transform executor (run-scoped by construction), keyed on node and the contract's version hash, which E-6a and E-6b make free; the entry is added only after the fold transaction has committed. Depends on E-6a and E-6b | The stored-hash versus recomputed-hash check on the `nodes` row drops from once per row to once per distinct contract | One write transaction per transform per row; −11% CPU on two A/B pairs with a value-keyed variant | TC | L1, L2 |
+| E-3a-own | Drop the post-insert routing-group ownership assertion (`core/landscape/execution/node_states.py:1520-1525`) | It is a Tier-1 guard against a mixed routing decision; the argument for removing it rests on the routing authority lock and is clean only on SQLite | 1 statement per gate row | TC | L1 |
+| E-10 | Plain read transaction for engine-internal reads. Refuse any `Select` carrying `FOR UPDATE` on the new path | It removes `PRAGMA query_only` on SQLite and `READ ONLY` on PostgreSQL from engine reads, narrowing defence in depth; a `Select` is not proof of a read. E-4's batched loads stay on the enforced read-only connection either way | 2 statements per gate row after E-4; more on fork rows | TC | L1 |
+| L3-6 | Write the source-row blob before the ingest transaction opens. **Amended design:** the data-flow layer builds a prepared-record object that the verb accepts, rather than the caller passing a loose hash and ref | A deposed leader can then leave one unreferenced blob it could not leave before, and a store error now precedes the leadership-lost error. Edits the same verb as L2-1 and R-2a | Two fsyncs per row leave the write-lock hold | TC | L3 |
+| L5-1 | Share one HTTP transport per provider instead of one per row | Cookies are no longer carried between attempts of one state; and a stale kept-alive connection can surface as a retryable network error, adding an error `calls` row a fresh connection would not have produced | 6–7 ms CPU per row plus a TLS handshake per row on real endpoints | — | L5 |
+| L4-7 | Type-check the performance tests' repository calls and smoke-run them at tiny N | Adds a CI step and a 20–40 s mypy-in-test; keep it only if it meets the "materially improves reliability" bar | Prevents the rot L4-6 repairs | — | L4 |
+| L6-2 | Stop re-selecting the parent state's immutable columns when allocating a call index and when updating payload refs | The re-select is a defensive read of columns that cannot change | 1–2 statements, 0.2–0.4 ms per call | TC | L6 |
+| L6-9 | Memoise the node-cursor existence check | A foreign key already backs it; the in-process check becomes once per node | 9 statements per fork row | TC | L6 |
+
+### C2. Needs a ruling first
 
 Each row gives the short form of the question; the exact wording, the ADR
-text it touches and the options are in the appendix.
+text it touches and the options are in the appendix. The independent review
+did not open the ADRs, so the ADR citations are the lane investigators'
+readings.
 
 | ID | Decision | Touches | Why it is a decision | Saving if approved | Appendix |
 |---|---|---|---|---|---|
@@ -187,11 +234,11 @@ text it touches and the options are in the appendix.
 | R-2a | Let a leader `_on` verb discharge its fence by proving the outer transaction already took it | ADR-047, ADR-030 D4 | ADR-047 gives raw-connection callers an explicit renewal obligation | 6 statements per source row (prototyped: ingest 30 → 24) | L1 |
 | L1-4 | Extend the clock-authority gate to prove provenance through a prebuilt statement's bind mapping | ADR-047 | The gate pins the source shape of the fence and clock statements | Unlocks the two rows below | L1 |
 | E-1a part 2 | Prebuild the leader fence, leader renewal and clock helpers | via L1-4 | Blocked by the gate today | ≈5–6% | L1 |
-| E-1b part 2 | Prebuild every write that binds a timestamp | via L1-4 | Blocked by the gate today | Estimated 8–12%, unmeasured; the largest remaining CPU item | L1 |
+| E-1b part 2 | Prebuild every write that binds a timestamp | via L1-4 | Blocked by the gate today | Unknown until measured; the lane's estimate is 8–12% | L1 |
 | R-2b | Issue the leader deadline once, at the completion boundary | ADR-047 | The entry renewal is a deliberate part of the leader context | 2 statements per leader transaction | L1 |
 | R-7 | Fold the transactions of one transition (options A–D) | ADR-030 D4, ADR-026 | Changes what a crash leaves behind | A: 3 commits per gate decision; D: 9 → 2 write transactions per transform row | L1 |
 | R-12 | Lock form of the fences (`SELECT … FOR UPDATE` versus a no-op `UPDATE`) | ADR-030 D7, ADR-047 | D7 chose the verify-UPDATE form | One WAL frame per member transaction on SQLite; PostgreSQL unmeasured | L1 |
-| L3-4 | One progress checkpoint per durable sink write group instead of one per token | ADR-029, ADR-030 | Changes the documented behaviour of `every_row`; checkpoint rows hold no token position | 9 statements and 1 commit per sink token, about 7.8% at the default cadence | L3 |
+| L3-4 | One progress checkpoint per durable sink write group instead of one per token | ADR-029, ADR-030 | Changes the documented behaviour of `every_row`; checkpoint rows hold no token position | 9 statements and 1 commit per sink token; 4.8 s of a 60.6 s gate run at the default cadence | L3 |
 | L3-5 | Validate the payload-store directory once per operation, or bind to a directory fd | Payload-store threat model | The earlier review left this alone as deliberate hardening | `lstat` per row 129–245 → about 45 | L3 |
 | L3-3 | Whether sinks stay deferred to the end of the run | ADR-030 D2, ADR-029, ADR-026 | Changes effect count, ids and output row order | Memory: about 7 kB peak RSS per narrow row today, projected ~1 GB at 100k rows | L3 |
 | L2-4 | Carry the canonical hash on the frozen row and hand rows to the node-state verbs | ADR-032 | Changes which object the Landscape hashes; two tests pin "Landscape receives a dict" | 2 canonicalisations and 2 thaws per token × node | L2 |
@@ -199,16 +246,20 @@ text it touches and the options are in the appendix.
 | E-9c | Skip barrier intake reads when the leader produced nothing to adopt | ADR-029 § E.2 | The ADR specifies per-iteration intake | About 2.5% of fork CPU | L4 |
 | L5-3 | Share one TLS context across the per-request SSRF clients | SSRF guard | Touches the SSRF path | 6 ms CPU per SSRF request | L5 |
 | L5-6 | Whether HTTP-transport providers need two call records per query | Call-recording contract | Changes the audit shape behind replay and verify | Up to 15 statements and 3 commits per query. Listed for completeness, not recommended as a performance fix | L5 |
+| L6-3 | Whether call payload refs need their own transaction (options A–C) | Call-recording order; no ADR records the row → file → ref sequence | Carrying the ref in the `calls` insert makes a crash leftover read `PURGED` instead of `HASH_ONLY` (`core/landscape/row_data.py:17-19`); writing the files first lets a deposed worker write blobs before the fence | A or B: 5 statements, 1 commit, ~1.4 ms CPU per call | L6 |
 
 ### D. Measurement owed
 
 | ID | Item | Status |
 |---|---|---|
-| M-1 | Repeat the baseline on PostgreSQL and with a follower worker. Every lane's numbers are SQLite, single process; several items (E-3, E-4, E-10, L3-2, R-2a) should matter more per round trip there | open — no Docker on the box used |
+| M-1 | PostgreSQL baseline and a follower-worker run. Scheduled in section A so there is a before-number; repeated after the SQL items | open — no Docker on the box used |
 | M-2 | Re-measure after section B and replace the estimates with measured figures | open |
 | M-3 | Profile one external-call pipeline | **done** (L5): ChaosLLM, zero latency, 300 rows, both providers |
 
 ### E. Examined and not recommended
+
+This table is a selection of the larger declines. Each appendix ends with its
+own complete list.
 
 | Item | Reason | Appendix |
 |---|---|---|
@@ -216,6 +267,7 @@ text it touches and the options are in the appendix.
 | R-8 record the catalog digest only for LLM pipelines | Moot once E-8a makes the digest cheap | L4 |
 | E-8b cache the runtime VAL manifest | At most 0.5 s; a sound cache key would be the manifest itself | L4 |
 | L2-9 hybrid C-`json` canonical serialiser | 4× faster and byte-identical on 36,000 cases, but a second serialiser behind a version pin is high risk for the gain | L2 |
+| L3-9 serialise each sink member row once | It would feed both sides of the divergence refusal at `engine/executors/sink_effects.py:1360-1364` from one retained byte string, for about 0.1% | L3 |
 | L4-2 retry wrapper, L4-3 per-node traversal loop | 11.65 µs per token × node; under 0.4% | L4 |
 | Input and output schema validation per transform attempt | Two distinct contracts, not a duplicate | L2 |
 | The executor's output hash | It converts NaN and Infinity into a routed violation (composer Fix 9 ruling) | L2 |
@@ -225,40 +277,86 @@ text it touches and the options are in the appendix.
 | L5-9 CSV source per-row validation | 46 µs per 10-column row at the trust boundary; nothing rebuilt per row | L5 |
 | L5-10 batching mixin thread handoffs | 55 µs per row; the worker thread is what makes timeout and eviction possible | L5 |
 | `BEGIN IMMEDIATE`, WAL, `synchronous=NORMAL` | Documented ADR-030 D5 choices | L1 |
+| Removing `allocate_call_index` before the external call | Its fence is the only item-lease check before the external effect; removing it would need ADR-048 reclassified | L6 |
+| Ingest thaw-then-freeze, fork-child deep copy, declaration-contract dispatch, `check_timeouts` scan, telemetry projection before the disabled check | Measured at 7 µs per row, 4.3 µs per child, ~10 µs of dispatcher per call across three distinct contract surfaces, 41 ns per pending group, and 1.3 µs with no manager when telemetry is off | L6 |
+| Sink-path row thaw (`engine/executors/sink.py:1557`) | Four consumers; its hash is the recorded `input_hash`, so it is decided by the L2-4 ruling | L6 |
+| Follower `live_leader` read per claim | A deliberate forced check | L6 |
+
+## Where this summary overrides an appendix
+
+| Item | Appendix says | Summary says |
+|---|---|---|
+| E-5 | L1: a repository memo keyed on run, node and hash. L2: an executor table keyed on the contract value | One design: executor memo keyed on node and version hash, entry added after commit; a confirmation, with TC |
+| E-6b | L2: engine only. L5: intern in `BaseTransform` | Two items: E-6b is L2's design; L5's is L5-11, after L5-7 |
+| E-3a | Seven read-backs including the routing-group ownership assertion | Six in section B; the assertion is E-3a-own in C1 |
+| E-3b | Two "written by this transaction" booleans | Witness records compared in memory |
+| E-10 | Ready, flagged for the maintainer in the text only | Confirmation in C1; refuse `FOR UPDATE`; saving restated net of E-4 |
+| L2-7 | Read frozen data in the declared-output-type check | Keep the thawed value there; pin the recorded type name |
+| L3-6 | Ready; pass hash and ref into the verb | Confirmation in C1; pass a prepared record |
+| L3-9 | Ready | Declined |
+| L4-1 | Exactness lost on eviction and on "journal restore (`:717`, `:1598`)" | Line 1598 is the `flush_pending` clear; any removal from `_completed_keys` falsifies exactness |
+| L5-1 | No ruling; confirm cookie policy | Confirmation in C1, naming both behaviour changes |
+| L5-4 | Both clients, all branches | LLM-client success path only |
+| L3-2 | Chunk size 900; test (c) expects the "disappeared" message | On SQLite the message becomes "member tokens are missing"; the lock-order argument assumes Python sort order equals the database's for the id format, which holds for hex UUIDs and should be tested; finalisation chunks at 500. Scheduled after the PostgreSQL baseline |
+| L3-8 | Raise fires "when an effect has 256 or more predecessors"; batch quarantine as an example | 256 predecessors pass and 257 fail; batch quarantine hashes are recorded as outcomes, not sink groups, and do not by themselves reach the cap |
+| L3-4 | 7.8% and 7.9% for the same figure | The sound number is 4.8 s of a 60.6 s run; single runs on a box that moved about ±15% |
+| E-4 | About 6% of gate CPU | A wrapped-region share the lane itself calls slightly high; quote the statement count |
+| L2 § 0 | A module-level `lru_cache` "cannot be used in this code" | Narrower: the runtime VAL manifest refuses one on contract hashing |
 
 ## Order
 
-1. **Instruments** — L4-8 with L1-2, then L4-6, L4-7, H-1 and H-2.
+1. **Instruments and baselines** — L4-8 with L1-2 (including the PostgreSQL
+   variant), M-1, L4-6, H-1 and H-2, and the full source-gate run against a
+   private copy of the E-3 / E-10 / L1-1 changes.
 2. **Raise the two defect rulings** — L2-6 and L3-8 — so they are not queued
-   behind performance work.
-3. **Super-linear terms** — L3-1, then E-11.
-4. **Independent, local, no SQL shape change** — E-6a, E-6b, E-5, L2-3, L2-2,
-   L2-1, L2-10, E-9a, L4-1, then the plugin group L5-2, L5-1, L5-4, L5-5,
-   L5-7, E-9b, and the startup pair E-8a, L4-4.
-5. **Landscape SQL, one testcontainer batch per group** — E-1a part 1 and
-   L1-1; then E-3a, E-3b; then E-10 and E-4 together (they change the same
-   read path); then L3-2; then E-1b part 1, after E-3 so removed statements
-   are not converted first; then L3-6.
-6. **Row hashing** — L2-5, L2-7, then L2-8 last because it touches the hash
-   of everything and its gain shrinks as the call count falls. L3-9 and L1-3
-   ride along.
-7. **Measure** — M-1 and M-2.
-8. **Remaining rulings, raised together with the M-1 and M-2 numbers** —
-   R-2a first (smallest, prototyped, shrinks E-1a part 2); L1-4, then E-1b
-   part 2 and E-1a part 2 behind it; R-2b; L3-4; L2-4; R-7 option A, then
-   B–D; L3-5; L3-3 after the sink fixes are re-measured; E-9c after L4-1;
-   L4-5; R-12; L5-3; L5-6.
+   behind performance work. Raise the C1 confirmations at the same time;
+   they are cheap to answer and several ready items wait on them.
+3. **Super-linear terms** — L3-1, then E-11. Both owe the testcontainer
+   suite.
+4. **Contract hashing** — E-6a, E-6b, then E-5 once confirmed.
+5. **Local changes** — L2-3, L2-10, E-9a, L4-1; L2-2 and L2-1 (TC, because
+   they sit on a path that takes a row lock); the plugin group L5-2, L5-4,
+   L5-7, E-9b, L5-11, L5-5, and L5-1 once confirmed; the startup pair E-8a
+   and L4-4.
+6. **Landscape SQL, one testcontainer batch per group** — E-1a part 1 and
+   L1-1; then E-3a, E-3b; then E-4, and E-10 once confirmed; then E-1b
+   part 1, after E-3 so removed statements are not converted first; then
+   L3-6 once confirmed.
+7. **Row hashing** — L2-5 after the L2-6 answer, L2-7, then L2-8 last
+   because it touches the hash of everything and its gain shrinks as the
+   call count falls. L1-3 rides with L2-8.
+8. **Measure** — M-1 again and M-2.
+9. **L3-2** — after step 8, because its saving and its deadlock risk exist
+   only on PostgreSQL.
+10. **Remaining rulings, raised together with the measured numbers** — R-2a
+    first (smallest, prototyped, shrinks E-1a part 2); L1-4, then E-1b
+    part 2 and E-1a part 2 behind it; R-2b; L3-4; L2-4; R-7 option A, then
+    B–D; L3-5; L3-3 after the sink fixes are re-measured; E-9c after L4-1;
+    L4-5; R-12; L5-3; L5-6.
 
-If L1-4 is ruled in early, E-1b part 2 becomes the largest single CPU item
-and should follow E-3 directly.
+Appendix L6's items slot in as follows: L6-6 and L6-4 with step 5; L6-1 with
+step 5 (TC); L6-7 and L6-8 with step 6, after E-10's confirmation because
+L6-8's saving depends on it; L6-2 and L6-9 are raised with the other C1
+confirmations in step 2; L6-5 rides with E-9b and L5-7; L6-3 is raised with
+the step 10 rulings. Three edits to existing items come from the same lane:
+add `_complete_node_states_many` to E-3a's site list; note that
+`pending_sink_bundle_clause()`'s host statement moves from E-1b part 1 to
+part 2 once E-3a folds it into an `UPDATE … RETURNING`; and note under R-7
+that none of options A–D covers a fork, coalesce or barrier transaction.
+
+If L1-4 is ruled in early, E-1b part 2 should follow E-3 directly and be
+measured then.
 
 ## Working rules for every fix
 
 - One fix per commit series. Run `scripts/branch-safety-check.sh` before
   each commit and push.
-- Read CONTRIBUTING.md § Whole-tree gates before writing code. Items that
-  move a function's identity (E-1, R-2a) re-pin the clock-authority and
-  mutation-fencing inventories deliberately; say so in the commit.
+- Read CONTRIBUTING.md § Whole-tree gates before writing code. These items
+  move a pinned inventory and must re-pin it deliberately, saying so in the
+  commit: E-1 and R-2a (function identity in the clock-authority and
+  mutation-fencing inventories); E-3b, E-10 and R-7 (they add to a closed
+  inventory); L3-6 (a signature in the frozen mutation-API inventory); L2-4
+  (the soft-mapping census).
 - No aliases, padding or reordering to reduce trust-tier signature churn.
   Several items edit files likely to carry signed suppressions
   (`clients/http.py`, `infrastructure/base.py`, the Landscape verbs); the
@@ -266,17 +364,52 @@ and should follow E-3 directly.
 - Smoke gate for every engine or Landscape change, as the composer plan
   used: same exit code, row counts, sink output digests, and
   `node_states` `input_hash` / `output_hash` values before and after on
-  `transform_pipeline` and `error_routing`.
+  `transform_pipeline` and `error_routing`. The smoke gate contains no
+  violations, so it cannot see a change to a recorded violation value;
+  items that touch a violation path (L2-7) need their own pinned test.
 - Items marked TC owe `pytest tests/ -m testcontainer -n 0` on a Docker
   host. Changes to shared runtime behaviour owe the full suite once before
   merge via `scripts/full-suite-gate.sh --execute --detach`.
 - Measure before claiming. Record counts from the L4-8 pins and CPU
   (user + sys), interleaving baseline and candidate; wall-clock on a shared
   box is not evidence.
-- Persisted data and public configuration: L3-4 changes the documented
-  behaviour of a config value, and L3-3 and L3-8 change effect counts and
-  ids for some runs. Each needs its compatibility position stated when
-  ruled.
+- Plugin source hashes. Editing a transform's module changes its
+  `source_file_hash`. For `value_transform` that hash is pinned three
+  times in `docs/architecture/dag/scenario-corpus/v1/manifest.yaml`, and
+  a changed hash makes a run interrupted before the upgrade refuse to
+  resume (`PLUGIN_IMPLEMENTATION_CHANGED`). So batch the plugin edits
+  (E-9b, L5-7, L6-5) into one change per plugin, and never edit a plugin
+  for a microsecond saving alone.
+- Compatibility. L3-4 changes the documented behaviour of a config value;
+  L3-3 and L3-8 change effect counts and ids for some runs; each needs its
+  compatibility position stated when ruled. Resume refuses a run whose
+  runtime VAL manifest has drifted (`engine/orchestrator/resume.py:639-648`),
+  and contract hashing is inside what the manifest covers, so E-6a (and any
+  other item editing manifest-covered code) makes runs interrupted before
+  the upgrade non-resumable after it. Which files the manifest covers was
+  not enumerated.
+
+## Review
+
+An independent reviewer read the first draft of this plan in full against
+the code and returned 31 findings: one blocker (L2-7 would have changed a
+recorded violation value), twelve major and the rest minor. All are applied
+in the summary above; the appendices are as the investigators wrote them,
+with the differences listed in "Where this summary overrides an appendix".
+Appendix L6 was added afterwards to close the coverage gap the review found;
+it and the summary rows drawn from it have not been independently reviewed,
+and none of its items was prototyped.
+
+The review also confirmed, by reading or experiment: the E-11 rewrite's
+equivalence; the L3-1 mechanism and its test-seam consumers; the L1-1
+caching claim; that the E-5 fold is a monotone join, so a skipped re-fold is
+sound; the L2-1 hash equivalence; the L2-6 defect; the L3-8 cap; and that no
+design needs a suppression or a new dynamic-attribute site.
+
+The review did not reach: any ADR text; verification of the ruling items'
+mechanisms against code; any pytest or gate run; E-4, E-8a, L4-4, L4-6,
+L4-7, L4-8, L5-7 and E-9b against code; whether existing tests pin behaviour
+that E-3a, E-3b or L2-8 would break; anything on PostgreSQL.
 
 ## Limits
 
@@ -286,17 +419,15 @@ and should follow E-3 directly.
 - The measurement lanes ran concurrently on a shared 4-core box. Counts are
   exact; CPU figures are indicative and A/B results rest on two to six
   pairs.
-- Most CPU percentages in section B are per-row counts multiplied by
-  micro-benchmark deltas, not end-to-end measurements. The measured
-  end-to-end figures are: the L2 prototype (−4.6% gate, −0.3% transform,
-  −17% at 100 columns), E-5 (−11% transform), R-2a (ingest 30 → 24
-  statements), and the earlier review's five-site prototype at a different
-  commit (−12% gate, −16 to −18% transform).
+- The end-to-end measurements at this commit are: the L2 prototype (−4.6%
+  gate, −0.3% transform, −17% at 100 columns), an E-5 variant (−11%
+  transform, two pairs), and R-2a (ingest 30 → 24 statements). The earlier
+  review's five-site prototype measured −12% gate and −16 to −18% transform
+  at a different commit and SQLAlchemy version; the per-item estimates here
+  account for roughly half of that transform figure, the difference is not
+  reconciled, and that review itself flagged the figure's drift.
 - No fix was run against the full default suite or the whole-tree gates.
-  Prototypes lived in private copies and are not retained; the harness
-  scripts are not committed (H-1, H-2).
-- Fork, expand, coalesce and aggregation verbs were traced for counts but no
-  item was designed against their specific SQL.
+  Prototypes lived in private copies and are not retained.
 - Each appendix lists what its investigator did not verify.
 
 ## Appendix L1 — Landscape SQL trunk: remediation plan
@@ -5193,3 +5324,655 @@ L5-1, L5-2 and L5-7 edit files that are likely on the signed tier-model allowlis
 - **PostgreSQL.** Everything is SQLite; the call-recording statement counts carry over, their cost does not.
 - **Bedrock, Gateway readiness, RAG and AWS transforms.** Client lifetimes were read for Bedrock and Gateway; their bodies and the RAG/AWS transforms were not read line by line.
 - **Web-run governance** (`llm_call_governance`) was `None` in every run, as it is for the CLI; out of scope.
+
+## Appendix L6 — Findings the draft plan neither remediates nor declines
+
+Lane L6 of the executor remediation effort. Verified at `bcc4e80f` (two
+docs-only commits on `1a7ff0e6`), SQLite, one process, CLI entry. Source paths
+are under `src/elspeth/` unless they start with `tests/` or `docs/`. Plan line
+numbers (`plan:N`) refer to `docs/development/executor-hot-path-remediation.md`.
+No tracked file was touched; `git status --short` is empty.
+
+Scope: the twelve findings listed in review finding 11
+(`.claude/lanes/exec-remediation/review/review.md`). Each one ends in either an
+item in the brief's format or a decline with the number that justifies it.
+
+### 0. What this lane found, in one page
+
+1. **External-call recording** is 16 statements / 3 commits per Azure call and
+   31 / 6 per OpenRouter call (L5's counts reproduced exactly). 10 of the 16
+   are transaction control, fences and a re-select of two immutable columns;
+   6 are work. The whole recording path is 5.0 ms CPU per call; the two
+   transactions that write nothing new (`allocate_call_index`,
+   `_record_call_payload_refs`) are 1.4 ms CPU each. Against a zero-latency
+   fake that is about 8% of the row; against a real provider call of 0.5 s or
+   more it is under 0.6%. Three items: one ready (L6-1), one ready with a
+   confirmation (L6-2), one ruling (L6-3).
+2. **The pre-effect fence in `allocate_call_index` is not waste** and should
+   stay. The index is allocated before the provider is called, so its fenced
+   transaction is the only item-lease check between claiming the item and
+   causing the external effect (`begin_node_state` checks membership only,
+   ADR-048 row 29). L5's note and review finding 11 describe it as
+   a transaction "to hand out an in-memory counter"; that is true only of the
+   four sites that allocate *after* the effect, immediately before
+   `record_call` (L6-1).
+3. **Carrying the payload ref in the insert changes a documented state.** A
+   crash between the row and the file today reads as `HASH_ONLY` ("payload was
+   never persisted"); with the ref in the insert it reads as `PURGED`
+   ("deleted (retention policy)"), which is false (`core/landscape/row_data.py:17-19`).
+   No ADR records the row → file → ref order. L6-3 frames the question.
+4. **`SinkEffectMember`**: 7 constructions and 14 canonicalisations per sink
+   row, confirmed by call-site trace. One construction is the ownership check;
+   the other six are `dataclasses.replace` calls that change only `ordinal`,
+   `member_effect_id` or `primary_effect_id` and re-verify content they did not
+   change. 250 µs per sink row at 5 columns, 1.9 ms at 100 (L6-4).
+5. **`pending_sink_bundle_clause()`** costs 276 µs per build and is built once
+   per row: about 1% of a gate row, the cheapest single win in this report
+   (L6-6). It needs no gate change.
+6. **Fork rows**: 393 statements, 61 transactions (27 write, 34 read) per
+   source row, reproduced and broken down by verb. Existing plan items cover
+   most of it. Three groups are not covered by any item: 16 statements that
+   re-read an immutable `ingest_sequence` (L6-7), 24 that read one token's
+   ownership two to four times before each fork and coalesce (L6-8), and 9
+   node-cursor existence checks behind a foreign key (L6-9).
+7. **Declined with a number**: the thaw-then-freeze at ingest (7 µs/row), the
+   plugin double copy as a standalone change (2.5 µs/row against a pinned
+   source hash and a corpus manifest re-pin), the fork-child deep copy
+   (4.3 µs/child), the sink thaw (needed by four consumers), declaration
+   dispatch (three distinct contract surfaces; dispatcher overhead ≈ 10 µs),
+   `check_timeouts` (41 ns per pending group), telemetry projection (1.3 µs,
+   only when telemetry is enabled), and the follower's leader read (deliberate).
+
+### Method
+
+Everything is under `.claude/lanes/exec-remediation/L6/`.
+
+| File | What it is |
+|---|---|
+| `trace.py` | SQLAlchemy listeners (`before/after_cursor_execute`, `begin`, `commit`, `rollback`) writing one JSON line per event in order: statement text, thread, elapsed, and the `src/elspeth` call stack (innermost first, 14 frames) |
+| `calltable.py` | Ordered statement table for one call's three verbs from a trace |
+| `verbclass.py`, `verbstmts.py`, `verbtable.py` | Marginal per-source-row counts between two run sizes, by Landscape verb × statement class, by statement shape, and by engine call site |
+| `time_calls.py`, `time_fn.py` | Call counts plus inclusive wall and thread-CPU time for named functions (`perf_counter`, `thread_time`) |
+| `count_fn.py` | `sys.setprofile` call counts with a caller chain |
+| `bench_misc.py` | Micro-benchmarks, CPU per call, best of five |
+| `prof_dispatch.py` | cProfile callees of the declaration dispatcher |
+| `chaos.yaml`, `wl/`, `mkwl.py`, `run_any.sh`, `run_trace.sh` | L5's ChaosLLM harness, copied, paths rewritten to L6 |
+| `setup_l4copy.py`, `work/` | L4's workload generator, copied |
+| `az_call_trace.txt`, `or_call_trace.txt`, `fork_verbclass.md`, `fork_verbstmts.txt`, `fork_verbtable.txt`, `prof_dispatch.txt` | Retained outputs |
+
+Runs (all exit 0, expected row counts): ChaosLLM zero latency, Azure and
+OpenRouter providers at 10 rows (traced) and 100 rows (timed); `fork_coalesce`
+at 20 and 40 rows (traced); `large_scale_test` gate at 50, 100, 300;
+`transform_pipeline` at 100, 150, 300. No other lane was running; load average
+was under 0.1 at the start.
+
+Instrument controls: the fork trace reproduces L1's independent totals exactly
+(393 statements, 52 pragmas, 45 clock reads, 9 leader CAS, 16 renewals, 20
+member fences, 53 commits and 8 rollbacks per source row, `plan:384`); the call
+trace reproduces L5's 16/3 and 31/6. `count_fn.py` first returned zero
+canonicalisations inside `SinkEffectMember.__post_init__` because it targeted
+`core.canonical.canonical_json` and the contract layer calls
+`contracts.hashing.canonical_json`; retargeted, it shows the 14.
+
+Limits: SQLite only; no PostgreSQL, no follower, no fault injection, no real
+provider. CPU figures carry timer-wrapper overhead of about 1 µs per call. No
+prototype was built for any item, so every "expected" count below is by
+construction from the trace, not measured after a change.
+
+---
+
+### Part 1 — External-call recording
+
+#### One call, end to end (Azure provider, row 5 of 10, `L6/az_call_trace.txt`)
+
+| # | Verb (`core/landscape/execution/calls.py`) | Statement | Call site | Class |
+|---:|---|---|---|---|
+| 1 | `allocate_call_index` `:139` | `BEGIN IMMEDIATE` | `database.py:288` | transaction |
+| 2 | | `UPDATE run_workers SET status=? WHERE run_id, worker_id, status` | `run_coordination_repository.py:541` | membership fence |
+| 3 | | `UPDATE token_work_items SET status=? WHERE run_id, work_item_id, attempt, token_id, row_id, lease_owner, status` | `item_fencing.py:43` | item fence |
+| 4 | | `SELECT node_states.run_id, token_id WHERE state_id = ?` | `calls.py:402` | ownership lookup (immutable columns) |
+| 5 | | `SELECT max(calls.call_index) WHERE state_id = ?` | `calls.py:193` | lookup; first allocation per state only |
+| — | | commit | | |
+| | *provider call happens here* | | | |
+| 6 | `record_call` `:613` | `BEGIN IMMEDIATE` | | transaction |
+| 7 | | membership fence | `:541` | fence |
+| 8 | | item fence | `item_fencing.py:43` | fence |
+| 9 | | parent select (`FOR UPDATE` on PostgreSQL) | `calls.py:402` | ownership lookup **and** the lock that serialises index remapping |
+| 10 | | `SELECT max(call_index), count(*) FILTER (WHERE call_index = ?)` | `calls.py:262` | lookup (collision probe) |
+| 11 | | `INSERT INTO calls (…)` | `calls.py:273` | **audit write** |
+| — | | commit | | |
+| | *two payload files written and fsynced here* (`calls.py:642`) | | | |
+| 12 | `_record_call_payload_refs` `:469` | `BEGIN IMMEDIATE` | | transaction |
+| 13 | | membership fence | | fence |
+| 14 | | item fence | | fence |
+| 15 | | parent select | `calls.py:402` | ownership lookup (immutable columns) |
+| 16 | | `UPDATE calls SET request_ref=?, response_ref=? WHERE call_id = ?` | `calls.py:452` | **audit write** |
+| — | | commit | | |
+
+By class: 3 transaction, 6 fence, 3 ownership lookup, 2 other lookups, 2 audit
+writes. No clock read: `calls.created_at` is the process clock
+(`calls.py:573`), which ADR-047 leaves alone. There is no read-back.
+
+OpenRouter (and Gateway) record two calls per query, the HTTP transport call
+and the logical LLM call: 4 + 5 allocate statements (the second allocation
+skips statement 5), 12 record, 10 ref-update = 31 statements, 6 commits
+(`L6/or_call_trace.txt`).
+
+#### Cost (`time_calls.py`, 100 rows, per call)
+
+| | Azure CPU ms | Azure wall ms | OpenRouter CPU ms (per record) |
+|---|---:|---:|---:|
+| `allocate_call_index` | 1.39 | 1.52 | 1.26 |
+| `record_call`, whole | 5.04 | 8.34 | 4.77 |
+| — `_prepare_call_payloads` | 0.37 | 0.38 | 0.38 |
+| — `_insert_allocated_call` (statements 10–11) | 0.84 | 0.89 | 0.78 |
+| — `_materialize_call_refs_after_insert` (2 files) | 1.12 | 4.12 | 0.92 |
+| — `_record_call_payload_refs` | 1.43 | 1.54 | 1.27 |
+| `_verify_state_parent`, each of 3 | 0.22 | 0.23 | 0.22 |
+| `FilesystemPayloadStore.store`, each | 0.52 | 2.15 | 0.44 |
+
+Marginal CPU for an Azure row in these runs is about 34 ms, so allocation plus
+the ref update is 2.8 ms, about 8% of a zero-latency row. L5's py-spy figures
+(1.05 and 2.8 ms) were wall samples under load; the wrapper figures here are
+the ones to use. The saving is a statement, commit and write-lock count, not a
+wall-clock one, on any pipeline that calls a real provider.
+
+#### What `allocate_call_index` is for
+
+`allocate_call_index` (`calls.py:137-146`) takes the item-fenced transaction,
+re-verifies the parent state and hands out a process-local proposal
+(`:182-200`). `record_call` then re-fences, re-verifies, probes for a collision
+and remaps the proposal if another writer took it (`:258-273`). So the
+allocation transaction writes nothing and its index is only a proposal.
+
+What it does do depends on where it is called:
+
+| Site | Position | What the fenced transaction buys |
+|---|---|---|
+| `plugins/infrastructure/clients/http.py:1469` (read: limiter wait at `:1468`, then allocate, then the request); `:1833`, `:2190`, `clients/retrieval/chroma.py:263`, `:516`, `plugins/transforms/pdf_rasterize.py:632` (same position by the surrounding lines, not read end to end) | before the external effect | **An authority check before the effect.** A worker whose item was reclaimed, or that was evicted, is refused before it calls out |
+| `clients/llm.py:735` | before the request is built and before the rate-limit wait at `:769` | The same check, but a limiter wait can separate it from the effect |
+| `plugins/transforms/llm/providers/openrouter.py:560`, `:604`; `providers/gateway.py:777`, `:821` | **after** the effect, on the line before `record_call` | Nothing: `record_call` takes the same two fences and the same parent select in the next transaction |
+
+`docs/architecture/adr/048-required-coordination-token-for-landscape-mutations.md`
+lists `allocate_call_index` as mutation API 38, ITEM-fenced (`:597`), and the
+mutation-fencing gate pins it
+(`tests/unit/architecture/test_web_landscape_mutation_fencing.py:245`, `:578`).
+
+#### What a crash leaves behind today
+
+Order in `record_call`: fenced insert of the `calls` row with both hashes and
+NULL refs (`:613-628`), commit; store the request file, then the response file,
+each temp-file + fsync + rename + directory fsync (`:642`,
+`core/payload_store.py:157-266`); fenced update of the refs (`:645`).
+
+| Crash or failure point | `calls` row | Payload files | Reads back as (`calls.py:1353-1370`) |
+|---|---|---|---|
+| after the provider answered, before the insert commits | none | none | the effect is unrecorded; the open node state is all that shows an attempt |
+| after the insert commits | present; `request_hash`, `response_hash` set; refs NULL | none | `HASH_ONLY` — "recorded (hash exists) but payload was never persisted" (`row_data.py:19`) |
+| after one or both files are stored | same | 1–2 unreferenced blobs | `HASH_ONLY`, although the bytes are in the store under the recorded hash |
+| ref update refused (lease or membership lost after the insert) | same | 2 unreferenced blobs | `HASH_ONLY`; `SchedulerLeaseLostError` propagates |
+| store raises (`OSError`) | same | 0–1 blobs | `HASH_ONLY`; `LandscapePostCommitError` (`:372`) |
+| ref update commits | refs set | 2 blobs | `AVAILABLE` |
+
+Two facts hold today and are not written down anywhere I could find: a
+non-NULL ref has always named a blob that existed, so `PURGED` is only ever
+produced by retention; and the `calls` row is durable before any payload file
+I/O starts. No reconciler attaches an orphaned blob to a `HASH_ONLY` row (grep
+for `request_ref.is_(None)` and `HASH_ONLY` finds only the readers at
+`calls.py:1314`, `:1355`, `clients/replayer.py:258`, `clients/verifier.py:397`
+and the legacy purge fallback at `reproducibility.py:320-326`).
+
+---
+
+#### L6-1 — Allocate inside the record transaction where nothing separates them
+
+**Finding.** Review finding 11 (a); L5 "Notes for other lanes" (`plan:5133`). No prior-review ID.
+
+**Mechanism (verified at bcc4e80f).** At four sites the allocation is followed directly by `record_call` with no external effect between them: `plugins/transforms/llm/providers/openrouter.py:560-561`, `:604-606`, `providers/gateway.py:777-778`, `:821`. Each opens `fenced_item_transaction` (`core/landscape/execution/calls.py:139`), runs `_verify_state_parent` (`:145`) and `_allocate_call_index_on` (`:146`), commits, and then `record_call` opens the same fenced transaction and runs the same parent select (`:613-619`). `record_operation_call` has the same shape internally: with `call_index=None` it calls `allocate_operation_call_index` in its own leader-fenced transaction (`:729-730`, `:204-211`) before opening its record transaction.
+
+**Evidence.** OpenRouter trace: the second allocation per query is 4 statements and 1 commit (`L6/or_call_trace.txt`); 1.26 ms CPU per allocation (`wl/orfast_100/time.json`).
+
+**Change.** Let `record_call` take `call_index: int | None`. With `None` it calls `self._allocate_call_index_on(conn, state_id)` inside its own transaction, after the fences and `_verify_state_parent`, and proceeds as today (`allocation_is_owned` is then true by construction). The four provider sites drop their `allocate_call_index` line and pass `None`. Do the same inside `record_operation_call`: move the `allocate_operation_call_index` work into its record transaction. `allocate_call_index` stays, unchanged, for the pre-effect callers.
+Rejected: removing the pre-effect allocation transaction (see section 3 at the end; it is an authority check). Rejected: allocating in memory with no connection at these four sites (loses the first-use seed from `calls`, and still leaves a signature change).
+
+**Must not change.** The recorded `call_index` values: the HTTP call still takes the lower index because it still allocates before the effect, and the logical call still takes the next. `UNIQUE(state_id, call_index)`, the collision remap under the parent lock (`:258-273`), `_finish_allocation` bookkeeping, both fences as the first statements of the record transaction. What a crash leaves behind is unchanged: the allocation transaction wrote nothing.
+
+**Risk.** Low. The mutation-fencing gate pins the caller set and the mutation API signatures (`tests/unit/architecture/test_web_landscape_mutation_fencing.py:245`, `:578`, `:2244`); `record_call`'s signature and the provider call sites move, so its inventories are re-pinned deliberately. `providers/openrouter.py` and `gateway.py` are plugin-adjacent files; check whether they carry signed tier-model suppressions before editing.
+
+**Ruling needed.** No.
+
+**Verification.** `tests/unit/core/landscape/test_call_recording.py`, `test_call_token_persistence.py`, `test_expanded_call_identity.py`, `test_ci_coverage_calls.py`; the provider suites under `tests/unit/plugins/transforms/llm/`; the mutation-fencing gate in full. New test: two records on one state, the first allocated pre-effect and the second with `None`, get indices 0 and 1; negative control — a second repository instance that has already inserted index 1 forces the remap and the test asserts index 2, proving the in-transaction allocation still goes through the collision probe. Testcontainer suite owed (lock and transaction change). Measurement: `trace.py` on `wl/orfast_10`, expect 31 → 27 statements and 6 → 5 commits per query.
+
+**Expected saving.** OpenRouter and Gateway: 4 statements, 1 commit, one write-lock acquisition and about 1.3 ms CPU per query. Azure and Bedrock: none. Source and sink operation calls: 1 leader-fenced transaction per call (unmeasured here).
+
+---
+
+#### L6-2 — Stop re-selecting the parent state's immutable columns
+
+**Finding.** Review finding 11 (d). No prior-review ID.
+
+**Mechanism (verified at bcc4e80f).** `_verify_state_parent` (`calls.py:400-408`) selects `node_states.run_id, token_id` for the state and compares them with the claimed item. It runs three times per call: in the allocation (`:145`), the record (`:619`) and the ref update (`:475`). Neither column is ever updated. In `record_call` the select carries `with_for_update(of=node_states_table)` and is the lock the comment at `:259-261` relies on to make the collision probe and the insert atomic on PostgreSQL. In the other two transactions nothing depends on that lock: the allocation inserts nothing, and the ref update addresses the row by `call_id`.
+
+**Evidence.** 0.22 ms CPU per select, three per call (`wl/az_100/time.json`).
+
+**Change.** Keep a bounded per-repository set of verified `(state_id, run_id, token_id)` triples, added to only after a select has returned and matched. `allocate_call_index` and `_record_call_payload_refs` skip the select when the triple is present. `record_call` always runs it, because there it is a lock. Evict on a simple FIFO bound (the natural size is the number of states with a call in flight).
+Rejected: dropping the check from the ref update outright and adding `AND state_id = ?` to the `UPDATE` (proves the call belongs to the state, not that the state belongs to the item). Rejected: the same memo for `record_call` (removes a lock).
+
+**Must not change.** The first use of any state by a repository instance still verifies against the database. A mismatch still raises `AuditIntegrityError` before any write. The fences are untouched.
+
+**Risk.** Low. It rests on `node_states.run_id` and `token_id` being immutable and on `node_states` rows never being deleted while a run is live; both hold in every `UPDATE` on that table I read (`execution/node_states.py:630`, `:824`), and I did not find a delete.
+
+**Ruling needed.** No — maintainer confirmation that an ownership check on immutable columns may be per process per state rather than per transaction (the same shape of confirmation review finding 2 asks for on E-5).
+
+**Verification.** `tests/unit/core/landscape/test_call_recording.py`, `test_call_token_persistence.py`. New test: a call recorded against a state that belongs to another token raises on the first use (negative control: seed the memo by hand in the test and show the same call no longer raises, which proves the test is exercising the database check and not the memo). Testcontainer suite owed. Measurement: trace, expect one statement fewer on a state's first call (16 → 15: the allocation's select populates the memo and the ref update skips its own) and two fewer on later calls of the same state (15 → 13).
+
+**Expected saving.** 1 statement and about 0.2 ms per call; 2 per call from the second call on a state. Small. Do it with L6-1 or not at all.
+
+---
+
+#### L6-3 — Decide whether the payload refs need their own transaction
+
+**Finding.** Review finding 11 (b); L5 "Notes for other lanes" (`plan:5131`); recon Appendix B § 8. No prior-review ID.
+
+**Mechanism (verified at bcc4e80f).** As traced above: `record_call` commits the row with NULL refs, stores the files (`calls.py:642`, `_materialize_call_refs_after_insert` `:377-398`), then runs `_record_call_payload_refs` (`:458-476`), a third fenced transaction whose only write is `UPDATE calls SET request_ref, response_ref` (`:451-456`). The ref is the content hash: `store()` returns `sha256(content)` (`core/payload_store.py:230`) and `get_call_response_data` requires `sha256(payload) == response_hash` (`calls.py:1396-1398`), so `ref == hash` for every stored payload and the value is known before the insert. `record_operation_call` has the same three-step shape (`:478-495`).
+
+**Evidence.** 5 statements, 1 commit, 1.43 ms CPU per call (Azure); 10, 2, 2.5 ms per OpenRouter query. The two file writes are 4.1 ms wall per call and are the larger cost; no option below changes them.
+
+**Change.** Three options. Only C is free of a ruling.
+
+| | A. Ref in the insert, files after the commit | B. Files first, then one insert carrying the refs | C. Keep the order, cheapen the third transaction |
+|---|---|---|---|
+| Transactions per call | 2 | 2 | 3 |
+| Crash after the row commits, before the files | row with refs, no blob → reads **`PURGED`** ("deleted (retention policy)") for a payload that never existed | not reachable | row with hashes, NULL refs → `HASH_ONLY` (today) |
+| Crash after the files, before the row | not reachable | **2 blobs and no `calls` row**; the effect is unrecorded | not reachable |
+| Window in which a completed external call has no `calls` row | as today (≈ 1.2 ms: prepare + insert) | today plus the two file writes (≈ 5.3 ms wall measured here; more on network storage) | as today |
+| Store raises | needs a compensating fenced `UPDATE` to NULL the refs — the third transaction returns on the failure path, and if it also fails the ref dangles | insert the row with NULL refs, then raise `LandscapePostCommitError`: same end state as today | as today |
+| Deposed worker (lease lost before recording) | refused at the insert, before any file (today) | writes 2 orphan blobs **before** it reaches the fence | refused at the insert (today) |
+| "A non-NULL ref named a blob that existed" | **no longer true** | true | true |
+| Saving per call | 5 statements, 1 commit, ≈ 1.4 ms CPU | same | with L6-2: 1 statement, ≈ 0.2 ms |
+
+- *C* is L6-2 plus the membership-fence prebuild already in the plan (E-1a part 1). Nothing else in that transaction can go without touching a fence.
+- *B* is the form the source-row path already uses, where the blob is written before the row that references it (`core/landscape/data_flow/tokens.py:346-363`). Its cost is the one review finding 4 raised against L3-6: file I/O moves ahead of the fence.
+- *A* is the form L5's note suggests. I recommend against it: it makes the retention state lie, and it needs the third transaction back on the failure path.
+
+Rejected: a "payload pending" marker column so A can tell a crash from a purge (a schema change to save one transaction). Rejected: storing only the request file before the effect, since its bytes are known then (the response ref still needs a second write).
+
+**Must not change.** `calls.request_hash` and `response_hash` values; that the hash survives when the payload does not (`docs/release/guarantees.md` § 1.4); the `CallDataState` each reader branches on (`clients/replayer.py:258-266`, `clients/verifier.py:397`); both fences ahead of every `calls` write (ADR-030 D4, ADR-048 rows 38–39).
+
+**Risk.** C: Low. B: Medium — error precedence changes (a store `OSError` can now precede the lease-lost refusal), and the no-row window widens. A: High.
+
+**Ruling needed.** Yes, for A or B. No ADR records the row → file → ref order; the nearest texts are ADR-048 (`docs/architecture/adr/048-required-coordination-token-for-landscape-mutations.md`, the fenced mutation inventory, which a removed DML owner re-pins) and the state definitions in `core/landscape/row_data.py:17-19`. Questions:
+1. Is "a non-NULL `request_ref` / `response_ref` always named a blob that was written" an invariant you rely on, so that `PURGED` means retention and nothing else? If yes, A is out.
+2. Is "the `calls` row is durable before any payload file I/O" intended — that is, should a provider call that completed be on record within about a millisecond even if the payload store is slow or failing? If yes, B is out and only C remains.
+3. If B is acceptable: may a worker that has already lost its lease leave two unreferenced blobs before the fence refuses it?
+Whatever the answer, it deserves a paragraph in an ADR or in `row_data.py`, because the order is currently carried only by the code.
+
+**Verification.** `tests/unit/core/landscape/test_call_recording.py`, `test_call_mode_persistence.py`, `test_call_token_persistence.py`; `tests/unit/plugins/` replayer and verifier suites. New tests per option: a store that raises on the second file leaves a row whose `get_call_response_data` state is the one the option's column above states (negative control: assert the *other* option's state and see it fail); for B, a fence that refuses leaves no `calls` row. Testcontainer suite owed. Measurement: trace, expect 16 → 11 statements and 3 → 2 commits per Azure call under A or B.
+
+**Expected saving.** A or B: 5 statements, 1 commit and about 1.4 ms CPU per recorded call (twice that per OpenRouter query). On PostgreSQL that is five round trips and a WAL flush per call; unmeasured. Under 0.3% of the wall time of a real provider call.
+
+#### (c) Double serialisation and the third hash — covered, no new item
+
+`_prepare_call_payloads` hashes and then separately serialises each payload (`calls.py:334-342`); **L2-1** already designs serialising once (`plan:2241-2291`). The payload store's own `sha256` (`core/payload_store.py:230`) is the content address the store derives from the bytes it was handed; it is 1–2 µs on a call-sized payload and is the only derivation independent of the caller. Leave it. One observation for whoever lands L2-1: nothing today compares the ref the store returns with `prepared.request_hash` (`calls.py:370-375`). Before L2-1 that comparison would be a real cross-check of two serialisations; after L2-1 both sides come from one byte string and the comparison proves only the store's addressing.
+
+---
+
+### Part 2 — `SinkEffectMember`
+
+#### L6-4 — Verify a sink member's content once; rebind ordinals without re-verifying
+
+**Finding.** Review finding 11 ("Other orphans"), L2 "Handed to other lanes" (`plan:2801-2827`), corrections row `plan:71`. L3-9 covers two other serialisations, not this. No prior-review ID.
+
+**Mechanism (verified at bcc4e80f).** `SinkEffectMember.__post_init__` (`contracts/sink_effects.py:546-580`) parses `lineage_json`, re-canonicalises it and compares (`:562-566`), re-hashes it (`:569`), walks the row (`:576`), then thaws, canonicalises and hashes the row and compares with `payload_hash` (`:579`), and deep-freezes it (`:581`). `dataclasses.replace` runs `__post_init__` again. Per sink row (`count_fn.py`, gate workload, caller chains in `work/gate_50/sem.json`):
+
+| # | Site | How | Fields that change | Class |
+|---:|---|---|---|---|
+| 1 | `core/landscape/execution/sink_effect_identity.py:292` | constructor | all | **Ownership check — keep.** `payload_hash` comes from `type_faithful_stable_hash(candidate.row)` (`:271`) and the constructor re-derives it through the contract layer's canonical JSON over the frozen row: two code paths, one stored value |
+| 2 | `sink_effect_identity.py:387` | `replace` | `member_effect_id` | incidental re-derivation |
+| 3 | `contracts/sink_effects.py:622` | `replace` | `ordinal`, `member_effect_id=None` | incidental |
+| 4 | `sink_effect_reservation.py:112` | `replace` | `ordinal`, `member_effect_id=None` | incidental |
+| 5 | `sink_effect_reservation.py:153` | `replace` | `member_effect_id` | incidental |
+| 6 | `engine/executors/sink_effects.py:1141` | `replace` | `ordinal`, `member_effect_id` | incidental |
+| 7 | `engine/executors/sink_effects.py:1242` (also `:1237`, `:1240` on the replacing-target branches) | `replace` | `ordinal` | incidental |
+
+Sites 2–7 copy `row`, `payload_hash`, `lineage_json` and `lineage_hash` by reference from an instance whose constructor verified exactly those objects. The class is `frozen=True, slots=True` and the row is deep-frozen, so the binding cannot have changed. Re-running the check compares a value with itself.
+
+Real cross-checks on this path, which stay exactly as they are (review finding 14):
+
+- construction 1 above;
+- `_persist_pipeline_member_payloads` (`engine/executors/sink_effects.py:1360-1364`): re-encodes the row and compares the payload store's content hash with `member.payload_hash`. Do **not** feed it retained bytes;
+- `_hydrate_member` (`:1377-1380`): recovery from stored bytes, a construction from durable evidence;
+- `compute_pipeline_membership_hash(members) != effect.membership_or_manifest_hash` (`:1349`);
+- the `SinkEffectReservationRequest` checks on uniqueness and primary linkage (`contracts/sink_effects.py:612-640`).
+
+**Evidence.** 7.00 constructions and 14.00 `contracts.hashing.canonical_json` calls per sink row (lines 566 and 579, seven callers each). `bench_misc.py`: `replace(member, ordinal=1)` is 41.6 µs at 5 columns and 318 µs at 100; first construction 37.8 and 315 µs. In a transform run the seven cost 428 µs per row (`work/transform_300/timefn.json`), 1.3% of a 33 ms row.
+
+**Change.** Add an instance method that rebinds without re-verifying content:
+
+```python
+def rebound(self, *, ordinal: int | None = None,
+            member_effect_id: str | None | _Keep = KEEP,
+            primary_effect_id: str | None | _Keep = KEEP) -> SinkEffectMember:
+    """Same verified content, new position or linkage."""
+```
+
+It validates only what it is given (`require_int` on the ordinal, `_require_lower_hex_64` on the ids, and the `routing_context.primary_effect_id` agreement at `:557-560` when the primary changes), builds the new instance with `object.__new__` and `object.__setattr__` on the declared slots, and copies the content fields by reference from `self`. The proof of verification is that `self` exists: the only way to get a `SinkEffectMember` is the constructor. The six `replace` sites call `rebound`. `replace(member, row=…)` and the constructor keep full verification.
+Alternative if a gate objects to `object.__new__`: split the class into a verified `SinkEffectMemberContent` and a thin binding that checks `type(content) is SinkEffectMemberContent` (ADR-032), with read-only properties so `member.row` still works. More churn: 11 source files and 22 test files name the class, 17 test constructions.
+Rejected: a constructor argument or private field that says "already verified" (a trust statement; review finding 7 objects to that shape). Rejected: caching the canonical bytes on the member and reusing them at `:1360` (turns the divergence refusal there into a tautology; review finding 14).
+
+**Must not change.** Every recorded value: `payload_hash`, `lineage_hash`, `membership_or_manifest_hash`, effect and member ids. Field-wise equality of the resulting member with what `replace` returns today. The five cross-checks listed above. Sink effect ids for existing runs (resume and reconcile rebuild the same members).
+
+**Risk.** Low–Medium. The class is at the centre of the sink effect protocol and its tests construct invalid members on purpose; a `rebound` that forgot one binding check would let an inconsistent routing context through. `contracts/sink_effects.py` is not a plugin file, so no `source_file_hash` moves. Whether a whole-tree gate inventories `object.__setattr__` sites was not checked.
+
+**Ruling needed.** No.
+
+**Verification.** `tests/unit/contracts/test_sink_effect_contract.py`, `test_sink_effect_carrier_boundaries.py`; `tests/unit/core/landscape/test_sink_effect_identity.py`, `test_sink_effect_reservation.py`, `test_sink_effect_reservation_integrity.py`, `test_sink_effect_lifecycle_integrity.py`, `test_sink_effect_result_derived_reconcile.py`. New tests: (1) for each of the six field combinations, `member.rebound(…) == dataclasses.replace(member, …)`; (2) `rebound` with a negative ordinal, a non-hex id, or a primary that disagrees with the routing context raises — negative control: the same three through `replace` raise today, so the test file shows both; (3) a count pin, 1 content verification per sink row, with a mutant that reverts one site to `replace` going red. The smoke gate's sink output digests and effect ids before and after. Testcontainer suite not owed by this change alone (no SQL), but the sink effect lock-order tests there construct members; run them once. Measurement: `count_fn.py` 7 → 1 `__post_init__` and 14 → 2 canonicalisations per sink row; `time_fn.py` on `transform_300`.
+
+**Expected saving.** 6 × 41.6 µs ≈ 250 µs per sink row at 5 columns (≈ 0.8% of the row), 1.9 ms at 100 columns. Twelve of the fourteen canonicalisations.
+
+---
+
+### Part 3 — Row copies
+
+#### L6-5 — Remove the plugin double copy when the file is next edited (not standalone)
+
+**Finding.** Review finding 11; L2 handed it to L5 (`plan:2801-2827`), L5 listed it as "not this pattern" (`plan:4985`).
+
+**Mechanism (verified at bcc4e80f).** `PipelineRow.to_dict()` returns a fresh deep copy (`contracts/schema_contract.py:733-743`, `deep_thaw`). These sites deep-copy that fresh copy again:
+
+| Site | Code |
+|---|---|
+| `plugins/transforms/value_transform.py:589` | `copy.deepcopy(row.to_dict())` |
+| `value_transform.py:593` | a second `row.to_dict()` only to read the keys |
+| `value_transform.py:601` | a `PipelineRow` (deep freeze) built per operation |
+| `plugins/transforms/type_coerce.py:419` | `copy.deepcopy(row.to_dict())` |
+| `plugins/transforms/truncate.py:222` | same |
+| `plugins/transforms/passthrough.py:116` | `PipelineRow(copy.deepcopy(row.to_dict()), …)` |
+| `plugins/transforms/reference_join.py:1076` | same pattern |
+| `plugins/transforms/batch_replicate.py:360` | same, once per copy |
+
+Not the pattern: `blob_text_expand.py:502`, `json_explode.py:554`, `line_explode.py:572`, `blob_csv_expand.py:509`, `blob_json_expand.py:603`, `pdf_rasterize.py:1107` copy a shared `base` once per child, which is needed; `field_mapper.py:825` copies `row_data`, not re-read here.
+
+**Evidence.** `bench_misc.py`, 5 columns / 100 columns: `row.to_dict()` 1.1 / 19.7 µs; `copy.deepcopy(row.to_dict())` 3.7 / 65.5 µs; `PipelineRow(dict, contract)` 2.3 / 39.6 µs. So the redundant copy is 2.5 µs per row at 5 columns and 46 µs at 100; the key-set thaw is 1.4 / 22 µs; the per-operation row is 2.3 / 40 µs per operation. `ValueTransform.process` is 380 µs per call and `TypeCoerce.process` 129 µs (`work/transform_300/timefn.json`), so the copies are about 2% of the plugin and under 0.02% of a 33 ms row.
+
+**Change.** `output = row.to_dict()` at each site; in `value_transform.py`, take `original_fields` from `working_data` before the loop, and keep the per-operation `PipelineRow` (an operation's result has to be visible to the next one under dual-name access). Do it only inside a commit that already edits the same file — E-9b and L5-7 both edit `value_transform.py` — and never as a change of its own.
+
+**What the `source_file_hash` pin is.** Every plugin class declares `source_file_hash = "sha256:<16 hex>"` over its own file's bytes with that line normalised (`value_transform.py:366`, `type_coerce.py:343`; computed by `scripts/cicd/plugin_hash.py`). It is recorded on the run's `nodes` row at registration (`engine/orchestrator/landscape_registration.py:131`). Any byte change to the file moves it. Updating it involves:
+
+1. Recompute after `ruff format` with the command in CONTRIBUTING.md § "Gate: plugin inventories, source hashes, scenario-corpus manifest, fingerprint baseline" (`CONTRIBUTING.md:383`) and edit the declaration; the lint rule `plugin_contract.plugin_hashes` (PH3, stale hash) runs in pre-commit and CI (`.pre-commit-config.yaml:105`, `.github/workflows/ci.yaml:145`).
+2. Re-pin `docs/architecture/dag/scenario-corpus/v1/manifest.yaml`, which holds audit records literally. It contains `value_transform`'s current hash `7d4ce6833cb24ca0` three times; it does not contain `type_coerce`'s or `truncate`'s. Then any `resumed_full_projection_sha256`, then `tests/unit/architecture/test_dag_scenario_corpus_contract.py::EXPECTED_CASE_REGISTRY_SHA256`, in that order (`CONTRIBUTING.md:389-393`).
+3. Run `tests/integration/core/dag` and `tests/unit/architecture`.
+4. Accept the operational consequence: resume compares the recorded hash with the current one and refuses with `PLUGIN_IMPLEMENTATION_CHANGED` (`engine/orchestrator/implementation_compatibility.py:25-33`), and source replay does the same (`engine/orchestrator/source_replay.py:316`). A run interrupted before the upgrade that used the edited plugin cannot be resumed after it. That is the existing refuse contract, but under the 0.8.5 compatibility posture it has to be stated per release. `plugin_version` is not bumped for this (`CONTRIBUTING.md:387-388`).
+
+**Must not change.** The emitted row and its hash; atomic rollback (an error returns before the working copy is used).
+
+**Risk.** Low for the code; the cost is the re-pin and the resume refusal.
+
+**Ruling needed.** No.
+
+**Verification.** `tests/unit/plugins/transforms/test_value_transform.py`, `test_type_coerce.py`, and the equivalents for the other four; new test per plugin: mutate a nested value in the output and assert the input `PipelineRow` is unchanged (negative control: a shallow `dict(row._data)` version fails it). Testcontainer not owed.
+
+**Expected saving.** 2.5–6 µs per row per transform at 5 columns; 46–110 µs at 100. Not worth a hash re-pin by itself.
+
+#### Declined in this part
+
+| Finding | Mechanism (verified) | Number | Decision |
+|---|---|---|---|
+| 3. `SourceIngestSpec` thaw-then-freeze | `engine/processor.py:2989` `pipeline_row.to_dict()`, then `freeze_fields(self, "data")` at `contracts/scheduler.py:62`. `deep_freeze` always copies a `MappingProxyType` to detach it (`contracts/freeze.py:59-63`), so handing the frozen data over would still copy once | 14.8 µs per row measured in a run for `__post_init__` (4 columns), 7.0 µs for the pair in isolation, 73 µs at 100 columns: 0.05% of a row | **Not fixing.** If L2-4 or L2-5 lands and rows are handed over frozen, pass the `PipelineRow` and let the spec check `type(…) is PipelineRow`; do not open the file for this alone |
+| 5. `engine/executors/sink.py:1557` thaw and `node_states.py:493` hash | One `to_dict()` per sink row; the dict then feeds `begin_node_states_many` (`:634-642`), `_validate_sink_input` (`:778`), the canonical round trip (`:810`) and the effect candidates. The hash at `core/landscape/execution/node_states.py:493` is the sink state's recorded `input_hash` | 1 thaw (1.1 µs at 5 columns) with four consumers; 1 `stable_hash` | **Not a separate item.** The thaw is needed. The hash is a recorded audit value derived by the repository; carrying it instead is L2-4 (ruling). L2-5 makes it cheaper |
+| 7a. `copy.deepcopy` per fork / expand child | `engine/tokens.py:367` `copy.deepcopy(data)` on a `PipelineRow`, which is `PipelineRow(self.to_dict(), …)` (`schema_contract.py:818-833`); `engine/tokens.py:676` `PipelineRow(copy.deepcopy(row_data), …)`, a copy followed by the freeze's own copy | 4.3 µs per fork child at 5 columns, 61 µs at 100; the redundant half at expand is 2.5 / 39 µs. A fork row costs about 110 ms CPU | **Not fixing.** The deep copy also isolates opaque mutable leaves that `deep_freeze` passes through unchanged (`freeze.py:88-89`); removing it trades 0.004% for a sharing hazard |
+
+---
+
+### Part 4 — Engine control findings
+
+All four are declined.
+
+| Finding | Mechanism (verified) | Number | Decision |
+|---|---|---|---|
+| 6. Declaration-contract dispatch three times per row × transform | `engine/executors/declaration_dispatch.py:124-170`. The three sites are three contract surfaces: boundary (source `processor.py`, sink `executors/sink.py:564`), pre-emission (`executors/transform.py:536`), post-emission (`:661`). The dispatcher is audit-complete by design: every applicable contract runs, none short-circuits (`:134-136`) | 6.00 dispatches per row on a two-transform pipeline, 70 µs each, 406 µs per row (1.2%). cProfile: the time is inside the four post-emission contract bodies; the dispatcher's own work (registry read under a lock, tuple copy, `applies_to`) is about 13%, ≈ 10 µs per dispatch (`L6/prof_dispatch.txt`) | **Not fixing.** Not a duplicate. The contract bodies' thaws are L2-7's subject. The only removable part is ≈ 3 µs of lock and tuple copy per dispatch once the registry is frozen |
+| 8. `check_timeouts` scans pending groups per source row | `engine/coalesce_executor.py:1513-1527`: returns before the scan when `timeout_seconds is None`; otherwise iterates every entry of `self._pending`. Called once per registered coalesce per source row (`engine/orchestrator/outcomes.py:450-455`) | 0.14 µs with one pending group, 41 µs with 1,000, 4.2 ms with 100,000 (`bench_misc.py`). In a single-leader drain each row's branches arrive before the next row is read, so the map holds 0–1 groups | **Not fixing.** Linear in pending groups, 41 ns each, only when a timeout is configured. It becomes worth an ordered structure only if a workload holds tens of thousands of groups open; none was produced here |
+| 9. `TelemetryManager.handle_event` projects before the disabled check | `telemetry/manager.py:428` projects, `:434-454` runs observers, `:457-465` checks disabled / no exporters / granularity. The order is deliberate: observers must see the projected event and must run before granularity filtering (`:430-433`). With telemetry off there is no manager at all (`telemetry/factory.py:208-210`, `engine/processor.py:1039`) | 1.29 µs per event (`bench_misc.py`), paid only when telemetry is enabled and the event is then filtered | **Not fixing.** A two-line early return when there are no observers and no exporters is correct but saves about 3 µs per row in a configuration that warns at startup |
+| 10. Follower `live_leader` read per claim | `engine/orchestrator/follower.py:373-375`: `ensure_leader_live(force=True)` before each claim. The same closure has an interval-throttled path (`:361-368`) and the claim path opts out of it. `live_leader` is one read transaction, a clock read and a seat select (`core/landscape/run_coordination_repository.py:1219-1231`) | 3 cursor statements per follower claim, against 11 in the claim transaction that follows. No follower was run by any lane | **Not fixing.** Deliberate, pinned by `tests/unit/engine/orchestrator/test_follower_processor.py`, and it stops a follower claiming work in a run whose leader is gone. Measure it under M-1's follower run before reconsidering |
+
+---
+
+### Part 5 — `pending_sink_bundle_clause()`
+
+#### L6-6 — Build the pending-sink bundle predicate once
+
+**Finding.** Prior review finding 9 (`prior-review.md:305`, 1.7%) and its E-1b scope (`:336`); named in neither part of the plan's E-1b.
+
+**Mechanism (verified at bcc4e80f).** `pending_sink_bundle_clause()` (`core/landscape/schema.py:1023-1080`) builds a nested `and_` / `or_` over nine columns from literal enum values on every call. Callers: `scheduler/dispositions.py:992` (inside `_transition_on`, once per row parked as `PENDING_SINK`), `:479`, `scheduler/leases.py:355`, `:621`, `scheduler/queue.py:608`. The function takes no argument and reads no state.
+
+**Evidence.** 1.03 calls per row, 426 µs each inside a run (`work/transform_300/timefn.json`); 276 µs in isolation; `select(<constant>).where(work_item_id == x)` is 12.1 µs against 286 µs today (`bench_misc.py`).
+
+**Change.** A module-level constant in `schema.py`, built once at import after the table is defined, and the five callers reference it. Keep the function as the builder that produces the constant, so the docstring stays with the definition. This is an expression, not a statement: it binds no value at execution, so it is outside what the clock-authority gate inspects (L1's probe V7 added module-level statements without a finding, `plan:505`).
+
+**Which part of E-1b it belongs to.** The statement at `dispositions.py:991-992` is a by-key select with no time value: **E-1b part 1** as the plan defines it (`plan:715-720`), and it is already in E-1b's mechanism list as `:991` (`plan:664`). But E-3a deletes that select and moves the predicate into the `RETURNING` of the `_transition_on` `UPDATE` (`plan:1276`), which binds `updated_at`: **part 2**, behind L1-4. E-3a's sketch still calls `pending_sink_bundle_clause()` per call. So add to E-1b's inventory: "`pending_sink_bundle_clause()` — expression rebuilt per call at `dispositions.py:479`, `:992`, `leases.py:355`, `:621`, `queue.py:608`; hoisted by L6-6 independently of both parts; its host statement at `:991` is part 1 today and part 2 after E-3a." Land L6-6 first; then neither part has to care.
+
+**Must not change.** The SQL text of every statement that embeds the predicate, on both dialects (same expression object, same compiled text). The claim select and its CAS `UPDATE` must keep using the identical predicate (`schema.py:1038-1039`).
+
+**Risk.** Low. SQLAlchemy clause elements are immutable and are shared across statements throughout this package (`token_work_items_table.c.*`).
+
+**Ruling needed.** No.
+
+**Verification.** `tests/unit/core/landscape/test_scheduler_pending_sink_claim.py`, `test_scheduler_queue_contract.py`; both source gates. New test: compile each of the five statements on the SQLite and PostgreSQL dialects before and after and assert equal text and parameters (negative control: change one literal in the constant and see the test fail). Testcontainer suite owed (a scheduler statement, even though its text does not move). Measurement: `time_fn.py`, calls per row 1.03 → 0.
+
+**Expected saving.** About 0.27–0.43 ms per row, ≈ 1% of a gate or transform row. The prior review's 1.7% was at a different commit.
+
+---
+
+### Part 6 — Fork / expand / coalesce verbs
+
+#### Per-fork-row statement table
+
+`fork_coalesce` example (truncate → fork to two paths → coalesce `require_all`
+→ gate → JSON sink), marginal per source row between 20 and 40 rows. One source
+row is 4 tokens (parent, two children, merged). 393 statements, 61 transactions
+(27 `BEGIN IMMEDIATE`, 34 plain `BEGIN`), 53 commits, 8 rollbacks.
+
+Statement classes: txn = `BEGIN` / `BEGIN IMMEDIATE`; pragma = `PRAGMA query_only`;
+mf / if / lf = membership, item and leader fence; lr = leader deadline renewal;
+clk = clock read; wr = audit or journal write; sel = any other select.
+
+| Verb | Engine call site | Stmts | txn | pragma | mf | if | lf | lr | clk | wr | sel | Already covered by | Left |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
+| `resolve_sink_effect_members` | `executors/sink.py:865` | 44 | 11 | 22 | | | | | | | 11 | E-4 (batch the lineage loads), E-10 | — |
+| `claim_ready` ×3 | `scheduler_drain.py:531` | 33 | 3 | | 3 | | | | 9 | 6 | 12 | E-1a part 1 (fence), E-3a (after-image `leases.py:326`), E-1b part 2 (claim `UPDATE`, event insert) | 3 `lock_worker_membership_row` selects (`leases.py:87`). The 9 clock reads (discovery `:132`, re-sample under lock `:225`, commit guard, per claim) are ADR-047's; E-1a part 2 cheapens them, nothing removes them |
+| `coalesce_tokens` | `engine/tokens.py:446` | 32 | 5 | 8 | | | 1 | 2 | 3 | 4 | 9 | E-10 (8 pragmas), R-2b (1 renewal + clock), E-1a part 2 | **L6-8**: 4 ownership read transactions |
+| `ingest_row_with_initial_claim` | `processor.py:2795` | 30 | 1 | | | | 3 | 4 | 7 | 7 | 8 | R-2a (6), E-3b (6), E-3a, R-2b | — |
+| `mark_terminal_with_ready_children` | `scheduler_drain.py:823` | 22 | 1 | | 1 | | | | 3 | 5 | 12 | E-3a (2 after-images), E-1b | **L6-9**: 4 node-cursor selects; 4 reference selects stay |
+| `finalize_coalesce_effect` | `engine/tokens.py:458` | 20 | 1 | | | | 1 | 2 | 3 | 3 | 10 | R-2b, E-1a part 2 | 3 `node_states` selects around one `UPDATE` (`node_states.py:808`, `:832`, `:862`) — E-3a's pattern, not in E-3a's site list |
+| `complete_barrier` | `processor.py:4793` | 19 | 1 | | | | 1 | 2 | 5 | 5 | 5 | R-2b, E-1a/E-1b part 2 | **L6-9**: 2 node-cursor selects; 2 reference selects stay |
+| `adopt_blocked_barrier_item` ×2 | `barrier_coordination.py:596` | 18 | 2 | | | | 2 | 4 | 8 | 2 | | R-2b (one renewal and its clock read per transaction: 4), E-1a part 2 | 2 leader transactions for 2 one-column updates; see "not designed" |
+| `fork_token` | `engine/tokens.py:335` | 18 | 3 | 4 | 1 | 1 | | | | 5 | 4 | E-10 (4 pragmas), E-1a part 1 | **L6-8**: 2 ownership read transactions |
+| `record_routing_events` (fork gate) | `executors/gate.py:512` | 16 | 2 | 2 | 1 | 1 | | | | 1 | 9 | E-3a (2), E-10 (2), R-7 option A | — |
+| `resolve_row_ingest_sequence` ×4 | `scheduler_work_codec.py:105` | 16 | 4 | 8 | | | | | | | 4 | E-10 would halve it | **L6-7**: all 16 |
+| `begin_node_state` ×5 | `state_guard.py:219` (3), `coalesce_executor.py:968` (2) | 15 | 5 | | 5 | | | | | 5 | | E-1a part 1, R-7 C/D | — |
+| `mark_blocked` ×2 | `scheduler_drain.py:1041` | 14 | 2 | | 2 | | | | 2 | 4 | 4 | E-3a (2 after-images), E-1a part 1 | — |
+| `record_routing_event` (route gate) | `executors/gate.py:495` | 13 | 2 | 2 | 1 | | | | | 1 | 7 | E-3a, E-10, R-7 option A | — |
+| `complete_node_state` ×3 | `state_guard.py:430` | 12 | 3 | | 3 | | | | | 3 | 3 | E-3a (3 read-backs), R-7 B | — |
+| `enqueue_ready` | `scheduler_drain.py:1252` | 10 | 1 | | 1 | | | | 1 | 1 | 6 | E-1b | **L6-9**: 2 node-cursor selects; 2 reference selects stay |
+| `mark_pending_sink` | `scheduler_drain.py:786` | 8 | 1 | | 1 | | | | 1 | 2 | 3 | E-3a (2) | — |
+| `list_pending_blocked_barrier_items` ×4 | `barrier_coordination.py:457` | 8 | 4 | | | | | | | | 4 | E-9c (ruling) | — |
+| `list_unadopted_group_losses` ×4 | `barrier_coordination.py:1225` | 8 | 4 | | | | | | | | 4 | E-9c (ruling) | — |
+| `has_completed_group_for_node` ×2 | `coalesce_executor.py:769` | 8 | 2 | 4 | | | | | | | 2 | L4-1 | — |
+| checkpoint (`create_checkpoint`) | `core/checkpoint/manager.py:136-171` | 9 | 1 | | | | 1 | 2 | 3 | 1 | 1 | L3-4 (ruling), E-9a | — |
+| run-end group settlement (`_group_member_is_settled_or_live`) | `core/checkpoint/recovery.py:356-391` via `run_status.py:65` | 6 | | | | | | | | | 6 | none | 3 selects per lineage group at finalize; see "not designed" |
+| `is_release_group` | `engine/tokens.py:231` | 4 | 1 | 2 | | | | | | | 1 | E-10 (2 pragmas) | 1 read transaction for an immutable group kind; small |
+| sink `finalize`, `reserve`, `mark_pending_sink_terminal_many`, `update_node_output_contract` | sink phase; `transform.py:803` | 10 | 1 | | 1 | | | | | 1 | 7 | L3-2, E-4, E-5 | — |
+| **Total** | | **393** | 61 | 52 | 20 | 2 | 9 | 16 | 45 | 56 | 132 | | |
+
+The checkpoint row is the fenced wrapper line of `L6/fork_verbclass.md` plus
+the two checkpoint statements from its "no landscape frame" line; the other six
+statements of that line are the run-end group settlement row. The last row is
+four small verbs added together. The 9-statement checkpoint agrees with L3-4. Full statement shapes per verb are in `L6/fork_verbstmts.txt`.
+
+What the existing items remove if all of them land, by reading the table:
+E-10 the 52 pragmas; E-4 the 11 sink lineage selects and their 11 transactions;
+L4-1 2 transactions; E-9c 8 transactions; R-2a 6; E-3a about 12 read-backs;
+E-3b 6; E-5 3; R-2b about 14 (one renewal and one clock read per leader
+transaction, 7 leader transactions per row: ingest, `coalesce_tokens`,
+`finalize_coalesce_effect`, `complete_barrier`, two adoptions, the checkpoint). R-7's options are written for a
+gate decision and a transform (`plan:1438-1455`); none of them names a fork,
+coalesce or barrier transaction.
+
+What no existing item touches: L6-7 (16), L6-8 (24, or 12 after E-10),
+L6-9 (9), and the four groups under "not designed" below.
+
+#### L6-7 — Carry the row's ingest sequence instead of reading it back per continuation
+
+**Finding.** Recon Appendix A "Copies, serialisation, hashing" (`hot-path-recon.md:463`, "DB read or cache UNVERIFIED"); review finding 11. No prior-review ID.
+
+**Mechanism (verified at bcc4e80f).** It is a database read, uncached. `SchedulerWorkCodec.ready_fields` calls `resolve_ingest_sequence(token.row_id)` whenever the caller does not supply the value (`engine/scheduler_work_codec.py:105`), bound to `data_flow.resolve_row_ingest_sequence` (`engine/processor.py:720`), which runs `SELECT rows.ingest_sequence WHERE row_id = ?` through the read-only ops, one read transaction each (`core/landscape/data_flow/ownership.py:55-70`). Only source ingest supplies it (`processor.py:2794`). Every other continuation resolves it: `scheduler_drain.py:773`, `:806`, `:825`, `:1229`; `processor.py:4227`, `:4304`, `:4312`, `:4581`, `:4714`, `:4802`, `:4835`, `:5059`. `rows.ingest_sequence` is written once at ingest. The value handed to the journal is then checked against the `rows` table inside the write transaction: `validate_work_item_references` selects `rows.ingest_sequence` and raises on a mismatch (`core/landscape/scheduler/work_items.py:208-219`).
+
+**Evidence.** 4.00 calls per fork row, 16 statements (4 `BEGIN`, 8 pragmas, 4 selects), 4 read transactions (`L6/fork_verbclass.md`). Linear rows: 0 (their only continuation is the pre-claimed ingest item).
+
+**Change.** Pass the value from the claim. Every continuation is created while a `TokenWorkItem` for the same row is in hand, and `TokenWorkItem.ingest_sequence` is a declared field (`contracts/scheduler.py:151`). `ready_emission(item, *, ingest_sequence: int)` and `ready_fields` take it from the caller; each call site passes `claimed.ingest_sequence` after asserting `claimed.row_id == item.token.row_id` (an `OrchestrationInvariantError` otherwise). For the barrier completion sites, where the tokens come from held arrivals, carry the value on the in-memory arrival record the same way. Keep the resolver for the one case with no claim in hand, if any remains after the call sites are converted.
+Alternative: a bounded process-local `{row_id: ingest_sequence}` memo in the codec, seeded at ingest. Simpler to write, but a memo; prefer the explicit carry.
+Rejected: dropping the engine-side value and letting the repository fill it from `rows` at insert (moves a read into every write transaction instead of removing it).
+
+**Must not change.** The `ingest_sequence` written to `token_work_items` (it orders claims, `leases.py:134-140`). The repository's check at `work_items.py:208-219` stays: after this change it compares a value carried from the claimed journal row with the `rows` table, which is an independent cross-check, not a tautology. E-3b proposes skipping that validation at source ingest only; that does not interact.
+
+**Risk.** Low. A wrong carried value is refused by the repository check before anything is written.
+
+**Ruling needed.** No.
+
+**Verification.** `tests/unit/core/landscape/test_scheduler_queue_contract.py`, `test_scheduler_repository_complete_barrier.py`, `tests/unit/engine/test_scheduler_drain_characterization.py`, `tests/integration/core/dag`. New test: a fork row emits children whose journal `ingest_sequence` equals the parent's; negative control: hand `ready_emission` a sequence one higher and assert the repository raises `AuditIntegrityError` (proves the cross-check is live). Add the fork statement pin in L4-8. Testcontainer suite not owed for the engine change; owed if the repository signature moves. Measurement: `verbclass.py`, `resolve_row_ingest_sequence` 16 → 0 statements and 4 → 0 read transactions per fork row.
+
+**Expected saving.** 16 statements and 4 read transactions per fork row on SQLite (4% of the row's statements); 4 round trips on PostgreSQL. Per expand child and per barrier release likewise.
+
+---
+
+#### L6-8 — Resolve a token's ownership once, inside the verb's own transaction
+
+**Finding.** L1 "Not verified" (`plan:1868-1871`: `resolve_token_ownership` at 9 statements and 6 read transactions per fork row). No prior-review ID.
+
+**Mechanism (verified at bcc4e80f).** `fork_token` calls `validate_token_run_ownership(parent_ref)` and then `validate_token_row_ownership(parent_ref.token_id, row_id)` (`core/landscape/data_flow/tokens.py:611-612`). Each calls `resolve_token_ownership` (`data_flow/ownership.py:131`, `:152`), the same `tokens LEFT JOIN rows` query (`:86-94`), each in its own read-only transaction, before the fenced write transaction opens at `:619`. `coalesce_tokens` does the same pair for every parent (`:885-887`): four read transactions for two parents. `expand_token` does it at `:1505-1506`, and the row-union release at `:1791-1794` (one, then two per member). `resolve_token_ownership` and `validate_token_run_ownership` already accept `conn=` (`ownership.py:72`, `:119`); `validate_token_row_ownership` does not.
+
+**Evidence.** Fork row: 2 read transactions (8 statements) in `fork_token`, 4 (16 statements) in `coalesce_tokens`; the two results per token are the same row (`L6/fork_verbstmts.txt`).
+
+**Change.** One helper, `validate_token_ownership_on(conn, refs, row_id)`, that runs one select for all the tokens (`WHERE token_id IN (…)`, chunked like `outcomes.py:138-164`) and checks existence, row-run agreement, run and row for each. `fork_token`, `coalesce_tokens`, `expand_token` and the release verb call it as the first statement after the fence inside their existing write transaction, and the pre-transaction calls go. The error classes and messages stay.
+Rejected: keeping the checks outside the transaction but merging each pair into one read (still a transaction per token, and it checks a snapshot the write transaction does not hold). Rejected: an engine-side memo of token ownership (the repository must not take the caller's word for it).
+
+**Must not change.** Every check and every `AuditIntegrityError`. No write before the checks pass: the fence's no-op `UPDATE` is the only statement ahead of them and a failed check rolls the transaction back. The lock order in `coalesce_tokens` ("parent tokens, parent node states, then the effect scope row", the comment above `_lock_coalesce_dependencies` at `:936-948`): the ownership select must not take a lock, or it must be folded into the existing parent-token lock in `_lock_coalesce_dependencies`.
+
+**Risk.** Low–Medium. Error precedence changes: a deposed worker is now refused by the fence before an ownership violation is reported, where today the ownership error comes first. The mutation-fencing gate freezes helper identities; a new `_on` helper re-pins its inventory.
+
+**Ruling needed.** No.
+
+**Verification.** `tests/unit/core/landscape/test_token_recording.py`, `test_token_recording_integrity.py`, `test_coalesce_effects.py`; `tests/integration/core/dag`. New tests: cross-run and cross-row parents still raise, and no `tokens`, `token_parents` or `token_outcomes` row exists afterwards (negative control: a variant that runs the check after the first insert leaves a row and fails the test). Testcontainer suite owed (statement moves inside a locking transaction). Measurement: `verbclass.py`, `fork_token` 18 → 11 and `coalesce_tokens` 32 → 17 statements, 6 read transactions fewer per fork row.
+
+**Expected saving.** 22 statements and 6 read transactions per fork row on SQLite (5.6% of the row's statements); on PostgreSQL 6 round trips become 2. If E-10 lands first the statement saving is 10, the transaction saving the same.
+
+---
+
+#### L6-9 — Check a node cursor against the run once per process
+
+**Finding.** L1's inventory row for `validate_node_cursor` (`plan:443`, 9.00 per fork row); E-3b removes it at ingest only. No prior-review ID.
+
+**Mechanism (verified at bcc4e80f).** `validate_node_cursor` (`core/landscape/scheduler/work_items.py:173-182`) selects `nodes.node_id WHERE run_id, node_id` and raises if absent. `validate_work_item_references` calls it twice per inserted work item, for `node_id` and `coalesce_node_id` (`:220-226`). The `nodes` rows are written at run registration and not afterwards. `token_work_items` already has composite foreign keys for both columns (`core/landscape/schema.py:978-979`), so the select's contribution over the constraint is the named error.
+
+**Evidence.** 9 per fork row: 4 in `mark_terminal_with_ready_children`, 2 in `complete_barrier`, 2 in `enqueue_ready`, 1 at ingest.
+
+**Change.** A per-repository set of `(run_id, node_id)` pairs that have been found, consulted before the select and added to only after a positive result. The set is bounded by the graph size. A miss still runs the select and raises exactly as today.
+Rejected: deleting the check and relying on the foreign key (changes the error an operator sees from a named `AuditIntegrityError` to a wrapped constraint failure). Rejected: preloading every node id at run start (a second source of truth for the graph).
+
+**Must not change.** A work item naming a node outside the run is refused with the same error before the insert. The foreign keys stay as the backstop for anything the memo could get wrong.
+
+**Risk.** Low. Rests on `nodes` rows not being deleted during a run; a web process keeps the repository across runs, so key on `run_id` and bound the set.
+
+**Ruling needed.** No — same confirmation as L6-2.
+
+**Verification.** `tests/unit/core/landscape/test_scheduler_queue_contract.py`, `test_scheduler_ingest.py`. New test: a work item for an unknown node raises on first use and again on second use (the memo holds positives only); negative control: with SQLite foreign keys enabled and the memo pre-seeded with the bad pair, the insert still fails on the constraint. Testcontainer suite owed. Measurement: `verbstmts.py`, `validate_node_cursor` 9 → 0 per fork row after the first row.
+
+**Expected saving.** 9 statements per fork row; 1 per linear row until E-3b lands, 0 after.
+
+---
+
+#### Left uncovered and not designed
+
+| Group | Statements per fork row | Why no item |
+|---|---:|---|
+| `adopt_blocked_barrier_item`: two leader-fenced transactions per row, each a one-column `UPDATE` wrapped in a leader CAS, two renewals and four clock reads (`core/landscape/scheduler/barrier.py:862-940`), each preceded by a member-fenced `mark_blocked` by the same process | 18 + 14 | Folding the deposit and the adoption into one transaction when the leader is its own depositor changes what a crash leaves in the journal and is the mechanism ADR-029 § E.2 specifies. That is a new R-7 option, not a ready fix. R-2b removes 4 of the 18. I did not read `barrier.py` end to end, so no design is offered |
+| `lock_worker_membership_row` after the membership fence in `claim_ready` (`scheduler/leases.py:87`, `:211`) | 3 | The fence `UPDATE` on the same `run_workers` row, first in the same transaction, already holds a stronger lock on PostgreSQL, and SQLite ignores `FOR SHARE` (`leases.py:83-85`). Removing it is a lock-shape change in the eviction serialisation fix (`elspeth-6903f82511`) for 3 statements per fork row and 0 per linear row. Not recommended without M-1 |
+| `validate_work_item_references` token and row selects outside ingest (`work_items.py:194-219`) | 8 | They are the cross-check that keeps L6-7 honest, and the rows were written by an earlier transaction, so there is no in-transaction witness. Only an R-7-style fold could remove them |
+| `finalize_coalesce_effect`: lock, before-image and after-image selects of the parent states around one `UPDATE` (`execution/node_states.py:808`, `:832`, `:862`, `data_flow/tokens.py:1233`) | 3–4 | E-3a's `RETURNING` pattern applies to `_complete_node_states_many`, but that function is not in E-3a's site list (`plan:1238-1244`). Add it there rather than as a new item |
+| Run-end group settlement: three selects per lineage group (`core/checkpoint/recovery.py:356`, `:372`, `:391`), reached from `assert_bound_groups_settled_from_audit` (`run_status.py:65`) | 6 | Linear in groups and run once at finalize, so not a hot-path term; it is the same per-group point-select shape E-11 replaced with a set query for the orphan sweep. Counted here, not read |
+| `is_release_group` read transaction (`engine/tokens.py:231`) | 4 | One immutable `group_records.kind` read per row; 2 statements after E-10. Could be memoised per group; too small to design |
+| Expand and aggregation verbs | — | Not traced. `fork_coalesce` has no expand and no batch. L6-7 and L6-8 apply to `expand_token` by reading (`data_flow/tokens.py:1505-1506`) |
+
+---
+
+### 1. Item table
+
+| ID | Title | Risk | Ruling | Prior-review ID | Expected saving |
+|---|---|---|---|---|---|
+| L6-1 | Allocate inside the record transaction where nothing separates them | Low | No | — | 4 statements, 1 commit, ≈ 1.3 ms CPU per OpenRouter / Gateway query; 1 transaction per operation call; none for Azure |
+| L6-2 | Stop re-selecting the parent state's immutable columns | Low | No (confirmation) | — | 1–2 statements, 0.2–0.4 ms per call |
+| L6-3 | Decide whether the payload refs need their own transaction | C Low / B Medium / A High | **Yes** for A or B (ADR-048 inventory; `row_data.py` state definitions; no ADR owns the order) | — | A or B: 5 statements, 1 commit, ≈ 1.4 ms CPU per recorded call |
+| L6-4 | Verify a sink member's content once; rebind without re-verifying | Low–Medium | No | — | 250 µs per sink row at 5 columns (≈ 0.8%), 1.9 ms at 100; 12 of 14 canonicalisations |
+| L6-5 | Remove the plugin double copy when the file is next edited | Low | No | — | 2.5–6 µs per row per transform; only as a ride-along |
+| L6-6 | Build the pending-sink bundle predicate once | Low | No | finding 9 / E-1b | ≈ 0.27–0.43 ms per row (≈ 1%) |
+| L6-7 | Carry the row's ingest sequence instead of reading it back | Low | No | — | 16 statements, 4 read transactions per fork row |
+| L6-8 | Resolve a token's ownership once, inside the verb's transaction | Low–Medium | No | — | 22 statements, 6 read transactions per fork row (10 statements after E-10) |
+| L6-9 | Check a node cursor against the run once per process | Low | No (confirmation) | — | 9 statements per fork row |
+
+Savings overlap with each other and with E-10, E-3a and E-1a; do not add them.
+
+### 2. Recommended order and dependencies
+
+1. **L6-6** — no dependency, no gate change, about 1% of every row. It can go in
+   the plan's step 4 ("independent, local"). Land it before E-3a so E-3a's
+   `RETURNING` uses the constant.
+2. **L6-4** — independent of everything; add its count pin to L4-8 first so the
+   7 → 1 is a pinned number moving.
+3. **L6-7**, then **L6-8**, then **L6-9** — after L4-8's fork pin exists, in one
+   testcontainer batch with the plan's step 5. L6-8 before E-10 gives the
+   larger measured delta; after E-10 it is still 6 transactions. L6-9 after
+   E-3b, which removes the ingest occurrence.
+4. **L6-1**, with **L6-2** in the same commit series (both edit
+   `execution/calls.py` and re-pin the same inventory).
+5. **L6-3** — raise the three questions with the other rulings in step 8. Its
+   option C is L6-2 and needs no answer.
+6. **L6-5** — only inside the commits that already edit `value_transform.py`
+   (E-9b, L5-7), sharing their hash and manifest re-pin.
+
+Additions to existing plan rows rather than new items: add
+`_complete_node_states_many` (`node_states.py:808-832`) to E-3a's site list;
+add the `pending_sink_bundle_clause()` line quoted in L6-6 to E-1b's inventory;
+note under R-7 that none of options A–D covers the barrier deposit / adoption
+pair.
+
+### 3. Examined and recommended NOT fixing
+
+| Finding | Reason | Number |
+|---|---|---|
+| Remove the fenced transaction from pre-effect `allocate_call_index` (review 11 a, as L5 framed it) | It is the authority check between the claim and the external effect at the pre-effect call sites (seven by position, two read end to end). Removing it lets a worker that has lost its lease call the provider and be refused only when it tries to record. It would also need ADR-048 row 38 reclassified. L6-1 takes the four sites where it buys nothing | 5 statements, 1 commit, 1.4 ms CPU per call, against a provider call of hundreds of milliseconds |
+| Payload store's own `sha256` of call payloads (review 11 c) | The store's content address, derived from the bytes it is given; the serialisation duplicate is L2-1 | 1–2 µs per payload |
+| Ref in the `calls` insert with files after the commit (L6-3 option A) | A crash leftover would read as `PURGED` by retention | saves the same 5 statements as option B |
+| 3. `SourceIngestSpec` thaw-then-freeze | `deep_freeze` detaches by copying anyway; nothing to carry until rows are handed over frozen (L2-4 / L2-5) | 7 µs per row at 5 columns, 73 µs at 100 |
+| 4. Plugin double copy as a standalone change | Each file edit moves `source_file_hash`, the scenario-corpus manifest (for `value_transform`) and makes pre-upgrade runs non-resumable | 2.5 µs per row |
+| 5. `sink.py:1557` thaw; `node_states.py:493` hash | The thaw has four consumers; the hash is the recorded `input_hash` (L2-4 is the ruling that could carry it) | 1 thaw, 1 hash per sink row |
+| 6. Declaration dispatch ×3 per row × transform | Three contract surfaces, audit-complete by design; time is in the contract bodies | 70 µs per dispatch, ≈ 10 µs of it dispatcher |
+| 7a. `copy.deepcopy` per fork / expand child | Isolates opaque mutable leaves the freeze does not copy | 4.3 µs per child at 5 columns |
+| 8. `check_timeouts` scan | Linear in pending groups, which stay at 0–1 in a single-leader drain | 41 ns per pending group per source row |
+| 9. Telemetry projection before the disabled check | Order is deliberate for observers; no manager exists when telemetry is off | 1.3 µs per event |
+| 10. Follower `live_leader` per claim | Deliberate forced check, pinned by tests; follower never measured | 3 statements per follower claim |
+| `lock_worker_membership_row` in `claim_ready` | Lock-shape change in an eviction-race fix | 3 statements per fork row, 0 per linear row |
+
+### 4. Not verified
+
+- **No prototype.** None of L6-1 to L6-9 was built, even in a private copy. The "expect N → M" figures are read off the trace by construction. No gate was run against any change, so every statement about the mutation-fencing and clock-authority gates is from reading the plan's probe results and the inventory lines cited.
+- **PostgreSQL, followers, resume, faults.** Nothing was run on PostgreSQL or with a second worker. The crash table in Part 1 is from reading the order of operations, not from killing a process. Retry and error call paths were not traced; every call figure is the success path.
+- **Why the row → file → ref order was chosen.** The checkout has 697 commits of history and `git log -S` reaches only the import commit, so the originating change and its rationale were not found. The two "facts that hold today" in Part 1 are inferred from the code and the state definitions.
+- **`node_states` and `nodes` rows are never deleted or re-keyed during a run** (L6-2, L6-9). Inferred from the `UPDATE` statements read; not established by a grep of every `delete()` in the tree.
+- **Whether a whole-tree gate inventories `object.__setattr__` / `object.__new__` sites** (L6-4), and whether `providers/openrouter.py`, `gateway.py` or `contracts/sink_effects.py` carry signed tier-model suppressions. The keyless trust-tier scan was not run.
+- **`plugins/transforms/field_mapper.py:825`** and the bodies of `reference_join.py`, `batch_replicate.py`, `truncate.py`, `passthrough.py` beyond the cited line. The pattern at those lines is from grep plus the surrounding few lines.
+- **Pre-effect allocation sites.** Only `clients/http.py:1469` and `clients/llm.py:735` were read through to the external call. `http.py:1833`, `:2190`, `clients/retrieval/chroma.py:263`, `:516` and `pdf_rasterize.py:632` are classed as pre-effect from the lines around the allocation; `http.py:724` is a replay hop with no effect and was not counted.
+- **Barrier verbs.** `scheduler/barrier.py` was read only at `adopt_blocked_barrier_item`'s signature; ADR-029 was not opened. The "not designed" row for the adoption pair is a count and a pointer.
+- **Expand and aggregation pipelines** were not run. L6-7 and L6-8 are extended to `expand_token` by reading only.
+- **Call sites that have no claimed work item in hand** (L6-7). Twelve call sites of `ready_emission` / `ready_fields` were listed; the three in `scheduler_drain.py:773-825` were confirmed to have the claim in scope, the barrier-completion sites in `processor.py` were not each traced back to a `TokenWorkItem`.
+- **ADR texts.** ADR-048 was read at the lines cited (context, § 3, the inventory rows 38–43); ADR-030, ADR-029 and ADR-047 were grepped, not read. The claim that no ADR governs the call-payload order rests on a grep of `docs/architecture/adr/` for `payload`, `response_ref` and `HASH_ONLY`.
+- **CPU percentages** are a function's measured CPU over a marginal row cost taken from two instrumented runs each (33–34 ms per row), not interleaved A/B pairs: there was no candidate build to interleave with.
