@@ -149,6 +149,16 @@ class CSVSourceConfig(TabularSourceDataConfig):
             codecs.lookup(v)
         except LookupError as exc:
             raise ValueError(f"unknown encoding: {v!r}") from exc
+        # codecs.lookup() also resolves bytes-to-bytes and str-to-str codecs
+        # (base64, hex, zlib, rot13). The incremental decoder load() uses would
+        # accept them and crash mid-read (binascii.Error, TypeError), so refuse
+        # them here. str.encode() checks the same text-encoding flag that
+        # bytes.decode() does; b"".decode() would not, as it short-circuits on
+        # empty input.
+        try:
+            "".encode(v)
+        except LookupError as exc:
+            raise ValueError(f"encoding {v!r} is not a text encoding") from exc
         return v
 
 
@@ -177,7 +187,7 @@ class CSVSource(BaseSource):
     name = "csv"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:94e4e14b6d89d7e1"
+    source_file_hash: str | None = "sha256:4299e6110527265e"
     # Structural observed-cell fact (elspeth-e6e552ce34): csv.reader yields
     # strings, and observed schemas preserve parsed cells untouched (module
     # docstring), so under mode: observed EVERY emitted cell is str by

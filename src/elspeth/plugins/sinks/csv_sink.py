@@ -246,7 +246,7 @@ class CSVSink(BaseSink, SinkEffectAuditContextCapability):
     name = "csv"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e3f05b88e042f095"
+    source_file_hash: str | None = "sha256:70e091ae2823f6ca"
     config_model = CSVSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM
@@ -777,7 +777,7 @@ class CSVSink(BaseSink, SinkEffectAuditContextCapability):
                     "collision_policy: 'fail_if_exists', 'auto_increment', or 'append_or_create' (only with mode: append). Unset is the default and OVERWRITES/truncates an existing file — set it deliberately to protect prior runs.",
                     "To guarantee column order, set schema.mode='fixed' and order schema.fields explicitly, including quarantine sinks. 'observed' infers order from first-row keys. headers changes display names only. Resume appends must preserve established order.",
                     "on_write_failure is REQUIRED (no default): set 'discard' (drop with an audit record) or a quarantine sink name for per-row write errors; omitting it fails validation.",
-                    "Cells are written verbatim by default, so text starting with =, +, -, @ or a tab can execute as a formula when the file is opened in a spreadsheet. Set options.neutralize_formulas=true when the output carries untrusted text (LLM output, scraped or uploaded data) and will be opened in Excel; it quote-prefixes those cells.",
+                    "Cells are written verbatim by default, so text starting with =, +, -, @ or a tab can run as a formula in a spreadsheet. Set options.neutralize_formulas=true when output carries untrusted text (LLM output, scraped or uploaded data) bound for Excel; it quote-prefixes those cells.",
                     "Set options.require_all_rows=true when every pipeline row must be retained: a row refusal then stops preparation before publication instead of routing or discarding it. Earlier publications are not rolled back.",
                 ),
             )
