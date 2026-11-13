@@ -961,3 +961,67 @@ def test_f7_inline_defaults_sit_at_the_ceilings() -> None:
     # The batch-wait ceiling still covers every SDK attempt at the read-timeout ceiling.
     transform = AWSTextractInlineAnalysis(_inline_review_config())
     assert vars(transform)["_effective_batch_wait_timeout_seconds"] == vars(module)["MAX_INLINE_BATCH_WAIT_TIMEOUT_SECONDS"]
+
+
+# --- finding 9: _project_pages is linear in the block count ---------------------
+
+
+def _review_geometry() -> dict[str, Any]:
+    return {
+        "BoundingBox": {"Width": 0.8, "Height": 0.1, "Left": 0.1, "Top": 0.2},
+        "Polygon": [{"X": 0.1, "Y": 0.2}, {"X": 0.9, "Y": 0.2}, {"X": 0.9, "Y": 0.3}, {"X": 0.1, "Y": 0.3}],
+    }
+
+
+def _interleaved_page_blocks(pages: int, lines_per_page: int) -> list[dict[str, Any]]:
+    """PAGE blocks first in reverse page order, then LINE blocks round-robin across pages."""
+    blocks: list[dict[str, Any]] = [
+        {"BlockType": "PAGE", "Id": f"page-{page}", "Page": page, "Geometry": _review_geometry()} for page in range(pages, 0, -1)
+    ]
+    for line in range(lines_per_page):
+        for page in range(1, pages + 1):
+            blocks.append(
+                {
+                    "BlockType": "LINE",
+                    "Id": f"line-{page}-{line}",
+                    "Page": page,
+                    "Text": f"p{page} l{line}",
+                    "Confidence": 99.0,
+                    "Geometry": _review_geometry(),
+                }
+            )
+    return blocks
+
+
+def test_f9_project_pages_reads_each_block_page_a_bounded_number_of_times(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.plugins.transforms.aws import textract_result as module
+
+    blocks = _interleaved_page_blocks(pages=60, lines_per_page=5)
+    real_page = vars(module)["_page"]
+    calls: list[str] = []
+
+    def counting_page(block: Any, path: str) -> int:
+        calls.append(path)
+        result: int = real_page(block, path)
+        return result
+
+    monkeypatch.setattr(module, "_page", counting_page)
+    pages = vars(module)["_project_pages"](blocks)
+
+    # Linear: every block's Page is read a constant number of times, not once per PAGE block.
+    assert len(calls) <= 3 * len(blocks), f"{len(calls)} Page reads for {len(blocks)} blocks"
+    assert [page["page"] for page in pages] == list(range(1, 61))
+    assert [line["id"] for line in pages[0]["lines"]] == [f"line-1-{line}" for line in range(5)]
+    assert pages[59]["text"] == "\n".join(f"p60 l{line}" for line in range(5))
+
+
+def test_f9_project_pages_keeps_lines_of_unknown_pages_out_and_duplicates_in() -> None:
+    from elspeth.plugins.transforms.aws import textract_result as module
+
+    blocks = _interleaved_page_blocks(pages=2, lines_per_page=2)
+    blocks.append({"BlockType": "LINE", "Id": "orphan", "Page": 9, "Text": "orphan", "Confidence": 99.0, "Geometry": _review_geometry()})
+    pages = vars(module)["_project_pages"](blocks)
+
+    assert [page["page"] for page in pages] == [1, 2]
+    assert all(line["id"] != "orphan" for page in pages for line in page["lines"])
+    assert pages[1]["text"] == "p2 l0\np2 l1"
