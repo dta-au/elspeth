@@ -11,6 +11,7 @@ class PDFRenderLimitsData(TypedDict):
     max_pages: int
     max_page_pixels: int
     max_page_bytes: int
+    max_total_bytes: int
     render_timeout_seconds: int
     worker_memory_limit_bytes: int
     extract_text: bool

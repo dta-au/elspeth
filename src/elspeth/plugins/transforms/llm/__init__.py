@@ -28,6 +28,7 @@ audit_fields: Provenance metadata for audit trail (may change between versions)
     - <response_field>_lookup_hash: SHA256 of lookup data
     - <response_field>_lookup_source: Config file path
     - <response_field>_system_prompt_source: Config file path
+    - <response_field>_parts_hash: SHA256 of the user message's content parts (only when image inputs are bound)
 
 WARNING: Do not build production logic that depends on audit_fields.
 These fields exist for audit trail reconstruction (explain() queries)
@@ -90,6 +91,7 @@ LLM_AUDIT_SUFFIXES: tuple[str, ...] = (
     "_lookup_hash",  # SHA256 of lookup data
     "_lookup_source",  # File path of lookup data (None if no lookup)
     "_system_prompt_source",  # File path of system prompt (None if inline)
+    "_parts_hash",  # SHA256 of the user message's content parts (emitted only when image inputs are bound)
 )
 
 
@@ -321,8 +323,8 @@ def populate_llm_operational_fields(
     output: dict[str, object],
     field_prefix: str,
     *,
-    usage: TokenUsage | None,
-    model: str | None,
+    usage: TokenUsage,
+    model: str,
 ) -> None:
     """Populate operational metadata into the output row (stays in pipeline data).
 
@@ -333,10 +335,12 @@ def populate_llm_operational_fields(
     Args:
         output: Mutable row dict to populate.
         field_prefix: Response field name (e.g., "llm_response").
-        usage: Token usage (TokenUsage or None).
-        model: Model identifier that actually responded.
+        usage: Token usage. Required: the output schema declares
+            ``<field>_usage`` non-nullable, and every caller passes an
+            ``LLMQueryResult.usage`` its ``__post_init__`` guarantees.
+        model: Model identifier that actually responded (non-nullable, as above).
     """
-    output[f"{field_prefix}_usage"] = usage.to_dict() if usage is not None else None
+    output[f"{field_prefix}_usage"] = usage.to_dict()
     output[f"{field_prefix}_model"] = model
 
 

@@ -7,7 +7,8 @@ Per ELSPETH's Three-Tier Trust Model:
 - Invalid responses must be caught, not silently coerced
 
 These tests exercise the PRODUCTION validation code in:
-    src/elspeth/plugins/llm/validation.py
+    src/elspeth/plugins/transforms/llm/validation.py (extract_structured_fields,
+    the parser the LLM transform and the LLM source run)
 
 They verify that validation correctly handles:
 - Non-JSON responses
@@ -25,11 +26,9 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from elspeth.plugins.transforms.llm.validation import (
-    ValidationError,
-    ValidationSuccess,
-    validate_json_object_response,
-)
+from elspeth.contracts.errors import TransformErrorReason
+from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig, OutputFieldType
+from elspeth.plugins.transforms.llm.validation import extract_structured_fields
 from tests.strategies.json import json_primitives
 
 # =============================================================================
@@ -81,6 +80,16 @@ wrong_type_json = st.one_of(
 # =============================================================================
 
 
+_ANSWER = (OutputFieldConfig(suffix="answer", type=OutputFieldType.STRING),)
+
+
+def _parse_object(content: str) -> TransformErrorReason | None:
+    """Parse with no declared fields: only the JSON-object boundary applies."""
+    extracted, reason = extract_structured_fields(content, ())
+    assert extracted == {}
+    return reason
+
+
 class TestLLMResponseParsingProperties:
     """Property tests for LLM response JSON parsing."""
 
@@ -88,20 +97,23 @@ class TestLLMResponseParsingProperties:
     @settings(max_examples=100)
     def test_valid_json_object_succeeds(self, response: dict[str, Any]) -> None:
         """Property: Valid JSON objects are accepted."""
-        content = json.dumps(response)
-        result = validate_json_object_response(content)
+        assert _parse_object(json.dumps(response)) is None
 
-        assert isinstance(result, ValidationSuccess)
-        assert result.data == response
+    @given(response=valid_json_objects, answer=st.text(max_size=50))
+    @settings(max_examples=100)
+    def test_declared_field_round_trips(self, response: dict[str, Any], answer: str) -> None:
+        """Property: A declared string field is extracted exactly as sent."""
+        content = json.dumps({**response, "answer": answer})
+        assert extract_structured_fields(content, _ANSWER) == ({"answer": answer}, None)
 
     @given(response=non_json_strings)
     @settings(max_examples=100)
     def test_non_json_rejected(self, response: str) -> None:
         """Property: Non-JSON strings are rejected with clear error."""
-        result = validate_json_object_response(response)
+        reason = _parse_object(response)
 
-        assert isinstance(result, ValidationError)
-        assert result.reason == "invalid_json"
+        assert reason is not None
+        assert reason["reason"] == "json_parse_failed"
 
     @given(response=wrong_type_json)
     @settings(max_examples=100)
@@ -111,54 +123,46 @@ class TestLLMResponseParsingProperties:
         LLM transforms expect {"field": value} responses, not arrays,
         primitives, or null.
         """
-        result = validate_json_object_response(response)
+        reason = _parse_object(response)
 
-        assert isinstance(result, ValidationError)
-        assert result.reason == "invalid_json_type"
-        assert result.expected == "object"
+        assert reason is not None
+        assert reason["reason"] == "invalid_json_type"
+        assert reason["expected"] == "object"
 
 
 class TestLLMResponseEdgeCases:
     """Property tests for LLM response edge cases."""
 
     def test_empty_object_accepted(self) -> None:
-        """Property: Empty object {} is valid (may have optional fields)."""
-        result = validate_json_object_response("{}")
-
-        assert isinstance(result, ValidationSuccess)
-        assert result.data == {}
+        """Property: Empty object {} is valid when nothing is declared."""
+        assert _parse_object("{}") is None
 
     def test_deeply_nested_accepted(self) -> None:
-        """Property: Deeply nested objects are accepted."""
+        """Property: Nested objects within the depth bound are accepted."""
         deep = {"a": {"b": {"c": {"d": {"e": "value"}}}}}
-        result = validate_json_object_response(json.dumps(deep))
-
-        assert isinstance(result, ValidationSuccess)
-        assert result.data == deep
+        assert _parse_object(json.dumps(deep)) is None
 
     @given(whitespace=st.sampled_from([" ", "\n", "\t", "\r\n"]))
     @settings(max_examples=20)
     def test_whitespace_padded_json_accepted(self, whitespace: str) -> None:
         """Property: JSON with leading/trailing whitespace is accepted."""
-        content = f'{whitespace}{{"key": "value"}}{whitespace}'
-        result = validate_json_object_response(content)
-
-        assert isinstance(result, ValidationSuccess)
+        content = f'{whitespace}{{"answer": "value"}}{whitespace}'
+        assert extract_structured_fields(content, _ANSWER) == ({"answer": "value"}, None)
 
     def test_null_json_rejected(self) -> None:
         """Property: JSON null is rejected (not an object)."""
-        result = validate_json_object_response("null")
+        reason = _parse_object("null")
 
-        assert isinstance(result, ValidationError)
-        assert result.reason == "invalid_json_type"
+        assert reason is not None
+        assert reason["reason"] == "invalid_json_type"
 
     def test_array_json_rejected(self) -> None:
         """Property: JSON array is rejected (not an object)."""
-        result = validate_json_object_response("[1, 2, 3]")
+        reason = _parse_object("[1, 2, 3]")
 
-        assert isinstance(result, ValidationError)
-        assert result.reason == "invalid_json_type"
-        assert result.actual == "list"
+        assert reason is not None
+        assert reason["reason"] == "invalid_json_type"
+        assert reason["actual"] == "list"
 
     @pytest.mark.parametrize(
         "content",
@@ -170,10 +174,10 @@ class TestLLMResponseEdgeCases:
     )
     def test_non_finite_constants_rejected(self, content: str) -> None:
         """Non-standard JSON constants are rejected at parse boundary."""
-        result = validate_json_object_response(content)
+        reason = _parse_object(content)
 
-        assert isinstance(result, ValidationError)
-        assert result.reason == "invalid_json"
+        assert reason is not None
+        assert reason["reason"] == "json_parse_failed"
 
 
 class TestLLMResponseDeterminism:
@@ -183,15 +187,4 @@ class TestLLMResponseDeterminism:
     @settings(max_examples=100)
     def test_validation_is_deterministic(self, content: str) -> None:
         """Property: Same input always produces same validation result."""
-        result1 = validate_json_object_response(content)
-        result2 = validate_json_object_response(content)
-
-        # Both should be same type
-        assert type(result1) is type(result2)
-
-        if isinstance(result1, ValidationSuccess):
-            assert isinstance(result2, ValidationSuccess)
-            assert result1.data == result2.data
-        else:
-            assert isinstance(result2, ValidationError)
-            assert result1.reason == result2.reason
+        assert extract_structured_fields(content, _ANSWER) == extract_structured_fields(content, _ANSWER)

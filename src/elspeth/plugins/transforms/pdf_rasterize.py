@@ -465,7 +465,7 @@ class PDFRasterize(BaseTransform):
     name = "pdf_rasterize"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:30f98ba21f7a8e25"
+    source_file_hash: str | None = "sha256:d393cd68e73b92f6"
     config_model = PDFRasterizeConfig
     usage_when_to_use: str = (
         "Use when each row carries a payload-store content hash for a PDF (from the blob_rows source or blob_fetch) "
@@ -748,6 +748,7 @@ class PDFRasterize(BaseTransform):
                 "max_pages": self._limits.max_pages,
                 "max_page_pixels": self._limits.max_page_pixels,
                 "max_page_bytes": self._limits.max_page_bytes,
+                "max_total_bytes": self._limits.max_total_bytes,
                 "render_timeout_seconds": self._limits.render_timeout_seconds,
                 "worker_memory_limit_bytes": self._limits.worker_memory_limit_bytes,
                 "extract_text": self._limits.extract_text,
