@@ -63,6 +63,11 @@ These changes are breaking:
   - OpenRouter `base_url` values with a query string or fragment.
   - A `web_scrape` `auth` setting, which previously failed every row, and a
     JSON record column without a path.
+  - An empty `query_template` or `query_pattern` in retrieval transforms.
+- **`type_coerce` is stricter.** Converting to `bool` no longer turns a blank
+  or whitespace-only string into `False`; it is a `not_boolean_string` row
+  error. Numeric strings with underscores or non-ASCII digits, and integers
+  outside the safe range (`out_of_range`), are refused instead of converted.
   - Multi-query LLM configs whose generated field names collide across
     queries, including the raw, `_usage` and `_model` fields. Uniqueness used
     to be checked only when a query set `structured_output_prefix`; the
@@ -340,6 +345,15 @@ Transforms:
     differs from the one requested, and a conflicting `LANGFUSE_BASE_URL`.
   - A required image field holding an empty list is an `invalid_input` row
     error (`empty_image_list`).
+- **`keyword_filter`:** the ReDoS guard treats `{,n}` and `{,}` as
+  quantifiers (`{}` stays literal), and a single-string `fields` declares
+  that one field rather than all fields.
+- **Unscanned fields are reported.** `keyword_filter` and the Azure content
+  safety and prompt shield transforms list fields they skipped because the
+  value was not a string in `success_reason.validation_warnings`. They do not
+  recurse into containers, by design.
+- **RAG:** the registry hides only a missing `chromadb` module, and its error
+  names the `elspeth[rag]` extra.
 
 Sinks and retrieval:
 
