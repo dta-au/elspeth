@@ -201,8 +201,15 @@ def validate_sink_config(
     Returns:
         List of validation errors (empty if valid)
     """
-    # Get config model for sink type
-    config_model = get_sink_config_model(sink_type) if plugin_cls is None else plugin_cls.get_config_model()
+    # Get config model for sink type, passing config as the runtime factory
+    # does (``get_config_model(options)``) so provider dispatch resolves the same model.
+    sink_cls = _resolve_sink_class(sink_type) if plugin_cls is None else plugin_cls
+    try:
+        config_model = sink_cls.get_config_model(config)
+    except ValueError as exc:
+        # Same contract as validate_source_config / validate_transform_config:
+        # a dispatch rejection is a config error, reported rather than raised.
+        return [ValidationError(field="provider", message=str(exc), value=None)]
 
     if config_model is None:
         return []  # No validation needed
@@ -310,13 +317,21 @@ def get_sink_config_model(sink_type: str) -> type[PluginConfigProtocol] | None:
     Raises:
         UnknownPluginTypeError: If sink_type is not a registered plugin.
     """
+    return _resolve_sink_class(sink_type).get_config_model()
+
+
+def _resolve_sink_class(sink_type: str) -> type[SinkProtocol]:
+    """Resolve a sink plugin class through the shared PluginManager.
+
+    Raises:
+        UnknownPluginTypeError: If sink_type is not a registered plugin.
+    """
     from elspeth.plugins.infrastructure.manager import PluginNotFoundError, get_shared_plugin_manager
 
     try:
-        plugin_cls = get_shared_plugin_manager().get_sink_by_name(sink_type)
+        return get_shared_plugin_manager().get_sink_by_name(sink_type)
     except PluginNotFoundError as exc:
         raise UnknownPluginTypeError(f"Unknown sink type: {sink_type}") from exc
-    return plugin_cls.get_config_model()
 
 
 def _extract_errors(
