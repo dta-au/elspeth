@@ -20,7 +20,11 @@ from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError, require_scalar_group_key
-from elspeth.plugins.transforms._scalar_buckets import same_scalar_bucket_value
+from elspeth.plugins.transforms._scalar_buckets import (
+    ConfiguredScalarLabel,
+    require_matchable_configured_label,
+    same_scalar_bucket_value,
+)
 
 type BatchEffectSizeRow = dict[str, object]
 
@@ -94,9 +98,12 @@ class BatchEffectSizeConfig(TransformDataConfig):
 
     variant_field: str = Field(description="Name of the field containing prompt/treatment variant labels")
     score_field: str = Field(description="Name of the numeric outcome field to compare")
-    baseline_variant: str | int | bool | None = Field(
+    baseline_variant: ConfiguredScalarLabel | None = Field(
         default=None,
-        description="Optional baseline variant. When omitted, the first-seen variant is the baseline.",
+        description=(
+            "Optional baseline variant (string, integer, number or boolean), matched by exact type. "
+            "When omitted, the first-seen variant is the baseline."
+        ),
     )
 
     @field_validator("variant_field")
@@ -115,10 +122,8 @@ class BatchEffectSizeConfig(TransformDataConfig):
 
     @field_validator("baseline_variant")
     @classmethod
-    def _reject_empty_baseline_variant(cls, v: str | int | bool | None) -> str | int | bool | None:
-        if type(v) is str and not v.strip():
-            raise ValueError("baseline_variant must not be empty")
-        return v
+    def _reject_unmatchable_baseline_variant(cls, v: str | int | float | bool | None) -> str | int | float | bool | None:
+        return require_matchable_configured_label(v, field_name="baseline_variant")
 
     @model_validator(mode="after")
     def _reject_field_collision(self) -> BatchEffectSizeConfig:
@@ -133,7 +138,7 @@ class BatchEffectSize(BaseTransform):
     name = "batch_effect_size"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:25b1137eb7c4a6e3"
+    source_file_hash: str | None = "sha256:798999da25b422dd"
     config_model = BatchEffectSizeConfig
     is_batch_aware = True
     # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.

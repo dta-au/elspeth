@@ -461,7 +461,11 @@ class OpenRouterLLMProvider:
             except (HTTPResponseBodyTooLargeError, HTTPResponseEncodingLimitError) as e:
                 raise LLMClientError("Provider response exceeded HTTP transport limits", retryable=False) from e
             except httpx.RequestError as e:
-                raise NetworkError(f"Network error: {e}") from e
+                # Fixed text: httpx/h11 transport errors can quote URLs and
+                # bytes the server sent, and this message reaches the audit
+                # row, the transform error and Langfuse. The original stays
+                # on __cause__.
+                raise NetworkError("Network error: OpenRouter request failed") from e
 
             data, content, usage, finish_reason, response_model = _validate_chat_completion_response(response)
 

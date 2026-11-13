@@ -248,18 +248,23 @@ class AzureLLMProvider:
             # Tier 3 envelope read through the declared boundary.
             finish_reason = finish_reason_from_raw_response(response.raw_response)
 
-            # Empty/whitespace content — AuditedLLMClient converts None→""
-            # (known fabrication). Detect here and raise typed errors so the
-            # transform's except LLMClientError handler catches them.
+            # Empty/whitespace str content. AuditedLLMClient raises on None
+            # content itself, so this branch sees only real empty strings.
+            # Classify by finish_reason as OpenRouter does: missing content
+            # alone does not establish a content-policy refusal, and a
+            # reasoning deployment that spends max_completion_tokens before
+            # replying stops with finish_reason=length.
             if not response.content or not response.content.strip():
+                if finish_reason == FinishReason.CONTENT_FILTER:
+                    raise ContentPolicyError("LLM returned empty content: provider filtered the response")
+                if finish_reason == FinishReason.LENGTH:
+                    raise LLMClientError("LLM exhausted the output token budget before returning content", retryable=False)
                 if finish_reason == FinishReason.TOOL_CALLS:
                     raise LLMClientError(
                         "Azure returned tool_calls response (not supported by ELSPETH)",
                         retryable=False,
                     )
-                raise ContentPolicyError(
-                    f"LLM returned empty content (finish_reason={finish_reason})",
-                )
+                raise LLMClientError("LLM returned empty content without an explicit refusal", retryable=False)
 
             return LLMQueryResult(
                 content=response.content,

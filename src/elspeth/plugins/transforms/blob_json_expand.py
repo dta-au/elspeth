@@ -328,6 +328,20 @@ def _check_json_nesting(text: str, *, phase: str, line_number: int | None = None
         ) from exc
 
 
+class _NonFiniteJSONConstantError(ValueError):
+    """A NaN / Infinity / -Infinity literal in the untrusted document."""
+
+
+def _reject_non_finite_constant(constant: str) -> None:
+    """``parse_constant`` hook: refuse non-RFC-8259 constants at the boundary.
+
+    Python's json module otherwise decodes them to non-finite floats, which the
+    canonical-JSON policy rejects later as a plugin contract breach instead of
+    as bad input. The JSON sources reject them at parse time the same way.
+    """
+    raise _NonFiniteJSONConstantError(f"non-standard JSON constant {constant!r} is not allowed; use null, not NaN/Infinity")
+
+
 def _is_payload_hash(value: str) -> bool:
     return len(value) == 64 and all(char in _SHA256_HEX_CHARS for char in value)
 
@@ -392,7 +406,7 @@ class BlobJSONExpand(BaseTransform):
     name = "blob_json_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:86a847226bed8d18"
+    source_file_hash: str | None = "sha256:e2b9ae839814a457"
     config_model = BlobJSONExpandConfig
     usage_when_to_use: str = (
         "Use when a row carries a JSON document — either a payload-store reference from blob_fetch or JSON text in a "
@@ -553,13 +567,18 @@ class BlobJSONExpand(BaseTransform):
         """Drive the real process path with a hermetic JSON payload seam."""
 
         class _InvariantPayloadStore:
-            def retrieve(self, ref: str) -> bytes:
+            # Mirrors PayloadStore.retrieve_bounded: a negative cap is refused,
+            # an unknown ref is not found, an oversize payload yields None.
+            def retrieve_bounded(self, ref: str, *, max_bytes: int) -> bytes | None:
+                if max_bytes < 0:
+                    raise ValueError("max_bytes must be nonnegative")
                 if ref != _INVARIANT_PROBE_BLOB_REF:
                     raise PayloadNotFoundError(ref)
-                return (
+                body = (
                     b'{"probe_documents": [{"probe_document_identifier": "blob_json_expand_probe_value", '
                     b'"probe_section_titles": ["probe_section"]}]}'
                 )
+                return body if len(body) <= max_bytes else None
 
         had_payload_store = "_payload_store" in self.__dict__
         original_payload_store: Any = None
@@ -729,7 +748,10 @@ class BlobJSONExpand(BaseTransform):
         resolved = self._resolve_blob_format(row)
 
         try:
-            body = self._payload_store.retrieve(blob_ref)
+            # Bounded read: the store stops after max_blob_bytes + 1 bytes and
+            # returns None for an oversize blob, so the cap limits memory, not
+            # just the accepted size (contracts/payload_store.py).
+            body = self._payload_store.retrieve_bounded(blob_ref, max_bytes=self._max_blob_bytes)
         except IntegrityError:
             # FIRST, ahead of the absence handler. The payload store returning
             # bytes that fail their own hash is ELSPETH's storage being corrupt,
@@ -745,14 +767,12 @@ class BlobJSONExpand(BaseTransform):
                 _json_error_reason("blob_not_found", field=self._blob_ref_field, blob_ref=blob_ref, error=str(exc))
             ) from exc
 
-        body_size = len(body)
-        if body_size > self._max_blob_bytes:
+        if body is None:
             raise _BlobJSONParseError(
                 _json_error_reason(
                     "blob_too_large",
                     field=self._blob_ref_field,
                     blob_ref=blob_ref,
-                    body_size=body_size,
                     max_blob_bytes=self._max_blob_bytes,
                 )
             )
@@ -851,12 +871,23 @@ class BlobJSONExpand(BaseTransform):
                     )
                 )
             elements: list[Any] = []
-            for line_number, line in enumerate(text.splitlines(), start=1):
+            # Split on "\n" only, as the JSONL sources do (a file object /
+            # TextIOWrapper(newline="")). str.splitlines() also breaks on
+            # U+2028, U+2029, U+0085 and \x1c-\x1e, which JSON permits raw
+            # inside strings, so it would cut a valid record mid-string.
+            for line_number, raw_line in enumerate(text.split("\n"), start=1):
+                line = raw_line.removesuffix("\r")
                 if not line.strip():
                     continue
                 _check_json_nesting(line, phase="jsonl_line", line_number=line_number)
                 try:
-                    elements.append(json.loads(line))
+                    elements.append(json.loads(line, parse_constant=_reject_non_finite_constant))
+                except _NonFiniteJSONConstantError as exc:
+                    raise _BlobJSONParseError(
+                        _json_error_reason(
+                            "invalid_json", error_type="non_finite_constant", phase="jsonl_line", line_number=line_number, error=str(exc)
+                        )
+                    ) from exc
                 except json.JSONDecodeError as exc:
                     raise _BlobJSONParseError(
                         _json_error_reason("invalid_json", phase="jsonl_line", line_number=line_number, error=str(exc))
@@ -865,7 +896,11 @@ class BlobJSONExpand(BaseTransform):
 
         _check_json_nesting(text, phase="document")
         try:
-            document = json.loads(text)
+            document = json.loads(text, parse_constant=_reject_non_finite_constant)
+        except _NonFiniteJSONConstantError as exc:
+            raise _BlobJSONParseError(
+                _json_error_reason("invalid_json", error_type="non_finite_constant", phase="document", error=str(exc))
+            ) from exc
         except json.JSONDecodeError as exc:
             raise _BlobJSONParseError(_json_error_reason("invalid_json", phase="document", line_number=exc.lineno, error=str(exc))) from exc
 
