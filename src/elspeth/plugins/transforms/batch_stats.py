@@ -27,6 +27,11 @@ from elspeth.plugins.transforms._scalar_buckets import ScalarBucketKey, scalar_b
 
 type BatchStatsAggregateRow = dict[str, object]
 
+# The largest magnitude an int may have in canonical JSON (RFC 8785 refuses any
+# int beyond it). An exact-int total outside ±_SAFE_INTEGER_MAX can never be
+# emitted, so the plugin records it as its own overflow instead.
+_SAFE_INTEGER_MAX = 2**53 - 1
+
 
 class BatchStatsConfig(TransformDataConfig):
     """Configuration for batch statistics transform.
@@ -127,7 +132,7 @@ class BatchStats(BaseTransform):
     name = "batch_stats"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:dc51745b4f352155"
+    source_file_hash: str | None = "sha256:7dd94ede3f04f5a9"
     config_model = BatchStatsConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
     # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
@@ -280,7 +285,8 @@ class BatchStats(BaseTransform):
         reaches it, ``_aggregate_group`` fails the batch on any value whose
         type is not exactly int or float). ``sum`` is ``sum(values)`` over
         those same int and float values: an exact int over int rows (never
-        converted, so an integer total above 2**53 keeps every digit) and a
+        converted; a total beyond ±(2**53-1) cannot be emitted in canonical
+        JSON, so it fails the group as a recorded ``float_overflow``) and a
         float otherwise, declared ``float`` because an int value satisfies a
         float declaration (ADR-050 Decision 5, ruling C3: one number type).
         ``group_by`` carries the group's row value, so its type is the data's
@@ -445,8 +451,8 @@ class BatchStats(BaseTransform):
                 skipped_non_finite_indices.append(row_index)
                 continue
 
-            # Preserve original type: int stays int (arbitrary precision),
-            # float stays float. Avoids precision loss for ints > 2^53.
+            # Preserve original type: int stays int (exact), float stays float.
+            # An int total is exact; one beyond ±(2**53-1) is refused below.
             values.append(raw_value)
 
         count = len(values)
@@ -480,18 +486,20 @@ class BatchStats(BaseTransform):
 
         # At this point, values is guaranteed non-empty: empty batch returns error
         # before grouping, and all-non-finite returns error above. count > 0.
-        total = sum(values)
-
-        # Guard against overflow: summing many large-but-valid floats can produce inf.
-        # Integer sums use arbitrary precision and cannot overflow.
+        # Overflow is a recorded, value-free failure of the sum: a float total
+        # that reaches inf (or an int too large for a float, summed with one),
+        # and an exact int total beyond ±(2**53-1), which canonical JSON
+        # refuses even when every input was inside that range. The latter is
+        # data-dependent, so it is recorded here rather than emitted and then
+        # blamed on the plugin as non-canonical output.
+        try:
+            total = sum(values)
+        except OverflowError:
+            return {}, self._error_for_sum_overflow(grouped_rows, count, cause=None)
         if isinstance(total, float) and not math.isfinite(total):
-            overflow_reason: TransformErrorReason = {
-                "reason": "float_overflow",
-                "batch_size": len(grouped_rows),
-                "valid_count": count,
-            }
-            self._locate_group(overflow_reason, grouped_rows)
-            return {}, TransformResult.error(overflow_reason, retryable=False)
+            return {}, self._error_for_sum_overflow(grouped_rows, count, cause=None)
+        if type(total) is int and abs(total) > _SAFE_INTEGER_MAX:
+            return {}, self._error_for_sum_overflow(grouped_rows, count, cause="integer_beyond_json_safe_range")
 
         result: BatchStatsAggregateRow = {
             "count": count,
@@ -524,6 +532,25 @@ class BatchStats(BaseTransform):
             result[self._group_by] = group_value
 
         return result, None
+
+    def _error_for_sum_overflow(
+        self,
+        grouped_rows: list[tuple[int, PipelineRow]],
+        valid_count: int,
+        *,
+        cause: str | None,
+    ) -> TransformResult:
+        """Audited, value-free error for a group whose sum cannot be emitted."""
+        reason: TransformErrorReason = {
+            "reason": "float_overflow",
+            "operation": "sum",
+            "batch_size": len(grouped_rows),
+            "valid_count": valid_count,
+        }
+        if cause is not None:
+            reason["cause"] = cause
+        self._locate_group(reason, grouped_rows)
+        return TransformResult.error(reason, retryable=False)
 
     def _error_for_no_valid_values(
         self,

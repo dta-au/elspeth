@@ -1023,17 +1023,24 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # bounds nesting before decode; its manifest provenance token moved
 # 204c8485e712dc75 -> 35519150141e19b9, the manifest's only changed byte run.
 # Captured from this file's parity failure (previous pin b14d1da8...).
+# Integrator follow-up (CSVSource refuses non-text codecs at config): its
+# fifteen manifest provenance tokens moved 94e4e14b6d89d7e1 -> 4299e6110527265e,
+# and reopen-resume's resumed_full_projection_sha256 moved d9f57ba0... ->
+# 1bf3705a..., measured by the production harness. Captured from this file's
+# parity failure on its own branch (previous pin 70bb6809...).
 # Sweep finding #42 (20261111-plugins-review): JSONSource decodes JSONL with a
 # byte-escaping error handler so one bad UTF-16/32 code unit stays on its line;
 # its manifest provenance token moved 35519150141e19b9 -> 098f17f23ccb7c66,
 # the manifest's only changed byte run. Captured from this file's parity
-# failure (previous pin 70bb6809...).
+# failure on its own branch (previous pin 70bb6809...).
 # Sweep finding #43 (20261111-plugins-review): JSONSource reads UTF-8 input as
 # utf-8-sig so a leading BOM no longer quarantines the file; its manifest
 # provenance token moved 098f17f23ccb7c66 -> c299bae1329a63c2, the manifest's
 # only changed byte run. Captured from this file's parity failure (previous
 # pin b88cee62...).
-EXPECTED_CASE_REGISTRY_SHA256 = "68e95dc040cf3e924aa37f4fe8b824e119b201554edafe3f78e36ea47a9d75ba"
+# Merged with the integrator follow-up: all of the above, re-captured from
+# this file's parity failure on the merged tree.
+EXPECTED_CASE_REGISTRY_SHA256 = "14d69b1c9e014634823cb323c1dbc8d334a80711e2724271e184be553e03fefe"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

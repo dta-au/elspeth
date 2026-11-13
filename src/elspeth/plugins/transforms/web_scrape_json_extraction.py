@@ -35,7 +35,9 @@ class JSONRecordColumn(BaseModel):
     model_config = {"extra": "forbid"}
 
     field: str = Field(min_length=1, max_length=128)
-    path: JSONPath = Field(default_factory=list, max_length=32)
+    # An empty path selects the record object itself, which is never a scalar,
+    # so the column could only fail every row; require at least one step.
+    path: JSONPath = Field(min_length=1, max_length=32)
     required: bool = False
     multiple: Literal["first", "one", "all"] = "first"
     max_values: int = Field(default=16, ge=1, le=256)

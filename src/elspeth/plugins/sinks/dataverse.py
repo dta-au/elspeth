@@ -305,6 +305,24 @@ class DataverseSinkConfig(DataPluginConfig):
             )
         return self
 
+    @model_validator(mode="after")
+    def validate_lookup_keys_in_field_mapping(self) -> Self:
+        """Reject lookups keyed by a pipeline field that field_mapping does not read.
+
+        ``_map_row`` applies a lookup only while walking ``field_mapping``, so a
+        lookup whose key is not a ``field_mapping`` key would validate and then
+        never be written: every upsert would silently drop the binding.
+        """
+        if self.lookups:
+            unmapped = sorted(set(self.lookups) - set(self.field_mapping))
+            if unmapped:
+                raise ValueError(
+                    f"lookups keys {unmapped} are not field_mapping keys. A lookup binds the value of a "
+                    f"mapped pipeline field; add each lookup key to field_mapping. "
+                    f"Available field_mapping keys: {sorted(self.field_mapping)}"
+                )
+        return self
+
 
 # Rebuild model to resolve forward references
 DataverseSinkConfig.model_rebuild()
@@ -320,7 +338,7 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b6385bbac6b974d2"
+    source_file_hash: str | None = "sha256:8378e75e1630d489"
     determinism = Determinism.EXTERNAL_CALL
     config_model = DataverseSinkConfig
     idempotent = True  # PATCH upsert is idempotent — safe for retries and crash recovery (engine does not yet read this flag)
@@ -387,7 +405,7 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
                     "lookups map pipeline fields to navigation-property bindings; avoid collisions with field_mapping targets.",
                     "environment_url must be HTTPS and within the allowed Dataverse domain patterns.",
                     "Alternate-key values must be non-empty strings at write time; an empty or non-string key crashes the run (it cannot form a valid OData URL).",
-                    "Every failed write raises so the engine retries or aborts: a client error about the row (400/404/409/412/422), auth/authz (401/403), rate limit (429), and 5xx alike. Dataverse error responses are not yet classified per row, so on_write_failure never routes them to its sink; fix the offending rows or mapping and rerun.",
+                    "Every failed write raises so the engine retries or aborts: row client errors (400/404/409/412/422), auth/authz (401/403), rate limit (429) and 5xx alike. Dataverse errors are not yet classified per row, so on_write_failure never routes them; fix the rows or mapping and rerun.",
                 ),
             )
         return None
@@ -457,13 +475,15 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
         """Build PATCH URL for upsert with alternate key.
 
         URL-encodes entity name, alternate key name, and key value to prevent
-        injection via special characters.
+        injection via special characters. The key value is first escaped as an
+        OData string literal (a single quote is doubled): servers percent-decode
+        before parsing OData, so a bare ``%27`` would still end the literal.
         key_value is guaranteed str by the isinstance checks on the effect paths
         (_member_effect_material / _validate_member_effect).
         """
         encoded_entity = urllib.parse.quote(self._entity, safe="")
         encoded_key_name = urllib.parse.quote(self._alternate_key, safe="")
-        encoded_value = urllib.parse.quote(key_value, safe="")
+        encoded_value = urllib.parse.quote(key_value.replace("'", "''"), safe="")
         return f"{self._environment_url.rstrip('/')}/api/data/{self._api_version}/{encoded_entity}({encoded_key_name}='{encoded_value}')"
 
     def _map_row(self, row: dict[str, Any]) -> dict[str, Any]:

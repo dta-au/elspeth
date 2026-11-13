@@ -306,7 +306,7 @@ class BlobCSVExpand(BaseTransform):
     name = "blob_csv_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ca4a5b4f566b7fd7"
+    source_file_hash: str | None = "sha256:36274db08c825a1e"
     config_model = BlobCSVExpandConfig
     usage_when_to_use: str = (
         "Use when each input row carries a payload-store reference to a CSV blob and you need to "
@@ -452,11 +452,15 @@ class BlobCSVExpand(BaseTransform):
         """
 
         class _InvariantPayloadStore:
+            # Mirrors PayloadStore.retrieve_bounded: a negative cap is refused,
+            # an unknown ref is not found, an oversize payload yields None.
             def retrieve_bounded(self, ref: str, *, max_bytes: int) -> bytes | None:
+                if max_bytes < 0:
+                    raise ValueError("max_bytes must be nonnegative")
                 if ref != _INVARIANT_PROBE_BLOB_REF:
                     raise PayloadNotFoundError(ref)
-                content = _INVARIANT_PROBE_CSV_TEXT.encode("utf-8")
-                return None if len(content) > max_bytes else content
+                body = _INVARIANT_PROBE_CSV_TEXT.encode("utf-8")
+                return body if len(body) <= max_bytes else None
 
         had_payload_store = "_payload_store" in self.__dict__
         original_payload_store: Any = None
@@ -610,8 +614,9 @@ class BlobCSVExpand(BaseTransform):
             )
 
         try:
-            # Bounded read: the store stops after max_blob_bytes + 1 bytes, so an
-            # oversized blob is refused without being read (or hashed) whole.
+            # Bounded read: the store stops after max_blob_bytes + 1 bytes and
+            # returns None for an oversize blob, so the cap limits memory, not
+            # just the accepted size (contracts/payload_store.py).
             body = self._payload_store.retrieve_bounded(blob_ref, max_bytes=self._max_blob_bytes)
         # ORDER IS LOAD-BEARING. A corrupt payload is not a missing payload: it
         # must crash the run rather than be quarantined as a routed row error,
@@ -638,8 +643,6 @@ class BlobCSVExpand(BaseTransform):
             ) from exc
 
         if body is None:
-            # retrieve_bounded stopped past the cap, so the exact size is not
-            # known and is not reported.
             raise _BlobCSVParseError(
                 _csv_error_reason(
                     "blob_too_large",

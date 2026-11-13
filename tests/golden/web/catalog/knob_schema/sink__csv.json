@@ -122,6 +122,16 @@
         "nullable": false,
         "required": false,
         "tier": "common"
+      },
+      {
+        "default": false,
+        "description": "Prefix string cell values that start with =, +, -, @, tab, CR or LF with a single quote so spreadsheet applications read them as text, not formulas (the guard CSV audit exports always apply). Use when the file may be opened in Excel and carries untrusted text such as LLM output or uploaded data. Header names are not rewritten. The written cells then differ from the audited row values; false writes verbatim.",
+        "kind": "checkbox",
+        "label": "Neutralize Formulas",
+        "name": "neutralize_formulas",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
       }
     ]
   },
