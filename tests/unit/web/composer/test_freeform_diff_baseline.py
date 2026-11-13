@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -10,12 +11,16 @@ from uuid import UUID
 
 import pytest
 
+from elspeth.contracts.composer_progress import ComposerProgressEvent
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
+from elspeth.web.sessions.converters import state_from_record
+from elspeth.web.sessions.protocol import CompositionStateData
 from tests.unit.web.composer._helpers import (
     _clean_advisor_checkpoint,
     _composer_service_with_session,
@@ -23,6 +28,8 @@ from tests.unit.web.composer._helpers import (
     _make_settings,
     _mock_catalog,
 )
+from tests.unit.web.composer.test_tools import _empty_state, _stage1_valid_preview_state, execute_tool
+from tests.unit.web.sessions.test_composer_proposals import _session_operation_context
 
 
 def _call(name: str, arguments: dict[str, Any], identifier: str) -> dict[str, Any]:
@@ -131,3 +138,375 @@ async def test_diff_uses_request_start_and_resets_for_next_request(
     assert next_payloads[0]["success"]
     assert next_payloads[0]["data"]["from_version"] == result.state.version
     assert next_payloads[0]["data"]["total_changes"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [False, True], ids=["request-start", "last-accepted"])
+@pytest.mark.parametrize("later_round", [False, True], ids=["same-batch", "later-round"])
+async def test_diff_reports_baseline_and_preserves_accepted_state_across_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, accepted: bool, later_round: bool
+) -> None:
+    monkeypatch.setattr(AdvisorCheckpointOwner, "_run_advisor_checkpoint", _clean_advisor_checkpoint)
+    service, session_id = _composer_service_with_session(_mock_catalog(), _make_settings(data_dir=tmp_path))
+    sessions = service._require_sessions_service()
+    sid = (await sessions.create_session("test-user", "Diff baseline", "local")).id
+    session_id = str(sid)
+    state = CompositionState(
+        nodes=(),
+        edges=(),
+        metadata=PipelineMetadata(),
+        version=1,
+        source=SourceSpec(
+            plugin="csv",
+            on_success="main",
+            on_validation_failure="discard",
+            options={"path": str(tmp_path / "blobs" / session_id / "input.csv"), "schema": {"mode": "observed"}},
+        ),
+        outputs=(
+            OutputSpec(
+                name="main",
+                plugin="csv",
+                on_write_failure="discard",
+                options={
+                    "path": str(tmp_path / "outputs" / session_id / "output.csv"),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        service._preflight,
+        "runtime_preflight",
+        lambda *_a, **_kw: ValidationResult(
+            is_valid=True,
+            checks=[],
+            errors=[],
+            readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
+        ),
+    )
+    current_state_id = None
+    if accepted:
+        # Two real accepted records prove selection of the newest, not the first.
+        for description in ("Older acceptance", "Newest acceptance"):
+            state = state.with_metadata({"description": description})
+            async with _session_operation_context(sessions, sid, SessionOperationKind.COMPOSE) as context:
+                proposal = await sessions.create_composition_proposal(
+                    session_id=sid,
+                    tool_call_id=description,
+                    tool_name="set_metadata",
+                    summary=description,
+                    rationale="User requested this description",
+                    affects=("metadata",),
+                    arguments_json={"patch": {"description": description}},
+                    arguments_redacted_json={"patch": {"description": description}},
+                    base_state_id=current_state_id,
+                    actor="test-user",
+                    session_operation_context=context,
+                )
+            raw = state.to_dict()
+            async with _session_operation_context(sessions, sid, SessionOperationKind.PROPOSAL) as context:
+                committed = await sessions.accept_composition_proposal(
+                    session_id=sid,
+                    proposal_id=proposal.id,
+                    expected_current_state_id=current_state_id,
+                    state=CompositionStateData(
+                        sources=raw["sources"],
+                        nodes=raw["nodes"],
+                        edges=raw["edges"],
+                        outputs=raw["outputs"],
+                        metadata_=raw["metadata"],
+                        is_valid=True,
+                    ),
+                    actor="test-user",
+                    session_operation_context=context,
+                )
+            assert committed.committed_state_id is not None
+            current_state_id = committed.committed_state_id
+            state = state_from_record(await sessions.get_state(current_state_id))
+    baseline_version = state.version
+    before = _call("diff_pipeline", {}, "diff_before_edits")
+    edits = (
+        _call("set_metadata", {"patch": {"description": "First edit after acceptance"}}, "edit_one"),
+        _call("patch_output_options", {"sink_name": "main", "patch": {"delimiter": ";"}}, "edit_two"),
+    )
+    diff = _call("diff_pipeline", {}, "diff_edits")
+    responses = [_response(before, *edits), _response(diff)] if later_round else [_response(before, *edits, diff)]
+    responses.append(_admit_composer_llm_completion(_make_llm_response(content="Edits inspected.")))
+    with (
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as provider,
+        patch.object(sessions, "get_state_in_session", wraps=sessions.get_state_in_session) as baseline_read,
+    ):
+        provider.side_effect = responses
+        result = await service.compose(
+            "Make both edits and inspect them.",
+            [],
+            state,
+            session_id=session_id,
+            current_state_id=str(current_state_id) if current_state_id else None,
+        )
+    assert baseline_read.await_count == (1 if accepted else 0)
+    initial_payload, payload = _diff_payloads(result)
+    assert initial_payload["success"], initial_payload
+    assert initial_payload["data"]["total_changes"] == 0
+    assert payload["success"], payload
+    assert "baseline_kind" in payload["data"]
+    assert payload["data"]["baseline_kind"] == ("last_accepted" if accepted else "request_start")
+    assert payload["data"]["from_version"] == baseline_version
+    assert payload["data"]["metadata_changed"]
+    edit_result = json.loads(
+        next(
+            invocation.result_canonical
+            for invocation in result.tool_invocations
+            if invocation.tool_name == "patch_output_options" and invocation.result_canonical is not None
+        )
+    )
+    assert edit_result["success"], json.dumps(edit_result)
+    assert payload["data"]["outputs"]["modified"] == ["main"]
+    assert payload["data"]["total_changes"] == 2
+    proposals = await sessions.list_composition_proposals(sid)
+    assert len(proposals) == (2 if accepted else 0), "Auto-commit edits must not invent accepted proposals"
+    current = await sessions.get_current_state(sid)
+    assert current is not None
+    with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as provider:
+        provider.side_effect = [
+            _response(_call("diff_pipeline", {}, "diff_next")),
+            _admit_composer_llm_completion(_make_llm_response(content="Diff inspected.")),
+        ]
+        next_result = await service.compose("What changed?", [], result.state, session_id=session_id, current_state_id=str(current.id))
+    next_payload = _diff_payloads(next_result)[0]
+    assert next_payload["success"], next_payload
+    assert next_payload["data"]["baseline_kind"] == ("last_accepted" if accepted else "request_start")
+    assert next_payload["data"]["from_version"] == (baseline_version if accepted else result.state.version)
+    assert next_payload["data"]["total_changes"] == (2 if accepted else 0)
+
+
+@pytest.mark.parametrize("valid", [False, True])
+def test_missing_baseline_does_not_change_graph_validity(valid: bool) -> None:
+    state = _stage1_valid_preview_state() if valid else _empty_state()
+    assert state.validate().is_valid is valid
+    result = execute_tool("diff_pipeline", {}, state, _mock_catalog())
+    assert not result.success
+    assert result.validation.is_valid is valid
+    assert result.validation.errors[0].error_code == "diff_baseline_unavailable"
+    assert result.validation.errors[1:] == state.validate().errors
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("valid", [False, True])
+async def test_accepted_baseline_credential_refusal_is_recoverable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    valid: bool,
+) -> None:
+    from elspeth.web.composer.protocol import ComposerPluginCrashError
+
+    monkeypatch.setattr(AdvisorCheckpointOwner, "_run_advisor_checkpoint", _clean_advisor_checkpoint)
+    service, session_id = _composer_service_with_session(_mock_catalog(), _make_settings(data_dir=tmp_path))
+    sessions = service._require_sessions_service()
+    sid = (await sessions.create_session("test-user", "Refused baseline", "local")).id
+    session_id = str(sid)
+    clean = _stage1_valid_preview_state() if valid else _empty_state()
+    marker = "sk-" + "a" * 24
+    poisoned = replace(
+        _stage1_valid_preview_state(),
+        outputs=(replace(_stage1_valid_preview_state().outputs[0], name=marker),),
+        metadata=PipelineMetadata(description="refused-baseline-description"),
+    )
+
+    async def commit(state: CompositionState, label: str) -> UUID:
+        head = await sessions.get_current_state(sid)
+        base_id = head.id if head else None
+        async with _session_operation_context(sessions, sid, SessionOperationKind.COMPOSE) as context:
+            proposal = await sessions.create_composition_proposal(
+                session_id=sid,
+                tool_call_id=label,
+                tool_name="set_metadata",
+                summary=label,
+                rationale="Baseline test",
+                affects=("metadata",),
+                arguments_json={"patch": {}},
+                arguments_redacted_json={"patch": {}},
+                base_state_id=base_id,
+                actor="test-user",
+                session_operation_context=context,
+            )
+        raw = state.to_dict()
+        async with _session_operation_context(sessions, sid, SessionOperationKind.PROPOSAL) as context:
+            accepted = await sessions.accept_composition_proposal(
+                session_id=sid,
+                proposal_id=proposal.id,
+                expected_current_state_id=base_id,
+                state=CompositionStateData(
+                    sources=raw["sources"],
+                    nodes=raw["nodes"],
+                    edges=raw["edges"],
+                    outputs=raw["outputs"],
+                    metadata_=raw["metadata"],
+                    is_valid=valid,
+                ),
+                actor="test-user",
+                session_operation_context=context,
+            )
+        assert accepted.committed_state_id is not None
+        return accepted.committed_state_id
+
+    current_id = await commit(poisoned, "refused-acceptance")
+    events: list[ComposerProgressEvent] = []
+
+    async def progress(event: ComposerProgressEvent) -> None:
+        events.append(event)
+
+    for request in range(3):
+        if request == 2:
+            current_id = await commit(clean.with_metadata({"description": "Clean acceptance"}), "clean-acceptance")
+            clean = state_from_record(await sessions.get_state(current_id))
+        events.clear()
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as provider:
+            provider.side_effect = [
+                _response(_call("diff_pipeline", {}, f"diff_{request}_first"), _call("get_pipeline_state", {}, f"state_{request}_first")),
+                _response(_call("diff_pipeline", {}, f"diff_{request}_later"), _call("get_pipeline_state", {}, f"state_{request}_later")),
+                _admit_composer_llm_completion(_make_llm_response(content="Inspection complete.")),
+            ]
+            try:
+                result = await service.compose(
+                    "Inspect changes.", [], clean, session_id=session_id, current_state_id=str(current_id), progress=progress
+                )
+            except ComposerPluginCrashError as exc:
+                raise AssertionError("A refused comparison baseline must fail the tool call, not crash the turn") from exc
+            assert provider.await_count == 3
+            captured = capsys.readouterr()
+            exposed = repr(provider.call_args_list) + repr(result) + repr(events) + caplog.text + captured.out + captured.err
+        assert marker not in exposed
+        assert "refused-baseline-description" not in exposed
+        payloads = _diff_payloads(result)
+        assert len(payloads) == 2
+        for payload in payloads:
+            assert payload["success"] is (request == 2)
+            assert payload["validation"]["is_valid"] is valid
+            if request < 2:
+                assert payload["validation"]["errors"][0]["error_code"] == "diff_baseline_unavailable"
+                assert "refused by the credential policy" in payload["validation"]["errors"][0]["message"]
+                assert "data" not in payload or not payload["data"]
+            else:
+                assert payload["data"]["baseline_kind"] == "last_accepted"
+                assert payload["data"]["total_changes"] == 0
+        inspections = [
+            json.loads(inv.result_canonical)
+            for inv in result.tool_invocations
+            if inv.tool_name == "get_pipeline_state" and inv.result_canonical is not None
+        ]
+        assert len(inspections) == 2
+        assert all(item["success"] for item in inspections)
+        refusals = [event for event in events if event.reason == "admission_refused"]
+        assert len(refusals) == (1 if request < 2 else 0)
+        if refusals:
+            assert refusals[0].phase == "using_tools"
+        clean = result.state
+        head = await sessions.get_current_state(sid)
+        assert head is not None
+        current_id = head.id
+
+
+@pytest.mark.asyncio
+async def test_planner_auto_commit_compares_with_its_committed_proposal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.web.composer.protocol import PipelineCommitIntent
+    from elspeth.web.composer.service import ComposerServiceImpl
+    from tests.unit.web.sessions.test_run_composer_turn import (
+        _create_running_pipeline_route_proposal,
+        _make_composer_mock,
+        _prepare_canonical_pipeline_route_proposal,
+        _run,
+        _running_job,
+    )
+
+    app, sessions, _pipeline, sid, creation, _endpoint = await _prepare_canonical_pipeline_route_proposal(
+        tmp_path, monkeypatch, tool_call_id="baseline-planner-build"
+    )
+    planner = _make_composer_mock()
+
+    async def planned(*args: Any, **kwargs: Any) -> ComposerResult:
+        row = await _create_running_pipeline_route_proposal(sessions, creation, kwargs)
+        assert row.pipeline_metadata is not None
+        return ComposerResult(
+            message="Pipeline prepared.",
+            state=_empty_state(),
+            pipeline_commit_intent=PipelineCommitIntent(proposal_id=row.id, draft_hash=row.pipeline_metadata.draft_hash),
+        )
+
+    planner.compose.side_effect = planned
+    app.state.composer_service = planner
+    async with _running_job(app, sessions, sid, kind="compose_message", content="Build the pipeline.") as job:
+        completed = await _run(app, job)
+    assert completed.status == "completed"
+    proposals = await sessions.list_composition_proposals(sid)
+    assert [proposal.status for proposal in proposals] == ["committed"]
+    current = await sessions.get_current_state(sid)
+    assert current is not None and proposals[0].committed_state_id == current.id
+
+    composer = ComposerServiceImpl.for_trained_operator(
+        catalog=app.state.catalog_service,
+        settings=_make_settings(data_dir=tmp_path),
+        sessions_service=sessions,
+        session_engine=app.state.session_engine,
+    )
+    monkeypatch.setattr(AdvisorCheckpointOwner, "_run_advisor_checkpoint", _clean_advisor_checkpoint)
+    with patch.object(composer._provider_gateway, "_call_llm", new_callable=AsyncMock) as provider:
+        provider.side_effect = [
+            _response(_call("diff_pipeline", {}, "diff_planner_build")),
+            _admit_composer_llm_completion(_make_llm_response(content="No changes since the build.")),
+        ]
+        async with _session_operation_context(sessions, sid, SessionOperationKind.COMPOSE) as context:
+            result = await composer.compose(
+                "What changed?",
+                [],
+                state_from_record(current),
+                session_id=str(sid),
+                current_state_id=str(current.id),
+                user_id="alice",
+                session_operation_context=context,
+            )
+    payload = _diff_payloads(result)[0]
+    assert payload["success"], payload
+    assert payload["data"]["baseline_kind"] == "last_accepted"
+    assert payload["data"]["from_version"] == current.version
+    assert payload["data"]["total_changes"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("credential_in_response", [False, True])
+async def test_baseline_lookup_follows_response_scan_and_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, credential_in_response: bool
+) -> None:
+    from elspeth.web.composer.protocol import ComposerPluginCrashError
+    from elspeth.web.credential_guard import CredentialMaterialRefused
+
+    service, session_id = _composer_service_with_session(_mock_catalog(), _make_settings(data_dir=tmp_path))
+    sessions = service._require_sessions_service()
+    # The first listing belongs to the existing tool-id replay preflight.
+    lookup = AsyncMock(spec=sessions.list_composition_proposals, side_effect=[[], ValueError("baseline lookup failed")])
+    monkeypatch.setattr(sessions, "list_composition_proposals", lookup)
+    completion = _admit_composer_llm_completion(
+        _make_llm_response(
+            content="Inspecting changes.",
+            tool_calls=[_call("diff_pipeline", {}, "diff_lookup_failure")],
+        )
+    )
+    if credential_in_response:
+        # Exercise the batch guard for an internal already-admitted completion.
+        completion = replace(completion, message=replace(completion.message, content="sk-" + "a" * 24))
+    with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as provider:
+        provider.return_value = completion
+        if credential_in_response:
+            with pytest.raises(CredentialMaterialRefused):
+                await service.compose("Inspect changes.", [], _stage1_valid_preview_state(), session_id=session_id)
+            lookup.assert_not_awaited()
+        else:
+            with pytest.raises(ComposerPluginCrashError) as caught:
+                await service.compose("Inspect changes.", [], _stage1_valid_preview_state(), session_id=session_id)
+            assert isinstance(caught.value.original_exc, ValueError)
+            assert caught.value.failed_turn is not None
+            assert lookup.await_count == 2

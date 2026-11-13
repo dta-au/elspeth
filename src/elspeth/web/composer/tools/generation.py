@@ -9,7 +9,7 @@ import io
 import re
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, Final, Literal, TypedDict, assert_never, final
 from uuid import UUID
@@ -458,7 +458,7 @@ _LEGACY_PLUGIN_UNAVAILABLE_REASONS: Final = (
 _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"diff_baseline_unavailable|No baseline available",
-        "This surface supplied no comparison baseline; this does not establish whether saved revisions exist.",
+        "This surface supplied no usable comparison baseline; this does not establish whether saved revisions exist.",
         "Use get_pipeline_state for the current state. Request a diff again when this surface supplies its comparison baseline.",
     ),
     (
@@ -4864,11 +4864,24 @@ def _execute_diff_pipeline(
         # A failure, not a success carrying an ``error`` key: ``error`` is a
         # failure-only key on every surface (elspeth-e405ad7cd2 D5). The
         # current version already rides the envelope's ``version``.
-        return _saved_graph_rejection_result(
+        rejection = _saved_graph_rejection_result(
             state,
-            "No baseline available. This surface supplied no comparison state; saved revisions may still exist.",
+            (
+                "No baseline available. The comparison state was refused by the credential policy; saved revisions may still exist."
+                if context.baseline_kind == "last_accepted"
+                else "No baseline available. This surface supplied no comparison state; saved revisions may still exist."
+            ),
             error_code="diff_baseline_unavailable",
             rejected_component=None,
+        )
+        # This is a comparison failure, not a graph defect. Preserve the
+        # catalog's standing verdict and findings, plus the refusal reason.
+        # Stamp the snapshot we actually validated so dispatch retains it.
+        validation = context.catalog.validate_composition_state(state).validation
+        return replace(
+            rejection,
+            validation=replace(validation, errors=(rejection.validation.errors[0], *validation.errors)),
+            _validation_snapshot_hash=context.plugin_snapshot.snapshot_hash,
         )
 
     baseline_validation = context.catalog.validate_composition_state(baseline).validation
@@ -4877,6 +4890,7 @@ def _execute_diff_pipeline(
         state,
         baseline_validation=baseline_validation,
         current_validation=current_validation,
+        baseline_kind=context.baseline_kind,
     )
     return _discovery_result(state, changes)
 
@@ -4886,9 +4900,9 @@ _DIFF_PIPELINE_DECLARATION = ToolDeclaration(
     response_contract=DIFF_PIPELINE_RESPONSE_CONTRACT,
     handler=_execute_diff_pipeline,
     kind=ToolKind.DISCOVERY,
-    description="Compare with this surface's baseline (Web Composer: request-start state, fixed across provider rounds). "
-    "On success `data` carries `from_version` (the baseline; the version it "
-    "changed TO is the envelope's own `version`), `sources_changed`, "
+    description="Compare pipeline states. Web loop `baseline_kind`: `last_accepted` "
+    "(newest committed proposal), else `request_start`; planner: `request_start`. "
+    "`data`: `from_version` (baseline; current is envelope `version`), `sources_changed`, "
     "`metadata_changed`, `total_changes`, `warnings_introduced`, "
     "`warnings_resolved`, and per-collection `added` / `removed` / `modified` "
     "lists under `nodes`, `edges`, `outputs`, and — only when `sources_changed` — `sources`. Without a "
