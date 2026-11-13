@@ -19,9 +19,13 @@ for stage 1 (13:23–13:31Z). Raw files are in
 >   - **The tutorial RUN step failed in this container.** The scrape could not
 >     reach the pages through this sandbox's egress relay, so the LLM step and
 >     the result rows were never reached.
-> - **Stage 2, the live concurrency load test at N = 1, 5, 10 and 20, is
->   still NOT RUN.** It is held by the orchestrator while other spikes use the
->   account. See [Not run](#not-run-and-resume-commands).
+> - **Stage 2 (13:40–14:05Z): RUN** (§3.8).
+>   - Live concurrency at N = 1, 5, 10 and 20 simultaneous users, at the
+>     default worker concurrency of 4.
+>   - Plus N = 20 at concurrency 16, twice, and N = 20 at concurrency 4
+>     repeated, as a paired comparison.
+>   - 96 live turns. All completed, with no 402, 429 or 503 errors.
+> - **Code baseline for stage 2:** `cf97234b`.
 
 ## 1. Question and why it matters
 
@@ -46,6 +50,7 @@ will use the system hands-on. WP0 needs two answers:
 | D classifier | `classify_provider_failure` run on constructed litellm `RateLimitError(429)`, `APIError(402)` and `ServiceUnavailableError(503)` | 1 each | none |
 | T1 tutorial, stage 1 | `S5/tutorial_run_driver.py` against a fresh instance on 8531. It mirrors the frontend: create the session, rename it to the pending title, GET `/sample`, send the fixed brief, accept the proposal, resolve every pending card, GET `/readiness`, POST `/api/tutorial/run`, then GET `/audit-story`. Run 1 used the main checkout (`S5-tutorial`). Run 2 used worktree `.claude/worktrees/S5-load-and-tutorial-run` with a measurement-only TLS shim (`S5/prototype.patch`); the shim did not change the outcome (§3.6). | 2 | DeepSeek v4.1 Flash composer; **the run's LLM step was never reached** |
 | T2 double-submit and burst, stage 1 | `load_driver.py --mode double` and `--mode burst --burst 25` (one user; a fresh session per burst message, spaced 2.2 s apart; each admitted operation is cancelled at once) | 1 each | DeepSeek v4.1 Flash |
+| L1 live concurrency, stage 2 | `S5/load_driver.py` via `S5/run_n.sh`: N users released together, one canary first turn each, on fresh sessions. N = 1, 5, 10, 20 at the default concurrency of 4; then N=20 at c=16 (×2) and N=20 at c=4 again, interleaved. | 7 runs, 96 turns | DeepSeek v4.1 Flash |
 
 **Turn durations used in probe A** (all EXECUTED earlier):
 
@@ -53,7 +58,7 @@ will use the system hands-on. WP0 needs two answers:
 - **62 s:** the audit's planner-turn p90 (remediation-plan runbook).
 - **Deadline 240 s:** `ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS` in this environment.
 
-**Spend.** Total **US$0.047**, summed from `usage.cost` in each instance's
+**Spend.** Total **US$0.81**, summed from `usage.cost` in each instance's
 `capture/llm_calls.jsonl`:
 
 | Phase | Calls | Cost |
@@ -61,10 +66,12 @@ will use the system hands-on. WP0 needs two answers:
 | Morning: boot probe + one planner call | 2 (the three 402s were not billed) | $0.0024 |
 | Stage 1, `S5-tutorial`: tutorial run 1 + double-submit | 5 | $0.0317 |
 | Stage 1, `S5-tutorial-run`: tutorial run 2 | 2 | $0.0126 |
+| Stage 2, `S5-load`: 7 concurrency runs (§3.8) | 306 | $0.762 (account delta $0.767) |
 
 The burst made no provider calls, because every operation was cancelled
-before it started. The account-level delta in `S5/spend.log` is shared with
-other spikes and is not attributable to this one.
+before it started. The morning and stage 1 account deltas in `S5/spend.log`
+are shared with other spikes. Stage 2 ran alone on the account, and its
+delta matches the captured cost.
 
 **Instrument caveats.**
 
@@ -301,6 +308,95 @@ This matches probe B1 live: the limit is 20 per rolling 60 s, and
 `web.log`. There were no provider 402 or 429 errors anywhere in stage 1
 (`provider_failures: 0` in every summary).
 
+### 3.8 Live concurrency (stage 2, EXECUTED)
+
+**Setup.**
+
+- **Instance:** one `instance.sh 8531 S5-load` (broad allowlist, SQLite,
+  local auth).
+- **Users:** N distinct users (`s5u01`…), each with a fresh session. All N
+  are released by one barrier and send the same first turn: the battery
+  `canary` prompt, a simple made-up build ("three colours … read in and
+  written straight back out to JSON").
+- **Models:** composer DeepSeek v4.1 Flash. No advisor call was made on
+  these planner turns.
+- **Driver:** `S5/load_driver.py`, polling at 1 s like the frontend. Its
+  sampler records:
+  - server CPU from `/proc`, every 0.5 s;
+  - latency of `GET /api/health`, a bare async handler (`app.py:2757`), as
+    the event-loop-lag proxy.
+- **Cost:** from `usage.cost` in each call captured during the run window.
+  Credit was checked before each N (`S5/spend.log`).
+- **Each configuration ran once (n=1),** except N=20, which ran twice at c=4
+  and twice at c=16. Interleave order: c4a, c16a, c16b, c4b.
+
+**Definitions.**
+
+- **TTFB:** latency of the `POST /messages` 202 admission. Composer replies
+  are not streamed, so the user's first sign of progress is the admission
+  plus the progress indicator.
+- **Queue wait:** time until the first poll that sees `running`, at 1 s
+  resolution.
+- **Completion:** submit to terminal.
+
+| Config | n | TTFB p50 / p95 / max (s) | Queue wait p50 / max (s) | Completion p50 / p95 / max (s) | Rejected (429/503) | Timed out | Provider calls / failures | Provider call median / max (s) | `/api/health` p50 / p95 / max (ms) | Server CPU mean / max (%) | Cost (US$) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| N=1, c=4 | 1 | 0.03 / 0.03 / 0.03 | 1.0 / 1.0 | 15.2 / 15.2 / 15.2 | 0 | 0 | 3 / 0 | 3.3 / 9.6 | 2.3 / 3.1 / 3.7 | 10 / 74 | 0.028 |
+| N=5, c=4 | 5 | 0.10 / 0.15 / 0.15 | 1.3 / 30.9 | 35.9 / 62.1 / 62.1 | 0 | 0 | 16 / 0 | 10.8 / 28.1 | 2.3 / 9.6 / 47 | 13 / 99 | 0.117 |
+| N=10, c=4 | 10 | 0.16 / 0.46 / 0.46 | 25.2 / 65.5 | 55.2 / 116.5 / 116.5 | 0 | 0 | 32 / 0 | 9.2 / 51.8 | 2.4 / 14.9 / 242 | 16 / 95 | 0.109 |
+| N=20, c=4 (a) | 20 | 0.31 / 0.66 / 0.70 | 33.0 / 72.7 | 50.8 / 88.8 / 99.7 | 0 | 0 | 63 / 0 | 4.6 / 21.5 | 2.5 / 45 / 104 | 32 / 127 | 0.117 |
+| N=20, c=4 (b) | 20 | 0.32 / 0.72 / 0.74 | 38.5 / 73.8 | 49.5 / 75.9 / 91.0 | 0 | 0 | 64 / 0 | 3.6 / 16.2 | 2.3 / 77 / 166 | 33 / 123 | 0.118 |
+| N=20, c=16 (a) | 20 | 0.38 / 1.27 / 4.38 | 1.9 / 26.0 | 28.3 / 40.2 / 62.0 | 0 | 0 | 61 / 0 | 5.3 / 27.4 | 2.6 / 88 / 128 | 52 / 127 | 0.150 |
+| N=20, c=16 (b) | 20 | 0.33 / 1.16 / 1.17 | 1.4 / 30.6 | 35.6 / 64.7 / 69.1 | 0 | 0 | 67 / **4** | 8.3 / 26.3 | 2.6 / 160 / 642 | 48 / 132 | 0.124 |
+
+**Raw per-user rows.** Each entry is `user: TTFB / queue wait / completion
+(s) outcome`, generated from the `*.requests.json` files:
+
+- **N=1, c=4** (`load/s2_n01.requests.json`): 01: 0.03 / 1.0 / 15.2 OK
+- **N=5, c=4** (`load/s2_n05.requests.json`): 01: 0.13 / 1.3 / 43.7 OK; 02: 0.10 / 1.3 / 31.5 OK; 03: 0.05 / 1.3 / 30.8 OK; 04: 0.15 / 30.9 / 62.1 OK; 05: 0.07 / 1.3 / 35.9 OK
+- **N=10, c=4** (`load/s2_n10.requests.json`): 01: 0.20 / 46.0 / 68.5 OK; 02: 0.18 / 38.4 / 55.2 OK; 03: 0.14 / 1.4 / 38.2 OK; 04: 0.14 / 30.2 / 91.2 OK; 05: 0.11 / 1.3 / 25.6 OK; 06: 0.46 / 65.5 / 103.4 OK; 07: 0.41 / 25.2 / 46.0 OK; 08: 0.43 / 55.2 / 116.5 OK; 09: 0.08 / 0.2 / 65.5 OK; 10: 0.16 / 0.4 / 30.1 OK
+- **N=20, c=4 (run a)** (`load/s2_n20.requests.json`): 01: 0.18 / 50.8 / 68.5 OK; 02: 0.57 / 26.5 / 39.1 OK; 03: 0.20 / 1.6 / 11.8 OK; 04: 0.26 / 50.0 / 67.5 OK; 05: 0.36 / 33.0 / 49.8 OK; 06: 0.34 / 28.7 / 38.1 OK; 07: 0.31 / 53.9 / 72.7 OK; 08: 0.21 / 1.5 / 14.2 OK; 09: 0.22 / 39.1 / 57.1 OK; 10: 0.37 / 14.2 / 50.8 OK; 11: 0.32 / 67.1 / 88.8 OK; 12: 0.60 / 14.2 / 32.8 OK; 13: 0.15 / 1.5 / 13.3 OK; 14: 0.65 / 72.7 / 87.8 OK; 15: 0.28 / 57.6 / 71.1 OK; 16: 0.66 / 68.5 / 81.6 OK; 17: 0.70 / 72.0 / 99.7 OK; 18: 0.29 / 12.0 / 28.6 OK; 19: 0.49 / 39.1 / 53.9 OK; 20: 0.18 / 1.7 / 26.1 OK
+- **N=20, c=4 (run b)** (`load/s2_n20_c4b.requests.json`): 01: 0.16 / 0.4 / 25.0 OK; 02: 0.30 / 22.1 / 40.0 OK; 03: 0.35 / 49.8 / 62.4 OK; 04: 0.23 / 48.5 / 64.3 OK; 05: 0.62 / 52.5 / 65.2 OK; 06: 0.56 / 28.3 / 38.8 OK; 07: 0.72 / 65.6 / 74.9 OK; 08: 0.65 / 31.9 / 44.7 OK; 09: 0.43 / 39.5 / 49.5 OK; 10: 0.15 / 1.2 / 21.6 OK; 11: 0.74 / 24.6 / 31.9 OK; 12: 0.21 / 63.4 / 75.9 OK; 13: 0.57 / 53.8 / 75.9 OK; 14: 0.59 / 45.3 / 53.5 OK; 15: 0.26 / 38.5 / 52.5 OK; 16: 0.32 / 73.8 / 91.0 OK; 17: 0.14 / 1.2 / 26.0 OK; 18: 0.62 / 64.3 / 73.2 OK; 19: 0.14 / 1.2 / 27.4 OK; 20: 0.19 / 27.3 / 47.5 OK
+- **N=20, c=16 (run a)** (`load/s2_n20_c16a.requests.json`): 01: 0.24 / 1.4 / 24.7 OK; 02: 0.18 / 1.8 / 35.4 OK; 03: 0.14 / 1.3 / 40.2 OK; 04: 1.10 / 15.9 / 35.6 OK; 05: 1.01 / 19.9 / 35.2 OK; 06: 0.38 / 2.7 / 25.9 OK; 07: 0.83 / 1.1 / 36.2 OK; 08: 0.27 / 1.4 / 28.3 OK; 09: 0.79 / 2.2 / 30.5 OK; 10: 0.67 / 2.9 / 25.9 OK; 11: 0.18 / 1.4 / 24.5 OK; 12: 1.27 / 22.2 / 62.0 OK; 13: 0.21 / 2.4 / 15.9 OK; 14: 0.30 / 1.4 / 21.0 OK; 15: 0.31 / 2.6 / 23.6 OK; 16: 4.38 / 26.0 / 37.6 OK; 17: 0.59 / 1.9 / 38.6 OK; 18: 0.42 / 1.8 / 37.8 OK; 19: 0.34 / 1.5 / 26.8 OK; 20: 0.50 / 4.9 / 20.7 OK
+- **N=20, c=16 (run b)** (`load/s2_n20_c16b.requests.json`): 01: 0.27 / 1.4 / 37.9 OK; 02: 0.16 / 1.3 / 34.9 OK; 03: 0.77 / 1.8 / 29.0 OK; 04: 0.20 / 1.3 / 35.1 OK; 05: 1.15 / 30.6 / 64.7 OK; 06: 0.18 / 1.4 / 33.3 OK; 07: 0.55 / 1.7 / 22.7 OK; 08: 0.33 / 1.4 / 29.9 OK; 09: 0.14 / 1.3 / 46.2 OK; 10: 0.35 / 1.4 / 35.6 OK; 11: 0.46 / 1.5 / 49.3 OK; 12: 0.23 / 0.9 / 64.7 OK; 13: 0.16 / 2.3 / 26.9 OK; 14: 0.21 / 1.1 / 24.7 OK; 15: 1.16 / 26.7 / 45.6 OK; 16: 1.01 / 24.6 / 38.4 OK; 17: 0.97 / 1.0 / 33.8 OK; 18: 0.28 / 1.3 / 35.6 OK; 19: 1.17 / 29.8 / 69.1 OK; 20: 0.40 / 1.4 / 36.0 OK
+
+**Reading.**
+
+- **Every one of the 96 turns completed.**
+  - No 429 `rate_limited`, no 429 `composer_queue_full`, no 503 and no
+    deadline expiry.
+  - No `database is locked`, `OperationalError` or Traceback in `web.log`
+    (`web_log` in each summary).
+  - Every user saw the normal staged-proposal reply.
+- **Provider errors:** none were 402 or 429.
+  - c16b had 4 transient transport failures ("Server disconnected" and 3 ×
+    "Response payload is not completed").
+  - These are litellm `APIError`, so they were retried, and all 20 users
+    still completed.
+  - This possibly comes from this sandbox's relay at 16 concurrent tunnels;
+    it is not attributed.
+- **At c=4 the bottleneck is the worker pool,** exactly as probe A predicted.
+  - Users 5+ wait in the queue: up to 31 s at N=5, 66 s at N=10 and 74 s
+    at N=20.
+  - N=20 completion p95 was 76–89 s and max 91–100 s.
+  - N=20 finished faster than N=10 because the provider was faster during
+    those runs: call median 3.6–4.6 s vs 9.2 s, max 16–22 s vs 52 s.
+  - **Provider latency variance between runs is as large as the
+    concurrency effect.** Treat single runs as indicative.
+- **At c=16, N=20 completion p95 was 40–65 s (max 62–69 s), against 76–89 s
+  at c=4.**
+  - The queue wait for the users beyond 16 was still up to 26–31 s.
+  - The cost is a busier single process:
+    - CPU mean about 50% vs 33%, with peaks above one core (127–132%);
+    - `/api/health` p95 88–160 ms (max 642 ms) vs 45–77 ms;
+    - TTFB max 1.2–4.4 s vs about 0.7 s.
+  - So the event loop is not saturated at 20, but its headroom shrinks.
+    Extrapolating to 40+ concurrent turns on one process is not supported
+    by these data.
+- **Cost:** about US$0.006–0.03 per canary turn. Stage 2 total: **US$0.762**
+  from captures, against an account delta of US$0.767 (13.0926 → 12.3253
+  remaining), so the two instruments agree.
+
 ## 4. Recommendation for WP0
 
 **Hands-on readiness verdict.** **Not ready for 80 hands-on users on one
@@ -312,13 +408,24 @@ handful of people. Expected behaviour if 80 people press Send at once:
 - about 16 get "The composer is busy. Retry shortly."
 
 That assumes every turn is as fast as the best tutorial turn (19.3 s). At
-the planner p90 (62 s), only 12 of 80 succeed.
+the planner p90 (62 s), only 12 of 80 succeed. These 80-user figures come
+from probe A (fake provider). The live N ≤ 20 runs in §3.8 behave as that
+model predicts: the queue forms at the worker cap, and wait grows with
+queue position.
 
-**The safe concurrency ceiling at default settings is about 8–10 simultaneous
-submits** if a p90 wait of about 60 s or less is acceptable. If waits up to
-the deadline are tolerable, the ceiling is about 40 for fast turns or about
-12 for p90 turns. The tutorial **RUN** for many users is a separate, harder
-limit: one pipeline run at a time per process, inside a 270 s held request.
+**Safe number of simultaneous live users** (stage 2 measured, probe A
+projected). "Simultaneous" means pressing Send within the same few seconds.
+People typing at their own pace spread the load further.
+
+| Worker concurrency | Up to this many simultaneous users | Expected wait | Evidence |
+|---|---|---|---|
+| 4 (default) | **5** for a p95 of about 1 min or less; 20 still all complete | N=5: p95 62 s; N=10: p95 117 s; N=20: p95 76–89 s, max 100 s | live, §3.8 |
+| 16 | **20** for a p95 of about 1 min or less, all completing | N=20: p95 40–65 s, max 62–69 s | live, §3.8 (×2) |
+| 16 | about 40 (projected) | p90 about 65 s if turns take about 19 s; slower turns scale linearly | probe A only. Not live: event-loop headroom at 40 is unmeasured. |
+| any | more than 64 waiting turns are refused | — | queue cap, §3.1 |
+
+The tutorial **RUN** for many users is a separate, harder limit: one
+pipeline run at a time per process, inside a 270 s held request.
 
 **The tutorial RUN step has still never been seen to succeed.**
 
@@ -332,13 +439,17 @@ limit: one pipeline run at a time per process, inside a 270 s held request.
 **What an operator must change for 80 people:**
 
 1. **Do not run 80 simultaneous hands-on sessions on one instance.**
-   Recommended: the presenter drives, or small groups (≤ 10 at a time)
-   stagger their Send. If hands-on at scale is required:
+   Recommended: the presenter drives, or groups of **20 or fewer** take
+   turns pressing Send (5 or fewer if the config stays at the default).
+   For any hands-on segment, set:
    - `ELSPETH_WEB__COMPOSER_ASYNC_WORKER_CONCURRENCY=16` (the maximum).
-     Measured: 40 users p90 65 s, 64 of 80 complete. Risk: the comment at
-     `config.py:400` says durable jobs share the 16-thread sync pool
-     (`async_workers.py:37`). Saturating it could starve other DB work.
-     This is unmeasured; test it.
+     - **Live-measured:** N=20 p95 dropped from 76–89 s to 40–65 s, with all
+       turns completed and no errors (§3.8).
+     - **Cost:** server CPU about 50% mean, with peaks above one core, and
+       event-loop p95 up to 160 ms.
+     - **Risk:** the comment at `config.py:400` says durable jobs share the
+       16-thread sync pool (`async_workers.py:37`). Saturating it could
+       starve other DB work. That was not observed at N=20.
    - `ELSPETH_WEB__COMPOSER_ASYNC_MAX_QUEUED_OPERATIONS=128` or more, so
      that users 65–80 are not refused with "busy".
    - `ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=420` or more, because queue wait
@@ -385,14 +496,16 @@ limit: one pipeline run at a time per process, inside a 270 s held request.
 **Proposed edits** (stated, not made):
 
 - **`remediation-plan.md` § Demo-day runbook → Configuration.** Add a bullet:
-  > **Concurrency (hands-on only).** One instance runs 4 composer turns at
-  > once; queued turns spend their own 240 s deadline, and the 65th waiting
-  > turn is refused. For more than about 10 simultaneous users set
-  > `COMPOSER_ASYNC_WORKER_CONCURRENCY=16`,
-  > `COMPOSER_ASYNC_MAX_QUEUED_OPERATIONS=128` and
-  > `COMPOSER_TIMEOUT_SECONDS=420`, raise `AUTH_RATE_LIMIT_PER_MINUTE` and set
-  > `TRUSTED_PROXY_HOSTS`; pipeline runs are serial per process, so do not
-  > have attendees press Run together (S5).
+  > **Concurrency.** Set `ELSPETH_WEB__COMPOSER_ASYNC_WORKER_CONCURRENCY=16`
+  > (default 4), `ELSPETH_WEB__COMPOSER_ASYNC_MAX_QUEUED_OPERATIONS=128`
+  > (default 64) and `ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=420` (queued time
+  > spends the deadline). With these, one instance served 20 simultaneous
+  > first turns with p95 40–65 s and no errors (S5 §3.8). Keep each
+  > hands-on wave to **20 or fewer people pressing Send together** (5 or
+  > fewer at the default concurrency). With local auth, raise
+  > `AUTH_RATE_LIMIT_PER_MINUTE` and set `TRUSTED_PROXY_HOSTS`. Pipeline
+  > runs are serial per process, so do not have attendees press Run
+  > together.
 
   Also extend the **Network** bullet with "egress usable by the IP-pinned,
   no-proxy scraper; a curl check is not evidence (S5 §3.6)". In Preflight
@@ -401,9 +514,11 @@ limit: one pipeline run at a time per process, inside a 270 s held request.
 - **Preflight.**
   - Add step 0: "Provider credit and rate limit checked; a 5-token
     completion on the composer and advisor models succeeds".
-  - Add step 5: "Load rehearsal: `S5/load_driver.py` at the expected
-    concurrency on the demo host; pass = no `composer_queue_full`, no
-    deadline expiry, p90 under 90 s".
+  - Add step 5: "Load rehearsal on the demo host, with the guard in
+    `required` mode: `S5/load_driver.py --n 20`; pass = all `completed`, no
+    `composer_queue_full` and no deadline expiry, p95 under 90 s". Stage 2
+    shows a provider-latency swing between runs as large as the concurrency
+    effect, so run it twice.
 - **`work-packages.md` § Fix list.** Add a row `Provider 429 not retried
   (S5 §3.4)`, status DECISION. Retrying 429 with backoff inside the deadline
   is a small change in `provider_errors.py`, but it changes audit retry
@@ -414,9 +529,14 @@ limit: one pipeline run at a time per process, inside a 270 s held request.
 
 ## 5. Open questions and what would change this
 
-- **Live latency under concurrency.** Does DeepSeek or OpenRouter slow down
-  or return 429 at 16 concurrent planner calls? If provider latency rises
-  with concurrency, raising the worker count buys less than probe A shows.
+- **Live latency under concurrency.** At 16 concurrent planner calls the
+  provider returned no 429 and per-call latency did not rise systematically
+  (§3.8). But run-to-run provider variance (call median 3.6–10.8 s) was as
+  large as the concurrency effect. Not measured:
+  - more than 20 simultaneous users live;
+  - the advisor on edit turns;
+  - the prompt guard in `required` mode, which adds an external call per
+    turn.
 - **Why the scraper's connection is reset here when a hand-built pinned
   request is not** (§3.6). If the cause is in the scraper's TLS or connection
   setup rather than this sandbox's relay, it also affects real hosts. A
@@ -436,7 +556,8 @@ limit: one pipeline run at a time per process, inside a 270 s held request.
 | Item | Status |
 |---|---|
 | Stage 1: tutorial via the API, double-submit, burst | **Done** (§3.6, §3.7). The tutorial RUN failed on this container's egress. |
-| Stage 2: live concurrency at N = 1, 5, 10, 20 | **NOT RUN.** The orchestrator is holding it while other spikes use the account. |
+| Stage 2: live concurrency at N = 1, 5, 10, 20 (+ N=20 at c=16 ×2, c=4 ×2) | **Done** (§3.8). |
+| Live N above 20, and 80 users | **NOT RUN.** Projection only (probe A). |
 | Tutorial RUN success path: duration, result rows, audit story | **NOT MEASURED.** It needs a host whose egress the scraper can use. |
 
 Run these from `<repo root>`, with `source .venv/bin/activate` and the
@@ -444,9 +565,10 @@ Run these from `<repo root>`, with `source .venv/bin/activate` and the
 
 ```bash
 S=.claude/lanes/composer-desk-audit-20261112/spikes/S5-load-and-tutorial-run
-# Stage 2: concurrent load. 24 users already exist in runs/instances/S5-load/users.json
+# Concurrency rerun (24 users exist in runs/instances/S5-load/users.json); add
+# ELSPETH_WEB__COMPOSER_ASYNC_WORKER_CONCURRENCY=16 before instance.sh for the c=16 arm
 evals/composer-live-audit/instance.sh 8531 S5-load
-for n in 1 5 10 20; do .venv/bin/python $S/load_driver.py --port 8531 --instance S5-load --n $n --label n$(printf %02d $n) --out $S/load; done
+$S/run_n.sh 20 rerun_n20      # prints credit before/after and the summary
 # Tutorial RUN on a host with working egress (fresh instance)
 evals/composer-live-audit/instance.sh 8531 S5-tutorial-host
 .venv/bin/python $S/tutorial_run_driver.py --port 8531 --instance S5-tutorial-host --out $S/tutorial-host

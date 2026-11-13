@@ -168,13 +168,18 @@ Owner for every package is the maintainer; dates are set by the operator.
   turns at once (`composer_async_worker_concurrency`, default 4, max 16).
   Queued turns spend their own 240 s deadline, which starts at submission,
   and the 65th waiting turn is refused with "The composer is busy".
-  - Modelled with the real admission code: 80 people sending the tutorial
-    brief together on defaults gives 44 completions (p90 202 s), 20 timeouts
-    and 16 "busy". About 8–10 simultaneous senders is the safe ceiling on
-    defaults.
-  - For more, set `ELSPETH_WEB__COMPOSER_ASYNC_WORKER_CONCURRENCY=16`,
-    `ELSPETH_WEB__COMPOSER_ASYNC_MAX_QUEUED_OPERATIONS` ≥ 128 and
-    `ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS` ≥ 420.
+  - **Measured live (S5 stage 2, one instance, simple build turns, 96
+    turns):** every turn completed at N = 1, 5, 10 and 20. On defaults,
+    completion p95 was 62 s at 5 users, 117 s at 10 and up to 89 s at 20 (the
+    wait is queueing behind 4 workers). With 16 workers, N = 20 gave p95
+    40–65 s and max 62–69 s, CPU about 50% average. Provider speed varied
+    3.6–10.8 s per call between runs, so treat each run as indicative.
+  - **Set for hands-on use:** `ELSPETH_WEB__COMPOSER_ASYNC_WORKER_CONCURRENCY=16`,
+    `ELSPETH_WEB__COMPOSER_ASYNC_MAX_QUEUED_OPERATIONS=128` and
+    `ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=420`. Run hands-on in waves of
+    **20 or fewer** simultaneous senders (5 or fewer if the defaults stay).
+    Do not have 80 people press Send at once on one instance: that was only
+    modelled (on defaults: 44 completions, 20 timeouts, 16 "busy").
   - Local-auth logins are limited per client IP
     (`ELSPETH_WEB__AUTH_RATE_LIMIT_PER_MINUTE`, default 20). Raise it, and
     set the trusted-proxy hosts if a whole room shares one network.
@@ -208,6 +213,9 @@ Owner for every package is the maintainer; dates are set by the operator.
    run produced no output rows".
 4. Check the provider account balance covers the day (S5).
 5. Pre-warm one throwaway session per demo flow.
+6. If attendees go hands-on: a load rehearsal on the demo host at the
+   expected wave size (N = 20, twice), with the guard in `required` mode.
+   **Pass** = no "busy" refusals, no deadline expiry, p95 under 90 s.
 
 ### Prompts
 
