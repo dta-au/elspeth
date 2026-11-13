@@ -6,6 +6,9 @@ burn down. Lanes run under the repo's `lane-manager` skill: worktree per lane,
 failing-first pytest, `verify` red → green → suite, then serial merge. The
 machine-readable tickets are in [lanes/tickets.json](lanes/tickets.json).
 
+Starting the execution in a new session: read [HANDOVER.md](HANDOVER.md)
+first.
+
 ## 1. Fix list
 
 Status: **READY** (a lane exists), **DECISION** (blocked on the maintainer),
@@ -172,6 +175,11 @@ land before the code freeze (remediation plan, WP1a).
   (cache marker), CDA-17 and CDA-20: `report.md` lists each planner
   transition the lane touched and shows that every proposal still comes from
   a provider call.
+- **Latency presumption (maintainer, 2026-11-13).** The composer's time is
+  presumed to be needed work. Examine a step only when its time is clearly
+  out of proportion, and then look for waste or a bug. A lane that touches
+  timing states in `report.md` what the step does and why it is needed
+  before it proposes shortening or removing it.
 - **Test first.** Write the failing test in the named test file first. It
   must fail at an assertion on the base commit, not by crashing. Assert that
   new symbols exist (`importlib.util.find_spec`, `hasattr` in the test only)
