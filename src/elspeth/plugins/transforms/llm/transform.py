@@ -37,6 +37,7 @@ from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import FrameworkBugError, RuntimePreflightFailedError
 from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.node_state_context import PoolExecutionContext
 from elspeth.contracts.plugin_assistance import PluginAssistance, PluginAssistanceExample
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ContentTrust, PluginCapability, WebConfigAuthority
 from elspeth.contracts.schema import FieldDefinition
@@ -1166,6 +1167,10 @@ class MultiQueryStrategy:
         else:
             entries = self.executor.execute_batch(contexts=contexts, process_fn=_process_fn, shutdown_event=shutdown_event)
         query_results = [entry.result for entry in entries]
+        # Pool behaviour behind this row (AIMD backoff, capacity retries,
+        # throttle wait, concurrency) and each query's submit/complete order,
+        # recorded in the node state's context_after (sweep finding #100).
+        pool_context = PoolExecutionContext.from_executor_stats(self.executor.get_stats(), entries)
 
         # Check for failures — atomic: any failure fails the row
         failed = [(i, r) for i, r in enumerate(query_results) if r.status == "error"]
@@ -1191,7 +1196,7 @@ class MultiQueryStrategy:
             error_reason["discarded_successful_queries"] = len(query_results) - len(failed)
             error_reason["failed_queries"] = [self.query_specs[i].name for i, _ in failed]
             error_reason["total_count"] = len(query_results)
-            return TransformResult.error(error_reason, retryable=first_result.retryable)
+            return TransformResult.error(error_reason, retryable=first_result.retryable, context_after=pool_context)
 
         # Merge all successful partial outputs
         accumulated_outputs: dict[str, Any] = {}
@@ -1231,6 +1236,7 @@ class MultiQueryStrategy:
                 "fields_added": list(accumulated_outputs.keys()),
                 "metadata": {"model": self.model, **accumulated_audit},
             },
+            context_after=pool_context,
         )
 
 
@@ -1264,7 +1270,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3c60f14ba869b372"
+    source_file_hash: str | None = "sha256:3060577e04da31de"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True

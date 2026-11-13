@@ -93,7 +93,7 @@ class Truncate(BaseTransform):
     name = "truncate"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:59df23578303bf55"
+    source_file_hash: str | None = "sha256:61cdc3ececd46174"
     config_model = TruncateConfig
     usage_when_to_use: str = (
         "Use for a deterministic character-length cap on selected text fields, optionally reserving "
@@ -115,6 +115,8 @@ class Truncate(BaseTransform):
 """
     capability_tags: tuple[str, ...] = ("text", "truncation", "length-limit")
     passes_through_input = True
+    # ``fields`` maps each input column to its max length: the KEYS are read columns.
+    column_keyed_config_keys = frozenset({"fields"})
 
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__(config)
