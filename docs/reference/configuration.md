@@ -2070,6 +2070,14 @@ positive is blocked even when the top-level Guardrail action is `NONE`, and an
 intervention, service failure, or malformed response also fails closed without
 including provider-generated text in row data or error details.
 
+`row_deadline_seconds` (default `300`, must be positive) bounds how long a row
+may keep starting Guardrail calls. A field still unscanned when the deadline
+passes fails the row closed as `retry_timeout` / `row_deadline_exceeded`.
+Throttling, 5xx and transport failures are handed to the engine retry policy,
+which re-runs every configured field under a new attempt; each call from the
+failed attempt stays recorded against that attempt. Web Composer sessions do
+not expose this option and use the default.
+
 The harmful-content categories required by this AWS plugin do not include
 Azure Content Safety's `self_harm` category. A deployment must not claim Azure
 coverage parity unless an additional approved control covers that category.
