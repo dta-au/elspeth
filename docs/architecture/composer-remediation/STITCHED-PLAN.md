@@ -111,7 +111,7 @@ its default is marked "safe to start"; otherwise it waits.
 | S-7 | **P-A2 and CDA-23.** P-A2 (one cumulative proposal) would change the state model that CDA-23's no-op rule is defined against. Redo the P-A2 design first, or land CDA-23 on today's model? Also CDA-D9a to D9c. | None. | CDA-23 |
 | S-8 | **Batch plugins to general availability** (ruled 2026-11-10, not implemented). Still wanted, and in this effort? | Not scheduled until confirmed. | P-B11 lane |
 | S-9 | **Audit documents.** The CDA documents, eval harness and spike artifacts are only on `ccr-d14093ba-glu6bw`. Merge that branch into the integration branch? | Not merged. Lanes read them from the `composer-desk-audit` worktree. | — |
-| S-10 | **Release.** Which version do these lanes ship in? | Lanes do not edit `CHANGELOG.md` or upgrade notes. Each lane's `report.md` carries a proposed changelog line. | — |
+| S-10 | **Release.** Which version do these lanes ship in? **Ruled 2026-11-13: 0.8.14.** Open: `origin/claude/zen-turing-pphown` is already a 0.8.14 candidate (the Python 3.14 release; `pyproject.toml` says 0.8.14, changelog section dated 2026-11-11) and contains neither the 0.8.12 nor the 0.8.13 candidate. Whether this work joins that release or that one is renumbered is not settled. | Lanes do not edit `CHANGELOG.md`, upgrade notes or the package version until that is settled. Each lane's `report.md` carries a proposed changelog line for 0.8.14. | — |
 | S-11 | **Environment.** Docker (the socket refuses this user) for the testcontainer suite; `OPENROUTER_API_KEY` for live acceptance. | — | CDA-13, 21, 23; live acceptance of CDA-07, 12 |
 
 What "What changed?" answers one turn after an edit, under the S-2 default:
