@@ -41,6 +41,7 @@ vi.mock("@/hooks/useComposer", () => ({
 }));
 
 const inlineRunResultsMountSpy = vi.hoisted(() => vi.fn());
+const sourceBubbleSpy = vi.hoisted(() => vi.fn());
 
 vi.mock("@/components/execution/InlineRunResults", () => ({
   InlineRunResults: () => {
@@ -102,12 +103,17 @@ vi.mock("./MessageBubble", () => ({
     proposalsByToolCallId,
     staleProposalIds,
     pendingReviewCreatedAt,
+    sourcesCreated,
+    onEditInlineSource,
   }: {
     message: ChatMessage;
     proposalsByToolCallId?: Map<string, CompositionProposal>;
     staleProposalIds?: string[];
     pendingReviewCreatedAt?: ReadonlyArray<string>;
+    sourcesCreated?: ReadonlyArray<import("@/types/api").InlineSourceSummary>;
+    onEditInlineSource?: (blobId: string) => void;
   }) => {
+    sourceBubbleSpy({ sourcesCreated, onEditInlineSource });
     const toolCallId = message.tool_calls?.[0]?.id ?? null;
     const proposal = toolCallId
       ? proposalsByToolCallId?.get(toolCallId) ?? null
@@ -1271,6 +1277,29 @@ describe("ChatPanel inline-source projection", () => {
     expect(
       screen.getByRole("button", { name: /edit the list/i }),
     ).toBeInTheDocument();
+  });
+
+  it.each([false, true])("keeps source details but hides inline editing in script mode (in bubble=%s)", async (inBubble) => {
+    vi.mocked(apiClient.getBlobMetadata).mockResolvedValue(makeBlobMetadata());
+    vi.mocked(apiClient.downloadBlobContent).mockResolvedValue(await sourceDownload(twoRowInlineSourceText));
+    useSessionStore.setState({
+      activeSessionId: "session-inline",
+      sessions: [sessionFixture],
+      messages: inBubble ? [{ id: "source-reply", session_id: "session-inline", role: "assistant", content: "Created your source.", tool_calls: null, created_at: "2026-11-13T12:00:00Z" }] : [],
+      compositionState: makeComposition(1, {
+        sources: { source: { plugin: "inline_blob", options: { blob_ref: "blob-inline-1" } } },
+      }),
+    });
+    render(<ChatPanel scriptMode />);
+    if (inBubble) {
+      await waitFor(() => expect(sourceBubbleSpy).toHaveBeenCalledWith({
+        sourcesCreated: [expect.objectContaining({ blobId: "blob-inline-1" })],
+        onEditInlineSource: undefined,
+      }));
+    } else {
+      expect(await screen.findByRole("region", { name: /source created/i })).toBeInTheDocument();
+    }
+    expect(screen.queryByRole("button", { name: "Edit the list" })).toBeNull();
   });
 
   it("renders the widget when a named inline source carries the blob_ref", async () => {

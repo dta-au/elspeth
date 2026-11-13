@@ -58,6 +58,7 @@ import { proposalEffectLabel } from "./proposalEffectLabel";
 import type { BlockedVerb, DecisionRow } from "./decisionPanelRows";
 
 export interface DecisionPanelProps {
+  scriptMode?: boolean;
   rows: readonly DecisionRow[];
   blockedVerbs: readonly BlockedVerb[];
   count: number;
@@ -75,7 +76,7 @@ export interface DecisionPanelProps {
   applyDisabledReason: string | null;
   phraseFor: (componentId: string | null) => string;
   stepLabelFor: (componentId: string) => string | null;
-  onApplySuggestion: (suggestion: ValidationEntryDTO) => void;
+  onApplySuggestion?: (suggestion: ValidationEntryDTO) => void;
   /** Draft a question about a blocker into the chat input. Undefined where
    *  there is no freeform input to draft into: the button is not rendered. */
   onAskAboutBlocker?: (detail: string, componentId: string | null, note: string | null) => void;
@@ -93,9 +94,13 @@ export interface DecisionPanelProps {
 }
 
 /** Plain-words sentence for the withheld verbs, in action-bar order. */
-export function blockedVerbsSentence(blockedVerbs: readonly BlockedVerb[]): string | null {
+export function blockedVerbsSentence(blockedVerbs: readonly BlockedVerb[], scriptMode = false): string | null {
   const run = blockedVerbs.includes("run");
   const save = blockedVerbs.includes("save_for_review");
+  if (scriptMode) {
+    if (run) return "Continue to Run is blocked.";
+    return save ? "Continue to Run is still available." : null;
+  }
   if (run && save) return "Run pipeline and Share inspect link are blocked.";
   if (run) return "Run pipeline is blocked.";
   if (save) return "Share inspect link is blocked. Run pipeline is still available.";
@@ -149,6 +154,7 @@ export function DecisionPanelLiveRegion({ count, decisionIds }: {
 }
 
 export function DecisionPanel({
+  scriptMode = false,
   rows,
   blockedVerbs,
   count,
@@ -198,7 +204,7 @@ export function DecisionPanel({
   }, [rejectConfirmId, rejectTarget]);
   if (count === 0) return null;
 
-  const verbSentence = blockedVerbsSentence(blockedVerbs);
+  const verbSentence = blockedVerbsSentence(blockedVerbs, scriptMode);
   const listRows = rows.filter((row) => row.kind !== "pending_interpretation");
   const gateReason = !isComposing && applyDisabled ? applyDisabledReason : null;
   const title = `Awaiting your decision (${count})`;
@@ -279,7 +285,7 @@ export function DecisionPanel({
                   prominent={suggestionCount === 1}
                   applyDisabled={applyDisabled}
                   gateReason={gateReason}
-                  onApply={(suggestion) => {
+                  onApply={onApplySuggestion === undefined ? undefined : (suggestion) => {
                     setApplyingRowId(row.id);
                     onApplySuggestion(suggestion);
                   }}
@@ -364,7 +370,7 @@ interface SuggestionItemProps {
   prominent: boolean;
   applyDisabled: boolean;
   gateReason: string | null;
-  onApply: (suggestion: ValidationEntryDTO) => void;
+  onApply?: (suggestion: ValidationEntryDTO) => void;
 }
 
 function SuggestionItem({
@@ -385,7 +391,7 @@ function SuggestionItem({
         <span className="decision-panel-optional">Optional</span>{" "}
         <strong>{phrase}:</strong> {finding.headline}
       </span>
-      <Button
+      {onApply !== undefined && <Button
         compact
         variant={prominent ? "primary" : "secondary"}
         className="decision-panel-apply-btn"
@@ -398,7 +404,7 @@ function SuggestionItem({
         }}
       >
         {applying ? "Applying..." : "Apply"}
-      </Button>
+      </Button>}
     </>
   );
 }

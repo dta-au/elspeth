@@ -376,7 +376,7 @@ export function MessageBubble({
                 <InlineSourceCreatedTurn
                   key={summary.blobId}
                   summary={summary}
-                  onEdit={onEditInlineSource ?? (() => undefined)}
+                  onEdit={onEditInlineSource}
                 />
               ))}
             </div>
