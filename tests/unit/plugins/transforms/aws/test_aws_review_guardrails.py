@@ -67,3 +67,65 @@ def test_wrong_typed_provider_value_is_a_recorded_malformed_response(mutator_nam
     assert len(execution.calls) == 1, "the SDK call was made, so it must be recorded"
     assert execution.calls[0]["status"] is CallStatus.ERROR
     assert execution.calls[0]["error"].to_dict() == {"type": "malformed_response", "retryable": False}
+
+
+# ---------------------------------------------------------------------------
+# Finding 8: the transform config cross-checks a guardrail ARN's partition and
+# region against ``region`` through the same shared function as the profile.
+# ---------------------------------------------------------------------------
+
+_MISMATCHED_ARNS = {
+    "other_region": "arn:aws:bedrock:us-west-2:123456789012:guardrail/abc123",
+    "govcloud_partition": "arn:aws-us-gov:bedrock:us-east-1:123456789012:guardrail/abc123",
+}
+
+
+def _transform_config(**overrides: object) -> dict[str, object]:
+    values: dict[str, object] = {
+        "guardrail_identifier": "privateguardrail",
+        "guardrail_version": "7",
+        "region": "us-east-1",
+        "fields": ["prompt"],
+        "schema": {"mode": "observed"},
+    }
+    values.update(overrides)
+    return values
+
+
+def test_shared_arn_binding_validator_exists() -> None:
+    from elspeth.plugins.transforms.aws import guardrail_profiles
+
+    assert hasattr(guardrail_profiles, "validate_guardrail_arn_binding")
+
+
+@pytest.mark.parametrize("arn_name", sorted(_MISMATCHED_ARNS))
+@pytest.mark.parametrize("plugin_name", ["prompt_shield", "content_safety"])
+def test_transform_config_rejects_arn_contradicting_region(arn_name: str, plugin_name: str) -> None:
+    from elspeth.plugins.infrastructure.config_base import PluginConfigError
+    from elspeth.plugins.transforms.aws.bedrock_content_safety import AWSBedrockContentSafety
+    from elspeth.plugins.transforms.aws.bedrock_prompt_shield import AWSBedrockPromptShield
+
+    plugin_cls: Any = AWSBedrockPromptShield if plugin_name == "prompt_shield" else AWSBedrockContentSafety
+    config = _transform_config(guardrail_identifier=_MISMATCHED_ARNS[arn_name])
+    rejected = False
+    try:
+        plugin_cls(config)
+    except PluginConfigError:
+        rejected = True
+    assert rejected, f"{plugin_name} accepted a guardrail ARN that contradicts region us-east-1 ({arn_name})"
+
+
+def test_transform_config_accepts_matching_arn_and_bare_identifier() -> None:
+    from elspeth.plugins.transforms.aws.bedrock_prompt_shield import AWSBedrockPromptShield
+
+    AWSBedrockPromptShield(_transform_config(guardrail_identifier="arn:aws:bedrock:us-east-1:123456789012:guardrail/abc123"))
+    AWSBedrockPromptShield(_transform_config(guardrail_identifier="abc123"))
+
+
+@pytest.mark.parametrize("arn_name", sorted(_MISMATCHED_ARNS))
+def test_profile_and_transform_share_the_arn_binding_message(arn_name: str) -> None:
+    from elspeth.plugins.transforms.aws import guardrail_profiles
+
+    assert hasattr(guardrail_profiles, "validate_guardrail_arn_binding")
+    with pytest.raises(ValueError, match="partition and region"):
+        guardrail_profiles.validate_guardrail_arn_binding(_MISMATCHED_ARNS[arn_name], region="us-east-1")
