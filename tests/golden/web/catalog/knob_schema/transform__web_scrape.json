@@ -206,7 +206,7 @@
       },
       {
         "default": "content",
-        "description": "Whether fingerprints cover processed content only or the full fetch response context.",
+        "description": "Hash of the extracted content with whitespace collapsed (content) or exactly as extracted (full); neither mode covers HTTP status, final URL, headers, or the raw body.",
         "enum": [
           "content",
           "full"

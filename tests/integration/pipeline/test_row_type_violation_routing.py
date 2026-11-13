@@ -1425,19 +1425,30 @@ payload_store:
 """
 
 
-def test_a_collector_emitting_non_canonical_output_fails_its_group_without_the_value(tmp_path: Any) -> None:
+def test_a_collector_emitting_non_canonical_output_fails_its_group_without_the_value(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The collector flush checks what it RELEASES, as the aggregation and per-row seams do.
 
     Before the check, the collector released the out-of-range sum and the run
     died at the next node's canonical hash: one row's data ended the run. Now
     the group fails as a Tier-2 contract violation (whole group, value-free),
     DOC-1's group still releases, and no audit cell holds the emitted value.
+
+    Since #99 batch_stats refuses an int sum beyond the JSON safe range itself
+    (a returned ``float_overflow`` error, the ``collector_transform_error``
+    arm), so it no longer releases one. This test is about the engine's
+    backstop for a collector that does, so it lifts that one guard to stand in
+    for such a plugin; everything else runs the production path.
     """
     import json
 
+    import elspeth.plugins.transforms.batch_stats as batch_stats_module
     from elspeth.core.landscape.database import LandscapeDB
     from elspeth.core.landscape.schema import node_states_table, nodes_table
     from elspeth.engine.orchestrator.run_status import cli_completion_for
+
+    monkeypatch.setattr(batch_stats_module, "_SAFE_INTEGER_MAX", _NON_CANONICAL_SUM)
 
     cli = _run_cli(tmp_path, _summing_collector_settings(tmp_path))
 

@@ -347,7 +347,10 @@ class WebScrapeConfig(TransformDataConfig):
     )
     fingerprint_mode: Literal["content", "full"] = Field(
         default="content",
-        description="Whether fingerprints cover processed content only or the full fetch response context.",
+        description=(
+            "Hash of the extracted content with whitespace collapsed (content) or exactly as extracted (full); "
+            "neither mode covers HTTP status, final URL, headers, or the raw body."
+        ),
     )
     strip_elements: list[str] = Field(
         default_factory=lambda: ["script", "style"],
@@ -467,6 +470,10 @@ class WebScrapeConfig(TransformDataConfig):
                     validate_allowed_http_origin(self.url, (auth_origin,))
                 except SSRFBlockedError as exc:
                     raise ValueError("fixed url must match auth.origin") from exc
+            # The binding checks above keep their specific diagnostics; a
+            # correctly bound auth block is still refused here, before any row,
+            # rather than failing every row at process time.
+            raise ValueError("authenticated web_scrape is unavailable until response evidence is secret safe")
         return self
 
     @model_validator(mode="after")
@@ -820,7 +827,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:1ecbd3ab145d2c04"
+    source_file_hash: str | None = "sha256:ef6e828ace325e3c"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True

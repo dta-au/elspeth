@@ -338,7 +338,7 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:aab91c78c0486f2b"
+    source_file_hash: str | None = "sha256:985091dfc97a79ff"
     determinism = Determinism.EXTERNAL_CALL
     config_model = DataverseSinkConfig
     idempotent = True  # PATCH upsert is idempotent — safe for retries and crash recovery (engine does not yet read this flag)
@@ -405,7 +405,7 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
                     "lookups map pipeline fields to navigation-property bindings; avoid collisions with field_mapping targets.",
                     "environment_url must be HTTPS and within the allowed Dataverse domain patterns.",
                     "Alternate-key values must be non-empty strings at write time; an empty or non-string key crashes the run (it cannot form a valid OData URL).",
-                    "Every failed write raises so the engine retries or aborts: a client error about the row (400/404/409/412/422), auth/authz (401/403), rate limit (429), and 5xx alike. Dataverse error responses are not yet classified per row, so on_write_failure never routes them to its sink; fix the offending rows or mapping and rerun.",
+                    "Every failed write raises so the engine retries or aborts: row client errors (400/404/409/412/422), auth/authz (401/403), rate limit (429) and 5xx alike. Dataverse errors are not yet classified per row, so on_write_failure never routes them; fix the rows or mapping and rerun.",
                 ),
             )
         return None

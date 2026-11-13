@@ -903,7 +903,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:c4126cd44880a771"
+    source_file_hash: str | None = "sha256:f203696d50207e25"
     config_model = AWSS3SourceConfig
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 
@@ -1169,8 +1169,16 @@ class AWSS3Source(BaseSource):
         try:
             if self._csv_options.has_header:
                 try:
-                    raw_headers = next(reader, _ROW_EXHAUSTED)
-                    lines.finish_record()
+                    # csv.reader yields [] for a blank physical line. Skip those
+                    # before header discovery (as the data loop below and
+                    # csv_source do) so a leading blank line cannot become a
+                    # zero-column header; a blank-only object reaches EOF and
+                    # takes the empty-file path.
+                    while True:
+                        raw_headers = next(reader, _ROW_EXHAUSTED)
+                        lines.finish_record()
+                        if raw_headers != []:
+                            break
                 except (_RecordLimitExceeded, csv.Error, UnicodeDecodeError):
                     yield from self._file_error(ctx, "CSV header could not be parsed safely")
                     return

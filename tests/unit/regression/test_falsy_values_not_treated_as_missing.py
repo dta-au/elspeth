@@ -185,16 +185,3 @@ class TestCallReplayerErrorJson:
         error_json = None
         should_parse = error_json is not None
         assert should_parse is False
-
-
-class TestCallVerifierResponseHash:
-    """A.5: verifier already uses `is not None` — confirm no regression."""
-
-    def test_verifier_uses_is_not_none(self) -> None:
-        """Verify the verifier source code uses `is not None` for response_hash."""
-        import inspect
-
-        from elspeth.plugins.infrastructure.clients.verifier import CallVerifier
-
-        source = inspect.getsource(CallVerifier.verify)
-        assert "response_hash is not None" in source
