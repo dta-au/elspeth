@@ -5,9 +5,9 @@ from __future__ import annotations
 import hashlib
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Self
 
-from pydantic import ConfigDict, Field, field_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from elspeth.contracts import Determinism, RunMode
 from elspeth.contracts.audit_protocols import PluginAuditWriter
@@ -20,6 +20,7 @@ from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.transforms.aws.guardrail_profiles import (
     check_bedrock_local_requirements,
+    validate_guardrail_arn_binding,
     validate_guardrail_identifier,
     validate_guardrail_region,
     validate_guardrail_version,
@@ -86,6 +87,11 @@ class BedrockGuardrailTransformConfig(TransformDataConfig):
         if any(len(field) > 256 for field in value):
             raise ValueError("field names must contain at most 256 characters")
         return value
+
+    @model_validator(mode="after")
+    def _arn_binding(self) -> Self:
+        validate_guardrail_arn_binding(self.guardrail_identifier, region=self.region)
+        return self
 
 
 class BedrockGuardrailTransformBase(BaseTransform, ABC):
