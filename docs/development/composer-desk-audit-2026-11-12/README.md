@@ -561,7 +561,7 @@ has 14.
   bookkeeping costs in the remediation plan's efficiency table. The battery
   never hit it (max 9 provider calls per tool-loop turn), so this is a guard
   gap, not an observed failure.
-- **Fix.** CDA-22, after decision D8. The startup budget warning already
+- **Fix.** CDA-22 (D8 approved). The startup budget warning already
   counts discovery turns as if they applied to both surfaces.
 
 #### F20. Run-state copy ignores which screen the user is on

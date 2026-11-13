@@ -46,8 +46,8 @@ Status: **READY** (a lane exists), **DECISION** (blocked on the maintainer),
 | Advisor demands a mutation on a read-only question; the composer then edits (S4, Sonnet r01 T2) | END rubric sentence | READY | CDA-07 |
 | Advisor reviews planner turns against the tool-loop policy, so an honest planner decline is withheld (S2, S4: s10 on every model) | Advisor gets the planner text and palette | READY | CDA-12 |
 | Opaque encrypted reasoning pattern-scanned; an `sk-` run inside OpenAI's blob failed a turn (S4, Luna, 1/37) | Never scan opaque reasoning fields | READY (D1 approved) | CDA-18 |
-| F21 discovery budget not enforced in the tool loop (also hot-path recon) | Enforce `composer_max_discovery_turns` in the loop | DECISION D8 | CDA-22 (proposed) |
-| Composer efficiency (hot-path recon): validate ≥3×/mutation, Stage-2 per mutation with reviews pending, rounds² context serialisation, provider-call bookkeeping, repeated fence proofs | P7–P10, E7 (remediation plan § Composer efficiency) | Plan of record governs; measure first. P10's snapshot-row skip needs a ruling | — |
+| F21 discovery budget not enforced in the tool loop (also hot-path recon) | Enforce `composer_max_discovery_turns` in the loop | READY (D8 approved) | CDA-22 |
+| Composer efficiency (hot-path recon): validate ≥3×/mutation, Stage-2 per mutation with reviews pending, rounds² context serialisation, provider-call bookkeeping, repeated fence proofs | P7–P10, E7 (remediation plan § Composer efficiency) | Plan of record governs; measure first. P10 approved: skip identical snapshot rows | CDA-23 (P10; scoping) |
 | Skip advisor on chat turns | P3 | NOT FIXING (loses real catches, e.g. s03 T4) | — |
 | Register as a gated artifact | E2 | Optional, only with E3 | — |
 
@@ -91,14 +91,15 @@ Raised by the spikes, **both approved 2026-11-13**:
   (`provider_errors.py`), which changes audit retry semantics; and, with it,
   whether the deadline should count from admission rather than submission.
 
-Open, from the hot-path recon:
+From the hot-path recon, **both approved 2026-11-13**:
 
-- **D8. F21.** Should the tool loop enforce `composer_max_discovery_turns`, as
-  the planner does and as the setting's name implies? Enforcing it adds a
-  terminal state (`convergence_discovery_budget`) to follow-up turns. The
-  alternative is to document that the setting is planner-only.
-- **P10 ruling.** May the composer skip writing a state snapshot row whose
-  content hash equals the previous row's?
+- **D8 approved. F21.** The tool loop enforces `composer_max_discovery_turns`,
+  as the planner does and as the setting's name implies. Follow-up turns gain
+  the `convergence_discovery_budget` terminal. Lane: CDA-22.
+- **P10 approved, and preferred.** The composer skips writing a state
+  snapshot row whose content equals the previous row's. The maintainer's
+  reason: today a turn that changed nothing still mints a version the user
+  sees, so only real changes should surface. Lane: CDA-23 (being scoped).
 
 R16 is also decided: you confirmed the tutorial is a fixed prompt the learner
 cannot edit (ADR-031). CDA-01 enforces that in the frontend only.
@@ -123,6 +124,7 @@ parallelism per lane (for example `-n 4`); CPUs do not multiply across lanes.
 | 2a′ (also) | CDA-19 | After CDA-06 (`credential_material.py`); parallel with CDA-18 |
 | 4 (also) | CDA-21 | Coordination and worker only; after wave 3 |
 | 4b | CDA-20 | After CDA-17 (`pipeline_planner.py` call path) |
+| 4 (also) | CDA-22 | After CDA-12 (`composer/service.py`); parallel with CDA-21 |
 
 **Cost coupling (hot-path recon).** CDA-09 adds Stage-2 validation to
 question-only turns, and CDA-20 multiplies per-call bookkeeping on retries.
@@ -784,6 +786,62 @@ the marker is a trivial fix candidate; measure it.
 - **Test files.** `tests/unit/web/composer/test_pipeline_planner.py`: a fake
   clock past the reserve yields a hand-off, not a deadline error.
 - **Depends on.** CDA-12.
+
+### CDA-22: The tool loop enforces the discovery budget (F21; D8 approved)
+
+- **Goal.** A follow-up turn that keeps calling read-only discovery tools
+  stops at `composer_max_discovery_turns`, exactly as the composition budget
+  stops mutating rounds. Today the loop counts discovery-only rounds
+  (`discovery_turns_used`, `composer/service.py` ~L1809, ~L3151) and never
+  compares them with a limit; only the planner enforces it
+  (`pipeline_planner.py:4858`).
+- **Design.** Mirror the composition path in `_classify_and_budget_turn`
+  (`service.py` ~L2173-2340):
+  - after a discovery-only round is charged, if
+    `discovery_turns_used >= composer_max_discovery_turns`, make the B-4D-3
+    last-chance call through the same shared no-tool finalize
+    (`_surface_and_finalize_no_tools`), so the review auto-surface and the
+    orphan gate still apply;
+  - if that call still returns tool calls, raise
+    `ComposerConvergenceError.capture(budget_exhausted="discovery", …)`,
+    which already maps to `convergence_discovery_budget`
+    (`composer/protocol.py:546-553`, `sessions/routes/_helpers.py:3115`) and
+    to the frontend's `ComposerProgressReason`;
+  - read the limit in `__init__` beside `_max_composition_turns` (~L664);
+  - replace the comment at ~L2173 ("Discovery counts are diagnostic…",
+    from `854297e0`), which records the old choice.
+  - Do **not** add budget-pressure text to discovery tool results:
+    `test_discovery_result_does_not_inject_removed_budget_pressure`
+    (`test_pipeline_planner.py:6732`) pins that for the planner, and the same
+    rule holds here. The cap is enforced, not narrated.
+  - Advisor-only turns stay uncharged (`test_advisor_tool.py:614`). A failed
+    discovery call keeps its current charging
+    (`test_service.py:3586`).
+- **Files.** `src/elspeth/web/composer/service.py`. Nothing in the planner.
+- **Test files.** `tests/unit/web/composer/test_service.py`:
+  - a scripted loop with `composer_max_discovery_turns=2` and a model that
+    only calls `list_sources` gets one last-chance call, then a
+    `convergence_discovery_budget` terminal with the discovery count in the
+    detail;
+  - the same loop whose last-chance reply is text ends normally, with the
+    advisor gate applied;
+  - a mixed turn (discovery plus mutation) charges composition only, as
+    today;
+  - the existing `test_turn_budget_convergence_detail_names_the_tool_call_loop`
+    (~L7989) covers the discovery wording on the loop surface.
+- **Test command.** `pytest tests/unit/web/composer/test_service.py tests/unit/web/composer/test_progress.py tests/unit/web/composer/test_advisor_tool.py -n 4 -q`.
+- **Acceptance.** The battery never exceeded 9 provider calls per tool-loop
+  turn, so with the shipped profiles' value of 10 no battery scenario
+  should change. Re-run s01, s04 and r01 once and confirm no new terminal.
+  Report whether any shipped profile's value is lower than a real turn
+  needs.
+- **Depends on.** CDA-12 (`service.py`).
+- **Size.** 0.5 agent-day.
+
+### CDA-23: Skip identical state snapshots; surface only real changes (P10; approved)
+
+Being scoped (writes, callers that expect a new state id, version surfacing
+in the frontend, audit semantics). The full brief replaces this stub.
 
 ## 6. Running it
 
