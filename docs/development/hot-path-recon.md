@@ -9,6 +9,28 @@ for that commit only.
 called the most to get from start to end — a pipeline run for the executor, a
 user message to a settled turn for the composer.
 
+## Corrections since first written
+
+[executor-hot-path-remediation.md](executor-hot-path-remediation.md)
+re-verified the findings outside `web/` and overturned or refined several of
+them. Its "Corrections to the earlier documents" table is the full list. The
+summary below has been corrected where it was wrong; the appendices are
+unchanged and keep the original claims.
+
+- **Fork/coalesce is not super-linear.** Marginal CPU is flat at
+  109–110 ms/row across 100 to 800 rows. The original 102 → 136 ms/row came
+  from three single wall-clock runs.
+- **The canonical JSON and hashing share is a cProfile bucket**, which
+  over-weights small Python calls. Its real weight on narrow rows is 5% or
+  less; it is large only on wide rows.
+- **The retry wrapper and the per-node traversal loop are not hot**
+  (Appendix A top-10 items 6 and 7).
+- **The CSV sink effect rebuild is one effect per sink per run** in the
+  common case, so it is downgraded.
+- Several static counts were off by small amounts (ingest statements, thaws
+  per transform, sink read transactions, canonical serialisations at the
+  sink).
+
 ## How to read this
 
 | Part | Evidence | Scope |
@@ -95,7 +117,9 @@ batch.
 | fork/coalesce, 600 rows | 8.0 | 79.3% | 9.1% | 1.2% | 0.1% |
 
 Percentages are cProfile self time on the marginal per-row cost, attributed
-by module path.
+by module path. cProfile over-weights small Python calls, so the canonical
+JSON column overstates its real share on narrow rows (see the corrections
+above).
 
 - **The audit-write trunk is the hot path, and within it SQLAlchemy rather
   than SQLite.** Roughly 50–60% of per-row time is SQLAlchemy's Python
@@ -116,8 +140,10 @@ by module path.
   serialised three times per node — twice as output, once as the next node's
   input. Measured `canonical_json` calls were 16–52 per source row.
   `rfc8785` is a pure-Python implementation.
-- **Fork/coalesce is super-linear.** Marginal cost rose from 102 ms/row
-  (10→200 rows) to 136 ms/row (200→600).
+- **Fork/coalesce is about three times the per-row cost of the others, and
+  linear.** The first measurement here suggested super-linear growth
+  (102 → 136 ms/row); a four-size re-measurement found it flat at
+  109–110 ms/row. See the corrections above.
 - **Fixed startup is about 7 s**, roughly 70% of it module import.
 
 ### Findings that are not about ranking
@@ -219,7 +245,9 @@ Ranked by the Appendix E investigator; all static.
 6. **Web validation trunk** — `web/execution/validation.py:497-776`: about
    20 phases per call including full plugin instantiation and graph build.
 7. **CSV sink effect rebuild** — `plugins/sinks/csv_sink.py:499-652`
-   re-streams and re-hashes the whole output per effect.
+   re-streams and re-hashes the whole output per effect. Later verification
+   found one effect per sink per run in the common case, so this is
+   downgraded.
 8. **Per-row HTTP client construction** —
    `plugins/transforms/azure/base.py:560-580`; no connection reuse across
    rows.
