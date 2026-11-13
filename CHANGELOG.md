@@ -94,6 +94,12 @@ published tag or an image.
   could make a link for a pipeline the owner was no longer looking at. Its
   success text no longer says read-only access when the recipient can import
   an editable copy with copies of the listed files.
+- **A pipeline that uses two files with the same content under different
+  names or file types is no longer shared for import.** An import keeps one
+  copy per content, so both uses would have taken one file's name and type,
+  and a `blob_rows` source would have emitted the wrong filename or MIME type
+  as row data. The share dialog names the two files; give them the same name
+  and type, or use one file in both places.
 - **The tutorial's audit step explains its LLM call count**, which includes
   one reachability check made before the run starts.
 
