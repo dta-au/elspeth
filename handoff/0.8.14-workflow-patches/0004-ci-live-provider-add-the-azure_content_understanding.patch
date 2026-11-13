@@ -1,0 +1,51 @@
+From 88133f7d562e282ec10c160906fab73086c1fa46 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 09:28:33 +0000
+Subject: [PATCH 4/4] ci(live-provider): add the azure_content_understanding
+ case
+
+The new azure_content_understanding transform is an external-provider
+plugin, so the live_azure job's matrix and environment must carry it:
+the case `transform:azure_content_understanding@default`, its endpoint
+and analyzer variables and its key secret. Without them
+test_workflow_matrix_is_the_exact_collision_free_external_case_inventory
+fails; with them tests/unit/cicd passes. The fix was specified by the
+plugin's author session, which could not push workflow files.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Szt2FzuKZ4Y8WpNigvatoY
+---
+ .github/workflows/state-engine-live-provider.yml | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/.github/workflows/state-engine-live-provider.yml b/.github/workflows/state-engine-live-provider.yml
+index 1430a23f..1f9d5794 100644
+--- a/.github/workflows/state-engine-live-provider.yml
++++ b/.github/workflows/state-engine-live-provider.yml
+@@ -140,6 +140,7 @@ jobs:
+           - source:azure_blob@sas_token
+           - source:azure_blob@service_principal
+           - transform:azure_content_safety@default
++          - transform:azure_content_understanding@default
+           - transform:azure_document_intelligence@default
+           - transform:azure_prompt_shield@default
+     runs-on: [self-hosted, Linux, X64, ephemeral, aws-ecs, postgresql-16-rds, state-engine-live-provider]
+@@ -157,12 +158,15 @@ jobs:
+       ELSPETH_TEST_AZURE_CONTENT_SAFETY_ENDPOINT: ${{ vars.ELSPETH_TEST_AZURE_CONTENT_SAFETY_ENDPOINT }}
+       ELSPETH_TEST_AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT: ${{ vars.ELSPETH_TEST_AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT }}
+       ELSPETH_TEST_AZURE_DOCUMENT_INTELLIGENCE_MODEL: ${{ vars.ELSPETH_TEST_AZURE_DOCUMENT_INTELLIGENCE_MODEL }}
++      ELSPETH_TEST_AZURE_CONTENT_UNDERSTANDING_ENDPOINT: ${{ vars.ELSPETH_TEST_AZURE_CONTENT_UNDERSTANDING_ENDPOINT }}
++      ELSPETH_TEST_AZURE_CONTENT_UNDERSTANDING_ANALYZER: ${{ vars.ELSPETH_TEST_AZURE_CONTENT_UNDERSTANDING_ANALYZER }}
+       ELSPETH_TEST_AZURE_DOCUMENT_URL: ${{ vars.ELSPETH_TEST_AZURE_DOCUMENT_URL }}
+       AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+       AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+       AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+       AZURE_CONTENT_SAFETY_KEY: ${{ secrets.AZURE_CONTENT_SAFETY_KEY }}
+       AZURE_DOCUMENT_INTELLIGENCE_KEY: ${{ secrets.AZURE_DOCUMENT_INTELLIGENCE_KEY }}
++      AZURE_CONTENT_UNDERSTANDING_KEY: ${{ secrets.AZURE_CONTENT_UNDERSTANDING_KEY }}
+     steps:
+       - name: Checkout frozen baseline
+         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+-- 
+2.43.0
+
