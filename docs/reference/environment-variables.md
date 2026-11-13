@@ -320,7 +320,8 @@ stamped with the strict tool contracts its route sends (see
 `ELSPETH_WEB__COMPOSER_STRICT_TOOLS` below), and the advisor model receives
 its structured-output request. When the advisor's route sends strict
 contracts, the advisor model also receives the pipeline planner's
-escape-hatch request (`hatch_terminal`): the proposal tool alone, as a
+escape-hatch request (`hatch_terminal`): the pipeline planner's full tool
+list, stamped for the advisor's route, as a
 16-token check that the request is accepted. A provider *bad request* — for
 example a model that rejects the configured
 `ELSPETH_WEB__COMPOSER_TEMPERATURE` or `ELSPETH_WEB__COMPOSER_SEED`, or a
