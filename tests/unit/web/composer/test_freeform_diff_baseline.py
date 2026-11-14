@@ -49,6 +49,84 @@ def _diff_payloads(result: ComposerResult) -> list[dict[str, Any]]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("baseline_kind", ["last_validated", "request_start"])
+async def test_zero_change_diff_teaches_provider_what_to_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, baseline_kind: str
+) -> None:
+    monkeypatch.setattr(AdvisorCheckpointOwner, "_run_advisor_checkpoint", _clean_advisor_checkpoint)
+    service, session_id = _composer_service_with_session(_mock_catalog(), _make_settings(data_dir=tmp_path))
+    sessions = service._require_sessions_service()
+    state = _stage1_valid_preview_state()
+    current_state_id = None
+    if baseline_kind == "last_validated":
+        sid = (await sessions.create_session("test-user", "Zero diff baseline", "local")).id
+        session_id = str(sid)
+        raw = state.to_dict()
+        async with _session_operation_context(sessions, sid, SessionOperationKind.COMPOSE) as context:
+            validated = await sessions.save_composition_state(
+                sid,
+                CompositionStateData(
+                    sources=raw["sources"],
+                    nodes=raw["nodes"],
+                    edges=raw["edges"],
+                    outputs=raw["outputs"],
+                    metadata_=raw["metadata"],
+                    is_valid=True,
+                    composer_meta={"validation_lane": "strict"},
+                ),
+                provenance="session_seed",
+                session_operation_context=context,
+            )
+            current = await sessions.save_composition_state(
+                sid,
+                CompositionStateData(
+                    sources=raw["sources"],
+                    nodes=raw["nodes"],
+                    edges=raw["edges"],
+                    outputs=raw["outputs"],
+                    metadata_=raw["metadata"],
+                    is_valid=True,
+                    composer_meta={"validation_lane": "strict"},
+                ),
+                provenance="session_seed",
+                session_operation_context=context,
+            )
+        state = state_from_record(current)
+        current_state_id = str(current.id)
+        expected_from_version = validated.version
+    else:
+        expected_from_version = state.version
+
+    with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as provider:
+        provider.side_effect = [
+            _response(_call("diff_pipeline", {}, "zero_diff")),
+            _admit_composer_llm_completion(_make_llm_response(content="No changes.")),
+        ]
+        result = await service.compose("What changed?", [], state, session_id=session_id, current_state_id=current_state_id)
+    payload = _diff_payloads(result)[0]
+    assert payload["success"]
+    assert payload["data"]["total_changes"] == 0
+    assert payload["data"]["baseline_kind"] == baseline_kind
+    assert payload["data"]["from_version"] == expected_from_version
+    assert payload["version"] == state.version
+    description = next(
+        tool["function"]["description"] for tool in provider.call_args_list[0].args[1] if tool["function"]["name"] == "diff_pipeline"
+    )
+    assert "With no edits yet this turn, `last_validated` compares with the validated version before the current one." in description
+    assert "Name `from_version` and envelope `version`" in description
+    assert "`version` is the working pipeline's number at this call" in description
+    assert "later saves this turn take higher numbers" in description
+    assert "give it as the compared version, not the user's final version" in description
+    assert "`from_version` can be looked for in the version menu" in description
+    assert "hides versions identical to their predecessors and lists only recent ones" in description
+    assert "a broken pipeline compares with its last validated version; a valid one with the previous validated version" in description
+    if baseline_kind == "last_validated":
+        assert "nothing has changed since the compared validated version `from_version`" in description
+    else:
+        assert "`baseline_kind` is `request_start`, say nothing has changed in this turn" in description
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("later_round", [False, True], ids=["same-batch", "later-round"])
 @pytest.mark.parametrize("explicit_approval", [False, True], ids=["auto-commit", "explicit-approval"])
 @pytest.mark.parametrize("strict_start", [False, True])
@@ -108,8 +186,10 @@ async def test_diff_uses_request_start_and_resets_for_next_request(
     assert len(payloads) == 2
     assert all(payload["success"] for payload in payloads), payloads
     assert payloads[0]["data"]["from_version"] == state.version
+    assert payloads[0]["version"] == state.version
     assert payloads[0]["data"]["total_changes"] == 0
     assert payloads[1]["data"]["from_version"] == state.version
+    assert payloads[1]["version"] == (state.version if explicit_approval else state.version + 1)
     assert payloads[1]["data"]["baseline_kind"] == ("last_validated" if strict_start and not explicit_approval else "request_start")
     assert payloads[1]["data"]["metadata_changed"] is (not explicit_approval)
     assert payloads[1]["data"]["total_changes"] == (0 if explicit_approval else 1)
