@@ -195,7 +195,7 @@ class TestAWSS3SourceConfig:
     def test_binary_or_text_transform_codecs_are_rejected(self, field: str, encoding: str) -> None:
         from elspeth.plugins.sources.aws_s3_source import AWSS3SourceConfig
 
-        with pytest.raises(PluginConfigError, match="decode bytes to text"):
+        with pytest.raises(PluginConfigError, match="not a text encoding"):
             AWSS3SourceConfig.from_dict(_config(**{field: {"encoding": encoding}}))
 
 

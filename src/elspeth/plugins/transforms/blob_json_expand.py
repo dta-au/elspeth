@@ -28,7 +28,6 @@ clauses below are the whole trust-boundary convention here: like
 
 from __future__ import annotations
 
-import codecs
 import copy
 import json
 from collections.abc import Mapping
@@ -49,7 +48,7 @@ from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.contracts.source_read_verification import MAX_JSON_DEPTH
 from elspeth.plugins.infrastructure.base import BaseTransform
-from elspeth.plugins.infrastructure.config_base import NormalizedFieldMappingOption, TransformDataConfig
+from elspeth.plugins.infrastructure.config_base import NormalizedFieldMappingOption, TextEncoding, TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.sources.field_normalization import ExternalHeaderError, is_normalized_field_name, normalize_field_name
@@ -122,7 +121,7 @@ class BlobJSONExpandConfig(TransformDataConfig):
     field_mapping: NormalizedFieldMappingOption = Field(
         default=None, description="Optional mapping from normalized JSON record keys to final pipeline field names."
     )
-    encoding: str = Field(default="utf-8", description="Encoding used to decode the JSON blob.")
+    encoding: TextEncoding = Field(default="utf-8", description="Encoding used to decode the JSON blob.")
     include_record_index: bool = Field(default=True, description="Whether to emit the record index within the parsed JSON document.")
     record_index_field: str = Field(default="json_record_index", description="Output field receiving the zero-based JSON record index.")
     max_output_rows: int = Field(default=DEFAULT_MAX_OUTPUT_ROWS, gt=0, description="Maximum rows emitted for one input document.")
@@ -144,15 +143,6 @@ class BlobJSONExpandConfig(TransformDataConfig):
         if not stripped:
             raise ValueError(f"{info.field_name} must not be empty")
         return stripped
-
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, value: str) -> str:
-        try:
-            codecs.lookup(value)
-        except LookupError as exc:
-            raise ValueError(f"unknown encoding: {value!r}") from exc
-        return value
 
     @field_validator("fields")
     @classmethod
@@ -406,7 +396,7 @@ class BlobJSONExpand(BaseTransform):
     name = "blob_json_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e2b9ae839814a457"
+    source_file_hash: str | None = "sha256:583cf14448990ab5"
     config_model = BlobJSONExpandConfig
     usage_when_to_use: str = (
         "Use when a row carries a JSON document — either a payload-store reference from blob_fetch or JSON text in a "
