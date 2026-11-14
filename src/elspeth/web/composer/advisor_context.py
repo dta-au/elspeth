@@ -114,6 +114,12 @@ _ADVISOR_END_PUBLICATION_INSTRUCTIONS: Final[str] = (
     "or a FLAGGED/blocked/empty graph. This grants no graph clearance and cannot erase pending or orphan constraints.\n"
     "- CLEAN with WITHHOLD keeps steps empty and note null; explain the prose/evidence objection in findings. "
     "Do not invent a graph defect to withhold prose. Full inspection alone never proves semantic equivalence."
+    "\n- The current deployment capabilities record is what the composer's discovery digest was rendered from; "
+    "it proves existence, absence or prohibition of a plugin, not what a plugin can do."
+    "\n- A reply that shows tool-call JSON or asks the user to run a tool or file a defect must receive "
+    "publication_verdict=WITHHOLD. This is a prose objection, not a graph finding."
+    '\n- On a read-only question ("What changed?", "Explain...") you must not demand a pipeline change; '
+    "a missing control must be reported in the reply, not addressed by editing the pipeline."
 )
 
 
@@ -317,6 +323,8 @@ def _advisor_user_sections(arguments: Mapping[str, Any]) -> tuple[str, ...]:
         publication_review = arguments["publication_review"]
         if type(publication_review) is not AdvisorPublicationReview:
             raise TypeError("Publication review must be an owned snapshot")
+        if publication_review.capability_record is not None:
+            user_msg_parts.append(publication_review.capability_record.provider_message()["content"])
         review = _neutralize_untrusted_summary_sentinels(publication_review.provider_review_context_json(), json_encoded=True)
         user_msg_parts.append(
             "\nCandidate/request and server-owned saved-effect/inspection projection "
@@ -603,6 +611,9 @@ def advisor_user_content_parts(arguments: Mapping[str, Any]) -> tuple[PromptGuar
         review = arguments["publication_review"]
         if type(review) is not AdvisorPublicationReview:
             raise InvariantError("Advisor publication review lacks producer ownership")
+        if review.capability_record is not None:
+            replacements[index] = review.capability_record.provider_message()["_elspeth_prompt_guard_content_parts"]
+            index += 1
         prefix = sections[index].index(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN) + len(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN) + 1
         replacements[index] = (
             PromptGuardContentPart(sections[index][:prefix]),

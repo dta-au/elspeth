@@ -86,6 +86,22 @@ def _record(label: str, content: str, parts: tuple[PromptGuardContentPart, ...] 
     return AdvisorEvidenceRecord(label, redacted, projected)
 
 
+def deployment_capability_record(plugin_snapshot: PluginAvailabilitySnapshot) -> AdvisorEvidenceRecord:
+    """Render the request's capability facts identically for both review paths."""
+    catalog = json.dumps(
+        {
+            "available_ids": sorted(str(item) for item in plugin_snapshot.available),
+            "prohibited_ids": sorted(
+                str(item.plugin_id) for item in plugin_snapshot.unavailable if item.reason is PluginUnavailableReason.WEB_SURFACE_PROHIBITED
+            ),
+            "usable_profile_aliases": {str(item): list(aliases) for item, aliases in plugin_snapshot.usable_profile_aliases},
+            "catalog_scope": "Available in this request; absence does not establish an engine capability gap.",
+        },
+        ensure_ascii=False,
+    )
+    return _record("current deployment capabilities", catalog, json_content_parts(catalog, ensure_ascii=False))
+
+
 def build_abandonment_review(
     *,
     request: str,
@@ -106,17 +122,6 @@ def build_abandonment_review(
     """
     detached = detach_prompt_guard_evidence(messages)
     graph = json.dumps(state.to_dict(), ensure_ascii=False)
-    catalog = json.dumps(
-        {
-            "available_ids": sorted(str(item) for item in plugin_snapshot.available),
-            "prohibited_ids": sorted(
-                str(item.plugin_id) for item in plugin_snapshot.unavailable if item.reason is PluginUnavailableReason.WEB_SURFACE_PROHIBITED
-            ),
-            "usable_profile_aliases": {str(item): list(aliases) for item, aliases in plugin_snapshot.usable_profile_aliases},
-            "catalog_scope": "Available in this request; absence does not establish an engine capability gap.",
-        },
-        ensure_ascii=False,
-    )
     records = [
         _record("current user request reference", "complete_original_user_request_section")
         if visible_transcript is not None
@@ -126,7 +131,7 @@ def build_abandonment_review(
         else _record(
             "complete current draft, including authored options and prompts", graph, json_content_parts(graph, ensure_ascii=False)
         ),
-        _record("current deployment capabilities", catalog, json_content_parts(catalog, ensure_ascii=False)),
+        deployment_capability_record(plugin_snapshot),
     ]
     for index, message in enumerate(detached.messages if visible_transcript is None else ()):
         role = message["role"]

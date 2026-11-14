@@ -17,7 +17,12 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.prompt_guard import PromptGuardContentPart
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer._attachment_response import CompleteAttachmentDataModel
-from elspeth.web.composer.advisor_abandonment import AdvisorAbandonmentReview, build_abandonment_review
+from elspeth.web.composer.advisor_abandonment import (
+    AdvisorAbandonmentReview,
+    AdvisorEvidenceRecord,
+    build_abandonment_review,
+    deployment_capability_record,
+)
 from elspeth.web.composer.advisor_output import AdvisorAbandonmentResponse
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory, AdvisorTranscriptOwner, AdvisorVisibleTranscript
 from elspeth.web.composer.discovery_response import AdmittedDiscoveryResult, serialize_admitted_discovery_result
@@ -194,6 +199,7 @@ class AdvisorPublicationReview:
     provider_payload_json: str = field(repr=False)
     transcript: AdvisorVisibleTranscript | None = field(default=None, repr=False)
     candidate_event_id: str | None = None
+    capability_record: AdvisorEvidenceRecord | None = field(default=None, repr=False)
 
     def current_request_text(self) -> str:
         """The complete centrally redacted request owned by this snapshot."""
@@ -689,7 +695,13 @@ class TurnEvidence:
         )
 
     def review_candidate(
-        self, *, candidate: str, request: str, current_state: CompositionState, scope: DeliveryScope = "primary"
+        self,
+        *,
+        candidate: str,
+        request: str,
+        current_state: CompositionState,
+        scope: DeliveryScope = "primary",
+        plugin_snapshot: PluginAvailabilitySnapshot | None = None,
     ) -> AdvisorPublicationReview:
         if stable_hash(request) != self.request_hash:
             raise AuditIntegrityError("Publication candidate belongs to a different user request")
@@ -856,6 +868,7 @@ class TurnEvidence:
         binding = stable_hash(
             {
                 "candidate": candidate,
+                "snapshot_hash": plugin_snapshot.snapshot_hash if plugin_snapshot is not None else None,
                 "request": request,
                 "evidence": evidence_identity,
                 "current_graph": authored_state_hash(current_state),
@@ -868,6 +881,7 @@ class TurnEvidence:
         semantic_repair_key = stable_hash(
             {
                 "request_scope": (self.session_id, self.operation_id, self.request_id, self.request_hash),
+                "snapshot_hash": plugin_snapshot.snapshot_hash if plugin_snapshot is not None else None,
                 "candidate": candidate,
                 "request": request,
                 "current_graph": authored_state_hash(current_state),
@@ -900,6 +914,7 @@ class TurnEvidence:
             provider_payload_json=json.dumps(provider_payload, ensure_ascii=False),
             transcript=transcript,
             candidate_event_id=self.transcript.candidate_event_id(provider_call_id=self.current_call_id(scope), candidate=candidate),
+            capability_record=deployment_capability_record(plugin_snapshot) if plugin_snapshot is not None else None,
         )
 
     def accept_checkpoint(
