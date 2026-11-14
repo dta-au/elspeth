@@ -30,6 +30,7 @@ from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.core.security.web import NetworkError, SSRFBlockedError, SSRFSafeRequest, validate_url_for_ssrf
 from elspeth.core.url_validation import validate_credential_safe_https_url
+from elspeth.plugins.infrastructure.clients.deadline import deadline_bound_client, http_deadline_scope
 from elspeth.plugins.infrastructure.clients.fingerprinting import (
     filter_response_headers,
     fingerprint_headers,
@@ -151,6 +152,10 @@ _THROTTLE_STATUS_CODES = frozenset({429, 503})
 _THROTTLE_INITIAL_BACKOFF_SECONDS = 1.0
 # Total seconds one request may spend waiting on throttled responses.
 DEFAULT_THROTTLE_WAIT_BUDGET_SECONDS = 300.0
+
+# Total wall-clock deadline for one Dataverse request (connect, send, headers
+# and the full body), not a per-socket-operation timeout.
+DATAVERSE_REQUEST_TIMEOUT_SECONDS = 30.0
 
 
 def _parse_retry_after(value: str | None) -> float | None:
@@ -406,7 +411,10 @@ class DataverseClient:
         throttle_wait_budget_seconds: float = DEFAULT_THROTTLE_WAIT_BUDGET_SECONDS,
         shutdown_event: threading.Event | None = None,
         on_throttle: Callable[[DataverseClientError, float], None] | None = None,
+        request_timeout_seconds: float = DATAVERSE_REQUEST_TIMEOUT_SECONDS,
     ) -> None:
+        if not math.isfinite(request_timeout_seconds) or request_timeout_seconds <= 0:
+            raise ValueError("request_timeout_seconds must be a finite, positive number of seconds")
         raw_environment_url = environment_url.rstrip("/")
         parsed = urllib.parse.urlparse(raw_environment_url)
         hostname = parsed.hostname
@@ -446,12 +454,11 @@ class DataverseClient:
         # Token scope for Dataverse
         self._token_scope = f"{self._environment_url}/.default"
 
-        # httpx.Client with connection pooling. follow_redirects=False per spec:
-        # redirects bypass the two-layer SSRF validation.
-        self._client = httpx.Client(
-            timeout=30.0,
-            follow_redirects=False,
-        )
+        # Pooled, deadline-bound httpx client. Redirects are never followed:
+        # they would bypass the two-layer SSRF validation. Every request runs
+        # inside http_deadline_scope, so the timeout is its total wall time.
+        self._request_timeout_seconds = request_timeout_seconds
+        self._client = deadline_bound_client(timeout=request_timeout_seconds)
 
         # Instance-level flag: credential reconstruction is allowed at most
         # once per client lifetime. A second 401 after reconstruction means the
@@ -759,15 +766,16 @@ class DataverseClient:
 
         start = time.perf_counter()
         try:
-            if method == "PATCH":
-                response = self._client.patch(
-                    connection_url,
-                    json=json_body,
-                    headers=headers,
-                    extensions=extensions,
-                )
-            else:
-                response = self._client.get(connection_url, headers=headers, extensions=extensions)
+            with http_deadline_scope(self._request_timeout_seconds):
+                if method == "PATCH":
+                    response = self._client.patch(
+                        connection_url,
+                        json=json_body,
+                        headers=headers,
+                        extensions=extensions,
+                    )
+                else:
+                    response = self._client.get(connection_url, headers=headers, extensions=extensions)
         except httpx.TimeoutException as exc:
             latency_ms = (time.perf_counter() - start) * 1000
             raise DataverseClientError(

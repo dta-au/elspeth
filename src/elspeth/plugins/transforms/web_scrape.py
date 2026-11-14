@@ -63,6 +63,7 @@ from elspeth.core.security.web import (
     NetworkError as SSRFNetworkError,
 )
 from elspeth.plugins.infrastructure.base import BaseTransform
+from elspeth.plugins.infrastructure.clients.deadline import http_deadline_scope
 from elspeth.plugins.infrastructure.clients.fingerprinting import (
     MAX_AUDIT_QUERY_CHARS,
     MAX_AUDIT_QUERY_FIELDS,
@@ -226,7 +227,7 @@ class WebScrapeHTTPConfig(BaseModel):
     timeout: int = Field(
         default=30,
         gt=0,
-        description="Request timeout in seconds",
+        description="Total wall-clock deadline in seconds for each HTTP request: connect, send, headers and the full response body, with redirect hops sharing it.",
     )
     max_body_bytes: int = Field(
         default=10 * 1024 * 1024,  # 10 MB
@@ -800,7 +801,7 @@ class WebScrapeTransform(BaseTransform):
         http:
             abuse_contact: Email for abuse reports (required)
             scraping_reason: Why we're scraping (required)
-            timeout: Request timeout in seconds (default: 30)
+            timeout: Total wall-clock deadline in seconds per request (default: 30)
 
     Error Handling (follows LLM plugin pattern):
         - Retryable errors (5xx, 429, network): Re-raised for engine retry
@@ -827,7 +828,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ef6e828ace325e3c"
+    source_file_hash: str | None = "sha256:93087269252f83e1"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -1602,11 +1603,18 @@ class WebScrapeTransform(BaseTransform):
                     safe_next = self._validate_pagination_url(next_url, ctx, request_headers=request_headers)
                 except (SSRFBlockedError, SSRFNetworkError) as exc:
                     return TransformResult.error(row_url_policy_refusal(exc))
+                # The page fetch shares the pagination budget: the nested
+                # deadline scope cuts a slow page off when max_elapsed_seconds
+                # runs out instead of letting it overrun by one HTTP timeout.
+                pagination_remaining = self._pagination.max_elapsed_seconds - (time.monotonic() - pagination_started)
+                if pagination_remaining <= 0:
+                    return TransformResult.error({"reason": "pagination_limit_exceeded", "error": "elapsed time limit exceeded"})
                 try:
-                    if request_headers:
-                        response, final_hostname_url, call = self._fetch_url(safe_next, ctx, request_headers=request_headers)
-                    else:
-                        response, final_hostname_url, call = self._fetch_url(safe_next, ctx)
+                    with http_deadline_scope(pagination_remaining):
+                        if request_headers:
+                            response, final_hostname_url, call = self._fetch_url(safe_next, ctx, request_headers=request_headers)
+                        else:
+                            response, final_hostname_url, call = self._fetch_url(safe_next, ctx)
                 except BodyTooLargeError as exc:
                     return TransformResult.error(
                         {"reason": "body_too_large", "body_size": exc.body_size, "max_body_bytes": exc.max_body_bytes}
@@ -1616,6 +1624,8 @@ class WebScrapeTransform(BaseTransform):
                         {"reason": "body_too_large", "error": "response encoding limit exceeded", "error_type": exc.reason}
                     )
                 except WebScrapeError as exc:
+                    if time.monotonic() - pagination_started > self._pagination.max_elapsed_seconds:
+                        return TransformResult.error({"reason": "pagination_limit_exceeded", "error": "elapsed time limit exceeded"})
                     if exc.retryable:
                         raise
                     return TransformResult.error({"reason": "api_error", "error": str(exc), "error_type": type(exc).__name__})

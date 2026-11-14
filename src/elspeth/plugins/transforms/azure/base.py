@@ -44,6 +44,8 @@ logger = structlog.get_logger(__name__)
 
 _CAPACITY_RETRY_INITIAL_DELAY_SECONDS = 0.05
 _CAPACITY_RETRY_MAX_DELAY_SECONDS = 1.0
+# Total wall-clock deadline of one Azure HTTP call (AuditedHTTPClient binds it
+# as an absolute deadline), so the batch wait "budget + one call" is a bound.
 _AZURE_HTTP_TIMEOUT_SECONDS = 30.0
 _AZURE_CONTENT_SAFETY_ENDPOINT_SUFFIXES = (
     ".cognitiveservices.azure.com",

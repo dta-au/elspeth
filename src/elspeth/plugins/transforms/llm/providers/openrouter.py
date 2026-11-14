@@ -227,7 +227,7 @@ class OpenRouterConfig(LLMConfig):
     Extends LLMConfig with OpenRouter API settings:
     - api_key (str): OpenRouter API key (required)
     - base_url: API base URL (default: https://openrouter.ai/api/v1)
-    - timeout_seconds: Request timeout (default: 60.0)
+    - timeout_seconds: Total wall-clock deadline per request (default: 60.0)
 
     Tier 2 tracing:
     - tracing: Optional Langfuse configuration (azure_ai not supported for OpenRouter)
@@ -244,7 +244,11 @@ class OpenRouterConfig(LLMConfig):
         default=OPENROUTER_BASE_URL,
         description="OpenRouter API base URL",
     )
-    timeout_seconds: float = Field(default=60.0, gt=0, description="Request timeout")
+    timeout_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        description="Total wall-clock deadline in seconds for each provider HTTP request, including the full response body.",
+    )
 
     @field_validator("base_url")
     @classmethod

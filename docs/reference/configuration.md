@@ -1410,7 +1410,7 @@ credential chain. See [AWS Bedrock LLM](#aws-bedrock-llm).
 | `model` | string | **Yes** | — | Model identifier such as `anthropic/claude-sonnet-4.6`; must appear in the OpenRouter catalog while `base_url` is the canonical endpoint |
 | `api_key` | string | **Yes** | — | OpenRouter API key |
 | `base_url` | string | No | `https://openrouter.ai/api/v1` | API base URL; HTTPS is required except for loopback hosts |
-| `timeout_seconds` | float | No | `60.0` | Per-request timeout; must be > 0 |
+| `timeout_seconds` | float | No | `60.0` | Total wall-clock deadline for each request, including the full response body; must be > 0 |
 | `tracing` | mapping | No | (none) | Optional plugin-internal tracing (`langfuse` only; `azure_ai` is not supported for OpenRouter) |
 
 ```yaml
