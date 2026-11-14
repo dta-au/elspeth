@@ -12,6 +12,8 @@ from pathlib import Path, PurePosixPath
 from typing import Final, Literal
 from uuid import UUID
 
+from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
+
 SOURCE_LOCAL_PATH_OPTION_KEYS: tuple[str, ...] = ("path", "file")
 SINK_LOCAL_PATH_OPTION_KEYS: tuple[str, ...] = ("path", "file", "persist_directory")
 # The two per-session folders a sink may write under:
@@ -23,6 +25,37 @@ SESSION_FOLDERS: tuple[SessionFolder, ...] = ("outputs", "blobs")
 # Chroma persist_directory there). Confined like sink paths — persist_directory
 # is a local read/write target.
 NESTED_LOCAL_PATH_OPTION_KEYS: tuple[str, ...] = ("persist_directory",)
+
+
+def require_mcp_root_context(
+    authority: McpConfiguredRootAuthority | None,
+    *,
+    data_dir: str | Path | None,
+    session_id: str | None,
+) -> None:
+    """Reject contradictory owned configuration before reading user paths."""
+    if authority is None:
+        return
+    if not isinstance(authority, McpConfiguredRootAuthority):
+        raise TypeError("MCP path authority must be McpConfiguredRootAuthority")
+    if session_id is not None:
+        raise ValueError("MCP root authority cannot carry Web session custody")
+    if data_dir is not None and Path(data_dir).resolve() != authority.root:
+        raise ValueError("MCP configured root contradicts data_dir")
+
+
+def is_local_path_value(value: object) -> bool:
+    """Admit the lexical shape before passing an external value to Path."""
+    return type(value) is str and bool(value) and "\x00" not in value
+
+
+def is_absent_sink_path(plugin: object, mode: object, key: str, value: object) -> bool:
+    """Only Chroma client mode permits an explicitly absent local directory.
+
+    Other path keys still require paths, and non-null directories still pass
+    through confinement. The plugin config validates the remaining connection.
+    """
+    return plugin == "chroma_sink" and mode == "client" and key == "persist_directory" and value is None
 
 
 def resolve_data_path(value: str, data_dir: str) -> Path:

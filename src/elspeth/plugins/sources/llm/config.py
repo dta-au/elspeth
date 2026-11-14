@@ -220,7 +220,7 @@ class OpenRouterLLMSourceConfig(LLMSourceConfig):
 
     provider: Literal["openrouter"] = Field(default="openrouter", description="LLM provider")
     model: str = Field(..., description="Model identifier")
-    api_key: str = Field(..., description="OpenRouter API key")
+    api_key: str = Field(..., description="OpenRouter API key", repr=False)
     base_url: str = Field(default=OPENROUTER_BASE_URL, description="OpenRouter API base URL")
     timeout_seconds: float = Field(default=60.0, gt=0, description="Request timeout")
     tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration")
@@ -309,7 +309,7 @@ class GatewayLLMSourceConfig(LLMSourceConfig):
         description="Logical model alias",
     )
     endpoint: str = Field(..., description="Gateway base URL ending in '/v1'")
-    api_key: str = Field(..., description="Resolved gateway bearer credential")
+    api_key: str = Field(..., description="Resolved gateway bearer credential", repr=False)
     contract_major: int = Field(default=1, description="Gateway contract major version")
     required_capabilities: tuple[str, ...] = Field(default=(), description="Required gateway capabilities")
     timeout_seconds: float = Field(

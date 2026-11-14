@@ -108,6 +108,22 @@ _TRANSFORM_REJECTION_CASES = [
         "Duplicate output field names",
         id="azure_document_intelligence-duplicate-output-fields",
     ),
+    # ── azure_content_understanding ──────────────────────────────────────
+    pytest.param(
+        "azure_content_understanding",
+        {
+            "schema": _make_observed_schema(),
+            "endpoint": "https://cu.services.ai.azure.com",
+            "api_key": "k",
+            "analyzer_id": "prebuilt-invoice",
+            "source_mode": "url",
+            "source_field": "doc_url",
+            "content_field": "dup",
+            "fields_field": "dup",  # collides with content_field output name
+        },
+        "Duplicate output field names",
+        id="azure_content_understanding-duplicate-output-fields",
+    ),
     # ── batch_stats ───────────────────────────────────────────────────────
     pytest.param(
         "batch_stats",
@@ -499,6 +515,17 @@ _TRANSFORM_REJECTION_CASES = [
         },
         "never silently overwritten",
         id="reference_join-declared-type-refuted-by-heterogeneous-table",
+    ),
+    # ── file_inject ───────────────────────────────────────────────────────
+    pytest.param(
+        "file_inject",
+        {
+            "schema": _make_observed_schema(),
+            "mode": "all",
+            "files": {"style_guide": {"content": "Be brief.", "format": "text"}},  # mode all: no per-entry output_field
+        },
+        "needs an output_field",
+        id="file_inject-mode-all-entry-without-output_field",
     ),
 ]
 

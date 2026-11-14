@@ -48,7 +48,7 @@ RUN npm run build
 # =============================================================================
 # Stage 2: Python Builder
 # =============================================================================
-FROM python:3.13-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91 AS builder
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS builder
 
 # psqlparse2 builds its bundled libpg_query and Python extension from source.
 # Keep make, the C compiler and libc headers in this builder stage only.
@@ -60,6 +60,17 @@ RUN apt-get update && \
 # Using official installer (https://docs.astral.sh/uv/getting-started/installation/)
 COPY --from=ghcr.io/astral-sh/uv@sha256:e590846f4776907b254ac0f44b5b380347af5d90d668138ca7938d1b0c2f98d3 /uv /usr/local/bin/uv
 
+# The interpreter ships with the image. Distroless publishes no Python 3.14
+# image, so the pinned uv installs its checksummed, self-contained CPython
+# build under /opt/python and the runtime stage copies that tree to the same
+# path. The venv's recorded interpreter therefore resolves identically in both
+# stages and nothing is rewritten when the venv moves into the runtime image.
+ENV UV_PYTHON_INSTALL_DIR=/opt/python \
+    UV_PYTHON_PREFERENCE=only-managed \
+    UV_PYTHON_DOWNLOADS=manual
+ARG PYTHON_VERSION="3.14.5"
+RUN uv python install "$PYTHON_VERSION"
+
 # Set up working directory
 WORKDIR /build
 
@@ -70,7 +81,9 @@ COPY elspeth-lints/ ./elspeth-lints/
 # Create virtual environment and sync the selected locked dependencies.
 # The default "all" preserves the shared GHCR/ACR image behavior.
 ARG INSTALL_EXTRAS
-RUN uv venv /opt/venv && \
+RUN uv venv --python "$PYTHON_VERSION" /opt/venv && \
+    grep -q '^home = /opt/python/' /opt/venv/pyvenv.cfg && \
+    test "$(/opt/venv/bin/python -c 'import platform; print(platform.python_version())')" = "$PYTHON_VERSION" && \
     . /opt/venv/bin/activate && \
     test -n "$INSTALL_EXTRAS" && \
     set -f && \
@@ -145,19 +158,12 @@ RUN groupadd --gid 1654 elspeth && \
     ln -s /busybox/sh /runtime-root/usr/bin/sh && \
     cp /etc/passwd /runtime-root/etc/passwd && \
     cp /etc/group /runtime-root/etc/group && \
-    chown -R 1654:1654 /runtime-root/app /runtime-root/home/elspeth && \
-    sed -i \
-        -e 's#^home = .*#home = /usr/bin#' \
-        -e 's#^executable = .*#executable = /usr/bin/python3.13#' \
-        /opt/venv/pyvenv.cfg && \
-    ln -sfn /usr/bin/python3.13 /opt/venv/bin/python && \
-    ln -sfn python /opt/venv/bin/python3 && \
-    ln -sfn python /opt/venv/bin/python3.13
+    chown -R 1654:1654 /runtime-root/app /runtime-root/home/elspeth
 
 # =============================================================================
 # Stage 3: Runtime
 # =============================================================================
-FROM gcr.io/distroless/python3-debian13:debug-nonroot@sha256:2f1a59f813c1742411f4a27c164d1ace60bbcc422e42b649c5100283c6d5b74c AS runtime
+FROM gcr.io/distroless/cc-debian13:debug-nonroot@sha256:c69d16acb50ae6ee26adfb0645467b507753c0eb91c389afad87914cd2ecf6de AS runtime
 
 ARG INSTALL_EXTRAS
 ARG RDS_CA_BUNDLE_SHA256
@@ -176,6 +182,7 @@ LABEL io.elspeth.rds-ca-certificate-identifier="rds-ca-rsa2048-g1"
 
 # Copy the prepared identity, home, application roots, and virtual environment.
 COPY --from=builder /runtime-root/ /
+COPY --from=builder /opt/python /opt/python
 COPY --from=builder /opt/venv /opt/venv
 
 # Set up PATH to use venv

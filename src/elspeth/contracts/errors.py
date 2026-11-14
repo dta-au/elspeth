@@ -644,6 +644,9 @@ TransformErrorCategory = Literal[
     # reference_join: the row key was absent from the reference table, or an
     # output path did not resolve against the entry that matched.
     "reference_miss",
+    # file_inject (mode select): the row's key value names no files entry and
+    # on_miss is fail.
+    "file_inject_miss",
 ]
 
 
@@ -755,6 +758,9 @@ class TransformErrorReason(TypedDict):
     configured_region: NotRequired[str]
     observed_region: NotRequired[str]
     bucket_region_verification: NotRequired[BucketRegionVerificationEvidence]
+    # A bucket_region_unverified outcome inherited from a concurrent row's
+    # single-flight HeadBucket call: this row made no call of its own.
+    cache_status: NotRequired[Literal["shared_failure"]]
     url: NotRequired[str]
     blob_ref: NotRequired[str]
     encoding: NotRequired[str]

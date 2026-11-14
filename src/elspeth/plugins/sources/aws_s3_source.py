@@ -46,6 +46,7 @@ from elspeth.plugins.infrastructure.config_base import (
     NormalizedFieldMappingOption,
     declared_source_schema_field_names,
 )
+from elspeth.plugins.infrastructure.config_content import reject_nonfinite_constant
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,
@@ -58,7 +59,6 @@ from elspeth.plugins.sources.field_normalization import (
 )
 from elspeth.plugins.sources.json_source import (
     _contains_surrogateescape_chars,
-    _reject_nonfinite_constant,
     _surrogateescape_line_to_bytes,
 )
 
@@ -558,6 +558,7 @@ class _BoundedDecodedLineIterator:
         self._stream = stream
         self._max_record_chars = max_record_chars
         self._logical_chars = 0
+        self._last_read_ended_line = True
 
     def __iter__(self) -> Self:
         return self
@@ -569,6 +570,7 @@ class _BoundedDecodedLineIterator:
         line = self._stream.readline(remaining + 1)
         if line == "":
             raise StopIteration
+        self._last_read_ended_line = line.endswith(("\n", "\r"))
         self._logical_chars += len(line)
         if self._logical_chars > self._max_record_chars:
             raise _RecordLimitExceeded("decoded record exceeds configured character limit")
@@ -576,6 +578,22 @@ class _BoundedDecodedLineIterator:
 
     def finish_record(self) -> None:
         self._logical_chars = 0
+
+    def skip_rest_of_line(self) -> None:
+        """Discard the unread remainder of an oversized physical line.
+
+        Reads in chunks bounded by the record limit so an oversized line is
+        never held in memory whole, then resets the record budget so the next
+        physical line starts a fresh record. Only valid for newline-framed
+        formats (JSONL); CSV records may span lines.
+        """
+        while not self._last_read_ended_line:
+            chunk = self._stream.readline(self._max_record_chars + 1)
+            if chunk == "":
+                break
+            self._last_read_ended_line = chunk.endswith(("\n", "\r"))
+        self._last_read_ended_line = True
+        self.finish_record()
 
 
 class _BoundedJSONTokenReader:
@@ -885,7 +903,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:95b46ac953b9c321"
+    source_file_hash: str | None = "sha256:f203696d50207e25"
     config_model = AWSS3SourceConfig
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 
@@ -1115,7 +1133,20 @@ class AWSS3Source(BaseSource):
                 self._active_download = None
             download.close()
 
-    def _file_error(self, ctx: SourceContext, message: str) -> Generator[SourceRow, None, None]:
+    def _file_error(
+        self,
+        ctx: SourceContext,
+        message: str,
+        *,
+        source_row_index: int = 0,
+    ) -> Generator[SourceRow, None, None]:
+        """Record a file-level parse failure as one quarantined row.
+
+        ``source_row_index`` must be the next index this load has not yet
+        used: a streaming parser can fail after earlier records were already
+        yielded, and reusing index 0 would collide with the first emitted row
+        (landscape rows are unique per run, source node and source row index).
+        """
         raw_row = {**self._audit_object_identity(), "error": message}
         ctx.record_validation_error(
             row=raw_row,
@@ -1128,7 +1159,7 @@ class AWSS3Source(BaseSource):
                 row=raw_row,
                 error=message,
                 destination=self._on_validation_failure,
-                source_row_index=0,
+                source_row_index=source_row_index,
             )
 
     def _load_csv(self, handle: BinaryIO, ctx: SourceContext) -> Generator[SourceRow, None, None]:
@@ -1138,8 +1169,16 @@ class AWSS3Source(BaseSource):
         try:
             if self._csv_options.has_header:
                 try:
-                    raw_headers = next(reader, _ROW_EXHAUSTED)
-                    lines.finish_record()
+                    # csv.reader yields [] for a blank physical line. Skip those
+                    # before header discovery (as the data loop below and
+                    # csv_source do) so a leading blank line cannot become a
+                    # zero-column header; a blank-only object reaches EOF and
+                    # takes the empty-file path.
+                    while True:
+                        raw_headers = next(reader, _ROW_EXHAUSTED)
+                        lines.finish_record()
+                        if raw_headers != []:
+                            break
                 except (_RecordLimitExceeded, csv.Error, UnicodeDecodeError):
                     yield from self._file_error(ctx, "CSV header could not be parsed safely")
                     return
@@ -1189,12 +1228,16 @@ class AWSS3Source(BaseSource):
                 try:
                     values = next(reader, _ROW_EXHAUSTED)
                     lines.finish_record()
+                # A CSV record may span physical lines and a csv.Error or
+                # decode failure leaves the reader state untrustworthy, so the
+                # loader cannot resync: it stops and says so in the record.
                 except _RecordLimitExceeded:
                     row_count += 1
                     yield from self._quarantine_parse_row(
                         ctx,
                         {"__row_number__": str(row_count)},
-                        "CSV record exceeds configured character limit",
+                        "CSV record exceeds configured character limit; "
+                        f"processing stopped at row {row_count} and later records were not read",
                         row_count - 1,
                     )
                     return
@@ -1203,7 +1246,7 @@ class AWSS3Source(BaseSource):
                     yield from self._quarantine_parse_row(
                         ctx,
                         {"__row_number__": str(row_count)},
-                        "CSV record could not be parsed safely",
+                        f"CSV record could not be parsed safely; processing stopped at row {row_count} and later records were not read",
                         row_count - 1,
                     )
                     return
@@ -1245,6 +1288,10 @@ class AWSS3Source(BaseSource):
                     raw_line = next(lines, _ROW_EXHAUSTED)
                     lines.finish_record()
                 except _RecordLimitExceeded:
+                    # JSONL is newline-framed: drop the rest of this line and
+                    # carry on with the next one rather than abandoning the
+                    # remainder of the object.
+                    lines.skip_rest_of_line()
                     line_number += 1
                     yield from self._quarantine_parse_row(
                         ctx,
@@ -1252,13 +1299,13 @@ class AWSS3Source(BaseSource):
                         "JSONL record exceeds configured character limit",
                         line_number - 1,
                     )
-                    return
+                    continue
                 except UnicodeDecodeError:
                     line_number += 1
                     yield from self._quarantine_parse_row(
                         ctx,
                         {**self._audit_object_identity(), "__line_number__": line_number},
-                        "JSONL record has invalid encoded text",
+                        f"JSONL record has invalid encoded text; processing stopped at line {line_number} and later records were not read",
                         line_number - 1,
                     )
                     return
@@ -1278,7 +1325,7 @@ class AWSS3Source(BaseSource):
                     )
                     continue
                 try:
-                    row = json.loads(line, parse_constant=_reject_nonfinite_constant)
+                    row = json.loads(line, parse_constant=reject_nonfinite_constant)
                 except (json.JSONDecodeError, ValueError):
                     yield from self._quarantine_parse_row(
                         ctx,
@@ -1312,7 +1359,14 @@ class AWSS3Source(BaseSource):
                 try:
                     row = next(items, _ROW_EXHAUSTED)
                 except (ijson.JSONError, UnicodeDecodeError, _RecordLimitExceeded, _JSONBoundaryError):
-                    yield from self._file_error(ctx, "JSON object could not be parsed within configured bounds")
+                    # Items are streamed, so the document can prove invalid
+                    # after earlier items were already emitted. Those rows
+                    # stand; the file error takes the next unused index and
+                    # says so, rather than colliding with row 0.
+                    message = "JSON object could not be parsed within configured bounds"
+                    if source_row_index:
+                        message = f"{message}; {source_row_index} rows were already emitted from this document before it proved invalid"
+                    yield from self._file_error(ctx, message, source_row_index=source_row_index)
                     return
                 if row is _ROW_EXHAUSTED:
                     return

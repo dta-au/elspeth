@@ -248,7 +248,7 @@ class TestCoerceToBool:
     def test_string_false_set(self) -> None:
         from elspeth.plugins.transforms.type_coerce import coerce_to_bool
 
-        for val in ["false", "FALSE", "False", "0", "no", "NO", "n", "N", "off", "OFF", ""]:
+        for val in ["false", "FALSE", "False", "0", "no", "NO", "n", "N", "off", "OFF"]:
             assert coerce_to_bool(val) is False, f"Expected False for {val!r}"
 
     def test_string_with_whitespace(self) -> None:
@@ -256,7 +256,6 @@ class TestCoerceToBool:
 
         assert coerce_to_bool(" true ") is True
         assert coerce_to_bool("  false  ") is False
-        assert coerce_to_bool("  ") is False  # whitespace-only = empty = false
 
     def test_string_invalid_errors(self) -> None:
         from elspeth.plugins.transforms.type_coerce import CoercionError, coerce_to_bool

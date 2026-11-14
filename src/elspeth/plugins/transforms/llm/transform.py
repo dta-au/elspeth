@@ -37,6 +37,7 @@ from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import FrameworkBugError, RuntimePreflightFailedError
 from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.node_state_context import PoolExecutionContext
 from elspeth.contracts.plugin_assistance import PluginAssistance, PluginAssistanceExample
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ContentTrust, PluginCapability, WebConfigAuthority
 from elspeth.contracts.schema import FieldDefinition
@@ -105,6 +106,16 @@ _warn_telemetry_before_start = make_warn_telemetry_before_start(logger)
 # Mirrors transforms/azure/base.py _CAPACITY_RETRY_* constants.
 _SEQUENTIAL_RETRY_INITIAL_DELAY_SECONDS: float = 0.05
 _SEQUENTIAL_RETRY_MAX_DELAY_SECONDS: float = 1.0
+
+# Engine batch-wait sizing. The engine's waiter starts at accept, but the
+# plugin's retry budget (max_capacity_retry_seconds) starts inside the worker
+# and is checked only between provider attempts, so the structured
+# retry_timeout result arrives at budget + one in-flight request per query.
+# Providers whose config carries no request timeout run on their SDK's
+# default, mirrored here (tests pin both against the installed SDK).
+_AZURE_OPENAI_SDK_REQUEST_TIMEOUT_SECONDS: float = 600.0  # openai.DEFAULT_TIMEOUT.read
+_BEDROCK_LITELLM_REQUEST_TIMEOUT_SECONDS: float = 6000.0  # litellm.request_timeout
+_BATCH_WAIT_HEADROOM_SECONDS: float = 30.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,6 +367,10 @@ class SingleQueryStrategy:
             user_content = (TextPart(text=provider_prompt), *image_parts)
             content_hash = parts_hash(user_content)
         messages.append(ChatMessage(role="user", content=user_content))
+        # Langfuse reconstructs the outbound messages from these separate
+        # values. Match the provider's truthy inclusion rule so an explicitly
+        # empty system prompt is omitted from both records (multi-query parity).
+        tracer_system_prompt = self.system_prompt or None
 
         if _shutdown_event_is_set(shutdown_event):
             return _shutdown_requested_result()
@@ -384,7 +399,7 @@ class SingleQueryStrategy:
                 model=self.model,
                 latency_ms=latency_ms,
                 extra_metadata=tracer_extra_metadata,
-                system_prompt=self.system_prompt,
+                system_prompt=tracer_system_prompt,
             )
             return TransformResult.error(
                 {"reason": "context_length_exceeded", "error": str(e)},
@@ -400,7 +415,7 @@ class SingleQueryStrategy:
                 model=self.model,
                 latency_ms=latency_ms,
                 extra_metadata=tracer_extra_metadata,
-                system_prompt=self.system_prompt,
+                system_prompt=tracer_system_prompt,
             )
             if e.retryable:
                 raise
@@ -425,7 +440,7 @@ class SingleQueryStrategy:
                 model=self.model,
                 latency_ms=latency_ms,
                 extra_metadata=tracer_extra_metadata,
-                system_prompt=self.system_prompt,
+                system_prompt=tracer_system_prompt,
             )
             return finish_reason_error.result
 
@@ -442,7 +457,7 @@ class SingleQueryStrategy:
             usage=result.usage,
             latency_ms=latency_ms,
             extra_metadata=tracer_extra_metadata,
-            system_prompt=self.system_prompt,
+            system_prompt=tracer_system_prompt,
         )
 
         # 6. Build output row — operational fields plus any declared
@@ -489,9 +504,18 @@ class SingleQueryStrategy:
             PipelineRow(output, output_contract),
             success_reason={
                 "action": "enriched",
-                "fields_added": [self.response_field, *(field.suffix for field in self.output_fields)],
+                # Every field written above: the structured outputs plus the
+                # response and the operational fields populate_llm_operational_fields
+                # writes (get_llm_guaranteed_fields names exactly those).
+                "fields_added": [
+                    *(field.suffix for field in self.output_fields),
+                    *get_llm_guaranteed_fields(self.response_field),
+                ],
+                # ``model`` is the configured model in both modes; the model
+                # the provider actually served is recorded separately.
                 "metadata": {
-                    "model": result.model,
+                    "model": self.model,
+                    "served_model": result.model,
                     "finish_reason": _serialize_finish_reason(result.finish_reason),
                     **result.usage.to_dict(),
                     **audit_metadata,
@@ -851,6 +875,9 @@ class MultiQueryStrategy:
         # Record finish_reason so audit trail distinguishes None (absent) from
         # STOP (confirmed completion). See Bug elspeth-393d2459aa.
         audit_metadata[f"{spec.name}_finish_reason"] = _serialize_finish_reason(result.finish_reason)
+        # The strategy-level ``model`` key is the configured model; record the
+        # model the provider actually served for this query beside it.
+        audit_metadata[f"{spec.name}_served_model"] = result.model
 
         return self._QuerySuccess(fields=partial, audit_metadata=audit_metadata)
 
@@ -1144,6 +1171,10 @@ class MultiQueryStrategy:
         else:
             entries = self.executor.execute_batch(contexts=contexts, process_fn=_process_fn, shutdown_event=shutdown_event)
         query_results = [entry.result for entry in entries]
+        # Pool behaviour behind this row (AIMD backoff, capacity retries,
+        # throttle wait, concurrency) and each query's submit/complete order,
+        # recorded in the node state's context_after (sweep finding #100).
+        pool_context = PoolExecutionContext.from_executor_stats(self.executor.get_stats(), entries)
 
         # Check for failures — atomic: any failure fails the row
         failed = [(i, r) for i, r in enumerate(query_results) if r.status == "error"]
@@ -1169,7 +1200,7 @@ class MultiQueryStrategy:
             error_reason["discarded_successful_queries"] = len(query_results) - len(failed)
             error_reason["failed_queries"] = [self.query_specs[i].name for i, _ in failed]
             error_reason["total_count"] = len(query_results)
-            return TransformResult.error(error_reason, retryable=first_result.retryable)
+            return TransformResult.error(error_reason, retryable=first_result.retryable, context_after=pool_context)
 
         # Merge all successful partial outputs
         accumulated_outputs: dict[str, Any] = {}
@@ -1209,6 +1240,7 @@ class MultiQueryStrategy:
                 "fields_added": list(accumulated_outputs.keys()),
                 "metadata": {"model": self.model, **accumulated_audit},
             },
+            context_after=pool_context,
         )
 
 
@@ -1242,7 +1274,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:498b84f2c8939775"
+    source_file_hash: str | None = "sha256:f6ef87bfdf2fac79"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1814,9 +1846,32 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             output=output,
             name=self.name,
             max_workers=max_pending,
-            batch_wait_timeout=float(self._max_capacity_retry_seconds),
+            batch_wait_timeout=self._effective_batch_wait_timeout_seconds(),
         )
         self._batch_initialized = True
+
+    def _provider_request_timeout_seconds(self) -> float:
+        """Upper bound of one provider request for this transform's provider."""
+        if isinstance(self._config, (OpenRouterConfig, GatewayConfig)):
+            return float(self._config.timeout_seconds)
+        if isinstance(self._config, AzureOpenAIConfig):
+            return _AZURE_OPENAI_SDK_REQUEST_TIMEOUT_SECONDS
+        if isinstance(self._config, BedrockConfig):
+            return _BEDROCK_LITELLM_REQUEST_TIMEOUT_SECONDS
+        raise RuntimeError(f"Unknown config type: {type(self._config).__name__}")
+
+    def _effective_batch_wait_timeout_seconds(self) -> float:
+        """Engine wait that the plugin's structured retry_timeout result always beats.
+
+        After the retry deadline each query gets at most one further provider
+        attempt (the one in flight, or the single attempt of a later
+        sequential query), so the wait covers the budget plus one request per
+        query plus headroom.
+        """
+        query_count = len(self._strategy.query_specs) if isinstance(self._strategy, MultiQueryStrategy) else 1
+        return (
+            float(self._max_capacity_retry_seconds) + query_count * self._provider_request_timeout_seconds() + _BATCH_WAIT_HEADROOM_SECONDS
+        )
 
     def created_output_fields(self) -> tuple[FieldDefinition, ...]:
         """Every field this transform creates, typed by the code that writes it (ADR-050).
@@ -2174,7 +2229,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     "Multi-query input_fields maps variables to upstream columns by default. Explicit query_input_mode=ordered needs list-form named queries and pool_size=1; exact bindings may name earlier validated generated fields, never self/forward.",
                     "Per-query output_fields default to <queryname>_<suffix>.",
                     "Per-query structured_output_prefix: null/omitted retains the query-name stem; empty string emits bare suffixes; a nonempty ASCII identifier (at most 64 characters) emits <stem>_<suffix>.",
-                    "structured_output_prefix leaves JSON response keys and raw/usage/model names unchanged. Any non-null override requires unique final generated names across every query; ordered mode always rejects collisions.",
+                    "structured_output_prefix leaves JSON response keys and raw/usage/model names unchanged. Final generated names, including raw/usage/model fields, must be unique across every query in every query_input_mode.",
                     "A separate semantic reviewer query must bind the actual earlier generated fields and relevant original evidence explicitly. A Boolean verdict plus result_checks can reject before downstream release.",
                     "Separate model calls are not a certification of semantic correctness; both prompts and authored judgment semantics still need ordinary review.",
                     "Ordered mode preserves original-only source_row/images and atomic final output. Later failure routes the original entry row; prior calls/charges remain. Node-level restart may repeat calls; no durable mid-node resume or exactly-once guarantee.",

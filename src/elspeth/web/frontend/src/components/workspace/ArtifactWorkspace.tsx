@@ -253,6 +253,7 @@ export function ArtifactWorkspaceSurface({
   const previousActiveTabRef = useRef(activeArtifactTab);
   const activePanelOwnedFocusRef = useRef(false);
   const pendingTabFocusRef = useRef<ArtifactTab | null>(null);
+  const explicitRequestInCommitRef = useRef(false);
   const mountedRef = useRef(false);
   const committedControllerRef = useRef<CommittedArtifactController>({
     sessionId: activeSessionId,
@@ -342,6 +343,12 @@ export function ArtifactWorkspaceSurface({
     state.artifactVisible,
   ]);
 
+  // Earlier siblings may request a view during layout. Their announcement
+  // takes precedence over this commit's old-tab normalization below.
+  useInsertionEffect(() => {
+    explicitRequestInCommitRef.current = false;
+  });
+
   useInsertionEffect(() => {
     committedControllerRef.current = {
       sessionId: activeSessionId,
@@ -372,9 +379,13 @@ export function ArtifactWorkspaceSurface({
         : "graph";
       actions.showPipeline();
       committed.selectArtifactTab(requested);
-      if (state.artifactVisible) {
-        tabRefs.current[selected]?.focus({ preventScroll: true });
+      const focusTarget = tabRefs.current[selected];
+      if (state.artifactVisible && focusTarget !== null) {
+        pendingTabFocusRef.current = null;
+        focusTarget.focus({ preventScroll: true });
       } else {
+        // Callback refs can still be detached when an earlier sibling's
+        // layout effect dispatches; apply focus after the selected tab commits.
         pendingTabFocusRef.current = selected;
       }
       if (selected !== requested) announceFallback(requested);
@@ -416,6 +427,7 @@ export function ArtifactWorkspaceSurface({
         return;
       }
       const intent = claimWorkspaceViewIntent();
+      explicitRequestInCommitRef.current = true;
       selectAndFocus(request.tab);
       if (request.tab === "graph" && request.focusMode) {
         queueGraphModal(request.sessionId, intent);
@@ -438,14 +450,17 @@ export function ArtifactWorkspaceSurface({
     }
     tabRefs.current[pending]?.focus({ preventScroll: true });
     pendingTabFocusRef.current = null;
-  }, [activeArtifactTab, state.artifactVisible]);
+    // No dependency list: a request for the tab that is already active (and
+    // visible) changes neither dependency, so it must be consumed on the
+    // commit that re-attaches the tab refs, whatever else changed.
+  });
 
   useLayoutEffect(() => {
     const previousActiveTab = previousActiveTabRef.current;
     if (previousActiveTab !== activeArtifactTab) {
       const previousBecameUnavailable =
         !availableArtifactTabs.includes(previousActiveTab);
-      if (previousBecameUnavailable) {
+      if (previousBecameUnavailable && !explicitRequestInCommitRef.current) {
         announceFallback(previousActiveTab);
       }
       if (
@@ -501,6 +516,12 @@ export function ArtifactWorkspaceSurface({
   return (
     <div className="artifact-workspace">
       <div className="artifact-workspace-toolbar">
+        {/* ARGOnite: the toolbar is the pipeline pane's title bar. The title
+            is visually hidden when the pane is too narrow for title, track
+            and catalog together (workspace.css @container), never removed. */}
+        <h2 className="workspace-pane-title workspace-pane-title--collapsible">
+          Pipeline
+        </h2>
         <div role="tablist" aria-label="Pipeline artifacts">
           {ARTIFACT_TABS.map((tab) => {
             const available = availableArtifactTabs.includes(tab);

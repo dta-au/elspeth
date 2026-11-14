@@ -3,7 +3,7 @@ name = "elspeth-lints"
 version = "0.1.0"
 description = "Workspace-only static analyzer for ELSPETH-specific CI invariants"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 dependencies = ["pyyaml>=6.0,<7", "python-dotenv>=1.2.2,<2"]
 
 [project.optional-dependencies]

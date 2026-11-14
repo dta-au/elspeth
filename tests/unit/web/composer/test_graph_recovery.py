@@ -3,11 +3,14 @@
 from dataclasses import replace
 from typing import Any
 from unittest.mock import patch
+from uuid import UUID
 
 import pytest
 
 from elspeth.web.composer.graph_recovery import GraphRecoveryIntent, qualify_editable_checkpoint
+from elspeth.web.composer.recovery_controls import parse_recovery_tool_call
 from elspeth.web.composer.state import CompositionState, EdgeSpec, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
+from tests.fixtures.resource_identity import BLOB_UUID, PARK_UUID_SPELLINGS, case_bearing_uuid, park_uuid_spelling
 
 
 def _empty_state() -> CompositionState:
@@ -155,9 +158,51 @@ def test_checkpoint_managed_reference_needs_no_secret_resolution() -> None:
         {"action": "restore_parked_graph"},
         {"action": "restore_parked_graph", "park_id": " "},
         {"action": "restore_parked_graph", "park_id": "x" * 129},
+        {"action": "restore_parked_graph", "park_id": 12},
+        {"action": "restore_parked_graph", "park_id": False},
+        {"action": "restore_parked_graph", "park_id": " " * 93 + BLOB_UUID},
     ],
 )
 def test_owned_recovery_intent_enforces_invariants(overrides: dict[str, Any]) -> None:
     values: dict[str, Any] = {"action": "park", "message": "Let's clarify.", "park_id": None, "tool_call_id": "call_1"}
     with pytest.raises(ValueError):
         GraphRecoveryIntent(**(values | overrides))
+
+
+@pytest.mark.parametrize("spelling", PARK_UUID_SPELLINGS)
+def test_restore_intent_and_parser_canonicalize_only_external_park_selector(spelling: str) -> None:
+    selector = park_uuid_spelling(BLOB_UUID, spelling)
+    message = " \tRestore that draft.\n"
+    arguments = {"park_id": selector, "message": message}
+    direct = GraphRecoveryIntent("restore_parked_graph", message, selector, " restore-call ")
+    parsed = parse_recovery_tool_call("restore_parked_graph", arguments, " restore-call ")
+    assert direct == parsed
+    assert direct.park_id == BLOB_UUID
+    assert direct.message == message
+    assert direct.tool_call_id == " restore-call "
+    assert arguments == {"park_id": selector, "message": message}
+
+
+@pytest.mark.parametrize("selector", ["park-one", " \tpark-one\n", "URN:UUID:" + BLOB_UUID])
+def test_non_uuid_park_selector_stays_exact_for_unavailable_target(selector: str) -> None:
+    direct = GraphRecoveryIntent("restore_parked_graph", "Restore.", selector, "restore-call")
+    parsed = parse_recovery_tool_call("restore_parked_graph", {"park_id": selector, "message": "Restore."}, "restore-call")
+    assert parsed == direct
+    assert direct.park_id == selector
+
+
+@pytest.mark.parametrize("selector", [None, 12, False, "", " \t\n", "x" * 129, " " * 93 + BLOB_UUID])
+def test_restore_parser_keeps_original_type_length_and_nonblank_constraints(selector: object) -> None:
+    with pytest.raises(ValueError):
+        parse_recovery_tool_call("restore_parked_graph", {"park_id": selector, "message": "Restore."}, "restore-call")
+
+
+def test_park_alias_fixture_keeps_case_changes_nonvacuous_for_numeric_uuid_seeds() -> None:
+    with patch("tests.fixtures.resource_identity.uuid4", autospec=True, side_effect=(UUID(int=1), UUID(int=2))):
+        first, second = case_bearing_uuid(), case_bearing_uuid()
+    assert first != second
+    for value in (first, second):
+        for spelling in ("uppercase", "mixed"):
+            selector = park_uuid_spelling(str(value), spelling)
+            assert selector != str(value)
+            assert UUID(selector) == value

@@ -52,9 +52,12 @@ _BUILTIN_ERROR_TYPES: frozenset[str] = frozenset(get_args(ErrorType))
 # (NaN/Infinity, an integer beyond ±(2**53-1)). Raised as this fixed
 # PydanticCustomError type so the rendered reason names the rule.
 NON_CANONICAL_NUMBER_ERROR_TYPE: Final = "non_canonical_number"
+# The source-boundary schema's nesting bound: a row nested deeper than the
+# external-JSON bound cannot be walked, frozen or hashed into the audit trail.
+NESTING_TOO_DEEP_ERROR_TYPE: Final = "nesting_too_deep"
 # ELSPETH's own closed error codes: fixed strings, never built from data, so
 # printing one cannot carry row content.
-ELSPETH_ERROR_TYPES: frozenset[str] = frozenset({NON_CANONICAL_NUMBER_ERROR_TYPE})
+ELSPETH_ERROR_TYPES: frozenset[str] = frozenset({NON_CANONICAL_NUMBER_ERROR_TYPE, NESTING_TOO_DEEP_ERROR_TYPE})
 _UNDECLARED_FIELD = "[undeclared]"
 _NESTED = "[item]"
 _CUSTOM_TYPE = "custom"

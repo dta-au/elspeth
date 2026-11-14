@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Any, Final, TypedDict, cast
 
 from elspeth.contracts.composer_llm_audit import (
     PROVIDER_SERVED_UNRECOGNISED,
+    ComposerContextBudgetRecord,
     ComposerLLMCall,
     ComposerLLMCallStatus,
     ComposerLLMRequestByteSplit,
@@ -725,6 +726,7 @@ def build_llm_call_record(
     provider_custody: ProviderCallCustody | None = None,
     failure: BaseException | None = None,
     private_request: PrivateProviderContext | None = None,
+    context_budget: ComposerContextBudgetRecord | None = None,
 ) -> ComposerLLMCall:
     from elspeth.web.composer.private_diagnostic_facts import capture_failure_facts
 
@@ -819,6 +821,7 @@ def build_llm_call_record(
         tool_contract_dialect=tool_contract_dialect,
         strict_tool_count=strict_tool_count,
         request_byte_split=request_byte_split,
+        context_budget=context_budget,
     )
     return provider_custody.bind_call(call) if provider_custody is not None else bind_provider_attempt(call)
 

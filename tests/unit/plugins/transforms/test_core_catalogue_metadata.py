@@ -14,12 +14,14 @@ from tests.fixtures.catalog_reference import (
     assert_reference_tags,
     assert_reference_text,
     discover_builtin_references,
+    materialize_example_file_options,
     parse_and_validate_example,
 )
 
 EXPECTED_CORE_TAGS = {
     "blob_csv_expand": ("csv", "blob", "tabular", "fan-out"),
     "field_mapper": ("fields", "mapping", "rename", "cleanup"),
+    "file_inject": ("file", "enrichment", "prompt-context", "reference-data"),
     "json_explode": ("json", "array", "fan-out", "deaggregation"),
     "keyword_filter": ("filtering", "regex", "content-screening"),
     "line_explode": ("text", "lines", "fan-out", "deaggregation"),
@@ -45,6 +47,7 @@ _PLACEHOLDER_MARKERS = ("todo", "tbd", "replace-me", "placeholder", "see the tec
 _REQUIRED_GUIDANCE = {
     "blob_csv_expand": (("payload-store", "csv blob", "rows"), ("file source", "binary parser")),
     "field_mapper": (("rename", "select", "drop"), ("expression", "type coercion")),
+    "file_inject": (("whole content", "small file"), ("runtime", "config time")),
     "json_explode": (("one json array field",), ("object flattening", "batch aggregation")),
     "keyword_filter": (("regex", "on_error"), ("general expression",)),
     "line_explode": (("text field", "rows"), ("file", "csv")),
@@ -83,7 +86,10 @@ def _assert_constructor_is_side_effect_free(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    options = cast(Mapping[str, Any], _declaring_node(reference).get("options", {}))
+    declared = cast(Mapping[str, Any], _declaring_node(reference).get("options", {}))
+    # Files an example binds are read by the settings loader, before the
+    # constructor runs; they are written before the snapshot for that reason.
+    options = materialize_example_file_options(reference.plugin_cls.name, declared, tmp_path)
     before = tuple(tmp_path.rglob("*"))
     reference.plugin_cls(dict(options))
     assert tuple(tmp_path.rglob("*")) == before

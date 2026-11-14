@@ -2,14 +2,21 @@
 
 Tier 2 tracing provides deep LLM observability beyond the framework's Tier 1 telemetry. While Tier 1 captures latency, status, and content hashes for ALL external calls, Tier 2 captures full prompts, responses, and token-level metrics for LLM calls specifically.
 
-> **Langfuse SDK v3.14+ Required**
+> **Langfuse SDK v5.2+ Required**
 >
-> ELSPETH uses Langfuse SDK v3, built on OpenTelemetry standards. In a source
+> ELSPETH uses Langfuse SDK v5, built on OpenTelemetry standards. In a source
 > checkout, install the locked tracing extra:
 > ```bash
 > uv sync --frozen --extra tracing-langfuse
 > ```
 > Do not install a second, unpinned SDK into the checkout environment.
+
+Langfuse SDK 5 requires Langfuse Cloud or **self-hosted Langfuse 4.59.0 or
+newer**. Older self-hosted v3 and v4 servers are unsupported; upgrade the
+server before upgrading ELSPETH. The SDK also JSON-encodes metadata span
+attributes, including string values. Custom OpenTelemetry exporters that
+read those attributes must decode their JSON values. See
+[Langfuse's SDK upgrade guide](https://langfuse.com/docs/observability/sdk/upgrade-path/python-v4-to-v5).
 
 ## Overview
 
@@ -148,9 +155,16 @@ because plaintext transport exposes both API keys to anything on the path.
 uv sync --frozen --extra tracing-langfuse
 ```
 
-> **Note:** Langfuse SDK v3.14+ is required and pinned by `uv.lock`. This
+> **Note:** Langfuse SDK v5.2+ is required and pinned by `uv.lock`. This
 > version uses OpenTelemetry-based context managers for trace lifecycle
 > management and is thread-safe for concurrent pipeline execution.
+
+The Web Composer's operator telemetry custody depends on reviewed
+OpenTelemetry SDK internals. ELSPETH 0.8.12 locks the SDK and OTLP exporters
+to 1.45.1 and the Prometheus exporter to 0.66b1. Keep those exact versions
+together when installing the web interface; its startup check refuses an
+unreviewed SDK or exporter version. Existing Langfuse `host`, credential and
+tracing configuration fields remain supported.
 
 ### Langfuse Credentials
 
@@ -192,17 +206,13 @@ Unlike Azure AI auto-instrumentation:
 - **LLM-specific features:** Prompt versioning, A/B testing, evaluation scores
 - **Thread-safe:** Uses OpenTelemetry thread-local context (safe for concurrent pipelines)
 
-### Langfuse v3 Behavioral Note
+### Langfuse observations
 
-In Langfuse SDK v3, traces are recorded **after** a successful LLM call, not wrapped around the call. This means:
-
-- **LLM call succeeds:** Trace is created with full prompt, response, and usage
-- **LLM call fails:** No trace is created in Langfuse
-
-This is acceptable because:
-1. Failed LLM calls are always recorded in the Landscape audit trail (source of truth)
-2. Telemetry events are still emitted for operational visibility
-3. Tier 2 tracing is for prompt engineering and cost tracking, not failure investigation
+ELSPETH records Langfuse observations after the call completes. A successful
+observation carries the prompt, response, model and token usage. The tracer
+also supports error observations with the prompt, model and error status;
+an error recorded by a plugin produces an error generation. Landscape remains
+the authoritative audit trail when optional tracing is unavailable.
 
 ## Using Both Tiers Together
 

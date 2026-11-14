@@ -14,7 +14,7 @@ the operator procedures are the three runbooks
 > **Status.** Implemented; desktop acceptance closed `elspeth-5ec3befc1a` on
 > 2026-09-10 under the operator's desktop-analysis ruling. No live cloud
 > acceptance is claimed. A future operator run may produce the sanitized receipt
-> at `docs/operator/evidence/azure-container-apps/0.8.10.json`; that receipt is
+> at `docs/operator/evidence/azure-container-apps/0.8.14.json`; that receipt is
 > no longer a tracker closure or documentation-promotion condition.
 
 The supported operating configuration is `Single` revision mode, `sticky`
@@ -137,6 +137,10 @@ against each parameter file, never on Bicep text.
 - `composerMaxCompositionTurns`, `composerMaxDiscoveryTurns`,
   `composerTimeoutSeconds`, `composerRateLimitPerMinute` — required runtime
   budgets, supplied to web and both doctors. `extraEnvironment` is web-only.
+- `composerContextMaxPromptTokens` — required, no default: the prompt-token
+  limit of your model gateway, which the context budgeter keeps each planner
+  request under. The shipped `200000` is a placeholder; set your gateway's
+  actual limit.
 - `authProvider` — explicit nonlocal production authentication, with SSO
   settings, first administrator subject and quota defaults in `extraEnvironment`;
   keep `registrationMode=closed`. Local authentication would put SQLite on NFS.

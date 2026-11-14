@@ -15,6 +15,7 @@ Trust-tier notes
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -33,11 +34,19 @@ class NodeStateContext(Protocol):
 
 
 class QueryOrderEntryInput(Protocol):
-    """Structural view of reorder-buffer entries needed for audit ordering."""
+    """Structural view of reorder-buffer entries needed for audit ordering.
 
-    submit_index: int
-    complete_index: int
-    buffer_wait_ms: float
+    Read-only members, so the frozen ``BufferEntry`` the pool returns satisfies it.
+    """
+
+    @property
+    def submit_index(self) -> int: ...
+
+    @property
+    def complete_index(self) -> int: ...
+
+    @property
+    def buffer_wait_ms(self) -> float: ...
 
 
 def _require_non_negative_finite_number(value: object, field_name: str) -> None:
@@ -160,7 +169,7 @@ class PoolExecutionContext:
     def from_executor_stats(
         cls,
         stats: dict[str, Any],
-        entries: list[QueryOrderEntryInput],
+        entries: Sequence[QueryOrderEntryInput],
     ) -> PoolExecutionContext:
         """Build from PooledExecutor.get_stats() and reorder buffer entries.
 

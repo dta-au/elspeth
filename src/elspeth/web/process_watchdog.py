@@ -14,11 +14,12 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
-from typing import final
 
-from elspeth.web.process_watchdog_codec import (
+from elspeth.contracts.process_watchdog_wire import (
+    BootstrapCompletionWitness as BootstrapCompletionWitness,
+)
+from elspeth.contracts.process_watchdog_wire import (
     FrameKind,
     FrameReader,
     RecoveryReason,
@@ -26,43 +27,21 @@ from elspeth.web.process_watchdog_codec import (
     WatchdogProtocolError,
     encode_frame,
 )
+from elspeth.contracts.process_watchdog_wire import (
+    GraceAcknowledgement as GraceAcknowledgement,
+)
+from elspeth.contracts.process_watchdog_wire import (
+    ProcessCompletionWitness as ProcessCompletionWitness,
+)
+from elspeth.contracts.process_watchdog_wire import (
+    ProcessWatchdogTarget as ProcessWatchdogTarget,
+)
 
 WEB_PROCESS_RECOVERY_GRACE_SECONDS = 30.0
 
 
 class ProcessWatchdogFailure(RuntimeError):
     """Required private process supervision failed."""
-
-
-@final
-@dataclass(frozen=True, slots=True)
-class ProcessWatchdogTarget:
-    pid: int
-    nonce: str
-
-
-@final
-@dataclass(frozen=True, slots=True)
-class GraceAcknowledgement:
-    target: ProcessWatchdogTarget
-    armed_at_ns: int
-    deadline_ns: int
-
-
-@final
-@dataclass(frozen=True, slots=True)
-class ProcessCompletionWitness:
-    """Owned lifecycle creates this only after all joins and engine finalization."""
-
-    target: ProcessWatchdogTarget
-
-
-@final
-@dataclass(frozen=True, slots=True)
-class BootstrapCompletionWitness:
-    """Owned factory creates this only while no construction effects entered."""
-
-    target: ProcessWatchdogTarget
 
 
 class ProcessWatchdogControl(ABC):
@@ -89,7 +68,12 @@ class ProcessWatchdogControl(ABC):
     async def observe_helper_outcome(self) -> None: ...
 
     @abstractmethod
-    def request_signal(self, sig: signal.Signals) -> None: ...
+    def request_graceful_termination(self) -> None:
+        """Request the owned process's cooperative shutdown after grace is armed."""
+
+    @abstractmethod
+    def force_termination(self) -> None:
+        """Force termination of the exact owned process when supervision fails."""
 
 
 _active_watchdog: ProcessWatchdog | None = None
@@ -276,6 +260,12 @@ class ProcessWatchdog(ProcessWatchdogControl):
             await asyncio.sleep(0.05)
         if not self._disarmed:
             raise ProcessWatchdogFailure("Required process watchdog exited while owner remained active")
+
+    def request_graceful_termination(self) -> None:
+        self.request_signal(signal.SIGTERM)
+
+    def force_termination(self) -> None:
+        self.request_signal(signal.SIGKILL)
 
     def request_signal(self, sig: signal.Signals) -> None:
         if type(sig) is not signal.Signals or sig not in (signal.SIGTERM, signal.SIGKILL):

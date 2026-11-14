@@ -7,12 +7,13 @@ from pydantic import Field, field_validator
 
 from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
+from elspeth.contracts.errors import TransformSuccessReason
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
-from elspeth.plugins.transforms.safety_utils import get_fields_to_scan
+from elspeth.plugins.transforms.safety_utils import get_fields_to_scan, unscanned_field_warnings
 from elspeth.plugins.transforms.safety_utils import validate_fields_not_empty as _validate_fields
 
 # ReDoS detection: patterns with nested quantifiers cause catastrophic backtracking
@@ -29,7 +30,11 @@ _MAX_PATTERN_LENGTH = 1000
 
 
 def _brace_quantifier_end(pattern: str, start: int) -> int | None:
-    """Return the exclusive end offset for a valid brace quantifier."""
+    """Return the exclusive end offset for a valid brace quantifier.
+
+    Mirrors ``re``: ``{n}``, ``{n,}``, ``{n,m}``, and — with an empty lower
+    bound — ``{,m}`` and ``{,}`` are quantifiers; ``{}`` is a literal.
+    """
     if start >= len(pattern) or pattern[start] != "{":
         return None
 
@@ -37,11 +42,10 @@ def _brace_quantifier_end(pattern: str, start: int) -> int | None:
     digits_start = i
     while i < len(pattern) and pattern[i].isdigit():
         i += 1
-    if i == digits_start:
-        return None
 
     if i < len(pattern) and pattern[i] == "}":
-        return i + 1
+        # "{}" (no digits) is a literal brace pair, "{n}" a quantifier.
+        return i + 1 if i > digits_start else None
 
     if i >= len(pattern) or pattern[i] != ",":
         return None
@@ -218,7 +222,7 @@ class KeywordFilter(BaseTransform):
     name = "keyword_filter"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3377cd14f8dd007e"
+    source_file_hash: str | None = "sha256:9522bc1e48633130"
     config_model = KeywordFilterConfig
     usage_when_to_use: str = (
         "Use for regex content screening when a pattern match must return an error for the node's "
@@ -267,9 +271,12 @@ class KeywordFilter(BaseTransform):
         self._fields = cfg.fields
         # Explicitly named scan fields fail the row closed when missing or
         # non-string; "all" mode skips non-strings instead, so it makes no
-        # static type claim (elspeth-b19dfe41fb).
-        if not isinstance(self._fields, str):
+        # static type claim (elspeth-b19dfe41fb). A single named field is
+        # declared exactly like a one-element list.
+        if isinstance(self._fields, list):
             self.declared_string_input_fields = frozenset(self._fields)
+        elif self._fields != "all":
+            self.declared_string_input_fields = frozenset({self._fields})
         self._schema_config = cfg.schema_config
         self._output_schema_config = self._build_output_schema_config(cfg.schema_config)
 
@@ -364,10 +371,16 @@ class KeywordFilter(BaseTransform):
 
         # No matches - pass through unchanged, under the node's declared
         # contract: the ONE stamp writes the operator's declared fields onto
-        # it (ADR-050 Decision 2).
+        # it (ADR-050 Decision 2). In "all" mode, name the non-string fields
+        # that were never scanned so the audit record does not read as a
+        # whole-row verdict.
+        success_reason: TransformSuccessReason = {"action": "filtered"}
+        unscanned = unscanned_field_warnings(self._fields, row)
+        if unscanned:
+            success_reason["validation_warnings"] = unscanned
         return TransformResult.success(
             PipelineRow(row.to_dict(), self._align_output_contract(self._apply_declared_output_field_contracts(row.contract))),
-            success_reason={"action": "filtered"},
+            success_reason=success_reason,
         )
 
     def close(self) -> None:

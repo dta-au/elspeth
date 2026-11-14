@@ -70,11 +70,13 @@ from elspeth.web.composer.advisor_decision import AdvisorGateBlocked, AdvisorGat
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
 from elspeth.web.composer.audit import ComposerToolCancellation, ComposerToolFailure
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
+from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.no_tool_policy import compose_graph_recovery_refusal_message
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
+from elspeth.web.composer.progress import context_budget_refusal_progress_event
 from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.composer.protocol import (
     PIPELINE_STAGED_REVIEW_MESSAGE,
@@ -1499,6 +1501,7 @@ async def _run_composer_turn(
                     provider_owner=provider_owner,
                     recovery_context=recovery_context,
                     retained_operation_context=retained_operation_context,
+                    context_budget_history=ContextBudgetHistory.from_records(records),
                     advisor_history=AdvisorTranscriptHistory.from_records(
                         session_id=str(turn.session_id),
                         actor_user_id=turn.actor_user_id,
@@ -1580,7 +1583,7 @@ async def _run_composer_turn(
             terminal_status = "timed_out" if exc.budget_exhausted == "timeout" else "failed"
             await _publish_progress(
                 progress_sink,
-                event=convergence_progress_event(budget_exhausted=exc.budget_exhausted),
+                event=convergence_progress_event(budget_exhausted=exc.budget_exhausted, reason=exc.reason),
             )
             observation.pending_exception_tool_invocations = exc.tool_invocations if exc.failed_turn is None else ()
             response_body = await _required_audit(
@@ -1753,9 +1756,12 @@ async def _run_composer_turn(
             # The planner's calls are already durable (llm_calls_durable), so this
             # records () and _handle_planner_failure persists none.
             observation.pending_exception_llm_calls = _llm_calls_from_exception(exc)
+            planner_progress_reason = freeform_planner_progress_reason(exc.code)
             await _publish_progress(
                 progress_sink,
-                event=ComposerProgressEvent(
+                event=context_budget_refusal_progress_event()
+                if planner_progress_reason == "context_budget_exceeded"
+                else ComposerProgressEvent(
                     phase="failed",
                     headline=f"The composer could not build a pipeline for this {labels.noun}.",
                     evidence=(
@@ -1768,7 +1774,7 @@ async def _run_composer_turn(
                         if exc.code == "COST_UNAVAILABLE"
                         else "Retry the request; if it keeps failing, simplify it or check the composer provider."
                     ),
-                    reason=freeform_planner_progress_reason(exc.code),
+                    reason=planner_progress_reason,
                 ),
             )
             status_code, planner_response_body = await _required_audit(

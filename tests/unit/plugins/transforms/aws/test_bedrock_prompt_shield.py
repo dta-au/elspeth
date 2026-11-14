@@ -189,7 +189,9 @@ def test_prompt_shield_evaluates_every_field_and_stops_on_detection(monkeypatch:
 
 @pytest.mark.parametrize(
     "failure",
-    [GuardrailServiceError(retryable=True), ValueError("malformed provider marker")],
+    # A retryable failure is raised for engine retry (AWS review 2026-11-13 #4);
+    # only a terminal one becomes a sanitized row error.
+    [GuardrailServiceError(retryable=False)],
 )
 def test_prompt_shield_sanitizes_provider_failures(
     monkeypatch: pytest.MonkeyPatch,
@@ -207,6 +209,6 @@ def test_prompt_shield_sanitizes_provider_failures(
     assert result.reason == {
         "reason": "api_call_failed",
         "field": "prompt",
-        "error_type": "guardrail_service_error",
+        "error_type": "service_error",
     }
     assert "malformed provider marker" not in repr(result)

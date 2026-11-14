@@ -18,7 +18,7 @@ from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.required_executor import RequiredGenerationUnavailable
-from elspeth.web.sessions.composer_operations import ComposerOperationError, ComposerRequiredRecoveryFailure
+from elspeth.web.sessions.composer_operations import CONTEXT_BUDGET_FAILURE_CODE, ComposerOperationError, ComposerRequiredRecoveryFailure
 from elspeth.web.sessions.protocol import StaleComposeStateError
 
 _JSON: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
@@ -241,6 +241,11 @@ def project_composer_operation_error(
             candidate = detail["error_type"] if "error_type" in detail else None
             if isinstance(candidate, str):
                 error_type = candidate
+            if "failure_code" in detail and detail["failure_code"] == CONTEXT_BUDGET_FAILURE_CODE:
+                # Both refusal sources keep their own error type in the body
+                # (``convergence``, ``composer_planner_failure``); the sealed
+                # category names the refusal for the public failure history.
+                error_type = CONTEXT_BUDGET_FAILURE_CODE
             detail = {**detail, "request_id": request_id}
         return _http_error(leaf.status_code, {"detail": detail}, error_type)
     return _generic_failure(request_id=request_id, diagnostic_id=diagnostic_id)

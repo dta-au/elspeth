@@ -10,6 +10,7 @@ This is the ONLY place in the pipeline where coercion is allowed.
 from __future__ import annotations
 
 import re
+import threading
 import urllib.parse
 import xml.etree.ElementTree as ET
 from collections.abc import Iterator, Mapping
@@ -64,9 +65,13 @@ class _DataverseSourceRequest(TypedDict):
     headers: dict[str, str] | None
 
 
-# OData annotation prefixes to strip from row data
-_ODATA_ANNOTATION_PATTERN = re.compile(r"^@odata\.|@Microsoft\.Dynamics\.CRM\.")
-_FORMATTED_VALUE_SUFFIX = "@OData.Community.Display.V1.FormattedValue"
+# OData annotations to strip from row data. Searched, not matched: an
+# annotation is either instance-level ("@odata.etag") or property-level
+# ("_parentcustomerid_value@Microsoft.Dynamics.CRM.lookuplogicalname"), and
+# Dataverse column logical names never contain "@".
+_ODATA_ANNOTATION_PATTERN = re.compile(r"@(?:odata|Microsoft\.Dynamics\.CRM)\.")
+_FORMATTED_VALUE_ANNOTATION = "OData.Community.Display.V1.FormattedValue"
+_FORMATTED_VALUE_SUFFIX = f"@{_FORMATTED_VALUE_ANNOTATION}"
 _DATAVERSE_LOGICAL_NAME_PATTERN = re.compile(r"^[a-z_][a-z0-9_]*$")
 _DATAVERSE_ENTITY_SET_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -146,6 +151,7 @@ class DataverseSourceConfig(DataPluginConfig):
     )
     top: int | None = Field(
         default=None,
+        ge=1,
         description="$top limit (None = all records)",
     )
 
@@ -208,9 +214,10 @@ class DataverseSourceConfig(DataPluginConfig):
         for index, select_name in enumerate(v):
             if not select_name or not select_name.strip():
                 raise ValueError(f"select[{index}] cannot be empty")
-            stripped = select_name.strip()
-            reject_operator_required_placeholder_value(stripped, field_name=f"select[{index}]")
-            stripped_fields.append(stripped)
+            # Each entry is joined unencoded into ``$select=``, so it must be a
+            # Dataverse logical name: '#', '&', ',' or whitespace would end or
+            # rewrite the query string (lookup columns like ``_x_value`` match).
+            stripped_fields.append(_validate_dataverse_logical_name(select_name.strip(), field_name=f"select[{index}]"))
         return stripped_fields
 
     @model_validator(mode="after")
@@ -269,9 +276,14 @@ class DataverseSourceConfig(DataPluginConfig):
                 ) from exc
             if root.tag != "fetch":
                 raise ValueError(f"FetchXML root element must be <fetch>, got <{root.tag}>.")
-            entity_elem = root.find("entity")
-            if entity_elem is not None and "name" in entity_elem.attrib:
-                _validate_dataverse_logical_name(entity_elem.attrib["name"], field_name="FetchXML <entity name>")
+            # _load_rows derives the entity set URL from this element, so a
+            # query without exactly one named <entity> can never run.
+            entity_elems = root.findall("entity")
+            if len(entity_elems) != 1:
+                raise ValueError(f"FetchXML <fetch> must contain exactly one <entity> element, found {len(entity_elems)}.")
+            if "name" not in entity_elems[0].attrib:
+                raise ValueError("FetchXML <entity> element must have a 'name' attribute.")
+            _validate_dataverse_logical_name(entity_elems[0].attrib["name"], field_name="FetchXML <entity name>")
         return v
 
 
@@ -290,7 +302,7 @@ class DataverseSource(BaseSource):
     _normalizes_external_names = True
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a993a9a403c9b3b8"
+    source_file_hash: str | None = "sha256:d95b4c4ee2aedc4c"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 
@@ -367,6 +379,10 @@ class DataverseSource(BaseSource):
         self._client: DataverseClient | None = None
         self._source_limiter: LimiterProtocol | None = None
         self._pending_verify_source_call_id: str | None = None
+        # Run shutdown signal (ends a throttle wait early) and the load
+        # context throttled calls are recorded against while load() runs.
+        self._shutdown_event: threading.Event | None = None
+        self._throttle_ctx: SourceContext | None = None
         self._pages_fetched = 0
         self._rows_yielded = 0
         self._quarantine_count = 0
@@ -385,6 +401,7 @@ class DataverseSource(BaseSource):
         # Obtain rate limiter (with null guard per spec)
         limiter = ctx.rate_limit_registry.get_limiter("dataverse_source") if ctx.rate_limit_registry is not None else None
         self._source_limiter = limiter
+        self._shutdown_event = ctx.shutdown_event
 
         # VERIFY first binds the source-load operation to an archived call.
         # Credential and HTTP client construction are deferred until load().
@@ -404,6 +421,26 @@ class DataverseSource(BaseSource):
             api_version=self._api_version,
             limiter=limiter,
             additional_domains=self._additional_domains,
+            shutdown_event=self._shutdown_event,
+            on_throttle=self._record_throttled_call,
+        )
+
+    def _record_throttled_call(self, error: DataverseClientError, wait_seconds: float) -> None:
+        """Record a throttled (429/503) call the client is about to wait out and re-send.
+
+        Without this the retried response would be the only recorded call, so
+        the throttled call and the wait chosen for it would vanish from the
+        audit trail.
+        """
+        ctx = self._throttle_ctx
+        if ctx is None:
+            raise FrameworkBugError("Dataverse client throttled outside load() — no source context to record against")
+        self._record_page_call(
+            ctx,
+            url=error.request_url,
+            error=error,
+            error_reason=error.error_category,
+            retry_wait_ms=round(wait_seconds * 1000),
         )
 
     def _metadata_url(self, logical_name: str) -> str:
@@ -414,7 +451,10 @@ class DataverseSource(BaseSource):
         )
 
     @staticmethod
-    def _verify_request_data(url: str) -> _DataverseSourceRequest:
+    def _verify_request_data(url: str, extra_headers: Mapping[str, str]) -> _DataverseSourceRequest:
+        # Mirrors the non-auth headers DataverseClient sends and records:
+        # its fixed OData headers plus the per-request extras (e.g. the
+        # FetchXML Prefer header).
         return {
             "method": "GET",
             "url": fingerprint_url(url),
@@ -422,10 +462,11 @@ class DataverseSource(BaseSource):
                 "Accept": "application/json",
                 "OData-MaxVersion": "4.0",
                 "OData-Version": "4.0",
+                **extra_headers,
             },
         }
 
-    def _preflight_verify_request(self, ctx: SourceContext, url: str) -> None:
+    def _preflight_verify_request(self, ctx: SourceContext, url: str, extra_headers: Mapping[str, str]) -> None:
         session = ctx.call_mode_session
         if session is None or session.mode is not RunMode.VERIFY:
             return
@@ -433,7 +474,7 @@ class DataverseSource(BaseSource):
         if operation_id is None:
             raise AuditIntegrityError("Dataverse verify requires a source-load operation")
         evidence = session.preflight_verify_operation_http_managed_identity(
-            request_data=self._verify_request_data(url),
+            request_data=self._verify_request_data(url, extra_headers),
             current_operation_id=operation_id,
         )
         self._pending_verify_source_call_id = evidence.source_call_id
@@ -635,7 +676,7 @@ class DataverseSource(BaseSource):
                 continue
 
             # Strip OData annotations
-            if _ODATA_ANNOTATION_PATTERN.match(key):
+            if _ODATA_ANNOTATION_PATTERN.search(key):
                 continue
 
             cleaned[key] = value
@@ -769,6 +810,7 @@ class DataverseSource(BaseSource):
         page: DataversePageResponse | None = None,
         error: DataverseClientError | None = None,
         error_reason: str | None = None,
+        retry_wait_ms: int | None = None,
     ) -> None:
         """Record a page fetch in the audit trail.
 
@@ -781,6 +823,8 @@ class DataverseSource(BaseSource):
             page: Response page (for success)
             error: DataverseClientError (for errors)
             error_reason: Additional error context
+            retry_wait_ms: For a throttled call the client re-sends, the wait
+                (ms) it chose before the re-send
         """
         # After page 1 the url IS the server-supplied @odata.nextLink (Tier-3
         # data), so every persisted copy rides fingerprint_url like the
@@ -836,6 +880,8 @@ class DataverseSource(BaseSource):
                 "status_code": error.status_code,
                 "reason": error_reason,
             }
+            if retry_wait_ms is not None:
+                error_data["retry_wait_ms"] = retry_wait_ms
             try:
                 recorded_call = ctx.record_call(
                     call_type=CallType.HTTP,
@@ -880,6 +926,7 @@ class DataverseSource(BaseSource):
         Yields SourceRow.valid() for validated rows and
         SourceRow.quarantined() for rows failing schema validation.
         """
+        self._throttle_ctx = ctx
         # Instance-level flag — NOT reset per page (spec: schema lock scoping)
         self._first_valid_row_processed = False
         is_first_row = True
@@ -892,17 +939,15 @@ class DataverseSource(BaseSource):
                 raise RuntimeError("config validator ensures entity or fetch_xml — neither is set, this is a bug")
             root = ET.fromstring(self._fetch_xml)
             entity_elem = root.find("entity")
-            if entity_elem is None:
-                raise RuntimeError("FetchXML is missing <entity> element — cannot determine entity name for URL")
-            if "name" not in entity_elem.attrib:
-                raise RuntimeError("FetchXML <entity> element missing 'name' attribute")
+            if entity_elem is None or "name" not in entity_elem.attrib:
+                raise RuntimeError("config validator ensures FetchXML has exactly one named <entity> — none found, this is a bug")
             logical_name = entity_elem.attrib["name"]
 
         if self._client is None:
             session = ctx.call_mode_session
             if session is None or session.mode is not RunMode.VERIFY:
                 raise RuntimeError("on_start() must be called before load() — this is a bug")
-            self._preflight_verify_request(ctx, self._metadata_url(logical_name))
+            self._preflight_verify_request(ctx, self._metadata_url(logical_name), {})
             credential = self._auth_config.create_credential()
             self._client = DataverseClient(
                 environment_url=self._environment_url,
@@ -910,21 +955,25 @@ class DataverseSource(BaseSource):
                 api_version=self._api_version,
                 limiter=self._source_limiter,
                 additional_domains=self._additional_domains,
-                before_request=lambda url: self._preflight_verify_request(ctx, url),
+                before_request=lambda url, extra_headers: self._preflight_verify_request(ctx, url, extra_headers),
+                shutdown_event=self._shutdown_event,
+                on_throttle=self._record_throttled_call,
             )
 
         entity_set_name = self._resolve_entity_set_name(ctx, logical_name)
         if self._entity is not None:
             url = self._build_query_url(entity_set_name)
+        # Dataverse returns FormattedValue annotations only when asked for them.
+        annotations = (_FORMATTED_VALUE_ANNOTATION,) if self._include_formatted_values else ()
 
         try:
             if self._entity is not None:
                 # Structured OData query
-                page_iterator = self._client.paginate_odata(url)
+                page_iterator = self._client.paginate_odata(url, annotations=annotations)
             else:
                 # FetchXML query
                 assert self._fetch_xml is not None
-                page_iterator = self._client.paginate_fetchxml(entity_set_name, self._fetch_xml)
+                page_iterator = self._client.paginate_fetchxml(entity_set_name, self._fetch_xml, annotations=annotations)
 
             for page in page_iterator:
                 # Record successful page fetch — use the actual URL from the

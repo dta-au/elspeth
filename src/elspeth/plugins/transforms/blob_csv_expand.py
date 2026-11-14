@@ -26,6 +26,7 @@ from elspeth.plugins.infrastructure.config_base import (
     NormalizedColumnsOption,
     NormalizedFieldMappingOption,
     TransformDataConfig,
+    validate_csv_delimiter,
 )
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
@@ -109,9 +110,7 @@ class BlobCSVExpandConfig(TransformDataConfig):
     @field_validator("delimiter")
     @classmethod
     def _validate_delimiter(cls, value: str) -> str:
-        if len(value) != 1:
-            raise ValueError(f"delimiter must be a single character, got {value!r}")
-        return value
+        return validate_csv_delimiter(value)
 
     @field_validator("encoding")
     @classmethod
@@ -307,7 +306,7 @@ class BlobCSVExpand(BaseTransform):
     name = "blob_csv_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:645858af23f9cf25"
+    source_file_hash: str | None = "sha256:64de4207fc6d2406"
     config_model = BlobCSVExpandConfig
     usage_when_to_use: str = (
         "Use when each input row carries a payload-store reference to a CSV blob and you need to "
@@ -453,10 +452,15 @@ class BlobCSVExpand(BaseTransform):
         """
 
         class _InvariantPayloadStore:
-            def retrieve(self, ref: str) -> bytes:
+            # Mirrors PayloadStore.retrieve_bounded: a negative cap is refused,
+            # an unknown ref is not found, an oversize payload yields None.
+            def retrieve_bounded(self, ref: str, *, max_bytes: int) -> bytes | None:
+                if max_bytes < 0:
+                    raise ValueError("max_bytes must be nonnegative")
                 if ref != _INVARIANT_PROBE_BLOB_REF:
                     raise PayloadNotFoundError(ref)
-                return _INVARIANT_PROBE_CSV_TEXT.encode("utf-8")
+                body = _INVARIANT_PROBE_CSV_TEXT.encode("utf-8")
+                return body if len(body) <= max_bytes else None
 
         had_payload_store = "_payload_store" in self.__dict__
         original_payload_store: Any = None
@@ -485,7 +489,7 @@ class BlobCSVExpand(BaseTransform):
         base = row.to_dict()
         try:
             loaded = self._load_csv_text(row)
-            parsed = self._parse_csv(loaded.text, base_fields=frozenset(base))
+            parsed = self._parse_csv(loaded, base_fields=frozenset(base))
         except _BlobCSVParseError as exc:
             return TransformResult.error(exc.reason, retryable=False)
 
@@ -610,7 +614,10 @@ class BlobCSVExpand(BaseTransform):
             )
 
         try:
-            body = self._payload_store.retrieve(blob_ref)
+            # Bounded read: the store stops after max_blob_bytes + 1 bytes and
+            # returns None for an oversize blob, so the cap limits memory, not
+            # just the accepted size (contracts/payload_store.py).
+            body = self._payload_store.retrieve_bounded(blob_ref, max_bytes=self._max_blob_bytes)
         # ORDER IS LOAD-BEARING. A corrupt payload is not a missing payload: it
         # must crash the run rather than be quarantined as a routed row error,
         # because silently routing it would let a pipeline continue past
@@ -635,14 +642,12 @@ class BlobCSVExpand(BaseTransform):
                 )
             ) from exc
 
-        body_size = len(body)
-        if body_size > self._max_blob_bytes:
+        if body is None:
             raise _BlobCSVParseError(
                 _csv_error_reason(
                     "blob_too_large",
                     field=self._blob_ref_field,
                     blob_ref=blob_ref,
-                    body_size=body_size,
                     max_blob_bytes=self._max_blob_bytes,
                 )
             )
@@ -703,8 +708,12 @@ class BlobCSVExpand(BaseTransform):
         # max_output_rows still bounds the fan-out below.
         return _CSVSourceText(text=value, field=self._text_field, blob_ref=None)
 
-    def _parse_csv(self, text: str, *, base_fields: frozenset[str]) -> _ParsedCSV:
-        stream = io.StringIO(text, newline="")
+    def _parse_csv(self, loaded: _CSVSourceText, *, base_fields: frozenset[str]) -> _ParsedCSV:
+        # Every parse-phase reason names the document it came from with the
+        # same identity keys the load-phase reasons and empty_csv carry, so one
+        # plugin routes one error taxonomy whichever phase refused the row.
+        identity = _source_identity(loaded)
+        stream = io.StringIO(loaded.text, newline="")
         reader = csv.reader(stream, delimiter=self._delimiter, strict=True)
 
         for skip_idx in range(self._skip_rows):
@@ -713,6 +722,7 @@ class BlobCSVExpand(BaseTransform):
                     raise _BlobCSVParseError(
                         _csv_error_reason(
                             "csv_exhausted_during_skip_rows",
+                            **identity,
                             skip_rows=self._skip_rows,
                             rows_skipped=skip_idx,
                         )
@@ -721,6 +731,7 @@ class BlobCSVExpand(BaseTransform):
                 raise _BlobCSVParseError(
                     _csv_error_reason(
                         "csv_parse_error",
+                        **identity,
                         phase="skip_rows",
                         row_number=skip_idx + 1,
                         line_number=reader.line_num,
@@ -745,6 +756,7 @@ class BlobCSVExpand(BaseTransform):
                 raise _BlobCSVParseError(
                     _csv_error_reason(
                         "csv_parse_error",
+                        **identity,
                         phase="header",
                         line_number=reader.line_num,
                         error=str(exc),
@@ -760,9 +772,9 @@ class BlobCSVExpand(BaseTransform):
                 columns=list(self._columns) if self._columns is not None else None,
             )
         except ExternalHeaderError as exc:
-            raise _BlobCSVParseError(_csv_error_reason("csv_header_error", error=str(exc))) from exc
+            raise _BlobCSVParseError(_csv_error_reason("csv_header_error", **identity, error=str(exc))) from exc
         except ValueError as exc:
-            raise _BlobCSVParseError(_csv_error_reason("csv_config_error", error=str(exc))) from exc
+            raise _BlobCSVParseError(_csv_error_reason("csv_config_error", **identity, error=str(exc))) from exc
 
         headers = tuple(field_resolution.final_headers)
         collisions = sorted(base_fields & set(headers))
@@ -774,6 +786,7 @@ class BlobCSVExpand(BaseTransform):
             raise _BlobCSVParseError(
                 _csv_error_reason(
                     "field_collision",
+                    **identity,
                     fields=sorted(set(collisions)),
                     error="CSV output fields collide with existing input fields",
                 )
@@ -789,6 +802,7 @@ class BlobCSVExpand(BaseTransform):
                 raise _BlobCSVParseError(
                     _csv_error_reason(
                         "csv_parse_error",
+                        **identity,
                         phase="data",
                         line_number=reader.line_num,
                         row_number=row_number + 1,
@@ -802,6 +816,7 @@ class BlobCSVExpand(BaseTransform):
                 raise _BlobCSVParseError(
                     _csv_error_reason(
                         "too_many_rows",
+                        **identity,
                         row_count=row_number,
                         max_output_rows=self._max_output_rows,
                     )
@@ -810,6 +825,7 @@ class BlobCSVExpand(BaseTransform):
                 raise _BlobCSVParseError(
                     _csv_error_reason(
                         "csv_column_count_mismatch",
+                        **identity,
                         line_number=reader.line_num,
                         row_number=row_number,
                         expected=expected_count,

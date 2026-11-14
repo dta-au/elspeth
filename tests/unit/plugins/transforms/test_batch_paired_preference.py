@@ -75,8 +75,9 @@ class TestBatchPairedPreference:
         assert result.row["tie_rate"] == pytest.approx(1 / 3)
         assert result.row["preference_rate"] == 0.5
         assert result.row["standard_error_delta"] == pytest.approx(0.17320508075688773)
-        assert result.row["confidence_95_low"] == pytest.approx(-0.33948195828349996)
-        assert result.row["confidence_95_high"] == pytest.approx(0.33948195828349996)
+        # Student-t at n-1 = 2 df (t = 4.302652729749464), not z = 1.96 (sweep #108).
+        assert result.row["confidence_95_low"] == pytest.approx(-0.17320508075688773 * 4.302652729749464)
+        assert result.row["confidence_95_high"] == pytest.approx(0.17320508075688773 * 4.302652729749464)
 
     def test_configured_baseline_is_used_even_when_not_first_seen(self, ctx: PluginContext) -> None:
         from elspeth.plugins.transforms.batch_paired_preference import BatchPairedPreference

@@ -524,12 +524,14 @@ def _assert_recovered_loser_contract(result: _ScenarioResult) -> None:
 
 
 @pytest.mark.timeout(120)
+@pytest.mark.timing_sensitive
 def test_late_success_observes_lease_loss_before_stale_disposition(tmp_path: Path) -> None:
     result = _run_stall_scenario(tmp_path, late_outcome="success")
     _assert_recovered_loser_contract(result)
 
 
 @pytest.mark.timeout(120)
+@pytest.mark.timing_sensitive
 def test_late_failure_observes_lease_loss_before_stale_failure_disposition(tmp_path: Path) -> None:
     result = _run_stall_scenario(tmp_path, late_outcome="failure")
     _assert_recovered_loser_contract(result)

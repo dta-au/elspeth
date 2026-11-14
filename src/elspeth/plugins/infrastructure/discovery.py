@@ -15,11 +15,14 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Import roots that ship ONLY in optional extras. A plugin file that fails to
+# import one of these is skipped with a warning. Anything that is a core
+# [project] dependency (chromadb, bs4, html2text, ...) must NOT be listed: a
+# missing core dependency is a broken installation and has to crash rather
+# than silently drop plugins from the catalog (see pyproject.toml's core
+# dependency comment). jinja2 ships only in the [llm]/[azure]/[aws] extras.
 OPTIONAL_PLUGIN_IMPORT_MODULES: frozenset[str] = frozenset(
     {
-        "bs4",
-        "chromadb",
-        "html2text",
         "jinja2",
     }
 )
@@ -88,7 +91,7 @@ def discover_plugins_in_directory(
 
         # Plugin code is SYSTEM-OWNED, not user-provided.
         # Most import errors indicate bugs in our code — crash immediately.
-        # ImportError from a missing optional extra (e.g., chromadb for [rag])
+        # ImportError from a missing optional extra (e.g., jinja2 for [llm])
         # is expected when not all extras are installed — skip with a warning.
         try:
             plugins = _discover_in_file(py_file, base_class)

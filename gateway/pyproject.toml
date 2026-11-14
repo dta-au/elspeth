@@ -2,7 +2,7 @@
 name = "elspeth-llm-gateway"
 version = "0.1.0"
 description = "ELSPETH LLM compatibility gateway: strict OpenAI Chat subset over custom agency invoke APIs"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 dependencies = [
     "certifi>=2026.10.19",  # Remove emSign trust roots affected by GHSA-6q48-6c7w-9gw2
     "fastapi>=0.115,<1",

@@ -14,6 +14,7 @@ variables, not hardcoded in configuration files.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal, Self, cast
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -54,7 +55,9 @@ class AzureAuthConfig(BaseModel):
         account_url: "https://mystorageaccount.blob.core.windows.net"
     """
 
-    model_config = {"extra": "forbid"}
+    # hide_input_in_errors: a refused value can carry a credential (a pasted
+    # SAS URL in account_url), so validation errors never echo the input.
+    model_config = {"extra": "forbid", "hide_input_in_errors": True}
 
     auth_mode: AzureAuthMethod | None = Field(
         default=None,
@@ -83,9 +86,22 @@ class AzureAuthConfig(BaseModel):
 
         SAS tokens are appended to the URL and bearer tokens are sent as headers —
         both would be transmitted in cleartext over HTTP.
+
+        A query string or fragment is refused: the portal's "Blob service SAS
+        URL" is the account URL plus ``?sv=...&sig=...``, and accepting it here
+        would carry the signature in a field that is not ``repr=False`` and
+        would be concatenated with ``sas_token`` into a malformed ``?..?..``
+        URL. The message names no part of the rejected value.
         """
         if v is not None and v.strip():
-            return validate_credential_safe_https_url(v, field_name="account_url")
+            safe_url = validate_credential_safe_https_url(v, field_name="account_url")
+            parsed = urlparse(safe_url)
+            if parsed.query or parsed.fragment or "?" in safe_url or "#" in safe_url:
+                raise ValueError(
+                    "account_url must be the bare storage account URL with no query string or fragment; "
+                    "put a SAS token in sas_token instead"
+                )
+            return safe_url
         return v
 
     @model_validator(mode="after")
@@ -240,6 +256,23 @@ class AzureAuthConfig(BaseModel):
                 client_secret=client_secret,
             )
             return BlobServiceClient(account_url, credential=sp_credential)
+
+    def close_blob_service_client(self, service_client: BlobServiceClient) -> None:
+        """Close a client from ``create_blob_service_client`` and the credential it created.
+
+        Clients derived with ``get_container_client`` / ``get_blob_client``
+        share the parent's transport through ``TransportWrapper``, whose
+        ``close()`` is a no-op, so only closing the service client releases
+        the HTTP session. ``BlobServiceClient.close()`` does not close its
+        credential, so the managed-identity / service-principal credential
+        this config constructed is closed here too, even when the transport
+        close raises.
+        """
+        try:
+            service_client.close()
+        finally:
+            if self.auth_method in ("managed_identity", "service_principal"):
+                service_client.credential.close()
 
     def _is_set(self, value: str | None) -> bool:
         """Check if a string field is non-empty after stripping whitespace.

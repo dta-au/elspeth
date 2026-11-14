@@ -22,9 +22,9 @@ Order of operations:
   3. Re-run ``test_baseline_capture_is_self_consistent`` to prove the fixture now matches.
 
 Requirements:
-  * Python 3.13 — baselines are interpreter-version-specific (see the test's skipif).
+  * Python 3.14 — baselines are interpreter-version-specific (see the test's skipif).
   * ``ELSPETH_JUDGE_METADATA_HMAC_KEY`` in the environment.
-  * Run from a checkout whose ``.venv`` is the canonical 3.13 venv (the capture shells
+  * Run from a checkout whose ``.venv`` is the canonical 3.14 venv (the capture shells
     out to ``.venv/bin/python``, mirroring CI and the test).
 
 Usage:
@@ -76,10 +76,10 @@ def _fail(message: str) -> NoReturn:
 
 
 def _check_preconditions() -> None:
-    if sys.version_info[:2] != (3, 13):
+    if sys.version_info[:2] != (3, 14):
         _fail(
-            f"baselines are Python-3.13-specific; this interpreter is "
-            f"{sys.version_info.major}.{sys.version_info.minor}. Run under the 3.13 venv."
+            f"baselines are Python-3.14-specific; this interpreter is "
+            f"{sys.version_info.major}.{sys.version_info.minor}. Run under the 3.14 venv."
         )
     if not VENV_PYTHON.exists():
         _fail(f"expected canonical venv interpreter at {VENV_PYTHON} (the capture shells out to it).")

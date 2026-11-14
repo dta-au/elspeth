@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import hashlib
+import threading
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Self
 
-from pydantic import ConfigDict, Field, field_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from elspeth.contracts import Determinism, RunMode
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
-from elspeth.contracts.errors import FrameworkBugError, TransformErrorCategory
+from elspeth.contracts.errors import FrameworkBugError, PluginRetryableError, TransformErrorCategory
 from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
@@ -20,11 +22,13 @@ from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.transforms.aws.guardrail_profiles import (
     check_bedrock_local_requirements,
+    validate_guardrail_arn_binding,
     validate_guardrail_identifier,
     validate_guardrail_region,
     validate_guardrail_version,
 )
 from elspeth.plugins.transforms.aws.guardrails_client import (
+    MAX_REQUEST_TEXT_CHARS,
     BedrockGuardrailsClient,
     GuardrailPartialCoverageError,
     GuardrailResponseError,
@@ -34,6 +38,14 @@ from elspeth.plugins.transforms.aws.guardrails_client import (
 )
 from elspeth.plugins.transforms.aws.replay_sdk import DeferredAWSClient, ReplayOnlySDK
 from elspeth.plugins.transforms.safety_utils import validate_fields_not_empty
+
+# Default row-scoped budget for STARTING field calls (config: row_deadline_seconds).
+# One ApplyGuardrail call is bounded by botocore at about 3 x (5 s connect + 15 s
+# read) plus backoff, so a degraded endpoint costs ~1 min per field; without a
+# bound a 32-field row could hold the engine's row thread for ~30 min. Fields left
+# unscanned at the deadline fail the row closed as retry_timeout /
+# row_deadline_exceeded (as azure/base.py does).
+GUARDRAIL_ROW_DEADLINE_SECONDS = 300
 
 
 class BedrockGuardrailTransformConfig(TransformDataConfig):
@@ -60,6 +72,14 @@ class BedrockGuardrailTransformConfig(TransformDataConfig):
         max_length=32,
         description="Input row fields whose text is evaluated by the Guardrail.",
     )
+    row_deadline_seconds: int = Field(
+        GUARDRAIL_ROW_DEADLINE_SECONDS,
+        gt=0,
+        description=(
+            "Seconds after a row starts within which each further field call must start; "
+            "fields left unscanned at the deadline fail the row as row_deadline_exceeded."
+        ),
+    )
 
     @field_validator("guardrail_identifier")
     @classmethod
@@ -85,6 +105,11 @@ class BedrockGuardrailTransformConfig(TransformDataConfig):
         if any(len(field) > 256 for field in value):
             raise ValueError("field names must contain at most 256 characters")
         return value
+
+    @model_validator(mode="after")
+    def _arn_binding(self) -> Self:
+        validate_guardrail_arn_binding(self.guardrail_identifier, region=self.region)
+        return self
 
 
 class BedrockGuardrailTransformBase(BaseTransform, ABC):
@@ -120,6 +145,9 @@ class BedrockGuardrailTransformBase(BaseTransform, ABC):
         self._run_id = ""
         self._telemetry_emit: Callable[[TelemetryEvent], None] = lambda _event: None
         self._sdk_client: Any | None = None
+        self._row_deadline_seconds = cfg.row_deadline_seconds
+        self._monotonic: Callable[[], float] = time.monotonic
+        self._shutdown = threading.Event()
 
     @property
     @abstractmethod
@@ -140,6 +168,8 @@ class BedrockGuardrailTransformBase(BaseTransform, ABC):
             self._sdk_client = build_bedrock_runtime_client(self._region)
 
     def close(self) -> None:
+        # Stop any row still in its field loop before the next call starts.
+        self._shutdown.set()
         sdk_client = self._sdk_client
         self._sdk_client = None
         if sdk_client is not None:
@@ -229,6 +259,12 @@ class BedrockGuardrailTransformBase(BaseTransform, ABC):
             call_mode_session=ctx.call_mode_session,
         )
 
+        row_started_at = self._monotonic()
+        row_deadline = row_started_at + self._row_deadline_seconds
+        # Validate every configured field before the first Bedrock call, as
+        # azure/base.py does: an invalid later field must not let an earlier
+        # field be sent, billed, and recorded before the row fails.
+        texts: list[tuple[str, str]] = []
         for field_name in self._fields:
             if field_name not in row:
                 return TransformResult.error({"reason": "missing_field", "field": field_name}, retryable=False)
@@ -236,6 +272,44 @@ class BedrockGuardrailTransformBase(BaseTransform, ABC):
             if type(value) is not str:
                 return TransformResult.error(
                     {"reason": "non_string_field", "field": field_name, "actual_type": type(value).__name__},
+                    retryable=False,
+                )
+            # The client refuses empty and over-long text before allocating a
+            # call; reject it here as row data so it is never reported as a
+            # Guardrail service failure with no call behind it.
+            if not value:
+                return TransformResult.error({"reason": "invalid_input", "field": field_name, "error_type": "empty_field"}, retryable=False)
+            if len(value) > MAX_REQUEST_TEXT_CHARS:
+                return TransformResult.error(
+                    {"reason": "invalid_input", "field": field_name, "error_type": "field_too_long"}, retryable=False
+                )
+            texts.append((field_name, value))
+        for field_name, value in texts:
+            # Shutdown and row-deadline checks precede every call. The deadline
+            # bounds when a call may START, not the in-flight call itself
+            # (botocore's own timeouts bound that), mirroring azure/base.py.
+            # Both end the row in an error, never a validated success.
+            if self._shutdown.is_set() or (ctx.shutdown_event is not None and ctx.shutdown_event.is_set()):
+                return TransformResult.error(
+                    {
+                        "reason": "shutdown_requested",
+                        "field": field_name,
+                        "error": "Bedrock Guardrail scan stopped because shutdown was requested",
+                        "elapsed_seconds": self._monotonic() - row_started_at,
+                        "max_seconds": self._row_deadline_seconds,
+                    },
+                    retryable=False,
+                )
+            if self._monotonic() >= row_deadline:
+                return TransformResult.error(
+                    {
+                        "reason": "retry_timeout",
+                        "field": field_name,
+                        "error": "Bedrock Guardrail row deadline passed before this field was scanned",
+                        "error_type": "row_deadline_exceeded",
+                        "elapsed_seconds": self._monotonic() - row_started_at,
+                        "max_seconds": self._row_deadline_seconds,
+                    },
                     retryable=False,
                 )
             try:
@@ -260,13 +334,29 @@ class BedrockGuardrailTransformBase(BaseTransform, ABC):
                     },
                     retryable=False,
                 )
-            except (GuardrailServiceError, GuardrailResponseError, ValueError):
+            except GuardrailResponseError:
+                # The parser refused the provider's response; a retry would get
+                # the same shape, so this is terminal for the row.
                 return TransformResult.error(
-                    {
-                        "reason": "api_call_failed",
-                        "field": field_name,
-                        "error_type": "guardrail_service_error",
-                    },
+                    {"reason": "api_call_failed", "field": field_name, "error_type": "malformed_response"},
+                    retryable=False,
+                )
+            except GuardrailServiceError as error:
+                # Only sanitized provider failures. A ValueError from the client
+                # is an internal invariant (source / required_filters ClassVars)
+                # and must crash, not become a per-row error.
+                if error.retryable:
+                    # Throttling / 5xx / transport after botocore's own retries:
+                    # hand the row to the engine's RetryManager, which re-runs
+                    # every field under a new attempt (TransformResult.error
+                    # retryable=True is not read by the engine). Without a retry
+                    # policy the engine records transient_error_no_retry.
+                    raise PluginRetryableError(
+                        f"Bedrock Guardrail service error on field {field_name!r} is retryable",
+                        retryable=True,
+                    ) from error
+                return TransformResult.error(
+                    {"reason": "api_call_failed", "field": field_name, "error_type": "service_error"},
                     retryable=False,
                 )
             if decision.detected:

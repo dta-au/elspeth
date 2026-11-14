@@ -165,6 +165,112 @@ def test_python_matrix_ci_does_not_hard_disable_xdist() -> None:
     assert "0" not in _pytest_numprocesses_values(no_coverage_run)
 
 
+def _assert_timing_workflow_contract(workflow: dict[str, Any]) -> None:
+    job = workflow["jobs"]["timing-sensitive"]
+    ordinary = workflow["jobs"]["test"]
+    assert job["needs"] == ["test"]
+    # Runs after failed ordinary shards, but never after a cancelled run. With
+    # always() the job started once the cancelled shards finished and ran for up
+    # to its 120-minute timeout, ignoring every cancel request (run 42907094408,
+    # 2026-11-10: only a force-cancel stopped it).
+    # The ${{ }} wrapper is required: a bare leading "!" is a YAML tag.
+    assert job["if"] == "${{ !cancelled() && (" + ordinary["if"] + ") }}"
+    assert job["name"] == "Timing-sensitive tests (Python ${{ matrix.python-version }})"
+    assert job["timeout-minutes"] == 120
+    assert "concurrency" not in job
+    assert job.get("continue-on-error", False) is False
+    assert job["runs-on"] == ordinary["runs-on"]
+    assert job["container"] == ordinary["container"]
+    assert job["strategy"]["fail-fast"] is False
+    assert job["strategy"]["matrix"] == {
+        "python-version": ordinary["strategy"]["matrix"]["python-version"],
+        "include": ordinary["strategy"]["matrix"]["include"],
+    }
+    for name in (
+        "Checkout code",
+        "Install uv",
+        "Use checkout-local uv cache",
+        "Install system dependencies",
+        "Set up Node.js for Python TLS browser acceptance",
+        "Use checkout-local browser cache",
+        "Install locked TLS browser prerequisites",
+        "Install dependencies",
+    ):
+        assert _step(job, name) == _step(ordinary, name), name
+    assert _step(job, "Install pinned Caddy for TLS acceptance")["run"] == _step(ordinary, "Install pinned Caddy for TLS acceptance")["run"]
+    assert job["env"] == {
+        "CI_CHECKOUT_PATH": "ci-${{ github.run_id }}-${{ github.run_attempt }}-timing-${{ matrix.python-version }}",
+        "COVERAGE_FILE": "coverage-data",
+    }
+    for covered, name in ((True, "Run timing-sensitive tests with coverage"), (False, "Run timing-sensitive tests without coverage")):
+        step = _step(job, name)
+        assert set(step) == {"name", "if", "working-directory", "run"}
+        assert step["if"] == ("matrix.coverage" if covered else "${{ !matrix.coverage }}")
+        assert step["working-directory"] == "${{ env.CI_CHECKOUT_PATH }}"
+        expected = [
+            "uv",
+            "run",
+            "python",
+            "-m",
+            "pytest",
+            "tests/",
+            "-p",
+            "scripts.ci_test_shards",
+            "--ci-partition=timing",
+            "--ci-shard-count=1",
+            "--ci-shard-index=0",
+            "--ci-shard-report=shard-manifest.json",
+            "-m",
+            "not slow and not stress and not performance and not testcontainer and not live_provider and timing_sensitive",
+        ]
+        if covered:
+            expected.extend(["--cov=src/elspeth", "--cov-report=", "--cov-fail-under=0"])
+        expected.extend(["-n", "0", "-q", "-rfE", "--junitxml=pytest-junit.xml"])
+        assert shlex.split(step["run"].replace("\\\n", " ")) == expected
+    junit = _step(job, "Upload JUnit report")
+    assert junit["if"] == "always()"
+    assert junit["with"]["name"] == "timing-junit-${{ matrix.python-version }}-attempt-${{ github.run_attempt }}"
+    assert junit["with"]["path"] == "${{ env.CI_CHECKOUT_PATH }}/pytest-junit.xml"
+    evidence = _step(job, "Upload timing coverage and selection evidence")
+    assert evidence["if"] == "always()"
+    assert evidence.get("continue-on-error", False) is False
+    assert evidence["with"] == {
+        "name": "timing-shard-${{ matrix.python-version }}-attempt-${{ github.run_attempt }}",
+        "path": "${{ env.CI_CHECKOUT_PATH }}/shard-manifest.json\n${{ env.CI_CHECKOUT_PATH }}/coverage-data\n",
+        "if-no-files-found": "error",
+        "retention-days": 7,
+    }
+
+
+def test_timing_job_is_serial_required_and_uses_the_test_environment() -> None:
+    _assert_timing_workflow_contract(_ci_workflow())
+
+
+@pytest.mark.parametrize("mutation", ["parallel", "partition", "masked", "continue", "dependency", "condition", "upload", "concurrency"])
+def test_timing_job_contract_rejects_isolation_or_evidence_regressions(mutation: str) -> None:
+    workflow = copy.deepcopy(_ci_workflow())
+    job = workflow["jobs"]["timing-sensitive"]
+    step = _step(job, "Run timing-sensitive tests with coverage")
+    if mutation == "parallel":
+        step["run"] = step["run"].replace("-n 0", "-n 2")
+    elif mutation == "partition":
+        step["run"] = step["run"].replace("--ci-partition=timing", "--ci-partition=ordinary")
+    elif mutation == "masked":
+        step["run"] += "\ntrue\n"
+    elif mutation == "continue":
+        step["continue-on-error"] = True
+    elif mutation == "dependency":
+        job["needs"] = []
+    elif mutation == "condition":
+        job["if"] = _ci_workflow()["jobs"]["test"]["if"]
+    elif mutation == "upload":
+        _step(job, "Upload timing coverage and selection evidence")["if"] = "success()"
+    elif mutation == "concurrency":
+        job["concurrency"] = "timing-tests"
+    with pytest.raises(AssertionError):
+        _assert_timing_workflow_contract(workflow)
+
+
 def test_integration_lane_caps_xdist_workers_explicitly() -> None:
     """An explicit cap prevents integration from inheriting the project worker default."""
     workflow = _ci_workflow()
@@ -524,7 +630,7 @@ def test_judge_aggregate_still_requires_successful_override_rate(result: str) ->
     assert completed.returncode == (0 if result == "success" else 1), completed.stdout + completed.stderr
 
 
-@pytest.mark.parametrize("job_name", ["test", "integration"])
+@pytest.mark.parametrize("job_name", ["test", "integration", "timing-sensitive"])
 def test_pytest_container_jobs_raise_the_open_file_limit(job_name: str) -> None:
     """Docker 29 starts the runners' containers with a soft nofile of 1024, which
     one xdist worker exhausted mid-suite (run 36526535297: `Too many open
@@ -812,11 +918,12 @@ def test_three_case_commands_cannot_mask_supervisor_failure(step_name: str, muta
     ],
 )
 @pytest.mark.parametrize("proof_result", ["success", "failure", "cancelled", "skipped", "timed_out", ""])
-def test_active_native_proof_result_remains_required(job_name: str, step_name: str, proof_result: str) -> None:
+@pytest.mark.parametrize("producer", ["landscape-proof", "timing-sensitive"])
+def test_active_native_proof_result_remains_required(job_name: str, step_name: str, proof_result: str, producer: str) -> None:
     job = _ci_workflow()["jobs"][job_name]
-    assert "landscape-proof" in job["needs"]
+    assert producer in job["needs"]
     run = _step_run(job, step_name)
-    assert "${{ needs.landscape-proof.result }}" in run
-    run = re.sub(r"\$\{\{ needs\.([\w-]+)\.result }}", lambda match: proof_result if match[1] == "landscape-proof" else "success", run)
+    assert "${{ needs." + producer + ".result }}" in run
+    run = re.sub(r"\$\{\{ needs\.([\w-]+)\.result }}", lambda match: proof_result if match[1] == producer else "success", run)
     result = subprocess.run(["bash", "-e", "-c", run], capture_output=True, text=True, check=False, timeout=5)
     assert result.returncode == (0 if proof_result == "success" else 1), result.stdout + result.stderr

@@ -946,7 +946,27 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # Power Automate: measured against the release parent of 05af04770. One arrival:
 # PowerAutomateSource._reject_candidate -> ctx.record_validation_error. The remaining
 # 286 caller identities are unchanged (no departures or moves).
-_EXPECTED_CALL_COUNT = 287
+# P2 json-csv (#40/#80): 287 -> 283. Arrived 0, moved 0, departed 4:
+# JSONSource._load_json_array -> ctx.record_validation_error #1/#2/#3 (the
+# structural quarantines now go through the existing JSONSource._record_parse_error
+# caller so each records the row it yields), and CSVSource.load ->
+# ctx.record_validation_error #2 (the text-mode and in-reader decode handlers merge
+# into one now that decoding is strict and line-attributed). Measured by
+# scripts/fencing_inventory.py --baseline against a git archive of 08cc09dc.
+# P3 dataverse-chroma (#75): 283 -> 284. Arrived 1, departed 0:
+# ChromaSearchProvider._record_operation_error -> self._execution.record_operation_call#1
+# (a failed readiness count / client initialisation now leaves an ERROR Call row
+# for its allocated operation call index). The search() initialisation-failure
+# path reuses the existing _record_error caller. Measured by this gate's scanner
+# on the lane tree against the base 10d56017 (283/87f23b4e…).
+# P3 cloud-blob (#19): 284 -> 285. Arrived 1, departed 0, moved 0:
+# AzureBlobSource._load_csv._quarantine_undecodable_file -> ctx.record_validation_error
+# (the file-level decode quarantine, now shared by the strict-decode fallback and an
+# undecodable header record). _load_csv keeps six callers: the old inline file-level
+# site left and the per-record undecodable-bytes quarantine arrived in its place.
+# Arrival measured on the lane against 10d56017; merged with the dataverse-chroma
+# landing 20584836, scripts/fencing_inventory.py reports live 285 and digest below.
+_EXPECTED_CALL_COUNT = 285
 # Release integration retains the ACA callers and the Dataverse lifecycle
 # wrapper: six validation writes move from load() to _load_rows().
 # AGG-ERROR-EDGE: 0b7a9382… -> d82c45a5…, the one caller added above.
@@ -963,7 +983,13 @@ _EXPECTED_CALL_COUNT = 287
 # a00408f8… (the arrival and departures named at _EXPECTED_CALL_COUNT).
 # QR merged with release/0.8.1: 72e3db35… (release) -> the value below, the arrival
 # and departures named at _EXPECTED_CALL_COUNT.
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "584288fd1e0aae2ff9dc879b809b169e3ef5cd06c062e603d3a762d1a79da2fc"
+# P2 json-csv: 584288fd… -> 87f23b4e…, the four departures named at
+# _EXPECTED_CALL_COUNT.
+# P3 dataverse-chroma: 87f23b4e… -> 9a8cb7c5…, the one arrival named at
+# _EXPECTED_CALL_COUNT.
+# P3 cloud-blob (#19): 9a8cb7c5… -> the value below, the one arrival named at
+# _EXPECTED_CALL_COUNT.
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "9b4ad47309d8766f7769c2787f0bae58ca9fdcf35aaeabb2b95820b8f6f59fe9"
 # C4 (recorded FAILED verdict): 138 -> 143, d3b83b4c… -> the value below. Arrived:
 # ExecutionRepository.complete_aggregation_failure -> insert_batch_transform_errors_on,
 # -> NodeStateRepository.record_routing_event_on, -> NodeStateRepository.complete_node_state_on,
@@ -5820,7 +5846,7 @@ _reserve_CANCEL_ROUTE_PATH = "src/elspeth/web/sessions/routes/composer/operation
 _reserve_CANCEL_ROUTE_SHA256 = "084791796bc88481d879d0a09b7ab43e8f483c378d56cff6bc46d9e075c8a4e6"
 _reserve_CANCEL_CONSUMERS = {
     "src/elspeth/web/composer_watch_reads.py": "099b7e92f3617d5d9f39b479c1f21f229375e24e20208d294c822d7099cf6e3f",
-    "src/elspeth/web/sessions/composer_turn.py": "ba2337366bfdc9f6c4181a85e8dcf0dc1d3048b405de3855c882d178e96dda52",
+    "src/elspeth/web/sessions/composer_turn.py": "cfc7cf22db60d8c2a430ca5ae96f1c6d6860388bc56319fe788c62493cc1d311",
     "src/elspeth/web/sessions/composer_async_worker.py": "863285bd0bc2ffb3c7002738834c09e892b479b2b11dd3dff062fe91ea905a2a",
 }
 
@@ -9448,7 +9474,7 @@ def _reserve_exception_registration_effect(units, app_uses):
             for statement in registrar.body[1:]
         )
         or hashlib.sha256(stable_ast_dump(registrar).encode("utf-8")).hexdigest()
-        != "5e18486157f3fbe44e927af08a3aa913ced6e8af39cc2aa98872be61ac7e6967"
+        != "0393632015d4152dfdbc6e3b22badbda6a4ce23cd77f1f9b3f2924a280645762"
     ):
         return ["application exception registration has unreviewed source-visible effects"], None
     imports = [
@@ -14361,9 +14387,11 @@ def _raw_attribute_collector(unit: SourceUnit, units: tuple[SourceUnit, ...]) ->
 # Exact non-run initialization effect: the supplied sources bind the locked
 # callback, EMPTY-only admission, and its shared occupancy implementation.
 # These are source bindings, not permissions granted by a filename alone.
+# Landscape creation now serializes and restores SQLAlchemy's transient DDL
+# rules. The EMPTY-only admission, locked callback and stamp are unchanged.
 _NEW_LANDSCAPE_STAMP_SOURCES = {
-    "src/elspeth/web/schema_probe.py": "c0f27e271e6128ea96a4cb345f32ef4c61bbcdd338aba0a9eaaf1db34447851d",
-    "src/elspeth/core/landscape/database.py": "b8da4ed519bbe887140a0a72f040ce264fc4910724c56ca0f55065c2a89653cf",
+    "src/elspeth/web/schema_probe.py": "0e4ba641686cba00c9b459e3cc241ce686847211197c2563a4991f5a5d31c4cd",
+    "src/elspeth/core/landscape/database.py": "099a5bff4fa162b87119cadbd5fc10109938cff4d6c4d2a1e8ac2e5d3f31f1ed",
     "src/elspeth/core/schema_shape.py": "5b32f7faf09a03a7c482b48a092eb0f7cf5811eb927302ad72820fde81ceccb0",
 }
 
@@ -16003,7 +16031,15 @@ _REVIEWED_REGISTRY_MODULES = {
     # changes refusal guidance. Deadline/journal installation order is retained.
     # Durable quota recovery adds calls.returned_model to required columns;
     # engine construction and deadline/journal guard ordering are unchanged.
-    "src/elspeth/core/landscape/database.py": "f95f6b921824bb82b58cc754fa86f6c3a46687d892ff810879b5abbb864ce246",
+    # f95f6b92… -> the value below (f9c23c59c): the three metadata.create_all
+    # calls go through the new module helper _create_landscape_tables, which
+    # holds a module lock and restores SQLAlchemy's transient constraint
+    # _create_rule values. That commit re-pinned _NEW_LANDSCAPE_STAMP_SOURCES
+    # but not this digest. The diff is the helper, its lock and the three call
+    # sites: all three install_deadline_guard calls, journal attachment before
+    # the guard, and guard installation before table creation are unchanged,
+    # and nothing in the journal, guard or clock modules calls the helper.
+    "src/elspeth/core/landscape/database.py": "032c18d341b47fc96ea110e88b222201ea98ab12754cc1527220e71c2b2c661f",
 }
 
 
@@ -21465,6 +21501,8 @@ def _new_landscape_stamp_control_call(unit: SourceUnit) -> ast.Call:
             "return LandscapeSchemaShape.EMPTY if database_target_is_empty(bind) else LandscapeSchemaShape.DIVERGENT",
             "return LandscapeSchemaShape.EMPTY",
         ),
+        ("src/elspeth/core/landscape/database.py", "with _LANDSCAPE_METADATA_CREATE_LOCK:", "if True:"),
+        ("src/elspeth/core/landscape/database.py", "constraint._create_rule = rule", "constraint._create_rule = None"),
         ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA application_id").scalar_one() == 0', "and True"),
         ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA user_version").scalar_one() == 0', "and True"),
     ],

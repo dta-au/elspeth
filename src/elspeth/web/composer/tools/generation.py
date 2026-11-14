@@ -11,7 +11,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Final, Literal, TypedDict, final
+from typing import Any, Final, Literal, TypedDict, assert_never, final
 from uuid import UUID
 
 from opentelemetry import metrics
@@ -24,7 +24,7 @@ from elspeth.contracts.schema import FieldDefinition, get_aggregation_contract_o
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.contracts.value_source import get_catalog_values
-from elspeth.core.expression_parser import ExpressionEvaluationError, ExpressionParser
+from elspeth.core.expression_parser import ExpressionEvaluationError, ExpressionEvaluationKind, ExpressionParser
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.manager import (
     get_shared_plugin_manager,
@@ -458,8 +458,8 @@ _LEGACY_PLUGIN_UNAVAILABLE_REASONS: Final = (
 _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"diff_baseline_unavailable|No baseline available",
-        "diff_pipeline has nothing to compare against: the session was created without a loaded baseline state.",
-        "Do not retry diff_pipeline in this session. Use get_pipeline_state to read the current state instead.",
+        "This surface supplied no comparison baseline; this does not establish whether saved revisions exist.",
+        "Use get_pipeline_state for the current state. Request a diff again when this surface supplies its comparison baseline.",
     ),
     (
         r"No source configured",
@@ -1807,6 +1807,17 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "requirements. Use user-uploaded content only through a supported inline-reference surface; do not change blob provenance.",
     ),
     DirectValidationGuidance(
+        "file_inject_content_not_uploaded",
+        "In the composer, file_inject content must be a file the user uploaded: anything else is refused for this "
+        "plugin, and so is default_content. The candidate was not applied.",
+        "Tell the user to save the text as a file and upload it. Once it is uploaded, find it with list_blobs / "
+        "get_blob_metadata and attach it: for an entry that already exists, wire_blob_inline_ref at "
+        "node:<node_id>.options.files.<entry_name>.content; when the call creates the node or the entry, set that "
+        'entry\'s content to {"blob_ref": "<blob_id>", "mode": "inline_content", "sha256": "<content_hash>"} with the '
+        "blob's id and content_hash. Instead of default_content use on_miss: null or on_miss: fail and handle the "
+        "miss downstream. An entry name must start with a letter or '_' and contain only letters, digits, '_' and '-'.",
+    ),
+    DirectValidationGuidance(
         "llm_retry_budget_policy",
         "A sequential multi-query LLM transform must use a bounded local capacity-retry budget allowed by Web policy.",
         "Keep the intended queries and set max_capacity_retry_seconds to a positive value no greater than 30 seconds, "
@@ -2199,10 +2210,19 @@ def _execute_explain_validation_error(
             updated_state=state,
             validation=validation,
             affected_nodes=(),
-            data={"error_text": error_text, "explanation": explanation, "suggested_fix": fix},
+            data={"error_text": error_text, "error_code": error_text, "explanation": explanation, "suggested_fix": fix},
         )
-    for pattern, explanation, fix in _VALIDATION_ERROR_PATTERNS:
+    for record in _VALIDATION_ERROR_PATTERNS:
+        pattern, explanation, fix = record
         if re.search(pattern, error_text):
+            # A legacy regex owns only the codes bound to this exact record by
+            # the catalogue. Shared prose is not identity, and another code in
+            # the input must not override the first matching regex's diagnosis.
+            codes = [code for code, guidance in _VALIDATION_GUIDANCE_BY_CODE.items() if guidance is record]
+            matched_code = next(
+                (code for code in codes if code.lower() in error_text.lower()),
+                codes[0] if len(codes) == 1 else None,
+            )
             return ToolResult(
                 success=True,
                 updated_state=state,
@@ -2210,6 +2230,7 @@ def _execute_explain_validation_error(
                 affected_nodes=(),
                 data={
                     "error_text": error_text,
+                    **({"error_code": matched_code} if matched_code is not None else {}),
                     "explanation": explanation,
                     "suggested_fix": _augment_with_expected_hint(fix, error_text),
                 },
@@ -2965,15 +2986,60 @@ def _source_schema_mode(source: SourceSpec) -> str | None:
     return mode.strip().lower()
 
 
-def _sample_csv_rows(content: bytes, *, filename: str, max_rows: int = 100) -> tuple[dict[str, str], ...]:
-    text = content[: 8 * 1024].decode("utf-8", errors="replace")
+def _csv_record_is_terminated(record_text: str, record: list[str], *, delimiter: str) -> bool:
+    """Whether ``record_text`` (the final record of a cut prefix) is a whole record.
+
+    A trailing newline can still belong to an open quoted field. Re-parsing the
+    record with one more newline appended leaves it unchanged only when the
+    record really ended at that newline (the same test ``source_inspection``
+    applies to its sample tail). Works on structure only; no value is inspected.
+    """
+    if not record_text.endswith(("\r", "\n")):
+        return False
+    return next(csv.reader(io.StringIO(record_text + "\n", newline=""), delimiter=delimiter)) == record
+
+
+def _sample_csv_rows(
+    content: bytes,
+    *,
+    filename: str,
+    total_size_bytes: int,
+    max_rows: int = 100,
+) -> tuple[dict[str, str], ...]:
+    """Bounded rows from the head of an observed CSV, never including a cut record.
+
+    ``content`` is a prefix of a blob of ``total_size_bytes``. When the byte cut
+    (``len(sample) < total_size_bytes``) lands inside a record, that record
+    lacks its trailing fields, and a correct gate condition would fail on it.
+    It is therefore excluded; a blob that was not cut keeps its final record
+    even without a terminator. A prefix too short to hold a complete header
+    yields no rows.
+    """
+    sample = content[: 8 * 1024]
+    cut = total_size_bytes > len(sample)
+    text = sample.decode("utf-8", errors="replace")
     delimiter = "\t" if filename.lower().endswith(".tsv") else ","
-    reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
+    stream = io.StringIO(text, newline="")
+    reader = csv.reader(stream, delimiter=delimiter)
+    header: list[str] | None = None
     rows: list[dict[str, str]] = []
-    for index, row in enumerate(reader):
-        if index >= max_rows:
+    record_start = 0
+    for record in reader:
+        record_end = stream.tell()
+        record_text = text[record_start:record_end]
+        record_start = record_end
+        if cut and record_end == len(text) and not _csv_record_is_terminated(record_text, record, delimiter=delimiter):
             break
-        rows.append({key: value for key, value in row.items() if type(key) is str and value is not None})
+        if header is None:
+            header = record
+            continue
+        if not record:
+            continue
+        if len(rows) >= max_rows:
+            break
+        # Short rows lack their trailing keys and extra values have no key, as
+        # with ``csv.DictReader``'s defaults.
+        rows.append(dict(zip(header, record, strict=False)))
     return tuple(rows)
 
 
@@ -3012,6 +3078,7 @@ def _gate_expression_type_diagnostics_for_observed_csv(
     blob_id: str,
     filename: str,
     content: bytes,
+    total_size_bytes: int,
 ) -> list[Mapping[str, Any]]:
     """Evaluate provably field-preserving source-fed gates against sampled rows.
 
@@ -3025,7 +3092,7 @@ def _gate_expression_type_diagnostics_for_observed_csv(
     if _source_schema_mode(source) != "observed":
         return []
 
-    rows = _sample_csv_rows(content, filename=filename)
+    rows = _sample_csv_rows(content, filename=filename, total_size_bytes=total_size_bytes)
     if not rows:
         return []
 
@@ -3084,21 +3151,25 @@ def _gate_expression_type_diagnostics_for_observed_csv(
         for row_index, row in enumerate(rows):
             try:
                 parser.evaluate(row)
-            except ExpressionEvaluationError:
+            except ExpressionEvaluationError as exc:
+                # Names this condition reads that the failing row does not
+                # carry: names only, no value. Tells a misspelt (or short-row)
+                # ``row.get('typo')`` from a real string-vs-number mismatch.
+                absent_fields = tuple(name for name in fields if name not in row)
+                message, suggested_repair = _gate_evaluation_failure_text(
+                    exc.kind,
+                    node_id=node.id,
+                    condition=condition,
+                    # Only a single-field condition can name the field to type;
+                    # with several, ``fields[0]`` may be a string-compared one.
+                    field=field if len(fields) == 1 else None,
+                    absent_fields=absent_fields,
+                )
                 diagnostics.append(
                     _blocking_diagnostic(
                         code="gate_expression_type_mismatch_against_source_schema",
-                        message=(
-                            f"Gate '{node.id}' condition {condition!r} fails against sampled observed CSV "
-                            "rows before runtime. Observed CSV source values are strings unless the "
-                            "source schema declares explicit field types. (The raw evaluation error is "
-                            "withheld: it can quote sampled row values and the observed field/key set.)"
-                        ),
-                        suggested_repair=(
-                            "Patch the source schema to declare the compared field with an explicit numeric "
-                            "type, for example schema.mode='fixed' or 'flexible' with schema.fields including "
-                            f"{field + ': int' if field is not None else '<field>: int'}, then re-run preview_pipeline."
-                        ),
+                        message=message,
+                        suggested_repair=suggested_repair,
                         evidence_locator={
                             "source": "blob",
                             "blob_id": str(blob_id),
@@ -3141,6 +3212,129 @@ def _gate_expression_type_diagnostics_for_observed_csv(
                 )
                 break
     return diagnostics
+
+
+_GATE_EVALUATION_WITHHELD_NOTE: Final[str] = (
+    "(The raw evaluation error is withheld: it can quote sampled row values and the observed field/key set.)"
+)
+
+
+def _gate_evaluation_failure_text(
+    kind: ExpressionEvaluationKind,
+    *,
+    node_id: str,
+    condition: str,
+    field: str | None,
+    absent_fields: tuple[str, ...],
+) -> tuple[str, str]:
+    """Value-free ``(message, suggested_repair)`` for a gate that failed on sampled rows.
+
+    Dispatches on the closed ``ExpressionEvaluationKind`` so the text names the
+    actual cause: only ``incompatible_types`` can be the observed-CSV
+    string-typing problem that the numeric-field-type repair fixes. Every other
+    kind would be mis-repaired by it (a misspelt field name is not cured by
+    declaring a type).
+
+    ``absent_fields`` are the field names the condition reads (operator-authored
+    text, already quoted in the condition) that the failing sampled row does
+    not carry. It
+    separates, without any row value, a ``row.get()`` of a misspelt name (the
+    ``None`` it yields cannot be compared, so the evaluator reports
+    ``incompatible_types``) from a genuine string-vs-number mismatch; when it is
+    non-empty the typing repair is offered only after the name check.
+
+    Only ``kind`` and those names are used — never the evaluator text, which
+    can quote row values and the observed key set.
+    """
+    subject = f"Gate '{node_id}' condition {condition!r}"
+    match kind:
+        case "incompatible_types":
+            if absent_fields:
+                names = ", ".join(repr(name) for name in absent_fields)
+                return (
+                    f"{subject} fails against sampled observed CSV rows before runtime. It reads {names}, which the "
+                    "sampled row it failed on does not carry; row.get() of an absent field yields None, and None "
+                    "cannot be compared, so a misspelt field name is reported as a type failure. Otherwise observed CSV source values "
+                    f"are strings unless the source schema declares explicit field types. {_GATE_EVALUATION_WITHHELD_NOTE}",
+                    f"First compare {names} with the source's observed field names (call inspect_source) and "
+                    "correct a misspelt name in the gate condition. This check keys each sampled row by the file's raw "
+                    "header spelling, while the runtime row keys are the normalized names (runtime_headers); if the "
+                    "condition already uses a runtime name, tell the user the preview cannot judge it rather than "
+                    "renaming it to the raw spelling. If the names are right and the sampled row is merely short, "
+                    "guard the read, for example row.get('<field>') is not None and <condition>. Only if the "
+                    "names are right, the rows are complete and the field is "
+                    "meant to be numeric, patch the source schema to declare it with an explicit numeric type, for "
+                    "example schema.mode='fixed' or 'flexible' with schema.fields including <field>: int, then "
+                    "re-run preview_pipeline.",
+                )
+            return (
+                f"{subject} fails against sampled observed CSV rows before runtime. Observed CSV "
+                "source values are strings unless the source schema declares explicit field types. "
+                f"{_GATE_EVALUATION_WITHHELD_NOTE}",
+                "Patch the source schema to declare the compared field with an explicit numeric "
+                "type, for example schema.mode='fixed' or 'flexible' with schema.fields including "
+                f"{field + ': int' if field is not None else '<field>: int'}, then re-run preview_pipeline. "
+                "If the field is meant to stay text, the incompatibility is elsewhere in the condition: check "
+                "the operand and argument types of each comparison, function call and index in it, and correct "
+                "the one that mixes types.",
+            )
+        case "missing_key":
+            return (
+                f"{subject} reads a field that a sampled observed CSV row does not carry. Either the name is not "
+                "a column of the source, or that row is shorter than the header, or the name is a normalized "
+                "runtime name (this check keys each sampled row by the file's raw header spelling); the check "
+                f"covers only the first rows of the file. It is not a field-typing mismatch. {_GATE_EVALUATION_WITHHELD_NOTE}",
+                "Compare every field name the condition reads with the source's observed field names "
+                "(call inspect_source) and correct a misspelt name in the gate condition or the source "
+                "column mapping. If the names are right, some data rows are short: fix the source data or guard "
+                "the read, for example row.get('<field>') is not None and <condition>, then re-run preview_pipeline. "
+                "If the condition already uses a runtime name from runtime_headers, the preview cannot judge it: "
+                "do not rename it to the raw spelling, and tell the user the preview check is blocking a name "
+                "that is correct at runtime.",
+            )
+        case "index_out_of_range":
+            return (
+                f"{subject} indexes past the end of a sequence value in the sampled rows. This is not a "
+                f"field-typing mismatch. {_GATE_EVALUATION_WITHHELD_NOTE}",
+                "Guard the index (check the length first) or use an index that exists in every sampled row, then re-run preview_pipeline.",
+            )
+        case "division_by_zero":
+            return (
+                f"{subject} divides by zero for a sampled row. This is not a field-typing mismatch. {_GATE_EVALUATION_WITHHELD_NOTE}",
+                "Guard the divisor in the gate condition (for example require it to be non-zero before "
+                "dividing), then re-run preview_pipeline.",
+            )
+        case "arithmetic_overflow":
+            return (
+                f"{subject} produced a number too large to represent during arithmetic. This is not a "
+                f"field-typing mismatch. {_GATE_EVALUATION_WITHHELD_NOTE}",
+                "Remove or shrink very large literals in the arithmetic, or compare the operands "
+                "directly instead of computing with them, then re-run preview_pipeline.",
+            )
+        case "invalid_value":
+            return (
+                f"{subject} passed a sampled or literal value that a function in the condition cannot accept "
+                f"(an invalid value, not a wrong declared type). {_GATE_EVALUATION_WITHHELD_NOTE}",
+                "Check the arguments of the function call: for example decimal_within requires a "
+                "non-negative tolerance and finite numbers. Correct the literal arguments or compare "
+                "directly instead, then re-run preview_pipeline.",
+            )
+        case "non_finite_result":
+            return (
+                f"{subject} produced a non-finite result (NaN or infinity) for a sampled row. This is "
+                f"not a field-typing mismatch. {_GATE_EVALUATION_WITHHELD_NOTE}",
+                "Rework the arithmetic so it cannot yield NaN or infinity (guard the operands), then re-run preview_pipeline.",
+            )
+        case "unexpected_error":
+            return (
+                f"{subject} failed with an unexpected evaluation error against sampled observed CSV "
+                "rows (this includes resource failures such as memory exhaustion). It is not a "
+                f"field-typing mismatch. {_GATE_EVALUATION_WITHHELD_NOTE}",
+                "Simplify the gate condition so it uses plain comparisons over the fields it needs and "
+                "does not build large intermediate values, then re-run preview_pipeline.",
+            )
+        case _:
+            assert_never(kind)
 
 
 _NUMERIC_VALUE_FIELD_AGGREGATION_PLUGINS: Final[frozenset[str]] = frozenset(
@@ -3876,7 +4070,12 @@ def _compute_proof_diagnostics_for_source(
                     code="source_inspection_failed",
                     message="Configured JSON source inspection failed; source options cannot support runtime record selection and field resolution.",
                     suggested_repair="Correct JSON format, data_key, encoding, field_mapping and schema options using get_plugin_schema, then preview again.",
-                    evidence_locator={"blob_id": str(blob_id), "source_plugin": source.plugin, "error_class": type(exc).__name__},
+                    evidence_locator={
+                        "source": "blob",
+                        "blob_id": str(blob_id),
+                        "source_plugin": source.plugin,
+                        "error_class": type(exc).__name__,
+                    },
                 )
             )
             return diagnostics
@@ -4039,6 +4238,7 @@ def _compute_proof_diagnostics_for_source(
                                 ),
                                 suggested_repair="Declare the carried JSON fields or use schema.mode='flexible', then preview again.",
                                 evidence_locator={
+                                    "source": "blob",
                                     "blob_id": str(blob_id),
                                     "selected_record_count": len(extra_rows),
                                     "all_rows_inspected": True,
@@ -4051,6 +4251,7 @@ def _compute_proof_diagnostics_for_source(
                                 "message": "Some sampled JSON records contain undeclared fields and will be discarded; the sample does not prove every row will be lost.",
                                 "suggested_repair": "Inspect the configured record selection and declare its carried fields or use schema.mode='flexible'.",
                                 "evidence_locator": {
+                                    "source": "blob",
                                     "blob_id": str(blob_id),
                                     "sample_extra_record_count": len(extra_rows),
                                     "all_rows_inspected": json_inspection.all_rows_inspected,
@@ -4068,6 +4269,7 @@ def _compute_proof_diagnostics_for_source(
                 blob_id=str(blob_id),
                 filename=blob["filename"],
                 content=content,
+                total_size_bytes=total_size_bytes,
             )
         )
         diagnostics.extend(
@@ -4664,7 +4866,7 @@ def _execute_diff_pipeline(
         # current version already rides the envelope's ``version``.
         return _saved_graph_rejection_result(
             state,
-            "No baseline available. Load or create a session first.",
+            "No baseline available. This surface supplied no comparison state; saved revisions may still exist.",
             error_code="diff_baseline_unavailable",
             rejected_component=None,
         )
@@ -4684,7 +4886,7 @@ _DIFF_PIPELINE_DECLARATION = ToolDeclaration(
     response_contract=DIFF_PIPELINE_RESPONSE_CONTRACT,
     handler=_execute_diff_pipeline,
     kind=ToolKind.DISCOVERY,
-    description="Compare the current pipeline with the baseline supplied by this surface, which may be the request-start state. "
+    description="Compare with this surface's baseline (Web Composer: request-start state, fixed across provider rounds). "
     "On success `data` carries `from_version` (the baseline; the version it "
     "changed TO is the envelope's own `version`), `sources_changed`, "
     "`metadata_changed`, `total_changes`, `warnings_introduced`, "

@@ -101,6 +101,7 @@ class TestRateLimiter:
         ) as limiter:
             assert limiter.name == "test_api"
 
+    @pytest.mark.timing_sensitive
     def test_acquire_within_limit(self) -> None:
         """acquire() succeeds when under limit."""
         from elspeth.core.rate_limit import RateLimiter

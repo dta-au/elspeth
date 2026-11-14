@@ -159,6 +159,7 @@ def _make_settings(
     return WebSettings(
         data_dir=Path(data_dir),
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=discovery_turns,
         composer_timeout_seconds=composer_timeout_seconds,
         composer_rate_limit_per_minute=10,
@@ -622,6 +623,7 @@ async def test_advisor_only_turn_does_not_consume_discovery_budget() -> None:
     settings = WebSettings(
         data_dir=Path("/data"),
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=1,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
@@ -807,6 +809,7 @@ async def test_exhausted_advisor_turn_preserves_discovery_accounting_and_deadlin
     settings = WebSettings(
         data_dir=Path("/data"),
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=1,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
@@ -1624,6 +1627,7 @@ async def test_f3b_advisor_rejects_oversized_prompt() -> None:
     settings = WebSettings(
         data_dir=Path("/data"),
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
@@ -1695,6 +1699,7 @@ async def test_f3c_advisor_prompt_size_counts_formatting_overhead(prompt_tokens:
     settings = WebSettings(
         data_dir=Path("/data"),
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,

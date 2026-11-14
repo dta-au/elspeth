@@ -12,6 +12,7 @@ at parse time per canonical JSON policy. Use null for missing values.
 import codecs
 import json
 from collections.abc import Iterator, Mapping
+from itertools import groupby
 from typing import Any, Literal
 
 from pydantic import Field, JsonValue, ValidationError, field_validator, model_validator
@@ -19,15 +20,18 @@ from pydantic import Field, JsonValue, ValidationError, field_validator, model_v
 from elspeth.contracts import Determinism, PluginSchema, SourceRow
 from elspeth.contracts.contexts import SourceContext
 from elspeth.contracts.contract_builder import ContractBuilder, ContractFieldLimitExceeded
+from elspeth.contracts.json_parser import check_json_depth
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
+from elspeth.contracts.source_read_verification import MAX_JSON_DEPTH
 from elspeth.plugins.infrastructure.base import BaseSource
 from elspeth.plugins.infrastructure.config_base import (
     NormalizedFieldMappingOption,
     SourceDataConfig,
     declared_source_schema_field_names,
 )
+from elspeth.plugins.infrastructure.config_content import reject_nonfinite_constant
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,
@@ -37,25 +41,6 @@ from elspeth.plugins.sources.field_normalization import (
     normalize_field_name,
     resolve_field_names,
 )
-
-
-def _reject_nonfinite_constant(value: str) -> None:
-    """Reject non-standard JSON constants (NaN, Infinity, -Infinity).
-
-    Python's json module accepts these by default, but they violate:
-    1. RFC 8259 (JSON standard) - only allows null, true, false
-    2. Canonical JSON policy - non-finite floats crash hashing
-
-    This function is passed to json.loads/json.load via parse_constant
-    parameter to reject these values at parse time.
-
-    Args:
-        value: The constant string (NaN, Infinity, or -Infinity)
-
-    Raises:
-        ValueError: Always - these constants are not allowed
-    """
-    raise ValueError(f"Non-standard JSON constant '{value}' not allowed. Use null for missing values, not NaN/Infinity.")
 
 
 def _contains_surrogateescape_chars(value: str) -> bool:
@@ -74,6 +59,55 @@ def _surrogateescape_line_to_bytes(value: str, encoding: str) -> bytes:
         return value.encode(encoding, errors="surrogateescape")
     except UnicodeEncodeError:
         return value.encode("utf-8", errors="surrogateescape")
+
+
+BYTE_ESCAPE_ERRORS = "elspeth.source_byte_escape"
+"""Codec error-handler name that escapes every undecodable byte (see below)."""
+
+
+def _escape_undecodable_bytes(exc: UnicodeError) -> tuple[str, int]:
+    """Decode error handler: replace each undecodable byte ``b`` with U+DC00+b.
+
+    ``surrogateescape`` only escapes bytes >= 0x80 and re-raises otherwise, so
+    for UTF-16/UTF-32 an illegal code unit such as a lone surrogate
+    (``b"\\x00\\xd8"``) escapes nothing and TextIOWrapper raises for its whole
+    read-ahead chunk, dropping valid lines on both sides of the bad bytes.
+    Escaping every byte keeps the decode going, so the bad bytes stay on the
+    line that carried them. A strict decode never yields U+DC00..U+DCFF
+    (lone surrogates are invalid in every Unicode encoding), so these code
+    points mark the escaped bytes unambiguously.
+    """
+    if not isinstance(exc, UnicodeDecodeError):
+        raise exc
+    undecodable = exc.object[exc.start : exc.end]
+    return "".join(chr(0xDC00 + byte) for byte in undecodable), exc.end
+
+
+codecs.register_error(BYTE_ESCAPE_ERRORS, _escape_undecodable_bytes)
+
+
+def contains_escaped_bytes(value: str) -> bool:
+    """Return True when value carries bytes escaped by ``BYTE_ESCAPE_ERRORS``."""
+    return any(0xDC00 <= ord(char) <= 0xDCFF for char in value)
+
+
+def escaped_line_to_bytes(value: str, encoding: str) -> bytes:
+    """Rebuild the raw bytes of a line decoded with ``BYTE_ESCAPE_ERRORS``.
+
+    Escaped code points become their original byte; every other run is
+    re-encoded with ``encoding`` (it decoded from that codec, so it encodes
+    back). A BOM-writing codec (``utf-16``, ``utf-32``) prefixes its BOM, as
+    ``str.encode`` would.
+    """
+    encoder = codecs.getincrementalencoder(encoding)()
+    raw = bytearray()
+    for escaped, run in groupby(value, key=lambda char: 0xDC00 <= ord(char) <= 0xDCFF):
+        if escaped:
+            raw.extend(ord(char) - 0xDC00 for char in run)
+        else:
+            raw.extend(encoder.encode("".join(run)))
+    raw.extend(encoder.encode("", final=True))
+    return bytes(raw)
 
 
 class JSONSourceConfig(SourceDataConfig):
@@ -184,7 +218,7 @@ class JSONSource(BaseSource):
     name = "json"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:997ca99f1069c7e6"
+    source_file_hash: str | None = "sha256:c299bae1329a63c2"
     config_model = JSONSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str
@@ -215,6 +249,11 @@ class JSONSource(BaseSource):
 
         self._path = cfg.resolved_path()
         self._encoding = cfg.encoding
+        # Windows tooling commonly writes UTF-8 with a leading BOM, which
+        # json.loads rejects ('Unexpected UTF-8 BOM'). Read UTF-8 input as
+        # utf-8-sig so only a BOM at the start of the file is stripped, as
+        # the CSV source's header normalization does.
+        self._read_encoding = "utf-8-sig" if codecs.lookup(cfg.encoding).name == "utf-8" else cfg.encoding
         self._data_key = cfg.data_key
 
         # Auto-detect format from extension if not specified
@@ -307,10 +346,12 @@ class JSONSource(BaseSource):
         try:
             # Iterate in text mode so newline handling respects multibyte encodings
             # (e.g., utf-16 / utf-32) instead of splitting on raw 0x0A bytes.
-            with open(self._path, encoding=self._encoding, errors="surrogateescape", newline="") as f:
+            # BYTE_ESCAPE_ERRORS keeps an undecodable code unit on its own line
+            # for every codec; surrogateescape cannot for UTF-16/UTF-32.
+            with open(self._path, encoding=self._read_encoding, errors=BYTE_ESCAPE_ERRORS, newline="") as f:
                 for line_num, raw_line in enumerate(f, start=1):
-                    if _contains_surrogateescape_chars(raw_line):
-                        raw_bytes = _surrogateescape_line_to_bytes(raw_line, self._encoding)
+                    if contains_escaped_bytes(raw_line):
+                        raw_bytes = escaped_line_to_bytes(raw_line, self._encoding)
                         raw_row = {"__raw_bytes_hex__": raw_bytes.hex(), "__line_number__": line_num}
                         error_msg = f"JSON parse error at line {line_num}: invalid {self._encoding} encoding"
                         quarantined = self._record_parse_error(
@@ -330,7 +371,11 @@ class JSONSource(BaseSource):
                     # Catch JSON parse errors at the trust boundary
                     # parse_constant rejects NaN/Infinity at parse time (canonical JSON policy)
                     try:
-                        row = json.loads(line, parse_constant=_reject_nonfinite_constant)
+                        # Bound nesting before decoding: a deep line decodes into a
+                        # row too deep for the schema walker and audit hashing, so
+                        # it must quarantine here as its raw line.
+                        check_json_depth(line, max_depth=MAX_JSON_DEPTH)
+                        row = json.loads(line, parse_constant=reject_nonfinite_constant)
                     except (json.JSONDecodeError, ValueError) as e:
                         # External data parse failure - quarantine, don't crash
                         # Store raw line + metadata for audit traceability
@@ -348,8 +393,9 @@ class JSONSource(BaseSource):
 
                     yield from self._validate_and_yield(row, ctx, source_row_index=line_num - 1)
         except UnicodeDecodeError as e:
-            # Some codecs (notably utf-16/utf-32) can still raise on truncated byte
-            # sequences while reading. Treat as an external parse failure.
+            # A codec can still refuse the stream outright, bypassing the error
+            # handler (utf-16/utf-32 without a BOM raise at the start of the
+            # stream). Treat as an external parse failure.
             error_line = line_num + 1
             raw_row = {"file_path": str(self._path), "__line_number__": error_line}
             error_msg = f"JSON parse error at line {error_line}: invalid {self._encoding} encoding ({e})"
@@ -370,17 +416,20 @@ class JSONSource(BaseSource):
         decode is quarantined, not crash the pipeline.
         """
         try:
-            with open(self._path, encoding=self._encoding) as f:
+            with open(self._path, encoding=self._read_encoding) as f:
                 # parse_constant rejects NaN/Infinity at parse time (canonical JSON policy)
                 try:
-                    data = json.load(f, parse_constant=_reject_nonfinite_constant)
+                    # Same nesting bound as the JSONL path, over the whole file.
+                    text = f.read()
+                    check_json_depth(text, max_depth=MAX_JSON_DEPTH)
+                    data = json.loads(text, parse_constant=reject_nonfinite_constant)
                 except (json.JSONDecodeError, ValueError) as e:
                     # File-level parse error - treat as Tier 3 boundary
                     # External data can be malformed; don't crash the pipeline
                     if isinstance(e, json.JSONDecodeError):
                         error_msg = f"JSON parse error at line {e.lineno} col {e.colno}: {e.msg}"
                     else:
-                        # ValueError from _reject_nonfinite_constant (NaN/Infinity)
+                        # ValueError from reject_nonfinite_constant (NaN/Infinity)
                         error_msg = f"JSON parse error: {e}"
                     quarantined = self._record_parse_error(
                         ctx=ctx,
@@ -416,37 +465,27 @@ class JSONSource(BaseSource):
             # Check 1: Root must be a dict to use data_key
             if not isinstance(data, dict):
                 error_msg = f"Cannot extract data_key '{self._data_key}': expected JSON object, got {type(data).__name__}"
-                ctx.record_validation_error(
-                    row={"file_path": str(self._path), "data_key": self._data_key},
-                    error=error_msg,
-                    schema_mode="parse",
-                    destination=self._on_validation_failure,
+                quarantined = self._record_parse_error(
+                    ctx=ctx,
+                    row={"file_path": str(self._path), "structure_error": error_msg},
+                    error_msg=error_msg,
+                    source_row_index=0,
                 )
-                if self._on_validation_failure != "discard":
-                    yield SourceRow.quarantined(
-                        row={"file_path": str(self._path), "structure_error": error_msg},
-                        error=error_msg,
-                        destination=self._on_validation_failure,
-                        source_row_index=0,
-                    )
+                if quarantined is not None:
+                    yield quarantined
                 return
 
             # Check 2: Key must exist in the dict
             if self._data_key not in data:
                 error_msg = f"data_key '{self._data_key}' not found in JSON object. Available keys: {list(data.keys())}"
-                ctx.record_validation_error(
-                    row={"file_path": str(self._path), "data_key": self._data_key},
-                    error=error_msg,
-                    schema_mode="parse",
-                    destination=self._on_validation_failure,
+                quarantined = self._record_parse_error(
+                    ctx=ctx,
+                    row={"file_path": str(self._path), "structure_error": error_msg},
+                    error_msg=error_msg,
+                    source_row_index=0,
                 )
-                if self._on_validation_failure != "discard":
-                    yield SourceRow.quarantined(
-                        row={"file_path": str(self._path), "structure_error": error_msg},
-                        error=error_msg,
-                        destination=self._on_validation_failure,
-                        source_row_index=0,
-                    )
+                if quarantined is not None:
+                    yield quarantined
                 return
 
             data = data[self._data_key]
@@ -454,19 +493,14 @@ class JSONSource(BaseSource):
         # Check 3: Data must be a list (either root or extracted via data_key)
         if not isinstance(data, list):
             error_msg = f"Expected JSON array, got {type(data).__name__}"
-            ctx.record_validation_error(
-                row={"file_path": str(self._path)},
-                error=error_msg,
-                schema_mode="parse",
-                destination=self._on_validation_failure,
+            quarantined = self._record_parse_error(
+                ctx=ctx,
+                row={"file_path": str(self._path), "structure_error": error_msg},
+                error_msg=error_msg,
+                source_row_index=0,
             )
-            if self._on_validation_failure != "discard":
-                yield SourceRow.quarantined(
-                    row={"file_path": str(self._path), "structure_error": error_msg},
-                    error=error_msg,
-                    destination=self._on_validation_failure,
-                    source_row_index=0,
-                )
+            if quarantined is not None:
+                yield quarantined
             return
 
         for source_row_index, row in enumerate(data):

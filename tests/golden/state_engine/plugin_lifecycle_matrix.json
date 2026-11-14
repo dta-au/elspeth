@@ -150,7 +150,7 @@
         "close": "elspeth.plugins.sinks.database_sink:DatabaseSink"
       },
       "source_hash_present": true,
-      "sink_effect_capability": "contract",
+      "sink_effect_capability": "restaging",
       "sink_effect_modes": [
         "append"
       ],
@@ -792,6 +792,34 @@
       "release_lane": "live-azure"
     },
     {
+      "plugin_key": "transform:azure_content_understanding",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.azure.content_understanding",
+      "qualname": "AzureContentUnderstanding",
+      "source_path": "src/elspeth/plugins/transforms/azure/content_understanding.py",
+      "determinism": "external_call",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.transforms.azure.analyze_lro:AzureAnalyzeTransform",
+        "process": "elspeth.plugins.transforms.azure.analyze_lro:AzureAnalyzeTransform",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.azure.analyze_lro:AzureAnalyzeTransform"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": true,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "provider-contract-fake",
+      "release_lane": "live-azure"
+    },
+    {
       "plugin_key": "transform:azure_document_intelligence",
       "kind": "transform",
       "module": "elspeth.plugins.transforms.azure.document_intelligence",
@@ -800,10 +828,10 @@
       "determinism": "external_call",
       "execution_model": "row-transform",
       "lifecycle_owners": {
-        "on_start": "elspeth.plugins.transforms.azure.document_intelligence:AzureDocumentIntelligence",
-        "process": "elspeth.plugins.transforms.azure.document_intelligence:AzureDocumentIntelligence",
+        "on_start": "elspeth.plugins.transforms.azure.analyze_lro:AzureAnalyzeTransform",
+        "process": "elspeth.plugins.transforms.azure.analyze_lro:AzureAnalyzeTransform",
         "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
-        "close": "elspeth.plugins.transforms.azure.document_intelligence:AzureDocumentIntelligence"
+        "close": "elspeth.plugins.transforms.azure.analyze_lro:AzureAnalyzeTransform"
       },
       "source_hash_present": true,
       "sink_effect_capability": null,
@@ -1378,6 +1406,34 @@
         "process": "elspeth.plugins.transforms.field_mapper:FieldMapper",
         "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
         "close": "elspeth.plugins.transforms.field_mapper:FieldMapper"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:file_inject",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.file_inject",
+      "qualname": "FileInject",
+      "source_path": "src/elspeth/plugins/transforms/file_inject.py",
+      "determinism": "deterministic",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.file_inject:FileInject",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.file_inject:FileInject"
       },
       "source_hash_present": true,
       "sink_effect_capability": null,

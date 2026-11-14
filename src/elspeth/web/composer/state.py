@@ -4497,8 +4497,7 @@ def _validate_multi_query_generated_input_requirements(node: NodeSpec) -> tuple[
         if images is not None:
             required.update(name for image in images for name in (image.field, image.format_field) if name is not None)
         response_field = TypeAdapter(str).validate_python(node.options.get("response_field", "llm_response"))
-        if any(spec.structured_output_prefix is not None for spec in specs):
-            unique_query_generated_fields(tuple(specs), response_field)
+        unique_query_generated_fields(tuple(specs), response_field)
         node_template: str | None = TypeAdapter(str | None).validate_python(node.options.get("prompt_template"))
         # Every query without an override renders the one node-level template;
         # analyse each distinct effective template once, not once per query.
@@ -8292,7 +8291,8 @@ class CompositionState:
         if not any(o.name == output_name for o in self.outputs):
             return None
         outputs = tuple(o for o in self.outputs if o.name != output_name)
-        return replace(self, outputs=outputs, version=self.version + 1)
+        edges = tuple(e for e in self.edges if e.from_node != output_name and e.to_node != output_name)
+        return replace(self, outputs=outputs, edges=edges, version=self.version + 1)
 
     def with_metadata(self, patch: dict[str, Any]) -> CompositionState:
         """Update metadata fields from partial dict. Version incremented."""

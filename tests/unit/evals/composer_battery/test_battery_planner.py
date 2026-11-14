@@ -346,4 +346,5 @@ def test_vocabularies_are_live_enum_members() -> None:
     codes = {m.value for m in ComposerPlannerCode}
     assert set(pp.TRIAGE_BY_CODE) <= codes, set(pp.TRIAGE_BY_CODE) - codes
     assert pp.triage_code("DISCOVERY_NO_GAIN") == "kit_misled_discovery" and pp.triage_code("REPAIR_EXHAUSTED") == "budget"
+    assert pp.triage_code("CONTEXT_BUDGET_EXHAUSTED") == "budget"
     assert pp.triage_code("repeated_fingerprint") == "error_message_not_actionable" and pp.triage_code("DECLINED") == "other"

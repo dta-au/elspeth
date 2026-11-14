@@ -557,7 +557,7 @@ class TestDataverseSourceConfigValidation:
         with pytest.raises(PluginConfigError, match="placeholder"):
             DataverseSourceConfig.from_dict(_base_config(select=[select_field]))
 
-    @pytest.mark.parametrize("select_field", ["todo", "unknown", "unset", "required", "<literal>"])
+    @pytest.mark.parametrize("select_field", ["todo", "unknown", "unset", "required"])
     def test_plain_placeholder_words_can_be_select_fields(self, select_field: str) -> None:
         from elspeth.plugins.sources.dataverse import DataverseSourceConfig
 
@@ -1235,18 +1235,19 @@ class TestDataverseSourceLoadStructured:
             )
         )
 
-        def client_factory(*_args: Any, before_request: Callable[[str], None], **_kwargs: Any) -> _DataverseClientFake:
+        def client_factory(*_args: Any, before_request: Callable[[str, Mapping[str, str]], None], **_kwargs: Any) -> _DataverseClientFake:
             assert events == ["preflight:metadata"]
             events.append("client")
             client = _DataverseClientFake(metadata_page=metadata_page)
 
             def get_metadata(url: str) -> DataversePageResponse:
-                before_request(url)
+                before_request(url, {})
                 events.append("dispatch:metadata")
                 return metadata_page
 
-            def get_pages(url: str) -> Any:
-                before_request(url)
+            def get_pages(url: str, *, annotations: tuple[str, ...]) -> Any:
+                assert annotations == ()
+                before_request(url, {})
                 events.append("dispatch:page")
                 yield data_page
 
@@ -1310,15 +1311,16 @@ class TestDataverseSourceLoadStructured:
         lifecycle_ctx.call_mode_session = source_ctx.call_mode_session = _VerifySession()
         source_ctx.record_call = _CallRecorder(return_value=SimpleNamespace(call_index=0, call_id="current-metadata"))
 
-        def client_factory(*_args: Any, before_request: Callable[[str], None], **_kwargs: Any) -> _DataverseClientFake:
+        def client_factory(*_args: Any, before_request: Callable[[str, Mapping[str, str]], None], **_kwargs: Any) -> _DataverseClientFake:
             client = _DataverseClientFake(metadata_page=metadata_page)
 
             def get_metadata(url: str) -> DataversePageResponse:
-                before_request(url)
+                before_request(url, {})
                 return metadata_page
 
-            def get_pages(url: str) -> Any:
-                before_request(url)
+            def get_pages(url: str, *, annotations: tuple[str, ...]) -> Any:
+                assert annotations == ()
+                before_request(url, {})
                 events.append("page dispatched")
                 yield _make_page([{"contactid": "1"}])
 
@@ -1364,11 +1366,11 @@ class TestDataverseSourceLoadStructured:
         lifecycle_ctx.call_mode_session = source_ctx.call_mode_session = _VerifySession()
         source_ctx.record_call = _CallRecorder(return_value=SimpleNamespace(call_index=0, call_id="current-error"))
 
-        def client_factory(*_args: Any, before_request: Callable[[str], None], **_kwargs: Any) -> _DataverseClientFake:
+        def client_factory(*_args: Any, before_request: Callable[[str, Mapping[str, str]], None], **_kwargs: Any) -> _DataverseClientFake:
             client = _DataverseClientFake()
 
             def metadata_error(url: str) -> None:
-                before_request(url)
+                before_request(url, {})
                 raise DataverseClientError(
                     "metadata server error",
                     retryable=True,
@@ -1798,30 +1800,17 @@ class TestDataverseSourceLoadFetchXML:
         assert not rows[0].is_quarantined
 
     def test_fetchxml_missing_entity_element(self) -> None:
-        """FetchXML without <entity> element raises RuntimeError."""
-        source = _make_source_for_load(
-            [],
-            _fetchxml_config(
-                fetch_xml="<fetch><all-attributes/></fetch>",
-            ),
-        )
-        ctx = _mock_source_context()
-
-        with pytest.raises(RuntimeError, match="missing <entity> element"):
-            list(source.load(ctx))
+        """FetchXML without <entity> element is refused at config time, before any client exists."""
+        with pytest.raises(PluginConfigError, match="exactly one <entity> element"):
+            _make_source_for_load([], _fetchxml_config(fetch_xml="<fetch><all-attributes/></fetch>"))
 
     def test_fetchxml_entity_missing_name_attribute(self) -> None:
-        """FetchXML <entity> without name attribute raises RuntimeError."""
-        source = _make_source_for_load(
-            [],
-            _fetchxml_config(
-                fetch_xml="<fetch><entity><attribute name='fullname'/></entity></fetch>",
-            ),
-        )
-        ctx = _mock_source_context()
-
-        with pytest.raises(RuntimeError, match="missing 'name' attribute"):
-            list(source.load(ctx))
+        """FetchXML <entity> without name attribute is refused at config time."""
+        with pytest.raises(PluginConfigError, match="'name' attribute"):
+            _make_source_for_load(
+                [],
+                _fetchxml_config(fetch_xml="<fetch><entity><attribute name='fullname'/></entity></fetch>"),
+            )
 
     def test_fetchxml_uses_paginate_fetchxml(self) -> None:
         """FetchXML resolves its logical name and preserves the original XML."""
@@ -1924,8 +1913,10 @@ class TestDataverseSourceLoadFetchXML:
                 {"value": [], "@odata.nextLink": f"{VALID_ENV_URL}/api/data/v9.2/contacts?page=4"},
             ]
         elif guard == "fetchxml_missing_morerecords":
+            # A cookie without morerecords is contradictory; absence of both
+            # is the documented final page and is not a guard.
             config = _fetchxml_config()
-            data_bodies = [{"value": []}]
+            data_bodies = [{"value": [], "@Microsoft.Dynamics.CRM.fetchxmlpagingcookie": "<cookie />"}]
         else:
             config = _fetchxml_config()
             data_bodies = [{"value": [], "@Microsoft.Dynamics.CRM.morerecords": True}]

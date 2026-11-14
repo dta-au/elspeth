@@ -5,6 +5,45 @@ instruction. It assumes the composer performance remediation branch
 (`docs/development/composer-performance-remediation.md`) has landed on main,
 so the per-component request byte split from fix 4A is being recorded.
 
+## Design, as built
+
+The design that answers Phase 2 is
+[`docs/superpowers/specs/2026-11-09-composer-context-budget-design.md`](../superpowers/specs/2026-11-09-composer-context-budget-design.md),
+built for 0.8.13. Before each compose-loop and planner provider call (the
+escape hatch included), a pure budgeter in
+`src/elspeth/web/composer/context_budget.py` sheds context to fit two
+ceilings, records what it shed on the call record (`context_budget`), or
+refuses with `context_budget_exceeded` before any provider call. Advisor and
+review calls are not yet budgeted: they still carry the whole session
+transcript and can be rejected by the gateway for size, which leaves the
+advisor unavailable for that turn.
+
+Settings (`WebSettings`, `src/elspeth/web/config.py`):
+
+| Setting | Environment variable | Default |
+|---|---|---|
+| `composer_context_max_prompt_tokens` | `ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS` | none; required |
+| `composer_context_shed_above` | `ELSPETH_WEB__COMPOSER_CONTEXT_SHED_ABOVE` | `0.85` |
+| `composer_context_shed_to` | `ELSPETH_WEB__COMPOSER_CONTEXT_SHED_TO` | `0.60` |
+| `composer_planner_max_request_bytes` | `ELSPETH_WEB__COMPOSER_PLANNER_MAX_REQUEST_BYTES` | 960 KiB (was 2 MiB); now also bounds the compose loop |
+
+Shed order, oldest first within each: tool-result bodies from earlier round
+trips of the current turn (replaced by a fixed stub), prior assistant prose,
+escape-hatch transcript events, prior user requests. Both ceilings are judged
+on the request as sent (canonical JSON of its messages and tools, so
+tool-call arguments and thinking blocks count; they are never shed). Tokens
+are estimated from that size with a bytes-per-token ratio: the recorded
+`request_wire_bytes` over the prompt tokens of the session's newest
+successful budgeted call on the same model (failing that, on any model),
+clamped to 2.0-6.0; before the session has one the ratio is 3.0.
+
+Not done: the Phase 1 records investigation below, and its acceptance
+evidence (replaying the affected users' failing sessions through the new
+policy), were not carried out. The design bounds the four growth paths its
+spec lists instead of the one a records investigation might single out; the
+advisor's transcript is a fifth and is not bounded. No live
+provider run has exercised the budget.
+
 ---
 
 ## Prompt

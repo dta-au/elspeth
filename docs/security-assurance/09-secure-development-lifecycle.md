@@ -204,8 +204,9 @@ these jobs reports `success` [EV-604]:
 |---|---|
 | `Static analysis` | actionlint, ruff, mypy, contract checks, elspeth-lints rules (§ 2.3) |
 | `Test (Python 3.12, shard 0–3)`, `Test (Python 3.13, shard 0–3)` | Four deterministic shards per interpreter over the default pytest selection; 3.13 shards emit coverage data |
-| `Combined coverage` | Requires all test shards, proves the four 3.13 manifests form one complete non-overlapping population, combines coverage and enforces every coverage floor |
+| `Combined coverage` | Requires ordinary, proof and timing-sensitive jobs; validates disjoint manifests for each interpreter, combines 3.13 coverage and enforces every coverage floor |
 | `Testcontainer (PostgreSQL contention proofs)` | `pytest tests/ -m testcontainer -n 0` against real PostgreSQL |
+| `Timing-sensitive tests (Python 3.12)`, `Timing-sensitive tests (Python 3.13)` | Required serial timing-sensitive selection; default tests exclude it |
 | `Host-runner unit (docker CLI, non-root filesystem)` | Tests that need a Docker CLI or a non-root user; required skips become failures |
 | `State-engine catalog and selector validation` | Proof catalogues, plugin lifecycle matrix and documentation links |
 | `Azure Container Apps Bicep bundle` | Compiles every Bicep template and parameter file; compiled-template contract test |
@@ -369,9 +370,13 @@ Hypothesis is imported by 112 files under `tests/`, 75 of them under
 ### 3.2 What the default selection leaves out
 
 `pyproject.toml` sets `-m "not slow and not stress and not performance and
-not testcontainer and not live_provider"` and `-n 12`. **The default
-selection excludes the PostgreSQL testcontainer tests**, which run only in the
+not testcontainer and not live_provider and not timing_sensitive"` and
+`-n 12`. **The default selection excludes the PostgreSQL testcontainer tests**, which run only in the
 separate CI job (§ 2.1) or with `pytest tests/ -m testcontainer -n 0`.
+It also excludes `timing_sensitive` tests: a green `pytest tests/` does NOT
+cover them. Run `pytest tests/ -m timing_sensitive -n 0` serially, as the
+separate required `timing-sensitive` CI job does. The measured counts below
+predate that partition.
 
 | Marker | Tests (whole tree) | Where they run |
 |---|---|---|
@@ -500,13 +505,14 @@ Limits an assessor should weigh:
 ### 6.1 Build inputs
 
 - **Base images pinned by digest** in the `Dockerfile`: the Node frontend
-  builder (`node:24.18.0-bookworm-slim@sha256:…`), the Python builder
-  (`python:3.13-slim@sha256:…`), the `uv` binary image and the distroless
-  runtime (`gcr.io/distroless/python3-debian13:debug-nonroot@sha256:…`)
-  [EV-627].
+  builder (`node:24.18.0-bookworm-slim@sha256:…`), the Debian 13 Python
+  builder (`debian:trixie-slim@sha256:…`), the `uv` binary image and the
+  distroless runtime (`gcr.io/distroless/cc-debian13:debug-nonroot@sha256:…`)
+  [EV-627]. The CPython 3.14 interpreter is installed by that pinned `uv` from
+  its checksummed build list and copied into the runtime image.
 - **Locked dependencies:** the root `uv.lock`, the separate `gateway/uv.lock`
   and the frontend `package-lock.json` [EV-704] [EV-706].
-- **Gateway build inputs pinned and frozen:** its Python 3.12 Alpine builder
+- **Gateway build inputs pinned and frozen:** its Python 3.14 Alpine builder
   and runtime and its `uv` source are pinned by digest. Separate build and
   runtime environments consume `gateway/uv.lock` with `--frozen`; the exact
   local wheel is installed with `--no-deps` [EV-722].

@@ -1071,6 +1071,7 @@ def _run_failed_shutdown_release_child(root: Path, error_type: type[Exception], 
     ],
 )
 @pytest.mark.parametrize("repeat_cancellation", [False, True])
+@pytest.mark.timing_sensitive  # failed under 12 parallel workers on 2026-11-11, passes alone
 def test_cancelled_http_execute_observes_cleanup_failure_without_losing_primary(
     tmp_path: Path,
     cleanup_error_type: type[Exception],
@@ -3147,7 +3148,9 @@ def _exact_recovery_lease_owner_edges(member: _FunctionNode) -> frozenset[int]:
 
     try:
         module_symbols = symtable.symtable(ast.unparse(member), "<recovery-lease-proof>", "exec")
-        function_symbols = module_symbols.get_children()
+        # Python 3.14 (PEP 649) gives annotations their own ``__annotate__``
+        # scope beside the function; it binds nothing the proof inspects.
+        function_symbols = [child for child in module_symbols.get_children() if child.get_type() is not symtable.SymbolTableType.ANNOTATION]
         if len(function_symbols) != 1 or function_symbols[0].get_name() != member.name:
             return frozenset()
         lexical_scope = function_symbols[0]
@@ -3160,6 +3163,12 @@ def _exact_recovery_lease_owner_edges(member: _FunctionNode) -> frozenset[int]:
             if not symbol.is_local() or symbol.is_global() or symbol.is_nonlocal() or not symbol.is_parameter():
                 return frozenset()
         for name in dependency_names:
+            # Python 3.14 (PEP 649) no longer enters names read only in a
+            # local variable annotation into the function's table: such an
+            # annotation is never evaluated. A name absent from the table is
+            # not bound in this scope, which is all this check must exclude.
+            if name not in lexical_scope.get_identifiers():
+                continue
             symbol = lexical_scope.lookup(name)
             if symbol.is_local() or symbol.is_parameter() or symbol.is_nonlocal():
                 return frozenset()

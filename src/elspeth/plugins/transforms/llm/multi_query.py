@@ -184,7 +184,7 @@ class QueryDefinition(BaseModel):
         description=(
             "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier "
             "of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. "
-            "Any non-null override requires unique final generated names across all queries."
+            "Final generated names, including raw/usage/model fields, must be unique across all queries."
         ),
     )
 
@@ -502,10 +502,23 @@ class OrderedQueryPlanError(ValueError):
 def unique_query_generated_fields(specs: tuple[QuerySpec, ...], response_field: str) -> tuple[frozenset[str], ...]:
     """Inventory all actual publications, refusing even within-query collisions.
 
-    Ordered mode always uses this strict contract. Upstream mode opts in when
-    any query explicitly overrides its structured publication stem.
+    Every multi-query configuration (upstream and ordered, any structured
+    stem) uses this strict contract. A structured name equal to any query's
+    raw-response or operational field is refused with the same wording as the
+    single-prompt refusal: the transform's own write would destroy it.
     """
     from elspeth.plugins.transforms.llm import LLM_GUARANTEED_SUFFIXES
+
+    operational = {f"{spec.name}_{response_field}{suffix}" for spec in specs for suffix in LLM_GUARANTEED_SUFFIXES}
+    for spec in specs:
+        for item in spec.output_fields or ():
+            name = spec.structured_field_name(item.suffix)
+            if name in operational:
+                raise OrderedQueryPlanError(
+                    f"Generated output field collision: query '{spec.name}' output field suffix '{item.suffix}' "
+                    f"publishes '{name}', which collides with the transform's own response/operational fields; "
+                    "choose another suffix or structured_output_prefix, or rename response_field"
+                )
 
     seen: set[str] = set()
     generated: list[frozenset[str]] = []

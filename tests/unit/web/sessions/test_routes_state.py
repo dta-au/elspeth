@@ -43,6 +43,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.composer import test_file_inject_upload_only_tool_parity as _file_inject_tool_parity
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 from tests.unit.web.sessions.test_routes import (
     ValidationResult,
@@ -699,6 +700,7 @@ transforms:
             app.state.settings = WebSettings(
                 data_dir=tmp_path,
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -1090,6 +1092,7 @@ class TestYamlEndpoint:
     """Tests for GET /api/sessions/{id}/state/yaml."""
 
     @pytest.mark.asyncio
+    @pytest.mark.timing_sensitive
     async def test_yaml_template_validation_offloads_while_health_responds(self, tmp_path: Path, monkeypatch) -> None:
         import elspeth.web.sessions.routes.composer.state as state_routes
 
@@ -3951,6 +3954,9 @@ async def _rebind_preflight(state, *, settings, secret_service, user_id, session
     return ValidationResult(is_valid=True, checks=[], errors=[])
 
 
+blob_env = _file_inject_tool_parity.blob_env
+
+
 class TestImportRebindsSharedFiles:
     @pytest.mark.asyncio
     async def test_import_rebinds_inline_marker_at_field_path(self, tmp_path: Path) -> None:
@@ -4399,6 +4405,251 @@ class TestImportRebindsSharedFiles:
         assert resp.status_code == 400, resp.text
         assert resp.json()["detail"].startswith(
             f"wire_blob_inline_ref cannot wire LLM-authored blob '{blob.id}' into LLM node 'score' option 'prompt_template'"
+        )
+        assert await service.get_current_state(session.id) is None
+
+    @staticmethod
+    def _file_inject_yaml(entry_lines: str = "", option_lines: str = "") -> str:
+        return f"""
+sources:
+  source:
+    plugin: csv
+    on_success: inject_in
+    on_validation_failure: discard
+    options:
+      schema:
+        mode: observed
+transforms:
+- name: inject
+  plugin: file_inject
+  input: inject_in
+  on_success: main
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+    mode: select
+    key_field: kind
+    output_field: guidance
+{option_lines}    files:
+      invoice:
+        format: text
+{entry_lines}sinks:
+  main:
+    plugin: json
+    on_write_failure: discard
+"""
+
+    @pytest.mark.asyncio
+    async def test_import_rebinds_user_uploaded_file_inject_content(self, tmp_path: Path) -> None:
+        """The shared-graph case: the projection removed the marker, the copy is re-pointed at the same path."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        blob = _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A, filename="guidance.txt")
+        app.state.blob_service = _blob_service_for(blob)
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_rebind_preflight):
+            resp = client.post(
+                f"/api/sessions/{session.id}/state/yaml",
+                json={
+                    "yaml": self._file_inject_yaml(),
+                    "inline_blob_bindings": {"node:inject.options.files.invoice.content": {"blob_id": str(blob.id)}},
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        record = await service.get_current_state(session.id)
+        assert record is not None
+        assert record.nodes[0]["options"]["files"] == {
+            "invoice": {
+                "format": "text",
+                "content": {"blob_ref": str(blob.id), "mode": "inline_content", "sha256": _REBIND_DIGEST_A},
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_import_keeps_a_file_inject_marker_written_in_the_yaml(self, tmp_path: Path) -> None:
+        """A marker already in the YAML is not literal content: it is left untouched for /validate to resolve."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        blob_id = uuid.uuid4()
+        marker_lines = (
+            f"        content:\n          blob_ref: {blob_id}\n          mode: inline_content\n          sha256: {_REBIND_DIGEST_A}\n"
+        )
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_rebind_preflight):
+            resp = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": self._file_inject_yaml(marker_lines)})
+
+        assert resp.status_code == 200, resp.text
+        record = await service.get_current_state(session.id)
+        assert record is not None
+        assert record.nodes[0]["options"]["files"]["invoice"]["content"] == {
+            "blob_ref": str(blob_id),
+            "mode": "inline_content",
+            "sha256": _REBIND_DIGEST_A,
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("created_by", ["assistant", "pipeline"])
+    async def test_import_inline_binding_refuses_verbatim_blob_the_user_did_not_upload(self, tmp_path: Path, created_by: str) -> None:
+        """A fork copy of a planner blob, a composer create_blob and a pipeline output all record VERBATIM."""
+        from dataclasses import replace as dataclass_replace
+
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        blob = dataclass_replace(
+            _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A, filename="guidance.txt"),
+            created_by=created_by,
+        )
+        app.state.blob_service = _blob_service_for(blob)
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={
+                "yaml": self._file_inject_yaml(),
+                "inline_blob_bindings": {"node:inject.options.files.invoice.content": {"blob_id": str(blob.id)}},
+            },
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert f"blob '{blob.id}' is not a file the user uploaded" in resp.json()["detail"]
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    async def test_following_the_literal_content_refusal_imports_and_attaches(self, tmp_path: Path, blob_env: dict[str, Any]) -> None:
+        """The refusal says: remove the literal, import again, upload, attach. Each step is run here."""
+        from elspeth.contracts.freeze import deep_thaw
+        from elspeth.web.composer.tools._common import _prevalidate_plugin_options
+        from elspeth.web.sessions.converters import state_from_record
+        from tests.unit.web.composer import test_file_inject_upload_only_tool_parity as tool_parity
+
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+
+        refused = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={"yaml": self._file_inject_yaml('        content: "Hand-written guidance."\n')},
+        )
+        assert refused.status_code == 400, refused.text
+
+        # Step 1: the same YAML with the refused option removed is accepted.
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_rebind_preflight):
+            imported = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": self._file_inject_yaml()})
+        assert imported.status_code == 200, imported.text
+        record = await service.get_current_state(session.id)
+        assert record is not None
+        assert record.nodes[0]["options"]["files"] == {"invoice": {"format": "text"}}
+
+        # Steps 2 and 3: upload, then attach the upload to that entry in the imported graph.
+        state = state_from_record(record)
+        uploaded = await tool_parity._stored_blob_async(
+            blob_env, created_by="user", content="Check the totals.\n", source_description="uploaded"
+        )
+        attached = tool_parity._execute(
+            "wire_blob_inline_ref",
+            {"field_path": "node:inject.options.files.invoice.content", "blob_id": uploaded["blob_ref"]},
+            state,
+            blob_env,
+        )
+        assert attached.success is True, [error.message for error in attached.validation.errors]
+        [node] = [node for node in attached.updated_state.nodes if node.id == "inject"]
+        options = deep_thaw(node.options)
+        assert options["files"]["invoice"] == {"format": "text", "content": uploaded}
+        assert _prevalidate_plugin_options("transform", "file_inject", options) is None
+
+    @pytest.mark.asyncio
+    async def test_import_refuses_literal_file_inject_content(self, tmp_path: Path) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={"yaml": self._file_inject_yaml('        content: "Hand-written guidance."\n')},
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"] == (
+            "Imported YAML: file_inject node 'inject' option 'files.invoice.content' is refused: it holds literal "
+            "content, not an uploaded file. In the composer, file_inject content must be a file the user uploaded. "
+            "Remove 'files.invoice.content' from the YAML and import again, upload the file in this session, then "
+            "attach it to that entry."
+        )
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    async def test_import_refuses_file_inject_entry_name_no_upload_can_attach_to(self, tmp_path: Path) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        yaml_text = self._file_inject_yaml().replace("      invoice:\n", '      "v1.2":\n')
+        assert '"v1.2":' in yaml_text
+
+        resp = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+
+        assert resp.status_code == 400, resp.text
+        detail = resp.json()["detail"]
+        assert detail.startswith("Imported YAML: file_inject node 'inject' option 'files.v1.2' is refused: ")
+        assert detail.endswith(
+            "Rename the entry in the YAML to a name of that form and import again. In mode select the entry name is "
+            "the value rows are matched on, so renaming it changes which rows match."
+        )
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    async def test_import_refuses_file_inject_default_content(self, tmp_path: Path) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        blob = _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A, filename="guidance.txt")
+        app.state.blob_service = _blob_service_for(blob)
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={
+                "yaml": self._file_inject_yaml(option_lines='    on_miss: default\n    default_content: "Hand-written fallback."\n'),
+                "inline_blob_bindings": {"node:inject.options.files.invoice.content": {"blob_id": str(blob.id)}},
+            },
+        )
+
+        assert resp.status_code == 400, resp.text
+        detail = resp.json()["detail"]
+        assert detail.startswith("Imported YAML: file_inject node 'inject' option 'default_content' is refused: ")
+        assert "Remove default_content from the YAML and use on_miss: null or on_miss: fail, then import again." in detail
+        assert "Hand-written fallback" not in detail
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    async def test_import_inline_binding_refuses_llm_authored_blob_for_file_inject_content(self, tmp_path: Path) -> None:
+        from dataclasses import replace as dataclass_replace
+
+        from elspeth.contracts.enums import CreationModality
+
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        blob = dataclass_replace(
+            _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A, filename="guidance.txt"),
+            creation_modality=CreationModality.LLM_GENERATED,
+        )
+        app.state.blob_service = _blob_service_for(blob)
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={
+                "yaml": self._file_inject_yaml(),
+                "inline_blob_bindings": {"node:inject.options.files.invoice.content": {"blob_id": str(blob.id)}},
+            },
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"].startswith(
+            "wire_blob_inline_ref cannot set file_inject node 'inject' option 'files.invoice.content': "
+            f"blob '{blob.id}' is not a file the user uploaded"
         )
         assert await service.get_current_state(session.id) is None
 

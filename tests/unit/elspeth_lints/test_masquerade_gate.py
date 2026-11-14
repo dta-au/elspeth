@@ -1531,17 +1531,14 @@ def test_definition_header_expression_order_matches_the_running_interpreter() ->
         pytest.param(
             "def later[T = probe(obj, 'field')]():\n    pass\n",
             id="type-var-default",
-            marks=pytest.mark.skipif(sys.version_info < (3, 13), reason="PEP 696 defaults need Python 3.13"),
         ),
         pytest.param(
             "def later[*Ts = probe(obj, 'field')]():\n    pass\n",
             id="type-var-tuple-default",
-            marks=pytest.mark.skipif(sys.version_info < (3, 13), reason="PEP 696 defaults need Python 3.13"),
         ),
         pytest.param(
             "class Later[**P = probe(obj, 'field')]:\n    pass\n",
             id="param-spec-default",
-            marks=pytest.mark.skipif(sys.version_info < (3, 13), reason="PEP 696 defaults need Python 3.13"),
         ),
     ],
 )

@@ -2,21 +2,35 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn
 
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import canonical_json
 
+MalformedTextractCategory = Literal["malformed_response", "too_many_blocks", "result_too_large"]
+
 
 class MalformedTextractResponse(ValueError):
-    """Raised when a provider response cannot be safely normalized."""
+    """Raised when a provider response cannot be safely normalized.
 
-    def __init__(self, message: str = "malformed Amazon Textract response") -> None:
+    ``category`` is the structured failure class callers dispatch on. The
+    message can embed provider-controlled text (block ids, block types), so
+    it must never be substring-matched to choose an audited reason.
+    """
+
+    def __init__(
+        self,
+        message: str = "malformed Amazon Textract response",
+        *,
+        category: MalformedTextractCategory = "malformed_response",
+    ) -> None:
         super().__init__(message)
+        self.category: MalformedTextractCategory = category
 
 
 _MAX_DOCUMENT_PAGES = 3_000
@@ -76,8 +90,8 @@ class NormalizedTextractResult:
         )
 
 
-def _malformed(path: str, detail: str) -> NoReturn:
-    raise MalformedTextractResponse(f"{path}: {detail}")
+def _malformed(path: str, detail: str, *, category: MalformedTextractCategory = "malformed_response") -> NoReturn:
+    raise MalformedTextractResponse(f"{path}: {detail}", category=category)
 
 
 @trust_boundary(
@@ -258,15 +272,20 @@ def _project_pages(blocks: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any],
         ((index, block) for index, block in numbered_blocks if block["BlockType"] == "PAGE"),
         key=lambda item: _page(item[1], f"Blocks[{item[0]}]"),
     )
-    result: list[dict[str, Any]] = []
-    for page_index, page_block in page_blocks:
-        page_number = _page(page_block, f"Blocks[{page_index}]")
-        lines: list[dict[str, Any]] = []
+    numbered_pages = [(index, block, _page(block, f"Blocks[{index}]")) for index, block in page_blocks]
+    # One pass buckets LINE blocks by page number, in block order. Only pages
+    # that a PAGE block declares are projected; a LINE on any other page is
+    # Page-validated (when there is a page at all) but not projected.
+    lines_by_page: dict[int, list[dict[str, Any]]] = {page_number: [] for _index, _block, page_number in numbered_pages}
+    if lines_by_page:
         for block_index, block in numbered_blocks:
-            if block["BlockType"] != "LINE" or _page(block, f"Blocks[{block_index}]") != page_number:
+            if block["BlockType"] != "LINE":
                 continue
             line_path = f"Blocks[{block_index}]"
-            lines.append(
+            line_page = _page(block, line_path)
+            if line_page not in lines_by_page:
+                continue
+            lines_by_page[line_page].append(
                 {
                     "id": _required_str(block, "Id", line_path),
                     "text": _required_str(block, "Text", line_path),
@@ -274,6 +293,13 @@ def _project_pages(blocks: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any],
                     "geometry": _geometry(block, line_path),
                 }
             )
+    result: list[dict[str, Any]] = []
+    projected_pages: set[int] = set()
+    for page_index, page_block, page_number in numbered_pages:
+        # A repeated PAGE number gets its own copy of the lines, as when each
+        # PAGE block projected its lines independently.
+        lines = copy.deepcopy(lines_by_page[page_number]) if page_number in projected_pages else lines_by_page[page_number]
+        projected_pages.add(page_number)
         text = "\n".join(line["text"] for line in lines)
         result.append(
             {
@@ -478,6 +504,7 @@ def _project_forms(blocks: Sequence[Mapping[str, Any]], index: Mapping[str, Mapp
 
         value_block: Mapping[str, Any] | None = None
         value_id: str | None = None
+        value_selection_status: str | None = None
         if value_ids:
             value_id = value_ids[0]
             value_block = index[value_id]
@@ -486,12 +513,25 @@ def _project_forms(blocks: Sequence[Mapping[str, Any]], index: Mapping[str, Mapp
                 _malformed(key_path, "VALUE relationship must target a KEY_VALUE_SET VALUE block")
             if _page(value_block, value_path) != _page(key_block, key_path):
                 _malformed(value_path, "VALUE Page must match its KEY")
+            # A checkbox VALUE's CHILD is a SELECTION_ELEMENT, which
+            # ``_text_from_children`` renders as "", so its state is projected
+            # here, validated exactly as a table cell's selection_status.
+            for selection_id in _child_ids(value_block, value_path):
+                selection = index[selection_id]
+                if selection["BlockType"] != "SELECTION_ELEMENT":
+                    continue
+                if value_selection_status is not None:
+                    _malformed(value_path, "VALUE block contains multiple selection elements")
+                value_selection_status = _required_str(selection, "SelectionStatus", f"block {selection_id!r}")
+                if value_selection_status not in {"SELECTED", "NOT_SELECTED"}:
+                    _malformed(f"block {selection_id!r}.SelectionStatus", "must be SELECTED or NOT_SELECTED")
 
         result.append(
             {
                 "page": _page(key_block, key_path),
                 "key": _text_from_children(key_block, index, path=key_path),
                 "value": None if value_block is None else _text_from_children(value_block, index, path=f"block {value_id!r}"),
+                "value_selection_status": value_selection_status,
                 "key_block_id": _required_str(key_block, "Id", key_path),
                 "value_block_id": value_id,
                 "key_confidence": _confidence(key_block, key_path),
@@ -613,7 +653,7 @@ def normalize_textract_result(
             block = _mapping(raw_block, f"{result_path}.Blocks[{block_offset}]")
             blocks.append(block)
             if len(blocks) > max_blocks:
-                _malformed("Blocks", f"block count exceeds max_blocks={max_blocks}")
+                _malformed("Blocks", f"block count exceeds max_blocks={max_blocks}", category="too_many_blocks")
 
         if "Warnings" in result:
             raw_warnings = _sequence(result["Warnings"], f"{result_path}.Warnings")
@@ -709,7 +749,7 @@ def normalize_analyze_document_result(
             block = {**block, "Page": 1}
         blocks.append(block)
         if len(blocks) > max_blocks:
-            _malformed("Blocks", f"block count exceeds max_blocks={max_blocks}")
+            _malformed("Blocks", f"block count exceeds max_blocks={max_blocks}", category="too_many_blocks")
 
     return _normalize_block_graph(
         blocks,
@@ -773,7 +813,11 @@ def _normalize_block_graph(
     except (TypeError, ValueError, RecursionError, UnicodeError) as error:
         raise MalformedTextractResponse("native result contains a non-canonical value") from error
     if result_size > max_result_bytes:
-        _malformed("native_result", f"serialized result exceeds max_result_bytes={max_result_bytes}")
+        _malformed(
+            "native_result",
+            f"serialized result exceeds max_result_bytes={max_result_bytes}",
+            category="result_too_large",
+        )
 
     pages = _project_pages(blocks)
     tables = _project_tables(blocks, block_index)

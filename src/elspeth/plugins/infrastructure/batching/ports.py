@@ -51,6 +51,19 @@ class OutputPort(Protocol):
         """
         ...
 
+    def fail_pending(self, failure: Exception) -> None:
+        """Deliver a terminal failure to every result still awaited from this port.
+
+        Called by the emitting stage when it can no longer emit at all (its
+        release thread died), so a consumer blocked on a result fails now
+        instead of sleeping out its timeout. Independent of ``emit()``, which
+        may be the thing that broke.
+
+        Args:
+            failure: The exception every pending waiter should raise
+        """
+        ...
+
 
 class NullOutputPort:
     """Output port that discards all results.
@@ -62,6 +75,10 @@ class NullOutputPort:
         """Discard the result."""
         pass
 
+    def fail_pending(self, failure: Exception) -> None:
+        """Nothing awaits a discarded result."""
+        pass
+
 
 class CollectorOutputPort:
     """Output port that collects results into a list.
@@ -71,10 +88,15 @@ class CollectorOutputPort:
 
     def __init__(self) -> None:
         self.results: list[tuple[TokenInfo, TransformResult | ExceptionResult, str | None]] = []
+        self.failures: list[Exception] = []
 
     def emit(self, token: TokenInfo, result: TransformResult | ExceptionResult, state_id: str | None) -> None:
         """Collect the result."""
         self.results.append((token, result, state_id))
+
+    def fail_pending(self, failure: Exception) -> None:
+        """Record the terminal failure; nothing blocks on a collected result."""
+        self.failures.append(failure)
 
     def clear(self) -> None:
         """Clear collected results."""

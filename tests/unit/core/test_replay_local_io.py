@@ -261,7 +261,7 @@ def test_payload_collector_binds_row_token_and_pdf_receipt_refs() -> None:
             get_call_response_data=lambda call_id: CallDataResult(
                 state=CallDataState.AVAILABLE,
                 data={
-                    "format": "pdf_rasterize/v1",
+                    "format": "pdf_rasterize/v2",
                     "renderer_identity": "a" * 64,
                     "outcome_kind": "rasterized",
                     "result_status": "success",
@@ -402,7 +402,7 @@ def test_payload_collector_accepts_failed_pdf_state_with_refusal_receipt() -> No
             get_call_response_data=lambda _call_id: CallDataResult(
                 state=CallDataState.AVAILABLE,
                 data={
-                    "format": "pdf_rasterize/v1",
+                    "format": "pdf_rasterize/v2",
                     "renderer_identity": "a" * 64,
                     "outcome_kind": "document_refusal",
                     "result_status": "error",

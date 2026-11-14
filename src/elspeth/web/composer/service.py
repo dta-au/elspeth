@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from copy import deepcopy
@@ -42,7 +43,9 @@ from elspeth.contracts.blobs import BlobServiceProtocol
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
 from elspeth.contracts.composer_audit import ComposerToolInvocation, PrivateToolAuthoring
 from elspeth.contracts.composer_llm_audit import (
+    ComposerContextBudgetRecord,
     ComposerLLMCall,
+    ComposerLLMRequestByteSplit,
 )
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
@@ -94,6 +97,27 @@ from elspeth.web.composer.composition_completion import (
     _append_interpretation_review_handoff_message,
     _with_advisor_gate_decision,
 )
+from elspeth.web.composer.context_budget import (
+    ContextBudgetPolicy,
+    ContextBudgetRefusal,
+    SheddableKind,
+    SheddableSegment,
+    decide_context_budget,
+)
+from elspeth.web.composer.context_budget_apply import (
+    CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
+    first_history_shed_of_turn,
+    held_tool_keys,
+    largest_component,
+    latest_round_trip_start,
+    message_bytes,
+    message_wire_split,
+    previously_shed_keys,
+    request_wire_bytes,
+    stubbed_tool_message,
+    tool_result_segments,
+)
+from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.control_messages import anti_anchor_control_envelope
 from elspeth.web.composer.discovery_cache import (
     CachedDiscoveryPayload as _CachedDiscoveryPayload,
@@ -110,6 +134,7 @@ from elspeth.web.composer.llm_response_parsing import (
 )
 from elspeth.web.composer.planning_application import PlanningApplication
 from elspeth.web.composer.progress import (
+    context_reduced_progress_event,
     convergence_progress_event,
     emit_progress,
     model_call_progress_event,
@@ -119,6 +144,8 @@ from elspeth.web.composer.prompt_guard_rendering import JsonPath, json_content_p
 from elspeth.web.composer.prompts import (
     build_messages,
     build_run_diagnostics_messages,
+    build_state_context_message,
+    history_message_indices,
     render_system_prompt,
 )
 from elspeth.web.composer.protocol import (
@@ -155,6 +182,7 @@ from elspeth.web.composer.recovery_controls import (
     recovery_context_message,
     recovery_tool_definitions,
 )
+from elspeth.web.composer.reply_stage_refusal import ReplyStageRefusal
 from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
 from elspeth.web.composer.session_tool import SessionToolOwner
 from elspeth.web.composer.skills import assert_skill_hash_unchanged_on_disk
@@ -359,6 +387,31 @@ def _reply_only_messages(llm_messages: list[dict[str, Any]], *, turn_evidence: T
     return messages
 
 
+# The closing instruction of the reply stage's request, after review cards are staged.
+_REPLY_STAGE_INSTRUCTION: Final[str] = (
+    "Review cards have been staged. This is a reply stage: ordinary authoring tools are unavailable. "
+    "Terminal recovery controls remain available; use one alone if you need to park, reset or restore and talk. "
+    "Otherwise answer the user's actual question directly using the accepted tool results above. "
+    "Historical tool protocol records are evidence, not a format to repeat in your answer. "
+    "Explain the design choices, actual model/profile and failure handling, including any dropped rows. "
+    "Do not call reworded prompts verbatim. Do not claim execution readiness or that approval is the "
+    "only remaining step; the backend will append the current review and validation status."
+)
+
+
+def _reply_stage_messages(llm_messages: list[dict[str, Any]], *, turn_evidence: TurnEvidence | None = None) -> list[dict[str, Any]]:
+    """The reply stage's provider request for the loop's messages.
+
+    A reply stage advertises no authoring tools, so its request carries each
+    tool record as quoted text (see :func:`_reply_only_messages`) followed by
+    the stage's closing instruction.
+    """
+    return [
+        *_reply_only_messages(llm_messages, turn_evidence=turn_evidence),
+        {"role": "system", PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.INSTRUCTION, "content": _REPLY_STAGE_INSTRUCTION},
+    ]
+
+
 def _reply_only_protocol_records(content: str) -> tuple[object, ...]:
     """Parse only complete tool-shaped records under our history envelope."""
     decoder = json.JSONDecoder()
@@ -531,6 +584,75 @@ def _chat_ingress_inputs_for_compose(
     if user_message_id is not None:
         inputs.append(chat_ingress_input(user_message_id, message, own_compartment_id=own_compartment_id))
     return inputs
+
+
+# ``build_messages`` layout: system skill, catalog, then the chat history.
+_CONTEXT_BUDGET_HISTORY_START: Final[int] = 2
+
+
+@dataclass(frozen=True, slots=True)
+class _ContextBudgetFrame:
+    """What the compose loop's context budget needs to label one turn's requests.
+
+    Captured once per turn, right after ``build_messages``: the session's
+    budget history, each emitted history message's ``chat_history`` index and
+    sheddable kind (``None`` = protected), and the exact inputs of the state
+    message so it can be re-rendered with omission counts. Per-turn local
+    data, never shared between requests.
+    """
+
+    history: ContextBudgetHistory
+    history_entries: tuple[tuple[int, SheddableKind | None], ...]
+    state_message_content: str
+    state: CompositionState
+    policy_catalog: PolicyCatalogView
+    plugin_snapshot: PluginAvailabilitySnapshot
+    schemas_loaded: frozenset[tuple[str, str]]
+
+    @property
+    def state_index(self) -> int:
+        return _CONTEXT_BUDGET_HISTORY_START + len(self.history_entries)
+
+
+@dataclass(frozen=True, slots=True)
+class _ContextBudgetRefusalScope:
+    """Compose-loop locals a context-budget refusal reports, in the style of the other convergence raises."""
+
+    state: CompositionState
+    initial_version: int
+    composition_turns_used: int
+    discovery_turns_used: int
+    failed_turn: FailedTurnMetadata | None
+    recorder: BufferingRecorder
+
+
+def _context_budget_component_bytes(
+    split: ComposerLLMRequestByteSplit, *, state_index: int, latest_start: int | None, latest_stop: int, sheddable_bytes: int
+) -> dict[str, int]:
+    """Name each component of a request sized per message on the wire; ``other`` excludes what could still be shed.
+
+    ``split`` is :func:`message_wire_split` of the request the decision
+    measured, so an assistant tool-call turn counts with its arguments and, at
+    the reply stage, a tool record counts as the quoted text it is sent as.
+    ``latest_start`` and ``latest_stop`` bound the latest tool round by the
+    loop's message positions, which the reply-stage request keeps one to one;
+    its closing instruction lies past ``latest_stop`` and counts as
+    ``other``. ``sheddable_bytes`` is what the decision credited the
+    sheddable segments with.
+    """
+    sizes = split.message_bytes
+    if latest_start is not None and latest_start <= state_index + 1:
+        raise InvariantError("compose-loop tool round precedes the current user message")
+    named = {
+        "system": sizes[0],
+        "catalog": sizes[1],
+        "tools": split.tools_bytes if split.tools_bytes is not None else 0,
+        "state": sizes[state_index],
+        "current_message": sizes[state_index + 1],
+        "latest_tool_round": sum(sizes[latest_start:latest_stop]) if latest_start is not None else 0,
+    }
+    named["other"] = split.total_bytes - sum(named.values()) - sheddable_bytes
+    return named
 
 
 # Task 6 Step 3 (elspeth-bff8fe6864, belt-and-braces): once a genuine repair
@@ -722,6 +844,12 @@ class ComposerServiceImpl:
         from elspeth.web.sessions.telemetry import build_sessions_telemetry
 
         self._max_tool_calls_per_turn: int = self._settings.composer_max_tool_calls_per_turn
+        self._context_budget_policy = ContextBudgetPolicy(
+            max_prompt_tokens=settings.composer_context_max_prompt_tokens,
+            max_request_bytes=settings.composer_planner_max_request_bytes,
+            shed_above=settings.composer_context_shed_above,
+            shed_to=settings.composer_context_shed_to,
+        )
         self._telemetry: _SessionsTelemetry = build_sessions_telemetry(meter=metrics.get_meter("elspeth.web.composer"))
         self._redaction_telemetry: RedactionTelemetry = OtelRedactionTelemetry()
 
@@ -1127,6 +1255,7 @@ class ComposerServiceImpl:
         recovery_context: GraphRecoveryContext | None = None,
         retained_operation_context: RetainedOperationContext | None = None,
         advisor_history: AdvisorTranscriptHistory | None = None,
+        context_budget_history: ContextBudgetHistory | None = None,
     ) -> ComposerResult:
         """Run the LLM composition loop with dual-counter budget.
 
@@ -1270,6 +1399,7 @@ class ComposerServiceImpl:
                         retained_operation_context=retained_operation_context,
                         turn_evidence=turn_evidence,
                         request_deadline=deadline,
+                        context_budget_history=context_budget_history,
                     )
                 return await self._compose_loop(
                     message,
@@ -1291,11 +1421,12 @@ class ComposerServiceImpl:
                     recovery_context=recovery_context,
                     retained_operation_context=retained_operation_context,
                     turn_evidence=turn_evidence,
+                    context_budget_history=context_budget_history,
                 )
             except ComposerConvergenceError as exc:
                 await emit_progress(
                     progress,
-                    convergence_progress_event(budget_exhausted=exc.budget_exhausted),
+                    convergence_progress_event(budget_exhausted=exc.budget_exhausted, reason=exc.reason),
                 )
                 # Has its own partial_state; route handler persists. Do not intercept.
                 raise
@@ -1420,34 +1551,253 @@ class ComposerServiceImpl:
             failed_turn=failed_turn,
         )
 
-    def _prepare_primary_delivery(
+    async def _prepare_primary_delivery(
         self,
         *,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         recorder: BufferingRecorder,
         turn_evidence: TurnEvidence | None,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], BlobDeliveryAttempt | None]:
-        """Freeze the selected input and derive the gateway's exact marked hash."""
+        budget_frame: _ContextBudgetFrame,
+        state: CompositionState,
+        initial_version: int,
+        composition_turns_used: int,
+        discovery_turns_used: int,
+        failed_turn: FailedTurnMetadata | None,
+        progress: ComposerProgressSink | None,
+        reply_stage: bool = False,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], BlobDeliveryAttempt | None, ComposerContextBudgetRecord]:
+        """Freeze the selected input, fit it to the context budget, and derive the gateway's exact marked hash.
+
+        Shedding is applied to the copy before cache markers are added, so the
+        request that is hashed, recorded and sent is one request. The caller's
+        ``messages`` list and the transcript owner keep the unshed messages.
+        When this is the turn's first request whose decision sheds
+        conversation history, the shed is announced on ``progress`` before
+        the request is returned for sending.
+
+        ``messages`` are always the loop's own messages, tool roles intact.
+        With ``reply_stage`` the request is a reply stage's: the loop's
+        messages are fitted first and the request sent is the reply-only form
+        of the fitted list, so a tool result stubbed here or on an earlier
+        call of the turn is quoted as its stub, not re-sent in full.
+        """
         from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers, supports_anthropic_prompt_cache_markers
 
         selected_messages, selected_tools = deepcopy(messages), deepcopy(tools)
+        if turn_evidence is not None:
+            # The transcript owner observes the unshed request in the form it takes.
+            turn_evidence.transcript.observe_messages(
+                _reply_stage_messages(messages, turn_evidence=turn_evidence) if reply_stage else messages
+            )
+        refusal_scope = _ContextBudgetRefusalScope(
+            state=state,
+            initial_version=initial_version,
+            composition_turns_used=composition_turns_used,
+            discovery_turns_used=discovery_turns_used,
+            failed_turn=failed_turn,
+            recorder=recorder,
+        )
+        selected_messages, budget_record, bytes_per_token = self._shed_to_context_budget(
+            messages=selected_messages,
+            tools=selected_tools,
+            frame=budget_frame,
+            recorder=recorder,
+            refusal_scope=refusal_scope,
+            reply_stage=reply_stage,
+        )
+        # The latest tool round by the fitted loop messages' positions; the reply-stage form keeps them one to one.
+        latest_start, latest_stop = latest_round_trip_start(selected_messages), len(selected_messages)
+        if reply_stage:
+            # Quoted inspections were registered from the unshed request above; a stubbed result registers none.
+            selected_messages = _reply_stage_messages(selected_messages)
+        marked_messages, marked_tools = selected_messages, selected_tools
+        if supports_anthropic_prompt_cache_markers(self._model):
+            marked_messages, marked_tools_or_none = apply_anthropic_cache_markers(selected_messages, selected_tools, mark_history_tail=True)
+            marked_tools = marked_tools_or_none if marked_tools_or_none is not None else selected_tools
+        # The wire bytes of the request that will be sent: recorded on the
+        # call, where a later call's bytes-per-token ratio is read from, and
+        # checked by the final guard. The decision was fed this measure, so
+        # the guard is reached only if applying the decision grew the request
+        # past what the decision's allowances cover.
+        marked_wire_bytes = request_wire_bytes(marked_messages, marked_tools or None)
+        budget_record = replace(budget_record, request_wire_bytes=marked_wire_bytes)
+        if marked_wire_bytes > self._context_budget_policy.max_request_bytes:
+            marked_split = message_wire_split(marked_messages, marked_tools or None)
+            kept_history = len(budget_frame.history_entries) - len(budget_record.shed_history_indices)
+            raise self._context_budget_refusal(
+                ContextBudgetRefusal(
+                    ceiling="bytes",
+                    estimated_tokens=math.ceil(marked_wire_bytes / bytes_per_token),
+                    request_bytes=marked_wire_bytes,
+                ),
+                _context_budget_component_bytes(
+                    marked_split,
+                    state_index=_CONTEXT_BUDGET_HISTORY_START + kept_history,
+                    latest_start=latest_start,
+                    latest_stop=latest_stop,
+                    sheddable_bytes=0,
+                ),
+                refusal_scope,
+            )
         delivery = None
         if turn_evidence is not None:
-            turn_evidence.transcript.observe_messages(messages)
-            marked_messages, marked_tools = selected_messages, selected_tools
-            if supports_anthropic_prompt_cache_markers(self._model):
-                marked_messages, marked_tools_or_none = apply_anthropic_cache_markers(
-                    selected_messages, selected_tools, mark_history_tail=True
-                )
-                marked_tools = marked_tools_or_none if marked_tools_or_none is not None else selected_tools
             delivery = turn_evidence.prepare_delivery(
                 detach_prompt_guard_messages(marked_messages)[0],
                 previous_calls=recorder.llm_calls,
                 tools=marked_tools or None,
                 scope="primary",
             )
-        return selected_messages, selected_tools, delivery
+        if first_history_shed_of_turn(budget_record, recorder.llm_calls):
+            await emit_progress(progress, context_reduced_progress_event())
+        return selected_messages, selected_tools, delivery, budget_record
+
+    def _shed_to_context_budget(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        frame: _ContextBudgetFrame,
+        recorder: BufferingRecorder,
+        refusal_scope: _ContextBudgetRefusalScope,
+        reply_stage: bool = False,
+    ) -> tuple[list[dict[str, Any]], ComposerContextBudgetRecord, float]:
+        """Label the request's segments, decide, and apply the decision to ``messages`` (a private copy).
+
+        Returns the fitted loop messages, the record of the decision, and the
+        bytes-per-token ratio it used.
+
+        Segments are always labelled on the loop's messages. With
+        ``reply_stage`` the size the decision is fed is that of the
+        reply-stage request built from them. Quoting a tool record as JSON
+        text only adds bytes, so stubbing a result saves at least its
+        labelled saving in the reply-stage request too: the decision's size
+        after shedding remains an upper bound.
+        """
+        from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers, supports_anthropic_prompt_cache_markers
+
+        state_index = frame.state_index
+        if len(messages) < state_index + 2 or messages[state_index]["content"] != frame.state_message_content:
+            raise InvariantError("compose-loop request does not have the layout its context budget frame describes")
+        split = message_bytes(messages, tools or None)
+        latest_start = latest_round_trip_start(messages)
+
+        segments: list[SheddableSegment] = []
+        for position, (chat_index, kind) in enumerate(frame.history_entries):
+            saving = split.message_bytes[_CONTEXT_BUDGET_HISTORY_START + position]
+            if kind is not None and saving > 0:
+                segments.append(SheddableSegment(kind=kind, key=f"history:{chat_index}", saving_bytes=saving))
+        # A re-render after shedding history adds the omission counts.
+        omission_allowance = CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES if segments else 0
+        tool_segments, tool_positions = tool_result_segments(
+            messages, split, start=state_index + 2, stop=latest_start if latest_start is not None else len(messages)
+        )
+        segments.extend(tool_segments)
+
+        # The decision measures the request as it will be sent: with cache
+        # markers, in wire bytes (content, tool-call arguments, thinking
+        # blocks and tool definitions all count), plus the worst case the
+        # omission counts can add. The content split above only labels
+        # segments and names components; its savings are lower bounds on the
+        # wire savings.
+        sent_messages = _reply_stage_messages(messages) if reply_stage else messages
+        sent_tools = tools or None
+        if supports_anthropic_prompt_cache_markers(self._model):
+            sent_messages, marked_tools = apply_anthropic_cache_markers(sent_messages, tools, mark_history_tail=True)
+            sent_tools = marked_tools or None
+
+        try:
+            decision = decide_context_budget(
+                policy=self._context_budget_policy,
+                request_bytes=request_wire_bytes(sent_messages, sent_tools) + omission_allowance,
+                segments=segments,
+                # The ratio measured on this model's own budgeted calls, when the session has one.
+                bytes_per_token=frame.history.ratio_for(self._model),
+                previously_shed=previously_shed_keys(frame.history, recorder.llm_calls),
+                held=held_tool_keys(recorder.llm_calls),
+            )
+        except ContextBudgetRefusal as refusal:
+            raise self._context_budget_refusal(
+                refusal,
+                _context_budget_component_bytes(
+                    # Sized on the form of the request the decision measured (the reply stage's own), before cache markers.
+                    message_wire_split(_reply_stage_messages(messages) if reply_stage else messages, tools or None),
+                    state_index=state_index,
+                    latest_start=latest_start,
+                    latest_stop=len(messages),
+                    sheddable_bytes=sum(segment.saving_bytes for segment in segments),
+                ),
+                refusal_scope,
+            ) from refusal
+        record = ComposerContextBudgetRecord.from_shed_keys(
+            policy_hash=decision.policy_hash,
+            bytes_per_token=decision.bytes_per_token,
+            estimated_tokens_before=decision.estimated_tokens_before,
+            estimated_tokens_after=decision.estimated_tokens_after,
+            # The decision's bound; the caller records the exact size of the request it sends.
+            request_wire_bytes=decision.request_bytes_after,
+            shed_keys=decision.shed_keys,
+        )
+        shed = frozenset(decision.shed_keys)
+        if not shed:
+            return messages, record, decision.bytes_per_token
+
+        shed_history_positions = {
+            _CONTEXT_BUDGET_HISTORY_START + position
+            for position, (chat_index, _kind) in enumerate(frame.history_entries)
+            if f"history:{chat_index}" in shed
+        }
+        stub_positions = {index for key, positions in tool_positions.items() if key in shed for index in positions}
+        shed_kinds = [frame.history_entries[index - _CONTEXT_BUDGET_HISTORY_START][1] for index in shed_history_positions]
+        applied: list[dict[str, Any]] = []
+        for index, message in enumerate(messages):
+            if index in shed_history_positions:
+                continue
+            if index == state_index and shed_history_positions:
+                applied.append(
+                    build_state_context_message(
+                        frame.state,
+                        frame.policy_catalog,
+                        plugin_snapshot=frame.plugin_snapshot,
+                        schemas_loaded=frame.schemas_loaded,
+                        conversation_omissions={
+                            "prior_user_requests_omitted": shed_kinds.count(SheddableKind.USER_REQUEST),
+                            "prior_assistant_messages_omitted": shed_kinds.count(SheddableKind.ASSISTANT_PROSE),
+                        },
+                    )
+                )
+            elif index in stub_positions:
+                applied.append(stubbed_tool_message(message))
+            else:
+                applied.append(message)
+        return applied, record, decision.bytes_per_token
+
+    def _context_budget_refusal(
+        self,
+        refusal: ContextBudgetRefusal,
+        component_bytes: Mapping[str, int],
+        scope: _ContextBudgetRefusalScope,
+    ) -> ComposerConvergenceError:
+        """Build the pre-dispatch refusal for a request the context budget cannot fit."""
+        return ComposerConvergenceError.capture(
+            max_turns=scope.composition_turns_used + scope.discovery_turns_used,
+            budget_exhausted="composition",
+            state=scope.state,
+            initial_version=scope.initial_version,
+            tool_invocations=scope.recorder.invocations,
+            llm_calls=scope.recorder.llm_calls,
+            reason="context_budget_exceeded",
+            evidence={
+                "ceiling": refusal.ceiling,
+                "estimated_tokens": refusal.estimated_tokens,
+                # Wire bytes: the measure both ceilings are judged on.
+                "request_bytes": refusal.request_bytes,
+                "max_prompt_tokens": self._context_budget_policy.max_prompt_tokens,
+                "max_request_bytes": self._context_budget_policy.max_request_bytes,
+                "largest_component": largest_component(component_bytes),
+            },
+            failed_turn=scope.failed_turn,
+        )
 
     async def _call_model_turn(
         self,
@@ -1463,16 +1813,19 @@ class ComposerServiceImpl:
         composition_turns_used: int,
         discovery_turns_used: int,
         failed_turn: FailedTurnMetadata | None,
+        budget_frame: _ContextBudgetFrame,
         provider_owner: ProviderInvocationOwner | None = None,
         turn_evidence: TurnEvidence | None = None,
     ) -> _CallModelOutcome:
         """Phase P1 of the compose loop — one LLM call with cap enforcement.
 
-        Emits the model-call progress event, calls the provider before the
-        cooperative deadline, and enforces ``_max_tool_calls_per_turn``.
-        A cap breach raises :class:`ComposerConvergenceError` with the
-        ``tool_call_cap_exceeded`` reason directly; no carrier is returned
-        in that case.
+        Emits the model-call progress event, fits the request to the context
+        budget, calls the provider before the cooperative deadline, and
+        enforces ``_max_tool_calls_per_turn``. A request the budget cannot fit
+        raises :class:`ComposerConvergenceError` with the
+        ``context_budget_exceeded`` reason before any provider call. A cap
+        breach raises it with the ``tool_call_cap_exceeded`` reason directly;
+        no carrier is returned in either case.
 
         ``failed_turn`` is the driver's running metadata for the LAST
         persisted tool-call turn — carried here only so a wall-clock timeout
@@ -1481,8 +1834,18 @@ class ComposerServiceImpl:
         turn has been persisted yet.
         """
         await emit_progress(progress, model_call_progress_event(message))
-        selected_messages, selected_tools, delivery = self._prepare_primary_delivery(
-            messages=llm_messages, tools=tools, recorder=recorder, turn_evidence=turn_evidence
+        selected_messages, selected_tools, delivery, budget_record = await self._prepare_primary_delivery(
+            messages=llm_messages,
+            tools=tools,
+            recorder=recorder,
+            turn_evidence=turn_evidence,
+            budget_frame=budget_frame,
+            state=state,
+            initial_version=initial_version,
+            composition_turns_used=composition_turns_used,
+            discovery_turns_used=discovery_turns_used,
+            failed_turn=failed_turn,
+            progress=progress,
         )
         completion = await self._call_llm_before_deadline(
             selected_messages,
@@ -1495,6 +1858,7 @@ class ComposerServiceImpl:
             discovery_turns_used=discovery_turns_used,
             failed_turn=failed_turn,
             provider_owner=provider_owner,
+            context_budget=budget_record,
         )
         assistant_tool_calls = completion.tool_batch.calls
         self._enforce_tool_call_cap(
@@ -1717,6 +2081,7 @@ class ComposerServiceImpl:
         composition_turns_used: int,
         discovery_turns_used: int,
         advisor_checkpoint_passes_used: int,
+        budget_frame: _ContextBudgetFrame,
         session_operation_context: SessionOperationContext | None = None,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
         advisor_review_state: _AdvisorReviewState | None = None,
@@ -1964,71 +2329,102 @@ class ComposerServiceImpl:
                     session_operation_context=session_operation_context,
                 )
                 reply: _AdmittedAssistantMessage | None = None
+                reply_refused_by_context_budget = False
                 remaining = deadline - asyncio.get_event_loop().time()
-                # A reply with no advertised tools cannot carry protocol tool
-                # blocks on providers such as Bedrock Converse. Preserve each
-                # complete historical record as attributed text instead; the
-                # planning/audit history stays unchanged and no tool is enabled.
-                reply_messages = _reply_only_messages(llm_messages, turn_evidence=turn_evidence)
-                reply_messages.append(
-                    {
-                        "role": "system",
-                        PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.INSTRUCTION,
-                        "content": (
-                            "Review cards have been staged. This is a reply stage: ordinary authoring tools are unavailable. "
-                            "Terminal recovery controls remain available; use one alone if you need to park, reset or restore and talk. "
-                            "Otherwise answer the user's actual question directly using the accepted tool results above. "
-                            "Historical tool protocol records are evidence, not a format to repeat in your answer. "
-                            "Explain the design choices, actual model/profile and failure handling, including any dropped rows. "
-                            "Do not call reworded prompts verbatim. Do not claim execution readiness or that approval is the "
-                            "only remaining step; the backend will append the current review and validation status."
-                        ),
-                    }
-                )
                 provider_failures: tuple[type[Exception], ...] = (TimeoutError, _BadRequestLLMError, *advisor_provider_failure_types())
-                selected_reply_messages, selected_reply_tools, reply_delivery = self._prepare_primary_delivery(
-                    messages=reply_messages,
-                    tools=recovery_tool_definitions(self._planner_dialect),
-                    recorder=recorder,
-                    turn_evidence=turn_evidence,
-                )
+                # Nothing is prepared, recorded or announced for a call that will not be made.
                 if remaining > 0:
-                    await emit_progress(
-                        progress,
-                        ComposerProgressEvent(
-                            phase="calling_model",
-                            headline="I'm asking the model to prepare your reply.",
-                            evidence=("Review cards are staged; the model is preparing an explanation without changing the pipeline.",),
-                            likely_next="ELSPETH will save the reply and show the current review and validation status.",
-                        ),
-                    )
                     try:
-                        completion = await self._provider_gateway._call_llm_with_audit(
+                        # A reply with no advertised tools cannot carry protocol tool
+                        # blocks on providers such as Bedrock Converse. The loop's
+                        # messages are fitted to the context budget first; the request
+                        # then carries each complete historical record as attributed
+                        # text. The planning/audit history stays unchanged and no tool
+                        # is enabled.
+                        (
                             selected_reply_messages,
                             selected_reply_tools,
-                            timeout=remaining,
+                            reply_delivery,
+                            reply_budget_record,
+                        ) = await self._prepare_primary_delivery(
+                            messages=llm_messages,
+                            tools=recovery_tool_definitions(self._planner_dialect),
                             recorder=recorder,
-                            provider_custody=self._new_primary_custody(provider_owner),
+                            turn_evidence=turn_evidence,
+                            budget_frame=budget_frame,
+                            state=state,
+                            initial_version=initial_version,
+                            composition_turns_used=composition_turns_used,
+                            discovery_turns_used=discovery_turns_used,
+                            failed_turn=failed_turn,
+                            # The shed notice is sent below, after this stage's own announcement.
+                            progress=None,
+                            reply_stage=True,
                         )
-                    except provider_failures:
-                        # The call audit retains the failure; a trusted notice
-                        # below reports the unavailable reply to the user.
+                    except ComposerConvergenceError as refusal:
+                        if refusal.reason != "context_budget_exceeded":
+                            raise
+                        # The turn's work is done and this reply is optional: a request
+                        # the context budget cannot fit is not sent, and the turn
+                        # completes without a reply. No provider call was made, so no
+                        # call record is written; the refusal's own audit row records
+                        # what was measured, and a trusted notice below tells the user
+                        # why there is no reply.
                         reply = None
-                    else:
-                        recovery_result = self._terminal_recovery_result(
-                            completion, state, recorder, prior_tools_persisted=persisted_tool_call_turn
+                        reply_refused_by_context_budget = True
+                        await self._completion._persist_reply_stage_refusal(
+                            ReplyStageRefusal(
+                                ceiling=refusal.evidence["ceiling"],
+                                estimated_tokens=refusal.evidence["estimated_tokens"],
+                                request_wire_bytes=refusal.evidence["request_bytes"],
+                                max_prompt_tokens=refusal.evidence["max_prompt_tokens"],
+                                max_request_bytes=refusal.evidence["max_request_bytes"],
+                                largest_component=refusal.evidence["largest_component"],
+                            ),
+                            session_id=session_id,
+                            session_operation_context=session_operation_context,
                         )
-                        if recovery_result is not None:
-                            return _ClassifyOutcome(action="return", result=recovery_result)
-                        reply = completion.message
-                        if _reply_only_protocol_echo(
-                            reply.content or "",
-                            history_has_tool_protocol=any(row["role"] == "tool" or "tool_calls" in row for row in llm_messages),
-                            user_message=message,
-                        ):
+                    else:
+                        await emit_progress(
+                            progress,
+                            ComposerProgressEvent(
+                                phase="calling_model",
+                                headline="I'm asking the model to prepare your reply.",
+                                evidence=("Review cards are staged; the model is preparing an explanation without changing the pipeline.",),
+                                likely_next="ELSPETH will save the reply and show the current review and validation status.",
+                            ),
+                        )
+                        # After the stage's announcement, so the notice is the latest progress during the call.
+                        if first_history_shed_of_turn(reply_budget_record, recorder.llm_calls):
+                            await emit_progress(progress, context_reduced_progress_event())
+                        try:
+                            completion = await self._provider_gateway._call_llm_with_audit(
+                                selected_reply_messages,
+                                selected_reply_tools,
+                                timeout=remaining,
+                                recorder=recorder,
+                                provider_custody=self._new_primary_custody(provider_owner),
+                                context_budget=reply_budget_record,
+                            )
+                        except provider_failures:
+                            # The call audit retains the failure; a trusted notice
+                            # below reports the unavailable reply to the user.
                             reply = None
-                        if reply is not None and not completion.tool_batch.calls and reply_delivery is not None:
-                            turn_evidence.confirm_delivery(reply_delivery, recorder.llm_calls)
+                        else:
+                            recovery_result = self._terminal_recovery_result(
+                                completion, state, recorder, prior_tools_persisted=persisted_tool_call_turn
+                            )
+                            if recovery_result is not None:
+                                return _ClassifyOutcome(action="return", result=recovery_result)
+                            reply = completion.message
+                            if _reply_only_protocol_echo(
+                                reply.content or "",
+                                history_has_tool_protocol=any(row["role"] == "tool" or "tool_calls" in row for row in llm_messages),
+                                user_message=message,
+                            ):
+                                reply = None
+                            if reply is not None and not completion.tool_batch.calls and reply_delivery is not None:
+                                turn_evidence.confirm_delivery(reply_delivery, recorder.llm_calls)
                 advisor_gate = None
                 if reply is not None:
                     try:
@@ -2147,7 +2543,11 @@ class ComposerServiceImpl:
                 if reply is None:
                     handoff_result = replace(
                         handoff_result,
-                        message=_no_tool_policy.compose_review_reply_unavailable_message(handoff_result.message),
+                        message=(
+                            _no_tool_policy.compose_review_reply_context_budget_message(handoff_result.message)
+                            if reply_refused_by_context_budget
+                            else _no_tool_policy.compose_review_reply_unavailable_message(handoff_result.message)
+                        ),
                         raw_assistant_content=(
                             "" if handoff_result.raw_assistant_content is None else handoff_result.raw_assistant_content
                         ),
@@ -2182,8 +2582,18 @@ class ComposerServiceImpl:
                 # B-4D-3 fix: give the LLM one last chance to see the
                 # tool results and produce a text response.
                 await emit_progress(progress, model_call_progress_event(message))
-                selected_final_messages, selected_final_tools, final_delivery = self._prepare_primary_delivery(
-                    messages=llm_messages, tools=tools, recorder=recorder, turn_evidence=turn_evidence
+                selected_final_messages, selected_final_tools, final_delivery, final_budget_record = await self._prepare_primary_delivery(
+                    messages=llm_messages,
+                    tools=tools,
+                    recorder=recorder,
+                    turn_evidence=turn_evidence,
+                    budget_frame=budget_frame,
+                    state=state,
+                    initial_version=initial_version,
+                    composition_turns_used=new_composition_turns_used,
+                    discovery_turns_used=discovery_turns_used,
+                    failed_turn=failed_turn,
+                    progress=progress,
                 )
                 completion = await self._call_llm_before_deadline(
                     selected_final_messages,
@@ -2198,6 +2608,7 @@ class ComposerServiceImpl:
                     discovery_turns_used=discovery_turns_used,
                     failed_turn=failed_turn,
                     provider_owner=provider_owner,
+                    context_budget=final_budget_record,
                 )
                 recovery_result = self._terminal_recovery_result(
                     completion, state, recorder, prior_tools_persisted=persisted_tool_call_turn
@@ -2374,6 +2785,7 @@ class ComposerServiceImpl:
         recovery_context: GraphRecoveryContext | None = None,
         retained_operation_context: RetainedOperationContext | None = None,
         turn_evidence: TurnEvidence | None = None,
+        context_budget_history: ContextBudgetHistory | None = None,
     ) -> ComposerResult:
         """Inner composition loop with dual-counter budget tracking.
 
@@ -2458,6 +2870,15 @@ class ComposerServiceImpl:
             user_id=user_id,
             plugin_snapshot=plugin_snapshot,
             policy_catalog=policy_catalog,
+        )
+        budget_frame = self._context_budget_frame(
+            chat_history=messages,
+            llm_messages=llm_messages,
+            state=state,
+            session_id=session_id,
+            plugin_snapshot=plugin_snapshot,
+            policy_catalog=policy_catalog,
+            history=context_budget_history if context_budget_history is not None else ContextBudgetHistory.empty(),
         )
         turn_evidence.transcript.begin_messages(llm_messages)
         tools = composer_loop_tool_definitions(self._planner_dialect)
@@ -2585,6 +3006,7 @@ class ComposerServiceImpl:
                 composition_turns_used=composition_turns_used,
                 discovery_turns_used=discovery_turns_used,
                 failed_turn=failed_turn,
+                budget_frame=budget_frame,
                 provider_owner=provider_owner,
                 turn_evidence=turn_evidence,
             )
@@ -3142,6 +3564,7 @@ class ComposerServiceImpl:
                 composition_turns_used=composition_turns_used,
                 discovery_turns_used=discovery_turns_used,
                 advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
+                budget_frame=budget_frame,
                 plugin_snapshot=plugin_snapshot,
                 advisor_review_state=advisor_review_state,
                 completion_gates=completion_gates,
@@ -3235,6 +3658,46 @@ class ComposerServiceImpl:
         except OSError as exc:
             raise ComposerServiceError(f"Failed to load deployment skill ({type(exc).__name__})") from exc
 
+    def _context_budget_frame(
+        self,
+        *,
+        chat_history: list[ComposerHistoryMessage],
+        llm_messages: list[dict[str, Any]],
+        state: CompositionState,
+        session_id: str | None,
+        plugin_snapshot: PluginAvailabilitySnapshot,
+        policy_catalog: PolicyCatalogView,
+        history: ContextBudgetHistory,
+    ) -> _ContextBudgetFrame:
+        """Label this turn's history and capture the state message inputs, right after :meth:`_build_messages`.
+
+        A history row carrying the user-authorship marker is a user request; an
+        assistant row is assistant prose; any other row is protected.
+        ``schemas_loaded`` is read synchronously after the build, so it is the
+        value the state message was rendered with.
+        """
+        entries: list[tuple[int, SheddableKind | None]] = []
+        for chat_index in history_message_indices(chat_history):
+            history_message = chat_history[chat_index]
+            kind: SheddableKind | None = None
+            if COMPOSER_HISTORY_USER_AUTHORED_KEY in history_message:
+                if history_message[COMPOSER_HISTORY_USER_AUTHORED_KEY] is not True or history_message["role"] != "user":
+                    raise InvariantError("composer user-authorship marker is malformed")
+                kind = SheddableKind.USER_REQUEST
+            elif history_message["role"] == "assistant":
+                kind = SheddableKind.ASSISTANT_PROSE
+            entries.append((chat_index, kind))
+        state_index = _CONTEXT_BUDGET_HISTORY_START + len(entries)
+        return _ContextBudgetFrame(
+            history=history,
+            history_entries=tuple(entries),
+            state_message_content=llm_messages[state_index]["content"],
+            state=state,
+            policy_catalog=policy_catalog,
+            plugin_snapshot=plugin_snapshot,
+            schemas_loaded=self._schema_disclosure.schemas_loaded_for_session(session_id),
+        )
+
     def _new_primary_custody(self, provider_owner: ProviderInvocationOwner | None) -> ProviderCallCustody | None:
         if provider_owner is None:
             return None
@@ -3254,6 +3717,7 @@ class ComposerServiceImpl:
         composition_turns_used: int,
         discovery_turns_used: int,
         failed_turn: FailedTurnMetadata | None,
+        context_budget: ComposerContextBudgetRecord,
         provider_owner: ProviderInvocationOwner | None = None,
     ) -> _AdmittedLLMCompletion:
         """Call the LLM with a per-call timeout derived from the deadline.
@@ -3310,7 +3774,7 @@ class ComposerServiceImpl:
             try:
                 if provider_custody is None:
                     return await self._provider_gateway._call_llm_with_audit(
-                        messages, tools, timeout=remaining, recorder=recorder, credential_state=state
+                        messages, tools, timeout=remaining, recorder=recorder, credential_state=state, context_budget=context_budget
                     )
                 return await self._provider_gateway._call_llm_with_audit(
                     messages,
@@ -3319,6 +3783,7 @@ class ComposerServiceImpl:
                     recorder=recorder,
                     provider_custody=provider_custody,
                     credential_state=state,
+                    context_budget=context_budget,
                 )
             except PromptGuardRefused as exc:
                 raise exc.with_evidence(

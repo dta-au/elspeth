@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, replace
+from pathlib import Path
+from unittest.mock import patch
+from uuid import UUID
 
 import pytest
 import yaml
@@ -33,6 +37,18 @@ from elspeth.web.plugin_policy.availability import build_plugin_snapshot
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+from tests.integration.web.composer.test_freeform_proposal_prevalidation import (
+    _fake_llm_response,
+    _harness,
+    _incremental_base_state,
+    _record_phase3_outcomes,
+    _ScriptedLLM,
+    _tool_turn,
+    _valid_pipeline_args,
+)
+from tests.unit.web._sync_asgi_client import SyncASGITestClient
+from tests.unit.web.sessions.routes.composer.test_proposal_accept_terminal_refusal import _proposal
+from tests.unit.web.sessions.test_routes import _make_app
 
 _SHIELD = PluginId("transform", "aws_bedrock_prompt_shield")
 _PRIVATE_BINDING = "privatespliceguardrailmarker"
@@ -65,6 +81,7 @@ def _policy_context() -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
     settings = WebSettings.model_validate(
         {
             "composer_max_composition_turns": 4,
+            "composer_context_max_prompt_tokens": 200_000,
             "composer_max_discovery_turns": 4,
             "composer_timeout_seconds": 60,
             "composer_rate_limit_per_minute": 20,
@@ -234,11 +251,14 @@ def _reviewed_state() -> CompositionState:
     )
 
 
+@pytest.mark.parametrize("visual_edges", (True, False), ids=("visual-edges", "logical-only"))
 def test_profile_splice_flow_is_valid_review_aware_and_private_binding_safe(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, visual_edges: bool
 ) -> None:
     view, snapshot = _policy_context()
     state = _reviewed_state()
+    if not visual_edges:
+        state = replace(state, edges=())
     arguments = {
         "predecessor_id": "scrape",
         "successor_id": "llm",
@@ -259,12 +279,9 @@ def test_profile_splice_flow_is_valid_review_aware_and_private_binding_safe(
     assert result.success, result.data
     assert result.updated_state.version == state.version + 1
     assert [node.id for node in result.updated_state.nodes] == ["scrape", "prompt_shield", "llm"]
-    assert [edge.id for edge in result.updated_state.edges] == [
-        "source-scrape",
-        "scrape-llm",
-        "scrape-llm__splice__prompt_shield",
-        "llm-output",
-    ]
+    assert [edge.id for edge in result.updated_state.edges] == (
+        ["source-scrape", "scrape-llm", "scrape-llm__splice__prompt_shield", "llm-output"] if visual_edges else []
+    )
     shield = result.updated_state.nodes[1]
     assert shield.options["profile"] == "prompt-default"
     assert "guardrail_identifier" not in shield.options
@@ -345,3 +362,126 @@ def test_profile_splice_flow_is_valid_review_aware_and_private_binding_safe(
     settings = load_settings_from_config_dict(exported, expand_env_vars=True)
     lowered_llm = next(t for t in settings.transforms if t.plugin == "llm")
     assert lowered_llm.options["provider"] == "gateway"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trust_mode", ("auto_commit", "explicit_approve"))
+async def test_freeform_splice_of_planner_shaped_pipeline_applies_or_stages(tmp_path: Path, trust_mode: str) -> None:
+    harness = _harness(tmp_path)
+    await harness.sessions.update_composer_preferences(
+        UUID(harness.session_id), trust_mode=trust_mode, density_default="high", actor="user:proposal-prevalidation-user"
+    )
+    arguments = _valid_pipeline_args(tmp_path)
+    arguments["source"]["on_success"] = "rows"
+    arguments["nodes"] = [
+        {
+            "id": node_id,
+            "node_type": "transform",
+            "plugin": "passthrough",
+            "input": input_name,
+            "on_success": output_name,
+            "on_error": "discard",
+            "options": {"schema": {"mode": "observed"}},
+        }
+        for node_id, input_name, output_name in (("before", "rows", "middle"), ("after", "middle", "main"))
+    ]
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(harness.catalog)
+    catalog = PolicyCatalogView.for_trained_operator(harness.catalog, snapshot)
+    seeded = execute_tool("set_pipeline", arguments, _incremental_base_state(tmp_path), catalog, plugin_snapshot=catalog.snapshot)
+    assert seeded.success, seeded.validation.errors
+    state = seeded.updated_state
+    assert state.edges == ()
+    splice_arguments = {
+        "predecessor_id": "before",
+        "successor_id": "after",
+        "node": {"id": "inserted", "plugin": "passthrough", "options": {"schema": {"mode": "observed"}}, "on_error": "discard"},
+    }
+    llm = _ScriptedLLM(
+        _tool_turn("call_logical_splice", "splice_transform", splice_arguments), _fake_llm_response(content="The insertion is ready.")
+    )
+    with patch.object(harness.service._provider_gateway, "_call_llm", new=llm), _record_phase3_outcomes(harness.service) as batches:
+        result = await harness.service.compose(
+            "Insert one passthrough transform between before and after.",
+            [],
+            state,
+            session_id=harness.session_id,
+            user_id="proposal-prevalidation-user",
+            user_message_id=harness.user_message_id,
+        )
+    assert batches[0][0].response.success
+    proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+    if trust_mode == "auto_commit":
+        assert proposals == []
+        assert [node.id for node in result.state.nodes] == ["before", "inserted", "after"]
+        assert result.state.version == state.version + 1
+    else:
+        assert len(proposals) == 1
+        assert proposals[0].tool_name == "splice_transform"
+        assert proposals[0].status == "pending"
+        assert result.state is state
+    assert result.state.edges == ()
+
+
+def test_approval_accepts_logical_splice_without_creating_visual_edges(tmp_path: Path) -> None:
+    app, sessions = _make_app(tmp_path)
+    client = SyncASGITestClient(app)
+    session_id = UUID(client.post("/api/sessions", json={"title": "Logical splice"}).json()["id"])
+    source_path = tmp_path / "blobs" / str(session_id) / "rows.csv"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_text("value\n1\n", encoding="utf-8")
+    arguments = {
+        "source": {
+            "plugin": "csv",
+            "on_success": "rows",
+            "on_validation_failure": "discard",
+            "options": {"path": str(source_path), "schema": {"mode": "observed"}},
+        },
+        "nodes": [
+            {
+                "id": "after",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "rows",
+                "on_success": "main",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            }
+        ],
+        "edges": [],
+        "outputs": [
+            {
+                "sink_name": "main",
+                "plugin": "json",
+                "options": {
+                    "path": str(tmp_path / "outputs" / str(session_id) / "result.jsonl"),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                "on_write_failure": "discard",
+            }
+        ],
+    }
+    seed = _proposal(sessions, session_id, "set_pipeline", arguments)
+    response = client.post(f"/api/sessions/{session_id}/proposals/{seed.id}/accept")
+    assert response.status_code == 200, response.text
+    before = asyncio.run(sessions.get_current_state(session_id))
+    assert before is not None
+    splice = _proposal(
+        sessions,
+        session_id,
+        "splice_transform",
+        {
+            "predecessor_id": "source",
+            "successor_id": "after",
+            "node": {"id": "inserted", "plugin": "passthrough", "options": {"schema": {"mode": "observed"}}, "on_error": "discard"},
+        },
+        before.id,
+    )
+    response = client.post(f"/api/sessions/{session_id}/proposals/{splice.id}/accept")
+    assert response.status_code == 200, response.text
+    after = asyncio.run(sessions.get_current_state(session_id))
+    assert after is not None
+    assert after.version == before.version + 1
+    assert after.edges == ()
+    assert [node["id"] for node in after.nodes] == ["inserted", "after"]

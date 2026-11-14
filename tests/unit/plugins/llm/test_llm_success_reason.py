@@ -72,6 +72,20 @@ class _PooledExecutorDouble:
     ) -> None:
         self.execute_batch = execute_batch
 
+    def get_stats(self) -> dict[str, Any]:
+        """A PooledExecutor.get_stats() shaped reply (recorded in context_after, sweep finding #100)."""
+        return {
+            "pool_config": {"pool_size": 4, "max_capacity_retry_seconds": 3600, "dispatch_delay_at_completion_ms": 0.0},
+            "pool_stats": {
+                "capacity_retries": 0,
+                "successes": 0,
+                "peak_delay_ms": 0.0,
+                "current_delay_ms": 0.0,
+                "total_throttle_time_ms": 0.0,
+                "max_concurrent_reached": 0,
+            },
+        }
+
 
 def _make_ctx() -> PluginContext:
     """Explicitly authorized mock context for LLM strategy execution."""

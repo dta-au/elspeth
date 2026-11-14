@@ -140,6 +140,7 @@ def _make_settings(**overrides: Any) -> WebSettings:
     defaults: dict[str, Any] = {
         "data_dir": Path("/data"),
         "composer_max_composition_turns": 15,
+        "composer_context_max_prompt_tokens": 200_000,
         "composer_max_discovery_turns": 10,
         "composer_timeout_seconds": 85.0,
         "composer_rate_limit_per_minute": 10,
@@ -1054,8 +1055,8 @@ async def test_compose_loop_records_arg_error_for_non_finite_non_object_argument
 #
 # Matrix: 4 discovery tools x {cache miss, cache hit} = 8 invocation
 # scenarios. Real handlers now cross selected response admission before
-# audit, while cache hits readmit the owned value and build a slim audit
-# envelope. Both paths must preserve the same catalog data.
+# audit, while cache hits readmit the owned value and rebuild the current
+# envelope. Both paths must preserve the delivered envelope.
 # ---------------------------------------------------------------------------
 
 
@@ -1183,9 +1184,8 @@ class TestComposerDiscoveryAuditPreservesResult:
     async def test_cache_hit_audit_preserves_pydantic_payload(self, tool_name: str, tool_args: dict[str, Any]) -> None:
         """Cache-hit replay records the cached catalog data, not the sentinel.
 
-        Cache hits readmit the owned response and build a slim audit
-        envelope. Its canonical data must equal the original miss even
-        though the cache avoids a second handler dispatch.
+        Cache hits readmit the owned response and record the full delivered
+        envelope while avoiding a second handler dispatch.
 
         Sequence: two compose loop turns each issuing the same
         cacheable tool call, then a final text turn. The first call
@@ -1255,17 +1255,13 @@ class TestComposerDiscoveryAuditPreservesResult:
         miss_payload = json.loads(miss_inv.result_canonical)
         hit_payload = json.loads(hit_inv.result_canonical)
 
-        # Cache-miss payload uses the full ToolResult.to_dict shape;
-        # cache-hit uses the slim hand-built shape. Both must contain
-        # the catalog data and neither must contain the sentinel.
         _assert_payload_preserved(miss_payload, tool_name)
-        assert "_canonicalization_error" not in hit_payload, (
-            f"{tool_name}: cache-hit audit row carries sentinel — cache replay path bypassed normalization. Payload: {hit_payload}"
-        )
-        # Hand-built cache-hit shape has data + success + cache_hit.
-        assert hit_payload["success"] is True
-        assert hit_payload["cache_hit"] is True
-        assert "data" in hit_payload
+        _assert_payload_preserved(hit_payload, tool_name)
+        delivered = [message for message in mock_llm.call_args_list[-1][0][0] if message["role"] == "tool"]
+        assert len(delivered) == 2
+        assert miss_payload == json.loads(delivered[0]["content"])
+        assert hit_payload == json.loads(delivered[1]["content"])
+        assert hit_payload["affected_nodes"] == []
         assert hit_payload["data"] == miss_payload["data"]
 
         if tool_name == "list_sources":
@@ -1273,6 +1269,28 @@ class TestComposerDiscoveryAuditPreservesResult:
         elif tool_name == "get_plugin_schema":
             assert hit_payload["data"]["name"] == "csv"
             assert hit_payload["data"]["json_schema"] == {"title": "Config", "properties": {}}
+
+
+def test_historical_slim_cache_hit_remains_readable() -> None:
+    """Historical cache rows remain successful lookups without new envelope keys."""
+    from elspeth.web.composer.audit import begin_dispatch, finish_success
+    from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
+    from elspeth.web.sessions.routes._helpers import _tool_call_outcomes_by_call_id, _ToolCallOutcomeKind
+    from tests.unit.web.sessions.routes.test_tool_call_outcomes import _tool_row
+
+    historical = {"success": True, "data": {"grammar": "historical grammar"}, "cache_hit": True}
+    invocation = finish_success(
+        begin_dispatch("historical-hit", "get_expression_grammar", {}, version_before=2, actor="composer"),
+        result_payload=historical,
+        version_after=2,
+        cache_hit=True,
+    )
+    content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
+    row = _tool_row(tool_call_id="historical-hit", content=content, tool_calls=[envelope])
+    outcomes = _tool_call_outcomes_by_call_id([row], state_versions_by_id={})
+    assert outcomes["historical-hit"].outcome is _ToolCallOutcomeKind.COMPLETED
+    assert outcomes["historical-hit"].applied_state_version is None
+    assert json.loads(content)["success"] is True
 
 
 @pytest.mark.asyncio

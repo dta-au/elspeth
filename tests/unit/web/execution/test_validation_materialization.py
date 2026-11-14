@@ -421,7 +421,7 @@ def test_materialization_does_not_catch_yaml_path_or_bounded_yaml_exceptions(
     if stage == "path":
         monkeypatch.setattr(
             "elspeth.web.execution._validation_materialization.resolve_runtime_yaml_paths",
-            lambda pipeline_yaml, data_dir, *, session_id: (_ for _ in ()).throw(ExpectedError("path")),
+            lambda pipeline_yaml, data_dir, *, session_id, mcp_root_authority: (_ for _ in ()).throw(ExpectedError("path")),
         )
 
     with pytest.raises(ExpectedError, match=stage):

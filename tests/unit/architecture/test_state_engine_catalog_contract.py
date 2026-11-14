@@ -32,8 +32,8 @@ V3_ASSESSMENT_SCHEMA_PATH = V3_CATALOG_DIRECTORY / "assessment.schema.json"
 ASSESSMENT_SCRIPT_PATH = REPOSITORY_ROOT / "scripts/state_engine_assessment.py"
 PROFILE_REPORTER_PLUGIN = "scripts.state_engine_profile_reporter"
 V1_CATALOG_SHA256 = "2e025df8fcb61869f4ac2575d2d1b0c5bba5aa63c88c0d059e630431062eef2e"
-V2_CATALOG_SHA256 = "08f3faadaf07ee5aa8c1a793250b775e5a7b80a745b78e26f357d1e061dbd3dc"
-V3_CATALOG_SHA256 = "b78c4b6d007967fd000544b4cd06f27993936c30e6576cc48909b0f512fa4713"
+V2_CATALOG_SHA256 = "0e2b941519571ca8a2a2736c696482b7f42d07a96c63dff3abe76fdb31d9c130"
+V3_CATALOG_SHA256 = "c4b55bbc70c663bae2f43b12173135e38aee890e2fca43a17659a021481ca440"
 
 
 def _load_catalog(path: Path) -> dict[str, object]:
@@ -165,7 +165,7 @@ def test_v2_catalog_plugin_cases_exhaust_live_inventory() -> None:
     ]
 
     assert pb09["required_cases"] == expected
-    assert len(expected) == 60
+    assert len(expected) == 62
 
 
 def test_v1_catalog_remains_byte_identical_historical_evidence() -> None:

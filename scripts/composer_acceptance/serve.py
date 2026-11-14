@@ -162,6 +162,7 @@ def main() -> None:
         composer_model=args.planner,
         composer_advisor_model=args.advisor,
         composer_max_composition_turns=12,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=6,
         composer_timeout_seconds=900,
         composer_transport_idle_ceiling_seconds=960,

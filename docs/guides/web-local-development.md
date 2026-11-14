@@ -6,7 +6,7 @@ topologies, use the [deployment platform reference](../reference/deployment-plat
 
 ## Prerequisites
 
-- Python 3.12 or newer and [uv](https://docs.astral.sh/uv/)
+- Python 3.14 or newer and [uv](https://docs.astral.sh/uv/)
 - Node.js 24 and npm 11 (the frontend's pinned toolchain)
 - OpenSSL to generate local secret keys
 - Credentials for the Composer model provider you configure
@@ -29,6 +29,7 @@ mkdir -p data/blobs data/outputs
 export ELSPETH_WEB__SECRET_KEY="$(openssl rand -hex 32)"
 export ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY="$(openssl rand -base64 32)"
 export ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS=15
+export ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS=200000  # set to your model gateway's prompt-token limit
 export ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS=10
 export ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=180.0
 export ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE=60

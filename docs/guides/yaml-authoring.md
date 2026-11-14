@@ -252,9 +252,9 @@ the example links contain complete settings files and prerequisite notes.
 | Cloud/business input | Sources `aws_s3`, `azure_blob`, `dataverse`, `power_automate` | Object/table/flow identity, credentials, schema, and bounded transfer controls. [S3 contract](../reference/configuration.md#available-source-plugins), [Power Automate](../../examples/power_automate/README.md). |
 | Rename, calculate, normalize | Transforms `field_mapper`, `value_transform`, `type_coerce`, `truncate`, `passthrough` | `mapping`/`select_only`, `operations`, `conversions`, or `fields`. [Reference enrichment and calculations](../../examples/reference_join/README.md). |
 | Filter or expand rows | Transforms `keyword_filter`, `json_explode`, `line_explode`; batch plugin `batch_replicate` | Content patterns, array/text fields, or copies field. Use a gate for expression routing; use a scope/collector for per-parent expansion results. [JSON explode](../../examples/json_explode/README.md), [deaggregation](../../examples/deaggregation/README.md). |
-| Lookup or fetch context | Transforms `reference_join`, `web_scrape`, `rag_retrieval`, `azure_ai_search` | Reference table and match key, URL/query field, or retrieval provider/index. [Reference joins](../../examples/reference_join/README.md), [web scraping](../reference/web-scrape-transform.md), [Chroma](../../examples/chroma_rag/README.md). Network/retrieval plugins have extra prerequisites. |
+| Lookup or fetch context | Transforms `reference_join`, `file_inject`, `web_scrape`, `rag_retrieval`, `azure_ai_search` | Reference table and match key, bound files and their formats, URL/query field, or retrieval provider/index. [Reference joins](../../examples/reference_join/README.md), [whole files on rows](../../examples/file_inject/README.md), [web scraping](../reference/web-scrape-transform.md), [Chroma](../../examples/chroma_rag/README.md). Network/retrieval plugins have extra prerequisites. |
 | LLM generation | Source `llm` for one authored prompt; transform `llm` for a prompt per arriving row | Provider/profile, prompt, input declarations, response shape, capacity controls. [LLM source](../../examples/llm_source/README.md) and [queries below](#author-llm-queries). |
-| Document extraction | `pdf_rasterize`, `azure_document_intelligence`, `aws_textract_document_analysis`, `aws_textract_inline_analysis` | Managed blobs or service document references, page/extraction options. [PDF rasterization](../../examples/pdf_rasterize/README.md), [Textract](../../examples/textract_inline/README.md). Service extraction is billable. |
+| Document extraction | `pdf_rasterize`, `azure_document_intelligence`, `azure_content_understanding`, `aws_textract_document_analysis`, `aws_textract_inline_analysis` | Managed blobs or service document references, page/extraction options. [PDF rasterization](../../examples/pdf_rasterize/README.md), [Textract](../../examples/textract_inline/README.md). Service extraction is billable. |
 | Content controls | `azure_content_safety`, `azure_prompt_shield`, `aws_bedrock_content_safety`, `aws_bedrock_prompt_shield` | Declared text fields, service credentials, thresholds or guardrail identity. [Required controls](../reference/configuration.md#required-controls-and-error-routing). |
 | Batch statistics/comparison | `batch_stats`, `batch_rank`, `batch_classifier_metrics`, `batch_data_quality_report`, `batch_distribution_profile`, `batch_drift_compare`, `batch_effect_size`, `batch_experiment_compare`, `batch_outlier_annotator`, `batch_paired_preference`, `batch_threshold_summary`, `batch_top_k` | Put batch-aware plugins in `aggregations` or a bound `collector`, then select value/group/variant fields. [Statistics examples](../../examples/statistical_batch_plugins/README.md). |
 | Reports and local output | Batch transform `report_assemble`; sinks `csv`, `json`, `text`, `document` | File path, schema, collision policy; text/document select one string field. `text` writes LF-delimited records; `document` writes one whole field value. [Report assembly](../../examples/report_assemble/README.md). |
@@ -281,6 +281,81 @@ The mapping direction is arriving field → output field. For calculations use
 evaluate expressions. For a static reference table use `reference_join`, not
 a second source plus an assumed SQL join. Multiple independent sources can
 feed a queue, but a queue does not join records by key.
+
+### Put a whole file on each row
+
+Use `file_inject` when a later node needs a whole document on the row, such as
+guidance text for an LLM prompt. Name each file beside the settings file and
+state its `format`. `mode: select` writes one file per row, chosen by a row
+value. This fragment consumes `tickets` and assumes sinks named `output` and
+`quarantine`:
+
+```yaml
+transforms:
+  - name: attach_guidance
+    plugin: file_inject
+    input: tickets
+    on_success: output
+    on_error: quarantine
+    options:
+      schema: {mode: observed}
+      mode: select
+      key_field: type
+      output_field: guidance
+      files:
+        "A": {content_file: guidance_a.md, format: text}
+        "B": {content_file: guidance_b.md, format: text}
+```
+
+A row with `type: A` leaves with the text of `guidance_a.md` in `guidance`. A
+later `llm` node reads it as `{{ row.guidance }}` and may list `guidance` in
+`required_input_fields`, because `file_inject` guarantees the field.
+
+`mode: all` drops `key_field` and the top-level `output_field`, and gives each
+entry its own `output_field`. Every row then receives every file:
+
+```yaml
+      mode: all
+      files:
+        "policy": {content_file: policy.md, format: text, output_field: policy_text}
+        "rubric": {content_file: rubric.json, format: json, output_field: rubric}
+```
+
+What to know before you run it:
+
+- **Formats.** `text` writes the file as one string, with nothing trimmed. A
+  `content_file` is read in text mode, so Windows (`\r\n`) line endings arrive
+  as `\n`; a file uploaded in Composer keeps its line endings. `json` writes
+  the parsed value, or one member of a top-level object with `data_key`.
+  `jsonl` writes a list with one parsed value per non-blank line. `csv` needs a
+  header row and writes a list of objects keyed by it; cells stay strings.
+  `format` is never inferred from the file name.
+- **Entry names.** In `select` they are the key values, compared exactly as
+  written. Quote them, so YAML does not read `1` or `true` as a number or a
+  boolean.
+- **Misses.** A row whose key names no entry follows `on_miss`. The default,
+  `fail`, sends the original row through `on_error`. `null` writes null.
+  `default` writes `default_content`. A missing key field or a key that is not
+  a string is a row error under every policy.
+- **New fields only.** An output field must not already be on the arriving
+  row. `file_inject` does not overwrite.
+- **Paths.** `content_file` resolves relative to the settings file and must
+  stay inside its directory. Files are read as UTF-8; there is no `encoding`
+  option.
+- **Validation.** Every file is read and parsed when the settings are
+  validated. A missing file, malformed JSON, or a CSV row with the wrong number
+  of cells stops `elspeth validate`.
+- **Size.** Parsed content is limited to 16 MiB per entry and 64 MiB per node.
+  JSON may nest 100 levels. A CSV cell may hold 131,072 characters; put longer
+  text in a `text` or `json` file.
+- **Resume.** The content is part of the node's configuration. Edit a bound
+  file between a run and its resume and the resume is refused. Replay uses the
+  content recorded with the original run.
+
+The [configuration reference](../reference/configuration.md#bound-files-as-row-fields)
+lists every option and refusal. The
+[`file_inject` example](../../examples/file_inject/README.md) runs both modes
+and a miss with no LLM or network.
 
 ## Route, fork, join, and batch
 

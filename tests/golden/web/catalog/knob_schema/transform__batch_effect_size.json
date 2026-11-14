@@ -42,7 +42,7 @@
       },
       {
         "default": null,
-        "description": "Optional baseline variant. When omitted, the first-seen variant is the baseline.",
+        "description": "Optional baseline variant (string, integer, number or boolean), matched by exact type. When omitted, the first-seen variant is the baseline.",
         "kind": "json-value",
         "label": "Baseline Variant",
         "name": "baseline_variant",

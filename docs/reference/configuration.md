@@ -1583,6 +1583,7 @@ hosted server, which is why the web boundary pins `base_url` separately.
 | Plugin | Purpose |
 |--------|---------|
 | `azure_document_intelligence` | Enrich rows with Azure AI Document Intelligence extraction |
+| `azure_content_understanding` | Enrich rows with an Azure AI Content Understanding analyzer (documents, images, audio, video) |
 | `blob_fetch` | Fetch an operator-authorised remote document into the run payload store |
 | `blob_csv_expand` | Expand a payload-store CSV blob into output rows |
 | `passthrough` | Pass rows unchanged |
@@ -1609,6 +1610,7 @@ hosted server, which is why the web boundary pins `base_url` separately.
 | `azure_ai_search` | Azure RAG: enriches rows with ranked, cited context from an existing Azure AI Search index ([example](../../examples/azure_search_rag/README.md)) |
 | `rag_retrieval` | Enriches rows with retrieval-augmented context from a Chroma collection |
 | `reference_join` | Add named fields through one or several independent lookups against configuration-bound reference tables (`reference_file` on the CLI, an `inline_content` blob on the web) — fixed at run start, never read at row time |
+| `file_inject` | Write the whole content of configuration-bound files into row fields, either every file on every row or one file chosen by a row value (`content_file` on the CLI, an uploaded `inline_content` blob on the web) — fixed at run start, never read at row time ([options](#bound-files-as-row-fields)) |
 
 ### Multiple reference lookups
 
@@ -1683,6 +1685,220 @@ missing files fail configuration loading. They are not missing matches and
 cannot be hidden by a default. Output field collisions are rejected by the
 normal pipeline checks. There is no fixed lookup-count limit; the combined
 materialized indexes must fit the node's cell and byte safeguards.
+
+### Bound files as row fields
+
+`file_inject` writes the whole content of one or more files into row fields.
+Use it when a later step, usually an LLM prompt, needs a document that depends
+on the row or is the same for every row. To take one record out of a keyed
+table, use `reference_join`.
+
+`mode` is required and has no default. `mode: select` writes the one entry
+whose name equals the row's `key_field` value. This fragment assumes the
+pipeline also defines a sink named `quarantine`:
+
+```yaml
+name: attach_guidance
+plugin: file_inject
+input: tickets
+on_success: with_guidance
+on_error: quarantine
+options:
+  schema: {mode: observed}
+  mode: select
+  key_field: type
+  output_field: guidance
+  on_miss: fail
+  files:
+    "A": {content_file: guidance_a.md, format: text}
+    "B": {content_file: guidance_b.json, format: json, data_key: rubric}
+    "C": {content_file: guidance_c.csv, format: csv}
+```
+
+`mode: all` writes every entry onto every row, each to its own field. A single
+unconditional file is `mode: all` with one entry:
+
+```yaml
+name: attach_policy
+plugin: file_inject
+input: tickets
+on_success: with_policy
+on_error: quarantine
+options:
+  schema: {mode: observed}
+  mode: all
+  files:
+    "policy": {content_file: policy.md, format: text, output_field: policy_text}
+    "examples": {content_file: examples.csv, format: csv, output_field: examples}
+```
+
+Top-level options:
+
+| Option | Mode | Meaning |
+| ------ | ---- | ------- |
+| `mode` | both | `select` or `all`. Required. |
+| `files` | both | Entry name → entry. At least one entry. |
+| `key_field` | `select` | Row field whose value names the entry. Required. |
+| `output_field` | `select` | New row field the selected content is written to. Required. |
+| `on_miss` | `select` | `fail` (default), `null`, or `default`. |
+| `default_content` | `select` | Value written on a miss when `on_miss: default`. Required then, refused otherwise. Not available in Composer. |
+
+Options of each `files` entry:
+
+| Option | Meaning |
+| ------ | ------- |
+| `content_file` | CLI settings files only. Path relative to the settings file; must stay inside its directory. Read as UTF-8 when the settings load. |
+| `content` | The file's text, written inline. Give `content` or `content_file`, not both. In Composer this is where an uploaded file is attached. |
+| `format` | `text`, `json`, `jsonl`, or `csv`. Required; never inferred from the file name. |
+| `data_key` | `json` only. Write this member of the file's top-level object instead of the whole value. |
+| `delimiter` | `csv` only. One character, default `,`. |
+| `output_field` | `all` only, and required there: the new row field this entry is written to. |
+
+The loader also writes `content_source`, the original path, beside each
+materialized `content`. It appears in diagnostics; do not set it.
+
+Entry names must be non-empty strings with no leading or trailing whitespace.
+A name YAML reads as a string, such as `A`, may be left unquoted. One it reads
+as another type, such as `1` or `true`, is refused unless quoted, so quoting
+every name is the safe habit. In `select` they are the key values and are
+compared exactly: no trimming, no case folding, no coercion. A row value `1`
+does not match an entry named `"1"`. In `all` they are labels.
+
+| `format` | Value written | Rules |
+| -------- | ------------- | ----- |
+| `text` | The whole content as one string. Nothing is trimmed; a leading byte-order mark is kept. Line endings depend on how the file was bound, as described below. | None. |
+| `json` | The parsed value: an object, an array, or a scalar. With `data_key`, that member. | `NaN`, `Infinity`, and numbers that overflow are refused, as are integers outside the JSON safe range (see below), duplicate object members, and empty content. `data_key` needs a top-level object that has the member. |
+| `jsonl` | A list with one parsed value per non-blank line. | The `json` rules apply to each line. |
+| `csv` | A list with one object per data row, keyed by the header. Cells stay strings. | A header row is required; there is no headerless form. Empty or duplicate header names are refused, and so is a data row with more or fewer cells than the header. |
+
+For `json`, `jsonl`, and `csv` a leading byte-order mark is removed before
+parsing. There is no `encoding` option: `content_file` is read as UTF-8.
+
+Line endings in a `text` value differ between the two ways of binding a file:
+
+- A `content_file` in a CLI settings file is read in text mode, so every
+  Windows (`\r\n`) or old Mac (`\r`) line ending becomes `\n`.
+- A file uploaded in Composer is written exactly as uploaded, so `\r\n`
+  stays `\r\n`.
+
+The same file can therefore produce a different `text` value, and a different
+row hash, on the CLI and in Composer. Save the file with `\n` line endings if
+that matters. The structured formats are not affected: `json`, `jsonl`, and
+`csv` read every line ending alike.
+
+An empty file behaves differently per format:
+
+| `format` | Empty content |
+| -------- | ------------- |
+| `text` | Writes the empty string `""`. |
+| `jsonl` | Writes the empty list `[]`. A file of only blank lines does the same. |
+| `json` | Refused: the format needs one JSON value. |
+| `csv` | Refused: a header row is required. A header with no data rows writes `[]`. |
+
+Each written field is declared in the node's output schema and guaranteed on
+every row the node emits, so a downstream node may name it in
+`required_input_fields`:
+
+- In `all`, a `text` entry declares `str`; any other format declares `any`.
+- In `select`, the field is `str` when every entry is `text` and
+  `default_content`, if set, is a string. Otherwise it is `any`. It is nullable
+  when `on_miss: null`.
+- In either mode a field is nullable when a bound JSON value is itself `null`.
+
+You may declare a written field in the node's `schema`. The declaration is
+checked against what the bound content can produce and refused when it is
+wrong; it must be `required`.
+
+In `select`, a row's outcome depends on its key:
+
+| Row | Result |
+| --- | ------ |
+| Key names an entry | That entry's value is written. |
+| Key is a string naming no entry | `on_miss: fail` sends the original row through the node's `on_error`. `on_miss: null` writes null. `on_miss: default` writes `default_content`. |
+| `key_field` is absent | Row error under every `on_miss`. |
+| Key is not a string, including null | Row error under every `on_miss`. |
+
+A row that already carries an output field is a row error in both modes;
+`file_inject` never overwrites an arriving field. Error reasons name the field
+and, for a miss, the entry names. They never contain the row's value or any
+file content. `on_miss: fail` is the default because a row without its document
+looks like any other row at a sink.
+
+These are refused when the configuration is validated, before any row is
+processed:
+
+- a `content_file` that is missing, is a directory, is not UTF-8 text, resolves
+  outside the settings directory, or is given together with `content`;
+- an entry with neither `content` nor `content_file`, or with no `format`;
+- content that does not parse under its `format`;
+- a value a row cannot carry, in any format and in `default_content`: an
+  integer outside the JSON safe range of ±(2^53 − 1), which is
+  ±9,007,199,254,740,991, or text holding a character that cannot be encoded
+  as UTF-8 (a lone surrogate, which a JSON `\ud800` escape can produce). Write
+  a large identifier as a string, in quotes;
+- `data_key` on a format other than `json`, or a `delimiter` other than the
+  default `,` on a format other than `csv`;
+- a `delimiter` that is not exactly one character, or is a double quote or a
+  line break;
+- an entry name that is not a string, is empty, or has leading or trailing
+  whitespace;
+- an option that belongs to the other mode: `key_field`, top-level
+  `output_field`, `on_miss`, or `default_content` in `all`; an entry-level
+  `output_field` in `select`;
+- a missing `key_field` or `output_field` in `select`, or an entry without
+  `output_field` in `all`;
+- two entries writing the same `output_field`;
+- an `output_field` that equals `key_field` or is named in the node's
+  `required_input_fields`;
+- `on_miss: default` without `default_content`, `default_content` under any
+  other `on_miss`, or a `default_content` that is not plain JSON data;
+- an unknown option, such as `encoding`;
+- content over the limits below.
+
+Limits:
+
+| Limit | Value |
+| ----- | ----- |
+| Parsed value of one entry | 16 MiB |
+| Parsed values of one node, all entries plus `default_content` | 64 MiB |
+| JSON nesting, in `json`, each `jsonl` line, and `default_content` | 100 levels |
+| One CSV cell | 131,072 characters (Python's per-cell limit). Put longer text in a `text` or `json` file. |
+| Composer attachment | 256 KiB per file and 1 MiB across all inline attachments in the pipeline |
+
+The per-node limit counts every entry in both modes. In `all` that total is
+added to every row, so keep bound files small.
+
+The content is part of the node's configuration. It is fixed when the settings
+load, and the transform opens no file while rows are processed. Because it is
+in the node's options it is also in the run's topology hash: if a bound file is
+edited between a run and its resume, the resume is refused with "Pipeline
+configuration changed since checkpoint was created". Replay and verify use the
+content recorded with the original run and do not read the file.
+
+Loaders that expand environment variables reject `${VAR}` placeholders in
+inline `content` and in `default_content` before expansion. Text read from a
+`content_file` or a Composer upload is kept literally.
+
+In Composer, `content` must be a file the user uploaded, attached at
+`node:<node_id>.options.files.<entry_name>.content`. Anything else there is
+refused, including in imported YAML: literal text, a file the planner created,
+a file a pipeline wrote as output, an upload the planner has since rewritten
+with `update_blob` (it becomes the planner's file), and a session-fork copy of
+any of these.
+`default_content` is refused in any form.
+
+An upload can only be attached to an entry whose name starts with a letter or
+`_` and contains only letters, digits, `_` and `-` (`[A-Za-z_][A-Za-z0-9_-]*`),
+so in Composer every entry name must have that form, in both modes. Names such
+as `v1.2`, `Type A` or `2024` are refused. In `mode: select` the entry name is
+the value rows are matched on, so a key column with values of another form
+cannot be matched as it stands: add a step before `file_inject` that maps those
+values to names of that form. Renaming an entry changes which rows match it.
+See
+[Attach uploaded files to rows](../guides/user-manual.md#attach-uploaded-files-to-rows)
+in the user manual. A settings file run from the CLI is not restricted this
+way. The [`file_inject` example](../../examples/file_inject/README.md) has
+runnable settings for both modes and for a miss.
 
 ### AWS Bedrock LLM
 
@@ -1853,6 +2069,14 @@ Each configured field must receive an explicit safe result. A detect-only
 positive is blocked even when the top-level Guardrail action is `NONE`, and an
 intervention, service failure, or malformed response also fails closed without
 including provider-generated text in row data or error details.
+
+`row_deadline_seconds` (default `300`, must be positive) bounds how long a row
+may keep starting Guardrail calls. A field still unscanned when the deadline
+passes fails the row closed as `retry_timeout` / `row_deadline_exceeded`.
+Throttling, 5xx and transport failures are handed to the engine retry policy,
+which re-runs every configured field under a new attempt; each call from the
+failed attempt stays recorded against that attempt. Web Composer sessions do
+not expose this option and use the default.
 
 The harmful-content categories required by this AWS plugin do not include
 Azure Content Safety's `self_harm` category. A deployment must not claim Azure

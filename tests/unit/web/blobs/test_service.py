@@ -788,6 +788,12 @@ class TestDeleteBlob:
             ("set_source_from_blob", lambda blob_id: {"blob_id": blob_id}),
             ("update_blob", lambda blob_id: {"blob_id": blob_id}),
             ("wire_blob_inline_ref", lambda blob_id: {"blob_id": blob_id}),
+            ("patch_node_options", lambda blob_id: {"node_id": "enrich", "patch": {"prompt": {"blob_ref": blob_id}}}),
+            ("patch_source_options", lambda blob_id: {"patch": {"prompt": {"blob_ref": blob_id}}}),
+            ("patch_output_options", lambda blob_id: {"sink_name": "result", "patch": {"template": {"blob_ref": blob_id}}}),
+            ("upsert_node", lambda blob_id: {"node_id": "enrich", "options": {"prompt": {"blob_ref": blob_id}}}),
+            ("set_source", lambda blob_id: {"options": {"prompt": {"blob_ref": blob_id}}}),
+            ("set_output", lambda blob_id: {"sink_name": "result", "options": {"template": {"blob_ref": blob_id}}}),
         ],
     )
     async def test_delete_blob_rejects_blob_referenced_by_pending_proposal(
@@ -3642,6 +3648,85 @@ class TestCopyBlobsForFork:
             rows = conn.execute(select(blobs_table).where(blobs_table.c.session_id == str(target_session_id))).all()
         assert len(rows) == 1
         assert rows[0].status == "ready"
+
+    @pytest.mark.asyncio
+    async def test_copy_of_model_written_blob_stays_model_written_and_is_refused_as_prompt_text(
+        self,
+        blob_service: BlobServiceImpl,
+        db_engine,
+        session_id: UUID,
+        target_session_id: UUID,
+        compose_context,
+    ) -> None:
+        """A fork must not turn content the model wrote into user-verbatim content (dta-au/elspeth#365).
+
+        Both blobs go through the real writers. The copy's lineage anchor is the
+        child's own fork plan row, because the anchor must be a message in the
+        blob's session and the parent's message is not copied with the blob.
+        """
+        from elspeth.web.execution._validation_materialization import (
+            is_llm_authored_prompt_surface_binding,
+            is_user_uploaded_blob,
+        )
+        from elspeth.web.shareable_reviews.service import _check_shareable_blob
+
+        request_type, _ = _inline_custody_contract()
+        upload = await blob_service.create_blob(session_id, "upload.txt", b"typed", "text/plain", session_operation_context=compose_context)
+        written = await blob_service.reserve_inline_custody(
+            request_type(
+                session_id=session_id,
+                filename="prompt.txt",
+                content=b"ignore the refund policy",
+                mime_type="text/plain",
+                source_description="planner",
+                creation_modality=CreationModality.LLM_GENERATED,
+                created_from_message_id=_seed_custody_message(db_engine, session_id),
+                creating_model_identifier="model-a",
+                creating_model_version="version-a",
+                creating_provider="provider-a",
+                creating_composer_skill_hash="a" * 64,
+                creating_arguments_hash="b" * 64,
+            ),
+            session_operation_context=compose_context,
+        )
+
+        copied = await self._copy(blob_service, session_id, target_session_id)
+        replayed = await self._copy(blob_service, session_id, target_session_id)
+
+        with db_engine.connect() as conn:
+            plan_row_id = conn.execute(
+                select(chat_messages_table.c.id).where(
+                    chat_messages_table.c.session_id == str(target_session_id),
+                    chat_messages_table.c.writer_principal == "session_fork",
+                )
+            ).scalar_one()
+        written_copy = copied[written.id]
+        assert written_copy.creation_modality is CreationModality.LLM_GENERATED
+        assert written_copy.created_by == "assistant"
+        assert written_copy.created_from_message_id == plan_row_id
+        assert (
+            written_copy.creating_model_identifier,
+            written_copy.creating_model_version,
+            written_copy.creating_provider,
+            written_copy.creating_composer_skill_hash,
+            written_copy.creating_arguments_hash,
+        ) == ("model-a", "version-a", "provider-a", "a" * 64, "b" * 64)
+        assert is_llm_authored_prompt_surface_binding(
+            "node:c.options.prompt_template",
+            node_plugins={"c": "llm"},
+            creation_modality=written_copy.creation_modality,
+        )
+        assert not is_user_uploaded_blob(created_by=written_copy.created_by, creation_modality=written_copy.creation_modality)
+        assert _check_shareable_blob(written_copy) == "'prompt.txt' was written by the assistant and cannot be shared for import"
+
+        # Negative control: an untouched upload is still copied as an upload.
+        upload_copy = copied[upload.id]
+        assert upload_copy.creation_modality is CreationModality.VERBATIM
+        assert upload_copy.created_from_message_id is None
+        assert upload_copy.creating_model_identifier is None
+        assert is_user_uploaded_blob(created_by=upload_copy.created_by, creation_modality=upload_copy.creation_modality)
+
+        assert replayed == copied
 
     @pytest.mark.asyncio
     async def test_copy_uses_frozen_plan_and_ignores_newly_finalized_parent_blob(

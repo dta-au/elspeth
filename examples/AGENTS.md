@@ -11,6 +11,11 @@ uv pip install -e ".[all]"
 
 Ensure `errorworks` is installed with its entry points (`chaosllm`, `chaosweb` are standalone commands, NOT `elspeth` subcommands).
 
+Install the `sqlite3` command-line tool (e.g. `apt install sqlite3`). The
+`multi_worker`, `multi_worker_showcase` and `join_refused` launchers poll the
+audit DB with it and refuse to start without it, and most READMEs use it for
+their audit queries.
+
 ## Example Categories
 
 ### Standalone (no external services)
@@ -37,6 +42,8 @@ These run immediately with no setup:
 | `json_explode` | 3 | JSON source with array expansion (3→6 output) |
 | `transform_pipeline` | 5 | Type coercion followed by dependent derived-field calculations |
 | `reference_join` | 5 / 5 / 3 / 5 / 4 | Keyed enrichment from config-bound reference tables; run one `settings*.yaml` file at a time. `settings.yaml` joins a flat CSV table, `settings_nested.yaml` a sparse nested JSON table with per-field defaults, and `settings_missing_product.yaml` ends PARTIAL/exit 1 **by design** with one missing product. `settings_multi.yaml` performs three independent lookups across three CSVs, supplies separate product/region defaults, and ends PARTIAL/exit 1 **by design**: four enriched orders and one original whole row quarantined on a later tax lookup miss. `settings_chained.yaml` resolves a shared product key then consumes it in two later tables: three enriched orders and one original row quarantined, PARTIAL/exit 1 **by design**. `reference_file` resolves relative to the SETTINGS directory, not the repo root |
+| `file_inject` | 4 / 4 / 3 | Whole files bound as configuration written into row fields; run one `settings*.yaml` file at a time. `settings.yaml` (`mode: select` on `type`) writes a text, a parsed JSON or a parsed CSV value to `guidance` and `settings_all.yaml` (`mode: all`) writes all three files onto every row; both COMPLETED/exit 0. `settings_miss.yaml` ends PARTIAL/exit 1 **by design**: 2 tickets written and 1 original row, whose type has no entry, routed to `unmatched_type_tickets.jsonl`. `content_file` resolves relative to the SETTINGS directory, not the repo root |
+| `reference_join_chain` | 5 | One `reference_join` node whose second lookup consumes the field its first lookup produced (customer → region → regional policy); ends PARTIAL/exit 1 **by design** with 3 enriched tickets and 2 original tickets quarantined |
 | `landscape_journal` | 2 | JSON source, audit journal |
 | `multi_flow` | 4 | Two independent named source flows in one run |
 | `multi_source_queue` | 3 | Multiple named sources fan into a queue |
@@ -72,8 +79,10 @@ per config, not a blanket `-eq 0`:
 | `document_review_panel/settings_incomplete.yaml` | 1 | one page loses a reviewer; the page, then the document verdict, fail closed |
 | `document_review_panel/settings_run_as_row.yaml` | 1 | same loss, run encapsulated as one row — the corpus verdict is refused entirely |
 | `reference_join/settings_missing_product.yaml` | 1 | 1 order names a product absent from the reference table; `on_miss: fail` quarantines it |
+| `reference_join_chain/settings.yaml` | 1 | 2 tickets miss a lookup (no customer; no regional policy); `on_miss: fail` quarantines each original ticket |
 | `reference_join/settings_multi.yaml` | 1 | 1 order's tax lookup misses after earlier enrichment/defaults; its whole original row is quarantined |
 | `reference_join/settings_chained.yaml` | 1 | 1 order's fulfilment lookup misses after shared-key and product enrichment; its whole original row is quarantined |
+| `file_inject/settings_miss.yaml` | 1 | 1 ticket's `type` names no `files` entry; `on_miss: fail` routes it to the `unmatched` sink |
 | `batch_error_routing/settings.yaml` | 1 | 1 wrongly typed amount fails its batch; all 3 rows of it routed to `failed_batches` |
 | `batch_error_routing/settings_discard.yaml` | 1 | the same failed batch under `on_error: discard`; its 3 rows recorded as quarantined |
 | `batch_error_routing/settings_declared.yaml` | 1 | the declared `amount_cents: int` routes the 1 bad row before the batch |

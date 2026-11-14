@@ -4,7 +4,7 @@ Thanks for your interest in contributing to ELSPETH! This document covers the ba
 
 ## Development Setup
 
-Install Python 3.12 or newer, `uv`, Node.js 24, and npm 11. The repository's
+Install Python 3.14 or newer, `uv`, Node.js 24, and npm 11. The repository's
 `.node-version`, `package.json`, and lockfiles are the toolchain authority.
 
 ```bash
@@ -147,6 +147,11 @@ gate that catches it lives in a test file you did not run.
   web acceptance fixture shares one PostgreSQL container). CI runs that
   selection in the required `Testcontainer (PostgreSQL contention proofs)`
   job; a PostgreSQL-only defect is invisible to everything else.
+- The default selection also deselects `timing_sensitive`; a green
+  `pytest tests/` does NOT cover those tests. Run
+  `pytest tests/ -m timing_sensitive -n 0` serially, as the separate required
+  `timing-sensitive` CI job does. These tests assert wall-clock deadlines or
+  spawn and kill real processes and can fail under host contention.
 - Several gates run **only in CI** (`trust_boundary.tests`, the plugin
   `source_file_hash` check): a green local suite and a green pre-commit hook
   prove nothing about them. Run the CI command yourself; the commands are

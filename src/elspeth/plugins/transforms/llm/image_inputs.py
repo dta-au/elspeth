@@ -156,6 +156,19 @@ def resolve_image_parts(
                 return TransformResult.error(missing_reason, retryable=False)
             continue
 
+        # A required field holding an empty reference collection would
+        # otherwise contribute no parts, and the call would go out text-only
+        # for a row whose required image was never sent.
+        if isinstance(row[spec.field], (list, tuple)) and not row[spec.field]:
+            if spec.required:
+                empty_list_reason: TransformErrorReason = {
+                    "reason": "invalid_input",
+                    "field": spec.field,
+                    "error_type": "empty_image_list",
+                }
+                return TransformResult.error(empty_list_reason, retryable=False)
+            continue
+
         image_format = _resolve_format(spec, row)
         if isinstance(image_format, TransformResult):
             return image_format
@@ -172,10 +185,13 @@ def resolve_image_parts(
         for list_index, ref in refs:
             prepared.append((spec, image_format, list_index, ref))
             if len(prepared) > max_images_per_call:
+                # Counting stopped at the first ref past the limit, so the
+                # true count is only known to exceed it: record that lower
+                # bound, never max+1 presented as the row's count.
                 too_many_reason: TransformErrorReason = {
                     "reason": "too_many_images",
                     "max_images": max_images_per_call,
-                    "actual": str(len(prepared)),
+                    "actual": f"more than {max_images_per_call}",
                 }
                 return TransformResult.error(too_many_reason, retryable=False)
 

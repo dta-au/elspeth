@@ -272,7 +272,7 @@ def test_workflow_matrix_is_the_exact_collision_free_external_case_inventory() -
                 assert lane_id.startswith("protected-live-")
             assert lane_id not in observed_lane_ids
             observed_lane_ids.add(lane_id)
-    assert len(observed_lane_ids) == 39
+    assert len(observed_lane_ids) == 40
 
 
 def _selector(path: Path) -> None:

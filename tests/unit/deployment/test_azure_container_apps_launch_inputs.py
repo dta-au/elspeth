@@ -42,6 +42,7 @@ def launch(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
         json.dumps(
             {
                 "composerMaxCompositionTurns": 24,
+                "composerContextMaxPromptTokens": 200000,
                 "composerMaxDiscoveryTurns": 12,
                 "composerTimeoutSeconds": 180,
                 "composerRateLimitPerMinute": 10,
@@ -136,6 +137,7 @@ def test_resolver_requires_operator_inputs(launch: tuple[dict[str, str], Path, P
         ("maxReplicas", 2.5),
         ("minReplicas", True),
         ("composerMaxCompositionTurns", None),
+        ("composerContextMaxPromptTokens", None),
         ("composerMaxDiscoveryTurns", 0),
         ("composerTimeoutSeconds", 1.5),
         ("composerRateLimitPerMinute", "10"),
@@ -210,6 +212,7 @@ def test_resolver_wires_independent_endpoints_and_extra_secrets(launch: tuple[di
         ("minReplicas", "2"),
         ("maxReplicas", 2.5),
         ("composerMaxCompositionTurns", True),
+        ("composerContextMaxPromptTokens", 0),
         ("composerTransportIdleCeilingSeconds", 241),
         ("composerTimeoutSeconds", 0),
         ("composerTransportIdleCeilingSeconds", 30),

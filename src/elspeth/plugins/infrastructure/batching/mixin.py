@@ -14,7 +14,7 @@ import threading
 import traceback
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
 import structlog
 
@@ -285,14 +285,37 @@ class BatchTransformMixin(BatchTransformRuntime):
             raise failure
 
     def _run_release_loop(self) -> None:
-        """Retain a release-thread crash for the orchestrator lifecycle too."""
+        """Retain a release-thread crash and fail every waiter blocked on it.
+
+        Once the release thread is dead no result can reach a waiter, so a
+        waiter blocked in the executor would otherwise sleep out
+        batch_wait_timeout and report a TimeoutError. The port delivers the
+        failure to every pending waiter at once instead. A non-Tier-1 crash
+        (a pre-unpack invariant break) is a framework fault, not a row's, so it
+        travels as a FrameworkBugError chained to the original.
+        """
         try:
             self._release_loop()
-        except BaseException as failure:
+        except contract_errors.TIER_1_ERRORS as failure:
+            self._fail_pending_after_release_crash(failure)
+            raise
+        except Exception as crash:
+            wrapped = FrameworkBugError(f"Release thread for {self._batch_name} died: {type(crash).__name__}: {crash}")
+            wrapped.__cause__ = crash
+            self._fail_pending_after_release_crash(wrapped)
+            raise wrapped from crash
+        except BaseException as fatal:
             with self._batch_failure_lock:
                 if self._batch_worker_failure is None:
-                    self._batch_worker_failure = failure
+                    self._batch_worker_failure = fatal
             raise
+
+    def _fail_pending_after_release_crash(self, failure: Exception) -> None:
+        """Retain the release-thread failure and deliver it to every pending waiter."""
+        with self._batch_failure_lock:
+            if self._batch_worker_failure is None:
+                self._batch_worker_failure = failure
+        self._batch_output.fail_pending(failure)
 
     def _process_and_complete(
         self,
@@ -352,13 +375,34 @@ class BatchTransformMixin(BatchTransformRuntime):
             from elspeth.contracts import ExceptionResult
 
             if isinstance(result, ExceptionResult):
-                raise result.exception
+                self._raise_orphaned_late_failure(result.exception, token, state_id)
             _logger.debug(
                 "late_result_discarded",
                 token_id=token.token_id,
                 state_id=state_id,
                 reason="timeout_evicted_or_shutdown",
             )
+
+    def _raise_orphaned_late_failure(self, late: BaseException, token: TokenInfo, state_id: str | None) -> NoReturn:
+        """Raise a timed-out (evicted) row's late worker failure without misattributing it.
+
+        The row this failure belongs to was evicted: its waiter timed out and
+        it is already recorded FAILED. Re-raised as-is, a non-Tier-1 failure
+        would surface from the NEXT accept() under the next token's
+        NodeStateGuard and be recorded as that row's own failure. As a Tier-1
+        framework failure naming its origin, it ends the run instead of being
+        attributed to an innocent row. A Tier-1 failure is raised unchanged.
+        """
+        try:
+            raise late
+        except contract_errors.TIER_1_ERRORS:
+            raise
+        except Exception as orphaned:
+            raise FrameworkBugError(
+                f"Worker for evicted submission token_id={token.token_id!r} state_id={state_id!r} of "
+                f"{self._batch_name} raised {type(orphaned).__name__}: {orphaned} after its waiter timed out. "
+                f"That row is already recorded as timed out; this failure belongs to no later row."
+            ) from orphaned
 
     def _release_loop(self) -> None:
         """Release thread: emit results in FIFO order to output port.
@@ -492,13 +536,23 @@ class BatchTransformMixin(BatchTransformRuntime):
             True if entry was evicted, False if not found or already completed
         """
         key = (token_id, state_id)
+        # The tracking entry is dropped ONLY when the buffer actually evicts.
+        # A refused eviction (the entry already completed, held behind a
+        # slower predecessor) leaves the ticket in the buffer, and the release
+        # loop will delete its tracking key when it releases it; popping it
+        # here first made that delete raise KeyError, which the output-port
+        # failure path then emitted in place of the real result. Holding the
+        # submissions lock across buffer.evict() keeps the release loop from
+        # deleting the key between the lookup and the decision; the release
+        # loop never holds the buffer lock while taking this one, so the
+        # nesting cannot deadlock.
         with self._batch_submissions_lock:
-            ticket = self._batch_submissions.pop(key, None)
-
-        if ticket is None:
-            return False
-
-        return self._batch_buffer.evict(ticket)
+            if key not in self._batch_submissions:
+                return False
+            evicted = self._batch_buffer.evict(self._batch_submissions[key])
+            if evicted:
+                del self._batch_submissions[key]
+        return evicted
 
     def shutdown_batch_processing(self, timeout: float = 30.0, *, wait_for_workers: bool = True) -> None:
         """Shutdown batch processing gracefully.

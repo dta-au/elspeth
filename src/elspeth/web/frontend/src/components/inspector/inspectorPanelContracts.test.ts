@@ -114,11 +114,13 @@ describe("the canvas edge label respects the 12px type floor (elspeth-859eae4480
 
 describe("graph panel corners stay concentric with the node cards (elspeth-37cc8b5310)", () => {
   it("rounds the config panel at the card rank", () => {
-    // The node cards read --radius-lg (GraphView.tsx node style); a panel
+    // The node cards read --radius-node (GraphView.tsx node style); a panel
     // rounding SHARPER than its cards inverts the outer-≥-inner concentric
     // relationship. Same token on both surfaces, so a retune moves together.
+    // ARGOnite: nodes moved --radius-lg (8px) -> --radius-node (14px), so the
+    // panel moves with them.
     expect(declaredValue(".graph-config-panel", "border-radius")).toBe(
-      "var(--radius-lg)",
+      "var(--radius-node)",
     );
   });
 
@@ -131,7 +133,8 @@ describe("graph panel corners stay concentric with the node cards (elspeth-37cc8
     // card rank could never reach the graph. Inline style is the only place
     // React Flow accepts node geometry, so the consumption check is a source
     // check, like reactFlowThemeScope.test.tsx's vendor-consumption pins.
-    expect(graphViewSource).toContain('borderRadius: "var(--radius-lg)"');
+    // ARGOnite: the node rank is --radius-node (design doc: nodes 14px).
+    expect(graphViewSource).toContain('borderRadius: "var(--radius-node)"');
     expect(graphViewSource).not.toMatch(/borderRadius:\s*\d/);
   });
 });

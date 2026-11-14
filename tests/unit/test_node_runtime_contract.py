@@ -80,10 +80,11 @@ def test_ci_and_release_image_build_with_node_24() -> None:
         "integration",
         "supply-chain-audit",
         "test",
+        "timing-sensitive",
     ]
     assert {step["uses"] for step in setup_steps} == {f"actions/setup-node@{SETUP_NODE_REVISION}"}
     for job_name, step in setup_jobs:
-        if job_name in {"test", "integration"}:
+        if job_name in {"test", "integration", "timing-sensitive"}:
             assert step["with"]["node-version-file"] == "${{ env.CI_CHECKOUT_PATH }}/.node-version"
             assert "node-version" not in step["with"]
         else:
@@ -166,7 +167,7 @@ def test_source_checkout_install_docs_use_locked_toolchains() -> None:
     assert "npm --prefix src/elspeth/web/frontend ci" in web_local
     assert "Node.js 24, and npm 11" in contributing
     assert "npm --prefix src/elspeth/web/frontend ci" in contributing
-    assert "Python 3.12+" in first_pipeline
+    assert "Python 3.14+" in first_pipeline
     assert "Node.js 24, npm 11" in first_pipeline
     assert "npm --prefix src/elspeth/web/frontend ci" in first_pipeline
     assert "uv sync --frozen --all-extras" in user_manual

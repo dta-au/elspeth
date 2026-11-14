@@ -4,7 +4,976 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
-## Unreleased (0.8.11)
+## 0.8.14 - 2026-11-11
+
+Python 3.14. ELSPETH now requires and runs on Python 3.14 only; this release
+moves the packages, the images and CI to it and corrects the behaviour that
+changed under the new interpreter. The dated entry and package version do not
+establish qualification, a published tag or an image. Not run for this work:
+the PostgreSQL testcontainer suites, a live provider, end-to-end browser tests
+and CI itself on the new single lane.
+
+### Upgrade notes
+
+These changes are breaking:
+
+- **Python 3.14 is required** for `elspeth`, `elspeth-lints` and the LLM
+  gateway (and the gateway adapter template). Python 3.12 and 3.13 are no
+  longer supported or tested. Locked dependency versions are unchanged; only
+  the 3.12 and 3.13 markers and wheels left the lockfiles.
+- **Startup refuses `JSON_LOGS=true`.** This applies to the CLI, the web
+  server and both MCP servers. LiteLLM's JSON-logs mode logs unhandled
+  exception messages verbatim through its own handler, which ELSPETH's log
+  scrubbing cannot reach. Unset it; ELSPETH's JSON output has its own setting.
+- **Drain in-flight runs and pending approvals before upgrading.** The
+  runtime-validation manifest hash changes with the interpreter, so a run
+  checkpointed under 3.13 refuses to resume under 3.14, and a web approval
+  recorded under 3.13 no longer matches. The `database` sink's effect plan
+  format also changed, so a batch prepared but not committed before the
+  upgrade is refused.
+- **The release image carries its own interpreter.** The runtime base is now
+  `gcr.io/distroless/cc-debian13:debug-nonroot`, and the image carries CPython
+  3.14.5, installed by the pinned uv under `/opt/python`, with the venv at
+  `/opt/venv`. There is no `/usr/bin/python3` in the image any more. The
+  builder is `debian:trixie-slim`. The gateway image is `python:3.14-alpine`.
+  3.14.5 is the newest CPython the pinned uv offers; a later patch release
+  needs a uv image bump.
+- **Dataverse FetchXML runs recorded before this release cannot be replayed
+  in verify mode.** The `Prefer` header is now part of the recorded request,
+  so the earlier records no longer match. OData runs are unaffected.
+- **Plugin configs and inputs that used to load are now refused.** Each was
+  either a latent failure or silently wrong:
+  - `reference_join` reference data containing NaN, Infinity or integers
+    beyond 2^53.
+  - Dataverse endpoints that are not HTTPS origins, or that carry a path or
+    query; `select` entries that are not valid logical names; FetchXML with
+    zero or several entities; a sink lookup whose key is not mapped
+    (previously ignored).
+  - Azure blob `account_url` values with a query string or fragment; put a
+    SAS token in `sas_token`.
+  - `batch_classifier_metrics` with a `positive_label` whose type differs
+    from the data (for example `1.0` against integer labels), and baseline
+    labels in the paired-preference, effect-size and experiment-compare batch
+    transforms that relied on coercion (`2.0` no longer matches `2`).
+  - In observed mode, a row key the S3 or Azure blob sink cannot encode in
+    the CSV header is now a config error instead of a row failure.
+  - CSV sources and sinks with a non-text codec (base64, hex, zlib, rot13),
+    and CSV sinks with a `"`, newline or carriage-return delimiter. Such a
+    source could not read a row after the strict-decoding fix below.
+  - OpenRouter `base_url` values with a query string or fragment.
+  - A `web_scrape` `auth` setting, which previously failed every row, and a
+    JSON record column without a path.
+  - An empty `query_template` or `query_pattern` in retrieval transforms.
+- **`type_coerce` is stricter.** Converting to `bool` no longer turns a blank
+  or whitespace-only string into `False`; it is a `not_boolean_string` row
+  error. Numeric strings with underscores or non-ASCII digits, and integers
+  outside the safe range (`out_of_range`), are refused instead of converted.
+  - Multi-query LLM configs whose generated field names collide across
+    queries, including the raw, `_usage` and `_model` fields. Uniqueness used
+    to be checked only when a query set `structured_output_prefix`; the
+    legacy precedence mode is removed.
+  - LLM pool delay settings that contradict each other (minimum above
+    maximum, or AIMD settings that cannot hold when `pool_size` is above 1).
+  - A tracing config that sets other keys while its provider is `none` or
+    omitted; those keys were previously ignored.
+- **Single-query LLM `metadata.model` is now the configured model.** The
+  model the provider actually served is in `metadata.served_model`
+  (`<query>_served_model` for multi-query). Readers that treated
+  `metadata.model` as the served model must switch fields.
+- **Some outputs and error shapes change.**
+  - `batch_paired_preference` 95% intervals use Student's t at n-1 degrees
+    of freedom instead of z = 1.96, so they widen for small samples (for
+    n = 3, ±0.34 becomes ±0.75).
+  - JSONL append in the `json` sink refuses an existing file that is not
+    newline-terminated or whose lines are not JSON objects; it previously
+    glued the first new record onto the last line.
+  - Azure blob JSONL output now ends every record with a newline, so
+    restaging a JSONL body written before this release fails closed.
+  - JSON, JSONL and blob inputs nested deeper than 64 levels are now
+    quarantined or routed as row errors.
+  - S3 JSONL objects with an oversized line now yield the rows after it.
+  - Azure and Bedrock LLM batch waits can be noticeably longer (see Plugins).
+  - The `blob_too_large` reason no longer carries `body_size`, and
+    `S3SinkPoisonedError` has been removed.
+  - The `OutputPort` protocol gains `fail_pending`; in-tree implementations
+    are updated, out-of-tree ones must add it.
+- **`CallVerifier` and `CallReplayer` are removed** from
+  `elspeth.plugins.infrastructure.clients`. `CallModeSession.verify_call` is
+  the single verify authority, and replaying an unrecorded ordered query now
+  raises `AuditIntegrityError`.
+- **`CallModeSession` gains `has_source_call`**, a read-only lookup used by
+  Textract replay and verify. Out-of-tree session implementations must add
+  it.
+- **Textract retries go through the engine.** Throttled and transient
+  Textract and S3 HeadBucket failures raise `PluginRetryableError` and
+  consume engine retry attempts; with no retry policy they end as the
+  engine's retry-exhausted row failure instead of `submit_failed` or
+  `analysis_failed`. `poll_timeout` stays a row error and is non-retryable.
+  SSL, proxy, response-streaming and HTTP-client botocore errors are now
+  retryable transport errors instead of a permanent `botocore_error`. In
+  verify mode a poll is admitted against the source job id instead of always
+  being refused.
+- **`aws_textract_inline_analysis` limits are capped.** `max_blocks`
+  (100000), `max_result_bytes` (50 MB), `request_timeout_seconds` (120) and
+  `batch_wait_timeout_seconds` (480) have ceilings, and a config above them
+  is refused at load. The `batch_wait_timeout_seconds` default rises from
+  420 to 480, the wait that was already in effect.
+- **A per-row Textract S3 key over 1024 UTF-8 bytes** fails locally as
+  `invalid_input` / `invalid_s3_key` instead of `submit_failed`.
+- **`request_ssrf_safe` refuses `follow_redirects=True`** except for a
+  body-less GET, raising `ValueError` before any network I/O.
+- **An Azure prompt shield earns `PROMPT_SHIELD` control credit only with
+  `analysis_type: both`** (explicit or as the configured default). A pipeline
+  that requires a `PROMPT_SHIELD` control and uses a shield set to
+  `user_prompt` or `document` alone is now refused at admission.
+- **Guardrail and safety error reasons change.** AWS guardrail transforms
+  report empty or over-length text as `invalid_input` (`empty_field`,
+  `field_too_long`) instead of `api_call_failed`. Azure safety transforms
+  stop with `retry_timeout` / `row_deadline_exceeded` once the row deadline
+  has passed. Textract `blob_too_large` reports its actual size as `>max`.
+  AWS guardrail transforms no longer report `guardrail_service_error`: a
+  terminal failure is `malformed_response` or `service_error`, retryable
+  throttling, 5xx and transport failures go to the engine retry policy
+  (`transient_error_no_retry` without one), and a row can end as
+  `row_deadline_exceeded` or `shutdown_requested`.
+- **A Bedrock guardrail ARN that contradicts `region` is refused.**
+  `aws_bedrock_prompt_shield` and `aws_bedrock_content_safety` configs whose
+  guardrail ARN names another region or a non-`aws` partition now fail
+  config validation with `PluginConfigError`, as the operator profile
+  already did.
+- **A mistyped landscape export sink is refused for every run.** A `FRESH`
+  run now refuses a `landscape.export` sink name that is not in `sinks`, as
+  some run purposes already did, and `${VAR}` references in
+  `landscape.export` are expanded before that check.
+- **Column options accept a header's spelling.** Column-keyed transform
+  options such as Truncate's `fields` match the canonical header name as
+  well as the normalised name, so a config that used to be refused when the
+  plugin was built may now be accepted.
+- **Dataverse throttling waits instead of failing.** A retryable 429 or 503
+  now waits and re-sends, up to 300 s of throttle waits per request; a 429
+  whose `Retry-After` exceeds 60 s still fails immediately. The source
+  records one extra ERROR call per waited-out throttle, so call indexes for
+  that page shift, and sink commit evidence may carry `throttle_wait_ms`.
+- **`web_scrape` auth is stricter.** An `api_key` `header_name` of
+  `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `Forwarded` or
+  `X-Forwarded-*` now fails config validation, and a basic secret without
+  `:` raises `ValueError` (without echoing the secret) when the header is
+  built.
+- **`web_scrape` JSON records skip nulls.** `first` returns the first
+  non-null value, `one` counts only non-null values and `all` omits nulls; an
+  all-null array gives `None` for `first` and `one` and `[]` for `all`, and
+  provenance `selected_count` counts only non-null values. A required column
+  with only nulls still fails. Pages that used to fail now extract.
+- **Power Automate archived SAS VERIFY** without `ELSPETH_FINGERPRINT_KEY`
+  fails with `fingerprint_key_required`, still before DNS and preflight.
+- **PDF runs recorded before this release cannot be replayed or verified.**
+  The `pdf_rasterize` render request format is now `pdf_rasterize/v2`; replay
+  or verify of a run recorded as `pdf_rasterize/v1` fails closed with
+  `AuditIntegrityError` naming the retired format, in both the replay payload
+  preload and receipt restore. Live runs are unaffected.
+- **`elspeth.plugins.transforms.llm.validation` loses public names.**
+  `validate_json_object_response` and its result types are removed, and
+  `get_llm_audit_fields()` returns one more name (`_parts_hash`). Landscape
+  `too_many_images` reason text changes.
+- **`batch_threshold_summary` refuses a non-numeric threshold.** A
+  `value: true`/`false` or a quoted number now fails at config load; it used
+  to be coerced to 1.0, 0.0 or the number. `batch_top_k` `wrong_type`
+  `expected` text changes, and batches with Decimal or datetime values, or
+  extreme opposite-sign values in `batch_distribution_profile`, now succeed
+  where they used to fail.
+- **Bedrock guardrails validate the whole row first.** A row with any invalid
+  field fails with the same payload and makes no Bedrock call, so earlier
+  fields leave no billed call, call record or telemetry, and a validation
+  error now precedes a shutdown or deadline result. Guardrail profile aliases
+  of 65 or more characters fail at web config load, naming `alias`.
+- **Textract query text and aliases** containing non-ASCII whitespace are
+  rejected at config load; the provider already rejected them per row. A
+  provider message mentioning `max_blocks` or `max_result_bytes` is now
+  recorded as `malformed_response`.
+- **A missing core dependency stops plugin discovery.** Only `jinja2` is
+  treated as optional; a missing `chromadb`, `bs4` or `html2text` now raises
+  instead of silently dropping plugins from the catalog.
+- **CI runs one Python 3.14 lane**, which is the coverage lane. Required
+  status-check names change with it, for example
+  `Test (Python 3.14, shard N)` and `Timing-sensitive tests (Python 3.14)`,
+  and the repository ruleset must be updated to match.
+
+Schema and stored data:
+
+- No schema epoch changed and no stored data is migrated, reset or rewritten.
+  Session epoch 78 and Landscape epoch 50 are unchanged from the previous
+  release; this release adds no schema-epoch cutover. Existing 0.8.13 session
+  and Landscape stores need no action beyond the drain above, and the 0.8.10
+  cutover guidance below continues to apply to older stores. This authorizes
+  no migration, reset, restamping or downgrade.
+
+### Engine and runtime
+
+Each of these keeps the behaviour ELSPETH had under Python 3.13.
+
+- **Strict JSON parsing bounds nesting explicitly** at the interpreter
+  recursion limit. Python 3.14's C decoder no longer stops there.
+- **The runtime-validation manifest again records helper dependencies reached
+  through local loads**, for which 3.14 emits new instructions. It also
+  ignores docstring-only edits, which 3.14 marks with a new `CO_HAS_DOCSTRING`
+  flag.
+- **Runtime preflight keeps reporting an abandoned task failure by class
+  only.** Python 3.14's `asyncio.shield` began logging the message and
+  traceback.
+
+### Plugins
+
+- **New `azure_content_understanding` transform.** It runs an Azure AI
+  Content Understanding analyzer (GA api-version `2025-11-01`) over one
+  document, image, audio or video reference per row. The reference is a URL or
+  a base64 string. Like `azure_document_intelligence`, it submits an
+  asynchronous analyze operation, polls it to completion and writes the
+  configured outputs onto the row: `content_field` (markdown), `fields_field`
+  (the analyzer's fields as plain values), `page_count_field`,
+  `metadata_field`, `result_field`, and `extract` facets that are
+  concatenated across the result's contents. Options also cover
+  `content_range`, `mime_type`, `processing_location`, `string_encoding` and
+  per-request `model_deployments`. Its key is `AZURE_CONTENT_UNDERSTANDING_KEY`.
+- **`azure_document_intelligence` no longer records a SAS signature in its
+  HTTP request record.** A `urlSource` that carried a SAS `sig` was recorded
+  verbatim in the Landscape request record and its telemetry. The recorded
+  request now fingerprints the credential-shaped query values and userinfo,
+  while Azure still receives the URL unchanged. The fingerprint key
+  requirement is the same one the api-key header already had. The row's own
+  `source_field` value is unchanged, so the URL is still stored wherever row
+  data is stored.
+- **`azure_document_intelligence` reports `canceled` and `skipped` operations
+  as `analysis_failed`.** They were reported as `malformed_response`. The
+  error reason now carries `error_type` (`failed` or `canceled`) alongside the
+  bounded `cause`.
+- **Rejected Document Intelligence calls name Azure's error code.** An
+  `api_error` now carries `code` (Azure's `error.code`) and `cause` (its
+  `innererror.code`), both bounded tokens from Azure's error envelope; the
+  error message is still never placed in the error reason.
+- **Document Intelligence retry timing follows Azure's `Retry-After`.**
+  Capacity retries (429/503) wait as long as Azure asks. A request for longer
+  than the remaining budget fails the row at once. `max_capacity_retry_seconds`
+  now bounds each call's retrying (clamped to `poll_timeout_seconds`) instead
+  of being measured from the row start, so a 429 on a late poll is retried. A
+  poll `Retry-After` is honoured up to 60 seconds.
+- **Two Document Intelligence failures no longer end the run.** A document
+  URL with a malformed bracketed host fails the row as
+  `invalid_input/invalid_document_url`, and a response with a refused
+  `Content-Encoding` fails it as
+  `malformed_response/response_encoding_refused`.
+- **Invalid base64 is rejected before it is sent.** A base64 source that is
+  not padded standard-alphabet base64 fails the row with
+  `invalid_input/invalid_base64` instead of costing a billed Azure call. This
+  includes a `data:` URI, the URL-safe alphabet, and line-wrapped or
+  whitespace-containing output, which was previously forwarded to Azure;
+  strip line breaks upstream.
+- **The Document Intelligence batch wait now covers a full request
+  timeout.** A large `request_timeout_seconds` could previously let a row
+  outlive the batch wait.
+- **New `azure_document_intelligence` outputs.** `fields_field` writes the
+  first document's typed fields as plain values (for example `InvoiceTotal`).
+  `metadata_field` writes bounded analysis metadata: model id, operation id,
+  page and document counts, and warning codes.
+- **Smaller `azure_document_intelligence` changes.** A `malformed_response`
+  message now names the facet without the `analyzeResult.` prefix. The
+  success metadata's `operation_id` is omitted when Azure's id is not a plain
+  token. The catalogue lists the shared source, polling and timeout options
+  before `endpoint` and `model_id`. Option names and defaults are unchanged.
+- **Generic HTTP JSON responses are admitted only if the audit can record
+  them.** A body nested deeper than 64 levels, a number that overflows to
+  infinity or an integer outside the canonical range is now recorded as a
+  JSON parse failure. Previously the call raised with no audit record.
+- **`web_scrape` refuses a row URL that contains a control character**, such
+  as a trailing newline, as a `validation_failed` row error. It previously
+  crashed the run.
+- **Chroma search records and classifies HTTP-layer failures.** Transport
+  errors and HTTP 408, 429 and 5xx are retryable; other 4xx responses and
+  non-JSON bodies are permanent. These calls were previously unrecorded and
+  not retried.
+- **Dataverse FetchXML paging works past the first page.** The request now
+  asks for the paging annotations, a page without `morerecords` ends the
+  results, and the paging cookie sent back is the annotation's inner
+  `pagingcookie` value. If the server ignores the annotations and a second
+  page exists, the source fails instead of truncating.
+- **The `database` sink publishes batches larger than about 64 KiB.** The
+  effect plan no longer embeds every row; it binds them by hash and member
+  count, and commit re-derives them from the durable member payloads. Such
+  batches previously failed at prepare. Not run for this change: the
+  PostgreSQL testcontainer suite.
+- **The `database` sink writes object and list values as RFC 8785 canonical
+  JSON text** (`{"k":1}`), where it previously wrote `json.dumps` output
+  (`{"k": 1}`). Consumers that compare the stored text byte-for-byte will see
+  the difference.
+
+Sources:
+
+- **External JSON is bounded at 64 levels of nesting before it is decoded**
+  in the JSON source (JSON arrays and each JSONL line), the Azure blob
+  source, `blob_json_expand`, the schema value walker and LLM response
+  validation. Over-deep input is quarantined (for JSONL, that line only)
+  instead of exhausting recursion and crashing the run.
+- **JSON source:** `data_key` and non-array quarantines record the same row
+  they route, so the validation-error link is kept, and resume snapshots no
+  longer crash.
+- **CSV source:** the file is decoded strictly in binary, so a decode error
+  names the physical line and row holding the bad byte. A bad byte on the
+  header line still quarantines the whole file without a line number.
+- **S3 source:** an object that fails partway gives its error row the next
+  unused index and says rows were already emitted. A JSONL object resyncs
+  past an oversized line, quarantining it, and a CSV or JSONL read that stops
+  records that it stopped.
+- **Azure blob source:** CSV is decoded per record, so an undecodable row is
+  quarantined on its own with its raw bytes, line and row number. An
+  undecodable header still quarantines the whole file.
+- **S3 CSV** skips blank records before header discovery; a blank-only
+  object raises the existing empty-file error.
+- **JSON source:** an undecodable UTF-16 or UTF-32 JSONL line is quarantined
+  on its own, with its true line number and raw bytes, instead of the whole
+  file. This registers a namespaced codec error handler,
+  `elspeth.source_byte_escape`, process-wide on import. UTF-8 input accepts
+  a leading byte-order mark; a mid-file U+FEFF is still data.
+- **Text source:** undecodable lines are quarantined one at a time.
+- **Dataverse source:** formatted values are requested with a `Prefer`
+  header and their annotations stripped. `top` must be at least 1, and
+  FetchXML must have exactly one named entity; both are checked at config
+  time rather than at load.
+
+Transforms:
+
+- **`web_scrape`:**
+  - Pagination cycle detection compares canonical URLs, so a self-link that
+    canonicalisation rewrites is caught instead of fetched again.
+  - In replay and verify, a malformed URL fails the row with a scheme/shape
+    refusal instead of crashing; live behaviour is unchanged.
+  - An invalid `next_link_selector` is a config error.
+  - A discovered link is used exactly as validated, without re-encoding its
+    query. Links found in `href`s refuse the same cursor and session query
+    keys that Link-header links already did (`cursor`, `continuation`,
+    `next_token`, `page_token`, `session`, `state`), and the
+    sensitive-parameter check also splits on `;`.
+  - The `fingerprint_mode` description now says it hashes content only; the
+    behaviour is unchanged.
+  - Null elements inside a selected JSON records array are treated as
+    absent, like a top-level null, instead of failing the page (#153).
+  - `compute_fingerprint` refuses an unknown fingerprint mode instead of
+    silently hashing as `full` (#157).
+  - API-key header names exclude hop-by-hop and proxy headers, and basic
+    credentials must be `user:password` (#164).
+- **Power Automate:** an archived SAS VERIFY run with no fingerprint key
+  reports `fingerprint_key_required` instead of a misleading
+  `authentication_failed` (#130).
+- **`reference_join`** refuses non-canonical reference values at config load
+  (see Upgrade notes); the first matching row previously crashed the run or
+  was misrouted as a contract violation.
+- **`field_mapper`** runs its dotted-source collision check, so an existing
+  field is no longer silently overwritten when the executor collision gate is
+  off.
+- **`batch_replicate`** joins the output contract across all buffered rows;
+  the first row's contract previously won, so copies could carry a contract
+  that misdescribed their own values.
+- **Batch statistics transforms:**
+  - `batch_stats` records integer sums beyond 2^53-1 and overflowing or
+    non-finite float sums as a `float_overflow` error.
+  - `batch_classifier_metrics` fails the batch on a `positive_label` type
+    mismatch instead of reporting tp = fn = 0.
+  - Baseline labels in `batch_paired_preference`, `batch_effect_size` and
+    `batch_experiment_compare` are type-strict; blank and non-finite labels
+    are refused, and `batch_experiment_compare` baselines are no longer
+    string-only.
+  - The `batch_paired_preference` interval uses Student's t.
+  - `batch_data_quality_report` counts distinct values in linear time.
+  - The composer hints of the outlier, rank, paired-preference and
+    drift-compare transforms state their 4096-row flush cap.
+  - `batch_drift_compare` success rows list skipped missing and non-finite
+    rows by batch index per cohort, as `batch_stats` does, in four new fields
+    (`baseline_`/`cohort_missing_indices`,
+    `baseline_`/`cohort_non_finite_indices`) (#101). Its usage text and
+    composer hint state that `chi_square_statistic` omits categories absent
+    from the baseline (#102).
+  - `batch_distribution_profile` percentiles of extreme opposite-sign finite
+    values no longer fail with `float_overflow` (#121).
+  - `batch_threshold_summary` requires a numeric threshold `value` (#135).
+  - `batch_top_k` counts datetime and Decimal values, as `group_by` already
+    admits; non-finite Decimals are skipped and reported (#136).
+- **Batch transform engine:** a timed-out row's late failure is no longer
+  charged to the next row, and a dead release thread fails pending rows at
+  once instead of leaving them blocked until timeout. A refused eviction no
+  longer replaces a completed row's result with a `KeyError` (#120).
+- **`blob_json_expand`, `blob_text`, `blob_csv`:** `max_blob_bytes` is enforced
+  while the blob is read, not after it is loaded. `blob_csv_expand` validates
+  its delimiter the same way the CSV sink does. `blob_json_expand` splits
+  JSONL only on `\n` (one trailing `\r` stripped), so records containing
+  U+2028, U+2029 or U+0085 stay whole, and it rejects NaN and Infinity.
+  `blob_csv_expand` parse-phase error reasons name their source (`field`,
+  `blob_ref`), like `empty_csv` and load errors, and every routed error
+  reason has a focused unit test (#53, #54).
+- **`json_explode`** has a new `index_field` option (default `item_index`), so
+  nested explodes do not collide (#111).
+- **JSON sink:** the unreachable JSON-array append path is removed;
+  `format: json` never appends (#105).
+- **`pdf_rasterize`:**
+  - The parent re-checks every page the worker reports and refuses bad
+    geometry, pages over `max_page_pixels`, text when `extract_text` is off,
+    and text over `max_page_text_bytes`.
+  - A memory error on one page refuses only that page.
+  - The temporary output directory is removed on every failure path.
+  - Multi-page replay works, and duplicate page rows are refused.
+  - The renderer identity check also accepts the macOS and Windows pdfium
+    library names.
+  - The audited render request records `max_total_bytes`, and its format is
+    `pdf_rasterize/v2` (#59).
+- **Textract:** FORMS entries carry `value_selection_status` (`SELECTED`,
+  `NOT_SELECTED` or none), and a malformed selection fails closed. Inline
+  analysis reads its input with a size bound. Closing a Textract transform no
+  longer sets the engine's shutdown event. When a bucket-region lookup fails,
+  rows waiting on the same lookup get the shared failure, marked with
+  `cache_status: shared_failure`.
+  From the AWS review:
+  - Throttled and transient failures raise `PluginRetryableError`, so the
+    engine retry policy applies; a `retryable=True` row result used to be
+    silently ignored. Transient poll errors retry in place until the poll
+    deadline (#1).
+  - `aws_textract_document_analysis` replay no longer sleeps or races the
+    wall clock and ends polling from the archive; verify substitutes the
+    source job id and `next_token` fingerprint, and HeadBucket single-flight
+    leadership in replay follows the source run (#2, #3).
+  - Textract and S3 HeadBucket audit records carry the observed HTTP attempt
+    count for every botocore transport error, and SSL, proxy and streaming
+    failures are classified as retryable, as botocore does (#6).
+  - Inline analysis limits are capped (#7).
+  - Page projection is linear in the block count instead of quadratic (#9).
+  - Per-row bucket mode bounds S3 keys in UTF-8 bytes (1024), as
+    static-bucket mode does (#10).
+  - `too_many_blocks` and `result_too_large` are recorded from a structured
+    error category, so provider text in a malformed response can no longer
+    pick the audited failure reason (#38).
+  - Query text and alias validation rejects non-ASCII whitespace such as
+    U+00A0 at config load, matching the provider pattern (#158).
+- **AWS guardrails** count botocore attempts as they are sent, so a transport
+  error reports the attempts actually made. They stop scanning at a row
+  deadline, set by the new `row_deadline_seconds` option (positive integer,
+  default 300; not exposed on the web operator profile), honour shutdown
+  between fields, and hand retryable failures to the engine retry policy
+  (AWS review #4). The response parser records a wrong-typed `confidence`,
+  `action` or `filterStrength` as a malformed response instead of crashing
+  with an unaudited `TypeError` (#5), and the guardrail ARN is cross-checked
+  against `region` (#8). Every configured field is validated before the
+  first ApplyGuardrail call, so a later invalid field no longer lets earlier
+  fields be sent and billed (#145), and profile aliases are limited to 64
+  characters at config load, matching the live check (#159).
+- **`azure_content_safety`** composer hint no longer claims a default
+  threshold of 4: every category threshold is required, and lower values are
+  stricter (#127).
+- **Azure analyze transforms** (Document Intelligence, Content Understanding)
+  retry network errors while polling until the poll deadline.
+- **LLM transforms:**
+  - Replaying a recorded content-policy refusal raises the same error as the
+    live run, so the row is handled the same way.
+  - The Azure and Bedrock batch wait covers the whole batch: the budget plus
+    queries × request timeout plus 30 seconds.
+  - Tracing imports its instrumentor before configuring, refuses a second,
+    conflicting tracing policy in one process, and type-checks its boolean
+    flags and credentials.
+  - An empty Azure completion is classified by its finish reason: a content
+    filter raises a content-policy error, `length` a token-budget error, and
+    anything else a non-retryable error. Bedrock's readiness check validates
+    content and finish reason the same way.
+  - OpenRouter network errors use fixed text, so the URL no longer reaches
+    the audit trail or Langfuse.
+  - The LLM gateway rejects malformed usage when the `usage` capability is
+    required, and rejects a malformed readiness response.
+  - The OpenRouter and gateway source configs no longer show the API key in
+    their repr.
+  - Single-query `fields_added` declares the `<response_field>_usage` and
+    `<response_field>_model` fields the transform already wrote.
+  - The Langfuse tracer refuses a cached client whose base URL or secret key
+    differs from the one requested, and a conflicting `LANGFUSE_BASE_URL`.
+  - A required image field holding an empty list is an `invalid_input` row
+    error (`empty_image_list`).
+  - Config refusals for row-object misuse or dynamic row access name the
+    query template at fault instead of always blaming `prompt_template`
+    (#33).
+  - Ordered-mode config validation compiles the ordered query plan once per
+    validation pass instead of once per query (#34).
+  - Single-query transforms no longer record an empty system message in
+    Langfuse when `system_prompt` is `""` (#46).
+  - `_parts_hash` is registered as an LLM audit-only field, so the row/audit
+    separation guards cover it (#87).
+  - `populate_llm_operational_fields` requires a `TokenUsage` and a model
+    string, matching the non-nullable output schema (#88).
+  - The unused `validate_json_object_response` parser is removed; response
+    property tests exercise the production parser `extract_structured_fields`
+    (#143).
+  - `too_many_images` reasons report "more than N" instead of a misleading
+    max+1 count (#154).
+- **`keyword_filter`:** the ReDoS guard treats `{,n}` and `{,}` as
+  quantifiers (`{}` stays literal), and a single-string `fields` declares
+  that one field rather than all fields.
+- **Unscanned fields are reported.** `keyword_filter` and the Azure content
+  safety and prompt shield transforms list fields they skipped because the
+  value was not a string in `success_reason.validation_warnings`. They do not
+  recurse into containers, by design.
+- **RAG:** the registry hides only a missing `chromadb` module, and its error
+  names the `elspeth[rag]` extra.
+
+Sinks and retrieval:
+
+- **Chroma sink:**
+  - An empty or duplicate document id in an effect group is diverted per row
+    at prepare; the whole effect previously failed, and an empty id was
+    recommitted forever.
+  - An upsert value error diverts the row.
+  - Startup refuses an existing collection whose `hnsw:space` differs from
+    `distance_function`.
+- **HTTP replay** re-raises a recorded transport failure and records the
+  replay call as an error; other recorded failure types still raise
+  `AuditIntegrityError`.
+- **Azure Search** result metadata excludes the vector field and
+  `@search.*` keys.
+- **Chroma retrieval** records a failure in runtime preflight or deferred
+  initialisation as a failed call.
+- **Dataverse sink:**
+  - Reconciliation no longer treats a server echo of the same value as a
+    mismatch.
+  - Apostrophes in upsert alternate-key values are OData-escaped.
+  - A lookup whose key is not mapped is a config error.
+- **Dataverse client:** errors carry a typed `retry_after` parsed from
+  `Retry-After`. The Dataverse source and sink honour it on 429 and 503
+  throttling: the client waits at least `Retry-After` (with an exponential
+  backoff floor and a 300 s throttle-wait budget per request, cancellable on
+  shutdown) and re-sends instead of failing the run. Each waited-out
+  throttled call is recorded with its `retry_wait_ms`, and sink commit
+  evidence names the waits as `throttle_wait_ms` (#76).
+- **S3 sink:** a closed sink refuses further requests, the CSV probe checks
+  the header it will actually write, and an unencodable header raises a
+  `ValueError`.
+- **Azure blob sink:** JSON and JSONL bodies are streamed in 64 KiB chunks.
+  The Azure blob sink and source close the service client and credential.
+- **CSV sink:** the delimiter is validated by building a real CSV writer, and
+  non-text encodings are refused. A new opt-in `neutralize_formulas` setting
+  (off by default, so output is byte-identical unless enabled) neutralises
+  spreadsheet formulas.
+- **Local file effects** admit storage per 64 KiB accumulated rather than per
+  chunk, with exact cumulative reservations.
+- **Audit-export bundles:** a bundle being built is held under an exclusive
+  lock, and the stale-scratch sweep skips locked trees, so it can no longer
+  delete a live bundle.
+- **`database` sink** composer guidance now matches what it supports:
+  SQLite or PostgreSQL, an existing table, no DDL, a required effect ledger,
+  and append only.
+- **Plugin infrastructure:**
+  - `PluginManager.create_*` builds the plugin class from its own registry
+    and validates config against that same class (#126).
+  - Plugin discovery raises on a missing core dependency (#129).
+  - The Chroma readiness probe reports a persistent path that is not an
+    existing directory as unreachable, without creating a client (#149).
+  - An unknown landscape export sink is refused for every run purpose,
+    `landscape.export` values are expanded before eligibility checks, and a
+    deferred Key Vault reference defers the raw-settings gate, in the CLI
+    preflight as well (#104).
+  - Fixed-schema checks accept the canonical header spelling in column-keyed
+    options such as Truncate `fields` (#0).
+  - A template render timeout is classified by worker CPU time: a template
+    that used its 2 s CPU budget is a row `TemplateError`, anything else a
+    retryable worker-lost error (#6).
+  - Parallel LLM multi-query records the pool execution context in
+    `context_after` (#100).
+
+### Composer
+
+- **A forked session's copy of a model-written file stays model-written**
+  (#365). Forking used to record the copy as VERBATIM, which let a session
+  fork turn LLM-generated text into a file the composer would accept as
+  prompt text. The copy now keeps its source's creation modality and the
+  `creating_*` provenance fields, anchored to the child session's own
+  `session_fork` audit row, so the prompt-surface guard, blob admission and
+  share checks treat it as model-written through forks of forks as well.
+
+### Logging
+
+- **asyncio diagnostics that carry an exception are reduced to class and code
+  location.** A task exception that was never retrieved, a failed loop
+  callback and 3.14's shielded-future report are logged as
+  `asyncio_unhandled_exception exc_class=… frames=file:line:function,…`, on
+  every event loop in the process. Records without an exception are
+  unchanged.
+
+### Examples
+
+- **The `multi_worker`, `multi_worker_showcase` and `join_refused` launchers
+  require the `sqlite3` command-line tool** and exit 2 with a clear message
+  when it is missing. Without it they used to fail as a misleading "leader
+  never reached RUNNING" timeout. `examples/AGENTS.md` lists `sqlite3` as a
+  prerequisite and documents `reference_join_chain`, which ends PARTIAL with
+  exit 1 by design.
+
+### Known limits
+
+- Ruff still targets `py313`, so that the formatter does not rewrite 169 files
+  to the PEP 758 `except A, B:` form. That is separate work.
+- One `elspeth-lints` masquerade test, of definition-time annotation order,
+  stays skipped on 3.14: the model it checks predates PEP 649.
+- Four signed tier-model allowlist entries for
+  `contracts/runtime_val_manifest.py` drift and await operator re-signing.
+  Keyless scans report them. The plugin fixes leave more awaiting re-signing:
+  one for the batch transform mixin, four for the S3 sink, and the signed
+  `http.py` entries after the client changes.
+- In pooled LLM mode, time a row spends queueing is still unbounded.
+- The plugin source-hash lint now checks the AWS transforms, which it had
+  skipped: it did not scan `plugins/transforms/aws` or recognise the Bedrock
+  guardrail base. The stale `aws_bedrock_prompt_shield` hash it then found is
+  re-pinned, and a test now requires the rule to cover every registered
+  plugin.
+- Bedrock's readiness check still requests 32 tokens, so reasoning models may
+  fail it. Recording an empty LLM completion as an ERROR call needs a
+  maintainer decision; only its classification has changed.
+- Seven allowlist entries for audit-export bundle effects also await
+  re-signing.
+- `azure-ai-inference` is not a declared dependency of LLM tracing, and if
+  `instrument()` fails the exporter is left running.
+- Dataverse sink errors are not yet diverted per row: which error codes are
+  attributable to a row needs a maintainer decision. Reconciliation does not
+  normalise decimal or datetime values.
+- The PostgreSQL testcontainer suite has not been run for the `database` sink
+  change or the fork provenance fix (#365).
+- Textract verify mode still compares responses and indexes `IN_PROGRESS`
+  polls per live run, so provider-generated `JobId` and `NextToken` values
+  are not yet normalised; replay residuals, a HeadBucket verify race, and
+  whether follower evidence should name the leader's state await
+  maintainer decisions.
+- The Dataverse 300 s throttle-wait budget is not configurable, and the
+  client retries only 429 and 503; 500, 502, 504 and timeouts are not
+  retried in the client.
+- The composer planner scaffold budget gains a 64-byte allowance for the
+  `batch_drift_compare` chi-square disclosure, which awaits maintainer
+  review; the batch transform mixin's `evict_submission` allowlist entry is
+  also stale and awaits re-signing. `truncate` (#146) is unchanged pending a
+  maintainer decision.
+- Power Automate still acquires an OAuth token per POST; reusing it (#131)
+  awaits a maintainer decision.
+- An engine retry of a guardrail row re-scans, and re-bills, fields that
+  already passed.
+  The guardrails client also awaits operator re-signing of three tier-model
+  allowlist entries for `BedrockGuardrailsClient.apply_guardrail`.
+- Fork copies made before the #365 fix stay VERBATIM; they are not rewritten.
+  A fork interrupted mid-copy across the upgrade fails closed on retry with a
+  modality mismatch. Pipeline `llm`-node output is still recorded VERBATIM
+  and has not been checked as a route to model-written prompt text.
+
+### Publication and acceptance
+
+Automatic image publication from main remains held. The 0.8.14 tag and
+container publication follow successful required checks and the protected
+merge. Operator signing, live-provider acceptance and deployment remain
+separate steps.
+
+---
+
+## 0.8.13 - 2026-11-11
+
+Composer context budget. Long Composer sessions grew until the server or the
+model gateway rejected a request for size; the Composer now sheds older
+context to fit an operator-set budget, or refuses with a named cause. The
+dated entry and package version do not establish qualification, a published
+tag or an image. Not run for this work: the PostgreSQL suites, a live
+provider, replay of real sessions and end-to-end browser tests.
+
+### Upgrade notes
+
+Two configuration changes are breaking:
+
+- **`ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS` is required.** It has no
+  default; the web server will not start without it. Set it to the
+  prompt-token limit of the model gateway in front of the Composer. The
+  shipped deployment examples carry `200000` as a placeholder.
+- **The default of `composer_planner_max_request_bytes`
+  (`ELSPETH_WEB__COMPOSER_PLANNER_MAX_REQUEST_BYTES`) is now 960 KiB** (it
+  was 2 MiB), and it now also bounds the compose loop, not only the planner.
+  A deployment that needs the old value must set it explicitly and raise the
+  gateway's body cap to match.
+
+Two optional settings are new: `ELSPETH_WEB__COMPOSER_CONTEXT_SHED_ABOVE`
+(default `0.85`) and `ELSPETH_WEB__COMPOSER_CONTEXT_SHED_TO` (default `0.60`),
+fractions of the token cap; `SHED_TO` must be below `SHED_ABOVE`.
+
+Other things an operator or client will notice:
+
+- A request that cannot fit is answered with HTTP 422 and
+  `context_budget_exceeded` on both the compose loop and the planner. This
+  replaces the generic failure previously shown when the planner's
+  request-byte ceiling refused a request.
+- `composer_skill_hash` changes: the composer skill gains one paragraph
+  explaining the counts of omitted earlier messages.
+- Composer call records gain a `context_budget` field. Older records without
+  it read as "no shedding recorded".
+- Existing sessions keep working. A session already over the high mark sheds on
+  its next turn, with the omissions recorded.
+- No schema epoch changed and no stored data is migrated, reset or rewritten.
+  Session epoch 78 and Landscape epoch 50 are unchanged from the previous
+  release; this release adds no schema-epoch cutover. Existing 0.8.12 session
+  and Landscape stores need no action, and the 0.8.10 cutover guidance below
+  continues to apply to older stores. This authorizes no migration, reset,
+  restamping or downgrade.
+
+### Composer
+
+- **The Composer sheds context to fit an operator-set budget.** Before each
+  compose-loop and planner provider call (the escape hatch and the reply
+  after staged review cards included; advisor and review calls are not, see
+  Known limits), the server removes context in a fixed order until the
+  request fits the prompt-token cap and the request-byte ceiling: earlier
+  tool results in the current turn (each body replaced by a fixed stub; the
+  call and result message stay), then earlier assistant prose, then
+  escape-hatch transcript events, then the oldest earlier user requests,
+  oldest first within each. The system skill, catalog, tool definitions,
+  current request, pipeline state and latest tool round trip are never
+  removed. The budgeter makes no provider call and adds no text of its own
+  beyond the stub and counts of omitted messages.
+- **Shedding has a high and a low mark.** It starts when the request is above
+  `SHED_ABOVE` of the token cap, or over the byte ceiling, and continues to
+  `SHED_TO`. What was shed stays shed. Whether more must go is judged on the
+  already-reduced request, so nothing more is shed until that crosses
+  `SHED_ABOVE` again; shed history is restored only when the whole request is
+  back at or under `SHED_TO`. A tool result stubbed during a turn stays
+  stubbed for the rest of that turn.
+- **Both ceilings are judged on the request as sent.** The measure is the
+  wire bytes of the request: the JSON of its messages and tools, escaping
+  included. That is what a gateway's body cap sees, and everything the model
+  reads (content, tool-call arguments, thinking blocks and tool definitions).
+  The token estimate divides that size by a bytes-per-token ratio measured on
+  the same basis.
+- **A request that cannot fit is refused with a named cause.** When the
+  protected content alone exceeds either ceiling, the server refuses before
+  any provider call with `context_budget_exceeded`: "This conversation is too
+  large for the composer to continue. Start a new session, or shorten your
+  request." It offers no Retry. The refusal names the ceiling and the largest
+  component of the request as sent.
+- **A reply that cannot fit does not fail a finished turn.** If the optional
+  reply after review cards are staged cannot be fitted, no provider call is
+  made and the turn completes with its staged work intact. The user sees:
+  "This turn's work was completed, but the model's final reply could not be
+  produced because this conversation is too large for the composer. Start a
+  new session, or shorten your request."
+- **Users are told when history is shed.** A turn whose model call leaves
+  earlier conversation out shows the progress notice "Earlier conversation is
+  no longer visible to the composer."
+- **The escape-hatch transcript header no longer says "Complete"**, because
+  the transcript can now be reduced to fit the budget.
+
+### Audit records
+
+- **What was shed is recorded on each budgeted call.** The call record and
+  its public envelope gain a `context_budget` field: the policy hash, the
+  `bytes_per_token` ratio the estimate used, the estimated tokens before and
+  after shedding (the figure after is an upper bound), `request_wire_bytes`
+  (the size of the request sent), and what was removed or stubbed. A call
+  that shed nothing says so explicitly. Advisor and auto-title calls are not
+  budgeted and store a null `context_budget`.
+- **A refused reply is recorded on the turn's audit trail.** It is an audit
+  row (`composer_reply_stage_refusal`, reason `context_budget_exceeded`) with
+  the ceiling, the estimated tokens and request bytes, the configured
+  ceilings and the largest component. It holds sizes and fixed names only. No
+  call record is written, because no call was made.
+- **The stored `request_byte_split` keeps its meaning** (the content split).
+  It is not what the budget is judged on.
+
+### Known limits
+
+- Advisor and review calls are not yet bounded by the context budget
+  (dta-au/elspeth#364). In a long session with the advisor enabled, such a
+  call can still be rejected by the gateway for size; the advisor is then
+  unavailable for that turn.
+- Tool-call arguments and thinking blocks count toward the budget but are
+  not shed. A turn whose arguments alone cannot fit is refused.
+- Token counts are estimated from request bytes, not a tokenizer. The
+  bytes-per-token ratio is the recorded `request_wire_bytes` over the
+  reported prompt tokens of the session's newest successful budgeted call on
+  the same model (failing that, on any model), clamped to 2.0-6.0. Until the
+  session has such a call the ratio is 3.0, which over-estimates tokens; this
+  includes the first turn of an existing session after the upgrade.
+- If the provider still rejects a request for context length, it is recorded
+  as before and there is no automatic retry.
+
+### Publication and acceptance
+
+Automatic image publication from main remains held. The 0.8.13 tag and
+container publication follow successful required checks and the protected
+merge. Operator signing, live-provider acceptance and deployment remain
+separate steps.
+
+---
+
+## 0.8.12 - 2026-11-10
+
+Composer tool remediation. Verification status is recorded in the pull
+request. The dated entry and package version do not establish qualification, a
+published tag or an image.
+
+### Dependencies
+
+- **The remaining Python dependency advisories are fixed.** OpenTelemetry
+  moves to 1.45.1 with the Prometheus exporter at 0.66b1. These SDK and
+  exporter versions are exact pins because operator telemetry custody verifies
+  their implementation at startup. Langfuse moves from SDK 3 to 5.2, allowing
+  packaging 26.3 and patched virtualenv 21.15.6. Azure Monitor moves with the
+  compatible OpenTelemetry stack to 1.8.12 / b59. Existing tracing
+  configuration remains supported; installs must use the updated lock rather
+  than upgrading the telemetry SDK independently.
+
+### Composer
+
+- **Refusals and no-ops go back to the model, not to an approval card.** A
+  mutation now passes validation-only admission before a proposal is staged.
+  A change the server already knows it will refuse, or one that would change
+  nothing, is returned to the model as tool feedback so it can repair its
+  request. Approval cards are created only for changes that pass admission.
+- **Blob and secret changes are checked before a proposal is published.**
+  Blob update and delete prerequisites, quota and custody checks run at
+  admission, and malformed blob references are refused there
+  (`proposal_blob_reference_malformed`). No blob-store effect is executed as a
+  preview. A pending option change keeps the blobs it depends on. When the
+  blob or graph a staged proposal depends on changes before publication, the
+  tool reports the race instead of reporting that the proposal was staged.
+- **Under explicit approval, one composition proposal is pending at a time.**
+  A response carrying more than one mutation is refused whole
+  (`approval_batch_not_atomic`), and a mutation is refused while a composition
+  proposal is pending (`approval_proposal_pending`); both refusals tell the
+  model what to do next. Proposals staged together from one response were
+  previewed against the same state, so accepting them in turn produced stale
+  or contradictory pipelines. This contains the defect and does not redesign
+  it: auto-commit sessions and blob-only proposals are not covered.
+- **Blob and parked-graph selectors accept any spelling of a UUID.** Blob
+  lookups, bindings, retention, planner facts, proposal custody and duplicate
+  detection treat a UUID in upper case, with braces or as a URN as the same
+  blob, and restoring a parked graph canonicalises its selector the same way.
+  The model's arguments, and the hashes recorded over them, are preserved
+  unchanged.
+- **`diff_pipeline` answers in freeform sessions.** It compares the current
+  state with the state at the start of the request, and says so when held
+  proposals are not included. Asked one turn after an edit it reports no
+  change; the intended baseline is still to be decided.
+- **Graph edits.** Transforms can be spliced into planner-built pipelines,
+  which do not carry the visual edges splicing used to require, and removing
+  an output removes its edges.
+- **An oversized blob read is reported as a size refusal**
+  (`blob_content_size_limit`), not as a credential problem.
+- **The gate-preview mismatch diagnostic names the actual failure** (a
+  misspelt field, a short row, a zero divisor or a bad function argument)
+  instead of always advising a numeric source-schema type, and the preview no
+  longer samples a CSV row cut short by its 8 KiB byte limit. Known and
+  deferred: the preview keys sampled rows by the raw CSV header where the
+  runtime uses normalised names; the repair text says so and tells the model
+  not to rename the field.
+- **Composer skill text corrected.** Contradictory and stale instructions were
+  removed or rewritten in place; the skill now says the server raises every
+  prompt review card, in place of wording that read as though prompts go
+  unreviewed. The text was not restructured; about a third of what the
+  proposal planner receives still describes tools it does not have.
+- **Smaller fixes.** A pending proposal's tool result states the next action.
+  The audit record for a cached discovery result matches the admitted
+  envelope delivered to the model. Three queue scope fields that were dropped
+  before `NodeSpec` admission are now carried through. JSON preview warnings
+  and record-count evidence are admitted by the preview response contract
+  instead of failing it. A Chroma client-mode configuration with a null
+  persistence directory is admitted without bypassing path confinement.
+  Recovery tools are recognised in persisted planner receipts.
+
+### Web interface
+
+- **The ARGOnite skin.** The web interface takes the ARGOnite look in light
+  and dark themes, with a high-contrast palette built on the same hues. Header
+  pills, the model chips included, share one height. The conversation runs the
+  full height of the window, with its hide/show control beside "Share inspect
+  link". A selected node and a selected edge are gold, distinct from the
+  keyboard focus colour. Known and deferred: between workspace widths of 960
+  and 1041 px the pipeline card is narrower than its 640 px target.
+- **The share dialog follows the active session and states what a link
+  grants.** It now closes when the active session changes. It stayed bound to
+  the session it was opened for, so after back/forward or a session switch it
+  could make a link for a pipeline the owner was no longer looking at. Its
+  success text no longer says read-only access when the recipient can import
+  an editable copy with copies of the listed files.
+- **The tutorial's audit step explains its LLM call count**, which includes
+  one reachability check made before the run starts.
+
+### LLM gateway
+
+- **Thinking from an adapter that does not declare `REASONING` is refused**
+  as upstream-invalid on the first turn. The gateway returned it with a 200,
+  then refused the caller's next turn when that thinking was sent back. The
+  reference adapter declares
+  `REASONING` and is unaffected; an operator adapter with this defect will now
+  fail earlier.
+
+### Plugins
+
+- **`file_inject` transform.** Writes the content of whole files, bound as
+  configuration, into row fields. The content is part of node identity, so
+  editing a bound file between a run and its resume refuses the resume. It is
+  in the default web plugin set. In the Composer its content must be a file the
+  user uploaded: content written by the planner is refused. A shipped example
+  is in `examples/file_inject/`.
+- **A file the agent rewrites is recorded as the agent's file.** `update_blob`
+  kept the uploader as creator, so a rewritten upload could pass as a user
+  upload after a session fork, or when the new text came from the user's
+  message. It now records the assistant as creator, as for a file the agent
+  creates. Files rewritten before this release keep their old record. Known
+  and deferred: the `llm` prompt guard reads modality only, and a fork copy of
+  a model-written file still passes it; prompt review cards cover that route.
+
+### MCP server
+
+- **File paths authored over MCP are resolved against the configured data
+  directory**, and a path outside it is refused at admission, including the
+  explicit-null case that previously bypassed the check.
+- **The standalone MCP server owns its process lifecycle.** The installed CLI
+  runs the server under a private supervisor, so shutdown, a failed start,
+  loss of the control channel and the death of the parent all settle the
+  child process instead of leaving it running. The supervisor uses the same
+  portable path on every platform; it has been exercised on Linux only.
+
+### Landscape
+
+- **Creating Landscape tables on PostgreSQL no longer breaks a later SQLite
+  initialization in the same process**, which lost its inline foreign keys.
+  Table creation is now serialized and restores the original constraint rules
+  on the shared schema metadata, including when the DDL fails.
+
+### Upgrade notes
+
+- Langfuse tracing now requires Langfuse Cloud or a self-hosted server at
+  version 4.59.0 or newer; Langfuse SDK 5 no longer supports self-hosted v3 or
+  older v4 servers. Upgrade an older server before upgrading ELSPETH. The
+  configuration field names remain unchanged. See the
+  [Langfuse SDK upgrade guide](https://langfuse.com/docs/observability/sdk/upgrade-path/python-v4-to-v5).
+- An MCP client that authors a file path outside the configured data
+  directory is now refused. Move the file under the data directory or change
+  the configured root.
+- A pending approval for a change that is now known to be refused or to be a
+  no-op settles as terminal instead of remaining pending.
+- Under explicit approval a model response with several mutations is refused
+  and the model is asked to send one. Sessions that relied on several
+  proposals being staged from one response will see one proposal per turn.
+- New refusal codes a client may receive: `approval_batch_not_atomic`,
+  `approval_proposal_pending`, `blob_content_size_limit`,
+  `proposal_blob_reference_malformed`.
+- No schema epoch changed. Existing session and Landscape stores load
+  unchanged. Session epoch 78 and Landscape epoch 50 are unchanged from the
+  previous release; this release adds no schema-epoch
+  cutover. Existing 0.8.10 session and Landscape stores need no action, and
+  the 0.8.10 cutover guidance below continues to apply to older stores. This
+  authorizes no migration, reset, restamping or downgrade.
+
+### Publication and acceptance
+
+Automatic image publication from main remains held. The 0.8.12 tag and
+container publication follow successful required checks and the protected
+merge. Operator signing, live-provider acceptance and deployment remain
+separate steps.
+
+---
+
+## 0.8.11 - 2026-11-10
 
 This section records changes on the 0.8.11 candidate. It does not establish
 qualification, a published tag or an image.
@@ -23,60 +992,58 @@ qualification, a published tag or an image.
   such an export reports the missing option unless the request re-attaches the
   file (see YAML import below).
 - **Shared, published and exported graphs no longer carry a `blob_rows`
-  source's file entries.** The public projection previously dropped only each
-  entry's `blob_id`, leaving the file's digest (`payload_ref`), filename, MIME
-  type and size, and reported nothing. The whole `blobs` list is now removed
-  and the redaction account names it (`blobs`, labelled `blob-linkage` in the
-  export header); such sources also count as reading uploaded files.
+  source's file entries.** Only each entry's `blob_id` was dropped, silently
+  leaving the file's digest (`payload_ref`), filename, MIME type and size. The
+  whole `blobs` list is now removed and named in the redaction account
+  (`blobs`, labelled `blob-linkage` in the export header); such sources also
+  count as reading uploaded files.
 - **The YAML export header no longer says sink paths are re-authored on
-  import.** That was not true for a pasted-YAML import. The rebind guidance
-  (also returned as `redaction.rebind_guidance`) now says sink paths are not
+  import**, which was untrue for a pasted-YAML import. The rebind guidance
+  (also returned as `redaction.rebind_guidance`) says sink paths are not
   exported and must be set after import, or passed as `sink_path_bindings`.
 - **A shared link can let recipients import a copy, files included.** The
-  "Share inspect link" dialog now has a configure step: "Let recipients import
-  a copy" (off by default), which lists the files that would travel, and "Link
-  expires after" 1 day, 7 days or 30 days. Nothing is minted until "Create
+  "Share inspect link" dialog has a configure step: "Let recipients import a
+  copy" (off by default), which lists the files that would travel, and "Link
+  expires after" 1 day, 7 days or 30 days; nothing is minted until "Create
   link". The deployment's `shareable_link_lifetime_seconds` is now the maximum:
-  the dialog offers only the lifespans at or below it and picks the longest of
-  those by default; when none fits, it offers no choice, says so, and the link
-  lasts the maximum. A longer lifespan sent to the server is refused with 422,
-  and "copy link again" keeps the chosen lifespan, clamped to the current
-  maximum. Import consent is tied to the listed files: the share carries the
-  list's fingerprint, and if the files changed after the owner saw them the
-  server refuses (409, `share_files_changed`) and the dialog shows the current
-  list for the owner to confirm again. When import is allowed, every
-  uploaded file the graph is attached to (source `blob_ref`, `blob_rows`
-  entries, transform inline-content markers) is frozen into the share at
-  creation, so later edits or deletion on the sharer's side do not break the
-  link. A recipient opening an import link sees "Import a copy into my
+  the dialog offers only lifespans at or below it, defaulting to the longest;
+  when none fits it offers no choice, says so, and the link lasts the maximum.
+  A longer lifespan sent to the server is refused with 422, and "copy link
+  again" keeps the chosen lifespan, clamped to the current maximum. Import
+  consent is tied to the listed files: the share carries the list's
+  fingerprint, and if the files changed after the owner saw them the server
+  refuses (409, `share_files_changed`) and the dialog shows the current list
+  for the owner to confirm again. When import is allowed, every uploaded file
+  the graph is attached to (source `blob_ref`, `blob_rows` entries, transform
+  inline-content markers) is frozen into the share at creation, so later
+  edits or deletion on the sharer's side do not break the link.
+- **Importing a shared copy.** An import link shows "Import a copy into my
   workspace" and the file list; importing creates a new session, "Copy of
   ‹name›", with its own copy of each file and every attachment pointing at the
   copy, and records the share's digest and sharer as `shared_import`
   provenance in the new state. Links minted before this release, and links
-  without the opt-in, stay view-only (403 on import). Secrets never travel.
-  A sink output path (`path`, `file` or `persist_directory`) inside the
-  sharer's own session `outputs/` or `blobs/` folder is re-based to the same
-  place under the recipient's new session, so the copy validates without
-  setting it; a sink path outside the sharer's session folders does not travel
-  and must be set in the copy, as does one longer than 1024 characters, one
-  holding a control character (C0, DEL or C1) or a Unicode line or paragraph
-  separator, or one shaped like a credential. Sinks that do
-  not write a local file are unaffected. The ordinary YAML import accepts the
-  same re-basing as `sink_path_bindings`, which can only name a path inside
-  the caller's own session folders and refuses those same paths. A graph using
-  a plugin the recipient's policy disallows is refused with 422 and the new
-  session is archived. The import page names the reason for a refusal: an
-  account without the pipeline-user role, a view-only link, a component whose
-  plugin the recipient's policy disallows (named, with why), a graph over the
-  YAML size cap, the server's detail for any other import refusal, too many
-  attempts (429) and an unavailable import (503) each have their own message.
+  without the opt-in, stay view-only (403 on import). Secrets never travel. A
+  sink output path (`path`, `file` or `persist_directory`) inside the sharer's
+  session `outputs/` or `blobs/` folder is re-based to the same place in the
+  new session, so the copy validates without setting it; any other sink path
+  does not travel and must be set in the copy, as must one longer than 1024
+  characters, one holding a control character (C0, DEL or C1) or a Unicode
+  line or paragraph separator, or one shaped like a credential. Sinks that do
+  not write a local file are unaffected. The ordinary YAML import
+  accepts the same re-basing as `sink_path_bindings`, which can only name a
+  path inside the caller's own session folders and refuses those same paths.
+  A graph using a plugin the recipient's policy disallows is refused with 422
+  and the new session is archived. The import page has its own message for an
+  account without the pipeline-user role, a view-only link, a disallowed
+  plugin (named, with why), a graph over the YAML size cap, too many attempts
+  (429), an unavailable import (503), and the server's detail for any other
+  refusal.
 - **Only files the user uploaded can be shared for import.** If the graph is
-  attached to a file the assistant created or a pipeline run produced, rather
-  than one the user uploaded, creating an import link is refused with 409
-  naming the file, and the dialog says so before the link is created. The
-  dialog judges each file from its stored record without reading it; creating
-  the link reads and checks every file's bytes, off the request's event loop.
-  View-only links to the same graph are unaffected.
+  attached to a file the assistant created or a pipeline run produced,
+  creating an import link is refused with 409 naming the file, and the dialog
+  says so beforehand, judging each file from its stored record; creating the
+  link reads and checks every file's bytes. View-only links to the same graph
+  are unaffected.
 - **Known cost: share snapshots and frozen files are not reclaimed.** Nothing
   in the web app deletes payload-store content, so every share, and every file
   frozen into an import link, stays on disk after the link expires. Identical
@@ -87,13 +1054,11 @@ qualification, a published tag or an image.
   process that dies mid-import can leave a half-built "Copy of …" session for
   the recipient to delete, and a deliberate retry after a network failure can
   create a second copy. The Import button is disabled while its request is in
-  flight, and stays disabled after a refusal a retry cannot change (400, 403,
-  422).
+  flight and after a refusal a retry cannot change (400, 403, 422).
 - **YAML import can re-attach files to transforms and multi-file sources.**
   `POST /api/sessions/{id}/state/yaml` accepts `inline_blob_bindings`, keyed by
-  component and option path, which rebuilds an inline-content file marker
-  from a ready blob of the session (its `sha256` is that blob's content
-  hash), and
+  component and option path, which rebuilds an inline-content file marker from
+  a ready blob of the session (its `sha256` is that blob's content hash), and
   `source_blob_rows`, which re-binds a `blob_rows` source's file entries and,
   like the composer's own multi-file source tool, refuses a file the assistant
   wrote. The Import YAML dialog does not offer these fields yet.
@@ -102,14 +1067,15 @@ qualification, a published tag or an image.
 
 - **The gateway carries thinking blocks through tool loops.** Assistant
   messages accept `thinking_blocks` (`thinking` with a signature, or
-  `redacted_thinking` with opaque data), adapters receive them in order and
+  `redacted_thinking` with opaque data); adapters receive them in order and
   unmodified, and thinking an adapter reports is returned on the response
   message in the same shape, so ELSPETH replays it on the next turn. Without
   this, a model that requires its signed thinking back (Claude with thinking
   enabled) rejects the second turn of every Composer tool loop. Replayed
   thinking to an adapter without the `reasoning` capability is refused with
   `capability_unsupported`. The reference adapter and mock upstream implement
-  the round trip, and the reference image's `adapter-fingerprint` label changes accordingly.
+  the round trip, and the reference image's `adapter-fingerprint` label
+  changes accordingly.
 
 ## 0.8.10 - 2026-11-09
 
@@ -233,7 +1199,7 @@ establish qualification, a published tag or an image.
 - **Still open.** The application's OpenTelemetry 1.40 pin (CVE-2026-114603)
   and eight virtualenv advisories remain. OpenTelemetry 1.45 breaks web start-up
   and operator telemetry custody, and virtualenv 21.14.7 or later needs
-  packaging 26, which langfuse 3 forbids. Both need their own change.
+  packaging 26, which langfuse 3 forbids. These are resolved together in 0.8.12.
 
 ### Upgrade notes
 

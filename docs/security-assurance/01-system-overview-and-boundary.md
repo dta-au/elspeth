@@ -92,7 +92,7 @@ may select, so a deployment exposes a subset [EV-009], [EV-013].
 | Kind | Count | Registered plugins that can reach outside the process |
 |---|---:|---|
 | Sources | 9 | `aws_s3`, `azure_blob`, `dataverse`, `llm` |
-| Transforms | 39 | `llm`, `blob_fetch`, `web_scrape`, `azure_ai_search`, `rag_retrieval`, `azure_content_safety`, `azure_prompt_shield`, `azure_document_intelligence`, `aws_bedrock_content_safety`, `aws_bedrock_prompt_shield`, `aws_textract_document_analysis`, `aws_textract_inline_analysis` |
+| Transforms | 39 | `llm`, `blob_fetch`, `web_scrape`, `azure_ai_search`, `rag_retrieval`, `azure_content_safety`, `azure_prompt_shield`, `azure_document_intelligence`, `azure_content_understanding`, `aws_bedrock_content_safety`, `aws_bedrock_prompt_shield`, `aws_textract_document_analysis`, `aws_textract_inline_analysis` |
 | Sinks | 9 | `aws_s3`, `azure_blob`, `chroma_sink`, `database`, `dataverse` |
 
 The exact enabled set and its operator profiles belong in the controlled
@@ -103,7 +103,7 @@ corresponding boundary crossings.
 
 | Layer | Product baseline at the reviewed commit | Evidence |
 |---|---|---|
-| Language and runtime | Python 3.12+ from source; Python 3.13 in the official distroless container runtime | [EV-627] |
+| Language and runtime | Python 3.14+ from source; CPython 3.14, shipped with the application, on the distroless `cc-debian13` container runtime | [EV-627] |
 | Web | FastAPI served by uvicorn; React and TypeScript frontend built with Vite | [EV-003] |
 | Data access | SQLAlchemy Core | [EV-003] |
 | Databases | SQLite, with optional SQLCipher for the Landscape, for single-host use; PostgreSQL 16 for external-state deployment profiles | [EV-003], [EV-320] |
@@ -235,7 +235,7 @@ unknown fields and hides input values in validation errors [EV-010].
 | HTTP `allowed_origins`, `allowed_hosts`, headers and fetch limits | No exact-origin list; `public_only`; response 10 MiB; POST request 1 MiB; 30 s | Origin/address/DNS/redirect policy constrains public fetches; web-authored values cannot exceed 10 MiB request/response and 30 s [EV-011], [EV-020] | DEPLOYMENT-TODO: |
 | Planner/advisor models, endpoints and same-model override | `gpt-5.5`; `anthropic/claude-sonnet-4-6`; endpoints unset; same model refused | Operator controls both destinations; endpoint and credential fields are paired; independent models are required unless explicitly overridden [EV-504] | DEPLOYMENT-TODO: |
 | Composer turn/time/rate settings | Composition turns, discovery turns, timeout and per-user rate are required; no implicit values | Bounds must fit the declared transport idle ceiling; provider errors are hidden by default [EV-504] | DEPLOYMENT-TODO: |
-| Planner/advisor resource budgets | Planner: 75 provider calls, 2 MiB request, 16,384 completion tokens, USD 5 cumulative cost, 2 repairs; advisor: 4 calls, 2 checkpoint passes, 4,000-unit input proxy / 8,192 completion tokens, 60 s | Limits resource consumption and review loops; checkpoint and ordinary advisor budgets are separate; see the 0.8.9 input-scope change below [EV-504] | DEPLOYMENT-TODO: |
+| Planner/advisor resource budgets | Planner: 75 provider calls, 960 KiB request, 16,384 completion tokens, USD 5 cumulative cost, 2 repairs; advisor: 4 calls, 2 checkpoint passes, 4,000-unit input proxy / 8,192 completion tokens, 60 s | Limits resource consumption and review loops; checkpoint and ordinary advisor budgets are separate; see the 0.8.9 input-scope change below [EV-504] | DEPLOYMENT-TODO: |
 | `execution_rate_limit` | 60 calls/minute per unconfigured service | Operator-owned limit for external calls made by web-executed runs | DEPLOYMENT-TODO: |
 | Pipeline and operator telemetry | Pipeline telemetry disabled, `lifecycle`, blocking backpressure; web operator mode `prometheus`, pipeline granularity `lifecycle` | `full` pipeline telemetry can export prompts, completions and HTTP bodies; AWS web mode permits only `lifecycle` or `rows` [EV-322], [EV-324] | DEPLOYMENT-TODO: |
 | `classification_banner` | None | No banner is shown until the operator declares a supported ceiling; the banner does not classify content [EV-016] | DEPLOYMENT-TODO: |

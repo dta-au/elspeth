@@ -428,6 +428,38 @@ class TestShippedExamples:
             if db is not None:
                 db.close()
 
+    @pytest.mark.parametrize(
+        ("settings_name", "output_name", "written_fields"),
+        [
+            ("settings.yaml", "tickets_with_guidance.jsonl", {"guidance"}),
+            ("settings_all.yaml", "tickets_with_everything.jsonl", {"style_guide", "review_rules", "checklist"}),
+        ],
+    )
+    def test_file_inject_example_executes_end_to_end(
+        self,
+        example_pipeline_dir: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        settings_name: str,
+        output_name: str,
+        written_fields: set[str],
+    ) -> None:
+        """file_inject ships as a runnable example: the settings run exactly as written, bound files included."""
+        example_dir = self._copy_example_to_tmp(example_pipeline_dir, tmp_path, "file_inject")
+        monkeypatch.chdir(tmp_path)
+        db: LandscapeDB | None = None
+        try:
+            result, db = self._run_example(example_dir / settings_name)
+
+            assert result["status"] == RunStatus.COMPLETED.value
+            assert result["rows_processed"] == 4
+            rows = self._read_jsonl(example_dir / "output" / output_name)
+            assert [row["ticket_id"] for row in rows] == ["T-1001", "T-1002", "T-1003", "T-1004"]
+            assert all(set(row) == {"ticket_id", "type", "summary"} | written_fields for row in rows)
+        finally:
+            if db is not None:
+                db.close()
+
     def test_multi_source_queue_example_executes_end_to_end(
         self,
         example_pipeline_dir: Path,

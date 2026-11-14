@@ -25,17 +25,22 @@ from typing import Literal
 from uuid import uuid4
 
 from elspeth.contracts.composer_progress import (
+    CONTEXT_BUDGET_REFUSAL_DETAIL,
     NON_TERMINAL_PROGRESS_PHASES,
     ComposerProgressEvent,
+    ComposerProgressReason,
     ComposerProgressSink,
 )
 from elspeth.web.composer.tools import is_discovery_tool
 
 __all__ = [
+    "CONTEXT_BUDGET_REFUSAL_DETAIL",
     "ComposerProgressRegistry",
     "ComposerProgressSnapshot",
     "advisor_checkpoint_progress_event",
     "client_cancelled_progress_event",
+    "context_budget_refusal_progress_event",
+    "context_reduced_progress_event",
     "convergence_progress_event",
     "emit_progress",
     "model_call_progress_event",
@@ -394,6 +399,7 @@ class ComposerProgressRegistry:
 def convergence_progress_event(
     *,
     budget_exhausted: Literal["composition", "discovery", "timeout"],
+    reason: ComposerProgressReason | None = None,
 ) -> ComposerProgressEvent:
     """Map a convergence budget discriminator to a discriminated progress event.
 
@@ -420,7 +426,14 @@ def convergence_progress_event(
     - composition budget → split the request into smaller turns
     - discovery budget   → narrow the schema/catalog exploration
     - wall-clock timeout → retry, or ask an operator to raise the server budget
+    - context budget     → start a new session or shorten the request
+
+    ``reason`` is the error's own reason. Only ``context_budget_exceeded``
+    changes the event: that refusal is raised with the composition budget
+    discriminator but spent no turn budget, so its copy must not say it did.
     """
+    if reason == "context_budget_exceeded":
+        return context_budget_refusal_progress_event()
     if budget_exhausted == "timeout":
         return ComposerProgressEvent(
             phase="failed",
@@ -443,6 +456,37 @@ def convergence_progress_event(
         evidence=("The mutation-turn budget was exhausted before a final answer.",),
         likely_next=("Split the request into smaller turns, or ask an operator to raise the mutation-turn budget."),
         reason="convergence_composition_budget",
+    )
+
+
+def context_budget_refusal_progress_event() -> ComposerProgressEvent:
+    """Build the failed event for a request the context budget refused, from the compose loop or the planner.
+
+    The headline and recovery are :data:`CONTEXT_BUDGET_REFUSAL_DETAIL`, split
+    at its cause and its recourse.
+    """
+    return ComposerProgressEvent(
+        phase="failed",
+        headline="This conversation is too large for the composer to continue.",
+        evidence=("The request does not fit the composer's context budget, even with earlier conversation left out.",),
+        likely_next="Start a new session, or shorten your request.",
+        reason="context_budget_exceeded",
+    )
+
+
+def context_reduced_progress_event() -> ComposerProgressEvent:
+    """Build the notice for a turn whose model call leaves earlier conversation out to fit the context budget.
+
+    Sent once per turn, before the first model call whose context budget
+    decision sheds conversation history. Stubbing tool results or leaving out
+    escape-hatch transcript events does not send it.
+    """
+    return ComposerProgressEvent(
+        phase="calling_model",
+        headline="Earlier conversation is no longer visible to the composer.",
+        evidence=("Some earlier messages were left out of this model request to fit the composer's context budget.",),
+        likely_next="The composer continues with your latest request and the current pipeline.",
+        reason="context_reduced",
     )
 
 

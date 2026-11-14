@@ -54,6 +54,7 @@ const composerSettingsEnv: Record<string, string> = {
   ELSPETH_WEB__registration_mode: "open",
   ELSPETH_WEB__auth_provider: "local",
   ELSPETH_WEB__composer_max_composition_turns: "15",
+  ELSPETH_WEB__composer_context_max_prompt_tokens: "200000",
   ELSPETH_WEB__composer_max_discovery_turns: "10",
   ELSPETH_WEB__composer_timeout_seconds: "180.0",
   ELSPETH_WEB__composer_rate_limit_per_minute: "60",

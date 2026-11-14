@@ -1,7 +1,7 @@
 """Tests that the Phase-7A reference-content fields are declared on all
 four plugin protocol classes in contracts/plugin_protocols.py.
 
-Walks ``cls.__mro__`` and unions each base's ``__annotations__`` rather
+Walks ``cls.__mro__`` and unions each base's own annotations rather
 than calling ``typing.get_type_hints()`` or ``hasattr()``.
 ``plugin_protocols.py`` defers context types (``PluginSchema``,
 ``SourceContext``, ``TransformContext``, ``SinkContext``, etc.) into
@@ -23,6 +23,8 @@ inherited attributes for a Protocol's structural contract.
 
 from __future__ import annotations
 
+import annotationlib
+
 from elspeth.contracts.plugin_protocols import (
     BatchTransformProtocol,
     SinkProtocol,
@@ -40,16 +42,15 @@ _PHASE_7A_FIELDS = {
 
 
 def _collect_inherited_annotations(cls: type) -> set[str]:
-    """Union ``__annotations__`` across the MRO via per-class dicts.
+    """Union each MRO entry's own annotations.
 
-    ``__annotations__`` is per-class, not inherited, but accessing it
-    via attribute lookup falls back through the MRO and would conflate
-    contributions across bases. ``vars(base).get("__annotations__", {})``
-    reads the class's own ``__dict__`` directly — strictly per-class.
-    The empty-dict default handles the one MRO entry that lacks the
-    attribute outright (``object``); every Protocol subclass on the
-    walk path has its own ``__annotations__`` populated by the
-    interpreter at class-creation time.
+    ``annotationlib.get_annotations`` returns only the class's own
+    annotations, never a base's, so contributions are strictly per-class.
+    Since Python 3.14 (PEP 649) a class no longer stores ``__annotations__``
+    in its ``__dict__``; the interpreter keeps an ``__annotate__`` function
+    instead, so a ``vars(base)`` probe would find nothing. ``FORWARDREF``
+    format leaves the TYPE_CHECKING-only names unevaluated rather than
+    raising ``NameError``; only the keys are read.
 
     Walking the MRO and union'ing reproduces what a structural
     type-checker sees as the protocol's full attribute set, including
@@ -57,8 +58,7 @@ def _collect_inherited_annotations(cls: type) -> set[str]:
     """
     names: set[str] = set()
     for base in cls.__mro__:
-        base_annotations = vars(base).get("__annotations__", {})
-        names |= set(base_annotations.keys())
+        names |= set(annotationlib.get_annotations(base, format=annotationlib.Format.FORWARDREF))
     return names
 
 

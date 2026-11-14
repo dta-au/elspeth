@@ -1,0 +1,67 @@
+# file_inject, mode: select — a row whose key names no entry
+#
+# THIS CONFIG ENDS PARTIAL / EXIT 1 BY DESIGN. Ticket T-2002 has type "D",
+# and there is no "D" entry under `files`.
+#
+# on_miss defaults to `fail`, so that row becomes a per-row error and is
+# routed by on_error to the `unmatched` sink, exactly as it arrived. The
+# alternative, on_miss: null, writes the ticket with `guidance: null`. Choose
+# it only when a row without guidance is a legitimate outcome that something
+# downstream checks for: a prompt rendered from a null would otherwise look
+# like any other prompt.
+
+sources:
+  tickets:
+    plugin: csv
+    on_success: attach_guidance
+    options:
+      path: examples/file_inject/input_with_unknown.csv
+      on_validation_failure: discard
+      schema:
+        mode: observed
+
+transforms:
+  - name: attach_guidance
+    plugin: file_inject
+    input: attach_guidance
+    on_success: output
+    on_error: unmatched
+    options:
+      schema:
+        mode: observed
+      mode: select
+      key_field: type
+      output_field: guidance
+      files:
+        "A":
+          content_file: guidance_a.md
+          format: text
+        "B":
+          content_file: guidance_b.json
+          format: json
+          data_key: rubric
+        "C":
+          content_file: guidance_c.csv
+          format: csv
+      on_miss: fail
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/file_inject/output/known_type_tickets.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+  unmatched:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/file_inject/output/unmatched_type_tickets.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/file_inject/runs/audit_miss.db

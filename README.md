@@ -3,8 +3,8 @@
 **E**xtensible **L**ayered **S**ecure **P**ipeline **E**ngine for **T**ransformation and **H**andling
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-![Status: 0.8.10](https://img.shields.io/badge/status-0.8.10-green.svg)
+[![Python 3.14+](https://img.shields.io/badge/python-3.14+-blue.svg)](https://www.python.org/downloads/)
+![Status: 0.8.14](https://img.shields.io/badge/status-0.8.14-green.svg)
 
 ELSPETH builds, validates, runs, and audits data and LLM workflows whose
 outputs need to be reviewed and explained. You can author a pipeline in
@@ -59,7 +59,7 @@ yet run a shared, persisted compiled-pipeline artifact. The
 
 ## Try a YAML pipeline
 
-You need Python 3.12 or newer and [uv](https://docs.astral.sh/uv/). From a
+You need Python 3.14 or newer and [uv](https://docs.astral.sh/uv/). From a
 source checkout:
 
 ```bash
@@ -98,7 +98,107 @@ ELSPETH supports audit export and optional signing. The
 [export settings and limits](docs/reference/configuration.md#export-settings)
 describe what is exported and how to configure it.
 
-## What changed in 0.8.10
+## What changed in 0.8.14
+
+0.8.14 moves ELSPETH to Python 3.14. See the [release notes](CHANGELOG.md),
+which also record earlier releases.
+
+Python 3.14 is now required for `elspeth`, `elspeth-lints` and the LLM gateway;
+3.12 and 3.13 are no longer supported or tested. Locked dependency versions are
+unchanged. The release image carries its own CPython 3.14.5 under `/opt/python`
+on a distroless `cc-debian13` base, so it has no `/usr/bin/python3`, and the
+gateway image is `python:3.14-alpine`. Behaviour that changed under the new
+interpreter is corrected: strict JSON parsing bounds nesting explicitly, the
+runtime-validation manifest again records helper dependencies, and asyncio
+diagnostics that carry an exception are logged as the exception class and code
+location only.
+
+Three things need action when upgrading. Startup refuses `JSON_LOGS=true`,
+because LiteLLM's JSON-logs mode logs unhandled exception messages verbatim;
+unset it. The runtime-validation manifest hash changes with the interpreter, so
+a run checkpointed under 3.13 refuses to resume under 3.14 and a web approval
+recorded under 3.13 no longer matches: drain in-flight runs and pending
+approvals before upgrading. CI runs one Python 3.14 lane, so required
+status-check names change and the repository ruleset must be updated to match.
+
+Session epoch 78 and Landscape epoch 50 are unchanged from the previous
+release; this release adds no schema-epoch cutover, so existing session and
+Landscape stores need no action. The 0.8.10 cutover guidance below continues to
+apply to older stores. Backwards compatibility is permitted and considered from 0.8.5 within
+explicitly supported boundaries. This release authorizes no in-place migration,
+reset or downgrade. Package metadata is 0.8.14; the package version alone does
+not establish qualification or image publication. Automatic image publication
+from main is held; verify the release tag and image digest before installing a
+published image.
+
+## Previously in 0.8.13
+
+0.8.13 adds the Composer context budget. See the [release notes](CHANGELOG.md).
+
+Long Composer sessions used to grow until the server or the model gateway
+rejected a request for size. Before each compose-loop and planner model call,
+the server now removes older context in a fixed order until the request fits an
+operator-set prompt-token cap and a request-byte ceiling: earlier tool results
+in the turn, then earlier assistant prose, then escape-hatch transcript events,
+then the oldest earlier user requests. The system skill, catalog, tool
+definitions, current request, pipeline state and latest tool round trip are
+never removed. What was removed is recorded on each call's audit record, and
+the user is told when earlier conversation is no longer visible to the
+Composer. A request that cannot fit is refused before any model call, with a
+named cause and the recourse (start a new session, or shorten the request).
+
+Two configuration changes are breaking. `ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS`
+is required and has no default: the web server does not start without it. Set
+it to the prompt-token limit of the model gateway in front of the Composer. The
+default of `ELSPETH_WEB__COMPOSER_PLANNER_MAX_REQUEST_BYTES` drops from 2 MiB
+to 960 KiB and now also bounds the compose loop.
+
+The budget does not bound every Composer request. Advisor and review calls are
+not yet covered ([#364](https://github.com/dta-au/elspeth/issues/364)), token
+counts are estimated from request bytes rather than a tokenizer, and a request
+the provider still rejects for context length is not retried.
+
+Session epoch 78 and Landscape epoch 50 are unchanged from the previous
+release; this release adds no schema-epoch cutover, so existing session and
+Landscape stores need no action. The 0.8.10 cutover guidance below continues to
+apply to older stores. Backwards compatibility is permitted and considered from 0.8.5 within
+explicitly supported boundaries. This release authorizes no in-place migration,
+reset or downgrade.
+
+## Previously in 0.8.12
+
+0.8.12 is the Composer tool remediation. See the [release notes](CHANGELOG.md).
+
+Under explicit approval, one composition proposal is pending at a time: a
+response carrying more than one mutation is refused whole, and a mutation is
+refused while a proposal is pending, with guidance to the model. This contains
+the defect rather than redesigning it; auto-commit sessions and blob-only
+proposals are not covered. Refusals and no-ops go back to the model as tool
+feedback instead of an approval card. `diff_pipeline` answers in freeform
+sessions, transforms can be spliced into planner-built pipelines, an oversized
+blob read is reported as a size refusal, and contradictory Composer skill text
+was corrected in place without restructuring it.
+
+MCP file paths are confined to the configured data directory, and the
+standalone MCP server runs under a supervisor that settles its child process on
+shutdown, failed start and parent death. Creating Landscape tables on PostgreSQL
+no longer breaks a later SQLite initialization in the same process.
+
+The web interface takes the ARGOnite look in light and dark themes. A new
+`file_inject` transform attaches the content of a file to each row; in the
+Composer it accepts only a file the user uploaded. Langfuse moves to 5.2.0 and
+the OpenTelemetry packages to 1.45.1, which clears the remaining Python
+dependency advisories; Langfuse tracing now needs Langfuse Cloud or a
+self-hosted server at 4.59.0 or later.
+
+Session epoch 78 and Landscape epoch 50 are unchanged from the previous
+release; this release adds no schema-epoch cutover, so existing session and
+Landscape stores need no action. The 0.8.10 cutover guidance below continues to
+apply to older stores. Backwards compatibility is permitted and considered from 0.8.5 within
+explicitly supported boundaries. This release authorizes no in-place migration,
+reset or downgrade.
+
+## Previously in 0.8.10
 
 0.8.10 carries the Composer performance remediation. Proposals, the
 `set_pipeline` schema and fixed tool definitions are verified once; restored
@@ -129,51 +229,12 @@ old workers isolated from the new stores. Compatible stores still require exact
 schema admission; unsupported stores are preserved and refused before incompatible
 writes. Backwards compatibility is permitted and considered from 0.8.5 within
 explicitly supported boundaries. This release authorizes no in-place migration,
-reset or downgrade. Package metadata is 0.8.10; the package version alone does not
-establish qualification or image publication. Automatic image publication from
-main is held; verify the release tag and image digest before installing a
-published image.
+reset or downgrade.
 
 Quota API quantities now use decimal strings for exact signed-64-bit values;
 older numeric clients must adapt their response parsing. Proxy deployments must
 explicitly configure `ELSPETH_WEB__TRUSTED_PROXY_HOSTS` with their actual numeric
 forwarding peers; the default trusts no forwarding headers.
-
-## Previously in 0.8.9
-
-0.8.9 combines Composer, Azure Container Apps and engine improvements.
-Full-replacement refusals and incremental output refusals
-retain their distinct candidate and saved-graph meanings, safe path diagnostics
-and repair guidance. Shared-link failures preserve the requested link instead
-of opening the recipient's workspace. Configured container token ceilings are
-provisioned before serving; configured container storage ceilings bound aggregate
-retained and reserved bytes. Automatic title
-requests disable the adapter and SDK retry paths. See the [release notes](CHANGELOG.md).
-
-Provider request rejections retain sanitized reason codes through tool feedback,
-audit records and readiness responses while remaining nonretryable and blocking
-publication. Exact no-op source patches preserve graph state. Shared-inspect
-links distinguish Bearer authentication failures from invalid links.
-
-Primary Composer and advisor requests use independently configured Azure AI
-Content Safety Prompt Shields, with required fail-closed protection by default.
-See [guard setup](docs/reference/composer-prompt-guard.md) for input limits and
-failure behavior. Advisor checkpoints retain complete mandatory evidence; this
-can increase request cost and latency.
-
-The Azure Container Apps first-install instructions select the GHCR account
-explicitly, separate model routing and pricing identities, export the transport
-ceiling, and mount both required authoring guards through versioned secret
-references. ACA startup and doctor require one `sslmode=verify-full` and one
-`sslrootcert` set to `system` or an absolute CA-file path. Duplicate TLS
-parameters, legacy `requiressl` and competing GSS encryption options are refused;
-correctly URL-escaped credentials remain supported.
-
-Doctor measures TLS on its initial schema-inspection connections and blocks
-schema initialization when preflight fails. Separate initialization, final
-verification and later web connections are outside that measurement. Offline
-instruction rehearsal does not establish live cloud acceptance. These ACA
-enhancements were developed under 0.8.8 and are included in 0.8.9.
 
 See the [release notes](CHANGELOG.md) and [deployment runbooks](docs/runbooks/index.md)
 before upgrading.

@@ -204,6 +204,7 @@ class TestRateLimiterTimeoutProperties:
 
     @given(name=valid_names)
     @settings(max_examples=10)
+    @pytest.mark.timing_sensitive
     def test_timeout_respects_duration(self, name: str) -> None:
         """Property: Timeout doesn't significantly exceed specified duration."""
         with RateLimiter(name=name, requests_per_minute=1) as limiter:
@@ -279,6 +280,7 @@ class TestNoOpLimiterProperties:
 
     @given(weight=weights)
     @settings(max_examples=30)
+    @pytest.mark.timing_sensitive
     def test_acquire_never_blocks(self, weight: int) -> None:
         """Property: NoOpLimiter.acquire() never blocks."""
         limiter = NoOpLimiter()

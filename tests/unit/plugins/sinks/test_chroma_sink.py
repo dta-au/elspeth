@@ -66,8 +66,14 @@ def _telemetry_emit(event: TelemetryEvent) -> None:
 
 
 def _make_chroma_collection_double() -> Any:
-    """Create a Chroma collection double specced to the SDK collection API."""
-    return create_autospec(chromadb.Collection, instance=True, spec_set=True)
+    """Create a Chroma collection double specced to the SDK collection API.
+
+    Its metadata carries the default ``hnsw:space`` so ``on_start``'s
+    distance-function check sees a collection built as configured.
+    """
+    collection = create_autospec(chromadb.Collection, instance=True, spec_set=True)
+    collection.metadata = {"hnsw:space": "cosine"}
+    return collection
 
 
 def _make_chroma_client_double() -> Any:
@@ -418,6 +424,8 @@ def _chroma_effect_context() -> RestrictedSinkEffectContext:
 
 class _RecoverableChromaCollection:
     def __init__(self) -> None:
+        # Read by ChromaSink.on_start's distance-function check.
+        self.metadata: dict[str, object] = {"hnsw:space": "cosine"}
         self.documents: dict[str, tuple[str, dict[str, object] | None]] = {}
         self.upsert_count_by_id: dict[str, int] = {}
 

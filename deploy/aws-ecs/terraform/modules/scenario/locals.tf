@@ -167,6 +167,7 @@ locals {
     "sink:json",
     "sink:text",
     "transform:field_mapper",
+    "transform:file_inject",
     "transform:line_explode",
     "transform:llm",
     "transform:reference_join",
@@ -468,6 +469,8 @@ locals {
     { name = "ELSPETH_WEB__DATA_DIR", value = local.data_dir },
     { name = "ELSPETH_WEB__PAYLOAD_STORE_PATH", value = local.payload_store_path },
     { name = "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS", value = "12" },
+    # Placeholder: set to your model gateway's prompt-token limit before production use.
+    { name = "ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS", value = "200000" },
     { name = "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS", value = "8" },
     # Advertise the real ALB transport ceiling for synchronous request
     # headroom. The durable composer job budget is independent of observer

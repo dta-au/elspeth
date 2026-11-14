@@ -33,7 +33,7 @@ event-factory functions, tool-name helpers) stays in
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from typing import Literal, Self
+from typing import Final, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
@@ -48,6 +48,14 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 COMPOSER_PROGRESS_MAX_EVIDENCE = 4
 _MAX_PROGRESS_TEXT_CHARS = 180
+
+# What the user reads when a request cannot be fitted to the context budget,
+# from either the compose loop or the planner. The refusal is permanent for
+# the session, so the recourse is a new session or a shorter request, never a
+# retry. Lives at L0 because the compose loop's refusal exception renders it.
+CONTEXT_BUDGET_REFUSAL_DETAIL: Final[str] = (
+    "This conversation is too large for the composer to continue. Start a new session, or shorten your request."
+)
 
 
 type ComposerProgressPhase = Literal[
@@ -98,6 +106,13 @@ type ComposerProgressReason = Literal[
     "convergence_discovery_budget",
     "convergence_wall_clock_timeout",
     "tool_call_cap_exceeded",
+    # The request could not be fitted to the operator's context budget
+    # (prompt-token or request-byte ceiling) even after shedding; refused
+    # before any provider call.
+    "context_budget_exceeded",
+    # Not a failure: the first model call of a turn that sheds earlier
+    # conversation to fit the context budget announces it, once per turn.
+    "context_reduced",
     # Provider-side failures — LiteLLM exception families.
     "provider_auth_failed",
     "provider_unavailable",

@@ -9,9 +9,10 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.engine import Connection
 
-from elspeth.contracts.blobs import BLOB_REF_PATH_PREFIX
+from elspeth.contracts.blobs import BLOB_REF_PATH_PREFIX, BLOB_STATUSES
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.pipeline_proposal import is_owned_composition_state_authority
+from elspeth.web.resource_identity import canonical_resource_uuid
 from elspeth.web.sessions.models import blobs_table, composition_proposals_table
 
 _TOP_LEVEL_BLOB_TOOLS = frozenset(
@@ -22,9 +23,30 @@ _TOP_LEVEL_BLOB_TOOLS = frozenset(
         "wire_blob_inline_ref",
     }
 )
-_BLOB_REFERENCE_TOOLS = _TOP_LEVEL_BLOB_TOOLS | {"set_pipeline", "set_source_from_blobs"}
+_OPTIONS_BLOB_TOOLS = frozenset({"upsert_node", "set_source", "set_output"})
+_PATCH_BLOB_TOOLS = frozenset({"patch_node_options", "patch_source_options", "patch_output_options"})
+_BLOB_REFERENCE_TOOLS = _TOP_LEVEL_BLOB_TOOLS | _OPTIONS_BLOB_TOOLS | _PATCH_BLOB_TOOLS | {"set_pipeline", "set_source_from_blobs"}
 
 _BLOB_SENTINEL_OPTION_KEYS = frozenset({"path", "file"})
+
+PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE = (
+    "I couldn't prepare this proposal because a referenced file is no longer available for this session. "
+    "Please choose the file again and retry."
+)
+
+
+class ProposalResourceUnavailableError(Exception):
+    """A queried proposal resource is missing, foreign, or known not ready."""
+
+
+class MalformedProposalBlobReferenceError(Exception):
+    """Model-supplied proposal arguments carry a malformed blob reference (Tier 3).
+
+    Raised only at proposal admission, where the arguments come from the
+    planner. The message names the offending position so the planner can
+    repair it. Rows already persisted by ELSPETH keep failing as
+    ``AuditIntegrityError`` in ``pending_proposal_reference_id``.
+    """
 
 
 def _canonical_sentinel_blob_id(value: str, *, position: str) -> str:
@@ -96,9 +118,27 @@ def proposal_blob_reference_ids(tool_name: str, arguments: Mapping[str, Any]) ->
     mappings, whose blob vocabulary (``blob_ref`` markers and ``blob:<uuid>``
     path/file sentinels) is walked recursively. Missing these positions could
     let a blob be deleted while a proposal depending on it is pending.
+
+    UUID projection here conservatively retains resources; it does not admit
+    graph marker syntax or rewrite the original, exactly hashed arguments.
+    Strict sentinel validation precedes this projection. Nonparseable IDs
+    remain references so malformed authority never silently sheds custody.
     """
     if tool_name not in _BLOB_REFERENCE_TOOLS:
         return ()
+
+    if tool_name in _OPTIONS_BLOB_TOOLS or tool_name in _PATCH_BLOB_TOOLS:
+        field = "patch" if tool_name in _PATCH_BLOB_TOOLS else "options"
+        if field not in arguments:
+            return ()
+        options = arguments[field]
+        if options is None:
+            return ()
+        if type(options) is not dict:
+            raise ValueError(f"{tool_name} {field} must be a mapping")
+        option_references: list[str] = []
+        _collect_option_blob_references(options, position=f"{tool_name}.{field}", into=option_references)
+        return tuple(dict.fromkeys(canonical_resource_uuid(value) or value for value in option_references))
 
     if tool_name == "set_source_from_blobs":
         raw_blob_ids = arguments["blob_ids"] if "blob_ids" in arguments else None
@@ -109,7 +149,7 @@ def proposal_blob_reference_ids(tool_name: str, arguments: Mapping[str, Any]) ->
         for index, member in enumerate(raw_blob_ids):
             if type(member) is not str or not member:
                 raise ValueError(f"set_source_from_blobs blob_ids[{index}] must be a non-empty string")
-        return tuple(dict.fromkeys(raw_blob_ids))
+        return tuple(dict.fromkeys(canonical_resource_uuid(value) or value for value in raw_blob_ids))
 
     if tool_name == "set_pipeline":
         collected: list[str] = []
@@ -136,7 +176,7 @@ def proposal_blob_reference_ids(tool_name: str, arguments: Mapping[str, Any]) ->
                         position=f"{collection_name}[{index}]",
                         into=collected,
                     )
-            return tuple(dict.fromkeys(collected))
+            return tuple(dict.fromkeys(canonical_resource_uuid(value) or value for value in collected))
         source = arguments["source"] if "source" in arguments else None
         if source is None:
             return ()
@@ -152,14 +192,14 @@ def proposal_blob_reference_ids(tool_name: str, arguments: Mapping[str, Any]) ->
             if type(options) is not dict:
                 raise ValueError("set_pipeline source.options must be a mapping when present")
             _collect_option_blob_references(options, position="source.options", into=collected)
-        return tuple(dict.fromkeys(collected))
+        return tuple(dict.fromkeys(canonical_resource_uuid(value) or value for value in collected))
 
     value = arguments["blob_id"] if "blob_id" in arguments else None
     if value is None:
         return ()
     if type(value) is not str or not value:
         raise ValueError(f"{tool_name} blob_id must be a non-empty string when present")
-    return (value,)
+    return (canonical_resource_uuid(value) or value,)
 
 
 def validate_proposal_blob_references(
@@ -170,14 +210,23 @@ def validate_proposal_blob_references(
     arguments: Mapping[str, Any],
 ) -> None:
     """Require every authoritative proposal blob to be owned and ready."""
-    for blob_id in proposal_blob_reference_ids(tool_name, arguments):
+    try:
+        blob_ids = proposal_blob_reference_ids(tool_name, arguments)
+    except ValueError as exc:
+        if tool_name == "set_pipeline" and is_owned_composition_state_authority(arguments):
+            # Server-owned authority is Tier 1: malformed here is our bug, not a planner error.
+            raise
+        raise MalformedProposalBlobReferenceError(str(exc)) from exc
+    for blob_id in blob_ids:
         row = conn.execute(select(blobs_table.c.session_id, blobs_table.c.status).where(blobs_table.c.id == blob_id)).first()
         if row is None:
-            raise ValueError(f"Proposal references blob {blob_id!r}, but that blob does not exist")
+            raise ProposalResourceUnavailableError(PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE)
         if row.session_id != session_id:
-            raise ValueError(f"Proposal references blob {blob_id!r}, but it is not owned by this session")
+            raise ProposalResourceUnavailableError(PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE)
+        if type(row.status) is not str or row.status not in BLOB_STATUSES:
+            raise AuditIntegrityError("Tier 1: owned proposal blob has invalid persisted status")
         if row.status != "ready":
-            raise ValueError(f"Proposal references blob {blob_id!r}, but its status is {row.status!r}, not 'ready'")
+            raise ProposalResourceUnavailableError(PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE)
 
 
 def pending_proposal_reference_id(

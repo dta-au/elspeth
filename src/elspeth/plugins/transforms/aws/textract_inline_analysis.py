@@ -31,7 +31,7 @@ from elspeth.contracts.binary_documents import (
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.enums import AuditCharacteristic
-from elspeth.contracts.errors import FrameworkBugError, TransformErrorCategory
+from elspeth.contracts.errors import FrameworkBugError, PluginRetryableError, TransformErrorCategory
 from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.payload_store import PayloadNotFoundError, PayloadStore
@@ -74,6 +74,16 @@ _PAYLOAD_REF_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_INLINE_QUERIES = 15
 _TEXTRACT_SDK_CONNECT_TIMEOUT_SECONDS = 10.0
 _TEXTRACT_SDK_TIMEOUT_HEADROOM_SECONDS = 90.0
+# Configuration ceilings; each default sits at its ceiling, as in the async
+# transform. One synchronous AnalyzeDocument response for a <= 5 MiB document
+# is far below the block and byte ceilings; the two timeouts bound how long an
+# author can hold an inline worker on one request.
+MAX_INLINE_BLOCKS = 100_000
+MAX_INLINE_RESULT_BYTES = 50_000_000
+MAX_INLINE_REQUEST_TIMEOUT_SECONDS = 120.0
+# Every SDK attempt at the read-timeout ceiling plus scheduling headroom:
+# 3 * (120 s read + 10 s connect) + 90 s.
+MAX_INLINE_BATCH_WAIT_TIMEOUT_SECONDS = 480.0
 
 logger = structlog.get_logger(__name__)
 _warn_telemetry_before_start = make_warn_telemetry_before_start(logger)
@@ -166,14 +176,27 @@ class AWSTextractInlineAnalysisConfig(TransformDataConfig):
         le=BINARY_DOCUMENT_MAX_BYTES,
         description="Maximum accepted document byte length; may be reduced but never raised above the 5 MiB provider bound.",
     )
-    max_blocks: int = Field(default=100_000, gt=0, description="Maximum Textract block count for one document.")
-    max_result_bytes: int = Field(default=50_000_000, gt=0, description="Maximum canonical JSON bytes retained for one document result.")
-    request_timeout_seconds: float = Field(
-        default=120.0,
+    max_blocks: int = Field(
+        default=MAX_INLINE_BLOCKS, gt=0, le=MAX_INLINE_BLOCKS, description="Maximum Textract block count for one document."
+    )
+    max_result_bytes: int = Field(
+        default=MAX_INLINE_RESULT_BYTES,
         gt=0,
+        le=MAX_INLINE_RESULT_BYTES,
+        description="Maximum canonical JSON bytes retained for one document result.",
+    )
+    request_timeout_seconds: float = Field(
+        default=MAX_INLINE_REQUEST_TIMEOUT_SECONDS,
+        gt=0,
+        le=MAX_INLINE_REQUEST_TIMEOUT_SECONDS,
         description="SDK read timeout for one AnalyzeDocument attempt; the connect timeout remains 10 seconds.",
     )
-    batch_wait_timeout_seconds: float = Field(default=420.0, gt=0, description="Maximum engine wait for one pipelined document row.")
+    batch_wait_timeout_seconds: float = Field(
+        default=MAX_INLINE_BATCH_WAIT_TIMEOUT_SECONDS,
+        gt=0,
+        le=MAX_INLINE_BATCH_WAIT_TIMEOUT_SECONDS,
+        description="Maximum engine wait for one pipelined document row.",
+    )
 
     @field_validator("request_timeout_seconds", "batch_wait_timeout_seconds")
     @classmethod
@@ -260,7 +283,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_inline_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:229d85c78907213d"
+    source_file_hash: str | None = "sha256:8fbbdb2d684a9029"
     config_model = AWSTextractInlineAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -370,6 +393,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         self._row_clients: dict[str, TextractInlineClient] = {}
         self._row_clients_lock = threading.Lock()
         self._shutdown = threading.Event()
+        self._run_shutdown: threading.Event | None = None
         self._batch_initialized = False
 
     def created_output_fields(self) -> tuple[FieldDefinition, ...]:
@@ -389,8 +413,11 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         self._telemetry_emit = ctx.telemetry_emit
         self._limiter = ctx.rate_limit_registry.get_limiter(self.name) if ctx.rate_limit_registry is not None else None
         self._payload_store = ctx.payload_store
-        if ctx.shutdown_event is not None:
-            self._shutdown = ctx.shutdown_event
+        # A fresh private event per start: close() sets it, so a restarted
+        # instance must not inherit the previous run's stop. The engine's
+        # event is only ever read.
+        self._shutdown = threading.Event()
+        self._run_shutdown = ctx.shutdown_event
         if self._sdk_client is None and ctx.run_mode is RunMode.REPLAY:
             self._sdk_client = ReplayOnlySDK()
         elif self._sdk_client is None and ctx.run_mode is RunMode.VERIFY:
@@ -508,26 +535,29 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         store = self._payload_store
         if store is None:
             raise FrameworkBugError("Amazon Textract inline transform requires a payload store")
+        # A bounded read stops after max_document_bytes + 1 bytes, so an
+        # oversized blob is rejected without any worker holding its whole
+        # body; the exact size is therefore unknown and reported as ">max".
         try:
-            content = store.retrieve(payload_ref)
+            content = store.retrieve_bounded(payload_ref, max_bytes=self._max_document_bytes)
         except PayloadNotFoundError:
             return TransformResult.error(
                 {"reason": "blob_not_found", "field": field_name, "blob_ref": payload_ref},
                 retryable=False,
             )
-        if not content:
-            return TransformResult.error(
-                {"reason": "invalid_input", "field": field_name, "error_type": "empty_document"},
-                retryable=False,
-            )
-        if len(content) > self._max_document_bytes:
+        if content is None:
             return TransformResult.error(
                 {
                     "reason": "blob_too_large",
                     "field": field_name,
                     "max_blob_bytes": self._max_document_bytes,
-                    "actual": str(len(content)),
+                    "actual": f">{self._max_document_bytes}",
                 },
+                retryable=False,
+            )
+        if not content:
+            return TransformResult.error(
+                {"reason": "invalid_input", "field": field_name, "error_type": "empty_document"},
                 retryable=False,
             )
         if not binary_document_signature_matches(self._document_format, content):
@@ -542,12 +572,22 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
             )
         return payload_ref, content
 
+    def _shutdown_requested(self) -> bool:
+        """Whether close() (private event) or the engine (run event) asked work to stop.
+
+        The engine's ``ctx.shutdown_event`` is read-only to this plugin:
+        close() stops this plugin's workers through the private
+        ``_shutdown`` event and never raises the run-wide cancellation signal.
+        """
+        run_shutdown = self._run_shutdown
+        return self._shutdown.is_set() or (run_shutdown is not None and run_shutdown.is_set())
+
     def _process_single_with_state(
         self, row: PipelineRow, state_id: str, *, ctx: TransformContext, token_id: str | None
     ) -> TransformResult:
         if not self._run_id or not self._node_id or token_id is None:
             raise FrameworkBugError("Amazon Textract inline processing requires run, node, and token identity")
-        if self._shutdown.is_set():
+        if self._shutdown_requested():
             return TransformResult.error({"reason": "shutdown_requested"}, retryable=False)
         document = self._read_document_bytes(row)
         if isinstance(document, TransformResult):
@@ -564,9 +604,19 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
                 queries=self._query_requests,
             )
         except TextractServiceError as error:
+            if error.retryable:
+                # The audited client has already recorded the failed call. The
+                # engine retries only a raised PluginRetryableError; the row is
+                # retried when the pipeline configures retry, and each retry is
+                # a new, possibly billable AnalyzeDocument call (no idempotency
+                # token exists for the synchronous API).
+                raise PluginRetryableError(
+                    f"Amazon Textract AnalyzeDocument failed (transient): {error.code}",
+                    retryable=True,
+                ) from error
             return TransformResult.error(
                 {"reason": "analysis_failed", "error_type": "service_error", "code": error.code},
-                retryable=error.retryable,
+                retryable=False,
             )
         except TextractResponseError as error:
             response_reason: TransformErrorCategory = "result_too_large" if error.category == "response_too_large" else "malformed_response"
@@ -580,14 +630,9 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
                 max_result_bytes=self._max_result_bytes,
             )
         except MalformedTextractResponse as error:
-            safe_message = str(error)
-            validation_reason: TransformErrorCategory
-            if "max_blocks" in safe_message:
-                validation_reason = "too_many_blocks"
-            elif "max_result_bytes" in safe_message:
-                validation_reason = "result_too_large"
-            else:
-                validation_reason = "malformed_response"
+            # Dispatch on the structured category, never the message: the
+            # message can embed provider-controlled block text.
+            validation_reason: TransformErrorCategory = error.category
             return TransformResult.error({"reason": validation_reason, "error_type": "result_validation"}, retryable=False)
 
         if normalized.page_count != 1:
@@ -726,6 +771,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         prior_payload_store = self._payload_store
         prior_clients = self._row_clients
         prior_shutdown = self._shutdown
+        prior_run_shutdown = self._run_shutdown
         try:
             self._recorder = ctx.landscape
             self._run_id = ctx.run_id
@@ -736,6 +782,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
             self._payload_store = _ProbePayloadStore()
             self._row_clients = {}
             self._shutdown = threading.Event()
+            self._run_shutdown = None
             state_id = ctx.state_id or "textract-inline-invariant-probe-state"
             token_id = ctx.token.token_id if ctx.token is not None else "textract-inline-invariant-probe-token"
             return self._process_single_with_state(probe_rows[0], state_id, token_id=token_id, ctx=ctx)
@@ -749,6 +796,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
             self._payload_store = prior_payload_store
             self._row_clients = prior_clients
             self._shutdown = prior_shutdown
+            self._run_shutdown = prior_run_shutdown
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:
@@ -769,7 +817,8 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
                 "downstream node then sets blob_ref_field: page_blob_ref and document_format: png. Mixed formats "
                 "need homogeneous sources or branches with one transform instance per format.",
                 "Multipage, oversized, or already-S3 documents belong in aws_textract_document_analysis.",
-                "Synchronous AnalyzeDocument has no idempotency guarantee, so SDK and engine retries can each repeat a billable provider call.",
+                "Synchronous AnalyzeDocument has no idempotency guarantee: botocore's SDK retries, and engine row retries of a "
+                "throttled or transient failure when the pipeline configures retry, can each repeat a billable provider call.",
                 "For explicit AWS credentials, use ELSPETH markers such as {secret_ref: AWS_ACCESS_KEY_ID}.",
             ),
         )

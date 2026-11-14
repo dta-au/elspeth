@@ -24,6 +24,12 @@ from elspeth.mcp.server import create_server
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Qualified Linux worker memory enforcement")
 
 
+# Below the 512 MiB the giant value needs, above what a healthy worker maps:
+# after imports the SQLCipher worker maps about 254 MiB on Python 3.14, so the
+# former 256 MiB budget could not run even the follow-up ``SELECT 1``.
+_GIANT_VALUE_BUDGET_BYTES = 384 * 1024 * 1024
+
+
 @pytest.fixture(params=[None, "query-worker-test-passphrase"])
 def audit_target(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[tuple[str, str | None]]:
     passphrase = request.param
@@ -81,9 +87,10 @@ async def test_non_budget_errors_are_errors_without_sql_diagnostics(audit_target
 async def test_giant_single_value_is_contained_and_worker_recovers(
     audit_target: tuple[str, str | None], monkeypatch: pytest.MonkeyPatch, process_pids: list[int]
 ) -> None:
-    # The request asks for 512 MiB; the disposable process may map only 256 MiB.
-    # Allocation fails before the driver can materialize the giant scalar.
-    monkeypatch.setattr(query_worker, "WORKER_MEMORY_BYTES", 256 * 1024 * 1024)
+    # The request asks for 512 MiB; the disposable process may map only
+    # _GIANT_VALUE_BUDGET_BYTES. Allocation fails before the driver can
+    # materialize the giant scalar.
+    monkeypatch.setattr(query_worker, "WORKER_MEMORY_BYTES", _GIANT_VALUE_BUDGET_BYTES)
     worker = RawQueryWorker(*audit_target)
     with pytest.raises(QueryBudgetExceeded, match="memory"):
         await worker.execute("SELECT hex(zeroblob(268435456)) AS value", None, 1)
@@ -158,7 +165,7 @@ async def test_mcp_dispatch_uses_worker_and_preserves_exact_json(
 async def test_mcp_giant_field_refusal_and_recovery(
     audit_target: tuple[str, str | None], monkeypatch: pytest.MonkeyPatch, process_pids: list[int]
 ) -> None:
-    monkeypatch.setattr(query_worker, "WORKER_MEMORY_BYTES", 256 * 1024 * 1024)
+    monkeypatch.setattr(query_worker, "WORKER_MEMORY_BYTES", _GIANT_VALUE_BUDGET_BYTES)
     server = create_server(audit_target[0], passphrase=audit_target[1])
     result = await _call(server, "query", {"sql": "SELECT hex(zeroblob(268435456)) AS value"})
     assert result.isError
@@ -214,6 +221,7 @@ async def test_mcp_input_budget_refuses_before_spawn(audit_target: tuple[str, st
 
 
 @pytest.mark.asyncio
+@pytest.mark.timing_sensitive
 async def test_deadline_reaps_query_and_allows_next_query(
     audit_target: tuple[str, str | None], monkeypatch: pytest.MonkeyPatch, process_pids: list[int]
 ) -> None:

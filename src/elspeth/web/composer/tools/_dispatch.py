@@ -17,7 +17,7 @@ only what this module defines (``execute_tool``, ``get_tool_definitions``,
 
 from __future__ import annotations
 
-import asyncio
+import inspect
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any, Final, cast
@@ -27,6 +27,7 @@ from jsonschema.exceptions import ValidationError
 from sqlalchemy import Engine
 
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
 from elspeth.contracts.freeze import deep_freeze, deep_thaw
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext
@@ -823,6 +824,7 @@ def execute_tool(
     executing_proposal_id: str | None = None,
     validate_arguments: bool = False,
     require_data_dir_for_paths: bool = False,
+    mcp_root_authority: McpConfiguredRootAuthority | None = None,
     raise_schema_argument_errors: bool = False,
     _interpretation_requirements_are_internal: bool = False,
 ) -> ToolResult:
@@ -953,6 +955,7 @@ def execute_tool(
         catalog=catalog,
         plugin_snapshot=plugin_snapshot,
         data_dir=data_dir,
+        mcp_root_authority=mcp_root_authority,
         require_data_dir_for_paths=require_data_dir_for_paths,
         session_engine=session_engine,
         session_id=session_id,
@@ -1090,7 +1093,7 @@ if _sync_declared_names & set(_SESSION_AWARE_TOOL_HANDLERS):
 # accidentally registered here would silently return a non-Awaitable; the
 # compose-loop ``await`` would crash with TypeError at the worst time.
 for _name, _handler in _SESSION_AWARE_TOOL_HANDLERS.items():
-    if not asyncio.iscoroutinefunction(_handler):
+    if not inspect.iscoroutinefunction(_handler):
         raise RuntimeError(
             f"_SESSION_AWARE_TOOL_HANDLERS[{_name!r}] is not async; sync handlers belong in _MUTATION_TOOLS / _DISCOVERY_TOOLS instead."
         )
@@ -1100,7 +1103,7 @@ for _name, _handler in _SESSION_AWARE_TOOL_HANDLERS.items():
 # ``ToolDeclaration`` with a sync kind that would return a coroutine
 # object as if it were a ToolResult.
 for _decl in _REGISTERED_TOOLS:
-    if asyncio.iscoroutinefunction(_decl.handler):
+    if inspect.iscoroutinefunction(_decl.handler):
         raise RuntimeError(
             f"ToolDeclaration({_decl.name!r}).handler is async but kind={_decl.kind.value!r} is a sync kind. "
             "Async handlers belong in _SESSION_AWARE_TOOL_HANDLERS instead."

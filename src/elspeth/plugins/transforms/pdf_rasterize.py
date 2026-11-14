@@ -27,6 +27,8 @@ from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError, Tra
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.payload_store import IntegrityError, PayloadNotFoundError
 from elspeth.contracts.pdf_render import (
+    PDF_RENDER_FORMAT,
+    PDF_RENDER_RETIRED_FORMATS,
     PDFRefusedPageData,
     PDFRenderedPageData,
     PDFRenderReceiptData,
@@ -34,7 +36,7 @@ from elspeth.contracts.pdf_render import (
 )
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
-from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.replay_payload_store import SourceBoundPayloadStore
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
@@ -102,6 +104,47 @@ def _page_output_refusal(page_number: int, data: bytes, max_page_bytes: int) -> 
         )
     if not binary_document_signature_matches("png", data):
         return RefusedPage(page_number=page_number, kind=PageRefusalKind.RENDER_ERROR, detail="render worker output is not a PNG")
+    return None
+
+
+def _page_claim_refusal(page: RenderedPage, *, extract_text: bool, max_page_text_bytes: int, max_page_pixels: int) -> RefusedPage | None:
+    """The parent's own verdict on one worker page's geometry and text claims.
+
+    Like ``_page_output_refusal``, these values come from a worker that parses hostile
+    PDF bytes and reach row data and the audit receipt, so every bound the worker
+    enforces on them is enforced again here. ``RenderedPage`` itself validates nothing.
+    """
+    width, height = page.width_px, page.height_px
+    if type(width) is not int or type(height) is not int or width <= 0 or height <= 0:
+        return RefusedPage(
+            page_number=page.page_number,
+            kind=PageRefusalKind.INVALID_GEOMETRY,
+            detail="render worker claimed a page size that is not a positive integer pixel geometry",
+        )
+    if width * height > max_page_pixels:
+        return RefusedPage(
+            page_number=page.page_number,
+            kind=PageRefusalKind.OVERSIZE_PIXELS,
+            detail=f"render worker claimed {width}x{height} px; max_page_pixels is {max_page_pixels}",
+        )
+    if not extract_text:
+        if page.text is not None:
+            return RefusedPage(
+                page_number=page.page_number,
+                kind=PageRefusalKind.RENDER_ERROR,
+                detail="render worker returned page text although extract_text is disabled",
+            )
+    elif type(page.text) is str:
+        # A non-str text with extraction enabled is a worker protocol break, raised
+        # as a FrameworkBugError where the row is built. surrogatepass: measuring
+        # must not crash on a lone surrogate a broken worker could return.
+        text_bytes = len(page.text.encode("utf-8", "surrogatepass"))
+        if text_bytes > max_page_text_bytes:
+            return RefusedPage(
+                page_number=page.page_number,
+                kind=PageRefusalKind.OVERSIZE_TEXT,
+                detail=f"render worker text is {text_bytes} bytes; max_page_text_bytes is {max_page_text_bytes}",
+            )
     return None
 
 
@@ -424,7 +467,7 @@ class PDFRasterize(BaseTransform):
     name = "pdf_rasterize"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:16a1d8c599b42132"
+    source_file_hash: str | None = "sha256:334c2c2d700d33c5"
     config_model = PDFRasterizeConfig
     usage_when_to_use: str = (
         "Use when each row carries a payload-store content hash for a PDF (from the blob_rows source or blob_fetch) "
@@ -700,13 +743,14 @@ class PDFRasterize(BaseTransform):
 
     def _render_request(self, blob_ref: str) -> PDFRenderRequestData:
         return {
-            "format": "pdf_rasterize/v1",
+            "format": PDF_RENDER_FORMAT,
             "input_pdf_hash": blob_ref,
             "render_limits": {
                 "dpi": self._limits.dpi,
                 "max_pages": self._limits.max_pages,
                 "max_page_pixels": self._limits.max_page_pixels,
                 "max_page_bytes": self._limits.max_page_bytes,
+                "max_total_bytes": self._limits.max_total_bytes,
                 "render_timeout_seconds": self._limits.render_timeout_seconds,
                 "worker_memory_limit_bytes": self._limits.worker_memory_limit_bytes,
                 "extract_text": self._limits.extract_text,
@@ -748,7 +792,7 @@ class PDFRasterize(BaseTransform):
         else:
             raise FrameworkBugError(f"Unknown PDF renderer result type: {type(outcome).__name__}")
         return {
-            "format": "pdf_rasterize/v1",
+            "format": PDF_RENDER_FORMAT,
             "renderer_identity": renderer_identity(),
             "outcome_kind": outcome_kind,
             "page_count": page_count,
@@ -761,7 +805,11 @@ class PDFRasterize(BaseTransform):
         }
 
     def _restore_render_receipt(self, receipt: object, input_row: PipelineRow) -> TransformResult:
-        if type(receipt) is not dict or "format" not in receipt or receipt["format"] != "pdf_rasterize/v1":
+        if type(receipt) is dict and "format" in receipt and receipt["format"] in PDF_RENDER_RETIRED_FORMATS:
+            raise AuditIntegrityError(
+                f"PDF replay source call was recorded as {receipt['format']}, which is no longer replayed (current {PDF_RENDER_FORMAT})"
+            )
+        if type(receipt) is not dict or "format" not in receipt or receipt["format"] != PDF_RENDER_FORMAT:
             raise AuditIntegrityError("PDF replay source call has no typed render receipt")
         identity = receipt["renderer_identity"] if "renderer_identity" in receipt else None
         if type(identity) is not str or _PAYLOAD_REF_PATTERN.fullmatch(identity) is None:
@@ -832,6 +880,11 @@ class PDFRasterize(BaseTransform):
             pages_by_number[number] = cast(PDFRenderedPageData, page)
         expected_input = input_row.to_dict()
         output_rows: list[PipelineRow] = []
+        # len(rows) == len(rendered) is checked above; with every row claiming a
+        # DISTINCT rendered page, rows map onto rendered pages one-to-one.
+        claimed_pages: set[int] = set()
+        shared_contract: SchemaContract | None = None
+        first_keys: set[str] | None = None
         for index, output in enumerate(rows):
             if type(output) is not dict or not all(key in output and output[key] == value for key, value in expected_input.items()):
                 raise AuditIntegrityError(f"PDF replay output row {index} disagrees with input")
@@ -840,6 +893,9 @@ class PDFRasterize(BaseTransform):
             number = output[self._page_number_field]
             if number not in pages_by_number:
                 raise AuditIntegrityError(f"PDF replay output row {index} has no matching rendered page")
+            if number in claimed_pages:
+                raise AuditIntegrityError(f"PDF replay output row {index} repeats rendered page {number}")
+            claimed_pages.add(number)
             page = pages_by_number[number]
             required_output = {
                 self._page_blob_ref_field,
@@ -866,10 +922,16 @@ class PDFRasterize(BaseTransform):
                 raise AuditIntegrityError(f"PDF replay output row {index} disagrees with worker receipt")
             if self._extract_text and ("text" not in page or output[self._page_text_field] != page["text"]):
                 raise AuditIntegrityError(f"PDF replay output row {index} text differs from worker receipt")
-            contract = narrow_contract_to_output(input_contract=input_row.contract, output_row=output)
-            contract = self._apply_declared_output_field_contracts(contract)
-            contract = self._align_output_contract(contract)
-            output_rows.append(PipelineRow(output, contract))
+            # One contract for every row, derived from the first, exactly as the live
+            # path builds it: success_multi() requires a single shared instance.
+            if first_keys is None or shared_contract is None:
+                first_keys = set(output)
+                shared_contract = narrow_contract_to_output(input_contract=input_row.contract, output_row=output)
+                shared_contract = self._apply_declared_output_field_contracts(shared_contract)
+                shared_contract = self._align_output_contract(shared_contract)
+            elif set(output) != first_keys:
+                raise AuditIntegrityError(f"PDF replay output row {index} has a different field set from row 0")
+            output_rows.append(PipelineRow(output, shared_contract))
         for page in pages_by_number.values():
             restored_ref = page["page_ref"]
             if type(restored_ref) is not str:
@@ -902,9 +964,11 @@ class PDFRasterize(BaseTransform):
 
         The worker parses hostile PDF bytes, so what it says it rendered is checked
         here rather than believed: the page partition, that every page file lies in
-        its own render output directory, that every page file is a PNG within
-        ``max_page_bytes``, and that the admitted pages total at most
-        ``max_total_bytes``. A page failing the per-page check becomes a typed
+        its own render output directory, that every page's claimed geometry is a
+        positive integer size within ``max_page_pixels``, that its text is absent
+        unless ``extract_text`` and then within ``max_page_text_bytes``, that every
+        page file is a PNG within ``max_page_bytes``, and that the admitted pages
+        total at most ``max_total_bytes``. A page failing the per-page check becomes a typed
         refusal, and an aggregate overrun refuses the document, exactly as if the
         worker had refused it.
         """
@@ -949,6 +1013,15 @@ class PDFRasterize(BaseTransform):
                     f"pdf_rasterize worker returned page {page.page_number} at path {page.png_path!r}, "
                     f"outside its own render output directory {output_dir!r} — worker containment breach"
                 )
+            claim_refusal = _page_claim_refusal(
+                page,
+                extract_text=self._limits.extract_text,
+                max_page_text_bytes=self._limits.max_page_text_bytes,
+                max_page_pixels=self._limits.max_page_pixels,
+            )
+            if claim_refusal is not None:
+                refused.append(claim_refusal)
+                continue
             data = _read_page_output(resolved_png_path, self._limits.max_page_bytes)
             refusal = _page_output_refusal(page.page_number, data, self._limits.max_page_bytes)
             if refusal is None:

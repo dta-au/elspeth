@@ -322,6 +322,7 @@ def test_application_example_supplies_both_required_guard_mounts_offline(
     monkeypatch.setenv("ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY", base64.b64encode(b"synthetic-test-value-32-bytes-long").decode())
     for parameter, field in (
         ("composerMaxCompositionTurns", "COMPOSER_MAX_COMPOSITION_TURNS"),
+        ("composerContextMaxPromptTokens", "COMPOSER_CONTEXT_MAX_PROMPT_TOKENS"),
         ("composerMaxDiscoveryTurns", "COMPOSER_MAX_DISCOVERY_TURNS"),
         ("composerTimeoutSeconds", "COMPOSER_TIMEOUT_SECONDS"),
         ("composerRateLimitPerMinute", "COMPOSER_RATE_LIMIT_PER_MINUTE"),

@@ -57,6 +57,7 @@ from elspeth.core.security.web import (
     validate_archived_ssrf_request,
     validate_configured_url_for_ssrf,
     validate_url_for_ssrf,
+    validate_url_scheme,
 )
 from elspeth.core.security.web import (
     NetworkError as SSRFNetworkError,
@@ -346,7 +347,10 @@ class WebScrapeConfig(TransformDataConfig):
     )
     fingerprint_mode: Literal["content", "full"] = Field(
         default="content",
-        description="Whether fingerprints cover processed content only or the full fetch response context.",
+        description=(
+            "Hash of the extracted content with whitespace collapsed (content) or exactly as extracted (full); "
+            "neither mode covers HTTP status, final URL, headers, or the raw body."
+        ),
     )
     strip_elements: list[str] = Field(
         default_factory=lambda: ["script", "style"],
@@ -466,6 +470,10 @@ class WebScrapeConfig(TransformDataConfig):
                     validate_allowed_http_origin(self.url, (auth_origin,))
                 except SSRFBlockedError as exc:
                     raise ValueError("fixed url must match auth.origin") from exc
+            # The binding checks above keep their specific diagnostics; a
+            # correctly bound auth block is still refused here, before any row,
+            # rather than failing every row at process time.
+            raise ValueError("authenticated web_scrape is unavailable until response evidence is secret safe")
         return self
 
     @model_validator(mode="after")
@@ -819,7 +827,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:eb90d8e44c6ff93d"
+    source_file_hash: str | None = "sha256:ef6e828ace325e3c"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -1330,6 +1338,13 @@ class WebScrapeTransform(BaseTransform):
                 raise FrameworkBugError("web_scrape has no configured URL source")
             if type(url) is not str:
                 raise TypeError("URL field must be a string")
+            # httpx refuses ASCII control characters (C0 and DEL) with
+            # httpx.InvalidURL, which is neither ValueError nor RequestError;
+            # urlsplit silently drops some of them, so the SSRF checks admit
+            # them. Refuse here, whatever allowed_origins says, so a trailing
+            # newline in a row's URL is a row error and not a crash.
+            if any(char.isascii() and not char.isprintable() for char in url):
+                raise SSRFBlockedError("URL contains an ASCII control character", kind="malformed_url")
             validate_allowed_http_origin(url, self._request_allowed_origins)
             if request_params:
                 try:
@@ -1339,6 +1354,11 @@ class WebScrapeTransform(BaseTransform):
                     return TransformResult.error({"reason": "validation_failed", "error": "query parameters cannot be URL encoded"})
                 if encoded_url_size > 8192:
                     return TransformResult.error({"reason": "validation_failed", "error": "URL with query parameters exceeds 8192 bytes"})
+            # Refuse a malformed URL shape before replay/verify compute
+            # fingerprint_url, whose urlsplit raises a bare ValueError; this is
+            # the same first check live mode's validate_url_for_ssrf applies,
+            # so every run mode records the same row refusal.
+            validate_url_scheme(url)
             session = ctx.call_mode_session
             if session is not None and session.mode is RunMode.REPLAY:
                 archived = session.replay_ssrf_request(
@@ -1522,7 +1542,10 @@ class WebScrapeTransform(BaseTransform):
             initial_request_url = str(httpx.Request("GET", url, params=request_params or None).url)
             page_contents = [content]
             page_records = list(records) if records is not None else None
-            seen_urls = {initial_request_url, final_hostname_url}
+            # Every discovered next URL is canonicalized with fingerprint_url
+            # before the cycle check, so seen URLs must be held in that same
+            # spelling; httpx and urlencode escape query characters differently.
+            seen_urls = {fingerprint_url(initial_request_url), fingerprint_url(final_hostname_url)}
             total_body_bytes = body_size
             next_source = self._pagination.mode
             pagination_pages.append(
@@ -1653,7 +1676,7 @@ class WebScrapeTransform(BaseTransform):
                         next_source=next_source,
                     )
                 )
-                seen_urls.update((next_url, final_hostname_url))
+                seen_urls.update((next_url, fingerprint_url(final_hostname_url)))
             content = self._aggregate_page_contents(page_contents)
             records = page_records
             final_resolved_ip = _final_response_ip(response)

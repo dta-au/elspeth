@@ -33,6 +33,7 @@ from elspeth.web.sessions.models import (
     sessions_table,
 )
 from elspeth.web.sessions.proposal_authority import _pipeline_private_arguments_hash
+from elspeth.web.sessions.proposal_blob_refs import ProposalResourceUnavailableError
 from elspeth.web.sessions.proposal_projection import project_composition_proposal
 from elspeth.web.sessions.protocol import CompositionStateData, ProposalStateConflictError
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -858,7 +859,7 @@ async def test_create_composition_proposal_rejects_unusable_blob_reference(engin
             )
         blob_id = record.id
 
-    with pytest.raises(ValueError, match="blob"):
+    with pytest.raises(ProposalResourceUnavailableError, match="referenced file"):
         async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
             await service.create_composition_proposal(
                 session_id=session_id,
@@ -1002,7 +1003,7 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
         release.set()
 
         await delete_task
-        with pytest.raises(ValueError, match="does not exist"):
+        with pytest.raises(ProposalResourceUnavailableError, match="referenced file"):
             await proposal_task
         with pytest.raises(BlobNotFoundError):
             await blob_service.get_blob(blob.id, session_operation_context=context)

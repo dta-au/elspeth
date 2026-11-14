@@ -51,7 +51,10 @@ class ThresholdSpec(BaseModel):
 
     name: str = Field(description="Stable label for this threshold")
     operator: ThresholdOperator = Field(description="Comparison operator")
-    value: float = Field(description="Finite numeric threshold value")
+    # strict: an int or float only. Lax float admitted True as 1.0 and '0.5'
+    # as 0.5, silently publishing an authoring mistake as a real threshold,
+    # while this plugin's data path refuses bool as non-numeric.
+    value: float = Field(strict=True, description="Finite numeric threshold value")
 
     @field_validator("name")
     @classmethod
@@ -109,7 +112,7 @@ class BatchThresholdSummary(BaseTransform):
     name = "batch_threshold_summary"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:7cb6f69881bb092a"
+    source_file_hash: str | None = "sha256:bb849e2af579a479"
     config_model = BatchThresholdSummaryConfig
     is_batch_aware = True
     # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.

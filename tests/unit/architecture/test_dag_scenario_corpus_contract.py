@@ -983,7 +983,71 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # (seven manifest lines). The canonical case JSON of the 0.8.9 manifest with
 # only engine:0.8.9 -> engine:0.8.10 substituted is byte-identical to the new
 # one, and this instrument reproduces the previous pin from the old manifest.
-EXPECTED_CASE_REGISTRY_SHA256 = "3538b2de3a4036fb2effdcbae99c2b4a0b7711b09252456a4514b93ca5636536"
+# 0.8.12 version cut: the same eight engine-owned plugin_version values advance
+# (seven manifest lines). The canonical case JSON of the new manifest with only
+# engine:0.8.12 -> engine:0.8.10 substituted reproduces the previous pin
+# (3538b2de...), and eight engine:0.8.12 occurrences were counted in it.
+# Shared config-content helpers: JSONSource's manifest provenance token moved
+# to 0c356038d5722d0c when its non-finite-constant hook moved to
+# plugins/infrastructure/config_content.py. That token is the manifest's only
+# changed byte run; this digest was captured from this file's parity failure.
+# Merge of the two changes above (0.8.12 version cut 3cb6bbb3... and the
+# JSONSource token move 01ae33ed...): both byte runs change in one manifest,
+# so neither parent's digest applies. Captured from this file's parity failure
+# on the merged tree.
+# 0.8.13 version cut on that merged tree: the same eight engine-owned
+# plugin_version values advance (seven manifest lines), engine:0.8.12 ->
+# engine:0.8.13. Captured from this file's parity failure (previous pin
+# b3162f4d...).
+# 0.8.14 version cut (Python 3.14 only): the same eight engine-owned
+# plugin_version values advance (seven manifest lines), engine:0.8.13 ->
+# engine:0.8.14. Captured from this file's parity failure (previous pin
+# 3338f07b...); reverting the eight values reproduces that pin.
+# Sweep finding #40 (20261111-plugins-review): JSONSource's structural
+# quarantines now record the row they yield; its manifest provenance token
+# moved 0c356038d5722d0c -> 204c8485e712dc75, the manifest's only changed byte
+# run. Captured from this file's parity failure (previous pin d2879537...).
+# Sweep finding #80 (20261111-plugins-review): CSVSource decodes line by line
+# so decode errors name the exact line; its fifteen manifest provenance tokens
+# moved 5a67572be967d4aa -> 94e4e14b6d89d7e1, and reopen-resume's
+# resumed_full_projection_sha256 moved 86bda402... -> b8c16e2c..., measured by
+# the production harness (test_dag_scenario_production_path). Captured from
+# this file's parity failure (previous pin 0ce52bbb...).
+# Sweep finding #103 (20261111-plugins-review): JSONSink refuses a JSONL
+# append baseline without a trailing LF; its seventeen manifest provenance
+# tokens moved 9ef547005076060e -> 0241bd4eb91ae378, and reopen-resume's
+# resumed_full_projection_sha256 moved b8c16e2c... -> d9f57ba0..., measured by
+# the production harness. Captured from this file's parity failure (previous
+# pin 28a82fc8...).
+# Deep-nesting follow-up (20261111-plugins-review #18/#68/#112/#138): JSONSource
+# bounds nesting before decode; its manifest provenance token moved
+# 204c8485e712dc75 -> 35519150141e19b9, the manifest's only changed byte run.
+# Captured from this file's parity failure (previous pin b14d1da8...).
+# Integrator follow-up (CSVSource refuses non-text codecs at config): its
+# fifteen manifest provenance tokens moved 94e4e14b6d89d7e1 -> 4299e6110527265e,
+# and reopen-resume's resumed_full_projection_sha256 moved d9f57ba0... ->
+# 1bf3705a..., measured by the production harness. Captured from this file's
+# parity failure on its own branch (previous pin 70bb6809...).
+# Sweep finding #42 (20261111-plugins-review): JSONSource decodes JSONL with a
+# byte-escaping error handler so one bad UTF-16/32 code unit stays on its line;
+# its manifest provenance token moved 35519150141e19b9 -> 098f17f23ccb7c66,
+# the manifest's only changed byte run. Captured from this file's parity
+# failure on its own branch (previous pin 70bb6809...).
+# Sweep finding #43 (20261111-plugins-review): JSONSource reads UTF-8 input as
+# utf-8-sig so a leading BOM no longer quarantines the file; its manifest
+# provenance token moved 098f17f23ccb7c66 -> c299bae1329a63c2, the manifest's
+# only changed byte run. Captured from this file's parity failure (previous
+# pin b88cee62...).
+# Merged with the integrator follow-up: all of the above, re-captured from
+# this file's parity failure on the merged tree.
+# P4 batch/JSON sweep (20261111-plugins-review #105, #111): JSONSink drops its
+# unreachable JSON-array append branch and JSONExplode gains index_field; their
+# manifest provenance tokens moved 0241bd4eb91ae378 -> 6c9b64bb34350d2c
+# (fifteen lines) and 1919e96964500441 -> bc435c1144336235 (one line), and
+# reopen-resume's resumed_full_projection_sha256 moved 1bf3705a... ->
+# b046c184..., measured by the production harness. Captured from this file's
+# parity failure (previous pin 14d69b1c...).
+EXPECTED_CASE_REGISTRY_SHA256 = "18037487924d662c3ec52977e345c452643994f12461e998e4c0dd07a5c4163e"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

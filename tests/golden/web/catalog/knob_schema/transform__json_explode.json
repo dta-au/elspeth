@@ -32,10 +32,20 @@
       },
       {
         "default": true,
-        "description": "Whether to include item_index field",
+        "description": "Whether to include the element index field",
         "kind": "checkbox",
         "label": "Include Index",
         "name": "include_index",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": "item_index",
+        "description": "Name for the emitted element index; set a distinct name when chaining explodes over nested arrays",
+        "kind": "text",
+        "label": "Index Field",
+        "name": "index_field",
         "nullable": false,
         "required": false,
         "tier": "common"

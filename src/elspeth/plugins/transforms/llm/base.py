@@ -18,6 +18,7 @@ from elspeth.contracts.schema_contract import declared_type_name_admits
 from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.pooling import PoolConfig
+from elspeth.plugins.infrastructure.pooling.config import validate_pool_delay_invariants
 from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment, find_runtime_unbound_variables
 from elspeth.plugins.transforms.llm import LLM_GUARANTEED_SUFFIXES, _llm_created_output_fields
 from elspeth.plugins.transforms.llm.image_inputs import ImageInputConfig
@@ -468,6 +469,26 @@ class LLMConfig(TransformDataConfig):
             max_capacity_retry_seconds=self.max_capacity_retry_seconds,
         )
 
+    @model_validator(mode="after")
+    def _validate_pool_knobs(self) -> LLMConfig:
+        """Enforce PoolConfig's cross-field invariants inside ``model_validate``.
+
+        The flat pool fields are range-checked individually, but PoolConfig's
+        cross-field rules used to run only when ``pool_config`` was first read
+        (``LLMTransform.__init__``), so a contradiction escaped ``from_dict`` and
+        later surfaced as a raw PoolConfig ValidationError echoing the input.
+        A minimum delay above the maximum is contradictory whatever the pool
+        size, so it is refused in sequential mode too; the AIMD viability rules
+        apply only when a pool will be built (``pool_size > 1``).
+        """
+        validate_pool_delay_invariants(
+            min_dispatch_delay_ms=self.min_dispatch_delay_ms,
+            max_dispatch_delay_ms=self.max_dispatch_delay_ms,
+            recovery_step_ms=self.recovery_step_ms,
+            pooled=self.pool_size > 1,
+        )
+        return self
+
     @field_validator("max_tokens", mode="before")
     @classmethod
     def reject_boolean_max_tokens(cls, value: object) -> object:
@@ -594,15 +615,14 @@ class LLMConfig(TransformDataConfig):
         Only *validation* moves earlier; the frozen ``QuerySpec`` runtime
         resolution still happens in ``LLMTransform.__init__`` (the second call is
         idempotent). This validator is deliberately scoped to config-shape errors:
-        it resolves typed queries and, for explicit prefix overrides, checks the
-        complete generated-name inventory. It does not catch or reshape any
+        it resolves typed queries and checks the complete generated-name
+        inventory (structured, raw-response and operational names) under every
+        query mode and structured stem. It does not catch or reshape any
         exception, so a genuine framework failure would still propagate.
         """
         if self.queries is None:
             return self
-        specs = self.resolved_queries()
-        if any(spec.structured_output_prefix is not None for spec in specs):
-            unique_query_generated_fields(tuple(specs), self.response_field)
+        unique_query_generated_fields(tuple(self.resolved_queries()), self.response_field)
         return self
 
     @model_validator(mode="after")
@@ -636,18 +656,33 @@ class LLMConfig(TransformDataConfig):
         """One dependency definition shared by authoring validation and runtime."""
         specs = tuple(self.resolved_queries())
         original_only = set(self.declared_input_fields) | set(self.schema_config.required_fields or ()) | set(self.image_input_fields)
+        source_row_columns = _memoized_per_template(multi_query_source_row_columns)
         for spec in specs:
-            original_only.update(multi_query_source_row_columns(self.effective_template(spec.template)))
+            original_only.update(source_row_columns(self.effective_template(spec.template)))
         return compile_ordered_query_plan(
             specs, self.response_field, frozenset(original_only), list_form=isinstance(self.queries, list), pool_size=self.pool_size
         )
 
     def external_query_inputs(self, spec: QuerySpec) -> frozenset[str]:
-        """Bindings supplied at node entry, excluding ordered internal edges."""
+        """Bindings supplied at node entry, excluding ordered internal edges.
+
+        For one query; a loop over queries uses ``external_inputs_by_query``.
+        """
         if self.query_input_mode == QueryInputMode.UPSTREAM:
             return frozenset(spec.input_fields.values())
+        return self.external_inputs_by_query()[spec.name]
+
+    def external_inputs_by_query(self) -> dict[str, frozenset[str]]:
+        """``external_query_inputs`` for every query, compiling the ordered plan once.
+
+        The per-query validators loop over every query; calling
+        ``external_query_inputs`` inside that loop recompiled the whole
+        ordered plan per query (O(queries^2) template parses).
+        """
+        if self.query_input_mode == QueryInputMode.UPSTREAM:
+            return {spec.name: frozenset(spec.input_fields.values()) for spec in self.resolved_queries()}
         plan = self.ordered_query_plan()
-        return plan.external_by_query[tuple(item.name for item in plan.specs).index(spec.name)]
+        return {spec.name: external for spec, external in zip(plan.specs, plan.external_by_query, strict=True)}
 
     @model_validator(mode="after")
     def _validate_single_mode_structured_output(self) -> LLMConfig:
@@ -799,8 +834,11 @@ class LLMConfig(TransformDataConfig):
         """
         from elspeth.core.templates import describe_dynamic_row_access, describe_row_api_misuse, extract_jinja2_field_usage
 
-        misuses: list[str] = []
-        computed_keys: list[str] = []
+        # Keyed by template label so each refusal names the slot at fault
+        # (prompt_template or query '<name>' template), the field an author
+        # or the planner repairs.
+        misuses: dict[str, list[str]] = {}
+        computed_keys: dict[str, list[str]] = {}
         for label, template in self._field_extraction_templates():
             try:
                 extractions = [extract_jinja2_field_usage(template)]
@@ -814,16 +852,18 @@ class LLMConfig(TransformDataConfig):
                 # through it are refused the same way as through row.
                 extractions.append(extract_jinja2_field_usage(template, row_attribute=_MULTI_QUERY_SOURCE_ROW))
             for extraction in extractions:
-                misuses.extend(extraction.row_api_misuses)
-                computed_keys.extend(extraction.computed_key_accesses)
+                if extraction.row_api_misuses:
+                    misuses.setdefault(label, []).extend(extraction.row_api_misuses)
+                if extraction.computed_key_accesses:
+                    computed_keys.setdefault(label, []).extend(extraction.computed_key_accesses)
 
         if misuses:
-            raise ValueError(f"LLM prompt_template {describe_row_api_misuse(misuses)}")
+            raise ValueError(f"LLM {', '.join(misuses)} {describe_row_api_misuse(kind for kinds in misuses.values() for kind in kinds)}")
         if not computed_keys or self.required_input_fields == []:
             return self
         raise ValueError(
-            "LLM prompt_template uses dynamic row field access "
-            f"({describe_dynamic_row_access(computed_keys)}). "
+            f"LLM {', '.join(computed_keys)} uses dynamic row field access "
+            f"({describe_dynamic_row_access([key for keys in computed_keys.values() for key in keys])}). "
             "Dynamic row keys cannot be audited against options.required_input_fields. "
             "Use static row.field or row['field'] references, or set "
             "options.required_input_fields: [] only for an intentional computed key or whole-row read; a field-scoped prompt shield cannot credit it."
@@ -866,8 +906,9 @@ class LLMConfig(TransformDataConfig):
                 # names: those are the query's own bindings.
                 extracted: set[str] = set()
                 source_row_columns = _memoized_per_template(multi_query_source_row_columns)
+                external_inputs = self.external_inputs_by_query()
                 for spec in self.resolved_queries():
-                    extracted.update(self.external_query_inputs(spec))
+                    extracted.update(external_inputs[spec.name])
                     effective_template = self.effective_template(spec.template)
                     extracted.update(source_row_columns(effective_template))
             else:
@@ -1135,12 +1176,13 @@ class LLMConfig(TransformDataConfig):
         # documented opt-out.
         if self.required_input_fields:
             source_row_columns = _memoized_per_template(multi_query_source_row_columns)
+            external_inputs = self.external_inputs_by_query()
             for spec in self.resolved_queries():
                 effective_template = self.effective_template(spec.template)
                 undeclared_columns = tuple(
                     sorted(
                         {
-                            *undeclared_row_fields(self.external_query_inputs(spec), self.declared_input_fields),
+                            *undeclared_row_fields(external_inputs[spec.name], self.declared_input_fields),
                             *undeclared_row_fields(source_row_columns(effective_template), self.required_input_fields),
                         }
                     )
@@ -1195,8 +1237,9 @@ class LLMConfig(TransformDataConfig):
             return header_spelled_row_lookups(extract_jinja2_field_usage(self.effective_template()).fields, self.required_input_fields)
         lookups: dict[str, str] = {}
         source_row_columns = _memoized_per_template(multi_query_source_row_columns)
+        external_inputs = self.external_inputs_by_query()
         for spec in self.resolved_queries():
-            lookups.update(header_spelled_row_lookups(self.external_query_inputs(spec), self.declared_input_fields))
+            lookups.update(header_spelled_row_lookups(external_inputs[spec.name], self.declared_input_fields))
             lookups.update(
                 header_spelled_row_lookups(source_row_columns(self.effective_template(spec.template)), self.required_input_fields)
             )

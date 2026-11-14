@@ -289,14 +289,23 @@ test("Build keeps its chrome out of the authoring pane and its Continue reachabl
     return {
       minInset: Math.min(...insets),
       paneTop: Math.round(pane.top),
+      artifactPaneTop: Math.round(rect(".workspace-artifact-pane").top),
+      titleBarTop: Math.round(rect(".workspace-pane-header").top),
+      titleBarBottom: Math.round(rect(".workspace-pane-header").bottom),
       transcriptTop: Math.round(rect(".chat-panel-messages").top),
       toolbarTop: Math.round(rect(".artifact-workspace-toolbar").top),
       transcript: Math.round(rect(".chat-panel-messages").height),
     };
   });
   expect(geometry.minInset, "every authoring control and line keeps the pane's 16px gutter").toBeGreaterThanOrEqual(16);
-  expect(geometry.paneTop, "both panes start on one row across the seam").toBe(geometry.toolbarTop);
-  expect(geometry.transcriptTop, "no chrome sits above the conversation in its pane").toBe(geometry.paneTop);
+  // ARGOnite: both panes are bordered cards, so the artifact toolbar sits 1px
+  // below its card's top edge. Compare card to card and title bar to title bar.
+  expect(geometry.paneTop, "both panes start on one row across the seam").toBe(geometry.artifactPaneTop);
+  expect(geometry.titleBarTop, "the two title bars register across the seam").toBe(geometry.toolbarTop);
+  // ARGOnite: the pane now has a "Conversation" title bar (design doc), which
+  // reverses the 2026-10-08 "nothing above the conversation" rule. The title
+  // bar is the only chrome allowed above it.
+  expect(geometry.transcriptTop, "only the pane's title bar sits above the conversation").toBe(geometry.titleBarBottom);
   expect(geometry.transcript, "the conversation keeps its 160px floor").toBeGreaterThanOrEqual(160);
 
   // Narrow Compose view hides the workspace bar's artifact cell, which is why
@@ -337,14 +346,21 @@ test("Build keeps unavailable operation history inset and retries the actual rea
     return {
       minInset: Math.min(...insets),
       paneTop: Math.round(pane.top),
+      artifactPaneTop: Math.round(rect(".workspace-artifact-pane").top),
+      titleBarTop: Math.round(rect(".workspace-pane-header").top),
+      titleBarBottom: Math.round(rect(".workspace-pane-header").bottom),
       transcriptTop: Math.round(rect(".chat-panel-messages").top),
       toolbarTop: Math.round(rect(".artifact-workspace-toolbar").top),
       transcript: Math.round(rect(".chat-panel-messages").height),
     };
   });
   expect(geometry.minInset, "failed-history text and retry retain the 16px gutter").toBeGreaterThanOrEqual(16);
-  expect(geometry.paneTop).toBe(geometry.toolbarTop);
-  expect(geometry.transcriptTop).toBe(geometry.paneTop);
+  // ARGOnite: card to card and title bar to title bar (the toolbar sits 1px
+  // inside its card's border); the "Conversation" title bar is the only
+  // chrome above the transcript. Same reasons as the Build test above.
+  expect(geometry.paneTop).toBe(geometry.artifactPaneTop);
+  expect(geometry.titleBarTop).toBe(geometry.toolbarTop);
+  expect(geometry.transcriptTop).toBe(geometry.titleBarBottom);
   expect(geometry.transcript).toBeGreaterThanOrEqual(160);
 
   const readsBeforeRetry = fixture.requests.filter((request) => request.startsWith("outcomes:")).length;
