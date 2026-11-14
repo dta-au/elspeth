@@ -175,6 +175,12 @@ These changes are breaking:
   `validate_json_object_response` and its result types are removed, and
   `get_llm_audit_fields()` returns one more name (`_parts_hash`). Landscape
   `too_many_images` reason text changes.
+- **`batch_threshold_summary` refuses a non-numeric threshold.** A
+  `value: true`/`false` or a quoted number now fails at config load; it used
+  to be coerced to 1.0, 0.0 or the number. `batch_top_k` `wrong_type`
+  `expected` text changes, and batches with Decimal or datetime values, or
+  extreme opposite-sign values in `batch_distribution_profile`, now succeed
+  where they used to fail.
 - **A missing core dependency stops plugin discovery.** Only `jinja2` is
   treated as optional; a missing `chromadb`, `bs4` or `html2text` now raises
   instead of silently dropping plugins from the catalog.
@@ -369,14 +375,33 @@ Transforms:
   - `batch_data_quality_report` counts distinct values in linear time.
   - The composer hints of the outlier, rank, paired-preference and
     drift-compare transforms state their 4096-row flush cap.
+  - `batch_drift_compare` success rows list skipped missing and non-finite
+    rows by batch index per cohort, as `batch_stats` does, in four new fields
+    (`baseline_`/`cohort_missing_indices`,
+    `baseline_`/`cohort_non_finite_indices`) (#101). Its usage text and
+    composer hint state that `chi_square_statistic` omits categories absent
+    from the baseline (#102).
+  - `batch_distribution_profile` percentiles of extreme opposite-sign finite
+    values no longer fail with `float_overflow` (#121).
+  - `batch_threshold_summary` requires a numeric threshold `value` (#135).
+  - `batch_top_k` counts datetime and Decimal values, as `group_by` already
+    admits; non-finite Decimals are skipped and reported (#136).
 - **Batch transform engine:** a timed-out row's late failure is no longer
   charged to the next row, and a dead release thread fails pending rows at
-  once instead of leaving them blocked until timeout.
+  once instead of leaving them blocked until timeout. A refused eviction no
+  longer replaces a completed row's result with a `KeyError` (#120).
 - **`blob_json_expand`, `blob_text`, `blob_csv`:** `max_blob_bytes` is enforced
   while the blob is read, not after it is loaded. `blob_csv_expand` validates
   its delimiter the same way the CSV sink does. `blob_json_expand` splits
   JSONL only on `\n` (one trailing `\r` stripped), so records containing
   U+2028, U+2029 or U+0085 stay whole, and it rejects NaN and Infinity.
+  `blob_csv_expand` parse-phase error reasons name their source (`field`,
+  `blob_ref`), like `empty_csv` and load errors, and every routed error
+  reason has a focused unit test (#53, #54).
+- **`json_explode`** has a new `index_field` option (default `item_index`), so
+  nested explodes do not collide (#111).
+- **JSON sink:** the unreachable JSON-array append path is removed;
+  `format: json` never appends (#105).
 - **`pdf_rasterize`:**
   - The parent re-checks every page the worker reports and refuses bad
     geometry, pages over `max_page_pixels`, text when `extract_text` is off,
@@ -598,6 +623,11 @@ Sinks and retrieval:
 - The Dataverse 300 s throttle-wait budget is not configurable, and the
   client retries only 429 and 503; 500, 502, 504 and timeouts are not
   retried in the client.
+- The composer planner scaffold budget gains a 64-byte allowance for the
+  `batch_drift_compare` chi-square disclosure, which awaits maintainer
+  review; the batch transform mixin's `evict_submission` allowlist entry is
+  also stale and awaits re-signing. `truncate` (#146) is unchanged pending a
+  maintainer decision.
 - Power Automate still acquires an OAuth token per POST; reusing it (#131)
   awaits a maintainer decision.
 - An engine retry of a guardrail row re-scans, and re-bills, fields that
