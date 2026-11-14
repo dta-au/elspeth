@@ -154,6 +154,18 @@ These changes are breaking:
   whose `Retry-After` exceeds 60 s still fails immediately. The source
   records one extra ERROR call per waited-out throttle, so call indexes for
   that page shift, and sink commit evidence may carry `throttle_wait_ms`.
+- **`web_scrape` auth is stricter.** An `api_key` `header_name` of
+  `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `Forwarded` or
+  `X-Forwarded-*` now fails config validation, and a basic secret without
+  `:` raises `ValueError` (without echoing the secret) when the header is
+  built.
+- **`web_scrape` JSON records skip nulls.** `first` returns the first
+  non-null value, `one` counts only non-null values and `all` omits nulls; an
+  all-null array gives `None` for `first` and `one` and `[]` for `all`, and
+  provenance `selected_count` counts only non-null values. A required column
+  with only nulls still fails. Pages that used to fail now extract.
+- **Power Automate archived SAS VERIFY** without `ELSPETH_FINGERPRINT_KEY`
+  fails with `fingerprint_key_required`, still before DNS and preflight.
 - **A missing core dependency stops plugin discovery.** Only `jinja2` is
   treated as optional; a missing `chromadb`, `bs4` or `html2text` now raises
   instead of silently dropping plugins from the catalog.
@@ -317,6 +329,15 @@ Transforms:
     sensitive-parameter check also splits on `;`.
   - The `fingerprint_mode` description now says it hashes content only; the
     behaviour is unchanged.
+  - Null elements inside a selected JSON records array are treated as
+    absent, like a top-level null, instead of failing the page (#153).
+  - `compute_fingerprint` refuses an unknown fingerprint mode instead of
+    silently hashing as `full` (#157).
+  - API-key header names exclude hop-by-hop and proxy headers, and basic
+    credentials must be `user:password` (#164).
+- **Power Automate:** an archived SAS VERIFY run with no fingerprint key
+  reports `fingerprint_key_required` instead of a misleading
+  `authentication_failed` (#130).
 - **`reference_join`** refuses non-canonical reference values at config load
   (see Upgrade notes); the first matching row previously crashed the run or
   was misrouted as a contract violation.
@@ -550,6 +571,8 @@ Sinks and retrieval:
 - The Dataverse 300 s throttle-wait budget is not configurable, and the
   client retries only 429 and 503; 500, 502, 504 and timeouts are not
   retried in the client.
+- Power Automate still acquires an OAuth token per POST; reusing it (#131)
+  awaits a maintainer decision.
 - An engine retry of a guardrail row re-scans, and re-bills, fields that
   already passed.
   The guardrails client also awaits operator re-signing of three tier-model
