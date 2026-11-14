@@ -206,7 +206,7 @@
       },
       {
         "default": "content",
-        "description": "Hash of the extracted content with whitespace collapsed (content) or exactly as extracted (full); neither mode covers HTTP status, final URL, headers, or the raw body.",
+        "description": "Hash of the extracted content with whitespace collapsed (content), or of the exact content plus each fetched page's HTTP status, final URL, content type and raw body hash (full).",
         "enum": [
           "content",
           "full"

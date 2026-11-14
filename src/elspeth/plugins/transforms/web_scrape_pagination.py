@@ -16,6 +16,7 @@ import soupsieve
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field, model_validator
 
+from elspeth.core.security.web import contains_ascii_control_character
 from elspeth.plugins.infrastructure.clients.fingerprinting import (
     MAX_AUDIT_QUERY_CHARS,
     MAX_AUDIT_QUERY_FIELDS,
@@ -95,7 +96,7 @@ def _link_header_next(values: list[str]) -> str | None:
     if combined and safe_link_header_for_audit(combined) != combined:
         raise ValueError("pagination Link header cannot be retained as exact replay evidence")
     for value in values:
-        if any(ord(char) < 32 for char in value):
+        if contains_ascii_control_character(value):
             raise ValueError("pagination Link header contains control characters")
         # A comma inside an angle-bracket URL or quoted parameter is legal in
         # the grammar, but unsupported here: reject ambiguity instead of
