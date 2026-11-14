@@ -20,7 +20,7 @@ from elspeth.contracts.security import secret_fingerprint
 from elspeth.plugins.infrastructure.clients.power_automate import PowerAutomateClientError, PowerAutomateOperationClient
 from elspeth.plugins.infrastructure.power_automate_nonlive import ArchivedPowerAutomateSourceConfig, DeferredPowerAutomateCredential
 from elspeth.plugins.transforms.web_scrape_auth import WebScrapeAuthConfig
-from elspeth.plugins.transforms.web_scrape_fingerprint import compute_fingerprint
+from elspeth.plugins.transforms.web_scrape_fingerprint import FetchResponseContext, compute_fingerprint
 from elspeth.plugins.transforms.web_scrape_json_extraction import JSONRecordsConfig, extract_json_records_with_provenance
 
 # --- #130: archived SAS verify path without a fingerprint key ---------------
@@ -122,8 +122,10 @@ def test_157_unknown_fingerprint_mode_is_refused(mode: Any) -> None:
 
 
 def test_157_known_modes_unchanged() -> None:
-    assert compute_fingerprint("a  b", "full") != compute_fingerprint("a  b", "content")
-    assert compute_fingerprint(" a  b ", "content") == compute_fingerprint("a b", "full")
+    page = FetchResponseContext(status_code=200, final_url="https://example.com/", content_type=None, body_sha256="0" * 64)
+    assert compute_fingerprint("a  b", "full", responses=(page,)) != compute_fingerprint("a  b", "content")
+    assert compute_fingerprint(" a  b ", "content") == compute_fingerprint("a b", "content")
+    assert compute_fingerprint(" a  b ", "full", responses=(page,)) != compute_fingerprint("a b", "full", responses=(page,))
 
 
 # --- #164: API-key header denylist and RFC 7617 basic credential ------------

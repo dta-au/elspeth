@@ -27,13 +27,19 @@ def test_exact_origin_accepts_same_scheme_host_and_effective_port(configured: st
         "https://sub.example.gov.au/search",
         "https://example.gov.au.evil.test/search",
         "https://example.gov.au\\@evil.test/search",
-        "https://example.gov.au:\t443/search",
     ],
 )
 def test_exact_origin_rejects_other_destinations(requested: str) -> None:
     with pytest.raises(SSRFBlockedError, match="origin") as exc:
         validate_allowed_http_origin(requested, (parse_http_origin("https://example.gov.au"),))
     assert exc.value.kind == "origin_not_allowed"
+
+
+def test_exact_origin_refuses_control_character_as_malformed_url() -> None:
+    """A control character is refused before origin matching, as httpx cannot send it."""
+    with pytest.raises(SSRFBlockedError, match="control character") as exc:
+        validate_allowed_http_origin("https://example.gov.au:\t443/search", (parse_http_origin("https://example.gov.au"),))
+    assert exc.value.kind == "malformed_url"
 
 
 @pytest.mark.parametrize(

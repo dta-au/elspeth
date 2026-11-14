@@ -1,4 +1,6 @@
-from elspeth.plugins.transforms.web_scrape_fingerprint import compute_fingerprint
+from elspeth.plugins.transforms.web_scrape_fingerprint import FetchResponseContext, compute_fingerprint
+
+_PAGE = FetchResponseContext(status_code=200, final_url="https://example.com/", content_type="text/html", body_sha256="0" * 64)
 
 
 def test_fingerprint_deterministic():
@@ -30,8 +32,8 @@ def test_fingerprint_full_mode_whitespace_sensitive():
     content1 = "Hello world"
     content2 = "Hello   world"
 
-    fp1 = compute_fingerprint(content1, mode="full")
-    fp2 = compute_fingerprint(content2, mode="full")
+    fp1 = compute_fingerprint(content1, mode="full", responses=(_PAGE,))
+    fp2 = compute_fingerprint(content2, mode="full", responses=(_PAGE,))
 
     assert fp1 != fp2
 
