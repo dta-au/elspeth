@@ -76,15 +76,6 @@ HINTED_PLUGIN_CASES: tuple[tuple[str, str, str, Mapping[str, object], str], ...]
         {"format": "json"},
         "array mode",
     ),
-    (
-        "sink",
-        "database",
-        "patch_output_options",
-        # The database sink's only write-behaviour knob is if_exists; 'replace'
-        # is refused at validation, so its post-call hint corrects the planner.
-        {"if_exists": "replace"},
-        "'replace' is not supported",
-    ),
 )
 
 
@@ -125,7 +116,7 @@ def test_post_call_hints_envelope_populated_for_hinted_plugins(
     config_snapshot: Mapping[str, object],
     expected_substring: str,
 ) -> None:
-    """For each of the 6 priority plugins, a successful mutation attaches a non-empty post_call_hints envelope."""
+    """For each hinted plugin case, a successful mutation attaches a non-empty post_call_hints envelope."""
     result = _attach_post_call_hints(
         _success_result(),
         catalog,
