@@ -172,6 +172,22 @@ describe("AcknowledgementStack — ordering", () => {
 });
 
 describe("AcknowledgementStack — accessibility", () => {
+  it("keeps the Change control and its labelled input outside script mode", async () => {
+    const user = userEvent.setup();
+    seedPending([makeEvent("e1")]);
+    render(<AcknowledgementStack sessionId={SID} />);
+
+    const change = screen.getByRole("button", { name: "Change the interpretation of cool" });
+    const accept = screen.getByRole("button", { name: /acknowledge the llm's interpretation of cool/i });
+    await user.tab();
+    expect(accept).toHaveFocus();
+    await user.tab();
+    expect(change).toHaveFocus();
+    await user.keyboard("{Enter}");
+    const input = screen.getByRole("textbox", { name: "What did you mean by cool?" });
+    expect(input).toHaveFocus();
+  });
+
   it("does not host its own role='status' announce (the decision panel owns it)", () => {
     // The stack returns null when empty, so a live region mounted INSIDE it
     // would be inserted with its content already present on the 0->1

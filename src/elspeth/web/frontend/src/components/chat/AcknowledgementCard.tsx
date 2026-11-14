@@ -324,7 +324,7 @@ export interface AcknowledgementCardProps {
    * the frozen draft.
    */
   compositionState?: CompositionState | null;
-  /** Render the inline amend affordance (vague_term only; off in tutorial). */
+  /** Render the inline amend affordance when the parent allows amendments. */
   showAmend?: boolean;
   /**
    * Fired after a successful resolve so the parent can advance its surface.

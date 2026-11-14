@@ -9,6 +9,7 @@ import { useExecutionStore } from "@/stores/executionStore";
 import { resetStore } from "@/test/store-helpers";
 import { makeComposition } from "@/test/composerFixtures";
 import type { ChatMessage } from "@/types/api";
+import type { InterpretationEvent } from "@/types/interpretation";
 import { TutorialFreeformShell } from "./TutorialFreeformShell";
 
 vi.mock("@/api/client");
@@ -40,6 +41,38 @@ async function resend() {
   expect(screen.queryByRole("textbox")).toBeNull();
   return screen.getByRole("button", { name: "Resend tutorial brief" });
 }
+
+it("offers Accept without an amendment control for a scripted interpretation", async () => {
+  vi.mocked(api.resolveInterpretation).mockImplementation(() => new Promise(() => {}));
+  const event: InterpretationEvent = {
+    id: "interpretation-1", session_id: brief.session_id, composition_state_id: "state-1",
+    affected_node_id: "node-1", tool_call_id: "tool-1", user_term: "cool",
+    kind: "vague_term", llm_draft: "interesting and engaging", accepted_value: null,
+    choice: "pending", created_at: "2026-11-13T12:00:00Z", resolved_at: null,
+    actor: "system:composer", interpretation_source: "user_approved",
+    model_identifier: "anthropic/claude-opus-4-7", model_version: "20260518",
+    provider: "anthropic", composer_skill_hash: "0".repeat(64),
+    arguments_hash: null, hash_domain_version: null,
+    runtime_model_identifier_at_resolve: null, runtime_model_version_at_resolve: null,
+    approved_prompt_artifact_hash: null,
+  };
+  useInterpretationEventsStore.setState({
+    pendingBySession: { [brief.session_id]: { [event.id]: event } },
+  });
+
+  render(<TutorialFreeformShell sessionId={brief.session_id} onCompleted={vi.fn()} />);
+  const accept = await screen.findByRole("button", { name: /acknowledge the llm's interpretation of cool/i });
+  expect(accept).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /change the interpretation of cool/i })).toBeNull();
+  expect(screen.queryByRole("textbox", { name: /what did you mean by cool/i })).toBeNull();
+  expect(screen.queryByText(/what did you mean by cool/i)).toBeNull();
+  expect(accept).not.toHaveAttribute("aria-describedby");
+  expect(accept).toBeEnabled();
+  fireEvent.click(accept);
+  await waitFor(() => expect(api.resolveInterpretation).toHaveBeenCalledWith(
+    brief.session_id, event.id, { choice: "accepted_as_drafted" },
+  ));
+});
 
 it.each([
   { name: "failed compose", messages: [{ ...brief, local_status: "failed" as const, local_error: "Request failed" }] },
