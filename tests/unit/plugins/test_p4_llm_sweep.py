@@ -221,3 +221,27 @@ def test_render_request_records_max_total_bytes() -> None:
     transform = PDFRasterize({"schema": {"mode": "observed"}, "max_total_bytes": 123_456})
     request = transform._render_request("sha256:abc")
     assert request["render_limits"]["max_total_bytes"] == 123_456
+
+
+# ── #59 follow-up (maintainer ruling): the changed request shape is a new format ─
+
+
+def test_pdf_render_format_is_bumped_to_v2() -> None:
+    from elspeth.contracts import pdf_render
+    from elspeth.plugins.transforms.pdf_rasterize import PDFRasterize
+
+    assert "PDF_RENDER_FORMAT" in vars(pdf_render)
+    assert pdf_render.PDF_RENDER_FORMAT == "pdf_rasterize/v2"
+    transform = PDFRasterize({"schema": {"mode": "observed"}})
+    assert transform._render_request("sha256:abc")["format"] == "pdf_rasterize/v2"
+
+
+def test_v1_render_receipt_is_refused_as_an_older_format() -> None:
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.plugins.transforms.pdf_rasterize import PDFRasterize
+    from elspeth.testing import make_pipeline_row
+
+    transform = PDFRasterize({"schema": {"mode": "observed"}})
+    row = make_pipeline_row({"blob_ref": "sha256:abc"})
+    with pytest.raises(AuditIntegrityError, match=r"pdf_rasterize/v1.*no longer replayed"):
+        transform._restore_render_receipt({"format": "pdf_rasterize/v1"}, row)
