@@ -186,16 +186,8 @@ class TestBatchDriftCompareSkippedIndices:
             } <= created
 
 
-class TestBatchDriftCompareChiSquareConvention:
-    def test_chi_square_baseline_support_convention_is_disclosed(self) -> None:
-        from elspeth.plugins.transforms.batch_drift_compare import BatchDriftCompare
-
-        assistance = BatchDriftCompare.get_agent_assistance()
-        assert assistance is not None
-        hints = [hint for hint in assistance.composer_hints if "chi_square_statistic" in hint]
-        assert hints, "no composer hint discloses how chi_square_statistic treats new categories"
-        assert any("new_categor" in hint for hint in hints)
-        assert "chi_square_statistic" in BatchDriftCompare.usage_when_not_to_use
+# #102 is now a behaviour fix (chi-square over the category union), pinned in
+# tests/unit/plugins/test_p5_batch_sweep.py; the disclosure this class pinned is gone.
 
 
 # ---------------------------------------------------------------------------

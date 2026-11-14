@@ -201,6 +201,28 @@ def _demote_required_model_fields(
     )
 
 
+def aggregation_trigger_count_cap_error(
+    aggregation_name: str,
+    plugin_name: str,
+    max_batch_rows: int | None,
+    trigger_count: int | None,
+) -> str | None:
+    """Return the refusal for a count trigger above a plugin's declared batch cap.
+
+    One rule for both authoring surfaces: runtime_factory raises it and the
+    composer's placement rule reports it, each from the plugin class's
+    ``max_batch_rows``. None when the plugin is uncapped or the trigger has
+    no count (an end-of-source or timeout flush has no size known in advance).
+    """
+    if max_batch_rows is None or trigger_count is None or trigger_count <= max_batch_rows:
+        return None
+    return (
+        f"Aggregation '{aggregation_name}' uses '{plugin_name}' with trigger count {trigger_count}, but "
+        f"'{plugin_name}' accepts at most {max_batch_rows} buffered rows per flush, so every full batch would "
+        f"fail (batch_too_large). Set trigger count at or below {max_batch_rows}."
+    )
+
+
 class BaseTransform(ABC):
     """Base class for all row transforms.
 
@@ -478,6 +500,12 @@ class BaseTransform(ABC):
     # refuses count/timeout/condition triggers; the plugin also checks its
     # actual durable flush window before producing an admission decision.
     requires_complete_source_batch: bool = False
+
+    # Largest batch a batch-aware plugin's flush accepts, or None for no cap.
+    # A capped plugin refuses a larger flush at run time, and runtime_factory
+    # and the composer refuse an aggregation whose trigger.count exceeds it,
+    # so a count trigger that would fail every batch never reaches a run.
+    max_batch_rows: int | None = None
 
     # True only for a batch-aware plugin whose every successful flush emits
     # exactly one row per buffered row, in buffered order, as

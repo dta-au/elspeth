@@ -20,7 +20,7 @@ from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
-from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError, require_scalar_group_key
+from elspeth.plugins.transforms._batch_row_types import MAX_BATCH_ROWS, BatchRowTypeError, require_scalar_group_key
 from elspeth.plugins.transforms._scalar_buckets import (
     ConfiguredScalarLabel,
     append_unique_bucket_value,
@@ -71,7 +71,6 @@ _PAIRED_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
     FieldDefinition("incomplete_pairs", "any", required=False),
 )
 _PAIRED_OUTPUT_FIELDS = frozenset(field.name for field in _PAIRED_CREATED_FIELDS if field.required)
-_MAX_BATCH_ROWS = 4096
 
 
 def _student_t_two_sided_coverage(t: float, df: int) -> float:
@@ -186,9 +185,10 @@ class BatchPairedPreference(BaseTransform):
     name = "batch_paired_preference"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ca3fc042c027f83a"
+    source_file_hash: str | None = "sha256:6558016bd881b03c"
     config_model = BatchPairedPreferenceConfig
     is_batch_aware = True
+    max_batch_rows: int = MAX_BATCH_ROWS
     # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
     flush_emits_one_row_per_buffered_row = False
     usage_when_to_use: str = (
@@ -228,9 +228,9 @@ class BatchPairedPreference(BaseTransform):
                 composer_hints=(
                     "Use output_mode: transform; passthrough requires one emitted row per buffered row. A failed batch applies on_error to every buffered input; discard records quarantine outcomes.",
                     "Use batch_paired_preference under aggregations with a trigger; it compares variants within pair_field groups.",
-                    f"A flush over more than {_MAX_BATCH_ROWS} buffered rows fails the whole batch (batch_too_large): "
-                    f"keep trigger count at or below {_MAX_BATCH_ROWS}, and do not rely on an end-of-source flush "
-                    "(omitted trigger) when the input can exceed it.",
+                    f"An aggregation trigger count above {MAX_BATCH_ROWS} is refused before the run; a flush over "
+                    f"{MAX_BATCH_ROWS} buffered rows fails the whole batch (batch_too_large), so do not rely on an "
+                    "end-of-source flush (omitted trigger) when the input can exceed it.",
                     "pair_field, variant_field, and score_field must be three distinct fields.",
                     "baseline_variant defaults to the first-seen variant; incomplete pairs are counted but not compared.",
                     "Output is paired preference metrics, not the original rows.",
@@ -411,12 +411,12 @@ class BatchPairedPreference(BaseTransform):
         return TransformResult.error(reason, retryable=False)
 
     @staticmethod
-    def _error_for_batch_too_large(*, batch_size: int) -> TransformResult:
+    def _error_for_batch_too_large(*, batch_size: int, max_batch_rows: int) -> TransformResult:
         reason: TransformErrorReason = {
             "reason": "validation_failed",
             "cause": "batch_too_large",
             "batch_size": batch_size,
-            "expected": f"at most {_MAX_BATCH_ROWS} rows",
+            "expected": f"at most {max_batch_rows} rows",
         }
         return TransformResult.error(reason, retryable=False)
 
@@ -581,8 +581,8 @@ class BatchPairedPreference(BaseTransform):
         """Compute paired preference summaries over a batch."""
         if not rows:
             return TransformResult.error({"reason": "empty_batch"}, retryable=False)
-        if len(rows) > _MAX_BATCH_ROWS:
-            return self._error_for_batch_too_large(batch_size=len(rows))
+        if len(rows) > self.max_batch_rows:
+            return self._error_for_batch_too_large(batch_size=len(rows), max_batch_rows=self.max_batch_rows)
 
         non_finite_error = self._non_finite_variant_error(rows)
         if non_finite_error is not None:

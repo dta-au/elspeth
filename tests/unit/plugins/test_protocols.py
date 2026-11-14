@@ -198,6 +198,7 @@ class TestTransformProtocol:
             supports_row_mode_when_batch_aware = False  # Batch-aware transforms only
             requires_aggregation_batch_context = False  # Reads ctx.aggregation_batch (aggregation-only)
             requires_complete_source_batch = False
+            max_batch_rows: int | None = None  # Largest flush accepted (None: uncapped)
             flush_emits_one_row_per_buffered_row = False  # One output row per buffered row (passthrough-capable)
             requires_runtime_preflight = False  # Optional engine-time readiness check
             creates_tokens = False  # Deaggregation (multi-row output)
