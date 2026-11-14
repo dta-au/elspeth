@@ -12,7 +12,7 @@ import re
 import urllib.parse
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Any, ClassVar, Literal, Self
+from typing import Any, ClassVar, Literal, NamedTuple, Self
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -141,6 +141,15 @@ def _validate_dataverse_entity_set_name(value: object, *, field_name: str) -> st
 # the bind reference; percent-encoding in an unquoted position would not be
 # (elspeth-e7d31117df).
 _SAFE_LOOKUP_BIND_VALUE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9-]+$")
+
+
+class _MemberEffectMaterial(NamedTuple):
+    """Plan material recomputed from one member batch."""
+
+    descriptor: ArtifactDescriptor
+    payload_hash: str
+    plan_hash: str
+    payloads: tuple[dict[str, object], ...]
 
 
 class LookupConfig(BaseModel):
@@ -338,7 +347,7 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:985091dfc97a79ff"
+    source_file_hash: str | None = "sha256:e4c1991fde2f2ab9"
     determinism = Determinism.EXTERNAL_CALL
     config_model = DataverseSinkConfig
     idempotent = True  # PATCH upsert is idempotent — safe for retries and crash recovery (engine does not yet read this flag)
@@ -449,6 +458,10 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
 
         # Lazy-constructed client (needs lifecycle context)
         self._client: DataverseClient | None = None
+        # One batch's recomputed plan material, keyed by effect_id and the
+        # exact (deep-frozen) effect_input object, so per-member validation
+        # recomputes it once per batch instead of once per member (#89).
+        self._member_material_cache: tuple[str, SinkEffectPipelineMembersInput, _MemberEffectMaterial] | None = None
 
     def on_start(self, ctx: LifecycleContext) -> None:
         """Construct credential and DataverseClient."""
@@ -545,7 +558,7 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
         self,
         effect_id: str,
         effect_input: SinkEffectPipelineMembersInput,
-    ) -> tuple[ArtifactDescriptor, str, str, tuple[dict[str, object], ...]]:
+    ) -> _MemberEffectMaterial:
         payloads: list[dict[str, object]] = []
         member_bindings: list[dict[str, object]] = []
         first_ordinal_by_key: dict[str, int] = {}
@@ -612,7 +625,7 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
                 "schema": "dataverse-member-effect-plan-v1",
             }
         )
-        return descriptor, payload_hash, plan_hash, tuple(payloads)
+        return _MemberEffectMaterial(descriptor, payload_hash, plan_hash, tuple(payloads))
 
     def inspect_effect(
         self,
@@ -667,7 +680,18 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
         member: SinkEffectMember,
         effect_input: SinkEffectPipelineMembersInput,
     ) -> tuple[str, dict[str, object], ArtifactDescriptor]:
-        descriptor, payload_hash, plan_hash, payloads = self._member_effect_material(plan.effect_id, effect_input)
+        # The integrity check below still runs for every member; only the
+        # recomputation is shared. Identity (not equality) keys the cache:
+        # SinkEffectPipelineMembersInput and its members are deep-frozen, so
+        # the same object cannot carry different content, and the cache holds
+        # a reference so its id cannot be reused.
+        cached = self._member_material_cache
+        if cached is not None and cached[0] == plan.effect_id and cached[1] is effect_input:
+            material = cached[2]
+        else:
+            material = self._member_effect_material(plan.effect_id, effect_input)
+            self._member_material_cache = (plan.effect_id, effect_input, material)
+        descriptor, payload_hash, plan_hash, payloads = material
         if (
             plan.protocol_version != SINK_EFFECT_PROTOCOL_VERSION
             or plan.input_kind is not SinkEffectInputKind.PIPELINE_MEMBERS
@@ -794,6 +818,7 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
 
     def close(self) -> None:
         """Release DataverseClient resources."""
+        self._member_material_cache = None
         if self._client is not None:
             self._client.close()
             self._client = None

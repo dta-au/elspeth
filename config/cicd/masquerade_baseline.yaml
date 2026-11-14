@@ -317,6 +317,21 @@ entries:
     DBAPI exception (psycopg and psycopg2 expose it; other drivers may not) and retains
     it only as an exact str matching the plain SQL identifier pattern, for a value-free
     diversion reason.
+- path: src/elspeth/plugins/sources/aws_s3_source.py
+  qualname: _s3_body_member
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - e76cffb3b38a787ee174f50403f1365ef32f1a34d00c51ae9880522a16288d81
+  classification: external-parse
+  justification: ADR-032 admission of the SDK-owned S3 GetObject response Body (botocore
+    StreamingBody or any wrapper). The name is the closed Literal read or close; each
+    is read once and an absent member returns a module sentinel (never a default value).
+    _admit_s3_body then requires both to be callable before building the frozen owned
+    _AdmittedS3Body, and every read() result is still checked as exact bytes within
+    the chunk bound. A missing or non-callable member is InvalidS3Body (closing the
+    body when its close is callable). Replaces a runtime_checkable Protocol isinstance
+    gate (plugin review P4 finding 12).
 - path: src/elspeth/plugins/transforms/aws/textract_document_analysis.py
   qualname: AWSTextractDocumentAnalysisConfig._consistency
   kind: getattr
@@ -1799,6 +1814,19 @@ entries:
     iterates the closed literal block-field table (body/orelse/finalbody, iter/test)
     over stdlib ast statement nodes whose field sets differ per class; the None default
     is the stdlib absence value and every hit is type-checked before use.'
+- path: tests/unit/plugins/test_p4_infra_sinks_sweep.py
+  qualname: _ProxiedBody.__getattr__
+  kind: dunder_getattr
+  occurrences: 1
+  probe_shapes:
+  - b3be05b0db2b44f5f766257a64de9ed8f65d16fba45c0aeba07aa5d82b3b649c
+  classification: approved-introspection
+  justification: The dynamic hook IS the subject under test. It models an S3 Body
+    wrapper whose read/close resolve through __getattr__, the shape a runtime_checkable
+    Protocol isinstance (inspect.getattr_static since Python 3.12) wrongly rejected;
+    the test proves the ADR-032 sentinel-getattr admission in _admit_s3_body accepts
+    it. It resolves exactly read and close and raises AttributeError for any other
+    name.
 - path: tests/unit/telemetry/test_delivery_metrics_contract.py
   qualname: _DynamicDeliveryMetricsExporter.__getattr__
   kind: dunder_getattr

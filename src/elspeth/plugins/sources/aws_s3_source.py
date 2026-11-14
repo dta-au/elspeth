@@ -13,11 +13,12 @@ import math
 import re
 import tempfile
 import time
-from collections.abc import Generator, Mapping
+from collections.abc import Callable, Generator, Mapping
 from collections.abc import Iterator as ABCIterator
+from dataclasses import dataclass
 from decimal import Decimal
 from types import TracebackType
-from typing import Any, BinaryIO, ClassVar, Literal, Never, Protocol, Self, cast, runtime_checkable
+from typing import Any, BinaryIO, ClassVar, Literal, Never, Protocol, Self, cast
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, JsonValue, ValidationError, field_validator, model_validator
@@ -276,16 +277,42 @@ class _S3Client(Protocol):
     def close(self) -> None: ...
 
 
-@runtime_checkable
-class _S3Body(Protocol):
-    def read(self, size: int) -> bytes: ...
+@dataclass(frozen=True, slots=True)
+class _AdmittedS3Body:
+    """The SDK response Body reduced to the two bound methods ELSPETH calls.
 
-    def close(self) -> None: ...
+    Every ``read`` result is still checked (``type(chunk) is bytes``): the
+    admission proves only that the methods exist and are callable.
+    """
+
+    read: Callable[[int], object]
+    close: Callable[[], object]
 
 
-@runtime_checkable
-class _S3Closable(Protocol):
-    def close(self) -> None: ...
+_MISSING_BODY_MEMBER = object()
+
+
+def _s3_body_member(raw_body: object, name: Literal["read", "close"]) -> object:
+    """Read one member of the SDK-owned Body once; an absent member is a sentinel, never a default."""
+    try:
+        return getattr(raw_body, name)
+    except AttributeError:
+        return _MISSING_BODY_MEMBER
+
+
+def _admit_s3_body(raw_body: object) -> tuple[_AdmittedS3Body | None, Callable[[], object] | None]:
+    """Parse the SDK-owned Body at the boundary (ADR-032): sentinel read plus callable checks.
+
+    Returns the admitted body, or ``None`` with the body's own callable
+    ``close`` (when it has one) so the caller can release the stream it is
+    rejecting.
+    """
+    read = _s3_body_member(raw_body, "read")
+    close = _s3_body_member(raw_body, "close")
+    usable_close = close if callable(close) else None
+    if not callable(read) or usable_close is None:
+        return None, usable_close
+    return _AdmittedS3Body(read=read, close=usable_close), usable_close
 
 
 class S3SourceReadError(RuntimeError):
@@ -375,9 +402,9 @@ def _read_error(
     )
 
 
-def _close_body(body: _S3Closable) -> str | None:
+def _close_body(close: Callable[[], object]) -> str | None:
     try:
-        body.close()
+        close()
     except _s3_provider_exception_types() as exc:
         return _normalize_error_type(exc)
     return None
@@ -456,13 +483,12 @@ def _download_s3_object(client: _S3Client, *, bucket: str, key: str, max_object_
 
     if "Body" not in get_response:
         _raise_safe(_read_error("InvalidS3Body", max_object_bytes=max_object_bytes))
-    raw_body = get_response["Body"]
-    if not isinstance(raw_body, _S3Body):
+    body, raw_close = _admit_s3_body(get_response["Body"])
+    if body is None:
         interface_error = _read_error("InvalidS3Body", max_object_bytes=max_object_bytes)
-        if isinstance(raw_body, _S3Closable):
-            interface_error.cleanup_error_type = _close_body(raw_body)
+        if raw_close is not None:
+            interface_error.cleanup_error_type = _close_body(raw_close)
         _raise_safe(interface_error)
-    body = raw_body
 
     get_length = _validated_length(get_response)
     validation_error: S3SourceReadError | None = None
@@ -473,7 +499,7 @@ def _download_s3_object(client: _S3Client, *, bucket: str, key: str, max_object_
     elif get_length != head_length:
         validation_error = _read_error("InvalidS3Metadata", max_object_bytes=max_object_bytes)
     if validation_error is not None:
-        validation_error.cleanup_error_type = _close_body(body)
+        validation_error.cleanup_error_type = _close_body(body.close)
         _raise_safe(validation_error)
 
     spool_created = False
@@ -482,7 +508,7 @@ def _download_s3_object(client: _S3Client, *, bucket: str, key: str, max_object_
         spool_created = True
     finally:
         if not spool_created:
-            _close_body(body)
+            _close_body(body.close)
 
     digest = hashlib.sha256()
     total = 0
@@ -516,7 +542,7 @@ def _download_s3_object(client: _S3Client, *, bucket: str, key: str, max_object_
             total = observed
 
         try:
-            cleanup_error_type = _close_body(body)
+            cleanup_error_type = _close_body(body.close)
         except Exception as exc:
             if primary_error is None:
                 raise
@@ -538,7 +564,7 @@ def _download_s3_object(client: _S3Client, *, bucket: str, key: str, max_object_
         return _DownloadedObject(spool, size_bytes=total, content_hash=digest.hexdigest())
     finally:
         if not body_closed:
-            _close_body(body)
+            _close_body(body.close)
         if not transfer_spool:
             spool.close()
 
@@ -903,7 +929,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f203696d50207e25"
+    source_file_hash: str | None = "sha256:2053b8a8ff1fd1b1"
     config_model = AWSS3SourceConfig
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 

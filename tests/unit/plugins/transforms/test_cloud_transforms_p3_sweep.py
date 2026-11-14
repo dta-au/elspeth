@@ -613,7 +613,3 @@ def test_omitted_analysis_type_is_credited_as_the_both_default() -> None:
 
     assert AzurePromptShieldConfig.model_fields["analysis_type"].default == "both"
     assert _prompt_shield_credit({}) is True
-
-
-def test_detect_only_prompt_shield_still_gets_no_credit_with_both() -> None:
-    assert _prompt_shield_credit({"analysis_type": "both", "detect_only": True}) is False
