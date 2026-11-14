@@ -203,6 +203,7 @@ def _assert_timing_workflow_contract(workflow: dict[str, Any]) -> None:
     assert _step(job, "Install pinned Caddy for TLS acceptance")["run"] == _step(ordinary, "Install pinned Caddy for TLS acceptance")["run"]
     assert job["env"] == {
         "CI_CHECKOUT_PATH": "ci-${{ github.run_id }}-${{ github.run_attempt }}-timing-${{ matrix.python-version }}",
+        "UV_PYTHON": "${{ matrix.python-version }}",
         "COVERAGE_FILE": "coverage-data",
     }
     for covered, name in ((True, "Run timing-sensitive tests with coverage"), (False, "Run timing-sensitive tests without coverage")):
