@@ -37,9 +37,11 @@ from elspeth.contracts.wire_visible_identity import reject_operator_required_pla
 from elspeth.plugins.infrastructure.azure_auth import AzureAuthConfig, AzureAuthMethod
 from elspeth.plugins.infrastructure.base import BaseSource
 from elspeth.plugins.infrastructure.config_base import (
+    CSVDelimiter,
     DataPluginConfig,
     NormalizedColumnsOption,
     NormalizedFieldMappingOption,
+    TextEncoding,
     declared_source_schema_field_names,
 )
 from elspeth.plugins.infrastructure.config_content import reject_nonfinite_constant
@@ -94,27 +96,9 @@ class CSVOptions(BaseModel):
 
     model_config = {"extra": "forbid"}
 
-    delimiter: str = ","
+    delimiter: CSVDelimiter = ","
     has_header: bool = True
-    encoding: str = "utf-8"
-
-    @field_validator("delimiter")
-    @classmethod
-    def _validate_delimiter(cls, v: str) -> str:
-        if len(v) != 1:
-            raise ValueError(f"delimiter must be a single character, got {v!r}")
-        return v
-
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, v: str) -> str:
-        import codecs
-
-        try:
-            codecs.lookup(v)
-        except LookupError as exc:
-            raise ValueError(f"unknown encoding: {v!r}") from exc
-        return v
+    encoding: TextEncoding = "utf-8"
 
 
 class JSONOptions(BaseModel):
@@ -122,19 +106,8 @@ class JSONOptions(BaseModel):
 
     model_config = {"extra": "forbid"}
 
-    encoding: str = "utf-8"
+    encoding: TextEncoding = "utf-8"
     data_key: str | None = None
-
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, v: str) -> str:
-        import codecs
-
-        try:
-            codecs.lookup(v)
-        except LookupError as exc:
-            raise ValueError(f"unknown encoding: {v!r}") from exc
-        return v
 
 
 class AzureBlobSourceConfig(DataPluginConfig):
@@ -426,7 +399,7 @@ class AzureBlobSource(BaseSource):
     name = "azure_blob"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:50003a51c8495a6b"
+    source_file_hash: str | None = "sha256:9168aebe890fd40a"
     config_model = AzureBlobSourceConfig
 
     usage_when_to_use: str = (

@@ -248,7 +248,7 @@ class TestAWSS3SinkConfig:
     def test_non_text_to_bytes_csv_codec_is_rejected_at_config(self, encoding: str) -> None:
         from elspeth.plugins.sinks.aws_s3_sink import AWSS3SinkConfig
 
-        with pytest.raises(PluginConfigError, match="text to bytes"):
+        with pytest.raises(PluginConfigError, match="not a text encoding"):
             AWSS3SinkConfig.from_dict(_base_config(csv_options={"encoding": encoding}), plugin_name="aws_s3")
 
 

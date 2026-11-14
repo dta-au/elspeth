@@ -45,8 +45,10 @@ from elspeth.contracts.wire_visible_identity import reject_operator_required_pla
 from elspeth.plugins.aws_s3_common import build_s3_client
 from elspeth.plugins.infrastructure.base import BaseSink
 from elspeth.plugins.infrastructure.config_base import (
+    CSVDelimiter,
     DataPluginConfig,
     HeaderModeOption,
+    TextEncoding,
     validate_headers_value,
 )
 from elspeth.plugins.infrastructure.display_headers import (
@@ -92,32 +94,9 @@ class CSVWriteOptions(BaseModel):
 
     model_config = {"extra": "forbid", "frozen": True}
 
-    delimiter: str = Field(default=",", description="Single-character CSV field delimiter")
-    encoding: str = Field(default="utf-8", description="Character encoding for CSV output")
+    delimiter: CSVDelimiter = Field(default=",", description="Single-character CSV field delimiter")
+    encoding: TextEncoding = Field(default="utf-8", description="Character encoding for CSV output")
     include_header: bool = Field(default=True, description="Write the CSV header record")
-
-    @field_validator("delimiter")
-    @classmethod
-    def _validate_delimiter(cls, value: str) -> str:
-        if len(value) != 1:
-            raise ValueError("delimiter must be a single character")
-        return value
-
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, value: str) -> str:
-        try:
-            codecs.lookup(value)
-        except LookupError as exc:
-            raise ValueError("unknown CSV encoding") from exc
-        try:
-            encoded: object = codecs.getincrementalencoder(value)(errors="strict").encode("", final=True)
-        except (LookupError, TypeError, UnicodeError, ValueError):
-            raise ValueError("CSV encoding must encode text to bytes") from None
-        # Text-to-text codecs such as rot13 look up cleanly but never yield bytes.
-        if type(encoded) is not bytes:
-            raise ValueError("CSV encoding must encode text to bytes")
-        return value
 
 
 class AWSS3SinkConfig(DataPluginConfig):
@@ -749,7 +728,7 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
     name = "aws_s3"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3d90ff2251470de9"
+    source_file_hash: str | None = "sha256:d3e6874fba82116c"
     config_model = AWSS3SinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP

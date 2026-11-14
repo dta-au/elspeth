@@ -703,7 +703,7 @@ _SINK_REJECTION_CASES = [
             "schema": _make_observed_schema(),
             "encoding": "rot_13",
         },
-        "not a supported text codec",
+        "not a text encoding",
         id="json_sink-non-text-codec",
     ),
     # ── csv sink ──────────────────────────────────────────────────────────

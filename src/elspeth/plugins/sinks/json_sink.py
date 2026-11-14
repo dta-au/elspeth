@@ -12,7 +12,7 @@ from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, model_validator
 
 from elspeth.contracts import CallType, Determinism, PluginSchema
 from elspeth.contracts.diversion import SinkWriteResult
@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.sink import OutputValidationResult
 from elspeth.contracts.contexts import SinkContext
 from elspeth.plugins.infrastructure.base import BaseSink
-from elspeth.plugins.infrastructure.config_base import OutputCollisionPolicy, SinkPathConfig
+from elspeth.plugins.infrastructure.config_base import OutputCollisionPolicy, SinkPathConfig, TextEncoding
 from elspeth.plugins.infrastructure.display_headers import (
     apply_display_headers,
     display_name_for,
@@ -87,7 +87,7 @@ class JSONSinkConfig(SinkPathConfig):
         description="Output JSON format. When omitted, the sink auto-detects JSONL from a .jsonl filename and JSON otherwise.",
     )
     indent: int | None = Field(default=None, description="Indentation level for JSON array output; null writes compact JSON.")
-    encoding: str = Field(
+    encoding: TextEncoding = Field(
         default="utf-8",
         strict=True,
         description="Text encoding used when writing JSON output.",
@@ -96,22 +96,6 @@ class JSONSinkConfig(SinkPathConfig):
         default="write",
         description="Whether to create/replace the JSON output file or append JSONL rows.",
     )
-
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, value: str) -> str:
-        try:
-            codecs.lookup(value)
-        except LookupError as exc:
-            raise ValueError("unknown encoding for JSON sink") from exc
-        try:
-            encoded = "".encode(value)
-            incremental = codecs.getincrementalencoder(value)().encode("", final=True)
-        except (LookupError, TypeError, UnicodeError, ValueError) as exc:
-            raise ValueError("encoding is not a supported text codec for JSON sink") from exc
-        if type(encoded) is not bytes or type(incremental) is not bytes:
-            raise ValueError("encoding is not a supported text codec for JSON sink")
-        return value
 
     @model_validator(mode="after")
     def _validate_mode_format_compatibility(self) -> "JSONSinkConfig":
@@ -152,7 +136,7 @@ class JSONSink(BaseSink):
     name = "json"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:6c9b64bb34350d2c"
+    source_file_hash: str | None = "sha256:4c5c6d960228d88d"
     config_model = JSONSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM
