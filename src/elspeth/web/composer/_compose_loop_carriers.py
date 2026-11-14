@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, PrivateToolAuthoring, ToolArgumentErrorCategory
-from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
+from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource, ReasoningWithhold
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.token_usage import TokenUsage
@@ -104,6 +104,7 @@ class _AdmittedLLMProviderMetadata:
     reasoning_details: Any | None
     thinking_blocks: Any | None
     provider_served: str | None
+    reasoning_withholds: tuple[ReasoningWithhold, ...] = ()
 
     def __post_init__(self) -> None:
         freeze_fields(self, "reasoning_details", "thinking_blocks")

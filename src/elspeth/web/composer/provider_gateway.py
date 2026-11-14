@@ -80,7 +80,7 @@ class _MalformedLLMResponseError(ComposerServiceError):
         text_received: bool = False,
         credential_surface: str = "composer_provider_response",
     ) -> None:
-        _require_no_credential_material_in_completion_fields(
+        provider_metadata = _require_no_credential_material_in_completion_fields(
             content=None,
             tool_calls=(),
             provider_metadata=provider_metadata,
@@ -154,12 +154,6 @@ def _capture_composer_llm_completion_fields(
         message=None if message is missing else message,
         pricing_model=pricing_model,
     )
-    _require_no_credential_material_in_completion_fields(
-        content=None,
-        tool_calls=(),
-        provider_metadata=provider_metadata,
-        surface=credential_surface,
-    )
     if choices is missing or not isinstance(choices, list | tuple):
         raise _MalformedLLMResponseError(
             "LLM returned malformed choices — cannot continue composition",
@@ -185,12 +179,6 @@ def _capture_composer_llm_completion_fields(
             provider_metadata=provider_metadata,
             credential_surface=credential_surface,
         )
-    _require_no_credential_material_in_completion_fields(
-        content=content,
-        tool_calls=(),
-        provider_metadata=provider_metadata,
-        surface=credential_surface,
-    )
     tool_calls = getattr(message, "tool_calls", missing)
     if tool_calls is missing and not require_tool_calls_field:
         tool_calls = None
@@ -200,6 +188,13 @@ def _capture_composer_llm_completion_fields(
             provider_metadata=provider_metadata,
             credential_surface=credential_surface,
         )
+    provider_metadata = _require_no_credential_material_in_completion_fields(
+        content=content,
+        tool_calls=(),
+        provider_metadata=provider_metadata,
+        surface=credential_surface,
+        thinking_replay_required=bool(tool_calls),
+    )
     return _AdmittedAssistantMessage(content=content), tuple(tool_calls or ()), provider_metadata
 
 
@@ -251,14 +246,15 @@ def _require_no_credential_material_in_completion(
     completion: _AdmittedLLMCompletion,
     *,
     surface: str,
-) -> None:
+) -> _AdmittedLLMCompletion:
     """Reject all persisted or replayed text metadata in an owned completion."""
-    _require_no_credential_material_in_completion_fields(
+    metadata = _require_no_credential_material_in_completion_fields(
         content=completion.message.content,
         tool_calls=tuple((call.id, call.function.name) for call in completion.tool_batch.calls),
         provider_metadata=completion.provider_metadata,
         surface=surface,
     )
+    return replace(completion, provider_metadata=metadata)
 
 
 def _require_no_credential_material_in_completion_fields(
@@ -267,9 +263,10 @@ def _require_no_credential_material_in_completion_fields(
     tool_calls: Sequence[tuple[str, str]],
     provider_metadata: _AdmittedLLMProviderMetadata,
     surface: str,
-) -> None:
+    thinking_replay_required: bool | None = None,
+) -> _AdmittedLLMProviderMetadata:
     """Guard the normalized provider fields that can be audited or replayed."""
-    require_no_credential_material_in_llm_metadata(
+    scrub = require_no_credential_material_in_llm_metadata(
         content=content,
         tool_calls=tool_calls,
         reasoning_content=provider_metadata.reasoning_content,
@@ -280,7 +277,9 @@ def _require_no_credential_material_in_completion_fields(
         finish_reason=provider_metadata.finish_reason,
         provider_served=provider_metadata.provider_served,
         surface=surface,
+        thinking_replay_required=thinking_replay_required,
     )
+    return scrub.apply(provider_metadata)
 
 
 class _BadRequestLLMError(ComposerServiceError):
@@ -651,7 +650,7 @@ class ProviderGateway:
                 surface="composer_provider_response",
                 credential_state=batch_credential_state,
             )
-        _require_no_credential_material_in_completion(
+        completion = _require_no_credential_material_in_completion(
             completion,
             surface="composer_provider_response",
         )
@@ -700,7 +699,7 @@ class ProviderGateway:
                 message=None,
                 pricing_model=self._settings.composer_pricing_model or self._model,
             )
-            _require_no_credential_material_in_completion_fields(
+            empty_response_metadata = _require_no_credential_material_in_completion_fields(
                 content=None,
                 tool_calls=(),
                 provider_metadata=empty_response_metadata,
@@ -721,7 +720,7 @@ class ProviderGateway:
         try:
             content = message.content
         except AttributeError:
-            _require_no_credential_material_in_completion_fields(
+            response_metadata = _require_no_credential_material_in_completion_fields(
                 content=None,
                 tool_calls=(),
                 provider_metadata=response_metadata,
@@ -731,7 +730,7 @@ class ProviderGateway:
                 "LLM returned a diagnostics message with no content field",
                 provider_metadata=response_metadata,
             ) from None
-        _require_no_credential_material_in_completion_fields(
+        response_metadata = _require_no_credential_material_in_completion_fields(
             content=content if type(content) is str else None,
             tool_calls=(),
             provider_metadata=response_metadata,
@@ -819,7 +818,7 @@ class ProviderGateway:
             else:
                 completion_call = self._call_llm(wire_messages, wire_tools)
             completion = await asyncio.wait_for(completion_call, timeout=timeout)
-            _require_no_credential_material_in_completion(
+            completion = _require_no_credential_material_in_completion(
                 completion,
                 surface="composer_provider_response",
             )
@@ -1016,7 +1015,7 @@ class ProviderGateway:
                     "LLM returned a malformed diagnostics explanation",
                     provider_metadata=admitted_metadata,
                 ) from None
-            _require_no_credential_material_in_completion_fields(
+            admitted_metadata = _require_no_credential_material_in_completion_fields(
                 content=content if type(content) is str else None,
                 tool_calls=(),
                 provider_metadata=admitted_metadata,

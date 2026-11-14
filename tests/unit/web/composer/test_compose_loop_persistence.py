@@ -939,6 +939,8 @@ async def test_internal_completion_control_metadata_refuses_atomically_before_an
             provider_metadata=replace(completion.provider_metadata, **{credential_field: metadata_value}),
         )
 
+    delivered = False
+
     async def _internal_completion(
         _messages: Any,
         _tools: Any,
@@ -949,6 +951,10 @@ async def test_internal_completion_control_metadata_refuses_atomically_before_an
         prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
         prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> _AdmittedLLMCompletion:
+        nonlocal delivered
+        if delivered:
+            return _text_response("The requested metadata has been saved.")
+        delivered = True
         return completion
 
     handler_calls = _record_real_tool_handlers(monkeypatch)
@@ -956,6 +962,39 @@ async def test_internal_completion_control_metadata_refuses_atomically_before_an
     assert sessions_service is not None
     before_messages = await sessions_service.get_messages(UUID(result_session_id))
     before_state = await sessions_service.get_current_state(UUID(result_session_id))
+
+    if credential_field in {"reasoning_content", "reasoning_details"}:
+        from elspeth.web.composer.audit import BufferingRecorder, llm_call_audit_envelope
+
+        recorded_calls = []
+        original_record = BufferingRecorder.record_llm_call
+
+        def capture_call(recorder: BufferingRecorder, call: Any, *, provider_custody: Any = None) -> None:
+            original_record(recorder, call, provider_custody=provider_custody)
+            recorded_calls.append(call)
+
+        monkeypatch.setattr(BufferingRecorder, "record_llm_call", capture_call)
+        await _run_one_turn(
+            composer_service_with_real_sessions,
+            llm=_internal_completion,
+            session_id=result_session_id,
+        )
+        assert handler_calls == ["create_blob", "set_metadata"]
+        after_messages = await sessions_service.get_messages(UUID(result_session_id))
+        assert candidate not in repr(after_messages)
+        assert recorded_calls[0].reasoning_content is None
+        assert recorded_calls[0].reasoning_details is None
+        assert candidate not in repr(recorded_calls)
+        withholds = [event for call in recorded_calls for event in llm_call_audit_envelope(call)["call"]["reasoning_withholds"]]
+        assert withholds == [
+            {
+                "surface": "composer_provider_response",
+                "category": "token_shape",
+                "detector_version": "1",
+                "field_class": credential_field,
+            }
+        ]
+        return
 
     with pytest.raises(CredentialMaterialRefused) as caught:
         await _run_one_turn(

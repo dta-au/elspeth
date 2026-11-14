@@ -281,8 +281,13 @@ PyJWT audit exception was removed; the current frozen audit and its remaining
 dated exceptions are recorded in [EV-708].
 
 The credential-boundary finding is resolved for the Web and Composer control
-plane by the versioned bounded detector and atomic refusal points described in
-[EV-227]. This is a finite recogniser, not universal data-loss prevention.
+plane by the versioned bounded detector and admission points described in
+[EV-227]. Credential-shaped plain reasoning is withheld with value-free audit
+evidence while retaining the turn. Final replies with credential-shaped native thinking
+withhold the complete block list with a value-free stored event. Native thinking required by an active tool
+loop cannot be edited or omitted, so a readable hit there still refuses the
+request. Opaque encrypted reasoning and native signatures/data are not
+pattern-scanned. This is a finite recogniser, not universal data-loss prevention.
 Pipeline rows, inline blob bodies, runtime model data, telemetry content and
 sink output remain outside that detector. Keep `R-008`, the user guidance and
 destination-specific controls wherever those data-plane surfaces are in the

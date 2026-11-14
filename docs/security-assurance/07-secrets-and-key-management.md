@@ -266,7 +266,12 @@ Further controls on this path:
   approval and execution boundaries. Refusal evidence is value-free, and the
   guarded operation cannot apply the rejected candidate's business mutation
   or retain its content. Provider attempts may retain one fixed, value-free
-  failure audit record [EV-227].
+  failure audit record. Credential-shaped plain reasoning is withheld with a
+  value-free stored event while retaining the turn. Final replies with credential-shaped
+  native thinking withhold the complete block list with a stored event. Readable native thinking
+  required in the current tool loop still refuses the request, because those
+  blocks cannot be edited or omitted. Opaque encrypted reasoning data, native
+  signatures and redacted-thinking data are not pattern-scanned [EV-227].
 
 These controls are not a general data-loss-prevention system. Recognised token
 shapes are detected even under ordinary control-field names, but arbitrary

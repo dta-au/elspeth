@@ -1129,7 +1129,7 @@ async def run_tool_batch(
     # already-admitted completion without passing through ProviderGateway, so
     # this common owner must cover prose, identifiers, reasoning, and mixed
     # batches all-or-nothing as well.
-    require_no_credential_material_in_llm_metadata(
+    scrub = require_no_credential_material_in_llm_metadata(
         content=raw_assistant_content,
         tool_calls=tuple((call.id, call.function.name) for call in assistant_tool_calls),
         reasoning_content=completion.provider_metadata.reasoning_content,
@@ -1141,6 +1141,7 @@ async def run_tool_batch(
         provider_served=completion.provider_metadata.provider_served,
         surface="composer_tool_batch",
     )
+    completion = replace(completion, provider_metadata=scrub.apply(completion.provider_metadata))
     from elspeth.web.credential_guard import credential_state_for_tool_batch
 
     batch_credential_state = credential_state_for_tool_batch(state, tuple(call.function.name for call in assistant_tool_calls))

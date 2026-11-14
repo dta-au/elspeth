@@ -329,7 +329,15 @@ def test_structured_refusal_contains_only_closed_evidence() -> None:
 
 @pytest.mark.parametrize(
     "surface",
-    ["composer_provider_response", "composer_planner_response", "composer_advisor_response", "composer_provider_thinking"],
+    [
+        "composer_provider_response",
+        "composer_planner_response",
+        "composer_advisor_response",
+        "composer_provider_thinking",
+        "composer_tool_batch",
+        "composer_tool_wire",
+        "composer_recovery_reply",
+    ],
 )
 def test_model_output_refusal_identifies_model_and_keeps_evidence_closed(surface: str) -> None:
     candidate = "sk-" + "a" * 24
@@ -366,11 +374,9 @@ def test_model_output_refusal_identifies_model_and_keeps_evidence_closed(surface
         "session_title",
         "blob_filename",
         "composer_tool_arguments",
-        "composer_tool_wire",
-        "composer_tool_batch",
+        "composer_advisor_complete_content",
         "composer_mcp_tool_arguments",
         "composer_prompt_guard_request",
-        "composer_recovery_reply",
         "composer_unknown_response",
     ],
 )
@@ -574,7 +580,7 @@ async def test_provider_response_is_refused_before_release(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
-async def test_provider_reasoning_is_refused_before_release(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_provider_reasoning_is_withheld_before_release(monkeypatch: pytest.MonkeyPatch) -> None:
     candidate = "sk-" + "a" * 24
     response = _make_llm_response(content="ordinary")
     response.choices[0].message.__dict__["reasoning_content"] = candidate
@@ -590,15 +596,14 @@ async def test_provider_reasoning_is_refused_before_release(monkeypatch: pytest.
         endpoint_api_key=None,
     )
 
-    with pytest.raises(CredentialMaterialRefused) as caught:
-        await gateway._call_llm([{"role": "user", "content": "ordinary"}], [])
-
-    assert caught.value.surface == "composer_provider_response"
-    assert candidate not in repr(caught.value.to_payload())
+    admitted = await gateway._call_llm([{"role": "user", "content": "ordinary"}], [])
+    assert admitted.provider_metadata.reasoning_content is None
+    assert admitted.provider_metadata.reasoning_withholds[0].surface == "composer_provider_response"
+    assert candidate not in repr(admitted)
 
 
 @pytest.mark.asyncio
-async def test_text_provider_reasoning_is_refused_before_release(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_text_provider_reasoning_keeps_visible_reply(monkeypatch: pytest.MonkeyPatch) -> None:
     candidate = "sk-" + "a" * 24
     response = _make_llm_response(content="ordinary")
     response.choices[0].message.__dict__["reasoning_content"] = candidate
@@ -614,11 +619,8 @@ async def test_text_provider_reasoning_is_refused_before_release(monkeypatch: py
         endpoint_api_key=None,
     )
 
-    with pytest.raises(CredentialMaterialRefused) as caught:
-        await gateway._call_text_llm([{"role": "user", "content": "ordinary"}])
-
-    assert caught.value.surface == "composer_provider_response"
-    assert candidate not in repr(caught.value.to_payload())
+    admitted = await gateway._call_text_llm([{"role": "user", "content": "ordinary"}])
+    assert admitted.choices[0].message.content == "ordinary"
 
 
 def test_pipeline_data_and_sink_modules_do_not_import_control_plane_guard() -> None:
