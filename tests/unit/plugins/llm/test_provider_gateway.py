@@ -32,6 +32,7 @@ from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
 from elspeth.plugins.infrastructure.clients.llm import (
     ContentPolicyError,
     ContextLengthError,
+    EmptyCompletionError,
     LLMClientError,
     NetworkError,
     RateLimitError,
@@ -670,7 +671,7 @@ class TestSuccessPathLeakGuard:
         must not leak via an f-string embedding the raw value."""
         body = _completion_body(content="   ", finish_reason=_BODY_SENTINEL)
         response = _gateway_response(body)
-        with pytest.raises(ContentPolicyError) as exc_info:
+        with pytest.raises(EmptyCompletionError) as exc_info:
             _validate_gateway_success_response(response, usage_required=False)
         assert _BODY_SENTINEL not in str(exc_info.value)
 
@@ -704,7 +705,7 @@ class TestSuccessPathLeakGuard:
         execute_query() HTTP path rather than the validator directly."""
         body = _completion_body(content="   ", finish_reason=_BODY_SENTINEL)
         respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(body))
-        with pytest.raises(ContentPolicyError) as exc_info:
+        with pytest.raises(EmptyCompletionError) as exc_info:
             provider.execute_query(
                 messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
@@ -841,11 +842,12 @@ class TestBlankContent:
         assert exc_info.value.retryable is False
 
     @respx.mock
-    def test_blank_content_otherwise_is_content_policy_error(self, provider: GatewayLLMProvider) -> None:
+    def test_blank_content_without_a_refusal_is_not_content_policy(self, provider: GatewayLLMProvider) -> None:
+        # Missing content alone does not establish a content-policy refusal (#123).
         respx.post(f"{_ENDPOINT}/chat/completions").mock(
             return_value=_gateway_response(_completion_body(content="   ", finish_reason="stop"))
         )
-        with pytest.raises(ContentPolicyError):
+        with pytest.raises(EmptyCompletionError, match="without an explicit refusal"):
             provider.execute_query(
                 messages=[ChatMessage(role="user", content="hi")],
                 model="standard",

@@ -2117,7 +2117,7 @@ class TestOpenRouterRuntimePreflightValidation:
             (
                 {"model": _OPENROUTER_MODEL, "choices": [{"message": {"content": None}}]},
                 LLMClientError,
-                "null content",
+                "without an explicit refusal",
             ),
             (
                 {"model": _OPENROUTER_MODEL, "choices": [{"message": {"content": None}, "finish_reason": "content_filter"}]},

@@ -278,7 +278,8 @@ def _https_origin(url: str) -> tuple[str, int] | None:
 class DataverseAuthConfig(BaseModel):
     """Authentication configuration for Dataverse connections."""
 
-    model_config = {"extra": "forbid", "frozen": True}
+    # Validation errors never echo the authored input: it carries client_secret.
+    model_config = {"extra": "forbid", "frozen": True, "hide_input_in_errors": True}
 
     method: Literal["service_principal", "managed_identity"]
 

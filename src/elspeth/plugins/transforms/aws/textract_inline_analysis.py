@@ -16,10 +16,10 @@ import re
 import threading
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
-from typing import Any, ClassVar, Self, cast
+from typing import Any, Self, cast
 
 import structlog
-from pydantic import ConfigDict, Field, ValidationInfo, field_validator, model_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 
 from elspeth.contracts import Determinism, RunMode
 from elspeth.contracts.audit_protocols import PluginAuditWriter
@@ -102,11 +102,6 @@ class TextractInlineQueryConfig(TextractQueryConfig):
 
 class AWSTextractInlineAnalysisConfig(TransformDataConfig):
     """Validated public configuration for synchronous inline document analysis."""
-
-    model_config: ClassVar[ConfigDict] = ConfigDict(
-        **TransformDataConfig.model_config,
-        hide_input_in_errors=True,
-    )
 
     region: str = Field(min_length=1, max_length=64, description="AWS region providing the Amazon Textract endpoint.")
     auth_mode: AuthMode = Field(
@@ -283,7 +278,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_inline_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8fbbdb2d684a9029"
+    source_file_hash: str | None = "sha256:90beb1e1b3308d91"
     config_model = AWSTextractInlineAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED

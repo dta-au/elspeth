@@ -10,7 +10,7 @@ from elspeth.contracts import CallStatus
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.enums import RunMode
 from elspeth.plugins.infrastructure.batching.ports import CollectorOutputPort
-from elspeth.plugins.infrastructure.clients.llm import AuditedLLMClient, ContentPolicyError
+from elspeth.plugins.infrastructure.clients.llm import AuditedLLMClient, FilteredCompletionError
 from elspeth.plugins.transforms.llm.transform import LLMTransform
 from tests.fixtures.mock_audit import mock_audit_authority
 from tests.unit.plugins.clients.test_audited_llm_client import (
@@ -47,7 +47,7 @@ def _content_filtered_source_call() -> dict[str, Any]:
         ),
     )
     live_error = _raised_by(lambda: client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")]))
-    assert type(live_error) is ContentPolicyError
+    assert type(live_error) is FilteredCompletionError
     execution.assert_recorded_once()
     return execution.last_record_call_kwargs
 
@@ -88,7 +88,7 @@ class TestFinding24ReplayContentFilteredCompletion:
 
         raised = _raised_by(lambda: client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")]))
 
-        assert type(raised) is ContentPolicyError, f"replay raised {type(raised).__name__}: {raised}"
+        assert type(raised) is FilteredCompletionError, f"replay raised {type(raised).__name__}: {raised}"
         assert str(raised) == source_error["message"]
         assert sdk.create_calls == []
         execution.assert_recorded_once()

@@ -21,12 +21,12 @@ import time
 from collections.abc import Mapping
 from dataclasses import asdict, replace
 from ipaddress import IPv4Network, IPv6Network
-from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 from urllib.parse import parse_qsl, urlsplit
 from xml.sax.saxutils import escape as escape_xml_text
 
 import httpx
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, Field, field_validator, model_validator
 
 from elspeth.contracts import CallType, Determinism
 from elspeth.contracts.audit import Call
@@ -294,10 +294,6 @@ class WebScrapeHTTPConfig(BaseModel):
 
 class WebScrapeConfig(TransformDataConfig):
     """Configuration for web scrape transform."""
-
-    # A nested secret can appear in an outer model's rejected input mapping,
-    # including when validation fails on an unrelated option.
-    model_config: ClassVar[ConfigDict] = ConfigDict(**TransformDataConfig.model_config, hide_input_in_errors=True)
 
     url_field: str | None = Field(
         default=None,
@@ -827,7 +823,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ef6e828ace325e3c"
+    source_file_hash: str | None = "sha256:83d5afee544a8d37"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True

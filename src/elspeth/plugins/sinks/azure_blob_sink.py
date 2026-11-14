@@ -208,12 +208,14 @@ class AzureBlobSinkConfig(DataPluginConfig):
     connection_string: str | None = Field(
         default=None,
         description="Azure Storage connection string",
+        repr=False,
     )
 
     # Auth Option 2: SAS token
     sas_token: str | None = Field(
         default=None,
         description="Azure Storage SAS token (with or without leading '?')",
+        repr=False,
     )
 
     # Auth Option 3: Managed Identity
@@ -238,6 +240,7 @@ class AzureBlobSinkConfig(DataPluginConfig):
     client_secret: str | None = Field(
         default=None,
         description="Azure AD client secret for Service Principal auth",
+        repr=False,
     )
 
     # Blob location (required for all auth methods)
@@ -401,7 +404,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
     name = "azure_blob"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8c5310c3821b716f"
+    source_file_hash: str | None = "sha256:29732938fa1803b8"
     config_model = AzureBlobSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP

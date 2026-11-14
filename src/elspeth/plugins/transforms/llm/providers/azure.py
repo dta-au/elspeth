@@ -26,7 +26,7 @@ from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import RunMode
 from elspeth.contracts.value_source import ValueSource
-from elspeth.plugins.infrastructure.clients.llm import AuditedLLMClient, ContentPolicyError, LLMClientError, build_llm_call_request
+from elspeth.plugins.infrastructure.clients.llm import AuditedLLMClient, LLMClientError, build_llm_call_request
 from elspeth.plugins.llm.config_validation import (
     AZURE_MODEL_VALUE_SOURCES,
     derive_azure_model,
@@ -102,6 +102,7 @@ class AzureOpenAIConfig(LLMConfig):
     tracing: dict[str, Any] | None = Field(
         default=None,
         description="Tier 2 tracing configuration (azure_ai, langfuse, or none)",
+        repr=False,
     )
 
     @field_validator("endpoint")
@@ -244,33 +245,16 @@ class AzureLLMProvider:
                 approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
             )
 
-            # raw_response is the Azure SDK's deserialized API response: a
-            # Tier 3 envelope read through the declared boundary.
-            finish_reason = finish_reason_from_raw_response(response.raw_response)
-
-            # Empty/whitespace str content. AuditedLLMClient raises on None
-            # content itself, so this branch sees only real empty strings.
-            # Classify by finish_reason as OpenRouter does: missing content
-            # alone does not establish a content-policy refusal, and a
-            # reasoning deployment that spends max_completion_tokens before
-            # replying stops with finish_reason=length.
-            if not response.content or not response.content.strip():
-                if finish_reason == FinishReason.CONTENT_FILTER:
-                    raise ContentPolicyError("LLM returned empty content: provider filtered the response")
-                if finish_reason == FinishReason.LENGTH:
-                    raise LLMClientError("LLM exhausted the output token budget before returning content", retryable=False)
-                if finish_reason == FinishReason.TOOL_CALLS:
-                    raise LLMClientError(
-                        "Azure returned tool_calls response (not supported by ELSPETH)",
-                        retryable=False,
-                    )
-                raise LLMClientError("LLM returned empty content without an explicit refusal", retryable=False)
-
+            # AuditedLLMClient has already recorded and raised every empty
+            # completion with its classification (classify_empty_completion),
+            # so content here is non-blank. raw_response is the Azure SDK's
+            # deserialized API response: a Tier 3 envelope read through the
+            # declared boundary.
             return LLMQueryResult(
                 content=response.content,
                 usage=response.usage,
                 model=response.model,
-                finish_reason=finish_reason,
+                finish_reason=finish_reason_from_raw_response(response.raw_response),
             )
         finally:
             # Clean up cached client for this audit parent to prevent unbounded growth.
@@ -322,8 +306,8 @@ class AzureLLMProvider:
                 temperature=temperature,
                 max_tokens=_PREFLIGHT_MAX_COMPLETION_TOKENS,
             )
-            if not response.content.strip():
-                raise ContentPolicyError("Azure preflight returned empty content")
+            # An empty completion has already been recorded and raised by
+            # AuditedLLMClient with its classification.
             finish_reason = finish_reason_from_raw_response(response.raw_response)
             if finish_reason not in (None, FinishReason.STOP):
                 raise LLMClientError("Azure preflight returned an unusable finish reason", retryable=False)

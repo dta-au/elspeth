@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -10,7 +11,7 @@ import httpx
 import pytest
 
 from elspeth.contracts.chat_parts import ChatMessage
-from elspeth.plugins.infrastructure.clients.llm import ContentPolicyError, LLMClientError, NetworkError
+from elspeth.plugins.infrastructure.clients.llm import ContentPolicyError, LLMClientError, NetworkError, UnsupportedResponseError
 from elspeth.plugins.llm.config_validation import normalize_openrouter_base_url, validate_openrouter_base_url
 from elspeth.plugins.sources.llm.config import (
     AzureOpenAILLMSourceConfig,
@@ -21,10 +22,8 @@ from elspeth.plugins.sources.llm.config import (
 from elspeth.plugins.transforms.llm.provider import LLMAuditParent
 from elspeth.plugins.transforms.llm.providers.gateway import _validate_gateway_success_response, _validate_readyz_payload
 from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterLLMProvider
-from tests.unit.plugins.llm.test_provider_azure import FakeLLMClient as AzureFakeLLMClient
-from tests.unit.plugins.llm.test_provider_azure import _make_llm_response as _make_azure_llm_response
+from tests.unit.plugins.llm.test_provider_azure import _LEADER_TOKEN as _AZURE_LEADER_TOKEN
 from tests.unit.plugins.llm.test_provider_azure import _make_provider as _make_azure_provider
-from tests.unit.plugins.llm.test_provider_azure import _provider_llm_client as _azure_provider_llm_client
 from tests.unit.plugins.llm.test_provider_bedrock import _LEADER_TOKEN as _BEDROCK_LEADER_TOKEN
 from tests.unit.plugins.llm.test_provider_bedrock import MODEL as _BEDROCK_MODEL
 from tests.unit.plugins.llm.test_provider_bedrock import _provider as _bedrock_provider
@@ -229,23 +228,25 @@ class TestBedrockPreflightRequiresUsableCompletion:
 
 
 def _azure_empty_completion_error(content: str, finish_reason: str | None) -> BaseException | None:
+    # Drive the real AuditedLLMClient (which owns the classification, #123)
+    # through a fake SDK; the provider itself never sees blank content.
     provider = _make_azure_provider()
-    client = AzureFakeLLMClient(response=_make_azure_llm_response(content=content, finish_reason=finish_reason))
-    with _azure_provider_llm_client(provider, client):
-        return _raised_by(
-            lambda: provider.execute_query(
-                messages=[ChatMessage(role="user", content="hi")],
-                model="gpt-4o",
-                temperature=0.0,
-                max_tokens=100,
-                audit_parent=LLMAuditParent.for_row(
-                    member_token=_OPENROUTER_MEMBER_TOKEN,
-                    work_item=_OPENROUTER_WORK_ITEM,
-                    state_id="state-1",
-                    token_id="tok-1",
-                ),
-            )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content), finish_reason=finish_reason)],
+        model="gpt-4o",
+        usage=None,
+        model_dump=lambda: {"choices": [{"message": {"content": content}, "finish_reason": finish_reason}], "model": "gpt-4o"},
+    )
+    provider._underlying_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: response)))
+    return _raised_by(
+        lambda: provider.execute_query(
+            messages=[ChatMessage(role="user", content="hi")],
+            model="gpt-4o",
+            temperature=0.0,
+            max_tokens=100,
+            audit_parent=LLMAuditParent.for_operation(operation_id="op-1", coordination_token=_AZURE_LEADER_TOKEN),
         )
+    )
 
 
 class TestAzureEmptyContentClassification:
@@ -276,7 +277,7 @@ class TestAzureEmptyContentClassification:
 
     def test_tool_calls_stays_unsupported_response(self) -> None:
         raised = _azure_empty_completion_error("", "tool_calls")
-        assert type(raised) is LLMClientError
+        assert type(raised) is UnsupportedResponseError
         assert "tool_calls" in str(raised)
 
 

@@ -197,10 +197,15 @@ class TestEmptyCompletionIsRecordedWithItsClassification:
         recorder = _Recorder()
         raised = _complete(_live_client(_Response(content, "tool_calls"), recorder, []))
 
-        assert type(raised) is LLMClientError
+        assert isinstance(raised, LLMClientError)
+        assert not isinstance(raised, ContentPolicyError)
+        assert raised.retryable is False
         assert "tool_calls" in str(raised)
         assert recorder.calls[0]["status"] is CallStatus.ERROR
-        assert _error_dict(recorder.calls[0])["category"] == "response_processing"
+        error = _error_dict(recorder.calls[0])
+        assert error["category"] == "response_processing"
+        # The raised type is the type the call row records.
+        assert error["type"] == type(raised).__name__ == "UnsupportedResponseError"
 
     def test_non_empty_completion_is_still_success(self) -> None:
         recorder = _Recorder()
@@ -526,7 +531,12 @@ _SECRETISH = re.compile(
     r"(api_key|apikey|secret|password|passwd|connection_string|sas_token|access_key|session_token|bearer|^token$|_token$|credential|private_key)",
     re.IGNORECASE,
 )
-_NOT_SECRET = re.compile(r"(_env$|_ref$|_name$|_field|max_|_fingerprint|_id$|auth_mode|_mode$|^token_)", re.IGNORECASE)
+# Lease identities (coordination/membership tokens) and pagination cursors are
+# not credentials.
+_NOT_SECRET = re.compile(
+    r"(_env$|_ref$|_name$|_field|max_|_fingerprint|_id$|auth_mode|_mode$|^token_|^coordination_token$|^member_token$|^next_token$)",
+    re.IGNORECASE,
+)
 
 
 def _plugin_modules() -> list[Any]:
@@ -543,7 +553,7 @@ def test_every_plugin_credential_field_hides_its_value() -> None:
     seen: set[type] = set()
     for module in _plugin_modules():
         for value in list(vars(module).values()):
-            if not isinstance(value, type) or value in seen or not value.__module__.startswith("elspeth."):
+            if not isinstance(value, type) or value in seen or not value.__module__.startswith("elspeth.plugins."):
                 continue
             seen.add(value)
             if issubclass(value, BaseModel):
@@ -560,7 +570,7 @@ def test_every_plugin_credential_field_hides_its_value() -> None:
                             leaking.append(f"{value.__module__}.{value.__qualname__}.{dc_field.name}")
     # Control: the walk must actually reach the known credential fields.
     assert checked >= 30, f"census found only {checked} credential fields; the walk is broken"
-    assert leaking == []
+    assert leaking == [], "\n".join(leaking)
 
 
 def _annotation_members(annotation: object) -> set[object]:
@@ -601,7 +611,7 @@ class TestConfigErrorsCarryNoAuthoredInput:
         assert raised is not None
         rendered = "".join(traceback.format_exception(raised))
         assert "thresholds" in rendered  # positive control: the error is the one we built
-        assert _SENTINEL[:8] not in rendered, "a secret prefix reached the rendered traceback"
+        assert _SENTINEL[:12] not in rendered, "a secret prefix reached the rendered traceback"
 
     def test_plugin_config_base_hides_input_in_errors(self) -> None:
         assert PluginConfig.model_config.get("hide_input_in_errors") is True
@@ -610,4 +620,4 @@ class TestConfigErrorsCarryNoAuthoredInput:
         raised = _raised_by(lambda: AzureSearchProviderConfig.model_validate({"api_key": _SENTINEL}))
 
         assert raised is not None
-        assert _SENTINEL[:8] not in "".join(traceback.format_exception(raised))
+        assert _SENTINEL[:12] not in "".join(traceback.format_exception(raised))

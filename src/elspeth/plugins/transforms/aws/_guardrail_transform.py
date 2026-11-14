@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any, ClassVar, Self
 
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from elspeth.contracts import Determinism, RunMode
 from elspeth.contracts.audit_protocols import PluginAuditWriter
@@ -52,7 +52,6 @@ class BedrockGuardrailTransformConfig(TransformDataConfig):
     """Explicit trained-operator binding shared by both transforms."""
 
     _component_type_exempt: ClassVar[bool] = True
-    model_config: ClassVar[ConfigDict] = ConfigDict(**TransformDataConfig.model_config, hide_input_in_errors=True)
 
     guardrail_identifier: str = Field(
         min_length=1,
