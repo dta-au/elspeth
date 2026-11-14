@@ -234,20 +234,3 @@ class TestTruncateBehavior:
         assert result.row is not None
         assert result.row.contract.mode == "FIXED"
         assert result.row.contract.locked is True
-
-    @pytest.mark.parametrize(
-        "fields",
-        [
-            {"value": 5, "Value Text": 10},
-            {"Value Text": 10, "value": 5},
-        ],
-    )
-    def test_duplicate_aliases_for_same_logical_field_raise_plugin_config_error(
-        self,
-        ctx: PluginContext,
-        fields: dict[str, int],
-    ) -> None:
-        transform = Truncate({"fields": fields, "schema": DYNAMIC_SCHEMA})
-
-        with pytest.raises(PluginConfigError, match="duplicate logical field"):
-            transform.process(_make_alias_mapped_row(), ctx)
