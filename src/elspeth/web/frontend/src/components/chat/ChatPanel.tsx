@@ -1008,6 +1008,7 @@ export function ChatPanelContent({
         interpretationContent={
           <AcknowledgementStack
             sessionId={activeSessionId}
+            allowAmend={!scriptMode}
             onFocusFallback={() => inputRef.current?.focus()}
             onResolved={createInterpretationResolutionHandler(activeSessionId)}
           />
