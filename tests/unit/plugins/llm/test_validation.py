@@ -3,7 +3,7 @@
 
 Covers:
 - strip_markdown_fences: Markdown code block stripping
-- validate_json_object_response: Tier 3 JSON object validation
+- extract_structured_fields: Tier 3 JSON object boundary and parse failures
 - reject_nonfinite_constant: NaN/Infinity rejection
 - parse_field_value: Output field type enforcement into the bound row type
 """
@@ -17,13 +17,10 @@ import pytest
 from elspeth.contracts.hashing import canonical_json
 from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig, OutputFieldType
 from elspeth.plugins.transforms.llm.validation import (
-    ValidationError,
-    ValidationSuccess,
     extract_structured_fields,
     parse_field_value,
     reject_nonfinite_constant,
     strip_markdown_fences,
-    validate_json_object_response,
 )
 
 # ── strip_markdown_fences tests ───────────────────────────────────
@@ -73,104 +70,39 @@ class TestStripMarkdownFences:
         assert result == '{\n  "a": 1,\n  "b": 2\n}'
 
 
-# ── validate_json_object_response tests ──────────────────────────
+# ── extract_structured_fields: the JSON-object boundary ──────────
 
 
-class TestValidateJsonObjectResponse:
-    """Tests for validate_json_object_response — Tier 3 boundary validation."""
+class TestExtractStructuredFieldsObjectBoundary:
+    """The Tier 3 object boundary of the production parser, with nothing declared."""
 
-    def test_valid_json_object_returns_success(self) -> None:
-        """Valid JSON object should return ValidationSuccess with parsed dict."""
-        result = validate_json_object_response('{"category": "spam", "score": 0.9}')
-        assert isinstance(result, ValidationSuccess)
-        assert result.data == {"category": "spam", "score": 0.9}
+    @pytest.mark.parametrize(
+        "content",
+        ['{"category": "spam", "score": 0.9}', '{"outer": {"inner": "value"}, "list": [1, 2]}', "{}"],
+    )
+    def test_json_object_is_accepted(self, content: str) -> None:
+        assert extract_structured_fields(content, ()) == ({}, None)
 
-    def test_invalid_json_string_returns_error(self) -> None:
-        """Malformed JSON should return ValidationError with reason=invalid_json."""
-        result = validate_json_object_response("{not valid json}")
-        assert isinstance(result, ValidationError)
-        assert result.reason == "invalid_json"
-        assert result.detail is not None
+    @pytest.mark.parametrize(
+        "content",
+        ["{not valid json}", "", '{"value": NaN}', '{"value": Infinity}', '{"value": -Infinity}'],
+    )
+    def test_unparseable_json_is_a_parse_failure(self, content: str) -> None:
+        extracted, reason = extract_structured_fields(content, ())
+        assert extracted == {}
+        assert reason is not None
+        assert reason["reason"] == "json_parse_failed"
+        assert reason["error"]
 
-    def test_json_array_returns_error(self) -> None:
-        """JSON array should return ValidationError with reason=invalid_json_type."""
-        result = validate_json_object_response("[1, 2, 3]")
-        assert isinstance(result, ValidationError)
-        assert result.reason == "invalid_json_type"
-        assert result.expected == "object"
-        assert result.actual == "list"
-
-    def test_json_null_returns_error(self) -> None:
-        """JSON null should return ValidationError with reason=invalid_json_type."""
-        result = validate_json_object_response("null")
-        assert isinstance(result, ValidationError)
-        assert result.reason == "invalid_json_type"
-        assert result.expected == "object"
-        assert result.actual == "NoneType"
-
-    def test_json_with_nan_returns_error(self) -> None:
-        """JSON containing NaN should return ValidationError (reject_nonfinite_constant)."""
-        result = validate_json_object_response('{"value": NaN}')
-        assert isinstance(result, ValidationError)
-        assert result.reason == "invalid_json"
-        assert result.detail is not None
-
-    def test_empty_string_returns_error(self) -> None:
-        """Empty string should return ValidationError."""
-        result = validate_json_object_response("")
-        assert isinstance(result, ValidationError)
-        assert result.reason == "invalid_json"
-
-    def test_json_number_primitive_returns_error(self) -> None:
-        """JSON number primitive should return ValidationError."""
-        result = validate_json_object_response("42")
-        assert isinstance(result, ValidationError)
-        assert result.reason == "invalid_json_type"
-        assert result.expected == "object"
-        assert result.actual == "int"
-
-    def test_json_string_primitive_returns_error(self) -> None:
-        """JSON string primitive should return ValidationError."""
-        result = validate_json_object_response('"hello"')
-        assert isinstance(result, ValidationError)
-        assert result.reason == "invalid_json_type"
-        assert result.expected == "object"
-        assert result.actual == "str"
-
-    def test_json_boolean_primitive_returns_error(self) -> None:
-        """JSON boolean should return ValidationError."""
-        result = validate_json_object_response("true")
-        assert isinstance(result, ValidationError)
-        assert result.reason == "invalid_json_type"
-        assert result.expected == "object"
-        assert result.actual == "bool"
-
-    def test_json_with_infinity_returns_error(self) -> None:
-        """JSON containing Infinity should return ValidationError."""
-        result = validate_json_object_response('{"value": Infinity}')
-        assert isinstance(result, ValidationError)
-        assert result.reason == "invalid_json"
-
-    def test_json_with_negative_infinity_returns_error(self) -> None:
-        """JSON containing -Infinity should return ValidationError."""
-        result = validate_json_object_response('{"value": -Infinity}')
-        assert isinstance(result, ValidationError)
-        assert result.reason == "invalid_json"
-
-    def test_nested_object_returns_success(self) -> None:
-        """Nested JSON object should return ValidationSuccess with deep-frozen contents."""
-        content = '{"outer": {"inner": "value"}, "list": [1, 2]}'
-        result = validate_json_object_response(content)
-        assert isinstance(result, ValidationSuccess)
-        # deep_freeze converts inner dicts to MappingProxyType and lists to tuples
-        assert result.data["outer"] == MappingProxyType({"inner": "value"})
-        assert result.data["list"] == (1, 2)
-
-    def test_empty_object_returns_success(self) -> None:
-        """Empty JSON object {} should return ValidationSuccess."""
-        result = validate_json_object_response("{}")
-        assert isinstance(result, ValidationSuccess)
-        assert result.data == {}
+    @pytest.mark.parametrize(
+        ("content", "actual"),
+        [("[1, 2, 3]", "list"), ("null", "NoneType"), ("42", "int"), ('"hello"', "str"), ("true", "bool")],
+    )
+    def test_non_object_json_is_rejected_by_type(self, content: str, actual: str) -> None:
+        assert extract_structured_fields(content, ()) == (
+            {},
+            {"reason": "invalid_json_type", "expected": "object", "actual": actual},
+        )
 
 
 # ── reject_nonfinite_constant tests ──────────────────────────────

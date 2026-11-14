@@ -263,19 +263,6 @@ _DEEP_LLM_RESPONSES = [
 
 
 @pytest.mark.parametrize("content", _DEEP_LLM_RESPONSES)
-def test_validate_json_object_response_reports_deep_json_as_invalid(content: str) -> None:
-    from elspeth.plugins.transforms.llm.validation import ValidationError as LLMValidationError
-    from elspeth.plugins.transforms.llm.validation import validate_json_object_response
-
-    outcome = _outcome(lambda: validate_json_object_response(content))
-
-    assert isinstance(outcome, LLMValidationError), f"validate_json_object_response gave {type(outcome).__name__}"
-    assert outcome.reason == "invalid_json"
-    assert outcome.detail is not None
-    assert "nesting" in outcome.detail
-
-
-@pytest.mark.parametrize("content", _DEEP_LLM_RESPONSES)
 def test_extract_structured_fields_reports_deep_json_as_a_parse_failure(content: str) -> None:
     from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig, OutputFieldType
     from elspeth.plugins.transforms.llm.validation import extract_structured_fields
@@ -298,9 +285,8 @@ def test_extract_structured_fields_reports_deep_json_as_a_parse_failure(content:
 def test_llm_parsing_still_accepts_ordinary_nested_objects() -> None:
     """Negative control: nesting within the bound still parses."""
     from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig, OutputFieldType
-    from elspeth.plugins.transforms.llm.validation import ValidationSuccess, extract_structured_fields, validate_json_object_response
+    from elspeth.plugins.transforms.llm.validation import extract_structured_fields
 
     content = '{"a": "x", "b": ' + _nested_list(10) + "}"
 
-    assert isinstance(validate_json_object_response(content), ValidationSuccess)
     assert extract_structured_fields(content, (OutputFieldConfig(suffix="a", type=OutputFieldType.STRING),)) == ({"a": "x"}, None)

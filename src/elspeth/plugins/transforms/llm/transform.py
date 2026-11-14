@@ -367,6 +367,10 @@ class SingleQueryStrategy:
             user_content = (TextPart(text=provider_prompt), *image_parts)
             content_hash = parts_hash(user_content)
         messages.append(ChatMessage(role="user", content=user_content))
+        # Langfuse reconstructs the outbound messages from these separate
+        # values. Match the provider's truthy inclusion rule so an explicitly
+        # empty system prompt is omitted from both records (multi-query parity).
+        tracer_system_prompt = self.system_prompt or None
 
         if _shutdown_event_is_set(shutdown_event):
             return _shutdown_requested_result()
@@ -395,7 +399,7 @@ class SingleQueryStrategy:
                 model=self.model,
                 latency_ms=latency_ms,
                 extra_metadata=tracer_extra_metadata,
-                system_prompt=self.system_prompt,
+                system_prompt=tracer_system_prompt,
             )
             return TransformResult.error(
                 {"reason": "context_length_exceeded", "error": str(e)},
@@ -411,7 +415,7 @@ class SingleQueryStrategy:
                 model=self.model,
                 latency_ms=latency_ms,
                 extra_metadata=tracer_extra_metadata,
-                system_prompt=self.system_prompt,
+                system_prompt=tracer_system_prompt,
             )
             if e.retryable:
                 raise
@@ -436,7 +440,7 @@ class SingleQueryStrategy:
                 model=self.model,
                 latency_ms=latency_ms,
                 extra_metadata=tracer_extra_metadata,
-                system_prompt=self.system_prompt,
+                system_prompt=tracer_system_prompt,
             )
             return finish_reason_error.result
 
@@ -453,7 +457,7 @@ class SingleQueryStrategy:
             usage=result.usage,
             latency_ms=latency_ms,
             extra_metadata=tracer_extra_metadata,
-            system_prompt=self.system_prompt,
+            system_prompt=tracer_system_prompt,
         )
 
         # 6. Build output row — operational fields plus any declared
@@ -1270,7 +1274,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3060577e04da31de"
+    source_file_hash: str | None = "sha256:f6ef87bfdf2fac79"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
