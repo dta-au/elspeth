@@ -1989,7 +1989,8 @@ def validate_transform_string_typed_input_fields(graph: ExecutionGraph) -> None:
     present AND string-valued on every arriving row — the fail-closed contract
     of the text-scanning family (Bedrock/Azure guardrails' ``fields``,
     keyword_filter's named ``fields``, document intelligence's
-    ``source_field``), which quarantines the row otherwise. A producer whose
+    ``source_field``) and of truncate's ``fields`` keys, which quarantines the
+    row otherwise. A producer whose
     schema declares such a field ``int``/``float``/``bool`` therefore fails
     100% of rows, first row onward — a pipeline *configuration* error whose
     fatality is knowable statically, so it belongs on the build-time surface

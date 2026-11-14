@@ -491,8 +491,8 @@ class TransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protoco
     # Fail-closed string-scan declaration surface (elspeth-b19dfe41fb).
     # Fields the transform requires to be present AND string-valued on every
     # arriving row, failing the row closed otherwise. Set at construction by
-    # the text-scanning family from their own scan-field options; empty
-    # frozenset for everything else. The type claim is consumed only at build
+    # the text-scanning family from their own scan-field options and by
+    # truncate from its ``fields`` keys; empty frozenset for everything else. The type claim is consumed only at build
     # time by validate_transform_string_typed_input_fields — there is no
     # runtime type dispatch, the plugins enforce it in their own process
     # paths. The names are also read declarations (declared_read_fields), so

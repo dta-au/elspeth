@@ -619,7 +619,9 @@ class BaseTransform(ABC):
     # Column-naming config options whose value is a MAPPING keyed by the
     # input column it applies to (``truncate.fields: {column: max_len}``).
     # Their keys are read columns for the fixed-schema read check and for
-    # demotion protection. A mapping option not declared here contributes no
+    # demotion protection. This describes the option's shape only; it grants
+    # no lookup semantics (a plugin that requires the columns declares them on
+    # ``declared_input_fields`` / ``declared_string_input_fields``). A mapping option not declared here contributes no
     # names: ``web_scrape.query_fields`` keys are query parameter names.
     column_keyed_config_keys: frozenset[str] = frozenset()
 
@@ -905,10 +907,11 @@ class BaseTransform(ABC):
                 authored_by[name] = [_DERIVED_INPUT_FIELD_PROVENANCE]
 
         declared = {field.name for field in schema_config.fields}
-        # A header spelling whose canonical form is declared reaches that field
-        # through the row contract at run time (``truncate`` resolves its keys
-        # that way), so only a name whose canonical form is ALSO undeclared is
-        # unsatisfiable. The spelling rule itself is the build's to enforce.
+        # A header spelling whose canonical form is declared is not "forbidden
+        # by the schema": it is a misspelling of a declared field, which the
+        # field-name spelling rule refuses at build with its own verdict
+        # (``validate_declared_field_spellings``). Only a name whose canonical
+        # form is ALSO undeclared is this check's to reject.
         missing = sorted(
             name
             for name in authored_by
@@ -1592,17 +1595,18 @@ class BaseTransform(ABC):
           a plugin projects onto it (``url_field``, ``query_field``,
           ``blob_ref_field``, ``key_field``, type_coerce's
           ``conversions[].field`` ...);
-        - ``declared_string_input_fields``: the scan fields the text-scanning
-          family (keyword_filter, the content-safety and prompt-shield
-          guardrails, document intelligence's ``source_field``) requires
-          present and string-valued. The string-type build validator compares
-          them to the upstream schema as written, so a header spelling would
-          walk past it.
+        - ``declared_string_input_fields``: the fields a transform requires
+          present and string-valued — keyword_filter's named ``fields``, the
+          content-safety and prompt-shield guardrails' ``fields``, document
+          intelligence's ``source_field`` and truncate's ``fields`` keys
+          (plugin review #146). The string-type build validator compares them
+          to the upstream schema as written, so a header spelling would walk
+          past it.
 
         Deliberately NOT the column-option limb of ``consumed_input_fields``:
         an option that stays off those surfaces is a row LOOKUP, resolved
-        through ``PipelineRow`` under either spelling (truncate's ``fields``,
-        field_mapper's non-normalized mapping sources), and the ruling keeps lookups
+        through ``PipelineRow`` under either spelling (field_mapper's
+        non-normalized mapping sources), and the ruling keeps lookups
         spelling-free. json_explode's ``array_field`` was one until it became a
         declared input (elspeth-5887fb7928 R2): it is on ``declared_input_fields``
         now, so it is spelled as rows carry the field.
