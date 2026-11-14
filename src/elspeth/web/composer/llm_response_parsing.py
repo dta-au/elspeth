@@ -753,7 +753,7 @@ def build_llm_call_record(
         finish_reason = response_metadata.finish_reason
         provider_request_id = response_metadata.provider_request_id
         provider_served = response_metadata.provider_served
-    require_no_credential_material_in_llm_metadata(
+    scrub = require_no_credential_material_in_llm_metadata(
         content=None,
         tool_calls=(),
         reasoning_content=reasoning_metadata["reasoning_content"],
@@ -764,6 +764,7 @@ def build_llm_call_record(
         finish_reason=finish_reason,
         provider_served=provider_served,
         surface=credential_surface,
+        thinking_replay_required=bool(_response_field(_first_response_message(response), "tool_calls")) if response is not None else False,
     )
     # The dialect and strict count are read off the exact list that was sent
     # (the bytes ``tools_spec_hash`` covers): every tool stamped with an exact
@@ -796,9 +797,10 @@ def build_llm_call_record(
         cache_creation_input_tokens=usage.cache_creation_input_tokens,
         cache_read_input_tokens=usage.cache_read_input_tokens,
         reasoning_tokens=usage.reasoning_tokens,
-        reasoning_content=reasoning_metadata["reasoning_content"],
-        reasoning_details=reasoning_metadata["reasoning_details"],
-        thinking_blocks=reasoning_metadata["thinking_blocks"],
+        reasoning_content=scrub.reasoning_content,
+        reasoning_details=scrub.reasoning_details,
+        reasoning_withholds=(response_metadata.reasoning_withholds if response_metadata is not None else ()) + scrub.withholds,
+        thinking_blocks=scrub.thinking_blocks,
         provider_cost=provider_cost,
         provider_cost_source=provider_cost_source,
         latency_ms=elapsed_ns // 1_000_000,

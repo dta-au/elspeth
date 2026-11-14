@@ -22,6 +22,7 @@ from typing import Any, Final, Literal, Protocol, Self
 
 from elspeth.contracts.composer_audit import PrivateFailureFacts, PrivateReceivedDiagnostic
 from elspeth.contracts.composer_provider_context import PrivateProviderContext
+from elspeth.contracts.credential_material import CredentialCategory
 from elspeth.contracts.freeze import deep_thaw, freeze_fields, require_int
 
 ComposerLLMProviderCostSource = Literal[
@@ -46,6 +47,25 @@ _VALID_PROVIDER_COST_SOURCES = {
 # closed provider-name shape. Fixed and value-free: provider bytes that fail
 # the shape never reach the audit row.
 PROVIDER_SERVED_UNRECOGNISED: Final[str] = "unrecognised"
+
+
+@dataclass(frozen=True, slots=True)
+class ReasoningWithhold:
+    """Value-free evidence of one removed provider reasoning field."""
+
+    surface: str
+    category: CredentialCategory
+    detector_version: str
+    field_class: Literal["reasoning_content", "reasoning_details", "thinking_blocks"]
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "surface": self.surface,
+            "category": self.category,
+            "detector_version": self.detector_version,
+            "field_class": self.field_class,
+        }
+
 
 # The closed shape of an OpenRouter served-endpoint name (the response's
 # top-level ``provider`` field): 1-64 characters, letters, digits, space, dot,
@@ -403,6 +423,7 @@ class ComposerLLMCall:
     reasoning_content: str | None = None
     reasoning_details: Any | None = None
     thinking_blocks: Any | None = None
+    reasoning_withholds: tuple[ReasoningWithhold, ...] = field(default=(), kw_only=True)
     provider_cost: float | None = None
     # Catalog identity configured for fallback pricing, independent of routing.
     pricing_model: str | None = None
@@ -518,7 +539,7 @@ class ComposerLLMCall:
             raise ValueError("non-success calls must include error_class and error_message")
         if self.reasoning_content is not None and type(self.reasoning_content) is not str:
             raise TypeError(f"reasoning_content must be str or None, got {type(self.reasoning_content).__name__}")
-        freeze_fields(self, "declared_tool_names", "reasoning_details", "thinking_blocks")
+        freeze_fields(self, "declared_tool_names", "reasoning_details", "thinking_blocks", "reasoning_withholds")
         if self.provider_cost_source not in _VALID_PROVIDER_COST_SOURCES:
             raise ValueError(
                 f"provider_cost_source must be one of {sorted(_VALID_PROVIDER_COST_SOURCES)}, got {self.provider_cost_source!r}"
@@ -548,6 +569,7 @@ class ComposerLLMCall:
         raw["tool_contract_dialect"] = self.tool_contract_dialect.value if self.tool_contract_dialect is not None else None
         raw["request_byte_split"] = self.request_byte_split.to_dict() if self.request_byte_split is not None else None
         raw["context_budget"] = self.context_budget.to_dict() if self.context_budget is not None else None
+        raw["reasoning_withholds"] = [event.to_dict() for event in self.reasoning_withholds]
         raw["started_at"] = self.started_at.isoformat()
         raw["finished_at"] = self.finished_at.isoformat()
         return raw

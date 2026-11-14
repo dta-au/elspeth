@@ -281,8 +281,13 @@ Model output is Tier 3. Controls:
   sensitive arguments before state reaches the model. A separate bounded
   credential detector scans control-plane state before provider
   serialisation, and scans provider response text, tool identifiers and
-  arguments, reasoning and retained provider metadata before audit or state
-  effects [EV-014] [EV-220] [EV-227] [EV-508].
+  arguments and retained provider metadata before audit or state effects.
+  Credential-shaped plain reasoning is withheld with value-free audit evidence
+  while the turn continues. Final replies with credential-shaped native thinking
+  withhold the complete block list with a value-free stored event. A readable hit in native thinking required by the
+  current tool loop refuses that request; blocks are never edited. Encrypted
+  reasoning data, native signatures and redacted-thinking data are opaque and
+  are not pattern-scanned [EV-014] [EV-220] [EV-227] [EV-508].
 - **Required controls.** The operator's policy can require prompt-shield or
   content-safety plugins in every web-authored pipeline [EV-502] [EV-507].
 - **Bounded cost.** Per-composition limits on provider calls, request size,
@@ -349,7 +354,8 @@ Controls:
   boundaries. Findings and refusal envelopes retain no candidate value. A
   rejection cannot apply the candidate's business mutation or retain the
   rejected content; provider attempts may still retain a fixed, value-free
-  failure audit record [EV-227].
+  failure audit record. Plain reasoning-only hits instead withhold the affected
+  field and retain the turn, with a value-free stored withhold event [EV-227].
 - The audit trail records fingerprints, not values
   ([07 § 2.4](07-secrets-and-key-management.md#24-what-the-audit-trail-records))
   [EV-207] [EV-208] [EV-209].

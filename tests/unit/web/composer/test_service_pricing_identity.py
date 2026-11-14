@@ -73,7 +73,7 @@ async def test_direct_service_call_uses_role_pricing_identity(tmp_path: Path, mo
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("surface", ["tools", "text", "advisor"])
-async def test_malformed_completion_credential_metadata_is_refused_before_audit(
+async def test_malformed_completion_withholds_reasoning_before_audit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     surface: str,
@@ -105,7 +105,7 @@ async def test_malformed_completion_credential_metadata_is_refused_before_audit(
 
     monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
     recorder = BufferingRecorder()
-    with pytest.raises(CredentialMaterialRefused) as caught:
+    with pytest.raises(provider_gateway._MalformedLLMResponseError):
         if surface == "advisor":
             await service._advisor_checkpoint._call_advisor_with_audit(
                 {"trigger": "reactive", "problem_summary": "stuck", "recent_errors": [], "attempted_actions": []},
@@ -125,11 +125,19 @@ async def test_malformed_completion_credential_metadata_is_refused_before_audit(
                 recorder=recorder,
             )
 
-    assert caught.value.surface in {"composer_provider_response", "composer_advisor_response"}
     assert len(recorder.llm_calls) == 1
     call = recorder.llm_calls[0]
     assert call.status.value == "malformed_response"
-    assert call.error_message == "credential_material_rejected"
+    assert call.error_message == "malformed_response"
+    assert call.reasoning_content is None
+    assert llm_call_audit_envelope(call)["call"]["reasoning_withholds"] == [
+        {
+            "surface": "composer_advisor_response" if surface == "advisor" else "composer_provider_response",
+            "category": "token_shape",
+            "detector_version": "1",
+            "field_class": "reasoning_content",
+        }
+    ]
     assert candidate not in repr(call.to_dict())
 
 

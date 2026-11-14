@@ -309,7 +309,6 @@ def _request(
         if thinking_entry is not None:
             for part_index, part in enumerate(thinking_entry.parts):
                 text = part.text if part.inspection_text is None else part.inspection_text
-                require_no_credential_material(text, surface="composer_prompt_guard_request")
                 documents.append(f"Message {index}, provider thinking part {part_index}:\n{text}")
         if parts is not None or index == genuine_index:
             continue
