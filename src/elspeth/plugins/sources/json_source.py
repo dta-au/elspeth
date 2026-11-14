@@ -43,24 +43,6 @@ from elspeth.plugins.sources.field_normalization import (
 )
 
 
-def _contains_surrogateescape_chars(value: str) -> bool:
-    """Return True when value contains surrogateescape-decoded bytes."""
-    return any(0xDC80 <= ord(char) <= 0xDCFF for char in value)
-
-
-def _surrogateescape_line_to_bytes(value: str, encoding: str) -> bytes:
-    """Encode a surrogateescape-decoded line back to bytes for quarantine.
-
-    UTF-16/UTF-32 codecs reject low-surrogate code points on encode, even when
-    ``errors="surrogateescape"`` is requested. Fall back to UTF-8 with
-    surrogateescape to preserve raw undecodable byte values without crashing.
-    """
-    try:
-        return value.encode(encoding, errors="surrogateescape")
-    except UnicodeEncodeError:
-        return value.encode("utf-8", errors="surrogateescape")
-
-
 class JSONSourceConfig(SourceDataConfig):
     """Configuration for JSON source plugin.
 
@@ -160,7 +142,7 @@ class JSONSource(BaseSource):
     name = "json"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e19b8c60096a2507"
+    source_file_hash: str | None = "sha256:47746b3fbe3b15a6"
     config_model = JSONSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str

@@ -30,6 +30,7 @@ from elspeth.plugins.infrastructure.config_base import (
 )
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+from elspeth.plugins.infrastructure.text_decoding import decoding_codec
 from elspeth.plugins.sources.field_normalization import ExternalHeaderError, is_normalized_field_name, resolve_field_names
 from elspeth.plugins.transforms.blob_expand_contract import (
     BLOB_REF_FIELD_DESCRIPTION,
@@ -292,7 +293,7 @@ class BlobCSVExpand(BaseTransform):
     name = "blob_csv_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b7f6696f4c317f23"
+    source_file_hash: str | None = "sha256:9c68394fd5a4d3f7"
     config_model = BlobCSVExpandConfig
     usage_when_to_use: str = (
         "Use when each input row carries a payload-store reference to a CSV blob and you need to "
@@ -639,7 +640,7 @@ class BlobCSVExpand(BaseTransform):
             )
 
         try:
-            text = body.decode(self._encoding)
+            text = body.decode(decoding_codec(self._encoding))
         except UnicodeDecodeError as exc:
             raise _BlobCSVParseError(
                 _csv_error_reason(
