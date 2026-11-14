@@ -384,9 +384,9 @@ def test_csv_ragged_row_and_bad_headers_refused(content: str, fragment: str) -> 
 
 @pytest.mark.parametrize("delimiter", ["", ";;", "\n", '"'])
 def test_csv_delimiter_must_be_one_usable_character(delimiter: str) -> None:
+    # Refused by the shared CSVDelimiter type, so pydantic's location names the entry.
     message = _refused(_all({"examples": {"content": "k;v\n", "format": "csv", "delimiter": delimiter, "output_field": "out"}}))
-    assert "files entry 'examples'" in message
-    assert "delimiter" in message
+    assert "files.examples.delimiter" in message
 
 
 def test_format_option_on_wrong_format_refused() -> None:

@@ -270,11 +270,11 @@ def test_text_source_strips_a_leading_utf8_bom_only(tmp_path: Any) -> None:
     from unittest.mock import MagicMock
 
     path = tmp_path / "bom.txt"
-    path.write_bytes(_BOM + "hello\n﻿world\n".encode())
+    path.write_bytes(_BOM + "hello\n\ufeffworld\n".encode())
 
     rows = list(_text_source(path).load(MagicMock()))
 
-    assert [row.row["line"] for row in rows] == ["hello", "﻿world"]
+    assert [row.row["line"] for row in rows] == ["hello", "\ufeffworld"]
 
 
 def _s3(payload: bytes, **overrides: Any) -> list[Any]:

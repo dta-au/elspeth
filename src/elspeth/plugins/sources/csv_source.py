@@ -30,6 +30,7 @@ from elspeth.contracts.schema_contract_factory import create_contract_from_confi
 from elspeth.plugins.infrastructure.base import BaseSource
 from elspeth.plugins.infrastructure.config_base import CSVDelimiter, TabularSourceDataConfig, TextEncoding
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+from elspeth.plugins.infrastructure.text_decoding import decoding_codec
 from elspeth.plugins.sources.field_normalization import ExternalHeaderError, FieldResolution, resolve_field_names
 
 _DECODE_CHUNK_BYTES = 64 * 1024
@@ -161,7 +162,7 @@ class CSVSource(BaseSource):
     name = "csv"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:46da771e9f72483b"
+    source_file_hash: str | None = "sha256:9ce7cf9e1d01b40a"
     # Structural observed-cell fact (elspeth-e6e552ce34): csv.reader yields
     # strings, and observed schemas preserve parsed cells untouched (module
     # docstring), so under mode: observed EVERY emitted cell is str by
@@ -280,7 +281,7 @@ class CSVSource(BaseSource):
         # csv.reader needs for embedded newlines in quoted fields.
         with open(self._path, "rb") as f:
             try:
-                yield from self._load_from_file(_iter_physical_lines(_iter_decoded_text(f, self._encoding)), ctx)
+                yield from self._load_from_file(_iter_physical_lines(_iter_decoded_text(f, decoding_codec(self._encoding))), ctx)
             except UnicodeDecodeError as e:
                 # A decode failure that escapes _load_from_file happened before
                 # any data row was read (skip_rows or the header line itself);
