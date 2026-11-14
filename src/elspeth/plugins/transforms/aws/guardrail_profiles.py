@@ -129,7 +129,9 @@ class BedrockGuardrailProfileSettings(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
 
-    alias: str
+    # 64 matches the live check and GuardrailLiveReceipt bound, so an
+    # over-long alias fails at config load naming the field.
+    alias: str = Field(max_length=64)
     plugin: BedrockGuardrailPlugin
     guardrail_identifier: str = Field(min_length=1, max_length=2048, repr=False)
     guardrail_version: str = Field(min_length=1, max_length=8, repr=False)

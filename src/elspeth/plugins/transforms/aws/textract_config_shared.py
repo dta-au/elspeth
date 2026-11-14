@@ -22,7 +22,9 @@ AuthMode = Literal["default_chain", "secret_refs"]
 FEATURE_TYPES = frozenset({"TABLES", "FORMS", "QUERIES", "SIGNATURES", "LAYOUT"})
 FACET_NAMES = ("pages", "tables", "forms", "queries", "signatures", "layout")
 
-_QUERY_TEXT_PATTERN = re.compile(r"^[a-zA-Z0-9\s!\"#$%'&()*+,\-./:;=?@[\\\]^_`{|}~><]+$")
+# re.ASCII: AWS's Java-style pattern's ``\s`` is ASCII whitespace only; in a
+# Python ``str`` regex ``\s`` would also admit Unicode whitespace (U+00A0 ...).
+_QUERY_TEXT_PATTERN = re.compile(r"^[a-zA-Z0-9\s!\"#$%'&()*+,\-./:;=?@[\\\]^_`{|}~><]+$", re.ASCII)
 _QUERY_PAGE_PATTERN = re.compile(r"^[0-9*\-]+$")
 
 
