@@ -216,3 +216,174 @@ def test_file_inject_csv_delimiter_uses_the_shared_check() -> None:
 
     with pytest.raises(ValueError, match="not usable by the csv module"):
         parse_injected_content("a\n1\n", fmt="csv", data_key=None, delimiter='"')
+
+
+# ---------------------------------------------------------------------------
+# F5/F6: one decoding authority. Every reader byte-escapes undecodable code
+# units on their own line (UTF-16/32 included) and decodes UTF-8 as utf-8-sig.
+# ---------------------------------------------------------------------------
+
+_BOM = b"\xef\xbb\xbf"
+
+
+def _utf16_with_bad_unit(lines: list[str], bad_index: int) -> bytes:
+    """UTF-16-LE with BOM; a lone high surrogate (D800) prefixes line ``bad_index``."""
+    out = b"\xff\xfe"
+    for index, line in enumerate(lines):
+        if index == bad_index:
+            out += b"\x00\xd8"
+        out += (line + "\n").encode("utf-16-le")
+    return out
+
+
+def _shape(rows: list[Any]) -> list[tuple[bool, int]]:
+    return [(row.is_quarantined, row.source_row_index) for row in rows]
+
+
+def _text_source(path: Any, **overrides: Any) -> Any:
+    from elspeth.plugins.sources.text_source import TextSource
+
+    config: dict[str, Any] = {"path": str(path), "column": "line", "schema": _OBSERVED, "on_validation_failure": "quarantine"}
+    config.update(overrides)
+    return TextSource(config)
+
+
+def test_text_source_utf16_bad_code_unit_keeps_every_other_line(tmp_path: Any) -> None:
+    """lane-06 suspected TextSource shared json/csv's UTF-16 chunk loss; it must not."""
+    from unittest.mock import MagicMock
+
+    lines = [f"line{i}" for i in range(3000)]  # several 8 KiB read-ahead chunks
+    path = tmp_path / "in.txt"
+    path.write_bytes(_utf16_with_bad_unit(lines, 1500))
+
+    rows = list(_text_source(path, encoding="utf-16").load(MagicMock()))
+
+    valid = [row.row["line"] for row in rows if not row.is_quarantined]
+    assert valid == lines[:1500] + lines[1501:]
+    quarantined = [row for row in rows if row.is_quarantined]
+    assert len(quarantined) == 1
+    assert quarantined[0].row["__line_number__"] == 1501
+    assert quarantined[0].source_row_index == 1500
+
+
+def test_text_source_strips_a_leading_utf8_bom_only(tmp_path: Any) -> None:
+    from unittest.mock import MagicMock
+
+    path = tmp_path / "bom.txt"
+    path.write_bytes(_BOM + "hello\n﻿world\n".encode())
+
+    rows = list(_text_source(path).load(MagicMock()))
+
+    assert [row.row["line"] for row in rows] == ["hello", "﻿world"]
+
+
+def _s3(payload: bytes, **overrides: Any) -> list[Any]:
+    from tests.unit.plugins.sources.test_aws_s3_source import _source_for
+
+    source, _, ctx = _source_for(payload, **overrides)
+    return list(source.load(ctx))
+
+
+@pytest.mark.parametrize("oversized_chars", [20, 41], ids=["cr-at-first-bounded-read", "cr-at-skip-chunk"])
+def test_s3_jsonl_crlf_split_by_a_bounded_read_is_one_terminator(oversized_chars: int) -> None:
+    oversized = b'{"id":"' + b"x" * (oversized_chars - 9) + b'"}'
+    assert len(oversized) == oversized_chars
+    payload = b'{"id":1}\r\n' + oversized + b'\r\n{"id":3}\r\n{"id":4}\r\n'
+
+    rows = _s3(payload, format="jsonl", max_record_chars=20)
+
+    assert _shape(rows) == [(False, 0), (True, 1), (False, 2), (False, 3)]
+    assert [rows[2].row, rows[3].row] == [{"id": 3}, {"id": 4}]
+
+
+def test_s3_jsonl_utf16_bad_code_unit_quarantines_only_its_line() -> None:
+    payload = _utf16_with_bad_unit(['{"id":1}', '{"id":2}', '{"id":3}'], 1)
+
+    rows = _s3(payload, format="jsonl", json_options={"encoding": "utf-16"})
+
+    assert _shape(rows) == [(False, 0), (True, 1), (False, 2)]
+    assert [rows[0].row, rows[2].row] == [{"id": 1}, {"id": 3}]
+    assert rows[1].row["__line_number__"] == 2
+
+
+@pytest.mark.parametrize(("fmt", "body"), [("jsonl", b'{"id":1}\n{"id":2}\n'), ("json", b'[{"id":1},{"id":2}]')])
+def test_s3_json_strips_a_leading_utf8_bom(fmt: str, body: bytes) -> None:
+    rows = _s3(_BOM + body, format=fmt)
+
+    assert _shape(rows) == [(False, 0), (False, 1)]
+    assert [row.row for row in rows] == [{"id": 1}, {"id": 2}]
+
+
+def _azure(payload: bytes, **overrides: Any) -> list[Any]:
+    from unittest.mock import patch
+
+    from tests.fixtures.factories import make_operation_context
+    from tests.unit.plugins.sources.test_azure_blob_source import PATCH_AUTH, _base_config, _fake_blob_service, _make_source
+
+    source = _make_source(_base_config(**overrides))
+    with patch(PATCH_AUTH, return_value=_fake_blob_service(payload)):
+        return list(source.load(make_operation_context(plugin_name="azure_blob")))
+
+
+def test_azure_jsonl_utf16_bad_code_unit_quarantines_only_its_line() -> None:
+    payload = _utf16_with_bad_unit(['{"id":1}', '{"id":2}', '{"id":3}'], 1)
+
+    rows = _azure(payload, format="jsonl", json_options={"encoding": "utf-16"})
+
+    assert _shape(rows) == [(False, 0), (True, 1), (False, 2)]
+    assert [rows[0].row, rows[2].row] == [{"id": 1}, {"id": 3}]
+    assert rows[1].row["__line_number__"] == 2
+
+
+def test_azure_csv_utf16_bad_code_unit_quarantines_only_its_record() -> None:
+    payload = _utf16_with_bad_unit(["id,name", "1,a", "2,b", "3,c"], 2)
+
+    rows = _azure(payload, format="csv", csv_options={"encoding": "utf-16"})
+
+    assert _shape(rows) == [(False, 0), (True, 1), (False, 2)]
+    assert [rows[0].row, rows[2].row] == [{"id": "1", "name": "a"}, {"id": "3", "name": "c"}]
+    assert rows[1].row["__line_number__"] == "3"
+
+
+@pytest.mark.parametrize(("fmt", "body"), [("jsonl", b'{"id":1}\n{"id":2}\n'), ("json", b'[{"id":1},{"id":2}]')])
+def test_azure_json_strips_a_leading_utf8_bom(fmt: str, body: bytes) -> None:
+    rows = _azure(_BOM + body, format=fmt)
+
+    assert _shape(rows) == [(False, 0), (False, 1)]
+    assert [row.row for row in rows] == [{"id": 1}, {"id": 2}]
+
+
+def test_blob_json_expand_accepts_a_utf8_bom_prefixed_document() -> None:
+    import json
+
+    from tests.unit.plugins.transforms.test_blob_json_expand import _run_blob
+
+    result = _run_blob(_BOM + json.dumps([{"document_id": "d1", "title": "T", "sections": []}]).encode())
+
+    assert result.status == "success"
+    assert result.rows is not None
+    assert [row.to_dict()["document_id"] for row in result.rows] == ["d1"]
+
+
+def test_blob_text_expand_strips_a_leading_utf8_bom() -> None:
+    from tests.unit.plugins.transforms.test_blob_text_expand import _run
+
+    _, result = _run(_BOM + b"alpha\nbeta\n")
+
+    assert result.rows is not None
+    assert [row.to_dict()["line"] for row in result.rows] == ["alpha", "beta"]
+
+
+def test_blob_csv_expand_strips_a_leading_utf8_bom() -> None:
+    from tests.fixtures.factories import make_context, make_pipeline_row
+    from tests.unit.plugins.transforms.test_blob_csv_expand import _build_transform, _hash, _PayloadStoreFake
+
+    body = _BOM + b"id,name\n1,alice\n"
+    transform = _build_transform(field_mapping={"id": "record_id"})
+    transform._payload_store = _PayloadStoreFake({_hash(body): body})
+
+    result = transform.process(make_pipeline_row({"url": "https://example.test/a.csv", "blob_ref": _hash(body)}), make_context())
+
+    assert result.status == "success"
+    assert result.rows is not None
+    assert result.rows[0].to_dict()["record_id"] == "1"
