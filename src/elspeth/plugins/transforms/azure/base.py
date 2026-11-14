@@ -92,7 +92,7 @@ class BaseAzureSafetyConfig(TransformDataConfig):
     """
 
     endpoint: str = Field(..., description="Azure Content Safety endpoint URL")
-    api_key: str = Field(..., description="Azure Content Safety API key")
+    api_key: str = Field(..., description="Azure Content Safety API key", repr=False)
     fields: str | list[str] = Field(
         ...,
         description="Field name(s) to analyze, or 'all' for all string fields",

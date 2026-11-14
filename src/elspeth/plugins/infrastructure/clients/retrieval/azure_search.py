@@ -8,7 +8,7 @@ import urllib.parse
 from typing import TYPE_CHECKING, Any, Literal, Protocol, Self, cast
 
 import httpx
-from pydantic import BaseModel, ValidationInfo, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
 from elspeth.contracts.call_data import HTTPCallRequest, RawCallPayload
 from elspeth.contracts.call_mode import CallModeSession, ReplaySSRFRequest
@@ -60,13 +60,14 @@ def _is_azure_search_managed_identity_hostname(hostname: str) -> bool:
 class AzureSearchProviderConfig(BaseModel):
     """Configuration for Azure AI Search provider."""
 
-    model_config = {"extra": "forbid", "frozen": True}
+    # Validation errors never echo the authored input: it carries api_key.
+    model_config = {"extra": "forbid", "frozen": True, "hide_input_in_errors": True}
 
     endpoint: str
     index: str
 
     auth_mode: AzureSearchAuthMode | None = None
-    api_key: str | None = None
+    api_key: str | None = Field(default=None, repr=False)
     use_managed_identity: bool = False
     api_version: str = "2024-07-01"
 

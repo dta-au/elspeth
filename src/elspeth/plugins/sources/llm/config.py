@@ -195,7 +195,7 @@ class AzureOpenAILLMSourceConfig(LLMSourceConfig):
     endpoint: str = Field(..., description="Azure OpenAI endpoint URL")
     api_key: str = Field(..., description="Azure OpenAI API key", repr=False)
     api_version: str = Field(default="2024-10-21", description="Azure API version")
-    tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration")
+    tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration", repr=False)
 
     @field_validator("endpoint")
     @classmethod
@@ -223,7 +223,7 @@ class OpenRouterLLMSourceConfig(LLMSourceConfig):
     api_key: str = Field(..., description="OpenRouter API key", repr=False)
     base_url: str = Field(default=OPENROUTER_BASE_URL, description="OpenRouter API base URL")
     timeout_seconds: float = Field(default=60.0, gt=0, description="Request timeout")
-    tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration")
+    tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration", repr=False)
 
     @field_validator("base_url")
     @classmethod
@@ -278,7 +278,7 @@ class BedrockLLMSourceConfig(LLMSourceConfig):
         repr=False,
         description="Optional resolved AWS session token for temporary static credentials.",
     )
-    tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration")
+    tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration", repr=False)
 
     @field_validator("model")
     @classmethod
@@ -324,7 +324,7 @@ class GatewayLLMSourceConfig(LLMSourceConfig):
         le=GATEWAY_MAX_TOKENS_LIMIT,
         description="Maximum tokens in response",
     )
-    tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration")
+    tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration", repr=False)
 
     @field_validator("endpoint")
     @classmethod
