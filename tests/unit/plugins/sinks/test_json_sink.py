@@ -105,9 +105,9 @@ class TestJSONSink:
             "encoding": encoding,
         }
 
-        with pytest.raises(PluginConfigError, match=r"encoding: Value error, encoding is not a supported text codec"):
+        with pytest.raises(PluginConfigError, match=r"encoding: Value error, encoding .* is not a text encoding"):
             JSONSinkConfig.from_dict(config, plugin_name="json")
-        with pytest.raises(PluginConfigError, match=r"encoding: Value error, encoding is not a supported text codec"):
+        with pytest.raises(PluginConfigError, match=r"encoding: Value error, encoding .* is not a text encoding"):
             JSONSink(config)
 
     @pytest.mark.parametrize("encoding", ["utf-8", "utf-16", "utf8"])

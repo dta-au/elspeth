@@ -9,7 +9,6 @@ This is the ONLY place in the pipeline where coercion is allowed.
 
 from __future__ import annotations
 
-import codecs
 import keyword
 from collections.abc import Iterator, Mapping
 from dataclasses import replace
@@ -25,9 +24,9 @@ from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.plugins.infrastructure.base import BaseSource
-from elspeth.plugins.infrastructure.config_base import SourceDataConfig
+from elspeth.plugins.infrastructure.config_base import SourceDataConfig, TextEncoding
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
-from elspeth.plugins.sources.json_source import BYTE_ESCAPE_ERRORS, contains_escaped_bytes, escaped_line_to_bytes
+from elspeth.plugins.infrastructure.text_decoding import BYTE_ESCAPE_ERRORS, contains_escaped_bytes, escaped_line_to_bytes
 
 
 class TextSourceConfig(SourceDataConfig):
@@ -37,7 +36,7 @@ class TextSourceConfig(SourceDataConfig):
         str,
         EmittedToOutput("the text source uses this as the output row key for every emitted line and as a downstream artifact column"),
     ] = Field(description="Pipeline field name that receives each emitted text line.")
-    encoding: str = Field(default="utf-8", description="Text encoding used to decode the input file.")
+    encoding: TextEncoding = Field(default="utf-8", description="Text encoding used to decode the input file.")
     strip_whitespace: bool = Field(default=True, description="Whether to trim leading and trailing whitespace from each line.")
     skip_blank_lines: bool = Field(default=True, description="Whether to drop blank lines after optional whitespace trimming.")
 
@@ -50,15 +49,6 @@ class TextSourceConfig(SourceDataConfig):
             raise ValueError(f"column '{v}' is a Python keyword")
         return v
 
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, v: str) -> str:
-        try:
-            codecs.lookup(v)
-        except LookupError as exc:
-            raise ValueError(f"unknown encoding: {v!r}") from exc
-        return v
-
 
 class TextSource(BaseSource):
     """Load one output row per text line into a configured column."""
@@ -66,7 +56,7 @@ class TextSource(BaseSource):
     name = "text"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:1010c5ab7ec5d18f"
+    source_file_hash: str | None = "sha256:544356641bd6457c"
     config_model = TextSourceConfig
     _on_validation_failure: str
 

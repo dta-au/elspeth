@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import codecs
 import csv
 import enum
 import hashlib
@@ -42,9 +41,11 @@ from elspeth.contracts.wire_visible_identity import reject_operator_required_pla
 from elspeth.plugins.aws_s3_common import build_s3_client
 from elspeth.plugins.infrastructure.base import BaseSource
 from elspeth.plugins.infrastructure.config_base import (
+    CSVDelimiter,
     DataPluginConfig,
     NormalizedColumnsOption,
     NormalizedFieldMappingOption,
+    TextEncoding,
     declared_source_schema_field_names,
 )
 from elspeth.plugins.infrastructure.config_content import reject_nonfinite_constant
@@ -86,22 +87,9 @@ class CSVOptions(BaseModel):
 
     model_config = {"extra": "forbid", "frozen": True}
 
-    delimiter: str = ","
+    delimiter: CSVDelimiter = ","
     has_header: bool = True
-    encoding: str = "utf-8"
-
-    @field_validator("delimiter")
-    @classmethod
-    def _validate_delimiter(cls, value: str) -> str:
-        if len(value) != 1:
-            raise ValueError("delimiter must be a single character")
-        return value
-
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, value: str) -> str:
-        _validate_text_encoding(value, format_name="CSV")
-        return value
+    encoding: TextEncoding = "utf-8"
 
 
 class JSONOptions(BaseModel):
@@ -109,24 +97,8 @@ class JSONOptions(BaseModel):
 
     model_config = {"extra": "forbid", "frozen": True}
 
-    encoding: str = "utf-8"
+    encoding: TextEncoding = "utf-8"
     data_key: str | None = None
-
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, value: str) -> str:
-        _validate_text_encoding(value, format_name="JSON")
-        return value
-
-
-def _validate_text_encoding(value: str, *, format_name: str) -> None:
-    try:
-        decoder = codecs.getincrementaldecoder(value)(errors="strict")
-        decoded = decoder.decode(b"", final=True)
-    except (LookupError, TypeError, UnicodeError, ValueError) as exc:
-        raise ValueError(f"{format_name} encoding must decode bytes to text") from exc
-    if not isinstance(decoded, str):
-        raise ValueError(f"{format_name} encoding must decode bytes to text")
 
 
 class AWSS3SourceConfig(DataPluginConfig):
@@ -929,7 +901,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:2053b8a8ff1fd1b1"
+    source_file_hash: str | None = "sha256:9eecdf4c47eef0a5"
     config_model = AWSS3SourceConfig
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 

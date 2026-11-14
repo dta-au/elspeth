@@ -13,7 +13,7 @@ import re
 from collections.abc import Iterator, Mapping
 from typing import Any, BinaryIO
 
-from pydantic import Field, ValidationError, field_validator
+from pydantic import Field, ValidationError
 
 from elspeth.contracts import (
     AuditCharacteristic,
@@ -28,7 +28,7 @@ from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.plugins.infrastructure.base import BaseSource
-from elspeth.plugins.infrastructure.config_base import TabularSourceDataConfig
+from elspeth.plugins.infrastructure.config_base import CSVDelimiter, TabularSourceDataConfig, TextEncoding
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.sources.field_normalization import ExternalHeaderError, FieldResolution, resolve_field_names
 
@@ -118,12 +118,12 @@ class CSVSourceConfig(TabularSourceDataConfig):
         json_schema_extra={"composer_tier": "advanced"},
     )
 
-    delimiter: str = Field(
+    delimiter: CSVDelimiter = Field(
         default=",",
         description="Single-character delimiter used to split CSV fields.",
         json_schema_extra={"composer_tier": "advanced"},
     )
-    encoding: str = Field(
+    encoding: TextEncoding = Field(
         default="utf-8",
         description="Text encoding used to decode the CSV file.",
         json_schema_extra={"composer_tier": "advanced"},
@@ -134,32 +134,6 @@ class CSVSourceConfig(TabularSourceDataConfig):
         description="Number of leading physical rows to skip before reading headers or data.",
         json_schema_extra={"composer_tier": "advanced"},
     )
-
-    @field_validator("delimiter")
-    @classmethod
-    def _validate_delimiter(cls, v: str) -> str:
-        if len(v) != 1:
-            raise ValueError(f"delimiter must be a single character, got {v!r}")
-        return v
-
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, v: str) -> str:
-        try:
-            codecs.lookup(v)
-        except LookupError as exc:
-            raise ValueError(f"unknown encoding: {v!r}") from exc
-        # codecs.lookup() also resolves bytes-to-bytes and str-to-str codecs
-        # (base64, hex, zlib, rot13). The incremental decoder load() uses would
-        # accept them and crash mid-read (binascii.Error, TypeError), so refuse
-        # them here. str.encode() checks the same text-encoding flag that
-        # bytes.decode() does; b"".decode() would not, as it short-circuits on
-        # empty input.
-        try:
-            "".encode(v)
-        except LookupError as exc:
-            raise ValueError(f"encoding {v!r} is not a text encoding") from exc
-        return v
 
 
 class CSVSource(BaseSource):
@@ -187,7 +161,7 @@ class CSVSource(BaseSource):
     name = "csv"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:4299e6110527265e"
+    source_file_hash: str | None = "sha256:46da771e9f72483b"
     # Structural observed-cell fact (elspeth-e6e552ce34): csv.reader yields
     # strings, and observed schemas preserve parsed cells untouched (module
     # docstring), so under mode: observed EVERY emitted cell is str by
