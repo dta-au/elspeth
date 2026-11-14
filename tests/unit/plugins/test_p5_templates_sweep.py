@@ -75,3 +75,13 @@ def test_azure_blob_path_render_opts_in_to_raw_diagnostics() -> None:
     )
     text = _failure_text(sink._blob_path_compiled, run_id=_SENTINEL, timestamp="2026-11-14T00:00:00+00:00")
     assert _SENTINEL in text
+
+
+def test_value_free_render_reports_the_output_bound_in_full() -> None:
+    """ELSPETH's own output bound names no value, so value-free rendering keeps its text."""
+    from elspeth.plugins.infrastructure.templates import ALL_FIELDS, SandboxedTemplate, TemplateRow
+    from elspeth.testing import make_pipeline_row
+
+    row = TemplateRow.project(make_pipeline_row({"text": "x"}), ALL_FIELDS)
+    text = _failure_text(SandboxedTemplate("{{ row.text * 5000000 }}"), row=row)
+    assert "Rendered template exceeds" in text

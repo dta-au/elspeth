@@ -725,10 +725,10 @@ def _serve_request(source: str, payload: bytes, value_free: bool) -> tuple[str, 
     A read of a field the node does not declare is reported with its own
     value-free text (``undeclared_field``). Any other failure is reported by
     its class alone when ``value_free`` is set, because its message can quote
-    row data; otherwise its bounded message is returned. The parent sets
-    ``value_free`` for every context that carries a ``TemplateRow``
-    (``_BoundedTemplate.render``), so only an operator-only context (no row)
-    ever gets the raw message.
+    row data; otherwise its bounded message is returned. ``value_free`` is the
+    default, and the parent sets it for every context that carries a
+    ``TemplateRow`` (``_BoundedTemplate.render``), so only an operator-only
+    context (no row) whose caller opted out ever gets the raw message.
     """
     try:
         # RLIMIT_CPU is cumulative over a process lifetime. Give each
@@ -758,7 +758,9 @@ def _serve_request(source: str, payload: bytes, value_free: bool) -> tuple[str, 
         for piece in template.generate(**context):
             size += len(piece.encode("utf-8"))
             if size > _MAX_RENDER_BYTES:
-                raise TemplateError(f"Rendered template exceeds {_MAX_RENDER_BYTES} UTF-8 bytes")
+                # ELSPETH's own bound: its text names no value, so it is
+                # reported in full whatever value_free says.
+                return "render_too_large", ""
             pieces.append(piece)
         return "ok", "".join(pieces)
     except _ValueFreeUndefinedError as exc:
@@ -952,7 +954,7 @@ def _exchange(entry: tuple[Any, Any], source: str, payload: bytes, value_free: b
     return status, value
 
 
-def _run_template_worker(source: str, payload: bytes, *, value_free: bool = False) -> str:
+def _run_template_worker(source: str, payload: bytes, *, value_free: bool = True) -> str:
     if len(payload) > _MAX_CONTEXT_BYTES:
         raise TemplateError(f"Template context exceeds {_MAX_CONTEXT_BYTES} bytes")
     index = _AVAILABLE_WORKERS.get_nowait()
@@ -990,6 +992,8 @@ def _run_template_worker(source: str, payload: bytes, *, value_free: bool = Fals
         if status == "retired_row_name":
             # A fixed text: it names the reserved set, never the name read.
             raise TemplateError(f"Reserved row name: {value}")
+        if status == "render_too_large":
+            raise TemplateError(f"Rendered template exceeds {_MAX_RENDER_BYTES} UTF-8 bytes")
         if value_free:
             if status == "safe_undefined":
                 raise TemplateError(f"Undefined variable: {value}")
@@ -1030,7 +1034,7 @@ def _run_template_worker(source: str, payload: bytes, *, value_free: bool = Fals
 
 
 class _BoundedTemplate:
-    def __init__(self, source: str, *, value_free: bool = False) -> None:
+    def __init__(self, source: str, *, value_free: bool = True) -> None:
         self._source = source
         self._value_free = value_free
 
@@ -1042,7 +1046,8 @@ class _BoundedTemplate:
             transport = _pack_context_value(context, memo=packed)
             # A render failure's message can quote row data, so a context that
             # carries a row always renders value-free, whatever the environment
-            # was built with; raw messages are kept for operator-only contexts.
+            # was built with; raw messages are kept only for operator-only
+            # contexts whose caller opted out with value_free=False.
             value_free = self._value_free or any(type(value) is _RowTransport for value in packed.values())
             return _run_template_worker(self._source, pickle.dumps(transport, protocol=5), value_free=value_free)
         finally:
@@ -1050,7 +1055,7 @@ class _BoundedTemplate:
 
 
 class _BoundedEnvironment(_LocalSandboxedEnvironment):
-    def __init__(self, *, value_free: bool = False, **kwargs: Any) -> None:
+    def __init__(self, *, value_free: bool = True, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._value_free = value_free
 
@@ -1278,13 +1283,15 @@ def _literal_argument(argument: nodes.Expr) -> tuple[bool, int | float | str | N
     return False, None
 
 
-def create_sandboxed_environment(*, value_free: bool = False) -> ImmutableSandboxedEnvironment:
+def create_sandboxed_environment(*, value_free: bool = True) -> ImmutableSandboxedEnvironment:
     """Create an ImmutableSandboxedEnvironment with StrictUndefined.
 
     Args:
-        value_free: Render failures use only operator-authored keys and types.
-            A render whose context carries a ``TemplateRow`` is value-free
-            whatever this says; the flag decides only operator-only contexts.
+        value_free: Render failures use only operator-authored keys and types
+            (the default). Pass ``False`` only where no row data can ever reach
+            the render context, to keep raw diagnostics for operator-only
+            values. A render whose context carries a ``TemplateRow`` is
+            value-free whatever this says.
 
     Returns:
         A sandboxed Jinja2 environment that:
