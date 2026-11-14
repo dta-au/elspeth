@@ -136,3 +136,14 @@ def test_chroma_whitespace_only_id_diverts_while_valid_sibling_is_published() ->
     assert all("id" in reason for reason in diverted.values())
     assert sorted(extracted_by_ordinal) == [2]
     assert extracted_by_ordinal[2][0] == "doc-2"
+
+
+def test_dead_on_duplicate_error_exception_is_removed() -> None:
+    # DuplicateDocumentError existed only for on_duplicate='error', which no
+    # longer exists; nothing raises it, so it must not stay in the contracts.
+    import elspeth.contracts as contracts
+    import elspeth.contracts.errors as contract_errors
+
+    assert "DuplicateDocumentError" not in vars(contract_errors)
+    assert "DuplicateDocumentError" not in vars(contracts)
+    assert "DuplicateDocumentError" not in contracts.__all__

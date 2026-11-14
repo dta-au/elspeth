@@ -200,7 +200,6 @@ from elspeth.contracts.errors import (
     ContractMergeError,
     ContractViolation,
     DependencyFailedError,
-    DuplicateDocumentError,
     EmptyResumeStateError,
     ErrorDetail,
     ExecutionError,
@@ -405,7 +404,6 @@ __all__ = [  # Grouped by category for readability
     # errors
     "CommencementGateFailedError",
     "DependencyFailedError",
-    "DuplicateDocumentError",
     "EmptyResumeStateError",
     "FrameworkBugError",
     "GracefulShutdownError",
