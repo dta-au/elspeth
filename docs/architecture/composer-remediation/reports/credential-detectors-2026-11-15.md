@@ -84,9 +84,23 @@ placeholder. On the corpus: prose false positives 7 of 15 to 0 of 15; vendor
 and URL hits 24 of 33 to 32 of 33. On 135,915 documentation lines: 52 flagged
 lines to 7.
 
-**Field-name suffix rule.** Unchanged in the agent's proposal. The
-string-matching survey shows it refusing `sort_key` and `join_key`; replacing
-it with schema-declared credential fields is an open design item.
+**Field-name suffix rule (run).** `is_secret_field` returns true for
+`sort_key`, `join_key`, `group_key`, `partition_key`, `primary_key`,
+`cache_key`, `dedup_key`, `next_page_token` and `pagination_token`; only
+`data_key` and `alternate_key` are exempt (`:77`). Proposed: keep the exact
+names (`api_key`, `secret_key`, `private_key`, `access_key`, `token`,
+`password`, `secret`, `client_secret`) and the specific suffixes `_api_key`,
+`_secret_key`, `_private_key`, `_access_key`, `_secret`, `_password`,
+`_credential`. For any other `*_key` or `*_token` field, refuse only when the
+value is a non-empty string that passes Tier 2; secret references stay
+exempt. Schema-declared credential fields remain the structural answer.
+
+**Blob content, assessed by reading.** A credential in an uploaded file is
+stored at rest unscanned, but no path was found that sends it to a provider
+through the composer, because content is scanned when a composer tool reads
+it. It can still reach a provider when a pipeline's LLM transform processes
+that data at run time, which is the data plane and outside the composer
+guard. So it is a storage exposure, not a composer-to-provider one.
 
 ## 5. Where the narrow rule must apply
 
