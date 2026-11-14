@@ -163,7 +163,7 @@ class AzureContentSafety(BaseAzureSafetyTransform):
 
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:6869d9e7a5f59d57"
+    source_file_hash: str | None = "sha256:20e51c74725215d4"
     config_model = AzureContentSafetyConfig
     passes_through_input = True
     capability_tags: tuple[str, ...] = ("azure", "content-safety", "moderation")
@@ -409,7 +409,7 @@ class AzureContentSafety(BaseAzureSafetyTransform):
                 summary="Score text against Azure Content Safety categories (hate, violence, sexual, self_harm). 0-6 severity scale; rows flagged when any threshold is exceeded.",
                 composer_hints=(
                     "Thresholds use OR logic: a row is flagged when ANY category exceeds its threshold. Tighten thresholds individually, not globally.",
-                    "Default thresholds tend to be 4 — set per-category based on the audit policy, not on Azure's recommendation.",
+                    "Every category threshold (hate, violence, sexual, self_harm) is required, with no default — set each one from the audit policy. Lower values are stricter.",
                     "Category moderation can block remote text that exceeds configured severity thresholds, but remote content remains untrusted; apply prompt-injection defenses before sending it to an LLM.",
                     "The transform records the full per-category response in audit, not just the flag — verify this is visible before declaring success.",
                 ),

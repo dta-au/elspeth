@@ -348,7 +348,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ea328c39a24bfb22"
+    source_file_hash: str | None = "sha256:e45dc8dbaf712404"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -964,14 +964,9 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 max_result_bytes=self._max_result_bytes,
             )
         except MalformedTextractResponse as error:
-            safe_message = str(error)
-            validation_reason: TransformErrorCategory
-            if "max_blocks" in safe_message:
-                validation_reason = "too_many_blocks"
-            elif "max_result_bytes" in safe_message:
-                validation_reason = "result_too_large"
-            else:
-                validation_reason = "malformed_response"
+            # Dispatch on the structured category, never the message: the
+            # message can embed provider-controlled block text.
+            validation_reason: TransformErrorCategory = error.category
             return TransformResult.error({"reason": validation_reason, "error_type": "result_validation"}, retryable=False)
         return self._build_enriched_result(row, receipt, normalized)
 

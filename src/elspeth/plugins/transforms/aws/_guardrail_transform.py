@@ -261,6 +261,10 @@ class BedrockGuardrailTransformBase(BaseTransform, ABC):
 
         row_started_at = self._monotonic()
         row_deadline = row_started_at + self._row_deadline_seconds
+        # Validate every configured field before the first Bedrock call, as
+        # azure/base.py does: an invalid later field must not let an earlier
+        # field be sent, billed, and recorded before the row fails.
+        texts: list[tuple[str, str]] = []
         for field_name in self._fields:
             if field_name not in row:
                 return TransformResult.error({"reason": "missing_field", "field": field_name}, retryable=False)
@@ -279,6 +283,8 @@ class BedrockGuardrailTransformBase(BaseTransform, ABC):
                 return TransformResult.error(
                     {"reason": "invalid_input", "field": field_name, "error_type": "field_too_long"}, retryable=False
                 )
+            texts.append((field_name, value))
+        for field_name, value in texts:
             # Shutdown and row-deadline checks precede every call. The deadline
             # bounds when a call may START, not the in-flight call itself
             # (botocore's own timeouts bound that), mirroring azure/base.py.

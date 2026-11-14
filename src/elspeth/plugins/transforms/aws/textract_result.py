@@ -6,18 +6,31 @@ import copy
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn
 
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import canonical_json
 
+MalformedTextractCategory = Literal["malformed_response", "too_many_blocks", "result_too_large"]
+
 
 class MalformedTextractResponse(ValueError):
-    """Raised when a provider response cannot be safely normalized."""
+    """Raised when a provider response cannot be safely normalized.
 
-    def __init__(self, message: str = "malformed Amazon Textract response") -> None:
+    ``category`` is the structured failure class callers dispatch on. The
+    message can embed provider-controlled text (block ids, block types), so
+    it must never be substring-matched to choose an audited reason.
+    """
+
+    def __init__(
+        self,
+        message: str = "malformed Amazon Textract response",
+        *,
+        category: MalformedTextractCategory = "malformed_response",
+    ) -> None:
         super().__init__(message)
+        self.category: MalformedTextractCategory = category
 
 
 _MAX_DOCUMENT_PAGES = 3_000
@@ -77,8 +90,8 @@ class NormalizedTextractResult:
         )
 
 
-def _malformed(path: str, detail: str) -> NoReturn:
-    raise MalformedTextractResponse(f"{path}: {detail}")
+def _malformed(path: str, detail: str, *, category: MalformedTextractCategory = "malformed_response") -> NoReturn:
+    raise MalformedTextractResponse(f"{path}: {detail}", category=category)
 
 
 @trust_boundary(
@@ -640,7 +653,7 @@ def normalize_textract_result(
             block = _mapping(raw_block, f"{result_path}.Blocks[{block_offset}]")
             blocks.append(block)
             if len(blocks) > max_blocks:
-                _malformed("Blocks", f"block count exceeds max_blocks={max_blocks}")
+                _malformed("Blocks", f"block count exceeds max_blocks={max_blocks}", category="too_many_blocks")
 
         if "Warnings" in result:
             raw_warnings = _sequence(result["Warnings"], f"{result_path}.Warnings")
@@ -736,7 +749,7 @@ def normalize_analyze_document_result(
             block = {**block, "Page": 1}
         blocks.append(block)
         if len(blocks) > max_blocks:
-            _malformed("Blocks", f"block count exceeds max_blocks={max_blocks}")
+            _malformed("Blocks", f"block count exceeds max_blocks={max_blocks}", category="too_many_blocks")
 
     return _normalize_block_graph(
         blocks,
@@ -800,7 +813,11 @@ def _normalize_block_graph(
     except (TypeError, ValueError, RecursionError, UnicodeError) as error:
         raise MalformedTextractResponse("native result contains a non-canonical value") from error
     if result_size > max_result_bytes:
-        _malformed("native_result", f"serialized result exceeds max_result_bytes={max_result_bytes}")
+        _malformed(
+            "native_result",
+            f"serialized result exceeds max_result_bytes={max_result_bytes}",
+            category="result_too_large",
+        )
 
     pages = _project_pages(blocks)
     tables = _project_tables(blocks, block_index)
