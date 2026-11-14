@@ -39,12 +39,13 @@ from elspeth.plugins.transforms.aws.guardrails_client import (
 from elspeth.plugins.transforms.aws.replay_sdk import DeferredAWSClient, ReplayOnlySDK
 from elspeth.plugins.transforms.safety_utils import validate_fields_not_empty
 
-# Row-scoped budget for STARTING field calls. One ApplyGuardrail call is bounded
-# by botocore at about 3 x (5 s connect + 15 s read) plus backoff, so a degraded
-# endpoint costs ~1 min per field; without a bound a 32-field row could hold the
-# engine's row thread for ~30 min. Fields left unscanned at the deadline fail the
-# row closed as retry_timeout / row_deadline_exceeded (as azure/base.py does).
-GUARDRAIL_ROW_DEADLINE_SECONDS = 300.0
+# Default row-scoped budget for STARTING field calls (config: row_deadline_seconds).
+# One ApplyGuardrail call is bounded by botocore at about 3 x (5 s connect + 15 s
+# read) plus backoff, so a degraded endpoint costs ~1 min per field; without a
+# bound a 32-field row could hold the engine's row thread for ~30 min. Fields left
+# unscanned at the deadline fail the row closed as retry_timeout /
+# row_deadline_exceeded (as azure/base.py does).
+GUARDRAIL_ROW_DEADLINE_SECONDS = 300
 
 
 class BedrockGuardrailTransformConfig(TransformDataConfig):
@@ -70,6 +71,14 @@ class BedrockGuardrailTransformConfig(TransformDataConfig):
         min_length=1,
         max_length=32,
         description="Input row fields whose text is evaluated by the Guardrail.",
+    )
+    row_deadline_seconds: int = Field(
+        GUARDRAIL_ROW_DEADLINE_SECONDS,
+        gt=0,
+        description=(
+            "Seconds after a row starts within which each further field call must start; "
+            "fields left unscanned at the deadline fail the row as row_deadline_exceeded."
+        ),
     )
 
     @field_validator("guardrail_identifier")
@@ -136,7 +145,7 @@ class BedrockGuardrailTransformBase(BaseTransform, ABC):
         self._run_id = ""
         self._telemetry_emit: Callable[[TelemetryEvent], None] = lambda _event: None
         self._sdk_client: Any | None = None
-        self._row_deadline_seconds = GUARDRAIL_ROW_DEADLINE_SECONDS
+        self._row_deadline_seconds = cfg.row_deadline_seconds
         self._monotonic: Callable[[], float] = time.monotonic
         self._shutdown = threading.Event()
 

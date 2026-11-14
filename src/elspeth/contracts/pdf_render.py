@@ -5,12 +5,19 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import NotRequired, TypedDict
 
+# Format of the audited render request and receipt. v2 added
+# render_limits.max_total_bytes to the request (the replay/verify match key);
+# runs recorded under v1 are refused rather than matched against a new shape.
+PDF_RENDER_FORMAT = "pdf_rasterize/v2"
+PDF_RENDER_RETIRED_FORMATS = frozenset({"pdf_rasterize/v1"})
+
 
 class PDFRenderLimitsData(TypedDict):
     dpi: int
     max_pages: int
     max_page_pixels: int
     max_page_bytes: int
+    max_total_bytes: int
     render_timeout_seconds: int
     worker_memory_limit_bytes: int
     extract_text: bool

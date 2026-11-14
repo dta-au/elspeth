@@ -164,7 +164,8 @@ def _selected_values(selected: object, column: JSONRecordColumn) -> list[str]:
     if selected is _MISSING or selected is None:
         return []
     if type(selected) is list:
-        elements = cast("list[object]", selected)
+        # A null element is absent, exactly like a selected top-level null.
+        elements = [element for element in cast("list[object]", selected) if element is not None]
         count = len(elements)
         if column.multiple == "one" and count > 1:
             raise ValueError(f"JSON record column {column.field!r} has multiple values")

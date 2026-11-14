@@ -7,10 +7,9 @@ Per ELSPETH's Three-Tier Trust Model:
   conversion is a structured output's JSON number parsed into the row type
   its declared field is bound to (``parse_field_value``)
 
-This module extracts the common validation pattern from LLM transforms
-so it can be:
-1. Reused across all LLM plugin implementations
-2. Property-tested with Hypothesis
+This module holds the one response parser every LLM plugin uses
+(``extract_structured_fields``: the LLM transform in both query modes and the
+LLM source), so its Hypothesis property suite tests the parser that runs.
 
 Shared helpers:
 - strip_markdown_fences: Strip markdown code block wrappers from LLM output
@@ -20,13 +19,9 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Mapping
-from dataclasses import dataclass
-from types import MappingProxyType
 from typing import Any, assert_never
 
 from elspeth.contracts.errors import TransformErrorReason
-from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.json_parser import check_json_depth
 from elspeth.contracts.source_read_verification import MAX_JSON_DEPTH
 from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig, OutputFieldType, ResponseFormat
@@ -132,68 +127,6 @@ def parse_field_value(
             assert_never(field_config.type)
 
 
-@dataclass(frozen=True, slots=True)
-class ValidationSuccess:
-    """Successful validation result containing parsed data."""
-
-    data: Mapping[str, Any]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.data, MappingProxyType):
-            object.__setattr__(self, "data", deep_freeze(self.data))
-
-
-@dataclass(frozen=True, slots=True)
-class ValidationError:
-    """Failed validation result with error details."""
-
-    reason: str
-    detail: str | None = None
-    expected: str | None = None
-    actual: str | None = None
-
-
-ValidationResult = ValidationSuccess | ValidationError
-
-
-def validate_json_object_response(content: str) -> ValidationResult:
-    """Validate LLM response content is a JSON object.
-
-    This is the standard validation for ELSPETH LLM transforms:
-    1. Parse JSON (catch JSONDecodeError)
-    2. Verify type is dict (not array, null, or primitive)
-    3. Return validated dict or structured error
-
-    Args:
-        content: Raw response content from LLM API
-
-    Returns:
-        ValidationSuccess with parsed dict, or ValidationError with details
-    """
-    # Step 1: Parse JSON. The nesting bound runs first: deep content either
-    # makes the decoder raise RecursionError or decodes into a value too deep
-    # to freeze; its ValueError carries a fixed message, never the content.
-    try:
-        check_json_depth(content, max_depth=MAX_JSON_DEPTH)
-        parsed = json.loads(content, parse_constant=reject_nonfinite_constant)
-    except (json.JSONDecodeError, ValueError) as e:
-        return ValidationError(
-            reason="invalid_json",
-            detail=str(e),
-        )
-
-    # Step 2: Verify type is dict
-    if not isinstance(parsed, dict):
-        return ValidationError(
-            reason="invalid_json_type",
-            expected="object",
-            actual=type(parsed).__name__,
-        )
-
-    # Success
-    return ValidationSuccess(data=parsed)
-
-
 def strip_markdown_fences(content: str) -> str:
     """Strip markdown code block fences from LLM response content.
 
@@ -290,7 +223,9 @@ def extract_structured_fields(
         ({}, error reason dict carrying at least "reason") on failure.
     """
     try:
-        # Bound nesting before decoding (see validate_json_object_response).
+        # Bound nesting before decoding: deep content either makes the
+        # decoder raise RecursionError or decodes into a value too deep to
+        # freeze; its ValueError carries a fixed message, never the content.
         check_json_depth(content, max_depth=MAX_JSON_DEPTH)
         parsed = json.loads(content, parse_constant=reject_nonfinite_constant)
     except (json.JSONDecodeError, ValueError) as e:
