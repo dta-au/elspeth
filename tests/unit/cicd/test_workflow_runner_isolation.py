@@ -366,6 +366,27 @@ def test_ci_uv_interpreter_matches_the_job_lane() -> None:
         assert environment.get("UV_PYTHON") == expected, name
 
 
+def test_ci_uv_jobs_use_their_own_interpreter_never_a_managed_download() -> None:
+    # uv 0.10.2's managed CPython 3.13.12 and 3.14.3 builds lack os.pidfd_open,
+    # which the web process watchdog calls at startup, and uv prefers a cached
+    # managed build over the job's own interpreter unless told otherwise.
+    workflow = _workflows()["ci.yaml"]
+    checked = []
+    for name, job in workflow["jobs"].items():
+        steps = job.get("steps", [])
+        if not any("uv sync" in step.get("run", "") for step in steps):
+            continue
+        environment = {**workflow.get("env", {}), **job.get("env", {})}
+        assert environment.get("UV_PYTHON_PREFERENCE") == "only-system", name
+        if "container" not in job:
+            setup = [index for index, step in enumerate(steps) if step.get("uses", "").startswith("actions/setup-python@")]
+            first_uv = next(index for index, step in enumerate(steps) if "uv " in step.get("run", ""))
+            assert setup and setup[0] < first_uv, f"{name} runs uv on the host without setting up Python first"
+            assert steps[setup[0]]["with"]["python-version"] == "${{ env.PYTHON_VERSION }}", name
+        checked.append(name)
+    assert {"testcontainer", "host-runner-unit", "state-engine-validation", "azure-container-apps-bicep", "e2e-frontend"} <= set(checked)
+
+
 def test_nyx_prerequisites_are_explicit_without_a_hosted_fallback() -> None:
     jobs = _workflows()["ci.yaml"]["jobs"]
     for name in ("testcontainer", "host-runner-unit", "state-engine-validation", "azure-container-apps-bicep", "e2e-frontend"):

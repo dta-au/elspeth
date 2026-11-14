@@ -34,6 +34,10 @@ env:
   PYTHON_VERSION: "3.13"
   # uv can prefer a managed interpreter over the container's system Python.
   UV_PYTHON: "3.13"
+  # Use only the container's or setup-python's interpreter, never a uv-managed
+  # download. Every uv job has one. The managed 3.13.12 and 3.14.3 builds that
+  # uv 0.10.2 fetches lack os.pidfd_open, which the web process watchdog needs.
+  UV_PYTHON_PREFERENCE: only-system
   UV_VERSION: "0.10.2"
 
 permissions:
@@ -984,6 +988,11 @@ jobs:
         with:
           path: ${{ env.CI_CHECKOUT_PATH }}
 
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
       - name: Verify Docker prerequisites
         run: |
           docker info
@@ -1061,6 +1070,11 @@ jobs:
         with:
           path: ${{ env.CI_CHECKOUT_PATH }}
 
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
       - name: Verify Docker prerequisites
         run: |
           docker info
@@ -1115,6 +1129,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           path: ${{ env.CI_CHECKOUT_PATH }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
@@ -1174,6 +1193,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           path: ${{ env.CI_CHECKOUT_PATH }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install Bicep (pinned)
         run: |
