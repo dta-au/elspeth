@@ -99,11 +99,9 @@
       },
       {
         "default": "overwrite",
-        "description": "Behaviour when a document ID already exists",
+        "description": "Behaviour when a document ID already exists; overwrite is the only policy.",
         "enum": [
-          "overwrite",
-          "skip",
-          "error"
+          "overwrite"
         ],
         "kind": "enum",
         "label": "On Duplicate",

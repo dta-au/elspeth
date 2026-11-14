@@ -130,12 +130,11 @@ def test_database_sink_guidance_states_the_runtime_requirements() -> None:
     assert "provisioned" in lowered
 
 
-def test_database_sink_replace_hint_says_replace_is_refused() -> None:
-    hints = DatabaseSink.get_post_call_hints(tool_name="upsert_node", config_snapshot={"if_exists": "replace"})
-    assert hints, "a 'replace' config must still get a corrective hint"
-    joined = " ".join(hints).lower()
-    assert "drops" not in joined, "hint claims 'replace' drops the table; the runtime refuses 'replace'"
-    assert "not supported" in joined
+def test_database_sink_replace_is_refused_by_the_config_type() -> None:
+    # 'replace' is no longer an admissible if_exists value (p5-db-chroma): the
+    # config refuses it instead of a post-call hint correcting it afterwards.
+    with pytest.raises(PluginConfigError, match="if_exists"):
+        DatabaseSink({"url": "sqlite:///:memory:", "table": "t", "schema": {"mode": "observed"}, "if_exists": "replace"})
     assert DatabaseSink.get_post_call_hints(tool_name="upsert_node", config_snapshot={"if_exists": "append"}) == ()
 
 
