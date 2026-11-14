@@ -28,7 +28,7 @@ import importlib.util
 import socket
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 
 import httpx
@@ -437,3 +437,24 @@ def test_pagination_link_header_with_control_character_is_refused(char: str) -> 
     except ValueError as exc:
         refused = exc
     assert refused is not None
+
+
+@pytest.mark.parametrize("char", ["\x7f", "\x00", "\n"])
+def test_dataverse_next_link_with_control_character_is_ssrf_rejected_before_dns(char: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.plugins.infrastructure.clients.dataverse import DataverseClient, DataverseClientError
+    from tests.unit.plugins.infrastructure.clients.test_dataverse_client import ENV_URL, FakeCredential
+
+    looked_up = _no_dns(monkeypatch)
+    client = DataverseClient(environment_url=ENV_URL, credential=cast(Any, FakeCredential()))
+    rejected: DataverseClientError | None = None
+    try:
+        client._validate_url_ssrf(f"{ENV_URL}/api/data/v9.2/accounts{char}")
+    except DataverseClientError as exc:
+        rejected = exc
+    finally:
+        client.close()
+    assert rejected is not None, "Dataverse admitted a URL httpx cannot send"
+    assert "control character" in str(rejected), str(rejected)
+    assert rejected.error_category == "ssrf_rejected"
+    assert rejected.retryable is False
+    assert looked_up == []
