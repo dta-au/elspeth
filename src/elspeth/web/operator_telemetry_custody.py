@@ -68,8 +68,8 @@ def _identity_present(values: object, target: object) -> bool:
 
 def verify_telemetry_sdk() -> None:
     for package, expected in (
-        ("opentelemetry-sdk", "1.45.1"),
-        ("opentelemetry-exporter-otlp-proto-grpc", "1.45.1"),
+        ("opentelemetry-sdk", "1.45.2"),
+        ("opentelemetry-exporter-otlp-proto-grpc", "1.45.2"),
         ("opentelemetry-exporter-prometheus", "0.66b1"),
     ):
         if importlib.metadata.version(package) != expected:

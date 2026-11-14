@@ -161,7 +161,7 @@ uv sync --frozen --extra tracing-langfuse
 
 The Web Composer's operator telemetry custody depends on reviewed
 OpenTelemetry SDK internals. ELSPETH 0.8.12 locks the SDK and OTLP exporters
-to 1.45.1 and the Prometheus exporter to 0.66b1. Keep those exact versions
+to 1.45.2 and the Prometheus exporter to 0.66b1. Keep those exact versions
 together when installing the web interface; its startup check refuses an
 unreviewed SDK or exporter version. Existing Langfuse `host`, credential and
 tracing configuration fields remain supported.

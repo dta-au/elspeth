@@ -61,9 +61,9 @@ dependencies = [
     "networkx>=3.6,<4",  # Graph algorithms
 
     # Observability
-    "opentelemetry-api>=1.45.1,<2",  # CVE-2026-114603 resource-exhaustion fix
-    "opentelemetry-sdk==1.45.1",  # Operator telemetry custody verifies these SDK internals
-    "opentelemetry-exporter-otlp==1.45.1",  # Keep the custody-reviewed exporter implementation
+    "opentelemetry-api>=1.45.2,<2",  # CVE-2026-114603, CVE-2026-126360
+    "opentelemetry-sdk==1.45.2",  # Operator telemetry custody verifies these SDK internals
+    "opentelemetry-exporter-otlp==1.45.2",  # Keep the custody-reviewed exporter implementation
 
     # Structured logging
     "structlog>=25.5,<26",  # Structured logging

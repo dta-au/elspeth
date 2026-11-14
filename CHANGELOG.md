@@ -13,7 +13,8 @@ published tag or an image.
 ### Dependencies
 
 - **The remaining Python dependency advisories are fixed.** OpenTelemetry
-  moves to 1.45.1 with the Prometheus exporter at 0.66b1. These SDK and
+  moves to 1.45.2 with the Prometheus exporter at 0.66b1, and soupsieve
+  moves to 4.0. These SDK and
   exporter versions are exact pins because operator telemetry custody verifies
   their implementation at startup. Langfuse moves from SDK 3 to 5.2, allowing
   packaging 26.3 and patched virtualenv 21.15.6. Azure Monitor moves with the
