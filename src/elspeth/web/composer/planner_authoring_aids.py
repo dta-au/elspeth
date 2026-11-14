@@ -263,6 +263,11 @@ class _ForkRowUnionAid(TypedDict):
     set_pipeline_exemplar: _SetPipelineProviderArguments
 
 
+class _GateRoutingAid(TypedDict):
+    rules: list[str]
+    set_pipeline_exemplar: _SetPipelineProviderArguments
+
+
 class _RulesAid(TypedDict):
     rules: list[str]
 
@@ -332,6 +337,7 @@ class _PlannerAuthoringAids(TypedDict, total=False):
     source_custody: _SourceCustodyAid
     fork_coalesce: _ForkCoalesceAid
     fork_row_union: _ForkRowUnionAid
+    gate_routing: _GateRoutingAid
     model_custody: _RulesAid
     llm_output_contract: _RulesAid
     llm_source_generation: _RulesAid
@@ -400,9 +406,10 @@ _SOURCE_CUSTODY_RULES: Final[tuple[str, ...]] = (
     # placeholder content' — a provenance inversion in an audit-grade tool.
     "Content YOU fabricated at the user's request ('make up N rows', "
     "'invent sample complaints') is planner-authored, not discovered: bind "
-    "it via inline_blob, stage the invented_source interpretation review, "
-    "and narrate it in FIRST PERSON — 'I generated this content as you "
+    "it via inline_blob and narrate it in FIRST PERSON — 'I generated this content as you "
     "asked' — never as something 'the system' produced or you found. "
+    "The server stages the invented_source review from the bound bytes; "
+    "never author that row. "
     "Reading a blob you authored this turn back through get_blob_content or read_attachment "
     "does not make its content external.",
 )
@@ -462,9 +469,9 @@ _FORK_COALESCE_RULES: Final[tuple[str, ...]] = (
     "Do not author interpretation_requirements rows for llm_prompt_template "
     "or llm_model_choice — required LLM reviews auto-stage on every llm "
     "node. Author rows only for the planner-owned kinds (vague_term wired "
-    "via prompt_template_parts, registered pipeline_decision, "
-    "invented_source), each in the short form {kind, user_term, draft} with "
-    "user_term mandatory.",
+    "via prompt_template_parts, and registered pipeline_decision), each in "
+    "the short form {kind, user_term, draft} with user_term mandatory. "
+    "Never author invented_source: the server stages it.",
     "Composer-authored coalesces support policy require_all, best_effort "
     "(requires timeout_seconds), or first, and merge union or nested. Engine "
     "quorum/select require fields this surface cannot author. Use best_effort "
@@ -478,6 +485,20 @@ _FORK_COALESCE_RULES: Final[tuple[str, ...]] = (
 
 _FORK_EXEMPLAR_CONTENT: Final[str] = "ticket_id,body\nT-1001,Cannot log in since the update\nT-1002,Invoice totals look wrong\n"
 _ROW_UNION_EXEMPLAR_CONTENT: Final[str] = "case_id,variant_text\nC-1001,Control copy\nC-1002,Treatment copy\n"
+
+_GATE_ROUTING_EXEMPLAR_CONTENT: Final[str] = "parcel_id,weight_kg\nP-3001,4\nP-3002,31\n"
+
+# The commonest requested topology (one source, one conditional split, two
+# outputs) had no worked exemplar: the only gate the aids showed was the
+# condition 'True' fan-out, so a traced planner re-derived route labels, sink
+# schemas and source typing from scattered rules on every such request.
+_GATE_ROUTING_RULES: Final[tuple[str, ...]] = (
+    "A boolean condition (a comparison, and/or/not) routes on exactly the labels 'true' and 'false'. "
+    "Each route value is a sink_name, a downstream node's input connection, fork, or discard.",
+    "Declare the compared field's type in the source schema so the source coerces it at ingestion; "
+    "an observed CSV cell is a string. Sinks never coerce: each sink declares the fields and types that arrive, "
+    "and a fixed sink refuses any field it does not declare.",
+)
 
 _FORK_ROW_UNION_RULES: Final[tuple[str, ...]] = (
     "Use row_union for require_all N-to-N reconvergence: every fork branch contributes its original rows, "
@@ -930,8 +951,9 @@ _REVIEW_REGISTRY_RULES: Final[tuple[str, ...]] = (
     "the draft's provenance, not whether the row is staged.",
     "Do not author rows for llm_prompt_template or llm_model_choice — "
     "required LLM reviews auto-stage on every llm node. The planner-owned "
-    "kinds are vague_term (wired via prompt_template_parts), registered "
-    "pipeline_decision, and invented_source.",
+    "kinds are vague_term (wired via prompt_template_parts) and registered "
+    "pipeline_decision. Never author invented_source: the server stages "
+    "it when it binds source rows you generated.",
     "Only the llm_prompt_template review auto-surfaces through ordinary "
     "no-tool finalization at TURN END against the final frozen pipeline "
     "skeleton — an "
@@ -2253,8 +2275,8 @@ def fork_coalesce_exemplar_args(
             "schema": {"mode": "observed"},
             # llm_prompt_template and llm_model_choice reviews are backend
             # auto-staged on every llm node — never hand-authored. Planner-
-            # owned kinds (vague_term, registered pipeline_decision,
-            # invented_source) ARE authored when the node calls for them:
+            # owned kinds (vague_term, registered pipeline_decision) ARE
+            # authored when the node calls for them:
             # the urgency branch below authors category semantics and must
             # stage its own wired vague_term review (run-3 E6: an exemplar
             # demonstrating an un-reviewed classification was imported as
@@ -2649,6 +2671,68 @@ def fork_row_union_exemplar_args(
     }
 
 
+def gate_routing_exemplar_args(
+    catalog: PolicyCatalogView,
+    *,
+    visible: Mapping[str, frozenset[str]] | None = None,
+) -> _SetPipelineExemplar | None:
+    """Complete ``set_pipeline`` args for one source split by a gate into two sinks."""
+    if visible is None:
+        visible = _visible_plugin_names(catalog, _plugin_summaries(catalog))
+    if "csv" not in visible["source"] or "json" not in visible["sink"]:
+        return None
+
+    fields = ["parcel_id: str", "weight_kg: int"]
+
+    def sink(sink_name: str) -> _ExemplarOutput:
+        return {
+            "sink_name": sink_name,
+            "plugin": "json",
+            "options": {
+                "path": f"outputs/{sink_name}_parcels.json",
+                "format": "json",
+                "schema": {"mode": "fixed", "fields": list(fields)},
+                "mode": "write",
+                "collision_policy": "auto_increment",
+            },
+            "on_write_failure": "discard",
+        }
+
+    return {
+        "source": {
+            "plugin": "csv",
+            "on_success": "parcels",
+            # Fixed on both sides: the source declares every column of its own
+            # rows, so nothing undeclared can reach the fixed sinks. A flexible
+            # source feeding fixed sinks validates and then fails on the first
+            # row that carries an extra column.
+            "options": {"schema": {"mode": "fixed", "fields": list(fields)}},
+            "on_validation_failure": "discard",
+            "inline_blob": {
+                "filename": "parcels.csv",
+                "mime_type": "text/csv",
+                "content": _GATE_ROUTING_EXEMPLAR_CONTENT,
+                "description": "Literal rows the user pasted into chat",
+            },
+        },
+        "nodes": [
+            {
+                "id": "route_by_weight",
+                "node_type": "gate",
+                "input": "parcels",
+                "condition": "row['weight_kg'] >= 20",
+                "routes": {"true": "freight", "false": "courier"},
+            },
+        ],
+        "edges": [],
+        "outputs": [sink("freight"), sink("courier")],
+        "metadata": {
+            "name": "Route parcels by weight",
+            "description": "Send parcels of 20 kg or more to the freight output and the rest to the courier output.",
+        },
+    }
+
+
 # Payload memo keyed by plugin-policy snapshot hash. Plugin classes are static
 # per process; visibility, profile aliases and control bindings are covered by
 # the snapshot. Model catalogs are discovered on demand and are not memoized
@@ -2714,6 +2798,12 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
         aids["fork_row_union"] = {
             "rules": list(_FORK_ROW_UNION_RULES),
             "set_pipeline_exemplar": {"pipeline": fork_row_union},
+        }
+    gate_routing = gate_routing_exemplar_args(catalog, visible=visible)
+    if gate_routing is not None:
+        aids["gate_routing"] = {
+            "rules": list(_GATE_ROUTING_RULES),
+            "set_pipeline_exemplar": {"pipeline": gate_routing},
         }
     # Resolved before the llm aids because the on_error rule they carry is
     # control-mode conditional. ``_selected_control_profile`` returns None for

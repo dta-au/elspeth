@@ -1780,6 +1780,188 @@ class TestGovernedExecutionAdmission:
                 session_operation_context=_execute_lease().context,
             )
 
+    def _file_inject_approval_inputs(
+        self,
+        service: ExecutionServiceImpl,
+        options: dict[str, Any],
+        *,
+        blob_id: UUID,
+        content: bytes,
+        modality: CreationModality,
+        created_by: str = "user",
+    ) -> tuple[Any, Any, list[dict[str, Any]]]:
+        """Compile approval inputs for one ``file_inject`` node; returns (inputs, blob service, loaded configs)."""
+        session_id = uuid4()
+        service.set_openrouter_catalog_snapshot(sha256="b" * 64, source="bundled")
+        blob_service = create_autospec(BlobServiceProtocol, instance=True)
+        blob_service.get_blob.return_value = replace(
+            _blob_record_stub(
+                blob_id=blob_id,
+                session_id=session_id,
+                content_hash=hashlib.sha256(content).hexdigest(),
+                size_bytes=len(content),
+                mime_type="text/plain",
+                status="ready",
+                creation_modality=modality,
+            ),
+            created_by=created_by,
+        )
+        blob_service.read_blob_content.return_value = content
+        service._blob_service = blob_service
+        config = {
+            "source": {"plugin": "csv", "options": {}},
+            "transforms": [{"name": "inject", "plugin": "file_inject", "options": options}],
+        }
+        snapshot = service._plugin_snapshot_for_user("author", operation="approval test")
+        frozen = FrozenRunSettings(plugin_snapshot=snapshot, executable_config=config, audit_safe_config=config)
+        loaded: list[dict[str, Any]] = []
+
+        def load(config_dict: dict[str, Any], *, expand_env_vars: bool) -> _ModelCopyNamespace:
+            assert expand_env_vars is False
+            loaded.append(config_dict)
+            return _mock_pipeline_settings()
+
+        with (
+            patch("elspeth.web.execution.service.load_settings_from_config_dict", side_effect=load),
+            patch("elspeth.web.operator_telemetry.apply_operator_pipeline_telemetry", side_effect=lambda settings, _web: settings),
+            patch(
+                "elspeth.web.execution.export_marking.apply_operator_export_marking",
+                return_value=_mock_pipeline_settings().landscape.export,
+            ),
+            patch("elspeth.web.execution.service.audit_safe_resolved_config", side_effect=lambda *_args, **_kwargs: loaded[-1]),
+            patch("elspeth.web.execution.service.runtime_val_manifest_sha256", return_value="c" * 64),
+        ):
+            inputs = service._approval_inputs_from_frozen(
+                frozen,
+                user_id="author",
+                session_id=session_id,
+                session_operation_context=_execute_lease().context,
+            )
+        return inputs, blob_service, loaded
+
+    def test_approval_compilation_admits_user_uploaded_file_inject_content(self, service: ExecutionServiceImpl) -> None:
+        content = b"Check the totals.\n"
+        blob_id = uuid4()
+        marker = {"blob_ref": str(blob_id), "mode": "inline_content", "sha256": hashlib.sha256(content).hexdigest()}
+
+        _inputs, blob_service, loaded = self._file_inject_approval_inputs(
+            service,
+            {"files": {"invoice": {"content": marker, "format": "text"}}},
+            blob_id=blob_id,
+            content=content,
+            modality=CreationModality.VERBATIM,
+        )
+
+        assert loaded[0]["transforms"][0]["options"]["files"]["invoice"]["content"] == content.decode()
+        blob_service.read_blob_content.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        ("refused", "field_path"),
+        [
+            pytest.param("llm_authored_blob", "node:inject.options.files.invoice.content", id="llm_authored_blob"),
+            pytest.param("assistant_verbatim_blob", "node:inject.options.files.invoice.content", id="assistant_verbatim_blob"),
+            pytest.param("pipeline_output_blob", "node:inject.options.files.invoice.content", id="pipeline_output_blob"),
+            pytest.param("literal_content", "node:inject.options.files.invoice.content", id="literal_content"),
+            pytest.param("default_content", "node:inject.options.default_content", id="default_content"),
+        ],
+    )
+    def test_approval_compilation_refuses_file_inject_content_that_is_not_an_upload(
+        self, service: ExecutionServiceImpl, refused: str, field_path: str
+    ) -> None:
+        from elspeth.web.execution.service import InlineBlobPromptSurfaceAdmissionError
+
+        content = b"Check the totals.\n"
+        blob_id = uuid4()
+        marker = {"blob_ref": str(blob_id), "mode": "inline_content", "sha256": hashlib.sha256(content).hexdigest()}
+        options: dict[str, Any] = {"files": {"invoice": {"content": marker, "format": "text"}}}
+        modality = CreationModality.VERBATIM
+        created_by = "user"
+        if refused == "llm_authored_blob":
+            modality = CreationModality.LLM_GENERATED
+            created_by = "assistant"
+        elif refused == "assistant_verbatim_blob":
+            # A composer create_blob of the user's own words, or a fork copy of a planner blob.
+            created_by = "assistant"
+        elif refused == "pipeline_output_blob":
+            created_by = "pipeline"
+        elif refused == "literal_content":
+            options["files"]["invoice"]["content"] = "Planner-written guidance.\n"
+        else:
+            options["on_miss"] = "default"
+            options["default_content"] = "Planner-written fallback.\n"
+
+        with pytest.raises(InlineBlobPromptSurfaceAdmissionError) as caught:
+            self._file_inject_approval_inputs(service, options, blob_id=blob_id, content=content, modality=modality, created_by=created_by)
+
+        assert field_path in str(caught.value)
+        assert "Planner-written" not in str(caught.value)
+        service._blob_service.read_blob_content.assert_not_awaited()
+
+    @pytest.mark.parametrize("refused", ["literal_content", "default_content", "assistant_verbatim_blob"])
+    def test_governed_run_refuses_file_inject_content_that_is_not_an_upload(
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, refused: str
+    ) -> None:
+        """The governed arm: ``_run_pipeline`` reads the frozen executable config, not the YAML text."""
+        from elspeth.web.execution.service import InlineBlobPromptSurfaceAdmissionError
+
+        content = b"Check the totals.\n"
+        blob_id = uuid4()
+        owner_session = uuid4()
+        marker = {"blob_ref": str(blob_id), "mode": "inline_content", "sha256": hashlib.sha256(content).hexdigest()}
+        options: dict[str, Any] = {"files": {"invoice": {"content": marker, "format": "text"}}}
+        if refused == "literal_content":
+            options["files"]["invoice"]["content"] = "Planner-written guidance.\n"
+        elif refused == "default_content":
+            options["on_miss"] = "default"
+            options["default_content"] = "Planner-written fallback.\n"
+        config = {
+            "source": {"plugin": "csv", "options": {"path": "input.csv"}},
+            "transforms": [{"name": "inject", "plugin": "file_inject", "options": options}],
+            "sinks": {"primary": {"plugin": "json", "options": {"path": "output.jsonl"}}},
+        }
+        snapshot = service._plugin_snapshot_for_user("author", operation="governed run test")
+        frozen = FrozenRunSettings(plugin_snapshot=snapshot, executable_config=config, audit_safe_config=config)
+        mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=owner_session)
+        blob_service = create_autospec(BlobServiceProtocol, instance=True)
+        blob_service.get_blob.return_value = replace(
+            _blob_record_stub(
+                blob_id=blob_id,
+                session_id=owner_session,
+                content_hash=hashlib.sha256(content).hexdigest(),
+                size_bytes=len(content),
+                mime_type="text/plain",
+                status="ready",
+                creation_modality=CreationModality.VERBATIM,
+            ),
+            created_by="assistant" if refused == "assistant_verbatim_blob" else "user",
+        )
+        service._blob_service = blob_service
+
+        with (
+            patch("elspeth.web.execution.service.Orchestrator") as orchestrator,
+            patch("elspeth.web.execution.service.load_settings_from_config_dict") as load,
+            patch("elspeth.web.execution.service.open_landscape_db"),
+            patch("elspeth.web.execution.service.FilesystemPayloadStore"),
+            pytest.raises(InlineBlobPromptSurfaceAdmissionError) as caught,
+        ):
+            service._run_pipeline(
+                str(uuid4()),
+                # Deliberately not the refused pipeline: the governed arm must judge the frozen config.
+                json.dumps({"source": {"plugin": "csv", "options": {}}, "sinks": {}}),
+                threading.Event(),
+                frozen,
+                "author",
+                session_operation_lease=_execute_lease(),
+            )
+
+        expected_path = "default_content" if refused == "default_content" else "files.invoice.content"
+        assert f"node:inject.options.{expected_path}" in str(caught.value)
+        assert "Planner-written" not in str(caught.value)
+        blob_service.link_blob_to_run.assert_not_awaited()
+        blob_service.read_blob_content.assert_not_awaited()
+        load.assert_not_called()
+        orchestrator.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_missing_approval_refuses_before_run_creation(
         self, service: ExecutionServiceImpl, mock_session_service: MagicMock, tmp_path: Path, execution_fixture: ExecutionTestCustody

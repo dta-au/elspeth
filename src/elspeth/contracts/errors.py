@@ -644,6 +644,9 @@ TransformErrorCategory = Literal[
     # reference_join: the row key was absent from the reference table, or an
     # output path did not resolve against the entry that matched.
     "reference_miss",
+    # file_inject (mode select): the row's key value names no files entry and
+    # on_miss is fail.
+    "file_inject_miss",
 ]
 
 

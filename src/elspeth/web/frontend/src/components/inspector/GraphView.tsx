@@ -52,8 +52,8 @@ import {
   FAN_IN_NODE_TYPES,
 } from "@/lib/graphTopology";
 import { plural } from "@/utils/plural";
-import { BADGE_COLORS, BADGE_BACKGROUNDS, EDGE_COLORS, EDGE_LABEL_COLOR, VALIDATION_COLORS } from "@/styles/tokens";
-import { Button, Icon, TypeBadge } from "@/components/ui";
+import { BADGE_COLORS, BADGE_BACKGROUNDS, EDGE_COLORS, EDGE_LABEL_COLOR, NODE_BORDER_COLOR, SELECTED_RING_COLOR, VALIDATION_COLORS } from "@/styles/tokens";
+import { Button, Icon, Input, TypeBadge } from "@/components/ui";
 import { pluginDisplayName } from "@/components/catalog/pluginDisplayName";
 import { llmBindingLabel } from "@/lib/llmBindingLabel";
 import type { CompositionState } from "@/types/index";
@@ -66,6 +66,12 @@ import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 
 const NODE_WIDTH = 260;
 const NODE_HEIGHT = 80;
+// ARGOnite: selection is a solid 2px ring set off from the card by a 2px gap
+// in the graph well's colour, the same gap-ring shape as the focus ring
+// (final review I5). Selected and valid greens are close in tone, so the gap
+// and the 4px reach (the pre-ARGOnite outer extent) carry selection, not hue.
+// Shared by selected nodes and a selected route's endpoints.
+const SELECTED_NODE_RING = `0 0 0 2px var(--color-well), 0 0 0 4px ${SELECTED_RING_COLOR}`;
 const FALLBACK_MINIMAP_NODE_COLOR_VAR = "--color-text-muted";
 const MINIMAP_NODE_STROKE_COLOR_VAR = "--color-border-strong";
 // Interim UX threshold: avoid MiniMap noise on small graphs until we can
@@ -1103,24 +1109,37 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
       // ring, which paints outside the border box and costs no layout. That is
       // the idiom the selection state already used for its outer halo, so
       // selection now uses it for its whole emphasis rather than half of it.
-      // Selection ring takes priority over the validation ring.
-      const ringColor = isSelected
-        ? "var(--color-selected-ring)"
-        : validationStatus === "error"
+      const validationColor =
+        validationStatus === "error"
           ? VALIDATION_COLORS.invalid
           : validationStatus === "warning"
             ? VALIDATION_COLORS.warning
             : validationStatus === "valid"
               ? VALIDATION_COLORS.valid
               : null;
-      const borderStyle = `1px solid ${ringColor ?? "var(--color-border-strong)"}`;
-      // Selection keeps its heavier 3px halo; validation matches the 2px total
-      // weight the old 2px border drew, as 1px border + 1px ring.
+      // The border keeps the validation colour when the node is selected:
+      // selection is the gap ring outside the box, and the selected green is
+      // close to the valid green, so a selected error or warning node that
+      // took the selection colour on its border would read as valid. Only an
+      // unvalidated selected node takes the selection colour on its border.
+      // This matches a selected route's endpoints (renderedNodes below),
+      // which swap the ring and leave the border alone.
+      const borderColor =
+        validationColor ?? (isSelected ? SELECTED_RING_COLOR : null);
+      // ARGOnite: the resting edge is the node-border role (>= 3:1 on the
+      // graph well), so the card never relies on its shadow for a boundary.
+      const borderStyle = `1px solid ${borderColor ?? NODE_BORDER_COLOR}`;
+      // ARGOnite: selection is the gap ring (SELECTED_NODE_RING above), far
+      // heavier than the 1px validation ring, which it replaces. The ring
+      // layers come first so they paint over the card's soft drop shadow.
       const ringShadow = isSelected
-        ? "0 0 0 3px var(--color-selected-ring)"
-        : ringColor
-          ? `0 0 0 1px ${ringColor}`
+        ? SELECTED_NODE_RING
+        : validationColor
+          ? `0 0 0 1px ${validationColor}`
           : undefined;
+      const cardShadow = ringShadow
+        ? `${ringShadow}, var(--shadow-card)`
+        : "var(--shadow-card)";
 
       return {
         id,
@@ -1177,21 +1196,26 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
           ),
         },
         position: { x: 0, y: 0 },
+        // ARGOnite: forced colours drops the box-shadow selection ring, so
+        // selection also carries a class (outline in themes.css).
+        className: isSelected ? "graph-node--selected" : undefined,
         style: {
           backgroundColor: "var(--color-surface-elevated)",
           border: borderStyle,
           // The card corner reads the token, not a raw 8 (elspeth-37cc8b5310):
           // the literal was invisible to the radius system, so a retune of the
-          // card rank could never reach the graph. --radius-lg is that rank,
-          // and .graph-config-panel (inspector.css) rounds at the same token
-          // so the panel floating over these cards can never round SHARPER
-          // than they do. Pinned by inspectorPanelContracts.test.ts.
-          borderRadius: "var(--radius-lg)",
+          // card rank could never reach the graph. --radius-node is that rank
+          // (ARGOnite: nodes 14px), and .graph-config-panel (inspector.css)
+          // rounds at the same token so the panel floating over these cards
+          // can never round SHARPER than they do. Pinned by
+          // inspectorPanelContracts.test.ts.
+          borderRadius: "var(--radius-node)",
           width: NODE_WIDTH,
           height: NODE_HEIGHT,
           padding: 0,
-          // The whole selection / validation emphasis (see ringShadow above).
-          boxShadow: ringShadow,
+          // The selection / validation emphasis (see ringShadow above) over
+          // the ARGOnite raised-card shadow.
+          boxShadow: cardShadow,
           cursor: "pointer",
         },
       };
@@ -2051,8 +2075,10 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
     zIndex: edge.id === activeEdge?.id ? 10 : 0,
     style: edge.id === activeEdge?.id ? { ...edge.style, strokeWidth: 4 } : edge.style,
   }));
+  // ARGOnite: a selected route's endpoints take the same gap ring as a
+  // selected node, over the card shadow.
   const renderedNodes = visibleGraph.nodes.map((node) => activeEdge && (node.id === activeEdge.source || node.id === activeEdge.target)
-    ? { ...node, style: { ...node.style, boxShadow: "0 0 0 3px var(--color-selected-ring)" } }
+    ? { ...node, className: "graph-node--selected", style: { ...node.style, boxShadow: `${SELECTED_NODE_RING}, var(--shadow-card)` } }
     : node);
 
   // Accessible, keyboard-operable equivalent of the visual DAG. The React Flow
@@ -2180,9 +2206,24 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
         className="graph-view-shell"
       >
         <div className="graph-view-toolbar">
-          <Button compact aria-pressed={showFailureRoutes} onClick={() => setShowFailureRoutes((shown) => !shown)}>
-            {showFailureRoutes ? "Hide" : "Show"} quarantine and discard routes
-          </Button>
+          {/* ARGOnite: the shared .switch primitive (shared.css) with one fixed
+              label; checked means the routes are shown (design doc
+              "Controls"). A native checkbox toggles on Space. The ui Input
+              omits .input chrome for checkbox types, so only .switch-input
+              styles it. */}
+          <label className="switch">
+            <Input
+              type="checkbox"
+              role="switch"
+              className="switch-input"
+              checked={showFailureRoutes}
+              onChange={() => setShowFailureRoutes((shown) => !shown)}
+            />
+            <span className="switch-track" aria-hidden="true">
+              <span className="switch-thumb" />
+            </span>
+            <span className="switch-label">Show quarantine and discard routes</span>
+          </label>
         </div>
         {/* Accessible + keyboard-operable equivalent of the visual DAG.
             The diagram below stays role="img" (a visual diagram); THIS list is

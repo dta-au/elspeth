@@ -353,8 +353,15 @@ class SpawnedProcessAtSeam:
             raise AssertionError(f"child exited with code {exitcode} before reaching process seam {self._seam!s}")
 
         evidence = self._diagnostics.snapshot(self._process)
-        self.close()
-        raise AssertionError(f"child did not reach process seam {self._seam!s} within {timeout:.3f}s\n{evidence}")
+        readiness_failure = AssertionError(f"child did not reach process seam {self._seam!s} within {timeout:.3f}s\n{evidence}")
+        try:
+            self.close()
+        except AssertionError as cleanup_failure:
+            # A child that outlives the cleanup ladder must not replace the
+            # readiness evidence captured above: that snapshot is the only
+            # record of where the child was when the wait expired.
+            readiness_failure.add_note(str(cleanup_failure))
+        raise readiness_failure
 
     def kill(self) -> None:
         """Abruptly terminate the child (SIGKILL on POSIX)."""
@@ -404,7 +411,12 @@ class SpawnedProcessAtSeam:
             self._process.kill()
             self._process.join(timeout=_PROCESS_CLEANUP_JOIN_SECONDS)
         if self._process.is_alive():
-            raise AssertionError(f"could not clean up child at process seam {self._seam!s}")
+            try:
+                evidence = self._diagnostics.snapshot(self._process)
+            except OSError as snapshot_failure:
+                # Evidence is best effort: it must never displace the failure.
+                evidence = f"snapshot unavailable: {snapshot_failure!r}"
+            raise AssertionError(f"could not clean up child at process seam {self._seam!s}\n{evidence}")
         self._ready_reader.close()
         self._release_writer.close()
         self._process.close()

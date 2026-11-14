@@ -20,6 +20,8 @@ export function TutorialWorkspaceFrame({
   ariaLabel: string;
   header: TutorialStepHeaderProps;
   children: ReactNode;
+  // The stub leaves out the panes, so the pane title has nowhere to render.
+  authoringTitle?: string;
 }): JSX.Element {
   return (
     <section data-testid="tutorial-workspace-frame" aria-label={ariaLabel}>

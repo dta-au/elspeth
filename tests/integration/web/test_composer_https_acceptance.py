@@ -60,7 +60,11 @@ def test_tls_instrument_requires_body_before_completion(tmp_path: Path, buffered
             release.set()
 
 
-@pytest.mark.parametrize("idle_cutoff", [False, True], ids=["client-detach", "proxy-idle-cutoff"])
+@pytest.mark.parametrize(
+    "idle_cutoff",
+    [pytest.param(False, marks=pytest.mark.timing_sensitive), True],
+    ids=["client-detach", "proxy-idle-cutoff"],
+)
 def test_production_operation_survives_tls_disconnect_without_provider_replay(tmp_path: Path, idle_cutoff: bool) -> None:
     """Socket observation detaches while the real app-owned job stays running."""
     import time

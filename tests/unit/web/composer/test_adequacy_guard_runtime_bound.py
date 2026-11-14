@@ -16,11 +16,14 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from elspeth.web.composer.redaction import MANIFEST
 
 from ._adequacy_helpers import compute_manifest_snapshot
 
 
+@pytest.mark.timing_sensitive
 def test_adequacy_guard_completes_in_under_5_seconds() -> None:
     """Closes plan-review M4: compute_manifest_snapshot finishes under 5s.
 

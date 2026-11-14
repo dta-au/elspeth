@@ -64,6 +64,7 @@ These examples run locally with no credentials or external services.
 | [`transform_pipeline`](transform_pipeline/) | Normalize CSV field types, then compute derived values with `type_coerce` and `value_transform` |
 | [`reference_join`](reference_join/) | Enrich a row from a keyed reference table bound as configuration; three configs — flat CSV, nested JSON with a sparse entry, and the default `on_miss: fail` quarantining an unknown key (exit 1 by design) |
 | [`reference_join_chain`](reference_join_chain/) | One `reference_join` node: customer lookup produces a region, then the next internal lookup consumes it to select a support policy; original-row quarantine on either miss |
+| [`file_inject`](file_inject/) | Write the whole content of files bound as configuration into row fields; three configs — `select` one file per row by its `type` (a text, a JSON and a CSV file, so all three value shapes appear), `all` files on every row, and the default `on_miss: fail` routing a row whose type has no entry (exit 1 by design) |
 | [`database_sink`](database_sink/) | Write pipeline output to SQLite via `./examples/database_sink/run.sh`, which provisions the operator-owned target and effect ledger |
 | [`checkpoint_resume`](checkpoint_resume/) | Crash recovery via checkpointing and `elspeth resume` |
 | [`retention_purge`](retention_purge/) | Payload retention lifecycle and `elspeth purge` |

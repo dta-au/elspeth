@@ -153,8 +153,11 @@ def _output_rows(path: Path) -> list[dict[str, Any]]:
     return sorted((json.loads(line) for line in path.read_text().splitlines()), key=json.dumps)
 
 
-@pytest.mark.parametrize("seam", _SEAMS)
-@pytest.mark.parametrize("output_mode", ["passthrough", "transform"])
+@pytest.mark.parametrize(
+    ("output_mode", "seam"),
+    [(output_mode, seam) for output_mode in ("passthrough", "transform") for seam in _SEAMS],
+)
+@pytest.mark.timing_sensitive
 def test_a_killed_release_into_a_scope_opener_resumes_to_the_uncrashed_outcome(tmp_path: Path, output_mode: str, seam: str) -> None:
     control_env = build_pipeline(tmp_path / "control", _scope_pipeline(output_mode), _DOCUMENTS["two"])
     assert run_pipeline(control_env).status is RunStatus.COMPLETED

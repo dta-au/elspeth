@@ -49,6 +49,7 @@ from elspeth.plugins.infrastructure.base import BaseSink, BaseSource, BaseTransf
 from elspeth.plugins.infrastructure.discovery import discover_all_plugins
 from elspeth.plugins.infrastructure.runtime_factory import PluginBundle, instantiate_plugins_from_config
 from elspeth.plugins.sinks.database_sink import database_effect_ledger_table
+from tests.fixtures.catalog_reference import materialize_example_file_options
 from tests.fixtures.pdf_documents import minimal_pdf
 from tests.fixtures.power_automate import READ_URL, WRITE_URL, DurablePowerAutomateFlow, pipeline_settings
 
@@ -165,6 +166,7 @@ def _rows_for(plugin_key: str) -> list[dict[str, object]]:
         "transform:blob_text_expand": [{"blob_ref": "filled-by-harness"}],
         "transform:blob_fetch": [{"document_url": "filled-by-harness"}],
         "transform:field_mapper": [{"id": 1, "applicant": "Ada", "notes": "ok"}],
+        "transform:file_inject": [{"document_kind": "invoice"}],
         "transform:json_explode": [{"items": ["a", "b"]}],
         "transform:keyword_filter": [{"notes": "public material"}],
         "transform:line_explode": [{"content": "alpha\nbeta"}],
@@ -217,6 +219,10 @@ def _materialize_pipeline(
         section = cast("dict[str, dict[str, Any]]", flow_settings["sources" if kind == "source" else "sinks"])
         options = dict(section["records" if kind == "source" else "publish"]["options"])
         options["auth"] = {"method": "sas_url", "trigger_url_secret": READ_URL if kind == "source" else WRITE_URL}
+
+    # An example that binds files names them beside a settings file; the
+    # in-memory loader used below has none, so they are bound here first.
+    options = materialize_example_file_options(plugin_name, options, tmp_path / "bound_files")
 
     if case.plugin_key == "source:csv":
         source_path = tmp_path / "input.csv"
@@ -437,7 +443,7 @@ def _stop_server(server: multiprocessing.Process | None) -> None:
 
 def test_local_lifecycle_cases_cover_the_exact_reviewed_subject_set() -> None:
     assert tuple(case.plugin_key for case in LOCAL_LIFECYCLE_CASES) == _reviewed_local_subjects()
-    assert len(LOCAL_LIFECYCLE_CASES) == 42
+    assert len(LOCAL_LIFECYCLE_CASES) == 43
     assert {case.profile_case for case in LOCAL_LIFECYCLE_CASES} == {SQLITE_SINGLE_LEADER}
 
 

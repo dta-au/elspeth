@@ -282,3 +282,18 @@ describe("forced-colors tutorial progress states (elspeth-44dc95153e)", () => {
     );
   });
 });
+
+describe("ARGOnite material tiers (card, pill, track)", () => {
+  // These tiers are multi-layer, so the single-layer slice-before-first-rgba
+  // helper above would only compare layer one. Blank every colour function
+  // instead and compare the remaining offsets, blurs and `inset` keywords.
+  const geometryOf = (value: string): string => value.replace(/rgba?\([^)]*\)/g, "C");
+
+  it("ARGOnite material tiers change only colour between themes", () => {
+    for (const tier of ["--shadow-card", "--shadow-pill", "--shadow-track"]) {
+      const dark = geometryOf(token("dark", tier));
+      expect(dark, `${tier} should have colour layers`).toContain("C");
+      expect(geometryOf(token("light", tier)), `${tier} geometry must match dark`).toBe(dark);
+    }
+  });
+});

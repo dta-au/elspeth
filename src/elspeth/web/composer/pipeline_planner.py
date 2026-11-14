@@ -174,6 +174,7 @@ from elspeth.web.composer.tools._common import (
 )
 from elspeth.web.composer.tools._dispatch import _schema_violation_loc, execute_discovery_tool_with_context
 from elspeth.web.composer.tools._generation_schema_response import AdmittedPluginSchemaResponse
+from elspeth.web.composer.tools.blobs import BlobIdArgumentsModel
 from elspeth.web.composer.tools.generation import (
     _CLOSED_VALIDATION_ERROR_CODES,
     EXPLAIN_VALIDATION_ERROR_GUIDANCE,
@@ -182,6 +183,7 @@ from elspeth.web.composer.tools.generation import (
 )
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema, canonical_set_pipeline_validator
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate, canonicalize_authored_node_review_requirements
+from elspeth.web.composer.tools.sources import InspectSourceArgumentsModel
 from elspeth.web.composer.tools.wire_projection import (
     _WIRE_TOOL_DEFS,
     decode_wire_arguments,
@@ -197,6 +199,7 @@ from elspeth.web.credential_guard import (
     require_no_credential_material_in_tool_wire,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.resource_identity import canonical_resource_uuid
 from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
 from elspeth.web.sessions.protocol import SessionOperationAuthority, SessionServiceProtocol
 
@@ -438,23 +441,41 @@ def _tool_information_keys(name: str, arguments: Mapping[str, Any]) -> tuple[str
     if name == "list_composer_blobs":
         return ("blob.index.composer",)
     if name == "get_blob_metadata":
-        blob_id = arguments["blob_id"] if "blob_id" in arguments else None
+        try:
+            metadata = BlobIdArgumentsModel.model_validate(deep_thaw(arguments))
+        except PydanticValidationError:
+            return ()
+        blob_id = canonical_resource_uuid(metadata.blob_id)
+        if blob_id is None:
+            return ()
         return (f"blob.metadata:{blob_id}",)
     if name == "inspect_source":
-        blob_id = arguments["blob_id"] if "blob_id" in arguments else None
+        try:
+            inspection = InspectSourceArgumentsModel.model_validate(deep_thaw(arguments))
+        except PydanticValidationError:
+            return ()
+        blob_id = canonical_resource_uuid(inspection.blob_id)
+        if blob_id is None:
+            return ()
         return (f"blob.inspection:{blob_id}",)
     if name == "get_blob_content":
         try:
             page = GetBlobContentArgumentsModel.model_validate(deep_thaw(arguments))
         except PydanticValidationError:
             return ()
-        return ("blob.content:" + canonical_json((page.blob_id, page.offset_chars, page.expected_content_hash)),)
+        blob_id = canonical_resource_uuid(page.blob_id)
+        if blob_id is None:
+            return ()
+        return ("blob.content:" + canonical_json((blob_id, page.offset_chars, page.expected_content_hash)),)
     if name == "read_attachment":
         try:
             attachment = ReadAttachmentArgumentsModel.model_validate(deep_thaw(arguments))
         except PydanticValidationError:
             return ()
-        return ("blob.attachment:" + canonical_json((attachment.blob_id, attachment.expected_content_hash)),)
+        blob_id = canonical_resource_uuid(attachment.blob_id)
+        if blob_id is None:
+            return ()
+        return ("blob.attachment:" + canonical_json((blob_id, attachment.expected_content_hash)),)
     if name == "list_secret_refs":
         return ("secret.index",)
     if name == "validate_secret_ref":
@@ -1942,12 +1963,23 @@ _SELECTED_SCHEMA_CONTRACTS_BUDGET_BYTES: Final[int] = 48 * 1024
 # The terminal instruction rides every planner request.
 PLANNER_TERMINAL_INSTRUCTION: Final[str] = (
     "Use read-only discovery as needed in earlier turns, then call emit_pipeline_proposal "
-    "alone in its turn with one complete canonical set_pipeline argument object. Never "
+    "alone in its turn with one complete canonical set_pipeline argument object: pipeline is a JSON "
+    "object, never a JSON-encoded string, and carries exactly one of source or sources. Never "
     "batch it with discovery or another call: a mixed terminal batch executes no calls. "
     "After a rejection, repair and resubmit the complete proposal. At any stage, you may instead call "
     "handoff_to_user or restore_parked_graph alone with your message to end authoring and talk to the user. "
     "You may also reply in plain text to explain, ask a question, or decline. "
-    "Conversational exits need no discovery, candidate capture or validation."
+    "Conversational exits need no discovery, candidate capture or validation. "
+    "This is the proposal-only surface: your palette is read-only discovery, the two recovery tools and "
+    "emit_pipeline_proposal, and nothing is saved until a proposal is accepted. Where the shared rules name "
+    "set_pipeline, apply them to emit_pipeline_proposal. You have no mutation tool (set_source, upsert_node, "
+    "patch_node_options, create_blob), no request_interpretation_review, no request_advisor_hint and no "
+    "applied_component echo: skip any step that calls one, and do not look for it. Author vague_term and "
+    "registered pipeline_decision rows inside the proposal's node options; never author invented_source, "
+    "llm_prompt_template, llm_model_choice or source_data_contract rows, which the server stages. Review cards "
+    "are surfaced from the accepted proposal. A rejected proposal returns success false with validation.errors; "
+    "each entry names its component and error_code and may carry explanation, suggested_fix, detail and "
+    "plugin_contracts. Repair from those fields."
 )
 
 
@@ -2739,6 +2771,41 @@ def _schema_violation_component_ref(parts: Sequence[Any]) -> str | None:
     return None
 
 
+def _exclusive_required_detail(alternatives: object) -> str | None:
+    """Say which keys a ``oneOf`` of bare ``required`` alternatives chooses between.
+
+    A root ``oneOf`` violation names only ``pipeline``: a candidate carrying
+    both ``source`` and an empty ``sources`` map, or neither, got back a rule
+    name with nothing to repair. The names come from the owned schema's own
+    alternatives, never from the rejected document.
+    """
+    if type(alternatives) is not list or len(alternatives) < 2:
+        return None
+    names: list[str] = []
+    for alternative in alternatives:
+        if type(alternative) is not dict or set(alternative) != {"required"}:
+            return None
+        required = alternative["required"]
+        if type(required) is not list or len(required) != 1 or type(required[0]) is not str:
+            return None
+        names.append(required[0])
+    return "Supply exactly one of " + ", ".join(names) + " and omit the other key entirely, even as an empty value."
+
+
+def _terminal_payload_shape_violations(pipeline: object) -> tuple[_SchemaViolation, ...]:
+    """Locate a terminal payload whose ``pipeline`` member is not an object.
+
+    Providers have returned the whole document as one JSON-encoded string. The
+    bare ``canonical_schema`` code gave them nothing to repair, so they resent
+    the same string until the repair budget was spent. The violation is
+    value-free: it names the member, the rule and the expected type only.
+    """
+    violation: _SchemaViolation = {"path": "pipeline", "rule": "type", "constraint": "object"}
+    if type(pipeline) is str:
+        violation["detail"] = "pipeline must be a JSON object, not a JSON-encoded string."
+    return (violation,)
+
+
 def _structural_schema_violations(errors: Iterable[Any]) -> tuple[list[_SchemaViolation], int]:
     """Project JSON-Schema errors into located, value-free repair facts.
 
@@ -2772,6 +2839,10 @@ def _structural_schema_violations(errors: Iterable[Any]) -> tuple[list[_SchemaVi
             constraint = error.validator_value
             if type(constraint) is str or type(constraint) is int:
                 violation["constraint"] = constraint
+            if error.validator == "oneOf":
+                exclusive_detail = _exclusive_required_detail(constraint)
+                if exclusive_detail is not None:
+                    violation["detail"] = exclusive_detail
             violations.append(violation)
     return violations, withheld
 
@@ -3897,7 +3968,7 @@ async def _plan_pipeline_inner(
                 response,
                 namespace=private_response_namespace,
                 ordinal=ordinal,
-                known_tools=frozenset(_WIRE_TOOL_DEFS[effective_dialect]) | {_TERMINAL_TOOL_NAME},
+                known_tools=frozenset(_WIRE_TOOL_DEFS[effective_dialect]) | {_TERMINAL_TOOL_NAME} | frozenset(PLANNER_RECOVERY_TOOL_NAMES),
             )
 
             def record_response_call(
@@ -4486,7 +4557,7 @@ async def _plan_pipeline_inner(
                 try:
                     payload = _PlannerTerminalPayload.model_validate(deep_thaw(call.arguments))
                 except ValueError:
-                    terminal_feedback = _canonical_schema_feedback()
+                    terminal_feedback = _canonical_schema_feedback(_terminal_payload_shape_violations(call.arguments["pipeline"]))
                 else:
                     schema_errors = (
                         [] if payload.pipeline is None else list(canonical_set_pipeline_validator().iter_errors(payload.pipeline))

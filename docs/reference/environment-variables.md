@@ -273,8 +273,22 @@ ELSPETH_WEB__COMPOSER_ALLOW_SAME_ADVISOR_MODEL=true
 Restart the web service after changing these settings.
 
 Composer and advisor also require independently configured authoring prompt
-guards. See [Composer prompt guard](composer-prompt-guard.md) for the Azure
-endpoint/credential objects and the explicit development mode.
+guards:
+
+| Variable | Purpose |
+| --- | --- |
+| `ELSPETH_WEB__COMPOSER_PROMPT_GUARD` | JSON object configuring the guard for primary Composer requests. Supply it through secret injection. |
+| `ELSPETH_WEB__COMPOSER_ADVISOR_PROMPT_GUARD` | The same, independently, for advisor requests. |
+| `ELSPETH_WEB__COMPOSER_PROMPT_GUARD_MODE` | `required` (default): protected authoring is refused while a guard is not configured. `debug-when-unconfigured`: authoring proceeds without a guard and each request is recorded as `debug_bypass`. |
+
+`debug-when-unconfigured` is for development and debugging only. Authoring is
+unprotected while it applies, so do not set it in production. It takes effect
+only for a role whose guard is not configured: it never bypasses a configured
+guard's block, timeout, service failure or invalid response. To debug without
+a guard on a deployment that has one, clear that role's object (a literal JSON
+`null`) as well as setting the mode. Restart the web service after changing
+either. See [Composer prompt guard](composer-prompt-guard.md) for the
+endpoint/credential objects and the failure behaviour.
 
 Composer credentials come from the web process environment, keyed by the
 inferred provider. Both the primary and the advisor contract must be

@@ -54,8 +54,9 @@ All work must be done inside the project folder inside the project root or a wor
 
 ```bash
 source .venv/bin/activate      # uv-managed venv (Python 3.12+)
-pytest tests/                  # default selection (~20 min at -n 12) = what CI's "Test" job runs; it EXCLUDES the PostgreSQL testcontainer suites
+pytest tests/                  # default selection (~20 min at -n 12) = what CI's "Test" job runs; EXCLUDES testcontainer and timing_sensitive
 pytest tests/ -m testcontainer -n 0   # CI's required "Testcontainer" job (Docker, serial); never part of the default run
+pytest tests/ -m timing_sensitive -n 0   # CI's required timing-sensitive job (serial); never part of the default run
 pytest tests/path::test -n 0   # ONE test: -n 0 disables the default 12 workers (needed for pdb / -s)
 ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing \
   elspeth-lints check --rules all --root src/elspeth   # keyless operator trust-tier diagnostic
@@ -95,7 +96,7 @@ working around it.
   base range, rerere, the HMAC key in the environment, and that
   `elspeth.__file__` resolves inside this tree. Exit 1 on any FAIL. `--fetch`
   is its only write.
-- `scripts/full-suite-gate.sh [--execute [--detach]] [--stages ruff,mypy,contracts,lints,pytest,testcontainer] [--root DIR] [--log-dir DIR]`
+- `scripts/full-suite-gate.sh [--execute [--detach]] [--stages ruff,mypy,contracts,lints,pytest,timing,testcontainer] [--root DIR] [--log-dir DIR]`
   runs the pre-merge gate as CI runs it: one log per stage, every exit code
   written to `summary.txt`, the tree state hashed before and after
   (`frozen=NO` means the run is not evidence), provenance proved with both
@@ -140,6 +141,11 @@ working around it.
   selection in the required `Testcontainer (PostgreSQL contention proofs)` job
   of `.github/workflows/ci.yaml`; it is the gate for the ids the default run
   never sees.
+- The default selection also deselects `timing_sensitive`, so a green
+  `pytest tests/` does NOT cover those tests. Run
+  `pytest tests/ -m timing_sensitive -n 0` serially, as the separate required
+  `timing-sensitive` CI job does. These tests assert wall-clock deadlines or
+  spawn and kill real processes and can fail under host contention.
 - A handful of process-death / peer-lease / resume tests are FLAKY under
   parallelism (elspeth-0077cb7789): two runs of identical code produced
   DISJOINT failure sets, all passing serially. Before blaming your change for

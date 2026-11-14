@@ -303,6 +303,95 @@ async def test_empty_build_stages_one_canonical_pipeline_proposal_for_both_trust
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("trust_mode", ["explicit_approve", "auto_commit"])
+async def test_second_empty_build_while_a_proposal_is_pending_stages_no_second_proposal_under_explicit_approval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    trust_mode: str,
+) -> None:
+    """The planner must not add a same-base sibling to a pending proposal the user has not decided.
+
+    The provider still plans the second request and its audit persists; only
+    the publication is refused. ``auto_commit`` keeps its existing behaviour.
+    """
+    engine = create_session_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="planner-user")
+        grant_test_pipeline_user(conn, identity_id="planner-user")
+    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    session = await sessions.create_session("planner-user", "Planner", "local")
+    await sessions.update_composer_preferences(session.id, trust_mode="explicit_approve", density_default="high", actor="test")
+    settings = WebSettings(
+        data_dir=tmp_path,
+        composer_model="test/planner",
+        composer_boot_probe_enabled=False,
+        composer_prompt_guard_mode="debug-when-unconfigured",
+        composer_max_composition_turns=3,
+        composer_max_discovery_turns=2,
+        composer_timeout_seconds=20.0,
+        composer_rate_limit_per_minute=10,
+        shareable_link_signing_key=b"\x00" * 32,
+    )
+    monkeypatch.setattr(
+        "elspeth.web.composer.service.compute_availability",
+        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+    )
+    composer = ComposerServiceImpl.for_trained_operator(
+        create_catalog_service(),
+        settings,
+        sessions_service=sessions,
+        session_engine=engine,
+    )
+    requests: list[dict[str, Any]] = []
+
+    async def completion(**kwargs: Any) -> _Response:
+        requests.append(kwargs)
+        response = _terminal_response(tmp_path, str(session.id))
+        # A real provider issues a fresh tool-call id for every completion.
+        calls = response.choices[0].message.tool_calls
+        calls[0] = _ToolCall(id=f"freeform-terminal-{len(requests)}", function=calls[0].function)
+        return response
+
+    monkeypatch.setattr("litellm.acompletion", completion)
+
+    async def build(text: str) -> Any:
+        user_message = await sessions.add_message(session.id, "user", text, writer_principal="route_user_message")
+        return await composer.compose(
+            text,
+            [],
+            _empty_state(),
+            session_id=str(session.id),
+            current_state_id=None,
+            user_id="planner-user",
+            user_message_id=str(user_message.id),
+        )
+
+    await build("Build a CSV to JSONL pipeline.")
+    (first,) = await sessions.list_composition_proposals(session.id, status="pending")
+    if trust_mode == "auto_commit":
+        await sessions.update_composer_preferences(session.id, trust_mode="auto_commit", density_default="high", actor="test")
+
+    second = await build("Build it again, the same way.")
+
+    # The provider planned both requests: the refusal never replaces the planner.
+    assert len(requests) == 2
+    pending = await sessions.list_composition_proposals(session.id, status="pending")
+    if trust_mode == "explicit_approve":
+        assert [proposal.id for proposal in pending] == [first.id]
+        assert str(first.id) in second.message
+        assert "was not recorded" in second.message
+        assert second.pipeline_commit_intent is None
+    else:
+        assert len(pending) == 2
+    assert second.state == _empty_state()
+
+
+@pytest.mark.asyncio
 async def test_planner_llm_call_audit_persists_the_served_endpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

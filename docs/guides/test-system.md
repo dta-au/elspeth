@@ -23,7 +23,10 @@ Default behavior:
 - `src` and `elspeth-lints/src` are on `pythonpath`.
 - Strict marker and strict config checks are enabled.
 - The default run excludes `slow`, `stress`, `performance`, `testcontainer`,
-  and `live_provider` tests. It is the selection CI's `Test` job runs.
+  `live_provider`, and `timing_sensitive` tests. It is the selection CI's
+  `Test` job runs. A green `pytest tests/` does NOT cover `timing_sensitive`
+  tests; run `pytest tests/ -m timing_sensitive -n 0` serially, as the separate
+  required `timing-sensitive` CI job does.
 - The `testcontainer` tests (real PostgreSQL 16 via testcontainers-python,
   Docker required) run in CI in their own required job,
   `Testcontainer (PostgreSQL contention proofs)` in
@@ -54,6 +57,7 @@ python -m pytest tests/property
 python -m pytest tests/e2e -m e2e
 python -m pytest -m "performance or stress"
 python -m pytest tests/ -m testcontainer -n 0
+python -m pytest tests/ -m timing_sensitive -n 0
 python -m pytest --collect-only -q
 ```
 
@@ -95,6 +99,7 @@ Registered markers include:
 - `composer_llm_eval`
 - `chaosllm`
 - `testcontainer`
+- `timing_sensitive`
 - `fingerprint_baseline`
 
 `tests/conftest.py` also auto-applies `e2e`, `performance`, and `stress`

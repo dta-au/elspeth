@@ -2086,10 +2086,11 @@ def _semantic_failure_cases(tmp_path: Path) -> list[tuple[str, dict[str, Any], T
             "Node 'classify': set_pipeline options.interpretation_requirements[0] includes resolver-owned status "
             "'resolved'. Composer tool input may stage pending review requirements only. Omit resolver-owned fields "
             "and retry set_pipeline with exactly kind, user_term, and draft, with optional display_title "
-            "(a non-empty string of at most 200 characters). When request_interpretation_review is offered, "
-            "call it for an authorable staged site. On a proposal-only surface, include pending requirements "
-            "in the complete proposal instead. Backend-owned review kinds are surfaced automatically. The user resolves "
-            "the card and ELSPETH writes resolved review metadata.",
+            "(a non-empty string of at most 200 characters). Author only vague_term and registered "
+            "pipeline_decision rows; never author invented_source, llm_prompt_template, llm_model_choice or "
+            "source_data_contract rows, which the server stages. Where request_interpretation_review is offered, "
+            "call it as the review ownership rules direct; on a proposal-only surface the rows you author ride in "
+            "the proposal and there is no review call.",
             "interpretation_requirements_invalid",
         ),
     ]
@@ -2368,6 +2369,50 @@ def test_inline_blob_canonical_b_failure_precedes_blob_persistence(tmp_path: Pat
     assert "sk-sensitive-inline-review" not in result.validation.errors[0].message
     assert blob_rows == 0
     assert blob_files == ()
+
+
+@pytest.mark.parametrize("bad_component", ["output", "provider"])
+def test_later_path_refusal_does_not_persist_a_prepared_inline_source(tmp_path: Path, bad_component: str) -> None:
+    """A good inline source must not write bytes before all paths are admitted."""
+    engine, session_id, message_id = _session_with_user_message()
+    args = _linear_args(tmp_path)
+    args["source"]["options"] = {"schema": {"mode": "observed"}}
+    args["source"]["inline_blob"] = {"filename": "data.csv", "mime_type": "text/csv", "content": "name,score\nada,42\n"}
+    args["outputs"][0]["options"]["path"] = str(tmp_path / "outputs" / session_id / "result.jsonl")
+    if bad_component == "output":
+        args["outputs"][0]["options"]["path"] = str(tmp_path / "outside-session.jsonl")
+        expected = ("sink_path_policy_invalid", "output:main")
+    else:
+        args["nodes"][0]["plugin"] = "rag_retrieval"
+        args["nodes"][0]["options"] = {
+            "provider": "chroma",
+            "provider_config": {"collection": "docs", "persist_directory": str(tmp_path / "outside-session-index")},
+            "query_field": "name",
+            "output_prefix": "rag_",
+            "schema": {"mode": "observed"},
+        }
+        expected = ("provider_config_path_policy_invalid", "node:copy")
+    context = _trained_context(
+        data_dir=tmp_path,
+        session_engine=engine,
+        session_id=session_id,
+        user_message_id=message_id,
+        user_message_content="Use this CSV: name,score\nada,42\n",
+        composer_model_identifier="test-model",
+        composer_model_version="test-model-version",
+        composer_provider="test-provider",
+        composer_skill_hash="a" * 64,
+        tool_arguments_hash="b" * 64,
+    )
+    state = _empty_state()
+    result = _execute_set_pipeline(args, state, context)
+    assert result.success is False
+    assert result.updated_state is state
+    assert result.affected_nodes == ()
+    assert (result.validation.errors[0].error_code, result.validation.errors[0].rejected_component) == expected
+    with engine.begin() as conn:
+        assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 0
+    assert tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file()) == ()
 
 
 def test_inline_blob_replacement_preserves_trusted_existing_source_requirement_id(tmp_path: Path) -> None:

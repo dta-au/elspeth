@@ -1674,6 +1674,27 @@ describe("toolbar catalog trigger (2026-08-15 UX review)", () => {
       );
     });
 
+    it("titles the toolbar 'Pipeline' ahead of the tablist without renaming a tab", () => {
+      // ARGOnite: the artifact toolbar is now the pipeline pane's title bar.
+      // The title is a heading BEFORE the tablist in reading order, and the
+      // tab names — including the live "Checks: …" composition — are exactly
+      // what they were.
+      renderArtifactWorkspace();
+
+      const tablist = screen.getByRole("tablist", { name: "Pipeline artifacts" });
+      const title = screen.getByRole("heading", { level: 2, name: "Pipeline" });
+      expect(title).toHaveClass("workspace-pane-title", "workspace-pane-title--collapsible");
+      expect(title.parentElement).toHaveClass("artifact-workspace-toolbar");
+      expect(
+        title.compareDocumentPosition(tablist) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).not.toBe(0);
+      expect(
+        within(tablist)
+          .getAllByRole("tab")
+          .map((tab) => tab.getAttribute("aria-label") ?? tab.textContent),
+      ).toEqual(["Workflow", "Approvals", "Spec", "YAML", "Checks: Ready", "Run"]);
+    });
+
     it("keeps the disabled empty-composition tab a plain unbadged Checks", () => {
       useSessionStore.setState({ compositionState: null });
       renderArtifactWorkspace();

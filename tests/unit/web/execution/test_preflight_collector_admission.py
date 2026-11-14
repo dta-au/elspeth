@@ -73,17 +73,28 @@ sinks:
 """
 
 
+def _nested_content_field(container_key: str, content_key: str) -> str:
+    return f"{container_key}.<name>.{content_key}"
+
+
 def _collector_exclusion_conflicts(
     plugin_classes: Iterable[type[Any]],
 ) -> tuple[dict[str, tuple[str, ...]], tuple[str, ...]]:
     """Return registry facts that reactivate the two collector exclusions."""
-    materialized_content_keys = {rule.content_key for rule in FILE_BACKED_TEMPLATE_OPTION_REGISTRY}
+    # A nested-only rule's content key is never a top-level config field, so it
+    # is matched by its declared (plugin, container) owner instead.
+    materialized_content_keys = {rule.content_key for rule in FILE_BACKED_TEMPLATE_OPTION_REGISTRY if rule.top_level}
     content_conflicts: dict[str, tuple[str, ...]] = {}
     provider_config_plugins: list[str] = []
     for plugin_cls in plugin_classes:
         config_model = plugin_cls.get_config_model()
         fields = set() if config_model is None else set(config_model.model_fields)
-        content_fields = tuple(sorted(fields & materialized_content_keys))
+        nested_fields = {
+            _nested_content_field(rule.nested_in[1], rule.content_key)
+            for rule in FILE_BACKED_TEMPLATE_OPTION_REGISTRY
+            if rule.nested_in is not None and rule.nested_in[0] == plugin_cls.name and rule.nested_in[1] in fields
+        }
+        content_fields = tuple(sorted((fields & materialized_content_keys) | nested_fields))
         if content_fields:
             content_conflicts[plugin_cls.name] = content_fields
         if "provider_config" in fields:
@@ -114,9 +125,15 @@ def test_collector_exclusion_trigger_detects_current_non_batch_owners() -> None:
     transforms = tuple(get_shared_plugin_manager().get_transforms())
     content_conflicts, provider_config_plugins = _collector_exclusion_conflicts(transforms)
     detected_content_keys = {field for fields in content_conflicts.values() for field in fields}
-    registered_content_keys = {rule.content_key for rule in FILE_BACKED_TEMPLATE_OPTION_REGISTRY}
+    registered_plugin_names = {plugin_cls.name for plugin_cls in transforms}
+    registered_content_keys = {rule.content_key for rule in FILE_BACKED_TEMPLATE_OPTION_REGISTRY if rule.top_level} | {
+        _nested_content_field(rule.nested_in[1], rule.content_key)
+        for rule in FILE_BACKED_TEMPLATE_OPTION_REGISTRY
+        if rule.nested_in is not None and rule.nested_in[0] in registered_plugin_names
+    }
 
     assert registered_content_keys
+    assert "tables.<name>.reference_content" in registered_content_keys
     assert detected_content_keys == registered_content_keys
     assert NESTED_LOCAL_PATH_OPTION_KEYS
     assert provider_config_plugins

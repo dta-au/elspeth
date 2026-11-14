@@ -662,6 +662,12 @@
   background: var(--color-surface-elevated);
 }
 
+.tutorial-audit-note {
+  margin: var(--space-xs) 0 0;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+
 .tutorial-audit-list dt {
   color: var(--color-text-muted);
   font-size: var(--font-size-sm);

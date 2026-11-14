@@ -58,6 +58,8 @@ _OUTSTANDING_ADMISSIONS = 0
 _SHARED_SHUTDOWN_STARTED = False
 _GENERATION_COUNTER = 0
 _GENERATION_CUSTODIAN: RequiredExecutorGenerationCustodian | None = None
+# Only outstanding recovery ownership, never a completed-generation archive.
+_RECOVERING_GENERATIONS: set[RequiredExecutorGenerationCustodian] = set()
 _GENERATION_UNAVAILABLE = threading.Event()
 _INSTANCE_DRAINING = threading.Event()
 _APPLICATION_FINALIZER_OWNER: ApplicationFinalizerOwner | None = None
@@ -96,6 +98,35 @@ def configure_required_executor_recovery(
     _INSTANCE_DRAINING = instance_draining
     _GENERATION_UNAVAILABLE = generation_unavailable
     _CAPTURED_DRAIN_SECONDS = drain_seconds
+
+
+def configure_standalone_executor_recovery(
+    *,
+    drain_seconds: float,
+    instance_draining: threading.Event,
+    generation_unavailable: threading.Event,
+    recovery_callback: Callable[[RequiredGenerationDrainExpired], None],
+) -> None:
+    """Fresh-process registration; an embedding host's owner cannot be replaced."""
+    if _RECOVERY_CALLBACK is not None or _SHARED_EXECUTOR is not None or _GENERATION_CUSTODIAN is not None:
+        raise RequiredGenerationUnavailable("Standalone executor requires an unowned process")
+    configure_required_executor_recovery(
+        drain_seconds=drain_seconds,
+        instance_draining=instance_draining,
+        generation_unavailable=generation_unavailable,
+        recovery_callback=recovery_callback,
+    )
+
+
+def _retain_generation_recovery(generation: RequiredExecutorGenerationCustodian) -> None:
+    _RECOVERING_GENERATIONS.add(generation)
+
+
+def _release_generation_recovery(generation: RequiredExecutorGenerationCustodian) -> None:
+    # The callback runs after the drain thread has physically exited and the
+    # observer outcome is retrieved. Failed ownership remains for shutdown.
+    if generation.observer_error is None and generation.drain_error is None and not generation.escalated:
+        _RECOVERING_GENERATIONS.discard(generation)
 
 
 def _assert_recovery_registered() -> None:
@@ -147,6 +178,8 @@ def _generation_for(
                 recovery_callback=callback,
                 replacement_factory=lambda: ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="async-worker"),
                 install_replacement=_install_replacement,
+                retain_recovery=_retain_generation_recovery,
+                release_recovery=_release_generation_recovery,
             )
         return _GENERATION_CUSTODIAN
 
@@ -566,6 +599,35 @@ async def shutdown_async_workers() -> None:
                 shutdown_pool.shutdown(wait=True, cancel_futures=False)
             except BaseException as original:
                 failures.append(original)
+    # The replaced generation may no longer be _GENERATION_CUSTODIAN. Its
+    # observer and physical drain thread remain owned until this settlement.
+    for recovering in tuple(_RECOVERING_GENERATIONS):
+        observer = recovering.observer
+        assert observer is not None
+        while not observer.done():
+            try:
+                await asyncio.shield(observer)
+            except asyncio.CancelledError as original:
+                _retain_cancellation(cancellations, original)
+            except BaseException:
+                break
+        try:
+            observer.result()
+        except BaseException as original:
+            failures.append(original)
+        thread = recovering.drain_thread
+        assert thread is not None
+        while thread.is_alive():
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError as original:
+                _retain_cancellation(cancellations, original)
+        thread.join()
+        if recovering.drain_error is not None and all(recovering.drain_error is not failure for failure in failures):
+            failures.append(recovering.drain_error)
+        if recovering.escalated:
+            failures.append(RequiredGenerationUnavailable("Required generation recovery escalated"))
+        _RECOVERING_GENERATIONS.discard(recovering)
     if shared_joined and not failures:
         _SHARED_EXECUTOR = None
         if not _INSTANCE_DRAINING.is_set():

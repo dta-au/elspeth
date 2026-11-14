@@ -170,6 +170,7 @@ class TestURLSchemeErrorRedaction:
 class TestDnsTimeoutEffectiveness:
     """Bug 7.5: DNS resolution uses a bounded thread pool to avoid resource leaks."""
 
+    @pytest.mark.timing_sensitive
     def test_timeout_does_not_block_caller(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """After timeout, the caller must return promptly without blocking."""
 
