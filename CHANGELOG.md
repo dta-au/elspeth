@@ -181,6 +181,15 @@ These changes are breaking:
   `expected` text changes, and batches with Decimal or datetime values, or
   extreme opposite-sign values in `batch_distribution_profile`, now succeed
   where they used to fail.
+- **Bedrock guardrails validate the whole row first.** A row with any invalid
+  field fails with the same payload and makes no Bedrock call, so earlier
+  fields leave no billed call, call record or telemetry, and a validation
+  error now precedes a shutdown or deadline result. Guardrail profile aliases
+  of 65 or more characters fail at web config load, naming `alias`.
+- **Textract query text and aliases** containing non-ASCII whitespace are
+  rejected at config load; the provider already rejected them per row. A
+  provider message mentioning `max_blocks` or `max_result_bytes` is now
+  recorded as `malformed_response`.
 - **A missing core dependency stops plugin discovery.** Only `jinja2` is
   treated as optional; a missing `chromadb`, `bs4` or `html2text` now raises
   instead of silently dropping plugins from the catalog.
@@ -435,14 +444,26 @@ Transforms:
   - Page projection is linear in the block count instead of quadratic (#9).
   - Per-row bucket mode bounds S3 keys in UTF-8 bytes (1024), as
     static-bucket mode does (#10).
+  - `too_many_blocks` and `result_too_large` are recorded from a structured
+    error category, so provider text in a malformed response can no longer
+    pick the audited failure reason (#38).
+  - Query text and alias validation rejects non-ASCII whitespace such as
+    U+00A0 at config load, matching the provider pattern (#158).
 - **AWS guardrails** count botocore attempts as they are sent, so a transport
   error reports the attempts actually made. They stop scanning at a row
   deadline, set by the new `row_deadline_seconds` option (positive integer,
-  default 300; not exposed on the web operator profile), honour shutdown between fields, and hand retryable failures to
-  the engine retry policy (AWS review #4). The response parser records a
-  wrong-typed `confidence`, `action` or `filterStrength` as a malformed
-  response instead of crashing with an unaudited `TypeError` (#5), and the
-  guardrail ARN is cross-checked against `region` (#8).
+  default 300; not exposed on the web operator profile), honour shutdown
+  between fields, and hand retryable failures to the engine retry policy
+  (AWS review #4). The response parser records a wrong-typed `confidence`,
+  `action` or `filterStrength` as a malformed response instead of crashing
+  with an unaudited `TypeError` (#5), and the guardrail ARN is cross-checked
+  against `region` (#8). Every configured field is validated before the
+  first ApplyGuardrail call, so a later invalid field no longer lets earlier
+  fields be sent and billed (#145), and profile aliases are limited to 64
+  characters at config load, matching the live check (#159).
+- **`azure_content_safety`** composer hint no longer claims a default
+  threshold of 4: every category threshold is required, and lower values are
+  stricter (#127).
 - **Azure analyze transforms** (Document Intelligence, Content Understanding)
   retry network errors while polling until the poll deadline.
 - **LLM transforms:**
