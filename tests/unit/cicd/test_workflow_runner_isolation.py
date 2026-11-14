@@ -356,6 +356,16 @@ def test_build_publication_workflow_run_retains_trusted_push_provenance() -> Non
     assert _admitted(jobs, "build-push", _context("push", ref="refs/tags/v0.8.4"))
 
 
+def test_ci_uv_interpreter_matches_the_job_lane() -> None:
+    workflow = _workflows()["ci.yaml"]
+    for name, job in workflow["jobs"].items():
+        if not any("uv sync" in step.get("run", "") for step in job.get("steps", [])):
+            continue
+        environment = {**workflow.get("env", {}), **job.get("env", {})}
+        expected = "${{ matrix.python-version }}" if name in ("test", "timing-sensitive") else workflow["env"]["PYTHON_VERSION"]
+        assert environment.get("UV_PYTHON") == expected, name
+
+
 def test_nyx_prerequisites_are_explicit_without_a_hosted_fallback() -> None:
     jobs = _workflows()["ci.yaml"]["jobs"]
     for name in ("testcontainer", "host-runner-unit", "state-engine-validation", "azure-container-apps-bicep", "e2e-frontend"):

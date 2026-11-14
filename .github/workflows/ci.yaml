@@ -32,6 +32,8 @@ concurrency:
 
 env:
   PYTHON_VERSION: "3.13"
+  # uv can prefer a managed interpreter over the container's system Python.
+  UV_PYTHON: "3.13"
   UV_VERSION: "0.10.2"
 
 permissions:
@@ -384,6 +386,7 @@ jobs:
       options: --ulimit nofile=65536:524288
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-test-${{ matrix.python-version }}-${{ matrix.shard }}
+      UV_PYTHON: ${{ matrix.python-version }}
       PYTEST_WORKERS: "2"
       COVERAGE_FILE: coverage-data
     # Run tests even if static analysis fails, so both results are visible.
@@ -600,6 +603,7 @@ jobs:
       options: --ulimit nofile=65536:524288
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-timing-${{ matrix.python-version }}
+      UV_PYTHON: ${{ matrix.python-version }}
       COVERAGE_FILE: coverage-data
     strategy:
       fail-fast: false
