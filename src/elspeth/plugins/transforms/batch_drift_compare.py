@@ -156,7 +156,7 @@ class BatchDriftCompare(BaseTransform):
     name = "batch_drift_compare"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a0f9d0027187a0ac"
+    source_file_hash: str | None = "sha256:fd51fd5370b91aab"
     config_model = BatchDriftCompareConfig
     is_batch_aware = True
     # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
@@ -167,9 +167,8 @@ class BatchDriftCompare(BaseTransform):
     )
     usage_when_not_to_use: str = (
         "Not for historical drift detection: it does not retain history, does not compute p-values, does not "
-        "apply an alert threshold, and does not provide cross-run monitoring. Not a full chi-square test either: "
-        "chi_square_statistic sums only categories the baseline contains, so a category new in the cohort adds "
-        "nothing to it (see new_category_count / new_categories)."
+        "apply an alert threshold, and does not provide cross-run monitoring. chi_square_statistic omits "
+        "categories absent from the baseline."
     )
     example_use: str = """aggregations:
   - name: score_drift
@@ -205,9 +204,8 @@ class BatchDriftCompare(BaseTransform):
                     "(omitted trigger) when the input can exceed it.",
                     "cohort_field and value_field must differ; baseline_cohort defaults to the first-seen cohort.",
                     "Set value_type=numeric for mean and KS-style distance, or categorical for category shifts and total variation.",
-                    "Categorical chi_square_statistic covers baseline-supported categories only: a category absent from the baseline "
-                    "has expected count 0 and contributes nothing, so mass moving into unseen categories does not raise it. Threshold "
-                    "on new_category_count / new_categories (or total_variation, which does count them) to catch that drift.",
+                    "chi_square_statistic omits categories absent from the baseline; use new_category_count or "
+                    "total_variation to catch drift into new categories.",
                     "Output is cohort comparison rows and does not preserve the original row shape.",
                 ),
             )
