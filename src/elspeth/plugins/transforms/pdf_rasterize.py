@@ -27,6 +27,8 @@ from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError, Tra
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.payload_store import IntegrityError, PayloadNotFoundError
 from elspeth.contracts.pdf_render import (
+    PDF_RENDER_FORMAT,
+    PDF_RENDER_RETIRED_FORMATS,
     PDFRefusedPageData,
     PDFRenderedPageData,
     PDFRenderReceiptData,
@@ -465,7 +467,7 @@ class PDFRasterize(BaseTransform):
     name = "pdf_rasterize"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:d393cd68e73b92f6"
+    source_file_hash: str | None = "sha256:334c2c2d700d33c5"
     config_model = PDFRasterizeConfig
     usage_when_to_use: str = (
         "Use when each row carries a payload-store content hash for a PDF (from the blob_rows source or blob_fetch) "
@@ -741,7 +743,7 @@ class PDFRasterize(BaseTransform):
 
     def _render_request(self, blob_ref: str) -> PDFRenderRequestData:
         return {
-            "format": "pdf_rasterize/v1",
+            "format": PDF_RENDER_FORMAT,
             "input_pdf_hash": blob_ref,
             "render_limits": {
                 "dpi": self._limits.dpi,
@@ -790,7 +792,7 @@ class PDFRasterize(BaseTransform):
         else:
             raise FrameworkBugError(f"Unknown PDF renderer result type: {type(outcome).__name__}")
         return {
-            "format": "pdf_rasterize/v1",
+            "format": PDF_RENDER_FORMAT,
             "renderer_identity": renderer_identity(),
             "outcome_kind": outcome_kind,
             "page_count": page_count,
@@ -803,7 +805,11 @@ class PDFRasterize(BaseTransform):
         }
 
     def _restore_render_receipt(self, receipt: object, input_row: PipelineRow) -> TransformResult:
-        if type(receipt) is not dict or "format" not in receipt or receipt["format"] != "pdf_rasterize/v1":
+        if type(receipt) is dict and "format" in receipt and receipt["format"] in PDF_RENDER_RETIRED_FORMATS:
+            raise AuditIntegrityError(
+                f"PDF replay source call was recorded as {receipt['format']}, which is no longer replayed (current {PDF_RENDER_FORMAT})"
+            )
+        if type(receipt) is not dict or "format" not in receipt or receipt["format"] != PDF_RENDER_FORMAT:
             raise AuditIntegrityError("PDF replay source call has no typed render receipt")
         identity = receipt["renderer_identity"] if "renderer_identity" in receipt else None
         if type(identity) is not str or _PAYLOAD_REF_PATTERN.fullmatch(identity) is None:
