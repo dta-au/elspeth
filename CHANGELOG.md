@@ -166,6 +166,15 @@ These changes are breaking:
   with only nulls still fails. Pages that used to fail now extract.
 - **Power Automate archived SAS VERIFY** without `ELSPETH_FINGERPRINT_KEY`
   fails with `fingerprint_key_required`, still before DNS and preflight.
+- **PDF runs recorded before this release cannot be replayed or verified.**
+  The `pdf_rasterize` render request format is now `pdf_rasterize/v2`; replay
+  or verify of a run recorded as `pdf_rasterize/v1` fails closed with
+  `AuditIntegrityError` naming the retired format, in both the replay payload
+  preload and receipt restore. Live runs are unaffected.
+- **`elspeth.plugins.transforms.llm.validation` loses public names.**
+  `validate_json_object_response` and its result types are removed, and
+  `get_llm_audit_fields()` returns one more name (`_parts_hash`). Landscape
+  `too_many_images` reason text changes.
 - **A missing core dependency stops plugin discovery.** Only `jinja2` is
   treated as optional; a missing `chromadb`, `bs4` or `html2text` now raises
   instead of silently dropping plugins from the catalog.
@@ -377,6 +386,8 @@ Transforms:
   - Multi-page replay works, and duplicate page rows are refused.
   - The renderer identity check also accepts the macOS and Windows pdfium
     library names.
+  - The audited render request records `max_total_bytes`, and its format is
+    `pdf_rasterize/v2` (#59).
 - **Textract:** FORMS entries carry `value_selection_status` (`SELECTED`,
   `NOT_SELECTED` or none), and a malformed selection fails closed. Inline
   analysis reads its input with a size bound. Closing a Textract transform no
@@ -433,6 +444,22 @@ Transforms:
     differs from the one requested, and a conflicting `LANGFUSE_BASE_URL`.
   - A required image field holding an empty list is an `invalid_input` row
     error (`empty_image_list`).
+  - Config refusals for row-object misuse or dynamic row access name the
+    query template at fault instead of always blaming `prompt_template`
+    (#33).
+  - Ordered-mode config validation compiles the ordered query plan once per
+    validation pass instead of once per query (#34).
+  - Single-query transforms no longer record an empty system message in
+    Langfuse when `system_prompt` is `""` (#46).
+  - `_parts_hash` is registered as an LLM audit-only field, so the row/audit
+    separation guards cover it (#87).
+  - `populate_llm_operational_fields` requires a `TokenUsage` and a model
+    string, matching the non-nullable output schema (#88).
+  - The unused `validate_json_object_response` parser is removed; response
+    property tests exercise the production parser `extract_structured_fields`
+    (#143).
+  - `too_many_images` reasons report "more than N" instead of a misleading
+    max+1 count (#154).
 - **`keyword_filter`:** the ReDoS guard treats `{,n}` and `{,}` as
   quantifiers (`{}` stays literal), and a single-string `fields` declares
   that one field rather than all fields.
