@@ -1040,7 +1040,14 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # pin b88cee62...).
 # Merged with the integrator follow-up: all of the above, re-captured from
 # this file's parity failure on the merged tree.
-EXPECTED_CASE_REGISTRY_SHA256 = "14d69b1c9e014634823cb323c1dbc8d334a80711e2724271e184be553e03fefe"
+# P4 batch/JSON sweep (20261111-plugins-review #105, #111): JSONSink drops its
+# unreachable JSON-array append branch and JSONExplode gains index_field; their
+# manifest provenance tokens moved 0241bd4eb91ae378 -> 6c9b64bb34350d2c
+# (fifteen lines) and 1919e96964500441 -> bc435c1144336235 (one line), and
+# reopen-resume's resumed_full_projection_sha256 moved 1bf3705a... ->
+# b046c184..., measured by the production harness. Captured from this file's
+# parity failure (previous pin 14d69b1c...).
+EXPECTED_CASE_REGISTRY_SHA256 = "18037487924d662c3ec52977e345c452643994f12461e998e4c0dd07a5c4163e"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

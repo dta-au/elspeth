@@ -306,7 +306,7 @@ class BlobCSVExpand(BaseTransform):
     name = "blob_csv_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:36274db08c825a1e"
+    source_file_hash: str | None = "sha256:64de4207fc6d2406"
     config_model = BlobCSVExpandConfig
     usage_when_to_use: str = (
         "Use when each input row carries a payload-store reference to a CSV blob and you need to "
@@ -489,7 +489,7 @@ class BlobCSVExpand(BaseTransform):
         base = row.to_dict()
         try:
             loaded = self._load_csv_text(row)
-            parsed = self._parse_csv(loaded.text, base_fields=frozenset(base))
+            parsed = self._parse_csv(loaded, base_fields=frozenset(base))
         except _BlobCSVParseError as exc:
             return TransformResult.error(exc.reason, retryable=False)
 
@@ -708,8 +708,12 @@ class BlobCSVExpand(BaseTransform):
         # max_output_rows still bounds the fan-out below.
         return _CSVSourceText(text=value, field=self._text_field, blob_ref=None)
 
-    def _parse_csv(self, text: str, *, base_fields: frozenset[str]) -> _ParsedCSV:
-        stream = io.StringIO(text, newline="")
+    def _parse_csv(self, loaded: _CSVSourceText, *, base_fields: frozenset[str]) -> _ParsedCSV:
+        # Every parse-phase reason names the document it came from with the
+        # same identity keys the load-phase reasons and empty_csv carry, so one
+        # plugin routes one error taxonomy whichever phase refused the row.
+        identity = _source_identity(loaded)
+        stream = io.StringIO(loaded.text, newline="")
         reader = csv.reader(stream, delimiter=self._delimiter, strict=True)
 
         for skip_idx in range(self._skip_rows):
@@ -718,6 +722,7 @@ class BlobCSVExpand(BaseTransform):
                     raise _BlobCSVParseError(
                         _csv_error_reason(
                             "csv_exhausted_during_skip_rows",
+                            **identity,
                             skip_rows=self._skip_rows,
                             rows_skipped=skip_idx,
                         )
@@ -726,6 +731,7 @@ class BlobCSVExpand(BaseTransform):
                 raise _BlobCSVParseError(
                     _csv_error_reason(
                         "csv_parse_error",
+                        **identity,
                         phase="skip_rows",
                         row_number=skip_idx + 1,
                         line_number=reader.line_num,
@@ -750,6 +756,7 @@ class BlobCSVExpand(BaseTransform):
                 raise _BlobCSVParseError(
                     _csv_error_reason(
                         "csv_parse_error",
+                        **identity,
                         phase="header",
                         line_number=reader.line_num,
                         error=str(exc),
@@ -765,9 +772,9 @@ class BlobCSVExpand(BaseTransform):
                 columns=list(self._columns) if self._columns is not None else None,
             )
         except ExternalHeaderError as exc:
-            raise _BlobCSVParseError(_csv_error_reason("csv_header_error", error=str(exc))) from exc
+            raise _BlobCSVParseError(_csv_error_reason("csv_header_error", **identity, error=str(exc))) from exc
         except ValueError as exc:
-            raise _BlobCSVParseError(_csv_error_reason("csv_config_error", error=str(exc))) from exc
+            raise _BlobCSVParseError(_csv_error_reason("csv_config_error", **identity, error=str(exc))) from exc
 
         headers = tuple(field_resolution.final_headers)
         collisions = sorted(base_fields & set(headers))
@@ -779,6 +786,7 @@ class BlobCSVExpand(BaseTransform):
             raise _BlobCSVParseError(
                 _csv_error_reason(
                     "field_collision",
+                    **identity,
                     fields=sorted(set(collisions)),
                     error="CSV output fields collide with existing input fields",
                 )
@@ -794,6 +802,7 @@ class BlobCSVExpand(BaseTransform):
                 raise _BlobCSVParseError(
                     _csv_error_reason(
                         "csv_parse_error",
+                        **identity,
                         phase="data",
                         line_number=reader.line_num,
                         row_number=row_number + 1,
@@ -807,6 +816,7 @@ class BlobCSVExpand(BaseTransform):
                 raise _BlobCSVParseError(
                     _csv_error_reason(
                         "too_many_rows",
+                        **identity,
                         row_count=row_number,
                         max_output_rows=self._max_output_rows,
                     )
@@ -815,6 +825,7 @@ class BlobCSVExpand(BaseTransform):
                 raise _BlobCSVParseError(
                     _csv_error_reason(
                         "csv_column_count_mismatch",
+                        **identity,
                         line_number=reader.line_num,
                         row_number=row_number,
                         expected=expected_count,

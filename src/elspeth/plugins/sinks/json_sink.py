@@ -16,7 +16,7 @@ from pydantic import Field, field_validator, model_validator
 
 from elspeth.contracts import CallType, Determinism, PluginSchema
 from elspeth.contracts.diversion import SinkWriteResult
-from elspeth.contracts.errors import SinkEffectCapabilityError
+from elspeth.contracts.errors import FrameworkBugError, SinkEffectCapabilityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.header_modes import HeaderMode
 from elspeth.contracts.plugin_assistance import PluginAssistance
@@ -66,21 +66,6 @@ from elspeth.plugins.sinks._local_file_effects import (
     prepare_local_effect,
     reconcile_local_effect,
 )
-
-
-def _iter_file_without_suffix(path: Path, suffix: bytes) -> Iterator[bytes]:
-    """Stream a file except for one exact structural suffix."""
-    pending = b""
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(64 * 1024), b""):
-            combined = pending + chunk
-            if len(combined) > len(suffix):
-                yield combined[: -len(suffix)]
-                pending = combined[-len(suffix) :]
-            else:
-                pending = combined
-    if pending != suffix:
-        raise ValueError("Existing JSON array does not have the expected terminal boundary")
 
 
 def _indent_json_value(serialized: str, indent: int) -> str:
@@ -167,7 +152,7 @@ class JSONSink(BaseSink):
     name = "json"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0241bd4eb91ae378"
+    source_file_hash: str | None = "sha256:6c9b64bb34350d2c"
     config_model = JSONSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM
@@ -540,34 +525,24 @@ class JSONSink(BaseSink):
                 yield final
 
         def json_array_chunks() -> Iterator[bytes]:
+            # A JSON array is always rebuilt from the full cumulative snapshot:
+            # the config refuses format=json with mode=append and
+            # configure_for_resume refuses every format but jsonl, so
+            # continuation_emission never asks an array to keep file bytes.
+            if include_baseline:
+                raise FrameworkBugError(
+                    "JSONSink format='json' reached a baseline-append rebuild; JSON arrays never append "
+                    "(mode='append' is refused for format='json' and resume is jsonl-only)."
+                )
             encoder = codecs.getincrementalencoder(self._encoding)()
             iterator = iter(serialized_rows())
             try:
                 _first_ordinal, first = next(iterator)
             except StopIteration:
-                if include_baseline and target.exists():
-                    yield from iter_path_chunks(target)
-                else:
-                    yield encoder.encode("[]", final=True)
+                yield encoder.encode("[]", final=True)
                 return
 
-            baseline_nonempty = False
-            if include_baseline and target.exists():
-                size = target.stat().st_size
-                if size > 64:
-                    baseline_nonempty = True
-                else:
-                    with target.open(encoding=self._encoding) as stream:
-                        baseline_nonempty = stream.read().strip() != "[]"
-            if baseline_nonempty:
-                suffix_encoder = codecs.getincrementalencoder(self._encoding)()
-                suffix_encoder.setstate(0)
-                suffix = suffix_encoder.encode("]" if self._indent is None else "\n]", final=True)
-                yield from _iter_file_without_suffix(target, suffix)
-                encoder.setstate(0)
-                yield encoder.encode(", " if self._indent is None else ",\n")
-            else:
-                yield encoder.encode("[" if self._indent is None else "[\n")
+            yield encoder.encode("[" if self._indent is None else "[\n")
 
             if self._indent is None:
                 yield encoder.encode(first)

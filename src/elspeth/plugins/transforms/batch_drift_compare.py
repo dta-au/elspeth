@@ -37,19 +37,25 @@ ValueType = Literal["numeric", "categorical"]
 # numeric statistics are floats whatever the input's numeric type (the means
 # sum ``float(value)``; the KS distance and the categorical total variation and
 # chi-square accumulate from float literals); ``category_shifts`` and
-# ``new_categories`` are lists the schema DSL has no type for.
+# ``new_categories`` are lists the schema DSL has no type for, and so are the
+# ``*_missing_indices`` / ``*_non_finite_indices`` lists, which name each
+# skipped row by its BATCH index (empty when nothing was skipped).
 _COMMON_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
     FieldDefinition("baseline_cohort", "any"),
     FieldDefinition("baseline_count", "int"),
     FieldDefinition("baseline_missing_count", "int"),
+    FieldDefinition("baseline_missing_indices", "any"),
     FieldDefinition("baseline_non_finite_count", "int"),
+    FieldDefinition("baseline_non_finite_indices", "any"),
     FieldDefinition("baseline_total_count", "int"),
     FieldDefinition("batch_size", "int"),
     FieldDefinition("cohort", "any"),
     FieldDefinition("cohort_count", "int"),
     FieldDefinition("cohort_field", "str"),
     FieldDefinition("cohort_missing_count", "int"),
+    FieldDefinition("cohort_missing_indices", "any"),
     FieldDefinition("cohort_non_finite_count", "int"),
+    FieldDefinition("cohort_non_finite_indices", "any"),
     FieldDefinition("cohort_total_count", "int"),
     FieldDefinition("value_field", "str"),
     FieldDefinition("value_type", "str"),
@@ -150,7 +156,7 @@ class BatchDriftCompare(BaseTransform):
     name = "batch_drift_compare"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:73159752694bcabe"
+    source_file_hash: str | None = "sha256:fd51fd5370b91aab"
     config_model = BatchDriftCompareConfig
     is_batch_aware = True
     # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
@@ -161,7 +167,8 @@ class BatchDriftCompare(BaseTransform):
     )
     usage_when_not_to_use: str = (
         "Not for historical drift detection: it does not retain history, does not compute p-values, does not "
-        "apply an alert threshold, and does not provide cross-run monitoring."
+        "apply an alert threshold, and does not provide cross-run monitoring. chi_square_statistic omits "
+        "categories absent from the baseline."
     )
     example_use: str = """aggregations:
   - name: score_drift
@@ -197,6 +204,8 @@ class BatchDriftCompare(BaseTransform):
                     "(omitted trigger) when the input can exceed it.",
                     "cohort_field and value_field must differ; baseline_cohort defaults to the first-seen cohort.",
                     "Set value_type=numeric for mean and KS-style distance, or categorical for category shifts and total variation.",
+                    "chi_square_statistic omits categories absent from the baseline; use new_category_count or "
+                    "total_variation to catch drift into new categories.",
                     "Output is cohort comparison rows and does not preserve the original row shape.",
                 ),
             )
@@ -454,6 +463,9 @@ class BatchDriftCompare(BaseTransform):
             cohort_prop = cohort_count / cohort.count
             total_variation_sum += abs(baseline_prop - cohort_prop)
             expected = baseline_prop * cohort.count
+            # Baseline-support convention (disclosed in usage_when_not_to_use
+            # and the composer hints): a category new in the cohort has
+            # expected 0 and is reported through new_categories, not here.
             if expected > 0:
                 chi_square += ((cohort_count - expected) ** 2) / expected
             if baseline_count == 0 and cohort_count > 0:
@@ -487,6 +499,12 @@ class BatchDriftCompare(BaseTransform):
             "cohort_missing_count": cohort.missing_count,
             "baseline_non_finite_count": baseline.non_finite_count,
             "cohort_non_finite_count": cohort.non_finite_count,
+            # The rows left out of the published statistic, by BATCH index
+            # (row content stays out), as batch_stats records its skips.
+            "baseline_missing_indices": list(baseline.missing_indices),
+            "cohort_missing_indices": list(cohort.missing_indices),
+            "baseline_non_finite_indices": list(baseline.non_finite_indices),
+            "cohort_non_finite_indices": list(cohort.non_finite_indices),
         }
 
     def _numeric_result(self, *, baseline: _CohortValues, cohort: _CohortValues, batch_size: int) -> BatchDriftCompareRow:

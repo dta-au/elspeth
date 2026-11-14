@@ -2094,7 +2094,7 @@ _BATCH_PLUGIN_CASES = [
         [{"id": 1, "v": ["SENTINEL-topk-81af"]}, {"id": 2, "v": ["b"]}, {"id": 3, "v": ["c"]}],
         {"field": "v", "k": 2},
         "SENTINEL-topk-81af",
-        _wrong_type("v", "a scalar top-k value (str, int, float, bool, or None)", "tuple", 0),
+        _wrong_type("v", "a scalar top-k value (str, int, float, bool, Decimal, datetime, or None)", "tuple", 0),
         id="top_k-array-value",
     ),
     pytest.param(

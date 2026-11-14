@@ -50,6 +50,7 @@ _REASONS: dict[tuple[str, str], str] = {
     ("batch_drift_compare", "cohort"): _CARRIED,
     ("batch_drift_compare", "category_shifts"): _LIST_OR_MAPPING,
     ("batch_drift_compare", "new_categories"): _LIST_OR_MAPPING,
+    ("batch_drift_compare", "*_indices"): _LIST_OR_MAPPING,
     ("batch_effect_size", "baseline_variant"): _CARRIED,
     ("batch_effect_size", "variant"): _CARRIED,
     ("batch_effect_size", "*_indices"): _LIST_OR_MAPPING,
