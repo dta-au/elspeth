@@ -185,10 +185,13 @@ def resolve_image_parts(
         for list_index, ref in refs:
             prepared.append((spec, image_format, list_index, ref))
             if len(prepared) > max_images_per_call:
+                # Counting stopped at the first ref past the limit, so the
+                # true count is only known to exceed it: record that lower
+                # bound, never max+1 presented as the row's count.
                 too_many_reason: TransformErrorReason = {
                     "reason": "too_many_images",
                     "max_images": max_images_per_call,
-                    "actual": str(len(prepared)),
+                    "actual": f"more than {max_images_per_call}",
                 }
                 return TransformResult.error(too_many_reason, retryable=False)
 
