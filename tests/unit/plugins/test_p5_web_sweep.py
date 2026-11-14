@@ -401,3 +401,39 @@ def test_discovered_link_with_del_is_refused() -> None:
     except ValueError as exc:
         refused = exc
     assert refused is not None
+
+
+# --- one shared predicate, matching httpx exactly ---------------------------
+
+
+def _shared_predicate() -> Callable[[str], bool]:
+    namespace = vars(security_web)
+    assert "contains_ascii_control_character" in namespace, "core.security.web must export the shared control-character predicate"
+    predicate: Callable[[str], bool] = namespace["contains_ascii_control_character"]
+    return predicate
+
+
+def test_shared_control_character_predicate_is_exactly_httpx() -> None:
+    predicate = _shared_predicate()
+    for code in [*range(128), 0x85, 0xA0, 0x2028, 0xE9, 0x1F600]:
+        char = chr(code)
+        refused_by_httpx = False
+        try:
+            httpx.URL(f"https://example.com/{char}")
+        except httpx.InvalidURL:
+            refused_by_httpx = True
+        assert predicate(f"https://example.com/{char}") is refused_by_httpx, f"predicate disagrees with httpx on U+{code:04X}"
+
+
+@pytest.mark.parametrize("char", ["\x7f", "\x01", "\x1f"])
+def test_pagination_link_header_with_control_character_is_refused(char: str) -> None:
+    from elspeth.plugins.transforms.web_scrape_pagination import PaginationConfig, discover_next_url
+
+    _shared_predicate()
+    response = httpx.Response(200, headers=[("link", f"<https://example.com/p2{char}>; rel=next")])
+    refused: ValueError | None = None
+    try:
+        discover_next_url(response, "https://example.com/", PaginationConfig(mode="link_header"))
+    except ValueError as exc:
+        refused = exc
+    assert refused is not None
