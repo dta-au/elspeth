@@ -1,7 +1,17 @@
-"""Absolute budgets for a single pinned, audited HTTP dispatch.
+"""Absolute budgets for audited HTTP requests.
+
+httpx timeouts bound each connect, read and write separately, so an upstream
+that trickles one byte just under the read timeout keeps a request alive
+without limit. Every audited HTTP request therefore runs inside one
+``http_deadline_scope``: an absolute expiration that every network operation
+of every connection made by a ``deadline_bound_client`` shrinks its own
+timeout to, including redirect hops of the same logical request. The
+configured timeout is thus the request's total wall time.
 
 The public HTTPCore backend seam lets each blocking syscall use the remaining
 budget, including short TLS writes hidden beneath HTTP response buffering.
+The Power Automate policy additionally pins its own literal-IP transport
+(``DeadlineHTTPTransport``) to the same scoped deadline.
 """
 
 from __future__ import annotations
@@ -13,12 +23,20 @@ import socket
 import ssl
 import time
 from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import partial
 from typing import ClassVar, Literal
 
 import httpcore
 import httpx
+
+# httpx's own reading of the proxy environment; reusing it keeps the mount keys
+# identical to the ones httpx builds, so each one is replaced (pinned httpx).
+from httpx._utils import get_environment_proxies
+
+import elspeth.contracts.errors as contract_errors
 
 
 class HTTPDeadlineExceeded(httpx.HTTPError):
@@ -287,3 +305,222 @@ class DeadlineHTTPTransport(httpx.BaseTransport):
 
     def close(self) -> None:
         _safe_operation(self._pool.close)
+
+
+# ---------------------------------------------------------------------------
+# Scoped absolute deadline for every audited HTTP request
+# ---------------------------------------------------------------------------
+
+_ACTIVE_HTTP_DEADLINE: ContextVar[HTTPDeadline | None] = ContextVar("elspeth_active_http_deadline", default=None)
+
+# Largest slice handed to one socket write, so a peer that drains our request
+# body slowly is re-checked against the deadline between slices.
+_WRITE_SLICE_BYTES = 16384
+
+_DEFAULT_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=5.0)
+
+
+@contextmanager
+def http_deadline_scope(total_seconds: float) -> Iterator[HTTPDeadline]:
+    """Bind one absolute deadline to every network operation in this context.
+
+    ``total_seconds`` is the request's total wall time: connect, request
+    write, response headers and the full response body. A nested scope never
+    extends an outer one: the earlier expiration wins, so redirect hops and
+    helper calls share the caller's budget.
+    """
+    if not math.isfinite(total_seconds) or total_seconds <= 0:
+        raise ValueError("HTTP deadline must be a finite, positive number of seconds")
+    candidate = HTTPDeadline(time.monotonic() + total_seconds, clock=time.monotonic)
+    outer = _ACTIVE_HTTP_DEADLINE.get()
+    deadline = outer if outer is not None and outer.expires_at <= candidate.expires_at else candidate
+    token = _ACTIVE_HTTP_DEADLINE.set(deadline)
+    try:
+        yield deadline
+    finally:
+        _ACTIVE_HTTP_DEADLINE.reset(token)
+
+
+def _scoped_timeout(phase_timeout: float | None, expired: type[httpcore.TimeoutException]) -> float:
+    """Shrink one operation's timeout to the remaining scoped budget."""
+    deadline = _ACTIVE_HTTP_DEADLINE.get()
+    if deadline is None:
+        raise contract_errors.FrameworkBugError("deadline-bound HTTP client used outside http_deadline_scope")
+    remaining = deadline.expires_at - deadline.clock()
+    if remaining <= 0:
+        raise expired("HTTP request exceeded its total deadline")
+    if phase_timeout is None:
+        return remaining
+    return min(phase_timeout, remaining)
+
+
+class _ScopedDeadlineStream(httpcore.NetworkStream):
+    """Network stream whose every blocking operation honours the scoped deadline."""
+
+    def __init__(self, inner: httpcore.NetworkStream) -> None:
+        self._inner = inner
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        return self._inner.read(max_bytes, timeout=_scoped_timeout(timeout, httpcore.ReadTimeout))
+
+    def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        view = memoryview(buffer)
+        for offset in range(0, len(view), _WRITE_SLICE_BYTES):
+            self._inner.write(bytes(view[offset : offset + _WRITE_SLICE_BYTES]), timeout=_scoped_timeout(timeout, httpcore.WriteTimeout))
+
+    def close(self) -> None:
+        self._inner.close()
+
+    def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> httpcore.NetworkStream:
+        upgraded = self._inner.start_tls(
+            ssl_context, server_hostname=server_hostname, timeout=_scoped_timeout(timeout, httpcore.ConnectTimeout)
+        )
+        # A handshake is several reads under one socket timeout; refuse a
+        # connection whose handshake alone consumed the whole budget.
+        try:
+            _scoped_timeout(None, httpcore.ConnectTimeout)
+        except httpcore.ConnectTimeout:
+            upgraded.close()
+            raise
+        return _ScopedDeadlineStream(upgraded)
+
+    def get_extra_info(self, info: str) -> object:
+        return self._inner.get_extra_info(info)
+
+
+class _ScopedDeadlineBackend(httpcore.NetworkBackend):
+    """Default sync backend with every connect bounded by the scoped deadline."""
+
+    def __init__(self) -> None:
+        self._inner = httpcore.SyncBackend()
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.NetworkStream:
+        stream = self._inner.connect_tcp(
+            host,
+            port,
+            timeout=_scoped_timeout(timeout, httpcore.ConnectTimeout),
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+        return _ScopedDeadlineStream(stream)
+
+    def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.NetworkStream:
+        stream = self._inner.connect_unix_socket(
+            path, timeout=_scoped_timeout(timeout, httpcore.ConnectTimeout), socket_options=socket_options
+        )
+        return _ScopedDeadlineStream(stream)
+
+    def sleep(self, seconds: float) -> None:
+        self._inner.sleep(seconds)
+
+
+class DeadlineBoundTransport(httpx.HTTPTransport):
+    """httpx's HTTP transport over the scoped-deadline network backend.
+
+    Construction mirrors ``httpx.HTTPTransport`` (direct, HTTP proxy and SOCKS
+    proxy pools) through httpcore's public ``network_backend`` seam; request
+    handling and httpcore-to-httpx exception mapping are inherited unchanged,
+    so a deadline expiry surfaces as an ordinary ``httpx.TimeoutException``.
+    """
+
+    def __init__(
+        self,
+        *,
+        verify: ssl.SSLContext | str | bool = True,
+        trust_env: bool = True,
+        http1: bool = True,
+        http2: bool = False,
+        limits: httpx.Limits = _DEFAULT_LIMITS,
+        proxy: httpx.Proxy | None = None,
+    ) -> None:
+        ssl_context = httpx.create_ssl_context(verify=verify, trust_env=trust_env)
+        backend = _ScopedDeadlineBackend()
+        if proxy is None:
+            self._pool = httpcore.ConnectionPool(
+                ssl_context=ssl_context,
+                max_connections=limits.max_connections,
+                max_keepalive_connections=limits.max_keepalive_connections,
+                keepalive_expiry=limits.keepalive_expiry,
+                http1=http1,
+                http2=http2,
+                network_backend=backend,
+            )
+            return
+        proxy_url = httpcore.URL(
+            scheme=proxy.url.raw_scheme,
+            host=proxy.url.raw_host,
+            port=proxy.url.port,
+            target=proxy.url.raw_path,
+        )
+        if proxy.url.scheme in ("http", "https"):
+            self._pool = httpcore.HTTPProxy(
+                proxy_url=proxy_url,
+                proxy_auth=proxy.raw_auth,
+                proxy_headers=proxy.headers.raw,
+                ssl_context=ssl_context,
+                proxy_ssl_context=proxy.ssl_context,
+                max_connections=limits.max_connections,
+                max_keepalive_connections=limits.max_keepalive_connections,
+                keepalive_expiry=limits.keepalive_expiry,
+                http1=http1,
+                http2=http2,
+                network_backend=backend,
+            )
+        elif proxy.url.scheme in ("socks5", "socks5h"):
+            self._pool = httpcore.SOCKSProxy(
+                proxy_url=proxy_url,
+                proxy_auth=proxy.raw_auth,
+                ssl_context=ssl_context,
+                max_connections=limits.max_connections,
+                max_keepalive_connections=limits.max_keepalive_connections,
+                keepalive_expiry=limits.keepalive_expiry,
+                http1=http1,
+                http2=http2,
+                network_backend=backend,
+            )
+        else:
+            raise ValueError(f"unsupported proxy scheme {proxy.url.scheme!r}")
+
+
+def deadline_bound_client(*, timeout: float, trust_env: bool = True) -> httpx.Client:
+    """The one httpx client factory for audited HTTP callers.
+
+    Every request made with the returned client must run inside
+    ``http_deadline_scope``; a network operation outside one is a framework
+    bug and fails closed. ``timeout`` stays the per-phase ceiling; the scope
+    bounds the request's total wall time. Redirects are never followed by
+    httpx (callers validate every hop for SSRF themselves).
+
+    With ``trust_env`` httpx still selects proxies from ``HTTP(S)_PROXY`` /
+    ``ALL_PROXY`` / ``NO_PROXY``; every proxy mount it would build is replaced,
+    key for key from httpx's own environment reading, by a deadline-bound
+    transport, so no environment route escapes the deadline.
+    """
+    mounts: dict[str, httpx.BaseTransport | None] = {}
+    if trust_env:
+        for pattern, proxy_url in get_environment_proxies().items():
+            mounts[pattern] = None if proxy_url is None else DeadlineBoundTransport(trust_env=True, proxy=httpx.Proxy(url=proxy_url))
+    return httpx.Client(
+        timeout=timeout,
+        follow_redirects=False,
+        trust_env=trust_env,
+        transport=DeadlineBoundTransport(trust_env=trust_env),
+        mounts=mounts,
+    )

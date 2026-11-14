@@ -151,7 +151,9 @@ class AzureAnalyzeConfig(TransformDataConfig):
     poll_backoff_multiplier: float = Field(1.5, ge=1, description="Exponential poll backoff factor.")
     poll_max_interval_seconds: float = Field(10.0, gt=0, description="Poll backoff cap.")
     poll_timeout_seconds: float = Field(300.0, gt=0, description="Outer bound on the poll sequence.")
-    request_timeout_seconds: float = Field(60.0, gt=0, description="Per HTTP call timeout.")
+    request_timeout_seconds: float = Field(
+        60.0, gt=0, description="Total wall-clock deadline in seconds for each submit or poll HTTP call, including the full response body."
+    )
     max_response_body_bytes: int = Field(50_000_000, gt=0, description="Cap on the analyze result response body.")
     max_capacity_retry_seconds: int = Field(
         300, gt=0, description="Per-row 429/503 retry budget (default 300 bounds web-worker hold time)."

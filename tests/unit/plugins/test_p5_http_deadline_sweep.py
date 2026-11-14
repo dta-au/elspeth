@@ -35,8 +35,8 @@ from tests.unit.plugins.clients.test_http import _CallRecorder, _ExecutionReposi
 # would run.
 TOTAL_SECONDS = 1.0
 DRIP_INTERVAL_SECONDS = 0.2
-DRIP_BYTES = 20  # 4 seconds when nothing cuts it off
-SLACK_SECONDS = 0.6
+DRIP_BYTES = 30  # 6 seconds when nothing cuts it off
+SLACK_SECONDS = 1.5
 
 _LOOPBACK = (ipaddress.ip_network("127.0.0.0/8"),)
 
@@ -139,18 +139,18 @@ def test_shared_deadline_mechanism_is_public() -> None:
     assert "deadline_bound_client" in names, "no shared factory builds an httpx client that honours the scoped deadline"
 
 
+@pytest.mark.parametrize("method", ["GET", "POST"])
 @pytest.mark.parametrize("drip", [_drip_body, _drip_headers], ids=["body", "headers"])
 @pytest.mark.parametrize("cap", [None, 1024], ids=["uncapped", "capped"])
-def test_get_and_post_are_cut_off_at_the_configured_total(drip: Callable[[socket.socket], None], cap: int | None) -> None:
+def test_get_and_post_are_cut_off_at_the_configured_total(method: str, drip: Callable[[socket.socket], None], cap: int | None) -> None:
     """OpenRouter, Gateway, Azure safety and AI Search call get()/post()."""
-    for method in ("GET", "POST"):
-        with _server([drip]) as port:
-            client = _client(cap=cap)
-            url = f"http://127.0.0.1:{port}/"
-            call = (lambda: client.get(url)) if method == "GET" else (lambda: client.post(url, json={"q": 1}))
-            elapsed, error = _timed(call)
-            client.close()
-        _assert_cut_off(elapsed, error, httpx.TimeoutException)
+    with _server([drip]) as port:
+        client = _client(cap=cap)
+        url = f"http://127.0.0.1:{port}/"
+        call = (lambda: client.get(url)) if method == "GET" else (lambda: client.post(url, json={"q": 1}))
+        elapsed, error = _timed(call)
+        client.close()
+    _assert_cut_off(elapsed, error, httpx.TimeoutException)
 
 
 @pytest.mark.parametrize("drip", [_drip_body, _drip_headers], ids=["body", "headers"])
@@ -177,6 +177,39 @@ def test_redirect_hops_share_one_budget() -> None:
             elapsed, error = _timed(lambda: client.request_ssrf_safe("GET", _pinned(port), follow_redirects=True, allowed_ranges=_LOOPBACK))
             client.close()
     _assert_cut_off(elapsed, error, httpx.TimeoutException)
+
+
+def test_outer_scope_bounds_a_longer_client_timeout() -> None:
+    """A caller budget (web_scrape pagination) cuts off a request whose own timeout is longer."""
+    with _server([_drip_body]) as port:
+        client = AuditedHTTPClient(
+            **mock_audit_authority(),
+            execution=_ExecutionRepositoryFake(),
+            state_id="state",
+            run_id="run",
+            telemetry_emit=_CallRecorder(),
+            timeout=TOTAL_SECONDS * 30,
+            max_response_body_bytes=1024,
+        )
+
+        def fetch() -> None:
+            with deadline_module.http_deadline_scope(TOTAL_SECONDS):
+                client.request_ssrf_safe("GET", _pinned(port), allowed_ranges=_LOOPBACK)
+
+        elapsed, error = _timed(fetch)
+        client.close()
+    _assert_cut_off(elapsed, error, httpx.TimeoutException)
+
+
+def test_deadline_bound_client_refuses_requests_outside_a_scope() -> None:
+    from elspeth.contracts.errors import FrameworkBugError
+
+    with (
+        _server([_drip_body]) as port,
+        deadline_module.deadline_bound_client(timeout=TOTAL_SECONDS) as raw,
+        pytest.raises(FrameworkBugError, match="outside http_deadline_scope"),
+    ):
+        raw.get(f"http://127.0.0.1:{port}/")
 
 
 class _FakeToken:

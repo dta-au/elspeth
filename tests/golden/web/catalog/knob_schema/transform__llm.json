@@ -1194,7 +1194,7 @@
       },
       {
         "default": 60.0,
-        "description": "Request timeout",
+        "description": "Total wall-clock deadline in seconds for each provider HTTP request, including the full response body.",
         "kind": "number-float",
         "label": "Timeout Seconds",
         "name": "timeout_seconds",
@@ -2442,7 +2442,7 @@
       },
       {
         "default": 60.0,
-        "description": "Request timeout",
+        "description": "Total wall-clock deadline in seconds for each provider HTTP request, including the full response body.",
         "kind": "number-float",
         "label": "Timeout Seconds",
         "name": "timeout_seconds",

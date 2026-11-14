@@ -90,7 +90,11 @@ class BlobFetchHTTPConfig(BaseModel):
 
     abuse_contact: str = Field(description="Email for abuse reports, sent as an HTTP header.")
     fetch_reason: str = Field(description="Why this pipeline is fetching remote files; recorded in audit and sent as an HTTP header.")
-    timeout: int = Field(default=30, gt=0, description="Request timeout in seconds.")
+    timeout: int = Field(
+        default=30,
+        gt=0,
+        description="Total wall-clock deadline in seconds for each HTTP request: connect, send, headers and the full response body, with redirect hops sharing it.",
+    )
     max_body_bytes: int = Field(default=10 * 1024 * 1024, gt=0, description="Maximum response body size in bytes.")
     allowed_hosts: Literal["public_only", "allow_private"] | Annotated[list[CidrStr], Field(min_length=1)] = Field(
         default="public_only",
@@ -332,7 +336,7 @@ class BlobFetch(BaseTransform):
     name = "blob_fetch"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9c75f8515498a8a4"
+    source_file_hash: str | None = "sha256:d8d0383ba08931bd"
     config_model = BlobFetchConfig
     passes_through_input = True
     fetches_http = True

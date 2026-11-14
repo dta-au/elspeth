@@ -59,6 +59,8 @@ from elspeth.plugins.infrastructure.clients.deadline import (
     DeadlineHTTPTransport,
     HTTPDeadline,
     HTTPDeadlineExceeded,
+    deadline_bound_client,
+    http_deadline_scope,
 )
 from elspeth.plugins.infrastructure.clients.fingerprinting import (
     filter_response_headers as _filter_response_headers,
@@ -317,7 +319,11 @@ class AuditedHTTPClient(AuditedClientBase):
             state_id: Node state ID to associate calls with
             run_id: Pipeline run ID for telemetry correlation
             telemetry_emit: Callback to emit telemetry events
-            timeout: Request timeout in seconds (default: 30.0)
+            timeout: Total wall-clock deadline in seconds for one request
+                (default: 30.0): connect, request write, response headers and
+                the full response body, with redirect hops sharing it. httpx's
+                per-phase timeouts alone would let a slow-drip upstream hold
+                the request without bound.
             base_url: Optional base URL to prepend to all requests
             headers: Default headers for all requests
             limiter: Optional rate limiter for throttling requests
@@ -365,7 +371,8 @@ class AuditedHTTPClient(AuditedClientBase):
         self._semantic_managed_identity_verify = semantic_managed_identity_verify
         # Shared httpx.Client for connection pooling and TCP reuse.
         # httpx.Client is thread-safe; the internal pool handles concurrency.
-        # Per-request timeouts override the default via timeout= kwarg.
+        # Per-request timeouts override the default via timeout= kwarg; every
+        # request runs inside http_deadline_scope so the timeout is a total.
         # follow_redirects=False: SSRF-safe methods manage redirects manually.
         # VERIFY waits until the first request has passed source-call admission.
         self._client_init_lock = Lock()
@@ -373,7 +380,7 @@ class AuditedHTTPClient(AuditedClientBase):
             None
             if audit_policy is HTTPAuditPolicy.POWER_AUTOMATE_V1
             or (call_mode_session is not None and call_mode_session.mode in (RunMode.REPLAY, RunMode.VERIFY))
-            else httpx.Client(timeout=self._timeout, follow_redirects=False)
+            else deadline_bound_client(timeout=self._timeout)
         )
 
     # Delegate to shared module functions. Instance methods preserved for
@@ -1540,7 +1547,7 @@ class AuditedHTTPClient(AuditedClientBase):
             method: HTTP method ("POST" or "GET")
             url: URL path (appended to base_url if configured)
             headers: Additional headers for this request
-            timeout: Request timeout override (uses client default if None)
+            timeout: Total-deadline override in seconds (uses client default if None)
             json: JSON body (POST only)
             params: Query parameters (GET only)
             audit_request_metadata: Audit-only metadata to include in the
@@ -1608,20 +1615,22 @@ class AuditedHTTPClient(AuditedClientBase):
                     if self._client is None:
                         if self._call_mode_session is None or self._call_mode_session.mode is not RunMode.VERIFY:
                             raise AuditIntegrityError("HTTP client absent outside admitted verify mode")
-                        self._client = httpx.Client(timeout=self._timeout, follow_redirects=False)
+                        self._client = deadline_bound_client(timeout=self._timeout)
             client = self._client
             if client is None:
                 raise AuditIntegrityError("HTTP client absent after verify admission")
-            # Dispatch to the correct httpx method
-            response = self._request_with_optional_body_cap(
-                client,
-                method,
-                full_url,
-                json=json,
-                params=params,
-                headers=merged_headers,
-                timeout=effective_timeout,
-            )
+            # Dispatch to the correct httpx method. The scope makes the
+            # timeout the request's total wall time, body read included.
+            with http_deadline_scope(effective_timeout):
+                response = self._request_with_optional_body_cap(
+                    client,
+                    method,
+                    full_url,
+                    json=json,
+                    params=params,
+                    headers=merged_headers,
+                    timeout=effective_timeout,
+                )
         except Exception as e:
             latency_ms = (time.perf_counter() - start) * 1000
             response_payload: HTTPCallResponse | None = None
@@ -1718,7 +1727,7 @@ class AuditedHTTPClient(AuditedClientBase):
             url: URL path (appended to base_url if configured)
             json: JSON body to send (optional)
             headers: Additional headers for this request
-            timeout: Request timeout in seconds (uses client default if None)
+            timeout: Total wall-clock deadline in seconds for this request (uses client default if None)
             audit_request_metadata: Audit-only metadata to include in the
                 recorded request payload without sending it to the remote
                 service.
@@ -1762,7 +1771,7 @@ class AuditedHTTPClient(AuditedClientBase):
             url: URL path (appended to base_url if configured)
             headers: Additional headers for this request
             params: Query parameters to append to URL
-            timeout: Request timeout in seconds (uses client default if None)
+            timeout: Total wall-clock deadline in seconds for this request (uses client default if None)
             token_id: Per-call token_id for telemetry (overrides client default).
                 Used by batch transforms where one client serves multiple tokens.
 
@@ -1810,11 +1819,15 @@ class AuditedHTTPClient(AuditedClientBase):
         form: tuple[tuple[str, str], ...] | None,
         multipart_body: bytes | None,
         params: dict[str, str | int | float] | None,
+        deadline: HTTPDeadline,
         before_send: Callable[[], None] | None = None,
     ) -> httpx.Response:
-        """Send one IP-pinned request with method-specific httpx handling."""
+        """Send one IP-pinned request with method-specific httpx handling.
+
+        ``deadline`` is the request's scoped total deadline; the Power
+        Automate policy's literal-IP transport is bound to the same one.
+        """
         if self._audit_policy is HTTPAuditPolicy.POWER_AUTOMATE_V1:
-            deadline = HTTPDeadline(time.monotonic() + self._timeout, clock=time.monotonic)
             with httpx.Client(
                 timeout=self._timeout,
                 follow_redirects=False,
@@ -2017,40 +2030,43 @@ class AuditedHTTPClient(AuditedClientBase):
             # an IP would map to the same pool key. A shared client would reuse a
             # TLS connection established for hostname-A when requesting hostname-B,
             # silently skipping SNI negotiation and certificate verification.
-            with httpx.Client(
-                timeout=effective_timeout,
-                follow_redirects=False,
-                trust_env=self._audit_policy is HTTPAuditPolicy.GENERIC,
-            ) as ssrf_client:
-                response = self._send_ssrf_safe_request(
-                    ssrf_client,
-                    method_upper,
-                    connection_url,
-                    headers=merged_headers,
-                    extensions=extensions if extensions else None,
-                    json=json,
-                    form=form,
-                    multipart_body=multipart_body,
-                    params=params,
-                    before_send=before_send,
-                )
+            # One deadline scope covers the request and every redirect hop, so
+            # the configured timeout is the logical request's total wall time.
+            with http_deadline_scope(effective_timeout) as deadline:
+                with deadline_bound_client(
+                    timeout=effective_timeout,
+                    trust_env=self._audit_policy is HTTPAuditPolicy.GENERIC,
+                ) as ssrf_client:
+                    response = self._send_ssrf_safe_request(
+                        ssrf_client,
+                        method_upper,
+                        connection_url,
+                        headers=merged_headers,
+                        extensions=extensions if extensions else None,
+                        json=json,
+                        form=form,
+                        multipart_body=multipart_body,
+                        params=params,
+                        deadline=deadline,
+                        before_send=before_send,
+                    )
 
-            # Handle redirects with SSRF validation at each hop
-            redirect_count = 0
-            final_hostname_url = logical_request_url
-            if follow_redirects:
-                response, redirect_count, final_hostname_url = self._follow_redirects_safe(
-                    response,
-                    max_redirects,
-                    effective_timeout,
-                    merged_headers,
-                    original_url=logical_request_url,
-                    allowed_ranges=allowed_ranges,
-                    allowed_origins=allowed_origins,
-                    bound_header_origin=bound_header_origin,
-                    fingerprinted_header_names=fingerprinted_header_names,
-                    replay_hops=replay_hops,
-                )
+                # Handle redirects with SSRF validation at each hop
+                redirect_count = 0
+                final_hostname_url = logical_request_url
+                if follow_redirects:
+                    response, redirect_count, final_hostname_url = self._follow_redirects_safe(
+                        response,
+                        max_redirects,
+                        effective_timeout,
+                        merged_headers,
+                        original_url=logical_request_url,
+                        allowed_ranges=allowed_ranges,
+                        allowed_origins=allowed_origins,
+                        bound_header_origin=bound_header_origin,
+                        fingerprinted_header_names=fingerprinted_header_names,
+                        replay_hops=replay_hops,
+                    )
 
             latency_ms = (time.perf_counter() - start) * 1000
 
@@ -2252,7 +2268,8 @@ class AuditedHTTPClient(AuditedClientBase):
         Args:
             response: Initial response (may be a redirect)
             max_redirects: Maximum number of redirect hops
-            timeout: Request timeout for each hop
+            timeout: Per-phase timeout ceiling for each hop; the caller's
+                ``http_deadline_scope`` bounds all hops together
             original_headers: Headers from original request (minus Host, which is set per-hop)
             original_url: Hostname-based URL for resolving relative redirects.
                 response.url is IP-based (from connection_url rewrite), so relative
@@ -2390,10 +2407,7 @@ class AuditedHTTPClient(AuditedClientBase):
             # as the initial SSRF-safe request — IP-based connection_url would
             # cause the pool to reuse connections across different hostnames.
             try:
-                with httpx.Client(
-                    timeout=timeout,
-                    follow_redirects=False,
-                ) as hop_client:
+                with deadline_bound_client(timeout=timeout) as hop_client:
                     response = self._request_with_optional_body_cap(
                         hop_client,
                         "GET",
