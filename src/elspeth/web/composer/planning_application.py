@@ -943,6 +943,7 @@ class PlanningApplication:
         provider_owner: ProviderInvocationOwner | None,
         turn_evidence: TurnEvidence,
         deadline: float,
+        plugin_snapshot: PluginAvailabilitySnapshot | None = None,
     ) -> ComposerResult:
         """Admit final declined prose using this request's remaining existing END limits."""
         from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict, _AdvisorCheckpointComposeDeadlineExpired
@@ -950,7 +951,9 @@ class PlanningApplication:
 
         end_call_start = len(recorder.llm_calls)
         try:
-            review = turn_evidence.review_candidate(candidate=candidate, request=request, current_state=state, scope="planner")
+            review = turn_evidence.review_candidate(
+                candidate=candidate, request=request, current_state=state, scope="planner", plugin_snapshot=plugin_snapshot
+            )
             budget = declined.continuation_budget
             verdict = AdvisorCheckpointVerdict(
                 ok=False,
@@ -995,7 +998,9 @@ class PlanningApplication:
                             failure_class="budget_exhausted",
                             findings_text="The original request deadline expired before final review.",
                         )
-            current = turn_evidence.review_candidate(candidate=candidate, request=request, current_state=state, scope="planner")
+            current = turn_evidence.review_candidate(
+                candidate=candidate, request=request, current_state=state, scope="planner", plugin_snapshot=plugin_snapshot
+            )
             admitted = (
                 budget is not None
                 and budget.within_cost_cap()
@@ -1276,6 +1281,7 @@ class PlanningApplication:
                 provider_owner=provider_owner,
                 turn_evidence=turn_evidence,
                 deadline=deadline,
+                plugin_snapshot=plugin_snapshot,
             )
         except PromptGuardRefused as exc:
             calls = recorder.llm_calls[planner_llm_start:]
