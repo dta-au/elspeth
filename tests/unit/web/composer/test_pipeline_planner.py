@@ -330,6 +330,10 @@ _VALIDATED_DIFF_BASELINE_CANONICAL_BYTES = 98
 # delivery limit, refusal condition and repair together; the rest of this
 # teaching unit is unchanged. Preserve existing headroom and boundary controls.
 _CDA04_REVIEWED_SLOT_CANONICAL_BYTES = 153
+# CDA-02b (2026-11-14): diff reply and version guidance grows the planner's
+# diff_pipeline declaration by 762 canonical bytes; the skill paragraph is not
+# carried in this planner request. Preserve the existing 17-byte headroom.
+_CDA02B_DIFF_GUIDANCE_CANONICAL_BYTES = 762
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
@@ -345,6 +349,7 @@ _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     + _FILE_INJECT_CATALOG_CANONICAL_BYTES
     + _VALIDATED_DIFF_BASELINE_CANONICAL_BYTES
     + _CDA04_REVIEWED_SLOT_CANONICAL_BYTES
+    + _CDA02B_DIFF_GUIDANCE_CANONICAL_BYTES
 )
 
 

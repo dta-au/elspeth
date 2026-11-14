@@ -585,8 +585,15 @@ class TestStep3DiscoveryTierMigration:
         assert self._get("diff_pipeline") == {
             "name": "diff_pipeline",
             "description": "Compare with the newest validated state other than the working state. `baseline_kind`: `last_validated` "
-            "or `request_start` if none exists (including never validated). In-request edits can compare with request start; planner: `request_start`. "
-            "`data`: `from_version` (baseline; current is envelope `version`), `sources_changed`, "
+            "or `request_start` if none is used. In-request edits can compare with request start; planner: `request_start`. "
+            "With no edits yet this turn, `last_validated` compares with the validated version before the current one. "
+            "When available, a broken pipeline compares with its last validated version; a valid one with the previous validated version. "
+            "Name `from_version` and envelope `version`: `version` is the working pipeline's number at this call; later saves "
+            "this turn take higher numbers, so give it as the compared version, not the user's final version. `from_version` can "
+            "be looked for in the version menu, which hides versions identical to their predecessors and lists only recent ones. "
+            "If `total_changes` is 0 and `baseline_kind` is `last_validated`, say nothing has changed since the compared validated "
+            "version `from_version`. If `total_changes` is 0 and `baseline_kind` is `request_start`, say nothing has changed in this turn. "
+            "`data`: `from_version` (baseline), `sources_changed`, "
             "`metadata_changed`, `total_changes`, `warnings_introduced`, "
             "`warnings_resolved`, and per-collection `added` / `removed` / `modified` "
             "lists under `nodes`, `edges`, `outputs`, and — only when `sources_changed` — `sources`. Without a "
