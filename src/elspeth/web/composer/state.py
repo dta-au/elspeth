@@ -1834,8 +1834,8 @@ def _batch_aware_placement_error(
         if parsed.has_count or parsed.has_timeout or parsed.has_condition:
             return f"Node '{node_id}' uses '{plugin_name}', which requires an EOF-only trigger; omit trigger or use {{}}"
 
-    batch_caps = _known_transform_plugin_batch_caps()
-    if node_type == "aggregation" and plugin_name in batch_caps:
+    batch_caps = _known_transform_plugin_batch_caps() if node_type == "aggregation" else {}
+    if plugin_name in batch_caps:
         parsed, error = _parse_aggregation_trigger(node_id, trigger or {})
         if error is not None:
             return error.message
