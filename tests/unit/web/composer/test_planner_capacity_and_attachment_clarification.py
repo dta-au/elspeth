@@ -40,6 +40,7 @@ from elspeth.web.required_work import (
 )
 from tests.unit.web.composer.test_pipeline_planner import (
     _budget,
+    _context_policy,
     _custody,
     _empty_state,
     _lifecycle,
@@ -63,6 +64,7 @@ def test_deployed_capacity_environment_override_retains_transport_cost_and_repai
 ) -> None:
     values = {
         "COMPOSER_MAX_COMPOSITION_TURNS": "15",
+        "COMPOSER_CONTEXT_MAX_PROMPT_TOKENS": "200000",
         "COMPOSER_MAX_DISCOVERY_TURNS": "10",
         "COMPOSER_RATE_LIMIT_PER_MINUTE": "10",
         "SHAREABLE_LINK_SIGNING_KEY": "0" * 64,
@@ -87,6 +89,7 @@ def test_deployed_capacity_environment_override_retains_transport_cost_and_repai
 
     defaults = WebSettings(
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=300,
         composer_rate_limit_per_minute=10,
@@ -197,6 +200,7 @@ async def test_length_stops_settle_each_owned_physical_provider_attempt(
                 rendered_skill=load_pipeline_capability_core() + "\nOrdinary bounded planner instructions.",
                 repair_budget=1,
                 budget_policy=_budget(),
+                context_policy=_context_policy(),
                 custody_config=replace(
                     _custody(tmp_path), session_engine=engine, session_operation_context=context, session_operation_authority=authority
                 ),

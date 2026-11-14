@@ -6,6 +6,7 @@ import { axe, toHaveNoViolations } from "jest-axe";
 import { SaveForReviewDialog } from "./SaveForReviewDialog";
 import { useShareableReviewStore } from "@/stores/shareableReviewStore";
 import { useExecutionStore } from "@/stores/executionStore";
+import { useSessionStore } from "@/stores/sessionStore";
 import {
   COMPLETION_BLOCKED_VALIDATION_READINESS,
   makeValidationResult,
@@ -60,6 +61,7 @@ describe("SaveForReviewDialog", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     useShareableReviewStore.getState().reset();
+    useSessionStore.setState({ activeSessionId: null });
     useExecutionStore.setState({
       validationResult: makeValidationResult(),
     });
@@ -416,6 +418,67 @@ describe("SaveForReviewDialog", () => {
     expect(screen.getByRole("radio", { name: "30 days" })).toBeChecked();
     expect(screen.getByRole("radio", { name: "1 day" })).not.toBeChecked();
     expect(screen.getByRole("radio", { name: "7 days" })).not.toBeChecked();
+  });
+
+  it("closes when the active session changes, so a link cannot be made for the session left behind", async () => {
+    useSessionStore.setState({ activeSessionId: "sess-cfg" });
+    const { mint } = await _renderConfigure();
+    expect(screen.getByTestId("save-for-review-dialog")).toBeInTheDocument();
+
+    act(() => {
+      useSessionStore.setState({ activeSessionId: "sess-other" });
+    });
+
+    expect(screen.queryByTestId("save-for-review-dialog")).toBeNull();
+    expect(mint).not.toHaveBeenCalled();
+  });
+
+  it("stays open when the session store changes but the active session does not", async () => {
+    useSessionStore.setState({ activeSessionId: "sess-cfg" });
+    await _renderConfigure();
+
+    act(() => {
+      useSessionStore.setState({ activeSessionId: "sess-cfg" });
+    });
+
+    expect(screen.getByTestId("save-for-review-dialog")).toBeInTheDocument();
+  });
+
+  it("closes from the error step too, so Try again cannot retry the session left behind", async () => {
+    useSessionStore.setState({ activeSessionId: "sess-retry" });
+    const mint = vi.spyOn(api, "markReadyForReview").mockRejectedValue(new Error("boom"));
+    await _openAndConfirm("sess-retry", _OPTIONS);
+    render(<SaveForReviewDialog />);
+    expect(screen.getByTestId("save-for-review-dialog")).toBeInTheDocument();
+    mint.mockClear();
+
+    act(() => {
+      useSessionStore.setState({ activeSessionId: "sess-other" });
+    });
+
+    expect(screen.queryByTestId("save-for-review-dialog")).toBeNull();
+    expect(mint).not.toHaveBeenCalled();
+  });
+
+  it("says what an import-enabled link lets the recipient do", async () => {
+    vi.spyOn(api, "markReadyForReview").mockResolvedValue(_validResponse);
+    await _openAndConfirm("sess-import", { allowImport: true, lifetimeSeconds: 604800 });
+    render(<SaveForReviewDialog />);
+
+    const success = screen.getByTestId("save-for-review-success");
+    expect(success).toHaveTextContent("make their own editable copy");
+    expect(success).toHaveTextContent("copies of the files you listed");
+    expect(success).not.toHaveTextContent("read-only access");
+  });
+
+  it("describes a view-only link as read-only and does not mention import", async () => {
+    vi.spyOn(api, "markReadyForReview").mockResolvedValue(_validResponse);
+    await _openAndConfirm("sess-view", { allowImport: false, lifetimeSeconds: 604800 });
+    render(<SaveForReviewDialog />);
+
+    const success = screen.getByTestId("save-for-review-success");
+    expect(success).toHaveTextContent("read-only access");
+    expect(success).not.toHaveTextContent("editable copy");
   });
 
   it("ticking import reveals the file list with human-readable sizes and users", async () => {

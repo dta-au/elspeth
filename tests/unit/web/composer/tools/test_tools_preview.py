@@ -3578,6 +3578,192 @@ class TestPreviewProofStep:
             mismatch = [d for d in diagnostics if d["code"] == "gate_expression_type_mismatch_against_source_schema"]
             assert not mismatch, mismatch
 
+    def _preview_gate_against_observed_csv(self, condition: str, evaluator_patch: Any = None) -> list[dict[str, Any]]:
+        """Preview a one-gate pipeline over the observed CSV; return the mismatch diagnostics.
+
+        ``evaluator_patch`` is an optional context manager that replaces the
+        evaluator's ``visit`` so a kind the sampled CSV rows cannot naturally
+        produce (division by zero, a wrapped MemoryError) reaches the REAL
+        ``ExpressionParser.evaluate`` wrapping logic.
+        """
+        import contextlib
+
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_csv_source(
+                session_operation_authority=authority, session_operation_context=context, schema_mode="observed"
+            )
+            upserted = execute_tool(
+                "upsert_node",
+                {
+                    "id": "kind_gate",
+                    "node_type": "gate",
+                    "plugin": None,
+                    "input": "rows",
+                    "condition": condition,
+                    "routes": {"true": "out", "false": "out"},
+                    "options": {},
+                },
+                state,
+                _mock_catalog(),
+            )
+            assert upserted.success, upserted.data
+            with evaluator_patch if evaluator_patch is not None else contextlib.nullcontext():
+                result = execute_tool(
+                    "preview_pipeline",
+                    {},
+                    upserted.updated_state,
+                    _mock_catalog(),
+                    session_engine=self.engine,
+                    session_id=self.session_id,
+                    data_dir=str(self.data_dir),
+                    session_operation_authority=authority,
+                    session_operation_context=context,
+                )
+            assert result.data["preview_is_valid"] is False
+            self.last_blocking_codes = sorted({d["code"] for d in result.data["proof_diagnostics"] if d["severity"] == "blocking"})
+            return [d for d in result.data["proof_diagnostics"] if d["code"] == "gate_expression_type_mismatch_against_source_schema"]
+
+    def test_observed_csv_gate_missing_key_does_not_prescribe_numeric_typing(self) -> None:
+        """A misspelt field name is a missing_key failure: still blocking under the
+        same code, but the repair must point at the field name, not a numeric type."""
+        mismatch = self._preview_gate_against_observed_csv("row['prcie'] >= 100")
+        assert mismatch
+        diag = mismatch[0]
+        assert diag["severity"] == "blocking"
+        text = f"{diag['message']} {diag['suggested_repair']}".lower()
+        assert "inspect_source" in diag["suggested_repair"]
+        assert "numeric" not in text
+        assert "schema.fields" not in text
+        assert ": int" not in text
+
+    def test_observed_csv_gate_division_by_zero_does_not_prescribe_numeric_typing(self) -> None:
+        from unittest.mock import patch
+
+        from elspeth.core.expression_parser import ExpressionEvaluationError, _ExpressionEvaluator
+
+        def raising_visit(self: Any, node: Any) -> Any:
+            raise ExpressionEvaluationError("division by zero", kind="division_by_zero")
+
+        mismatch = self._preview_gate_against_observed_csv(
+            "row['price'] >= 100", patch.object(_ExpressionEvaluator, "visit", raising_visit)
+        )
+        assert mismatch
+        diag = mismatch[0]
+        assert diag["severity"] == "blocking"
+        text = f"{diag['message']} {diag['suggested_repair']}".lower()
+        assert "divisor" in text
+        assert "numeric" not in text
+        assert ": int" not in text
+
+    def test_observed_csv_gate_wrapped_memory_error_is_not_schema_typing_repair(self) -> None:
+        """MemoryError inside the evaluator is wrapped by ExpressionParser.evaluate
+        as kind=unexpected_error (it is not in TIER_1_ERRORS), so it reaches the
+        ExpressionEvaluationError arm: it must not be told to declare a numeric type."""
+        from unittest.mock import patch
+
+        from elspeth.core.expression_parser import _ExpressionEvaluator
+
+        def exploding_visit(self: Any, node: Any) -> Any:
+            raise MemoryError("simulated allocation failure")
+
+        mismatch = self._preview_gate_against_observed_csv(
+            "row['price'] >= 100", patch.object(_ExpressionEvaluator, "visit", exploding_visit)
+        )
+        assert mismatch
+        diag = mismatch[0]
+        assert diag["severity"] == "blocking"
+        text = f"{diag['message']} {diag['suggested_repair']}".lower()
+        assert "numeric" not in text
+        assert ": int" not in text
+        assert "simulated allocation failure" not in text
+
+    def test_observed_csv_gate_on_a_correct_field_is_not_blocked_by_the_byte_cut(self) -> None:
+        """A CSV over the 8 KiB sample bound: the row the byte cut lands in lacks its
+        trailing fields. A correctly spelt, string-safe condition must not be blocked
+        with missing_key because of that sampling artefact."""
+        from sqlalchemy import update
+
+        from elspeth.web.blobs.service import content_hash as _content_hash
+        from elspeth.web.sessions.models import blobs_table
+
+        small_mismatch = self._preview_gate_against_observed_csv("row['price'] == '9'")
+        assert small_mismatch == []
+        small_codes = self.last_blocking_codes
+
+        content = ("order_id,customer,price\n" + "".join(f"O-{i},{'n' * 150},9\n" for i in range(400))).encode()
+        assert len(content) > 8 * 1024
+        self.csv_storage_path.write_bytes(content)
+        with self.engine.begin() as conn:
+            conn.execute(
+                update(blobs_table)
+                .where(blobs_table.c.id == self.csv_blob_id)
+                .values(size_bytes=len(content), content_hash=_content_hash(content))
+            )
+
+        assert self._preview_gate_against_observed_csv("row['price'] == '9'") == []
+        # The whole blocking set is what the small, uncut CSV yields: the byte cut adds no blocker.
+        assert self.last_blocking_codes == small_codes
+
+    def test_observed_csv_gate_get_of_a_misspelt_field_checks_the_name_before_typing(self) -> None:
+        """``row.get('prcie') >= 100`` evaluates None >= int and the evaluator reports
+        incompatible_types, so the repair must send the model to the field name first."""
+        mismatch = self._preview_gate_against_observed_csv("row.get('prcie') >= 100")
+        assert mismatch
+        diag = mismatch[0]
+        assert diag["severity"] == "blocking"
+        assert "'prcie'" in diag["message"]
+        repair = diag["suggested_repair"]
+        assert "inspect_source" in repair
+        assert repair.index("inspect_source") < repair.index("explicit numeric type")
+
+    def test_observed_csv_gate_get_on_a_short_row_checks_the_name_before_typing(self) -> None:
+        """The field exists in the header but the failing row is short: row.get() is None
+        there. The model is sent to the observed fields first, not straight to a type."""
+        from sqlalchemy import update
+
+        from elspeth.web.blobs.service import content_hash as _content_hash
+        from elspeth.web.sessions.models import blobs_table
+
+        content = b"order_id,customer,price\nO-1,ann,9\nO-2,bob\n"
+        self.csv_storage_path.write_bytes(content)
+        with self.engine.begin() as conn:
+            conn.execute(
+                update(blobs_table)
+                .where(blobs_table.c.id == self.csv_blob_id)
+                .values(size_bytes=len(content), content_hash=_content_hash(content))
+            )
+
+        mismatch = self._preview_gate_against_observed_csv("len(row.get('price')) > 0")
+        assert mismatch
+        diag = mismatch[0]
+        assert diag["evidence_locator"]["sample_row_index"] == 1
+        assert "'price'" in diag["message"] and "does not carry" in diag["message"]
+        repair = diag["suggested_repair"]
+        assert repair.index("inspect_source") < repair.index("explicit numeric type")
+
+    def test_observed_csv_gate_typing_repair_does_not_name_a_string_compared_field(self) -> None:
+        """With several fields in the condition, ``fields[0]`` need not be the numeric one:
+        the repair must not tell the model to type the string-compared field as an int."""
+        mismatch = self._preview_gate_against_observed_csv("row['customer'] == 'Alice' and row['price'] >= 100")
+        assert mismatch
+        repair = mismatch[0]["suggested_repair"]
+        assert "customer: int" not in repair
+        assert "<field>: int" in repair
+
+    def test_observed_csv_gate_get_of_a_present_field_keeps_unconditional_typing_repair(self) -> None:
+        mismatch = self._preview_gate_against_observed_csv("row.get('price') >= 100")
+        assert mismatch
+        repair = mismatch[0]["suggested_repair"]
+        assert "price: int" in repair
+        assert "inspect_source" not in repair
+
+    def test_observed_csv_gate_incompatible_types_keeps_numeric_typing_repair(self) -> None:
+        mismatch = self._preview_gate_against_observed_csv("row['price'] >= 100")
+        assert mismatch
+        repair = mismatch[0]["suggested_repair"]
+        assert "numeric" in repair
+        assert "price: int" in repair
+
     def test_observed_csv_batch_stats_string_value_field_blocks_through_transform(self) -> None:
         """Observed CSV strings must not reach numeric batch_stats at runtime.
 

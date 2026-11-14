@@ -20,6 +20,7 @@ def _settings(hosts: tuple[str, ...]) -> WebSettings:
     return WebSettings(
         trusted_proxy_hosts=hosts,
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
@@ -62,6 +63,7 @@ def test_application_and_transport_parse_the_same_environment(monkeypatch: pytes
             monkeypatch.delenv(name)
     required = {
         "COMPOSER_MAX_COMPOSITION_TURNS": "15",
+        "COMPOSER_CONTEXT_MAX_PROMPT_TOKENS": "200000",
         "COMPOSER_MAX_DISCOVERY_TURNS": "10",
         "COMPOSER_TIMEOUT_SECONDS": "85.0",
         "COMPOSER_RATE_LIMIT_PER_MINUTE": "10",

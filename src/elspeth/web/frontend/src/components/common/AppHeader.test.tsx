@@ -6,6 +6,49 @@ import { AppHeader } from "./AppHeader";
 import { useSessionStore } from "@/stores/sessionStore";
 
 describe("AppHeader", () => {
+  // ARGOnite: the wordmark is a yellow-on-navy chip on the DTA green band.
+  it("renders the ELSPETH wordmark inside the app-header-brand chip", () => {
+    const { container } = render(
+      <AppHeader onOpenSettings={() => {}} onSignOut={() => {}} />,
+    );
+    const brand = container.querySelector(".app-header-left > .app-header-brand");
+    expect(brand).not.toBeNull();
+    expect(brand?.textContent).toBe("ELSPETH");
+  });
+
+  it("styles the brand chip navy with a yellow wordmark and the model chip on the nav-control tint", () => {
+    // ARGOnite: yellow only on navy (never on the green band); on-nav-muted
+    // only on --color-nav-control (bare light green is 3.65:1, below AA).
+    const css = readFileSync("src/components/header/header.css", "utf8");
+    const rule = (selector: string): string => {
+      const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const match = new RegExp(`(?:^|\\})\\s*${escaped}\\s*\\{([^}]*)\\}`, "m").exec(css);
+      if (match === null) throw new Error(`no rule for ${selector}`);
+      return match[1];
+    };
+    const brand = rule(".app-header-brand");
+    expect(brand).toMatch(/background:\s*var\(--color-brand-navy\)/);
+    expect(brand).toMatch(/color:\s*var\(--color-brand-yellow\)/);
+    expect(brand).toMatch(/border-radius:\s*var\(--radius-md\)/);
+    expect(brand).toMatch(/padding:[^;]*var\(--space-sm\)/);
+
+    const chip = rule(".app-header .chat-model-chip");
+    expect(chip).toMatch(/background:\s*var\(--color-nav-control\)/);
+    expect(chip).toMatch(/color:\s*var\(--color-on-nav-muted\)/);
+
+    // Menus keep body ink: they inherit from .app-header, which is on-nav.
+    expect(rule(".app-header")).toMatch(/color:\s*var\(--color-on-nav\)/);
+    for (const popover of [
+      ".header-session-switcher-popover",
+      ".header-version-selector .version-selector-dropdown",
+      ".user-menu-list",
+    ]) {
+      expect(rule(popover), `${popover} declares body ink`).toMatch(
+        /color:\s*var\(--color-text\)/,
+      );
+    }
+  });
+
   it("sizes the application shell to the dynamic viewport with a legacy fallback", () => {
     const css = readFileSync("src/components/header/header.css", "utf8");
     const appRoot = css.match(/\.app-root\s*\{([^}]*)\}/s)?.[1];
@@ -14,18 +57,21 @@ describe("AppHeader", () => {
     expect(appRoot).toMatch(/height:\s*100vh;\s*height:\s*100dvh;/s);
   });
 
-  it("uses one compact control height for the short desktop header and version trigger", () => {
+  it("uses the shared pill height plus bottom breathing room in the short desktop header", () => {
+    // Task A: model pills join the three triggers at one height in every
+    // density regime; compact mode only reduces the surrounding band.
     const css = readFileSync("src/components/header/header.css", "utf8");
     const shortHeightRule = css.match(
       /@media \(min-width: 961px\) and \(max-height: 800px\)\s*\{([\s\S]*?)\n\}/,
     )?.[1];
     expect(shortHeightRule).toBeDefined();
     expect(shortHeightRule).toMatch(
-      /\.app-header\s*\{[^}]*height:\s*calc\(var\(--size-control-compact\) \+ 1px\);/s,
+      /\.app-header\s*\{[^}]*height:\s*calc\(var\(--size-header-pill-height\) \+ var\(--space-xs\) \+ 1px\);/s,
     );
-    expect(shortHeightRule).toMatch(
-      /\.header-session-switcher-trigger,\s*\.header-version-selector \.version-selector-trigger,\s*\.user-menu-trigger\s*\{[^}]*height:\s*var\(--size-control-compact\);[^}]*min-height:\s*var\(--size-control-compact\);/s,
+    expect(css).toMatch(
+      /\.app-header \.header-session-switcher-trigger,\s*\.app-header \.version-selector-trigger,\s*\.app-header \.chat-model-chip,\s*\.app-header \.user-menu-trigger\s*\{[^}]*height:\s*var\(--size-header-pill-height\);[^}]*min-height:\s*var\(--size-header-pill-height\);/s,
     );
+    expect(shortHeightRule).not.toMatch(/\.(?:header-session-switcher-trigger|version-selector-trigger|chat-model-chip|user-menu-trigger)\s*[{,]/);
     expect(shortHeightRule).not.toMatch(
       /height:\s*calc\(var\(--size-header-height\) - var\(--space-sm\)\)/,
     );

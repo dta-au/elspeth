@@ -42,6 +42,7 @@ from elspeth.contracts.composer_audit import (
     ComposerToolStatus,
     ToolArgumentErrorCategory,
 )
+from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.async_workers import run_sync_in_worker
@@ -76,6 +77,7 @@ from elspeth.web.execution.runtime_preflight import (
 )
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.execution.validation import validate_pipeline
+from elspeth.web.paths import require_mcp_root_context
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
 __all__ = ["create_server", "main"]
@@ -370,6 +372,7 @@ def _dispatch_tool(
     runtime_preflight: RuntimePreflight | None = None,
     session_manager: SessionManager | None = None,
     session_checkout_ref: list[SessionCheckout | None] | None = None,
+    mcp_root_authority: McpConfiguredRootAuthority | None = None,
 ) -> dict[str, Any]:
     """Dispatch a tool call and return a result dict.
 
@@ -410,6 +413,7 @@ def _dispatch_tool(
             runtime_preflight=runtime_preflight,
             validate_arguments=True,
             require_data_dir_for_paths=True,
+            mcp_root_authority=mcp_root_authority,
             raise_schema_argument_errors=True,
         )
         response = result.to_dict()
@@ -645,6 +649,7 @@ def create_server(
     *,
     runtime_preflight: McpRuntimePreflight | None,
     runtime_preflight_settings_hash: str | None,
+    mcp_root_authority: McpConfiguredRootAuthority | None = None,
     runtime_preflight_timeout_seconds: float = 5.0,
     runtime_preflight_coordinator: RuntimePreflightCoordinator | None = None,
     session_scope_provider: SessionScopeProvider | None = None,
@@ -678,12 +683,21 @@ def create_server(
         runtime_preflight_coordinator: Shared coordinator for in-flight deduplication.
             When embedded in-process with the web server, pass the same coordinator
             used by ComposerServiceImpl so HTTP and MCP share a single-flight lock.
+        mcp_root_authority: Operator-owned root for local file authoring and preview.
+            Omitting it refuses local path writes while retaining non-file tools.
         session_scope_provider: Optional callable returning the current session scope
             string. When None, scope is derived from scratch_dir and session_id.
 
     Returns:
         Configured MCP Server ready for stdio transport.
     """
+    require_mcp_root_context(mcp_root_authority, data_dir=None, session_id=None)
+    path_policy_scope = (
+        f"mcp-configured-root:{mcp_root_authority.root}" if mcp_root_authority is not None else "mcp-no-local-path-authority"
+    )
+    preflight_settings_hash = (
+        f"{runtime_preflight_settings_hash}:{path_policy_scope}" if runtime_preflight_settings_hash is not None else None
+    )
     server = Server("elspeth-composer")
     session_manager = SessionManager(scratch_dir)
     coordinator = runtime_preflight_coordinator or RuntimePreflightCoordinator()
@@ -828,13 +842,13 @@ def create_server(
 
             if name == "preview_pipeline" and runtime_preflight is not None:
                 try:
-                    if runtime_preflight_settings_hash is None:
+                    if preflight_settings_hash is None:
                         raise ValueError("runtime_preflight_settings_hash is required when runtime_preflight is configured")
                     preview_preflight = await _mcp_preview_runtime_preflight(
                         state_ref[0],
                         coordinator=coordinator,
                         session_scope=current_session_scope(),
-                        settings_hash=runtime_preflight_settings_hash,
+                        settings_hash=preflight_settings_hash,
                         timeout_seconds=runtime_preflight_timeout_seconds,
                         run_preflight=runtime_preflight,
                     )
@@ -865,6 +879,7 @@ def create_server(
                     runtime_preflight=runtime_preflight_callback,
                     session_manager=session_manager,
                     session_checkout_ref=session_checkout_ref,
+                    mcp_root_authority=mcp_root_authority,
                 )
             except ToolArgumentError as exc:
                 return _argument_error_result(exc, exc.category)
@@ -1022,32 +1037,23 @@ class _StdioValidationSettings:
     data_dir: Path
 
 
-def _build_stdio_server(catalog: CatalogService, scratch_dir: Path, data_dir: Path) -> Server:
+def _build_stdio_server(
+    catalog: CatalogService,
+    scratch_dir: Path,
+    data_dir: Path,
+    *,
+    runtime_preflight_coordinator: RuntimePreflightCoordinator | None = None,
+) -> Server:
     """Build the stdio server with a runtime-equivalent preflight wired in.
 
     Factored out of ``run_server`` so the construction the shipped transport
     uses is the construction under test.
     """
-    settings = _StdioValidationSettings(data_dir=data_dir)
+    authority = McpConfiguredRootAuthority(data_dir)
+    settings = _StdioValidationSettings(data_dir=authority.root)
     plugin_snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
-    # A validation-internal path-scoping token, NOT an identity. Three
-    # constraints make it necessary, and none of them are visible at the call
-    # below:
-    #
-    # 1. ``allowed_sink_directories`` / ``allowed_source_directories``
-    #    (web/paths.py) return ``()`` for ``session_id=None`` BY DESIGN — that
-    #    is web tenancy, where a caller without a session owns no directory.
-    #    Passing None here rejects every pipeline that reads or writes a local
-    #    file, and publishes it as an honest-looking ``is_valid: false``.
-    # 2. A single-user stdio process has no tenancy boundary to enforce and no
-    #    session identity to borrow, so it scopes itself once per process.
-    #    Threading the live MCP session id back in does NOT work: it is None
-    #    for any unsaved composition, which is the common case.
-    # 3. Nothing the user keeps carries it — ``generate_public_yaml`` takes no
-    #    session_id and emits authored paths verbatim.
-    #
-    # Traversal out of ``data_dir`` is still rejected; this widens no boundary.
-    session_id = uuid.uuid4().hex[:12]
+    # Filesystem authority comes only from operator configuration, never
+    # from the persistence session id or coordinator scope.
 
     async def stdio_runtime_preflight(state: CompositionState) -> ValidationResult:
         return await run_sync_in_worker(
@@ -1059,113 +1065,50 @@ def _build_stdio_server(catalog: CatalogService, scratch_dir: Path, data_dir: Pa
             profile_registry=None,
             catalog=catalog,
             secret_service=None,
-            session_id=session_id,
+            mcp_root_authority=authority,
         )
 
     return create_server(
         catalog,
         scratch_dir,
         runtime_preflight=stdio_runtime_preflight,
+        runtime_preflight_coordinator=runtime_preflight_coordinator,
+        mcp_root_authority=authority,
         # Both extras change the verdict for one data_dir, so both belong in
         # the key: a coordinator shared with an in-process web server would
         # otherwise serve its policy-filtered verdict for our snapshot.
-        runtime_preflight_settings_hash=f"{runtime_preflight_settings_hash(settings)}:{plugin_snapshot.snapshot_hash}:{session_id}",
+        runtime_preflight_settings_hash=f"{runtime_preflight_settings_hash(settings)}:{plugin_snapshot.snapshot_hash}",
     )
 
 
-async def run_server(catalog: CatalogService, scratch_dir: Path, data_dir: Path) -> None:
-    """Run the MCP server with stdio transport."""
-    server = _build_stdio_server(catalog, scratch_dir, data_dir)
+async def run_server(
+    catalog: CatalogService,
+    scratch_dir: Path,
+    data_dir: Path,
+    *,
+    runtime_preflight_coordinator: RuntimePreflightCoordinator | None = None,
+) -> None:
+    """Serve transport under the embedding host's executor lifecycle.
+
+    Standalone callers enter through the authenticated private runner, which
+    supplies and joins its coordinator. Embedded hosts retain their own owner.
+    """
+    server = _build_stdio_server(catalog, scratch_dir, data_dir, runtime_preflight_coordinator=runtime_preflight_coordinator)
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
-# ---------------------------------------------------------------------------
-# WORKAROUND — Linux-only kernel guard against orphan busy-spin.
-# Tracked by archived issue elspeth-7f99eba6ef. See _install_parent_death_signal_workaround
-# docstring for full diagnosis and deletion criteria.
-# ---------------------------------------------------------------------------
-def _install_parent_death_signal_workaround() -> None:
-    """Kernel-level guarantee that this process dies when its parent dies.
-
-    WORKAROUND for an upstream bug in ``mcp.server.stdio.stdio_server`` (the
-    official MCP Python SDK). When the controlling Claude Code session
-    terminates abnormally (crash, SIGKILL, suspend-without-resume), the
-    SDK's stdio read coroutine fails to detect parent-pipe EOF and instead
-    busy-spins on empty reads. Observed in production: a single orphaned
-    pair burned ~120% CPU for 9 days before discovery (~10.8 core-days of
-    waste). Diagnosis trace: ``~/.claude/plans/can-you-investigate-why-mighty-sphinx.md``.
-
-    This function uses Linux's ``prctl(PR_SET_PDEATHSIG, SIGTERM)`` so the
-    kernel sends SIGTERM to this process when its parent dies, regardless
-    of what the SDK's read loop does. The follow-up ``getppid() == 1``
-    check covers the race window between process start and the prctl call:
-    if the parent died before we registered, PDEATHSIG cannot fire (it
-    requires a parent transition we already missed), so we exit immediately.
-
-    NOT A FIX — this is belt-and-braces only. The underlying SDK bug
-    affects every platform; this guard only protects Linux. Non-Linux
-    platforms (macOS, Windows, BSD) remain vulnerable and need either an
-    SDK upgrade or a portable watchdog (e.g. periodic ``getppid()`` poll).
-
-    REVIEW SCHEDULE — archived issue ``elspeth-7f99eba6ef`` tracks the
-    deletion criteria. Re-evaluate at every MCP SDK upgrade. Delete this
-    function and its caller in ``main()`` when:
-
-    1. The pinned MCP SDK version handles stdin EOF correctly in
-       ``stdio_server()``.
-    2. A behavioural test confirms unclean parent-kill produces clean
-       child exit *without* this workaround.
-
-    Sibling vulnerability: the retired issue tracker MCP server (same SDK)
-    has the identical bug and needs its own fix; this workaround does not
-    cover it.
-    """
-    import ctypes
-    import ctypes.util
-    import os
-    import signal
-    import sys
-
-    if sys.platform != "linux":
-        return  # Non-Linux: no portable equivalent here. See review issue.
-
-    libc_name = ctypes.util.find_library("c")
-    if libc_name is None:
-        # No discoverable libc on a Linux system — exotic/embedded build.
-        # Skip the guard rather than crash; the workaround is non-essential.
-        return
-    libc = ctypes.CDLL(libc_name, use_errno=True)
-
-    # PR_SET_PDEATHSIG: see ``man 2 prctl``. Constant is stable kernel ABI.
-    pr_set_pdeathsig = 1
-    rc = libc.prctl(pr_set_pdeathsig, signal.SIGTERM, 0, 0, 0)
-    if rc != 0:
-        # prctl(PR_SET_PDEATHSIG, ...) is documented as never failing for
-        # valid arguments. A non-zero return here means we passed something
-        # the kernel rejected — that's a bug in this function, not a runtime
-        # condition to absorb. Crash with the errno preserved.
-        errno = ctypes.get_errno()
-        raise OSError(
-            errno,
-            f"prctl(PR_SET_PDEATHSIG, SIGTERM) failed: {os.strerror(errno)}",
-        )
-
-    # Race-window cleanup: if the parent died between fork/exec and the
-    # prctl call above, PDEATHSIG will not fire because the parent
-    # transition already happened. Exit immediately rather than wait for
-    # a signal that will never arrive.
-    if os.getppid() == 1:
-        sys.exit(0)
-
-
 def main() -> None:
     """CLI entry point for elspeth-composer MCP server."""
-    # WORKAROUND first — see _install_parent_death_signal_workaround
-    # docstring and archived issue elspeth-7f99eba6ef.
-    _install_parent_death_signal_workaround()
+    from elspeth.composer_mcp import main as launch
 
+    launch()
+
+
+def _parse_arguments() -> argparse.Namespace:
+    """Parse the unchanged public arguments inside the authenticated runner."""
     parser = argparse.ArgumentParser(
+        prog="elspeth-composer",
         description="ELSPETH Composer MCP Server",
     )
     parser.add_argument(
@@ -1179,16 +1122,7 @@ def main() -> None:
         type=Path,
         default=Path("data"),
         help=(
-            "Root for runtime preflight path checks (default: data). preview_pipeline reports source and sink paths that resolve outside this directory as invalid."
+            "Configured root for local source, sink and provider authoring and preview checks (default: data). Paths escaping this directory are refused."
         ),
     )
-    args = parser.parse_args()
-
-    # Lazy import to avoid pulling in the full catalog at module level.
-    from elspeth.web.dependencies import create_catalog_service
-
-    catalog = create_catalog_service()
-
-    import asyncio
-
-    asyncio.run(run_server(catalog, args.scratch_dir, args.data_dir))
+    return parser.parse_args()

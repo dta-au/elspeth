@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
+import time
 from collections.abc import Callable
 from multiprocessing.process import BaseProcess
 from pathlib import Path
@@ -10,6 +13,55 @@ from unittest.mock import Mock
 
 import pytest
 from tests.helpers import process_diagnostics
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux proc diagnostics")
+def test_proc_snapshot_describes_sleeping_child_and_exited_pid() -> None:
+    process = subprocess.Popen([sys.executable, "-c", "import time; print('ready', flush=True); time.sleep(60)"], stdout=subprocess.PIPE)
+    try:
+        assert process.stdout is not None
+        assert process.stdout.readline() == b"ready\n"
+        deadline = time.monotonic() + 5
+        while True:
+            snapshot = process_diagnostics.linux_process_snapshot(process.pid)
+            if "state=S (sleeping)" in snapshot:
+                break
+            assert time.monotonic() < deadline, snapshot
+        comm = Path(f"/proc/{process.pid}/comm").read_text().strip()
+        assert f"{process.pid}:S:{comm}" in snapshot
+        assert "sigpnd=" in snapshot and "shdpnd=" in snapshot
+        assert "wchan=" in snapshot and "syscall=" in snapshot
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+        assert process.stdout is not None
+        process.stdout.close()
+    snapshot = process_diagnostics.linux_process_snapshot(process.pid)
+    assert snapshot.startswith("proc:") and "unreadable" in snapshot
+
+
+def test_snapshot_includes_proc_block() -> None:
+    diagnostics = process_diagnostics.ProcessDiagnostics()
+    process = Mock(spec=BaseProcess)
+    process.is_alive.return_value = False
+    process.pid = None
+    process.exitcode = 0
+    try:
+        assert "proc:" in diagnostics.snapshot(process)
+    finally:
+        diagnostics.close()
+
+
+@pytest.mark.parametrize("error", [PermissionError("controlled denied proc"), UnicodeError("controlled non-UTF8 proc")])
+def test_proc_snapshot_never_raises_for_unreadable_fields(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    def unreadable(path: Path, *args: object, **kwargs: object) -> str:
+        raise error
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    snapshot = process_diagnostics.linux_process_snapshot(os.getpid())
+    assert "proc: state=unreadable" in snapshot
+    assert "sigpnd=unreadable" in snapshot and "shdpnd=unreadable" in snapshot
+    assert "wchan=unreadable" in snapshot and "syscall=unreadable" in snapshot
 
 
 class _DiagnosticClock:

@@ -358,6 +358,7 @@ export function TutorialTurn4Run({
   return (
     <TutorialWorkspaceFrame
       ariaLabel="Tutorial run"
+      authoringTitle="Run results"
       header={{
         title,
         headingRef,

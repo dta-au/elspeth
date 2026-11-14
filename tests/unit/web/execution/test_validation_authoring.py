@@ -9,6 +9,7 @@ from typing import Any, cast
 import pytest
 
 from elspeth.contracts import Determinism
+from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
 from elspeth.contracts.secrets import ResolvedSecret, SecretInventoryItem, SecretScope
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.plugins.transforms.blob_fetch import BlobFetch
@@ -233,6 +234,36 @@ def test_path_phase_returns_typed_failure_for_malformed_authored_paths(bad_path:
     assert isinstance(result, PhaseFailure)
     assert result.failed_check.name == "path_allowlist"
     assert result.errors[0].component_id == "source"
+
+
+@pytest.mark.parametrize(
+    ("component", "key"), [("source", "path"), ("source", "file"), ("sink", "path"), ("sink", "file"), ("sink", "persist_directory")]
+)
+@pytest.mark.parametrize("mode", ["web", "mcp"])
+def test_path_phase_refuses_present_null_for_each_source_sink_alias(tmp_path: Path, component: str, key: str, mode: str) -> None:
+    state = _state(source=_source({key: None})) if component == "source" else _state(outputs=(_output({key: None}),))
+    result = validate_path_policy(
+        _policy(state),
+        data_dir=tmp_path,
+        session_id="test-session" if mode == "web" else None,
+        mcp_root_authority=McpConfiguredRootAuthority(tmp_path) if mode == "mcp" else None,
+    )
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.name == "path_allowlist"
+    assert result.errors[0].component_type == component
+
+
+@pytest.mark.parametrize("mode", ["web", "mcp"])
+def test_path_phase_keeps_missing_keys_and_nullable_provider_distinct_from_null_source_sink(tmp_path: Path, mode: str) -> None:
+    state = _state(nodes=(_node(options={"provider_config": {"persist_directory": None}}),), outputs=(_output(),))
+    result = validate_path_policy(
+        _policy(state),
+        data_dir=tmp_path,
+        session_id="test-session" if mode == "web" else None,
+        mcp_root_authority=McpConfiguredRootAuthority(tmp_path) if mode == "mcp" else None,
+    )
+    assert isinstance(result, PhaseReport)
+    assert result.artifact.state.to_dict() == state.to_dict()
 
 
 @pytest.mark.parametrize(

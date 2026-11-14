@@ -46,6 +46,7 @@ from elspeth.plugins.infrastructure.config_base import (
     NormalizedFieldMappingOption,
     declared_source_schema_field_names,
 )
+from elspeth.plugins.infrastructure.config_content import reject_nonfinite_constant
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,
@@ -58,7 +59,6 @@ from elspeth.plugins.sources.field_normalization import (
 )
 from elspeth.plugins.sources.json_source import (
     _contains_surrogateescape_chars,
-    _reject_nonfinite_constant,
     _surrogateescape_line_to_bytes,
 )
 
@@ -885,7 +885,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:95b46ac953b9c321"
+    source_file_hash: str | None = "sha256:ecf90258957184af"
     config_model = AWSS3SourceConfig
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 
@@ -1278,7 +1278,7 @@ class AWSS3Source(BaseSource):
                     )
                     continue
                 try:
-                    row = json.loads(line, parse_constant=_reject_nonfinite_constant)
+                    row = json.loads(line, parse_constant=reject_nonfinite_constant)
                 except (json.JSONDecodeError, ValueError):
                     yield from self._quarantine_parse_row(
                         ctx,

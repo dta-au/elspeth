@@ -1235,7 +1235,8 @@ async def test_rejection_rejects_duplicate_successful_dispatch_evidence(service:
 
 
 @pytest.mark.asyncio
-async def test_pipeline_rejection_uses_closed_versioned_reason_and_is_exactly_idempotent(service: SessionServiceImpl) -> None:
+@pytest.mark.parametrize("reason", ["operator_rejected", "no_change"])
+async def test_pipeline_rejection_uses_closed_versioned_reason_and_is_exactly_idempotent(service: SessionServiceImpl, reason: str) -> None:
     session_id = uuid4()
     _insert_session(service, session_id)
     plan = _plan()
@@ -1245,7 +1246,7 @@ async def test_pipeline_rejection_uses_closed_versioned_reason_and_is_exactly_id
         session_id=session_id,
         proposal_id=row.id,
         draft_hash=plan.proposal.draft_hash,
-        reason="operator_rejected",
+        reason=reason,
         dispatch=None,
         actor="user:alice",
     )
@@ -1253,7 +1254,7 @@ async def test_pipeline_rejection_uses_closed_versioned_reason_and_is_exactly_id
         session_id=session_id,
         proposal_id=row.id,
         draft_hash=plan.proposal.draft_hash,
-        reason="operator_rejected",
+        reason=reason,
         dispatch=None,
         actor="user:alice",
     )
@@ -1266,11 +1267,13 @@ async def test_pipeline_rejection_uses_closed_versioned_reason_and_is_exactly_id
         "tool_call_id": plan.tool_call_id,
         "tool_name": "set_pipeline",
         "status": "rejected",
-        "outcome": "rejected",
-        "reason_code": "operator_rejected",
+        "outcome": "rejected" if reason == "operator_rejected" else "failed",
+        "reason_code": reason,
         "draft_hash": plan.proposal.draft_hash,
         "dispatch": None,
     }
+    reloaded = await service.get_authoritative_pipeline_proposal(session_id=session_id, proposal_id=row.id)
+    assert reloaded.row.status == "rejected"
     with pytest.raises((TypeError, ValueError, AuditIntegrityError)):
         await service.reject_pipeline_composition_proposal(
             session_id=session_id,

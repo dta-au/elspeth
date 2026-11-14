@@ -80,10 +80,11 @@ def test_ci_and_release_image_build_with_node_24() -> None:
         "integration",
         "supply-chain-audit",
         "test",
+        "timing-sensitive",
     ]
     assert {step["uses"] for step in setup_steps} == {f"actions/setup-node@{SETUP_NODE_REVISION}"}
     for job_name, step in setup_jobs:
-        if job_name in {"test", "integration"}:
+        if job_name in {"test", "integration", "timing-sensitive"}:
             assert step["with"]["node-version-file"] == "${{ env.CI_CHECKOUT_PATH }}/.node-version"
             assert "node-version" not in step["with"]
         else:

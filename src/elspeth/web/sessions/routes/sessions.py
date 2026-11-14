@@ -32,6 +32,7 @@ from elspeth.web.coordination.contracts import (
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material
 from elspeth.web.paths import locate_in_session_folder, session_folder_path
+from elspeth.web.session_operation_handlers import record_session_operation_fence_loss
 from elspeth.web.sessions.fork_custody import _free_text_embeds_parent_blob, _value_references_parent_blob
 from elspeth.web.sessions.operation_receipts import operation_receipt_response_hash
 from elspeth.web.sessions.protocol import (
@@ -938,6 +939,7 @@ def register_session_routes(router: APIRouter) -> None:
                     )
                 except SessionOperationFenceLost as exc:
                     if exc.reason is FenceLossReason.MISSING:
+                        record_session_operation_fence_loss(request, exc)
                         raise HTTPException(status_code=404, detail="Session not found") from exc
                     raise
                 except SessionNotFoundError as exc:

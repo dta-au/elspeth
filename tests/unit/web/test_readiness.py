@@ -140,6 +140,7 @@ class TestReadinessProbeRunner:
         runner.close()
 
     @pytest.mark.asyncio
+    @pytest.mark.timing_sensitive
     async def test_real_loop_deadline_expires_at_two_seconds_while_heartbeat_runs(self) -> None:
         runner = ReadinessProbeRunner()
         release = threading.Event()
@@ -170,6 +171,7 @@ class TestReadinessProbeRunner:
             runner.close()
 
     @pytest.mark.asyncio
+    @pytest.mark.timing_sensitive
     async def test_event_loop_stall_consumes_real_deadline_not_poll_iterations(self, monkeypatch: pytest.MonkeyPatch) -> None:
         runner = ReadinessProbeRunner()
         release = threading.Event()

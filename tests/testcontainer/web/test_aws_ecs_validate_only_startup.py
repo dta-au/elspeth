@@ -194,6 +194,7 @@ def _settings(tmp_path: Path, *, session_url: str, landscape_url: str) -> WebSet
         secret_key="this-validate-only-startup-secret-is-long-enough",
         shareable_link_signing_key=SecretBytes(bytes(range(32))),
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,

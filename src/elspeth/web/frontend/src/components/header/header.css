@@ -29,9 +29,9 @@
    covers something. Offsetting merely moved the occlusion onto Graph/Spec/
    YAML/Run.
 
-   The reserve is the STRIP's height (a constant), not the header's (which is
-   40/37/45/~130px across the wrap and compact rules), so no measurement is
-   involved. It is unconditional because making it conditional on a notice
+   The reserve is the STRIP's height (a constant), independent of header
+   wrapping and compact rules, so no measurement is involved. It is
+   unconditional because making it conditional on a notice
    being mounted reintroduces exactly the arrival/dismiss shift
    elspeth-1c4687ff67 removed. */
 .app-root {
@@ -226,8 +226,12 @@
   align-items: center;
   height: var(--size-header-height);
   padding: 0 var(--space-md);
+  padding-bottom: var(--space-xs);
   border-bottom: 1px solid var(--color-border);
   background: var(--color-surface-nav);
+  /* ARGOnite: text on the DTA green band is --color-on-nav. Floating menus
+     opened from the header re-assert --color-text on their own surfaces. */
+  color: var(--color-on-nav);
   flex-shrink: 0;
 }
 
@@ -248,7 +252,7 @@
     min-height: var(--size-header-height);
     flex-wrap: wrap;
     row-gap: var(--space-xs);
-    padding: var(--space-xs) var(--space-md);
+    padding: var(--space-xs) var(--space-md) var(--space-sm);
   }
 
   .app-header-left {
@@ -259,31 +263,80 @@
 
 @media (min-width: 961px) and (max-height: 800px) {
   .app-header {
-    /* The row includes its 1px bottom border; reserve a full 36px content
-       box so compact controls never straddle adjacent application regions. */
-    height: calc(var(--size-control-compact) + 1px);
+    /* Keep the common pill register and the extra space below it, including
+       the band's 1px bottom border. */
+    height: calc(var(--size-header-pill-height) + var(--space-xs) + 1px);
     padding-inline: var(--space-sm);
   }
+}
 
-  .header-session-switcher-trigger,
-  .header-version-selector .version-selector-trigger,
-  .user-menu-trigger {
-    height: var(--size-control-compact);
-    min-height: var(--size-control-compact);
-  }
+/* The two model chips share a class: these four selectors size all five
+   header pills in every density regime. */
+.app-header .header-session-switcher-trigger,
+.app-header .version-selector-trigger,
+.app-header .chat-model-chip,
+.app-header .user-menu-trigger {
+  height: var(--size-header-pill-height);
+  min-height: var(--size-header-pill-height);
 }
 
 /* The header brand mark is rendered by the canonical <WordMark> primitive
    (components/ui/WordMark.tsx), which owns the mono/uppercase/tracking
    treatment — the rationale (JetBrains Mono = "audit/forensic" register, a
-   1-element exception to the Inter body) lives there. The former
-   .app-header-brand class duplicated those declarations; it was removed so the
-   wordmark has a single source of truth. */
+   1-element exception to the Inter body) lives there. The .app-header-brand
+   chip below owns only the navy ground and geometry, never the type. */
+
+/* ARGOnite: the brand chip is a NAVY wrapper around the WordMark; the mark
+   itself keeps its mono face and turns yellow (~8.9:1 on navy). Yellow never
+   sits directly on the green band. The wrapper owns the geometry only; font
+   treatment still comes from <WordMark>. */
+/* ARGOnite: from ARGO (dta-au) client index.css — reuse assumed MIT, see design doc */
+.app-header-brand {
+  display: inline-flex;
+  align-items: center;
+  padding: var(--space-xs) var(--space-sm);
+  border-radius: var(--radius-md);
+  background: var(--color-brand-navy);
+  color: var(--color-brand-yellow);
+}
+
+/* ARGOnite: header controls are pills on the --color-nav-control tint with
+   --color-on-nav text and no border. The tint, not a border, is the control
+   boundary against the band. Hover stacks the tint a second time. Selectors
+   sit at (0,2,0)/(0,3,0) so they beat the .btn-compact base and its hover. */
+.app-header .header-session-switcher-trigger,
+.app-header .version-selector-trigger,
+.app-header .user-menu-trigger,
+.app-header .workflow-mailbox-badge {
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: var(--color-nav-control);
+  color: var(--color-on-nav);
+}
+
+.app-header .header-session-switcher-trigger:hover,
+.app-header .version-selector-trigger:hover,
+.app-header .user-menu-trigger:hover,
+.app-header .workflow-mailbox-badge:hover,
+.app-header .user-menu-trigger:focus-visible {
+  border: 0;
+  background-color: var(--color-nav-control);
+  background-image: linear-gradient(var(--color-nav-control), var(--color-nav-control));
+  color: var(--color-on-nav);
+}
+
+.app-header .header-session-switcher-trigger:focus-visible,
+.app-header .version-selector-trigger:focus-visible,
+.app-header .user-menu-trigger:focus-visible,
+.app-header .workflow-mailbox-badge:focus-visible {
+  outline: 2px solid var(--color-on-nav);
+  outline-offset: 2px;
+}
 
 .app-header-separator {
   width: 1px;
   height: 20px;
-  background-color: var(--color-border);
+  background-color: var(--color-on-nav-muted);
 }
 
 /* ModelChip renders nothing until /api/system/status resolves (and stays
@@ -297,11 +350,11 @@
    chat-panel headers (elspeth-8fa71e6d15): identity chrome belongs in the
    identity-chrome region, which has page width. Quiet reference chrome:
    mono + muted so it reads as provenance metadata, not a control.
-   --color-text-muted passes 4.5:1 on both themes' page backgrounds (pinned
+   The header-specific ink and tint below pass 4.5:1 in both themes (pinned
    by colorContrast.test.ts). Truncates rather than overflows
    (elspeth-0b70269ccc); the max-width fence keeps a long provider/model id
    from crowding the session switcher at the 1280px minimum supported width
-   — the full value stays available via the chip's aria-label. */
+   — the full value stays in the text and the raw id in its title. */
 .chat-model-chip {
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
@@ -322,6 +375,25 @@
 .chat-model-chip-label {
   font-weight: 600;
   color: var(--color-text-secondary);
+}
+
+/* ARGOnite: in the header the chip sits on the green band, where body-muted
+   ink fails. --color-on-nav-muted clears AA ONLY on the --color-nav-control
+   tint (bare light #c8ebd7 on #288264 is 3.65:1), so the chip carries that
+   tint as its own ground; the label inherits instead of the body-secondary
+   token. */
+.app-header .chat-model-chip {
+  padding: var(--space-2xs) var(--space-sm);
+  /* A block line box keeps ellipsis working while centring the mono text in
+     the shared pill height, after its two padding edges. */
+  line-height: calc(var(--size-header-pill-height) - 2 * var(--space-2xs));
+  border-radius: var(--radius-pill);
+  background: var(--color-nav-control);
+  color: var(--color-on-nav-muted);
+}
+
+.app-header .chat-model-chip-label {
+  color: inherit;
 }
 
 .header-session-switcher {
@@ -364,12 +436,22 @@
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-dropdown);
   z-index: var(--z-overlay);
+  /* ARGOnite: .app-header is on-nav; the popover's rows inherit, so declare
+     body ink for its nav-raised ground (white on pale green in light fails). */
+  color: var(--color-text);
+}
+
+/* The version dropdown (inspector.css) also inherits from the header; give it
+   body ink on its elevated surface. */
+.header-version-selector .version-selector-dropdown {
+  color: var(--color-text);
 }
 
 /* Filter strip above the menu (elspeth-8c7ac37d49): these three classes were
    emitted with NO definition anywhere in the barrel, so the filter field and
-   the show-archived checkbox rendered as white UA controls on the dark
-   --color-surface-nav-raised surface. The field takes the .input primitive's
+   the show-archived checkbox rendered as unstyled white UA controls on the
+   popover's --color-surface-nav-raised ground (deep green in the dark theme,
+   pale green in light). The field takes the .input primitive's
    vocabulary (input-border, elevated surface, the contrast-gated
    --color-text-secondary placeholder pair, the app focus-ring idiom) at the
    compact chrome rung this dense strip sits on. */
@@ -489,13 +571,14 @@
   font-weight: 600;
 }
 
-/* "+ New session" is an ACTION, not a session entry. Accent + weight keep it
-   visually distinct from session rows so a session named like the action can
-   never be conflated with it; the role="separator" li below it draws the
-   dividing rule (elspeth-ef8c18a6cb). */
+/* "+ New session" is an ACTION, not a session entry. Weight and the separator
+   li below it keep it distinct from session rows so a session named like the
+   action can never be conflated with it (elspeth-ef8c18a6cb). ARGOnite: it was
+   accent text, 3.50:1 on the dark nav-raised ground (3.14 hovered); body ink
+   clears AA on both (gated in colorContrast.test.ts). */
 .header-session-switcher-item-new {
   font-weight: 600;
-  color: var(--color-accent);
+  color: var(--color-text);
 }
 
 .header-session-switcher-separator {
@@ -573,6 +656,8 @@
      also binds the chat, workspace and inspector menus, and it cannot be
      settled — or seen — from inside this stylesheet. */
   z-index: var(--z-popover);
+  /* ARGOnite: the header is on-nav; the menu keeps body ink. */
+  color: var(--color-text);
   min-width: 200px;
   margin: 0;
   padding: var(--space-xs) 0;
@@ -667,7 +752,8 @@
    padding/type scale over .input — same dense-context move as
    .catalog-search-input. The primitive's border/focus-ring/placeholder
    vocabulary is adopted deliberately: those were UA-default chrome on the
-   dark popover, the defect class the ui primitives exist to retire. */
+   popover's nav-raised ground, the defect class the ui primitives exist to
+   retire. */
 .header-session-switcher-rename-input {
   min-height: var(--size-control-compact);
   padding: var(--space-2xs) var(--space-sm);
@@ -687,9 +773,11 @@
   /* Same layered recipe as the archive strip above: the error wash is a
      low-alpha tint, and this strip sits on the popover's nav-raised surface —
      a ground the contrast gate's tint matrix does not enumerate. Bare
-     tint-on-nav-raised measured 4.06:1 in the light theme (under AA); riding
-     the tint on background-image over an opaque --color-surface restores the
-     gated error-on-surface pairing in both themes. */
+     tint-on-nav-raised measured 4.06:1 on the pre-ARGOnite light value; on
+     ARGOnite's values it is 4.42:1 in the dark theme (under AA) and 4.63:1
+     in light. Riding the tint on background-image over an opaque
+     --color-surface restores the gated error-on-surface pairing in both
+     themes. */
   background-color: var(--color-surface);
   background-image: linear-gradient(var(--color-error-bg), var(--color-error-bg));
   color: var(--color-error);

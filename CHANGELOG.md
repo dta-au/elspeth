@@ -4,7 +4,318 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
-## Unreleased (0.8.11)
+## 0.8.13 - 2026-11-11
+
+Composer context budget. Long Composer sessions grew until the server or the
+model gateway rejected a request for size; the Composer now sheds older
+context to fit an operator-set budget, or refuses with a named cause. The
+dated entry and package version do not establish qualification, a published
+tag or an image. Not run for this work: the PostgreSQL suites, a live
+provider, replay of real sessions and end-to-end browser tests.
+
+### Upgrade notes
+
+Two configuration changes are breaking:
+
+- **`ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS` is required.** It has no
+  default; the web server will not start without it. Set it to the
+  prompt-token limit of the model gateway in front of the Composer. The
+  shipped deployment examples carry `200000` as a placeholder.
+- **The default of `composer_planner_max_request_bytes`
+  (`ELSPETH_WEB__COMPOSER_PLANNER_MAX_REQUEST_BYTES`) is now 960 KiB** (it
+  was 2 MiB), and it now also bounds the compose loop, not only the planner.
+  A deployment that needs the old value must set it explicitly and raise the
+  gateway's body cap to match.
+
+Two optional settings are new: `ELSPETH_WEB__COMPOSER_CONTEXT_SHED_ABOVE`
+(default `0.85`) and `ELSPETH_WEB__COMPOSER_CONTEXT_SHED_TO` (default `0.60`),
+fractions of the token cap; `SHED_TO` must be below `SHED_ABOVE`.
+
+Other things an operator or client will notice:
+
+- A request that cannot fit is answered with HTTP 422 and
+  `context_budget_exceeded` on both the compose loop and the planner. This
+  replaces the generic failure previously shown when the planner's
+  request-byte ceiling refused a request.
+- `composer_skill_hash` changes: the composer skill gains one paragraph
+  explaining the counts of omitted earlier messages.
+- Composer call records gain a `context_budget` field. Older records without
+  it read as "no shedding recorded".
+- Existing sessions keep working. A session already over the high mark sheds on
+  its next turn, with the omissions recorded.
+- No schema epoch changed and no stored data is migrated, reset or rewritten.
+  Session epoch 78 and Landscape epoch 50 are unchanged from the previous
+  release; this release adds no schema-epoch cutover. Existing 0.8.12 session
+  and Landscape stores need no action, and the 0.8.10 cutover guidance below
+  continues to apply to older stores. This authorizes no migration, reset,
+  restamping or downgrade.
+
+### Composer
+
+- **The Composer sheds context to fit an operator-set budget.** Before each
+  compose-loop and planner provider call (the escape hatch and the reply
+  after staged review cards included; advisor and review calls are not, see
+  Known limits), the server removes context in a fixed order until the
+  request fits the prompt-token cap and the request-byte ceiling: earlier
+  tool results in the current turn (each body replaced by a fixed stub; the
+  call and result message stay), then earlier assistant prose, then
+  escape-hatch transcript events, then the oldest earlier user requests,
+  oldest first within each. The system skill, catalog, tool definitions,
+  current request, pipeline state and latest tool round trip are never
+  removed. The budgeter makes no provider call and adds no text of its own
+  beyond the stub and counts of omitted messages.
+- **Shedding has a high and a low mark.** It starts when the request is above
+  `SHED_ABOVE` of the token cap, or over the byte ceiling, and continues to
+  `SHED_TO`. What was shed stays shed. Whether more must go is judged on the
+  already-reduced request, so nothing more is shed until that crosses
+  `SHED_ABOVE` again; shed history is restored only when the whole request is
+  back at or under `SHED_TO`. A tool result stubbed during a turn stays
+  stubbed for the rest of that turn.
+- **Both ceilings are judged on the request as sent.** The measure is the
+  wire bytes of the request: the JSON of its messages and tools, escaping
+  included. That is what a gateway's body cap sees, and everything the model
+  reads (content, tool-call arguments, thinking blocks and tool definitions).
+  The token estimate divides that size by a bytes-per-token ratio measured on
+  the same basis.
+- **A request that cannot fit is refused with a named cause.** When the
+  protected content alone exceeds either ceiling, the server refuses before
+  any provider call with `context_budget_exceeded`: "This conversation is too
+  large for the composer to continue. Start a new session, or shorten your
+  request." It offers no Retry. The refusal names the ceiling and the largest
+  component of the request as sent.
+- **A reply that cannot fit does not fail a finished turn.** If the optional
+  reply after review cards are staged cannot be fitted, no provider call is
+  made and the turn completes with its staged work intact. The user sees:
+  "This turn's work was completed, but the model's final reply could not be
+  produced because this conversation is too large for the composer. Start a
+  new session, or shorten your request."
+- **Users are told when history is shed.** A turn whose model call leaves
+  earlier conversation out shows the progress notice "Earlier conversation is
+  no longer visible to the composer."
+- **The escape-hatch transcript header no longer says "Complete"**, because
+  the transcript can now be reduced to fit the budget.
+
+### Audit records
+
+- **What was shed is recorded on each budgeted call.** The call record and
+  its public envelope gain a `context_budget` field: the policy hash, the
+  `bytes_per_token` ratio the estimate used, the estimated tokens before and
+  after shedding (the figure after is an upper bound), `request_wire_bytes`
+  (the size of the request sent), and what was removed or stubbed. A call
+  that shed nothing says so explicitly. Advisor and auto-title calls are not
+  budgeted and store a null `context_budget`.
+- **A refused reply is recorded on the turn's audit trail.** It is an audit
+  row (`composer_reply_stage_refusal`, reason `context_budget_exceeded`) with
+  the ceiling, the estimated tokens and request bytes, the configured
+  ceilings and the largest component. It holds sizes and fixed names only. No
+  call record is written, because no call was made.
+- **The stored `request_byte_split` keeps its meaning** (the content split).
+  It is not what the budget is judged on.
+
+### Known limits
+
+- Advisor and review calls are not yet bounded by the context budget
+  (dta-au/elspeth#364). In a long session with the advisor enabled, such a
+  call can still be rejected by the gateway for size; the advisor is then
+  unavailable for that turn.
+- Tool-call arguments and thinking blocks count toward the budget but are
+  not shed. A turn whose arguments alone cannot fit is refused.
+- Token counts are estimated from request bytes, not a tokenizer. The
+  bytes-per-token ratio is the recorded `request_wire_bytes` over the
+  reported prompt tokens of the session's newest successful budgeted call on
+  the same model (failing that, on any model), clamped to 2.0-6.0. Until the
+  session has such a call the ratio is 3.0, which over-estimates tokens; this
+  includes the first turn of an existing session after the upgrade.
+- If the provider still rejects a request for context length, it is recorded
+  as before and there is no automatic retry.
+
+### Publication and acceptance
+
+Automatic image publication from main remains held. The 0.8.13 tag and
+container publication follow successful required checks and the protected
+merge. Operator signing, live-provider acceptance and deployment remain
+separate steps.
+
+---
+
+## 0.8.12 - 2026-11-10
+
+Composer tool remediation. Verification status is recorded in the pull
+request. The dated entry and package version do not establish qualification, a
+published tag or an image.
+
+### Dependencies
+
+- **The remaining Python dependency advisories are fixed.** OpenTelemetry
+  moves to 1.45.2 with the Prometheus exporter at 0.66b1, and soupsieve
+  moves to 4.0. These SDK and
+  exporter versions are exact pins because operator telemetry custody verifies
+  their implementation at startup. Langfuse moves from SDK 3 to 5.2, allowing
+  packaging 26.3 and patched virtualenv 21.15.6. Azure Monitor moves with the
+  compatible OpenTelemetry stack to 1.8.12 / b59. Existing tracing
+  configuration remains supported; installs must use the updated lock rather
+  than upgrading the telemetry SDK independently.
+
+### Composer
+
+- **Refusals and no-ops go back to the model, not to an approval card.** A
+  mutation now passes validation-only admission before a proposal is staged.
+  A change the server already knows it will refuse, or one that would change
+  nothing, is returned to the model as tool feedback so it can repair its
+  request. Approval cards are created only for changes that pass admission.
+- **Blob and secret changes are checked before a proposal is published.**
+  Blob update and delete prerequisites, quota and custody checks run at
+  admission, and malformed blob references are refused there
+  (`proposal_blob_reference_malformed`). No blob-store effect is executed as a
+  preview. A pending option change keeps the blobs it depends on. When the
+  blob or graph a staged proposal depends on changes before publication, the
+  tool reports the race instead of reporting that the proposal was staged.
+- **Under explicit approval, one composition proposal is pending at a time.**
+  A response carrying more than one mutation is refused whole
+  (`approval_batch_not_atomic`), and a mutation is refused while a composition
+  proposal is pending (`approval_proposal_pending`); both refusals tell the
+  model what to do next. Proposals staged together from one response were
+  previewed against the same state, so accepting them in turn produced stale
+  or contradictory pipelines. This contains the defect and does not redesign
+  it: auto-commit sessions and blob-only proposals are not covered.
+- **Blob and parked-graph selectors accept any spelling of a UUID.** Blob
+  lookups, bindings, retention, planner facts, proposal custody and duplicate
+  detection treat a UUID in upper case, with braces or as a URN as the same
+  blob, and restoring a parked graph canonicalises its selector the same way.
+  The model's arguments, and the hashes recorded over them, are preserved
+  unchanged.
+- **`diff_pipeline` answers in freeform sessions.** It compares the current
+  state with the state at the start of the request, and says so when held
+  proposals are not included. Asked one turn after an edit it reports no
+  change; the intended baseline is still to be decided.
+- **Graph edits.** Transforms can be spliced into planner-built pipelines,
+  which do not carry the visual edges splicing used to require, and removing
+  an output removes its edges.
+- **An oversized blob read is reported as a size refusal**
+  (`blob_content_size_limit`), not as a credential problem.
+- **The gate-preview mismatch diagnostic names the actual failure** (a
+  misspelt field, a short row, a zero divisor or a bad function argument)
+  instead of always advising a numeric source-schema type, and the preview no
+  longer samples a CSV row cut short by its 8 KiB byte limit. Known and
+  deferred: the preview keys sampled rows by the raw CSV header where the
+  runtime uses normalised names; the repair text says so and tells the model
+  not to rename the field.
+- **Composer skill text corrected.** Contradictory and stale instructions were
+  removed or rewritten in place; the skill now says the server raises every
+  prompt review card, in place of wording that read as though prompts go
+  unreviewed. The text was not restructured; about a third of what the
+  proposal planner receives still describes tools it does not have.
+- **Smaller fixes.** A pending proposal's tool result states the next action.
+  The audit record for a cached discovery result matches the admitted
+  envelope delivered to the model. Three queue scope fields that were dropped
+  before `NodeSpec` admission are now carried through. JSON preview warnings
+  and record-count evidence are admitted by the preview response contract
+  instead of failing it. A Chroma client-mode configuration with a null
+  persistence directory is admitted without bypassing path confinement.
+  Recovery tools are recognised in persisted planner receipts.
+
+### Web interface
+
+- **The ARGOnite skin.** The web interface takes the ARGOnite look in light
+  and dark themes, with a high-contrast palette built on the same hues. Header
+  pills, the model chips included, share one height. The conversation runs the
+  full height of the window, with its hide/show control beside "Share inspect
+  link". A selected node and a selected edge are gold, distinct from the
+  keyboard focus colour. Known and deferred: between workspace widths of 960
+  and 1041 px the pipeline card is narrower than its 640 px target.
+- **The share dialog follows the active session and states what a link
+  grants.** It now closes when the active session changes. It stayed bound to
+  the session it was opened for, so after back/forward or a session switch it
+  could make a link for a pipeline the owner was no longer looking at. Its
+  success text no longer says read-only access when the recipient can import
+  an editable copy with copies of the listed files.
+- **A pipeline that uses two files with the same content under different
+  names or file types is no longer shared for import.** An import keeps one
+  copy per content, so both uses would have taken one file's name and type,
+  and a `blob_rows` source would have emitted the wrong filename or MIME type
+  as row data. The share dialog names the two files; give them the same name
+  and type, or use one file in both places.
+- **The tutorial's audit step explains its LLM call count**, which includes
+  one reachability check made before the run starts.
+
+### LLM gateway
+
+- **Thinking from an adapter that does not declare `REASONING` is refused**
+  as upstream-invalid on the first turn. The gateway returned it with a 200,
+  then refused the caller's next turn when that thinking was sent back. The
+  reference adapter declares
+  `REASONING` and is unaffected; an operator adapter with this defect will now
+  fail earlier.
+
+### Plugins
+
+- **`file_inject` transform.** Writes the content of whole files, bound as
+  configuration, into row fields. The content is part of node identity, so
+  editing a bound file between a run and its resume refuses the resume. It is
+  in the default web plugin set. In the Composer its content must be a file the
+  user uploaded: content written by the planner is refused. A shipped example
+  is in `examples/file_inject/`.
+- **A file the agent rewrites is recorded as the agent's file.** `update_blob`
+  kept the uploader as creator, so a rewritten upload could pass as a user
+  upload after a session fork, or when the new text came from the user's
+  message. It now records the assistant as creator, as for a file the agent
+  creates. Files rewritten before this release keep their old record. Known
+  and deferred: the `llm` prompt guard reads modality only, and a fork copy of
+  a model-written file still passes it; prompt review cards cover that route.
+
+### MCP server
+
+- **File paths authored over MCP are resolved against the configured data
+  directory**, and a path outside it is refused at admission, including the
+  explicit-null case that previously bypassed the check.
+- **The standalone MCP server owns its process lifecycle.** The installed CLI
+  runs the server under a private supervisor, so shutdown, a failed start,
+  loss of the control channel and the death of the parent all settle the
+  child process instead of leaving it running. The supervisor uses the same
+  portable path on every platform; it has been exercised on Linux only.
+
+### Landscape
+
+- **Creating Landscape tables on PostgreSQL no longer breaks a later SQLite
+  initialization in the same process**, which lost its inline foreign keys.
+  Table creation is now serialized and restores the original constraint rules
+  on the shared schema metadata, including when the DDL fails.
+
+### Upgrade notes
+
+- Langfuse tracing now requires Langfuse Cloud or a self-hosted server at
+  version 4.59.0 or newer; Langfuse SDK 5 no longer supports self-hosted v3 or
+  older v4 servers. Upgrade an older server before upgrading ELSPETH. The
+  configuration field names remain unchanged. See the
+  [Langfuse SDK upgrade guide](https://langfuse.com/docs/observability/sdk/upgrade-path/python-v4-to-v5).
+- An MCP client that authors a file path outside the configured data
+  directory is now refused. Move the file under the data directory or change
+  the configured root.
+- A pending approval for a change that is now known to be refused or to be a
+  no-op settles as terminal instead of remaining pending.
+- Under explicit approval a model response with several mutations is refused
+  and the model is asked to send one. Sessions that relied on several
+  proposals being staged from one response will see one proposal per turn.
+- New refusal codes a client may receive: `approval_batch_not_atomic`,
+  `approval_proposal_pending`, `blob_content_size_limit`,
+  `proposal_blob_reference_malformed`.
+- No schema epoch changed. Existing session and Landscape stores load
+  unchanged. Session epoch 78 and Landscape epoch 50 are unchanged from the
+  previous release; this release adds no schema-epoch
+  cutover. Existing 0.8.10 session and Landscape stores need no action, and
+  the 0.8.10 cutover guidance below continues to apply to older stores. This
+  authorizes no migration, reset, restamping or downgrade.
+
+### Publication and acceptance
+
+Automatic image publication from main remains held. The 0.8.12 tag and
+container publication follow successful required checks and the protected
+merge. Operator signing, live-provider acceptance and deployment remain
+separate steps.
+
+---
+
+## 0.8.11 - 2026-11-10
 
 This section records changes on the 0.8.11 candidate. It does not establish
 qualification, a published tag or an image.
@@ -23,60 +334,58 @@ qualification, a published tag or an image.
   such an export reports the missing option unless the request re-attaches the
   file (see YAML import below).
 - **Shared, published and exported graphs no longer carry a `blob_rows`
-  source's file entries.** The public projection previously dropped only each
-  entry's `blob_id`, leaving the file's digest (`payload_ref`), filename, MIME
-  type and size, and reported nothing. The whole `blobs` list is now removed
-  and the redaction account names it (`blobs`, labelled `blob-linkage` in the
-  export header); such sources also count as reading uploaded files.
+  source's file entries.** Only each entry's `blob_id` was dropped, silently
+  leaving the file's digest (`payload_ref`), filename, MIME type and size. The
+  whole `blobs` list is now removed and named in the redaction account
+  (`blobs`, labelled `blob-linkage` in the export header); such sources also
+  count as reading uploaded files.
 - **The YAML export header no longer says sink paths are re-authored on
-  import.** That was not true for a pasted-YAML import. The rebind guidance
-  (also returned as `redaction.rebind_guidance`) now says sink paths are not
+  import**, which was untrue for a pasted-YAML import. The rebind guidance
+  (also returned as `redaction.rebind_guidance`) says sink paths are not
   exported and must be set after import, or passed as `sink_path_bindings`.
 - **A shared link can let recipients import a copy, files included.** The
-  "Share inspect link" dialog now has a configure step: "Let recipients import
-  a copy" (off by default), which lists the files that would travel, and "Link
-  expires after" 1 day, 7 days or 30 days. Nothing is minted until "Create
+  "Share inspect link" dialog has a configure step: "Let recipients import a
+  copy" (off by default), which lists the files that would travel, and "Link
+  expires after" 1 day, 7 days or 30 days; nothing is minted until "Create
   link". The deployment's `shareable_link_lifetime_seconds` is now the maximum:
-  the dialog offers only the lifespans at or below it and picks the longest of
-  those by default; when none fits, it offers no choice, says so, and the link
-  lasts the maximum. A longer lifespan sent to the server is refused with 422,
-  and "copy link again" keeps the chosen lifespan, clamped to the current
-  maximum. Import consent is tied to the listed files: the share carries the
-  list's fingerprint, and if the files changed after the owner saw them the
-  server refuses (409, `share_files_changed`) and the dialog shows the current
-  list for the owner to confirm again. When import is allowed, every
-  uploaded file the graph is attached to (source `blob_ref`, `blob_rows`
-  entries, transform inline-content markers) is frozen into the share at
-  creation, so later edits or deletion on the sharer's side do not break the
-  link. A recipient opening an import link sees "Import a copy into my
+  the dialog offers only lifespans at or below it, defaulting to the longest;
+  when none fits it offers no choice, says so, and the link lasts the maximum.
+  A longer lifespan sent to the server is refused with 422, and "copy link
+  again" keeps the chosen lifespan, clamped to the current maximum. Import
+  consent is tied to the listed files: the share carries the list's
+  fingerprint, and if the files changed after the owner saw them the server
+  refuses (409, `share_files_changed`) and the dialog shows the current list
+  for the owner to confirm again. When import is allowed, every uploaded file
+  the graph is attached to (source `blob_ref`, `blob_rows` entries, transform
+  inline-content markers) is frozen into the share at creation, so later
+  edits or deletion on the sharer's side do not break the link.
+- **Importing a shared copy.** An import link shows "Import a copy into my
   workspace" and the file list; importing creates a new session, "Copy of
   ‹name›", with its own copy of each file and every attachment pointing at the
   copy, and records the share's digest and sharer as `shared_import`
   provenance in the new state. Links minted before this release, and links
-  without the opt-in, stay view-only (403 on import). Secrets never travel.
-  A sink output path (`path`, `file` or `persist_directory`) inside the
-  sharer's own session `outputs/` or `blobs/` folder is re-based to the same
-  place under the recipient's new session, so the copy validates without
-  setting it; a sink path outside the sharer's session folders does not travel
-  and must be set in the copy, as does one longer than 1024 characters, one
-  holding a control character (C0, DEL or C1) or a Unicode line or paragraph
-  separator, or one shaped like a credential. Sinks that do
-  not write a local file are unaffected. The ordinary YAML import accepts the
-  same re-basing as `sink_path_bindings`, which can only name a path inside
-  the caller's own session folders and refuses those same paths. A graph using
-  a plugin the recipient's policy disallows is refused with 422 and the new
-  session is archived. The import page names the reason for a refusal: an
-  account without the pipeline-user role, a view-only link, a component whose
-  plugin the recipient's policy disallows (named, with why), a graph over the
-  YAML size cap, the server's detail for any other import refusal, too many
-  attempts (429) and an unavailable import (503) each have their own message.
+  without the opt-in, stay view-only (403 on import). Secrets never travel. A
+  sink output path (`path`, `file` or `persist_directory`) inside the sharer's
+  session `outputs/` or `blobs/` folder is re-based to the same place in the
+  new session, so the copy validates without setting it; any other sink path
+  does not travel and must be set in the copy, as must one longer than 1024
+  characters, one holding a control character (C0, DEL or C1) or a Unicode
+  line or paragraph separator, or one shaped like a credential. Sinks that do
+  not write a local file are unaffected. The ordinary YAML import
+  accepts the same re-basing as `sink_path_bindings`, which can only name a
+  path inside the caller's own session folders and refuses those same paths.
+  A graph using a plugin the recipient's policy disallows is refused with 422
+  and the new session is archived. The import page has its own message for an
+  account without the pipeline-user role, a view-only link, a disallowed
+  plugin (named, with why), a graph over the YAML size cap, too many attempts
+  (429), an unavailable import (503), and the server's detail for any other
+  refusal.
 - **Only files the user uploaded can be shared for import.** If the graph is
-  attached to a file the assistant created or a pipeline run produced, rather
-  than one the user uploaded, creating an import link is refused with 409
-  naming the file, and the dialog says so before the link is created. The
-  dialog judges each file from its stored record without reading it; creating
-  the link reads and checks every file's bytes, off the request's event loop.
-  View-only links to the same graph are unaffected.
+  attached to a file the assistant created or a pipeline run produced,
+  creating an import link is refused with 409 naming the file, and the dialog
+  says so beforehand, judging each file from its stored record; creating the
+  link reads and checks every file's bytes. View-only links to the same graph
+  are unaffected.
 - **Known cost: share snapshots and frozen files are not reclaimed.** Nothing
   in the web app deletes payload-store content, so every share, and every file
   frozen into an import link, stays on disk after the link expires. Identical
@@ -87,13 +396,11 @@ qualification, a published tag or an image.
   process that dies mid-import can leave a half-built "Copy of …" session for
   the recipient to delete, and a deliberate retry after a network failure can
   create a second copy. The Import button is disabled while its request is in
-  flight, and stays disabled after a refusal a retry cannot change (400, 403,
-  422).
+  flight and after a refusal a retry cannot change (400, 403, 422).
 - **YAML import can re-attach files to transforms and multi-file sources.**
   `POST /api/sessions/{id}/state/yaml` accepts `inline_blob_bindings`, keyed by
-  component and option path, which rebuilds an inline-content file marker
-  from a ready blob of the session (its `sha256` is that blob's content
-  hash), and
+  component and option path, which rebuilds an inline-content file marker from
+  a ready blob of the session (its `sha256` is that blob's content hash), and
   `source_blob_rows`, which re-binds a `blob_rows` source's file entries and,
   like the composer's own multi-file source tool, refuses a file the assistant
   wrote. The Import YAML dialog does not offer these fields yet.
@@ -102,14 +409,15 @@ qualification, a published tag or an image.
 
 - **The gateway carries thinking blocks through tool loops.** Assistant
   messages accept `thinking_blocks` (`thinking` with a signature, or
-  `redacted_thinking` with opaque data), adapters receive them in order and
+  `redacted_thinking` with opaque data); adapters receive them in order and
   unmodified, and thinking an adapter reports is returned on the response
   message in the same shape, so ELSPETH replays it on the next turn. Without
   this, a model that requires its signed thinking back (Claude with thinking
   enabled) rejects the second turn of every Composer tool loop. Replayed
   thinking to an adapter without the `reasoning` capability is refused with
   `capability_unsupported`. The reference adapter and mock upstream implement
-  the round trip, and the reference image's `adapter-fingerprint` label changes accordingly.
+  the round trip, and the reference image's `adapter-fingerprint` label
+  changes accordingly.
 
 ## 0.8.10 - 2026-11-09
 
@@ -233,7 +541,7 @@ establish qualification, a published tag or an image.
 - **Still open.** The application's OpenTelemetry 1.40 pin (CVE-2026-114603)
   and eight virtualenv advisories remain. OpenTelemetry 1.45 breaks web start-up
   and operator telemetry custody, and virtualenv 21.14.7 or later needs
-  packaging 26, which langfuse 3 forbids. Both need their own change.
+  packaging 26, which langfuse 3 forbids. These are resolved together in 0.8.12.
 
 ### Upgrade notes
 

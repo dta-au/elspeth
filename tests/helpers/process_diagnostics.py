@@ -5,6 +5,7 @@ from __future__ import annotations
 import faulthandler
 import os
 import signal
+import sys
 import time
 import traceback
 from collections.abc import Callable, Iterator
@@ -12,6 +13,41 @@ from contextlib import contextmanager
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 from tempfile import TemporaryDirectory
+
+
+def linux_process_snapshot(pid: int | None) -> str:
+    """Best-effort Linux kernel observations; fields are read independently."""
+    fields = dict.fromkeys(("state", "sigpnd", "shdpnd", "wchan", "syscall", "threads"), "unreadable")
+    if sys.platform != "linux" or pid is None:
+        return "proc: " + " ".join(f"{key}={value}" for key, value in fields.items())
+    root = Path(f"/proc/{pid}")
+    try:
+        status = dict(line.split(":", 1) for line in (root / "status").read_text().splitlines() if ":" in line)
+        for source, target in (("State", "state"), ("SigPnd", "sigpnd"), ("ShdPnd", "shdpnd")):
+            if source in status:
+                fields[target] = status[source].strip()
+    except (OSError, ValueError):
+        pass  # The child can exit, or proc access can be denied, at any read.
+    for name in ("wchan", "syscall"):
+        try:
+            value = (root / name).read_text().strip()
+            fields[name] = value.split()[0] if value else "unreadable"
+        except (OSError, ValueError):
+            pass
+    try:
+        threads = []
+        for task in sorted((root / "task").iterdir()):
+            try:
+                stat = (task / "stat").read_text()
+                prefix, suffix = stat.rsplit(")", 1)
+                comm = prefix.split("(", 1)[1]
+                threads.append(f"{task.name}:{suffix.split()[0]}:{comm}")
+            except (OSError, ValueError, IndexError):
+                threads.append(f"{task.name}:unreadable")
+        fields["threads"] = "[" + ",".join(threads) + "]" if threads else "unreadable"
+    except OSError:
+        pass
+    return "proc: " + " ".join(f"{key}={value}" for key, value in fields.items())
 
 
 @contextmanager
@@ -72,7 +108,10 @@ class ProcessDiagnostics:
                 while (remaining := deadline - time.monotonic()) > 0:
                     time.sleep(min(0.01, remaining))
                 trace = Path(self.path).read_text(encoding="utf-8", errors="replace")
-        return f"pid={process.pid} alive={alive} exitcode={process.exitcode} elapsed={time.monotonic() - self._started_at:.3f}s\n{trace}"
+        return (
+            f"pid={process.pid} alive={alive} exitcode={process.exitcode} elapsed={time.monotonic() - self._started_at:.3f}s\n"
+            f"{linux_process_snapshot(process.pid)}\n{trace}"
+        )
 
     def close(self) -> None:
         self._directory.cleanup()

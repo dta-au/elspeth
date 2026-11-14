@@ -1,0 +1,9 @@
+{
+  "version": 3,
+  "rubric": {
+    "tone": "precise",
+    "must_include": ["invoice number", "amount in dispute"],
+    "refund_limit": 500,
+    "escalate": true
+  }
+}

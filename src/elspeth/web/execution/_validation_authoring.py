@@ -13,6 +13,7 @@ from pathlib import Path
 from pydantic import TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
+from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
 from elspeth.contracts.plugin_semantics import SemanticEdgeContract, SemanticOutcome, UnknownSemanticPolicy
 from elspeth.contracts.secrets import SecretRefPlacementViolation, SecretScope, WebSecretResolver
 from elspeth.contracts.trust_boundary import observation_boundary
@@ -76,6 +77,7 @@ from elspeth.web.interpretation_state import (
     materialize_state_for_authoring,
     materialize_state_for_execution,
 )
+from elspeth.web.paths import is_absent_sink_path, is_local_path_value, require_mcp_root_context
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.plugin_policy.validation import PolicyValidationStage, validate_plugin_policy
@@ -138,6 +140,7 @@ def _path_value_failure(
     component_type: str,
     option_name: str,
     detail: str,
+    mcp_root_authority: McpConfiguredRootAuthority | None = None,
 ) -> PhaseFailure:
     """Return the canonical typed failure for one malformed authored path."""
     return PhaseFailure(
@@ -154,7 +157,9 @@ def _path_value_failure(
                 component_id=component_id,
                 component_type=component_type,
                 message=detail,
-                suggestion=f"Set {option_name} to a valid path within this session's allowed directories.",
+                suggestion=f"Set {option_name} to a nonempty string path without NUL within the configured data root."
+                if mcp_root_authority is not None
+                else f"Set {option_name} to a valid path within this session's allowed directories.",
                 error_code=None,
             ),
         ),
@@ -250,6 +255,7 @@ def validate_path_policy(
     *,
     data_dir: Path,
     session_id: str | None,
+    mcp_root_authority: McpConfiguredRootAuthority | None = None,
 ) -> PhaseReport[PolicyLoweredState] | PhaseFailure:
     """Validate authored source, sink, and nested provider paths.
 
@@ -272,24 +278,30 @@ def validate_path_policy(
         resolve_sink_data_path,
     )
 
+    require_mcp_root_context(mcp_root_authority, data_dir=data_dir, session_id=session_id)
     state = policy.state
     data_dir_text = str(data_dir)
-    allowed_source_dirs = allowed_source_directories(data_dir_text, session_id=session_id)
-    allowed_sink_dirs = allowed_sink_directories(data_dir_text, session_id=session_id)
+    allowed_source_dirs = (
+        (mcp_root_authority.root,) if mcp_root_authority is not None else allowed_source_directories(data_dir_text, session_id=session_id)
+    )
+    allowed_sink_dirs = (
+        (mcp_root_authority.root,) if mcp_root_authority is not None else allowed_sink_directories(data_dir_text, session_id=session_id)
+    )
     path_checked = False
 
     for source_name, source in state.sources.items():
         source_options = dict(source.options)
         source_component = _source_policy_component_id(source_name)
         for key in SOURCE_LOCAL_PATH_OPTION_KEYS:
-            value = source_options.get(key)
-            if value is None:
+            if key not in source_options:
                 continue
-            if type(value) is not str:
+            value = source_options[key]
+            if not is_local_path_value(value):
                 return _path_value_failure(
                     component_id=source_component,
                     component_type="source",
                     option_name=key,
+                    mcp_root_authority=mcp_root_authority,
                     detail=f"Source '{source_name}' {key} must be a string path; got {type(value).__name__}",
                 )
             path_checked = True
@@ -300,6 +312,7 @@ def validate_path_policy(
                     component_id=source_component,
                     component_type="source",
                     option_name=key,
+                    mcp_root_authority=mcp_root_authority,
                     detail=f"Source '{source_name}' {key} is not a valid path",
                 )
             if not any(resolved.is_relative_to(directory) for directory in allowed_source_dirs):
@@ -317,7 +330,9 @@ def validate_path_policy(
                             component_id=source_component,
                             component_type="source",
                             message=f"Path traversal blocked: source '{source_name}' {key}='{value}' resolves outside allowed directories",
-                            suggestion="Use a file within the blobs directory.",
+                            suggestion="Use a file within the configured data root."
+                            if mcp_root_authority is not None
+                            else "Use a file within the blobs directory.",
                             error_code=None,
                         ),
                     ),
@@ -331,24 +346,32 @@ def validate_path_policy(
 
     for output in state.outputs:
         for key in SINK_LOCAL_PATH_OPTION_KEYS:
-            value = output.options[key] if key in output.options else None
-            if value is None:
+            if key not in output.options:
                 continue
-            if type(value) is not str:
+            value = output.options[key]
+            if is_absent_sink_path(output.plugin, output.options.get("mode"), key, value):
+                continue
+            if not is_local_path_value(value):
                 return _path_value_failure(
                     component_id=output.name,
                     component_type="sink",
                     option_name=key,
+                    mcp_root_authority=mcp_root_authority,
                     detail=f"Sink '{output.name}' {key} must be a string path; got {type(value).__name__}",
                 )
             path_checked = True
             try:
-                resolved = resolve_sink_data_path(value, data_dir_text, session_id=session_id)
+                resolved = (
+                    resolve_data_path(value, data_dir_text)
+                    if mcp_root_authority is not None
+                    else resolve_sink_data_path(value, data_dir_text, session_id=session_id)
+                )
             except (OSError, TypeError, ValueError):
                 return _path_value_failure(
                     component_id=output.name,
                     component_type="sink",
                     option_name=key,
+                    mcp_root_authority=mcp_root_authority,
                     detail=f"Sink '{output.name}' {key} is not a valid path",
                 )
             if not any(resolved.is_relative_to(directory) for directory in allowed_sink_dirs):
@@ -366,7 +389,9 @@ def validate_path_policy(
                             component_id=output.name,
                             component_type="sink",
                             message=f"Path traversal blocked: sink '{output.name}' {key}='{value}' resolves outside allowed directories",
-                            suggestion="Use a path within this session's output or blob subtree.",
+                            suggestion="Use a path within the configured data root."
+                            if mcp_root_authority is not None
+                            else "Use a path within this session's output or blob subtree.",
                             error_code=None,
                         ),
                     ),
@@ -407,21 +432,27 @@ def validate_path_policy(
             value = provider_config.get(key)
             if value is None:
                 continue
-            if type(value) is not str:
+            if not is_local_path_value(value):
                 return _path_value_failure(
                     component_id=node.id,
                     component_type="transform",
                     option_name=key,
+                    mcp_root_authority=mcp_root_authority,
                     detail=f"{node.node_type.capitalize()} '{node.id}' {key} must be a string path; got {type(value).__name__}",
                 )
             path_checked = True
             try:
-                resolved = resolve_sink_data_path(value, data_dir_text, session_id=session_id)
+                resolved = (
+                    resolve_data_path(value, data_dir_text)
+                    if mcp_root_authority is not None
+                    else resolve_sink_data_path(value, data_dir_text, session_id=session_id)
+                )
             except (OSError, TypeError, ValueError):
                 return _path_value_failure(
                     component_id=node.id,
                     component_type="transform",
                     option_name=key,
+                    mcp_root_authority=mcp_root_authority,
                     detail=f"{node.node_type.capitalize()} '{node.id}' {key} is not a valid path",
                 )
             if not any(resolved.is_relative_to(directory) for directory in allowed_sink_dirs):
@@ -439,7 +470,9 @@ def validate_path_policy(
                             component_id=node.id,
                             component_type="transform",
                             message=f"Path traversal blocked: {node.node_type} '{node.id}' {key}='{value}' resolves outside allowed directories",
-                            suggestion="Use a path within this session's output or blob subtree.",
+                            suggestion="Use a path within the configured data root."
+                            if mcp_root_authority is not None
+                            else "Use a path within this session's output or blob subtree.",
                             error_code=None,
                         ),
                     ),

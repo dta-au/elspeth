@@ -134,7 +134,12 @@ Use the reusable assertions in `tests/fixtures/catalog_reference.py`.
 `parse_and_validate_example` parses through `load_bounded_pipeline_yaml`,
 requires the declaring plugin exactly once in the correct section, and calls
 the class's `get_config_model(options)` followed by
-`from_dict(options, plugin_name=plugin_cls.name)`.
+`from_dict(options, plugin_name=plugin_cls.name)`. An example that binds files
+through a nested file-backed option (`file_inject`'s
+`files.<name>.content_file`) is first expanded by the settings loader's
+`TemplateOptionMaterializer` against placeholder text files
+(`materialize_example_file_options`), because the config model validates the
+loaded form, not the authored one.
 
 After editing one plugin module, refresh its hash mechanically:
 

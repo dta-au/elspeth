@@ -983,7 +983,23 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # (seven manifest lines). The canonical case JSON of the 0.8.9 manifest with
 # only engine:0.8.9 -> engine:0.8.10 substituted is byte-identical to the new
 # one, and this instrument reproduces the previous pin from the old manifest.
-EXPECTED_CASE_REGISTRY_SHA256 = "3538b2de3a4036fb2effdcbae99c2b4a0b7711b09252456a4514b93ca5636536"
+# 0.8.12 version cut: the same eight engine-owned plugin_version values advance
+# (seven manifest lines). The canonical case JSON of the new manifest with only
+# engine:0.8.12 -> engine:0.8.10 substituted reproduces the previous pin
+# (3538b2de...), and eight engine:0.8.12 occurrences were counted in it.
+# Shared config-content helpers: JSONSource's manifest provenance token moved
+# to 0c356038d5722d0c when its non-finite-constant hook moved to
+# plugins/infrastructure/config_content.py. That token is the manifest's only
+# changed byte run; this digest was captured from this file's parity failure.
+# Merge of the two changes above (0.8.12 version cut 3cb6bbb3... and the
+# JSONSource token move 01ae33ed...): both byte runs change in one manifest,
+# so neither parent's digest applies. Captured from this file's parity failure
+# on the merged tree.
+# 0.8.13 version cut on that merged tree: the same eight engine-owned
+# plugin_version values advance (seven manifest lines), engine:0.8.12 ->
+# engine:0.8.13. Captured from this file's parity failure (previous pin
+# b3162f4d...).
+EXPECTED_CASE_REGISTRY_SHA256 = "3338f07b09c11e79c487f9136bff55eef0c0f80aad4f25de32a07e67eab110d7"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

@@ -1,5 +1,6 @@
 {
   "composerMaxCompositionTurns": 15,
+  "composerContextMaxPromptTokens": 200000,
   "composerMaxDiscoveryTurns": 10,
   "composerTimeoutSeconds": 180,
   "composerRateLimitPerMinute": 10,

@@ -218,6 +218,7 @@ def _build_app(
     completion: Any,
     *,
     pending_llm_review: bool = False,
+    context_max_prompt_tokens: int = 200_000,
 ) -> tuple[SyncASGITestClient, Any, SessionServiceImpl]:
     """Wire a minimal real FastAPI app whose composer is a real ComposerServiceImpl.
 
@@ -253,6 +254,7 @@ def _build_app(
         if pending_llm_review
         else {},
         composer_max_composition_turns=3,
+        composer_context_max_prompt_tokens=context_max_prompt_tokens,
         composer_max_discovery_turns=2,
         composer_timeout_seconds=20.0,
         composer_rate_limit_per_minute=10,
@@ -1015,6 +1017,97 @@ def test_send_message_freeform_planner_failure_is_translated(
         )
 
 
+_CONTEXT_BUDGET_DETAIL = "This conversation is too large for the composer to continue. Start a new session, or shorten your request."
+
+
+def test_send_message_planner_context_budget_refusal_names_its_cause_on_the_operation_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A planner request whose protected content exceeds the token ceiling is refused before any provider call.
+
+    There is no call record, so the operation record is where the refusal, the
+    ceiling it hit and the largest component must be found.
+    """
+    provider = AsyncMock(spec=litellm.acompletion, side_effect=AssertionError("a context budget refusal makes no provider call"))
+    # 1,000 tokens at the fallback 3.0 bytes per token: the system skill alone is over the ceiling.
+    client, engine, _sessions = _build_app(tmp_path, monkeypatch, provider, context_max_prompt_tokens=1_000)
+    session_id = client.post("/api/sessions", json={"title": "planner context budget refusal"}).json()["id"]
+
+    settled = settle_sync(
+        client,
+        client.app,
+        path=f"/api/sessions/{session_id}/messages",
+        body={"content": _EMPTY_INTENT, "operation_id": str(uuid4()), "state_id": None},
+    )
+
+    status, body = settled.error()
+    detail = body["detail"]
+    # The same status as the compose loop's refusal of the same condition: the request, not the server, is at fault.
+    assert status == 422, settled.final.text
+    assert detail["error_type"] == "composer_planner_failure"
+    assert detail["failure_code"] == "context_budget_exceeded"
+    assert detail["planner_code"] == "CONTEXT_BUDGET_EXHAUSTED"
+    assert detail["detail"] == _CONTEXT_BUDGET_DETAIL
+    assert detail["detail_codes"] == ["context_ceiling_tokens", "largest_component_system"]
+    provider.assert_not_awaited()
+    assert _llm_audit_rows(engine) == []
+
+    progress = client.get(f"/api/sessions/{session_id}/composer-progress").json()
+    assert progress["phase"] == "failed"
+    assert progress["reason"] == "context_budget_exceeded"
+    assert progress["likely_next"] == "Start a new session, or shorten your request."
+
+    (disposition,) = _disposition_rows(engine)
+    assert disposition.tool_calls[0]["failure_code"] == "context_budget_exceeded"
+    assert disposition.tool_calls[0]["rejection_codes"] == ["context_ceiling_tokens", "largest_component_system"]
+
+    operation_id = settled.accepted.json()["operation_id"]
+    with engine.connect() as conn:
+        operation = (
+            conn.execute(select(composer_async_operations_table).where(composer_async_operations_table.c.operation_id == operation_id))
+            .mappings()
+            .one()
+        )
+    assert operation["status"] == "failed"
+    assert operation["failure_code"] == "http_error"
+    recorded = json.loads(operation["result_json"])
+    assert recorded["error_type"] == "context_budget_exceeded"
+    assert recorded["body"]["detail"]["failure_code"] == "context_budget_exceeded"
+    assert recorded["body"]["detail"]["detail"] == _CONTEXT_BUDGET_DETAIL
+    assert recorded["body"]["detail"]["detail_codes"] == ["context_ceiling_tokens", "largest_component_system"]
+
+    history = client.get(f"/api/sessions/{session_id}/operations", params={"operation_id": operation_id})
+    assert history.status_code == 200, history.text
+    (outcome,) = history.json()["items"]
+    assert outcome["failure_code"] == "http_error"
+    assert outcome["error_type"] == "context_budget_exceeded"
+
+
+@pytest.mark.parametrize(
+    ("code", "detail_codes"),
+    [
+        ("CONTEXT_BUDGET_EXHAUSTED", ("context_ceiling_tokens", "largest_component_request")),
+        ("CONTEXT_BUDGET_EXHAUSTED", ("context_ceiling_bytes", "largest_component_transcript")),
+        ("REQUEST_BYTES_EXHAUSTED", ()),
+    ],
+)
+def test_planner_context_budget_refusals_translate_to_context_budget_exceeded(code: str, detail_codes: tuple[str, ...]) -> None:
+    from elspeth.web.composer.pipeline_planner import PipelinePlannerError
+    from elspeth.web.sessions.routes._helpers import (
+        _FREEFORM_PLANNER_FAILURE_HTTP,
+        _freeform_planner_failure_code,
+        freeform_planner_progress_reason,
+    )
+
+    exc = PipelinePlannerError("planner context budget refusal", code=code, detail_codes=detail_codes)
+
+    assert _freeform_planner_failure_code(exc) == "context_budget_exceeded"
+    # 422, the status of the compose loop's refusal of the same condition.
+    assert _FREEFORM_PLANNER_FAILURE_HTTP["context_budget_exceeded"] == (422, _CONTEXT_BUDGET_DETAIL)
+    assert freeform_planner_progress_reason(code) == "context_budget_exceeded"
+
+
 def test_recompose_freeform_planner_failure_is_translated(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1067,6 +1160,7 @@ def test_recompose_freeform_planner_failure_is_translated(
 _ALL_PLANNER_CODES = (
     "COMPLETION_TOKENS_EXCEEDED",
     "COMPOSITION_EXHAUSTED",
+    "CONTEXT_BUDGET_EXHAUSTED",
     "COST_CAP_EXCEEDED",
     "COST_UNAVAILABLE",
     "DECLINED",

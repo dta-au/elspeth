@@ -20,6 +20,7 @@ from typing import ClassVar, Literal, Protocol, get_args
 from uuid import UUID, uuid5
 
 from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
@@ -776,19 +777,7 @@ class BlobDeletionPlan:
             or any(character not in "0123456789abcdef" for character in self.blob_snapshot_hash)
         ):
             raise ValueError("BlobDeletionPlan.blob_snapshot_hash must be lowercase SHA-256")
-        if type(self.expected_file_present) is not bool:
-            raise TypeError("BlobDeletionPlan.expected_file_present must be bool")
-        if self.expected_file_present:
-            if type(self.expected_file_size) is not int or self.expected_file_size < 0:
-                raise ValueError("BlobDeletionPlan.expected_file_size must be non-negative when bytes are present")
-            if (
-                type(self.expected_file_hash) is not str
-                or len(self.expected_file_hash) != 64
-                or any(character not in "0123456789abcdef" for character in self.expected_file_hash)
-            ):
-                raise ValueError("BlobDeletionPlan.expected_file_hash must be lowercase SHA-256 when bytes are present")
-        elif self.expected_file_size is not None or self.expected_file_hash is not None:
-            raise ValueError("BlobDeletionPlan absent-file evidence must not carry size or hash")
+        self.require_file_evidence(self.expected_file_present, self.expected_file_size, self.expected_file_hash)
         if type(self.created_at) is not datetime or type(self.updated_at) is not datetime:
             raise TypeError("BlobDeletionPlan timestamps must be exact datetimes")
         if self.created_at.utcoffset() is None or self.updated_at.utcoffset() is None:
@@ -797,6 +786,19 @@ class BlobDeletionPlan:
             raise ValueError("BlobDeletionPlan.updated_at must not precede created_at")
         if self.blob is not None and (type(self.blob) is not BlobRecord or self.blob.id != self.blob_id):
             raise ValueError("BlobDeletionPlan.blob must match blob_id")
+
+    @staticmethod
+    def require_file_evidence(present: bool, size: int | None, digest: str | None) -> None:
+        """Admission and durable preparation use exactly the same evidence domain."""
+        if type(present) is not bool:
+            raise TypeError("BlobDeletionPlan.expected_file_present must be bool")
+        if present:
+            if type(size) is not int or size < 0:
+                raise ValueError("BlobDeletionPlan.expected_file_size must be non-negative when bytes are present")
+            if type(digest) is not str or len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+                raise ValueError("BlobDeletionPlan.expected_file_hash must be lowercase SHA-256 when bytes are present")
+        elif size is not None or digest is not None:
+            raise ValueError("BlobDeletionPlan absent-file evidence must not carry size or hash")
 
 
 @dataclass(frozen=True, slots=True)
@@ -873,6 +875,20 @@ class BlobReplacementPlan:
             raise ValueError("BlobReplacementPlan old snapshot hash does not match metadata")
         if blob_record_snapshot_hash(self.replacement_blob) != self.replacement_blob_snapshot_hash:
             raise ValueError("BlobReplacementPlan replacement snapshot hash does not match metadata")
+
+    def require_current_metadata(self, current: BlobRecord | None) -> None:
+        """Recovery and admission require the same complete phase snapshot."""
+        if current != (self.replacement_blob if self.phase == "purge_pending" else self.old_blob):
+            raise AuditIntegrityError("replacement recovery metadata differs from the complete durable snapshot")
+
+
+@dataclass(frozen=True, slots=True)
+class BlobMutationObservation:
+    """Transient fenced metadata/debt observation; grants no durable admission."""
+
+    blob: BlobRecord | None
+    deletion: BlobDeletionPlan | BlobAtomicDeletionObligation | None
+    replacement: BlobReplacementPlan | None
 
 
 @dataclass(frozen=True, slots=True)
