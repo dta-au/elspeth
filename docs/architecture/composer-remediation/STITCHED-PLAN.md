@@ -191,6 +191,45 @@ These add to `work-packages.md` §4, which still applies.
   `verify` and merge. The reviewer is given the diff and the brief, not the
   worker's account of it.
 
+## 5a. Integrated delivery order (2026-11-15)
+
+This table supersedes the order in §6 wherever they differ. §6 is kept for the
+scope notes on each lane. The remediation is a multi-patch line of effort
+(ruled 2026-11-15): patch numbers below are planning allocations, to be
+confirmed before any version or changelog edit.
+
+The branch was rebased onto the landed 0.8.13 on 2026-11-14, and later 0.8.13
+CI fixes are merged in. A rebase that changes `uv.lock` needs
+`uv sync --frozen --all-extras` in this worktree: every lane worktree shares
+this one environment.
+
+| Order | Lane | What it delivers | State on 2026-11-15 | Patch |
+|---|---|---|---|---|
+| 1 | CDA-06, 05, 01, 04, 02 | Wave 1 | Merged | 0.8.14 |
+| 2 | CDA-02b | The model reports a diff plainly, with both version numbers | Merged (`48316c6d0`) | 0.8.14 |
+| 3 | CTX-A | Context budget: estimate anchored on provider token counts; stable shed state | Building | 0.8.14 |
+| 4 | CTX-B | Context budget: shed order; Anthropic thinking-block rules | Queued | 0.8.14 |
+| 5 | CTX-C | Context budget: refusal copy per cause, figures recorded | Queued | 0.8.14 |
+| 6 | CTX-D | Context budget: tests for surviving mutants | Not briefed | 0.8.14 |
+| 7 | CDA-07a | Advisor capability record, rubric, repair copy | In review | 0.8.14 |
+| 8 | CDA-18 | Credential-shaped reasoning withheld, turn kept; closes the CDA-06 surface gap | Building | 0.8.14 |
+| 9 | CDA-03 | `report_assemble` honest framing labels; text sink widened | Queued | 0.8.14 |
+| 10 | CDA-25 | A forked session's first version carries no unearned validated mark | Queued | 0.8.14 |
+| 11 | CDA-24 | Validated milestones in the version menu; menu shows the newest 50 | Queued | 0.8.14 |
+| 12 | CDA-26 | Provider-error scrubber uses the shared credential patterns | Not briefed | 0.8.14 |
+| 13 | CDA-27 | The prompt "structural directive" guard is removed | Not briefed | 0.8.14 |
+| 14 | CDA-01b | Tutorial interpretation card offers no "Change…" in script mode | Not briefed | 0.8.14 |
+| 15 | P-B11 with batch plugins | Three batch plugins generally available; `copy_index` repair text corrected | Awaits the planner byte allowance | 0.8.14 |
+| 16 | CDA-08, then CDA-09 | Withheld reply as a system notice; preflight on question-only turns | Briefed. CDA-08's brief must account for string-matching finding 9 (notices recognised by shape) | 0.8.14 or next |
+| 17 | CRED-A1 to CRED-E2 | Credential redesign: one pattern list, narrowing with detector version 2, wider checking at user ingress only, reasons on every block, browser paste and send block, egress redaction | Designed (`.lanes/cred-design/design-r2.md`), reviewed once. Absorbs CDA-19. Follows CDA-18 and CDA-26 | next patch |
+| 18 | CDA-11 → CDA-10 → P-B1 → CDA-12a → CDA-12b → CDA-13 | Wave 3, serial | Not briefed. CDA-10, P-B12 and P-B9a join the "producer carries the code" programme (string-matching findings 9 to 12) | later |
+| 19 | CDA-21 → CDA-23; CDA-17; CDA-22 → CDA-20; CDA-14; CDA-15; CDA-16 | Wave 4 | Not briefed. CDA-23 must keep a skipped turn-end version a milestone. CDA-14 may be dropped | later |
+| 20 | CRED-F, CRED-G | Repository scanning on the shared list, with a CI job; read-only stored-data report before any further widening | Designed | later |
+| 21 | Typed provenance, reconciliation column, typed notice segments, whole-tree gate on free-text matching | From `reports/string-matching-2026-11-15.md` | Tracked | later |
+
+Dropped: CDA-07b (S-5), CDA-19 as a separate lane (absorbed by the credential
+redesign), P-B17 (S-1).
+
 ## 6. Resequenced waves
 
 A wave starts from the tree that contains the earlier merges. Within a wave,
