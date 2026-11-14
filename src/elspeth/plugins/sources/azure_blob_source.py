@@ -46,6 +46,7 @@ from elspeth.plugins.infrastructure.config_base import (
 )
 from elspeth.plugins.infrastructure.config_content import reject_nonfinite_constant
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+from elspeth.plugins.infrastructure.text_decoding import BYTE_ESCAPE_ERRORS, contains_escaped_bytes, decoding_codec, escaped_line_to_bytes
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,
     FieldMappingCollisionError,
@@ -54,10 +55,6 @@ from elspeth.plugins.sources.field_normalization import (
     extend_field_resolution,
     normalize_field_name,
     resolve_field_names,
-)
-from elspeth.plugins.sources.json_source import (
-    _contains_surrogateescape_chars,
-    _surrogateescape_line_to_bytes,
 )
 
 if TYPE_CHECKING:
@@ -399,7 +396,7 @@ class AzureBlobSource(BaseSource):
     name = "azure_blob"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9168aebe890fd40a"
+    source_file_hash: str | None = "sha256:5da3ed9923a70982"
     config_model = AzureBlobSourceConfig
 
     usage_when_to_use: str = (
@@ -700,17 +697,18 @@ class AzureBlobSource(BaseSource):
                 )
 
         # THEIR DATA: Parsing blob content - wrap operations.
-        # surrogateescape (as _load_jsonl does) keeps undecodable bytes as
-        # lone surrogates so each bad record is quarantined on its own line
-        # below instead of one byte discarding every decodable row. The
-        # strict fallback remains for the bytes surrogateescape cannot carry.
+        # BYTE_ESCAPE_ERRORS (as _load_jsonl does) keeps every undecodable
+        # code unit, for every codec, on the record that carried it, so each
+        # bad record is quarantined on its own line below instead of one bad
+        # unit discarding every decodable row. A codec that refuses the
+        # stream outright still raises and quarantines the whole blob.
         try:
-            text_data = blob_data.decode(encoding, errors="surrogateescape")
+            text_data = blob_data.decode(decoding_codec(encoding), errors=BYTE_ESCAPE_ERRORS)
         except UnicodeDecodeError as e:
             yield from _quarantine_undecodable_file(f"Failed to decode CSV blob as {encoding}: {e}")
             return
         # Header-level quarantine previews must never carry lone surrogates.
-        blob_preview = "".join("\ufffd" if _contains_surrogateescape_chars(char) else char for char in text_data[:200])
+        blob_preview = "".join("\ufffd" if contains_escaped_bytes(char) else char for char in text_data[:200])
 
         # Physical lines consumed by the record csv.reader is assembling; the
         # reader pulls lines on demand, so after each next() this holds
@@ -783,7 +781,7 @@ class AzureBlobSource(BaseSource):
                     )
                 return
 
-            if _contains_surrogateescape_chars("".join(record_lines)):
+            if contains_escaped_bytes("".join(record_lines)):
                 yield from _quarantine_undecodable_file(
                     f"Failed to decode CSV blob header as {encoding}: undecodable bytes in the header record"
                 )
@@ -917,8 +915,8 @@ class AzureBlobSource(BaseSource):
             # Undecodable bytes — quarantine this record only, with its exact
             # raw bytes (mirrors _load_jsonl), and keep reading.
             raw_record = "".join(record_lines)
-            if _contains_surrogateescape_chars(raw_record):
-                raw_bytes = _surrogateescape_line_to_bytes(raw_record.rstrip("\r\n"), encoding)
+            if contains_escaped_bytes(raw_record):
+                raw_bytes = escaped_line_to_bytes(raw_record.rstrip("\r\n"), encoding)
                 raw_row = {
                     "__raw_bytes_hex__": raw_bytes.hex(),
                     "__line_number__": str(physical_line),
@@ -1004,7 +1002,7 @@ class AzureBlobSource(BaseSource):
 
         # THEIR DATA: JSON parsing - quarantine failures at boundary
         try:
-            text_data = blob_data.decode(encoding)
+            text_data = blob_data.decode(decoding_codec(encoding))
         except UnicodeDecodeError as e:
             error_msg = f"Failed to decode blob as {encoding}: {e}"
             yield from _record_file_level_error(error_msg, "parse")
@@ -1059,8 +1057,8 @@ class AzureBlobSource(BaseSource):
         try:
             text_stream = io.TextIOWrapper(
                 io.BytesIO(blob_data),
-                encoding=encoding,
-                errors="surrogateescape",
+                encoding=decoding_codec(encoding),
+                errors=BYTE_ESCAPE_ERRORS,
                 newline="",
             )
             for line_num, raw_line in enumerate(text_stream, start=1):
@@ -1070,8 +1068,8 @@ class AzureBlobSource(BaseSource):
 
                 non_empty_count += 1
 
-                if _contains_surrogateescape_chars(raw_line):
-                    raw_bytes = _surrogateescape_line_to_bytes(raw_line.rstrip("\r\n"), encoding)
+                if contains_escaped_bytes(raw_line):
+                    raw_bytes = escaped_line_to_bytes(raw_line.rstrip("\r\n"), encoding)
                     raw_row = {
                         "__raw_bytes_hex__": raw_bytes.hex(),
                         "__line_number__": line_num,

@@ -51,6 +51,7 @@ from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import NormalizedFieldMappingOption, TextEncoding, TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+from elspeth.plugins.infrastructure.text_decoding import decoding_codec
 from elspeth.plugins.sources.field_normalization import ExternalHeaderError, is_normalized_field_name, normalize_field_name
 from elspeth.plugins.transforms.blob_expand_contract import (
     BLOB_CONTENT_TYPE_FIELD_DESCRIPTION,
@@ -396,7 +397,7 @@ class BlobJSONExpand(BaseTransform):
     name = "blob_json_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:583cf14448990ab5"
+    source_file_hash: str | None = "sha256:95094a9c9643321b"
     config_model = BlobJSONExpandConfig
     usage_when_to_use: str = (
         "Use when a row carries a JSON document — either a payload-store reference from blob_fetch or JSON text in a "
@@ -768,7 +769,7 @@ class BlobJSONExpand(BaseTransform):
             )
 
         try:
-            text = body.decode(self._encoding)
+            text = body.decode(decoding_codec(self._encoding))
         except UnicodeDecodeError as exc:
             raise _BlobJSONParseError(
                 _json_error_reason("decode_failed", field=self._blob_ref_field, blob_ref=blob_ref, encoding=self._encoding, error=str(exc))
