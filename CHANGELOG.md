@@ -190,6 +190,15 @@ These changes are breaking:
   rejected at config load; the provider already rejected them per row. A
   provider message mentioning `max_blocks` or `max_result_bytes` is now
   recorded as `malformed_response`.
+- **Template errors on row data are value-free.** A template render failure
+  whose context carries a row now reports the exception class only; error
+  text that used to quote row values no longer does.
+- **S3 and audit export changes.** An `aws_s3` source body with a
+  non-callable `read` fails as `InvalidS3Body`. An `aws_s3` sink with
+  `overwrite: true` can now replace an existing object whose checksum is a
+  multipart SHA-256 composite, which used to be refused as malformed. Audit
+  export preflight now fails when its scratch probe cannot be removed, and
+  reconcile evidence values for the staging state change.
 - **A missing core dependency stops plugin discovery.** Only `jinja2` is
   treated as optional; a missing `chromadb`, `bs4` or `html2text` now raises
   instead of silently dropping plugins from the catalog.
@@ -578,6 +587,30 @@ Sinks and retrieval:
     retryable worker-lost error (#6).
   - Parallel LLM multi-query records the pool execution context in
     `context_after` (#100).
+  - Control credit no longer reads a `detect_only` option that no plugin
+    config admits (#1).
+  - A template render whose context carries a row reports failures by
+    exception class only, so row values cannot reach error text;
+    operator-only contexts such as blob paths keep the detailed message (#7).
+  - Sink pre-validation resolves the config model from the config, as the
+    runtime factory does, and reports a provider dispatch rejection as a
+    `provider` validation error, matching sources and transforms (#8).
+- **S3, audit export and Dataverse:**
+  - The `aws_s3` source admits the SDK `GetObject` body by parsing its
+    `read`/`close` members rather than a runtime-checkable protocol; a body
+    whose `read` is not callable is closed and reported as `InvalidS3Body`
+    instead of a mid-download `TypeError` (#12).
+  - The `aws_s3` sink records a multipart composite `ChecksumSHA256`
+    (`<base64>-<parts>`) as having no full-object checksum instead of
+    rejecting it as malformed; malformed composites are still refused (#31).
+  - Audit export bundle preflight reports a scratch probe it could not
+    remove (#15), the same-device guard compares the staging parent rather
+    than the target parent with itself (#16), and reconcile evidence records
+    the measured staging state, using `divergent` only for a tree actually
+    compared against the plan (#17).
+  - Dataverse member-effect validation computes batch plan material once per
+    batch rather than per member; the plan-vs-material integrity check still
+    runs for every member (#89).
 
 ### Composer
 
@@ -659,6 +692,10 @@ Sinks and retrieval:
   A fork interrupted mid-copy across the upgrade fails closed on retry with a
   modality mismatch. Pipeline `llm`-node output is still recorded VERBATIM
   and has not been checked as a route to model-written prompt text.
+- Two masquerade baseline entries added for the `aws_s3` source body parse
+  and a test double await maintainer review, and tier-model allowlist
+  entries for audit export preflight and the `aws_s3` source download await
+  operator re-signing.
 
 ### Publication and acceptance
 
