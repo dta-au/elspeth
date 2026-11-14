@@ -442,13 +442,16 @@ class TestDownloadS3Object:
         assert exc_info.value.provider_error_type == "InvalidS3Body"
 
     @pytest.mark.parametrize("read_value", [1, "not-callable"])
-    def test_malformed_body_read_contract_fails_loudly_and_closes(self, read_value: Any) -> None:
-        from elspeth.plugins.sources.aws_s3_source import _download_s3_object
+    def test_malformed_body_read_contract_is_rejected_and_closes(self, read_value: Any) -> None:
+        # ADR-032: a non-callable SDK ``read`` is malformed external data, parsed at
+        # the boundary into InvalidS3Body, not a TypeError raised mid-download.
+        from elspeth.plugins.sources.aws_s3_source import S3SourceReadError, _download_s3_object
 
         body = _CloseOnlyBody(read=read_value)
         client = _Client({"ContentLength": 0, "ETag": '"etag"'}, {"ContentLength": 0, "Body": body})
-        with pytest.raises(TypeError):
+        with pytest.raises(S3SourceReadError) as exc_info:
             _download_s3_object(client, bucket="bucket", key="key", max_object_bytes=1)
+        assert exc_info.value.provider_error_type == "InvalidS3Body"
         assert body.closed
 
     def test_malformed_body_programmer_close_failure_escapes(self) -> None:

@@ -81,6 +81,8 @@ _MAX_REGION_CHARS = 64
 _MAX_ETAG_BYTES = 1024
 _SAFE_ERROR_TYPE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
+# S3 multipart uploads have 1..10000 parts; a composite checksum carries that count.
+_S3_COMPOSITE_PART_COUNT = re.compile(r"(?:[1-9][0-9]{0,3}|10000)\Z")
 _CONDITIONAL_ERROR_CODES = frozenset({"PreconditionFailed", "ConditionalRequestConflict"})
 _DEFINITE_REJECTION_CODES = frozenset({"AccessDenied", "NoSuchBucket", "InvalidRequest"})
 
@@ -747,7 +749,7 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
     name = "aws_s3"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9f0d21a6ac2e98ed"
+    source_file_hash: str | None = "sha256:3d90ff2251470de9"
     config_model = AWSS3SinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP
@@ -912,14 +914,22 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
             checksum_value = response["ChecksumSHA256"]
             if not isinstance(checksum_value, str):
                 raise RemoteObjectPreconditionError("S3 object inspection returned malformed checksum")
+            # A multipart upload with SHA-256 checksums reports a COMPOSITE
+            # checksum, "<base64 digest-of-digests>-<part count>". It is a valid
+            # provider shape but not a hash of the object bytes, so it is
+            # recorded as "no full-object checksum" rather than rejected.
+            digest_b64, separator, part_count = checksum_value.partition("-")
+            if separator and _S3_COMPOSITE_PART_COUNT.fullmatch(part_count) is None:
+                raise RemoteObjectPreconditionError("S3 object inspection returned malformed checksum")
             try:
-                checksum_bytes = base64.b64decode(checksum_value, validate=True)
+                checksum_bytes = base64.b64decode(digest_b64, validate=True)
             except (binascii.Error, ValueError):
                 raise RemoteObjectPreconditionError("S3 object inspection returned malformed checksum") from None
             if len(checksum_bytes) != hashlib.sha256().digest_size:
                 raise RemoteObjectPreconditionError("S3 object inspection returned malformed checksum")
-            checksum_b64 = checksum_value
-            checksum_hash = checksum_bytes.hex()
+            if not separator:
+                checksum_b64 = checksum_value
+                checksum_hash = checksum_bytes.hex()
         if content_hash is not None and checksum_hash is not None and checksum_hash != content_hash:
             raise RemoteObjectPreconditionError("S3 object inspection checksum diverges from content hash metadata")
 

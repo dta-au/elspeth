@@ -417,9 +417,15 @@ class BaseTransform(ABC):
         role: ControlRole,
         options: Mapping[str, object],
     ) -> bool:
-        """Evaluate whether this concrete config can enforce a declared control."""
-        if "detect_only" in options and options["detect_only"] is True:
-            return False
+        """Evaluate whether this concrete config can enforce a declared control.
+
+        The default credits a declared ``blocks_positive_detection`` capability
+        and reads no option: it cannot know which knob makes a given plugin's
+        configuration non-blocking. A plugin with such a knob overrides this
+        and refuses credit for it (azure_content_safety no-op thresholds,
+        aws_bedrock_content_safety ``source``, azure_prompt_shield
+        ``analysis_type``).
+        """
         return any(
             declaration.capability is capability and declaration.control_role is role and declaration.blocks_positive_detection
             for declaration in cls.policy_capabilities
