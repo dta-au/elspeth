@@ -64,6 +64,7 @@ from tests.helpers.fenced_session import IDENTITY_TOKENS_PER_DAY, seed_token_pol
 from tests.helpers.quota_guard import GuardedQuotaTurn, assert_provider_audit_companion, guarded_quota_turn
 from tests.unit.web.composer.test_pipeline_planner import (
     _budget,
+    _context_policy,
     _custody,
     _empty_state,
     _lifecycle,
@@ -254,6 +255,7 @@ async def _run_quota_planner(
             rendered_skill=f"{load_pipeline_capability_core()}\n\nYou are the bounded ELSPETH pipeline planner.",
             repair_budget=1,
             budget_policy=_budget(),
+            context_policy=_context_policy(),
             custody_config=custody_config,
             lifecycle=_lifecycle(),
             recorder=recorder,

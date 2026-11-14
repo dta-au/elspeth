@@ -221,6 +221,7 @@ def test_read_rejects_expiry_even_on_eof() -> None:
 
 
 @pytest.mark.parametrize("send_control", [False, True])
+@pytest.mark.timing_sensitive
 def test_blocking_read_uses_remaining_budget(send_control: bool) -> None:
     client, peer = socket.socketpair()
     stream = DeadlineNetworkStream(client, HTTPDeadline(time.monotonic() + 0.12))

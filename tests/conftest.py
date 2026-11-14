@@ -684,15 +684,20 @@ def explicit_required_executor_recovery(monkeypatch: pytest.MonkeyPatch) -> Iter
     from tests.fixtures.required_executor import RecordingRequiredGenerationRecovery, assert_owned_executor_fixture_settled
 
     assert_owned_executor_fixture_settled(async_workers._GENERATION_CUSTODIAN)
+    for recovering in async_workers._RECOVERING_GENERATIONS:
+        assert_owned_executor_fixture_settled(recovering)
     monkeypatch.setattr(async_workers, "_APPLICATION_FINALIZER_OWNER", None)
     monkeypatch.setattr(async_workers, "_SHARED_SHUTDOWN_STARTED", False)
     monkeypatch.setattr(async_workers, "_GENERATION_CUSTODIAN", None)
+    monkeypatch.setattr(async_workers, "_RECOVERING_GENERATIONS", set())
     monkeypatch.setattr(async_workers, "_RECOVERY_CALLBACK", RecordingRequiredGenerationRecovery())
     monkeypatch.setattr(async_workers, "_GENERATION_UNAVAILABLE", threading.Event())
     monkeypatch.setattr(async_workers, "_INSTANCE_DRAINING", threading.Event())
     monkeypatch.setattr(async_workers, "_CAPTURED_DRAIN_SECONDS", 10.0)
     yield
     assert_owned_executor_fixture_settled(async_workers._GENERATION_CUSTODIAN)
+    for recovering in async_workers._RECOVERING_GENERATIONS:
+        assert_owned_executor_fixture_settled(recovering)
 
 
 @pytest.fixture(autouse=True)

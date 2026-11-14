@@ -578,8 +578,10 @@
 }
 
 .catalog-tab-count--active {
-  background-color: var(--color-accent);
-  color: var(--color-text-inverse);
+  /* ARGOnite: the primary-button pair (navy on DTA green). White on the dark
+     accent #29b480 is ~2.65:1; gated in colorContrast.test.ts. */
+  background-color: var(--color-btn-primary-bg);
+  color: var(--color-btn-primary-text);
 }
 
 .catalog-tab-count--inactive {

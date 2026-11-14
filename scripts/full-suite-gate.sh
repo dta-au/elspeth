@@ -26,7 +26,9 @@
 #                 compare the count before and after your change, not to zero.
 #   pytest        pytest tests/ — the default selection = CI's "Test" job. The
 #                 marker expression comes from pyproject addopts; this script never
-#                 passes -m for it.
+#                 passes -m for it. It does NOT cover timing_sensitive tests.
+#   timing        pytest tests/ -m timing_sensitive -n 0 — CI's serial timing job.
+#                 Run separately from other suites to reduce host contention.
 #   testcontainer pytest tests/ -m testcontainer -n 0 — CI's required PostgreSQL job.
 #                 Needs Docker; serial by design. Run it if you touched schema, SQL,
 #                 session/Landscape persistence, or a lock. Score against the known
@@ -52,7 +54,7 @@
 # Output: one directory per run under --log-dir (default
 # $ELSPETH_GATE_LOG_DIR or /tmp/elspeth-gates/$USER), containing
 #   preflight.txt · <stage>.log · <stage>-<ordinal>.exit (observed stage rc)
-#   pytest-junit.xml · summary.txt · driver.exit · .done (last, driver terminal
+#   <stage>-junit.xml · summary.txt · driver.exit · .done (last, driver terminal
 #   receipt only; read stage exit and frozen status before qualifying a run)
 # Nothing is ever piped through tail; read summary.txt, then the logs.
 #
@@ -62,6 +64,7 @@
 #   scripts/full-suite-gate.sh --execute --detach                # background; prints the wait loop
 #   scripts/full-suite-gate.sh --execute --stages ruff,mypy,contracts,lints,pytest
 #   scripts/full-suite-gate.sh --execute --stages testcontainer
+#   scripts/full-suite-gate.sh --execute --stages timing
 #   scripts/full-suite-gate.sh --execute --root .claude/worktrees/<name> --log-dir "$S/gate"
 #
 # Options:
@@ -116,7 +119,7 @@ LOG_DIR="${LOG_DIR:-${ELSPETH_GATE_LOG_DIR:-/tmp/elspeth-gates/${USER:-$(id -un)
 
 IFS=',' read -r -a STAGE_LIST <<<"$STAGES"
 for s in "${STAGE_LIST[@]}"; do
-    case "$s" in ruff|mypy|contracts|lints|pytest|testcontainer) ;; *) echo "unknown stage: $s" >&2; exit 2 ;; esac
+    case "$s" in ruff|mypy|contracts|lints|pytest|timing|testcontainer) ;; *) echo "unknown stage: $s" >&2; exit 2 ;; esac
 done
 has_stage() { local s; for s in "${STAGE_LIST[@]}"; do [ "$s" = "$1" ] && return 0; done; return 1; }
 
@@ -176,6 +179,9 @@ if has_stage testcontainer; then
     if docker info >/dev/null 2>&1; then pre "docker      : reachable"; else pre "REFUSED     : testcontainer stage requested but docker is not reachable"; REFUSE=1; fi
     [ "$N_SIB" -gt 0 ] && pre "WARNING     : a testcontainer run beside another suite records contention as failures; serialise on the box first"
 fi
+if has_stage timing; then
+    [ "$N_SIB" -gt 0 ] && pre "WARNING     : a timing run beside another suite records contention as failures; serialise on the box first"
+fi
 
 tree_state() {
     # HEAD plus a digest of the working-tree state: every status line (tracked
@@ -232,6 +238,7 @@ CMD_OF[mypy]="$ROOT/.venv/bin/mypy src/ elspeth-lints/src/"
 CMD_OF[contracts]="$PY scripts/check_contracts.py && $PY scripts/cicd/generate_skill_inventory.py --check"
 CMD_OF[lints]="ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing $PY -m elspeth_lints.core.cli check --rules all --root src/elspeth"
 CMD_OF[pytest]="$PY -m pytest tests/ -n $WORKERS -o 'pythonpath=$ROOT/src $ROOT/elspeth-lints/src' -v --junitxml=<run-dir>/pytest-junit.xml $PYTEST_ARGS"
+CMD_OF[timing]="$PY -m pytest tests/ -m timing_sensitive -n 0 -o 'pythonpath=$ROOT/src $ROOT/elspeth-lints/src' -v --junitxml=<run-dir>/timing-junit.xml"
 CMD_OF[testcontainer]="$PY -m pytest tests/ -m testcontainer -n 0 -o 'pythonpath=$ROOT/src $ROOT/elspeth-lints/src' -v --junitxml=<run-dir>/testcontainer-junit.xml"
 
 say
@@ -409,7 +416,7 @@ run_stage() { # run_stage <name> <fatal 0|1> <command string>
     local extra=""
     case "$name" in
         lints)  extra=" findings=$(grep -cE '^[^ ].*:[0-9]+:' "$log" || true)" ;;
-        pytest|testcontainer) extra=" $(grep -E '^(=+ .*(passed|failed|error).* =+)$' "$log" | tail -n 1 | tr -d '=' | sed 's/^ *//; s/ *$//' || true)" ;;
+        pytest|timing|testcontainer) extra=" $(grep -E '^(=+ .*(passed|failed|error).* =+)$' "$log" | tail -n 1 | tr -d '=' | sed 's/^ *//; s/ *$//' || true)" ;;
     esac
     note "stage=$name exit=$rc seconds=$((t1 - t0)) fatal=$fatal$extra"
     CURRENT_PHASE="watcher_cleanup"

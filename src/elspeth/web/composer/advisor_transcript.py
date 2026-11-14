@@ -10,7 +10,7 @@ import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal, cast, final, get_args
+from typing import Any, Final, Literal, cast, final, get_args
 from uuid import UUID
 
 from pydantic import JsonValue
@@ -18,6 +18,7 @@ from pydantic import JsonValue
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import is_lower_sha256_hex, stable_hash
 from elspeth.contracts.prompt_guard import PromptGuardContentPart
+from elspeth.web.composer.context_budget import escaped_bytes
 from elspeth.web.composer.control_messages import replay_composer_control_message
 from elspeth.web.composer.prompt_guard_rendering import JsonPath, _json_inspection_text, json_content_parts
 from elspeth.web.composer.visible_tool_event import (
@@ -572,10 +573,19 @@ def _recover_read_bodies(events: list[dict[str, Any]], reader: TranscriptBlobRea
             }
 
 
+# The availability gap a transcript reduced to fit the context budget carries.
+CONTEXT_BUDGET_TRANSCRIPT_OMISSION_GAP: Final[str] = "oldest_events_omitted_for_context_budget"
+
+# Where the current request's full text lives; the event carrying one of these
+# as its ``content_ref`` stands for the current request.
+AdvisorRequestReference = Literal["complete_original_user_request_section", "initial_planner_request.intent"]
+_REQUEST_REFERENCES: Final[frozenset[str]] = frozenset(get_args(AdvisorRequestReference))
+
+
 @final
 @dataclass(frozen=True, slots=True)
 class AdvisorVisibleTranscript:
-    """Immutable complete available visible chronology; all text is untrusted."""
+    """Immutable available visible chronology, possibly reduced to fit a context budget (see ``availability_gaps``); all text is untrusted."""
 
     request: str = field(repr=False)
     binding: str
@@ -584,7 +594,7 @@ class AdvisorVisibleTranscript:
 
     def with_request_reference(
         self,
-        reference: Literal["complete_original_user_request_section", "initial_planner_request.intent"],
+        reference: AdvisorRequestReference,
     ) -> AdvisorVisibleTranscript:
         """Point to the existing full request in another owned entry path."""
         payload = json.loads(self.provider_json)
@@ -595,6 +605,65 @@ class AdvisorVisibleTranscript:
         return AdvisorVisibleTranscript(
             self.request,
             stable_hash({"transcript": self.binding, "request_reference": reference}),
+            json.dumps(payload, ensure_ascii=False),
+            self.semantic_binding,
+        )
+
+    def event_bytes(self) -> tuple[int, ...]:
+        """UTF-8 bytes each event occupies in ``provider_json``, plus one for its separator.
+
+        Measured on the event's own serialization inside ``provider_json``, not
+        on canonical JSON, whose number rendering can be longer: removing
+        events while one remains removes at least these bytes, because each
+        separator is two. Removing a lone last event over-counts by one.
+        """
+        payload = json.loads(self.provider_json)
+        return tuple(len(json.dumps(event, ensure_ascii=False).encode("utf-8")) + 1 for event in payload["events"])
+
+    def event_wire_bytes(self) -> tuple[int, ...]:
+        """Wire bytes each event occupies once the transcript is carried as a request message's content, plus one.
+
+        The transcript travels inside a JSON string, so each event's
+        serialization is escaped once more; escaping is per character, so an
+        event's share is its own escaped length. The separator escapes to its
+        own two bytes, and the plus-one carries :meth:`event_bytes`'s
+        convention: a lower bound while one event remains, one over when the
+        lone last event goes.
+        """
+        payload = json.loads(self.provider_json)
+        return tuple(escaped_bytes(json.dumps(event, ensure_ascii=False)) + 1 for event in payload["events"])
+
+    def sheddable_event_indices(self) -> tuple[int, ...]:
+        """Indices of every event except the current request's reference.
+
+        A legacy ``content_ref`` (``legacy_invocations[0].result_canonical``)
+        points inside its own event, so dropping that event leaves no
+        reference dangling.
+        """
+        payload = json.loads(self.provider_json)
+        return tuple(
+            index
+            for index, event in enumerate(payload["events"])
+            if "content_ref" not in event or event["content_ref"] not in _REQUEST_REFERENCES
+        )
+
+    def without_events(self, indices: frozenset[int]) -> AdvisorVisibleTranscript:
+        """Drop sheddable events to fit a context budget; the gap is disclosed once.
+
+        ``binding`` describes the reduced transcript; ``request`` and
+        ``semantic_binding`` are unchanged. No indices returns this transcript.
+        """
+        if not indices:
+            return self
+        if not indices <= frozenset(self.sheddable_event_indices()):
+            raise ValueError("only sheddable transcript events can be omitted")
+        payload = json.loads(self.provider_json)
+        payload["events"] = [event for index, event in enumerate(payload["events"]) if index not in indices]
+        if CONTEXT_BUDGET_TRANSCRIPT_OMISSION_GAP not in payload["availability_gaps"]:
+            payload["availability_gaps"].append(CONTEXT_BUDGET_TRANSCRIPT_OMISSION_GAP)
+        return AdvisorVisibleTranscript(
+            self.request,
+            stable_hash({"transcript": self.binding, "omitted_events": sorted(indices)}),
             json.dumps(payload, ensure_ascii=False),
             self.semantic_binding,
         )

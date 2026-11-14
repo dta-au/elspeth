@@ -56,6 +56,7 @@ from elspeth.web.composer.tools._common import (
     _mutation_result,
     _normalize_echoed_interpretation_requirements,
     _options_with_default_llm_reviews,
+    _path_policy_refusal_message,
     _plugin_selection_violation,
     _post_mutation_invariant_error,
     _prevalidate_transform_for_context,
@@ -74,7 +75,7 @@ from elspeth.web.composer.tools._common import (
     review_reconciliation_failure_message,
 )
 from elspeth.web.composer.tools._naming_disclosure import _disclose_node_name_constraints
-from elspeth.web.composer.tools.blobs import _llm_authored_inline_prompt_surface_error
+from elspeth.web.composer.tools.blobs import _file_inject_node_option_error, _llm_authored_inline_prompt_surface_error
 from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
     ToolKind,
@@ -628,6 +629,9 @@ def _execute_upsert_queue_node(
         expected_output_count=validated.expected_output_count,
         timeout_seconds=validated.timeout_seconds,
         description=validated.description,
+        scope_name=validated.scope_name,
+        scope_opener=validated.scope_opener,
+        scope_policy=validated.scope_policy,
     )
     contract_error = queue_node_contract_error(node)
     if contract_error is not None:
@@ -793,6 +797,18 @@ def _execute_upsert_node(
             return _saved_graph_rejection_result(
                 state, prompt_surface_error, error_code="llm_authored_inline_blob_content", rejected_component=node_ref
             )
+        # file_inject content is a user-uploaded file on every authoring path.
+        file_inject_error = _file_inject_node_option_error(
+            context,
+            tool_name="upsert_node",
+            node_id=node_id,
+            plugin=plugin,
+            options=review_options,
+        )
+        if file_inject_error is not None:
+            return _saved_graph_rejection_result(
+                state, file_inject_error, error_code="file_inject_content_not_uploaded", rejected_component=node_ref
+            )
 
         prevalidation_error = _prevalidate_transform_for_context(context, plugin, review_options)
         if prevalidation_error is not None:
@@ -817,11 +833,20 @@ def _execute_upsert_node(
                     state, f"Node '{node_id}': {provider_policy_error}", error_code="llm_retry_budget_policy", rejected_component=node_ref
                 )
 
-        provider_path_error = _validate_transform_provider_config_path(review_options, context.data_dir, session_id=context.session_id)
+        provider_path_error = _validate_transform_provider_config_path(
+            review_options,
+            context.data_dir,
+            session_id=context.session_id,
+            require_data_dir=context.require_data_dir_for_paths,
+            mcp_root_authority=context.mcp_root_authority,
+        )
         if provider_path_error is not None:
             return _saved_graph_rejection_result(
                 state,
-                "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
+                _path_policy_refusal_message(
+                    context,
+                    "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
+                ),
                 error_code="provider_config_path_policy_invalid",
                 rejected_component=node_ref,
             )
@@ -1146,17 +1171,18 @@ def _splice_topology_error(
             return "Splice predecessor has no direct on_success connection."
         if predecessor_output != successor.input:
             return "Splice predecessor and successor do not share one direct on_success connection."
-        matching = [
-            edge
-            for edge in state.edges
-            if edge.from_node == predecessor_id and edge.to_node == successor.id and edge.edge_type == "on_success"
-        ]
-        if len(matching) != 1:
-            return "Splice path must have exactly one direct visual on_success edge."
-        if any(edge.from_node == predecessor_id and edge is not matching[0] for edge in state.edges):
-            return "Splice predecessor has an ambiguous or branched visual path."
-        if any(edge.to_node == successor.id and edge is not matching[0] for edge in state.edges):
-            return "Splice successor has an ambiguous or branched visual path."
+        if state.edges:
+            matching = [
+                edge
+                for edge in state.edges
+                if edge.from_node == predecessor_id and edge.to_node == successor.id and edge.edge_type == "on_success"
+            ]
+            if len(matching) != 1:
+                return "Splice path must have exactly one direct visual on_success edge."
+            if any(edge.from_node == predecessor_id and edge is not matching[0] for edge in state.edges):
+                return "Splice predecessor has an ambiguous or branched visual path."
+            if any(edge.to_node == successor.id and edge is not matching[0] for edge in state.edges):
+                return "Splice successor has an ambiguous or branched visual path."
         other_consumers = [node.id for node in state.nodes if node.id != successor.id and node.input == predecessor_output]
         if other_consumers or predecessor_output in {output.name for output in state.outputs}:
             return "Splice connection has multiple consumers or terminates at a sink."
@@ -1189,6 +1215,8 @@ def _splice_topology_error(
         return "Existing splice topology is incomplete."
     if inserted_index + 1 != successor_index:
         return "Existing splice node is not immediately before its successor."
+    if not state.edges:
+        return None
     predecessor_edges = [
         (index, edge)
         for index, edge in enumerate(state.edges)
@@ -1331,11 +1359,6 @@ def _execute_splice_transform(
     assert predecessor is not None
     predecessor_output = predecessor.on_success
     assert type(predecessor_output) is str
-    direct_edge_index, direct_edge = next(
-        (index, edge)
-        for index, edge in enumerate(state.edges)
-        if edge.from_node == predecessor_id and edge.to_node == successor_id and edge.edge_type == "on_success"
-    )
     connection_name = _splice_connection_name(node_args.id, state)
     if connection_name is None:
         return _saved_graph_rejection_result(
@@ -1344,14 +1367,32 @@ def _execute_splice_transform(
             error_code="splice_derivation_conflict",
             rejected_component=node_ref,
         )
-    new_edge_id = _splice_edge_id(direct_edge.id, node_args.id)
-    if new_edge_id in {edge.id for edge in state.edges}:
-        return _saved_graph_rejection_result(
-            state,
-            f"Derived splice edge ID '{new_edge_id}' collides with an existing edge.",
-            error_code="splice_derivation_conflict",
-            rejected_component=node_ref,
+    edges = state.edges
+    edge_data: dict[str, str] = {}
+    if state.edges:
+        direct_edge_index, direct_edge = next(
+            (index, edge)
+            for index, edge in enumerate(state.edges)
+            if edge.from_node == predecessor_id and edge.to_node == successor_id and edge.edge_type == "on_success"
         )
+        new_edge_id = _splice_edge_id(direct_edge.id, node_args.id)
+        if new_edge_id in {edge.id for edge in state.edges}:
+            return _saved_graph_rejection_result(
+                state,
+                f"Derived splice edge ID '{new_edge_id}' collides with an existing edge.",
+                error_code="splice_derivation_conflict",
+                rejected_component=node_ref,
+            )
+        predecessor_edge = replace(direct_edge, to_node=node_args.id)
+        successor_edge = EdgeSpec(
+            id=new_edge_id,
+            from_node=node_args.id,
+            to_node=successor.id,
+            edge_type="on_success",
+            label=None,
+        )
+        edges = (*state.edges[:direct_edge_index], predecessor_edge, successor_edge, *state.edges[direct_edge_index + 1 :])
+        edge_data = {"replaced_edge_id": direct_edge.id, "new_edge_id": new_edge_id}
     prepared = _prepare_transform_candidate(
         state=state,
         context=context,
@@ -1372,15 +1413,6 @@ def _execute_splice_transform(
     successor_rewired = replace(successor, input=connection_name)
     successor_index = next(index for index, node in enumerate(state.nodes) if node is successor)
     nodes = (*state.nodes[:successor_index], prepared_node, successor_rewired, *state.nodes[successor_index + 1 :])
-    predecessor_edge = replace(direct_edge, to_node=prepared_node.id)
-    successor_edge = EdgeSpec(
-        id=new_edge_id,
-        from_node=prepared_node.id,
-        to_node=successor.id,
-        edge_type="on_success",
-        label=None,
-    )
-    edges = (*state.edges[:direct_edge_index], predecessor_edge, successor_edge, *state.edges[direct_edge_index + 1 :])
     proposed = CompositionState(
         sources=state.sources,
         nodes=nodes,
@@ -1442,8 +1474,7 @@ def _execute_splice_transform(
             "successor_id": successor.id,
             "inserted_node_id": prepared_node.id,
             "derived_connection": connection_name,
-            "replaced_edge_id": direct_edge.id,
-            "new_edge_id": new_edge_id,
+            **edge_data,
         },
     )
 
@@ -1870,6 +1901,18 @@ def _execute_patch_node_options(
             return _saved_graph_rejection_result(
                 state, prompt_surface_error, error_code="llm_authored_inline_blob_content", rejected_component=node_ref
             )
+        # file_inject content is a user-uploaded file on every authoring path.
+        file_inject_error = _file_inject_node_option_error(
+            context,
+            tool_name="patch_node_options",
+            node_id=node_id,
+            plugin=current.plugin,
+            options=new_options,
+        )
+        if file_inject_error is not None:
+            return _saved_graph_rejection_result(
+                state, file_inject_error, error_code="file_inject_content_not_uploaded", rejected_component=node_ref
+            )
 
     new_node = replace(current, options=new_options)
     # Third canonical mutation boundary: a patch that would break a queue's
@@ -1927,11 +1970,20 @@ def _execute_patch_node_options(
 
         # S2: confine nested provider_config persist_directory (RAG retrieval).
         # A merge-patch can introduce an escaping path just as upsert_node can.
-        provider_path_error = _validate_transform_provider_config_path(reconciled_options, context.data_dir, session_id=context.session_id)
+        provider_path_error = _validate_transform_provider_config_path(
+            reconciled_options,
+            context.data_dir,
+            session_id=context.session_id,
+            require_data_dir=context.require_data_dir_for_paths,
+            mcp_root_authority=context.mcp_root_authority,
+        )
         if provider_path_error is not None:
             return _saved_graph_rejection_result(
                 state,
-                "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
+                _path_policy_refusal_message(
+                    context,
+                    "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
+                ),
                 error_code="provider_config_path_policy_invalid",
                 rejected_component=node_ref,
             )
@@ -2124,6 +2176,18 @@ def _prepare_transform_candidate(
         return _saved_graph_rejection_result(
             state, prompt_surface_error, error_code="llm_authored_inline_blob_content", rejected_component=node_ref
         )
+    # file_inject content is a user-uploaded file on every authoring path.
+    file_inject_error = _file_inject_node_option_error(
+        context,
+        tool_name=tool_name,
+        node_id=node_id,
+        plugin=plugin,
+        options=review_options,
+    )
+    if file_inject_error is not None:
+        return _saved_graph_rejection_result(
+            state, file_inject_error, error_code="file_inject_content_not_uploaded", rejected_component=node_ref
+        )
 
     prevalidation_error = _prevalidate_transform_for_context(context, plugin, review_options)
     if prevalidation_error is not None:
@@ -2145,11 +2209,20 @@ def _prepare_transform_candidate(
             return _saved_graph_rejection_result(
                 state, f"Node '{node_id}': {provider_policy_error}", error_code="llm_retry_budget_policy", rejected_component=node_ref
             )
-    provider_path_error = _validate_transform_provider_config_path(review_options, context.data_dir, session_id=context.session_id)
+    provider_path_error = _validate_transform_provider_config_path(
+        review_options,
+        context.data_dir,
+        session_id=context.session_id,
+        require_data_dir=context.require_data_dir_for_paths,
+        mcp_root_authority=context.mcp_root_authority,
+    )
     if provider_path_error is not None:
         return _saved_graph_rejection_result(
             state,
-            "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
+            _path_policy_refusal_message(
+                context,
+                "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
+            ),
             error_code="provider_config_path_policy_invalid",
             rejected_component=node_ref,
         )
@@ -2217,12 +2290,13 @@ _SPLICE_TRANSFORM_DECLARATION = ToolDeclaration(
     kind=ToolKind.MUTATION,
     description=(
         "Insert one transform between a predecessor and successor on an existing direct linear on_success path. "
-        "Requires exactly one direct visual on_success edge between the endpoints, no routed error branches on either "
-        "endpoint, and no other consumers or visual branches on that path. "
+        "Requires one direct logical on_success connection, no routed error branches on either endpoint, "
+        "and no other consumers or visual branches on that path. When visual edges exist, exactly one must "
+        "directly connect the endpoints; an entirely edge-free graph stays edge-free. "
         "Use this for insert/between/before/after edits; the server derives input, on_success, connection, and edge IDs. "
         "Returns `inserted_node_id`, `predecessor_id`, `successor_id`, `derived_connection` (the on_success carried "
-        "over), `replaced_edge_id`, and `new_edge_id`; repeating an identical splice returns `already_applied`: true "
-        "with the node ids but no edge ids, instead of failing."
+        "over), plus `replaced_edge_id` and `new_edge_id` only when visual edges were split; "
+        "repeating an identical splice returns `already_applied`: true with the node ids but no edge ids, instead of failing."
     ),
     json_schema={
         "type": "object",

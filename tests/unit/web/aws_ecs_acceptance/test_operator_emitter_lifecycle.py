@@ -21,6 +21,7 @@ def settings() -> WebSettings:
     return WebSettings(
         composer_timeout_seconds=85,
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_rate_limit_per_minute=10,
         shareable_link_signing_key=b"\x00" * 32,

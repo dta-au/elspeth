@@ -91,6 +91,7 @@ def _durable_provider_rows(service, session_id):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("quota_enabled", [False, True], ids=["no-token-cap", "configured-token-cap"])
+@pytest.mark.timing_sensitive
 async def test_slow_title_sdk_times_out_before_original_operation_deadline(tmp_path, monkeypatch, quota_enabled):
     # Leave real guard, SQL and END review headroom after the five-second SDK
     # timeout. The unbounded twenty-second title still cannot fit this deadline.

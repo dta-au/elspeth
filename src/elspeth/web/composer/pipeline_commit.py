@@ -44,6 +44,7 @@ from elspeth.web.composer.pipeline_proposal import (
     owned_composition_state_execution_arguments_from_restored,
     restore_owned_composition_state_authority,
 )
+from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import normalize_set_pipeline_redacted_arguments, semantic_redacted_pipeline_arguments_hash
 from elspeth.web.composer.reviewed_source_authority import (
     resolve_owned_composition_source_authority,
@@ -528,12 +529,15 @@ async def prepare_pipeline_proposal_commit(
         _interpretation_requirements_are_internal=True,
     )
 
-    candidate = await bounded(
-        build_set_pipeline_candidate,
-        execution_arguments,
-        current_state,
-        context,
-    )
+    try:
+        candidate = await bounded(
+            build_set_pipeline_candidate,
+            execution_arguments,
+            current_state,
+            context,
+        )
+    except ToolArgumentError as exc:
+        raise PipelineCommitError(exc.safe_message, code="ARGUMENT_ERROR", dispatch=recovery_dispatch) from exc
     if not candidate.acceptable or candidate.prepared_inline_blob is not None:
         raise PipelineCommitError("pipeline proposal failed current candidate validation", code="VALIDATION_FAILED")
     candidate_hash = composition_content_hash(candidate.result.updated_state)
@@ -546,6 +550,12 @@ async def prepare_pipeline_proposal_commit(
         assert recovery_executor_content_hash is not None
         if candidate_hash != recovery_executor_content_hash:
             raise PipelineCommitMismatchError(None, recovery_dispatch)
+
+    if candidate_hash == composition_content_hash(current_state):
+        raise PipelineCommitError("pipeline proposal does not change the current composition", code="NO_CHANGE", dispatch=recovery_dispatch)
+
+    if recovery_dispatch is not None:
+        assert recovery_executor_content_hash is not None
         return RecoveredPipelineCommit(
             result=candidate.result,
             candidate_content_hash=candidate_hash,
@@ -597,16 +607,20 @@ async def prepare_pipeline_proposal_commit(
             ),
         )
 
-    outcome = await dispatch_with_audit(
-        recorder=recorder,
-        audit=audit,
-        do_dispatch=execute_exact,
-        version_after_provider=lambda result: result.updated_state.version,
-        arg_error_payload_factory=lambda exc: {
-            "error_class": type(exc).__name__,
-            "error_code": exc.category.value,
-        },
-    )
+    try:
+        outcome = await dispatch_with_audit(
+            recorder=recorder,
+            audit=audit,
+            do_dispatch=execute_exact,
+            version_after_provider=lambda result: result.updated_state.version,
+            arg_error_payload_factory=lambda exc: {
+                "error_class": type(exc).__name__,
+                "error_code": exc.category.value,
+            },
+        )
+    except ToolArgumentError as exc:
+        # ARG_ERROR remains buffered evidence, never a SUCCESS-only binding.
+        raise PipelineCommitError(exc.safe_message, code="ARGUMENT_ERROR") from exc
     result = outcome.result
     if type(result) is not ToolResult:
         raise AuditIntegrityError("pipeline executor returned a non-ToolResult")

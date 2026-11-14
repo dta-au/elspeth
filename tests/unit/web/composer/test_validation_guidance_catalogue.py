@@ -21,6 +21,68 @@ def test_runtime_union_collision_reason_has_guidance_without_build_code() -> Non
     result = execute_tool("explain_validation_error", {"error_text": "union_field_collision"}, _empty_state(), _mock_catalog())
     assert result.success
     assert "Composer cannot author" in result.data["suggested_fix"]
+    assert "error_code" not in result.data
+
+
+@pytest.mark.parametrize("code", generation._CLOSED_VALIDATION_ERROR_CODES)
+@pytest.mark.parametrize("form", ["exact", "lowercase_noise", "uppercase_noise"])
+def test_closed_code_is_canonical_on_every_match_branch(code: str, form: str) -> None:
+    text = code if form == "exact" else f"LOG {code.lower() if form == 'lowercase_noise' else code.upper()} END"
+    result = execute_tool("explain_validation_error", {"error_text": text}, _empty_state(), _mock_catalog())
+    assert result.success
+    assert result.data["error_code"] == code
+    assert (result.data["explanation"], result.data["suggested_fix"]) == generation.explain_validation_code(code)
+
+
+def test_identifiable_legacy_prose_returns_its_indexed_code() -> None:
+    result = execute_tool("explain_validation_error", {"error_text": "Invalid unknown node_type."}, _empty_state(), _mock_catalog())
+    assert result.data["error_code"] == "unknown_node_type"
+
+
+@pytest.mark.parametrize("text", ["ZZZ_UNRECOGNIZED_QQQ", "No source configured. LOG UNKNOWN_NODE_TYPE END"])
+def test_unowned_match_does_not_borrow_a_code_from_elsewhere(text: str) -> None:
+    result = execute_tool("explain_validation_error", {"error_text": text}, _empty_state(), _mock_catalog())
+    assert "error_code" not in result.data
+
+
+def test_matching_prose_text_is_not_record_ownership(monkeypatch: pytest.MonkeyPatch) -> None:
+    owned = generation._VALIDATION_GUIDANCE_BY_CODE["unknown_node_type"]
+    assert isinstance(owned, tuple)
+    unowned = ("unowned diagnostic", owned[1], owned[2])
+    monkeypatch.setattr(generation, "_VALIDATION_ERROR_PATTERNS", (unowned, *generation._VALIDATION_ERROR_PATTERNS))
+    result = execute_tool(
+        "explain_validation_error", {"error_text": "unowned diagnostic UNKNOWN_NODE_TYPE"}, _empty_state(), _mock_catalog()
+    )
+    assert result.data["explanation"] == owned[1]
+    assert "error_code" not in result.data
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Coalesce on_success must point to a sink", "Destination is neither a sink nor a known connection"],
+)
+def test_ambiguous_legacy_prose_does_not_invent_one_of_its_codes(text: str) -> None:
+    matching = next(row for row in generation._VALIDATION_ERROR_PATTERNS if re.search(row[0], text))
+    owners = [code for code, record in generation._VALIDATION_GUIDANCE_BY_CODE.items() if record is matching]
+    assert len(owners) > 1
+    result = execute_tool("explain_validation_error", {"error_text": text}, _empty_state(), _mock_catalog())
+    assert result.data["explanation"] == matching[1]
+    assert result.data["suggested_fix"] == matching[2]
+    assert "error_code" not in result.data
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("coalesce_on_success_must_be_sink", "coalesce_on_success_unknown_sink"),
+        ("coalesce_policy_invalid", "coalesce_merge_invalid"),
+        ("transform_on_success_dangling", "aggregation_on_success_dangling"),
+    ],
+)
+def test_multiple_explicit_codes_for_one_record_keep_index_precedence(first: str, second: str) -> None:
+    assert generation._VALIDATION_GUIDANCE_BY_CODE[first] is generation._VALIDATION_GUIDANCE_BY_CODE[second]
+    result = execute_tool("explain_validation_error", {"error_text": f"LOG {second} {first} END"}, _empty_state(), _mock_catalog())
+    assert result.data["error_code"] == first
 
 
 def _historical_fixture():
@@ -252,7 +314,8 @@ def test_new_policy_guidance_does_not_extend_legacy_patterns(monkeypatch: pytest
 def test_direct_exact_and_noisy_lookup_and_help_derive_from_records() -> None:
     for record in generation._DIRECT_VALIDATION_GUIDANCE:
         exact = execute_tool("explain_validation_error", {"error_text": record.code}, _empty_state(), _mock_catalog())
-        assert list(exact.data) == ["error_text", "explanation", "suggested_fix"]
+        assert list(exact.data) == ["error_text", "error_code", "explanation", "suggested_fix"]
+        assert exact.data["error_code"] == record.code
         assert exact.data["explanation"] == record.explanation
         assert exact.data["suggested_fix"] == record.suggested_fix
         noisy = execute_tool("explain_validation_error", {"error_text": f"LOG {record.code.upper()} END"}, _empty_state(), _mock_catalog())
@@ -284,6 +347,30 @@ def test_public_prose_retains_first_match_and_expected_hint() -> None:
     result = execute_tool("explain_validation_error", {"error_text": text}, _empty_state(), _mock_catalog())
     assert result.data["explanation"] == matching[0][1]
     assert result.data["suggested_fix"] == matching[0][2] + " Expected a declared node kind."
+    assert result.data["error_code"] == "unknown_node_type"
+
+
+def test_first_regex_owns_code_even_when_later_code_occurs_first_in_text() -> None:
+    text = "coalesce_policy_invalid; unknown node_type. Expected a declared node kind."
+    result = execute_tool("explain_validation_error", {"error_text": text}, _empty_state(), _mock_catalog())
+    assert result.data["error_code"] == "unknown_node_type"
+    guidance = generation.explain_validation_code("unknown_node_type")
+    assert guidance is not None
+    assert result.data["explanation"] == guidance[0]
+    assert result.data["suggested_fix"] == guidance[1] + " Expected a declared node kind."
+
+
+def test_fuzzy_match_retains_expected_hint() -> None:
+    result = execute_tool(
+        "explain_validation_error",
+        {"error_text": "LOG UNKNOWN_NODE_TYPE END. Expected a declared node kind."},
+        _empty_state(),
+        _mock_catalog(),
+    )
+    guidance = generation.explain_validation_code("unknown_node_type")
+    assert guidance is not None
+    assert result.data["error_code"] == "unknown_node_type"
+    assert result.data["suggested_fix"] == guidance[1] + " Expected a declared node kind."
 
 
 def test_public_noisy_code_preserves_legacy_seed_precedence() -> None:

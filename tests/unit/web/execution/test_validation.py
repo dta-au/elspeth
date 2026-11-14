@@ -207,6 +207,7 @@ def _make_settings(data_dir: str = "/tmp/test_data") -> WebSettings:
     return WebSettings(
         data_dir=Path(data_dir),
         composer_max_composition_turns=10,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=5,
         composer_timeout_seconds=30.0,
         composer_rate_limit_per_minute=60,
@@ -1089,7 +1090,8 @@ def test_validate_pipeline_public_signature_is_stable_through_boundary_decorator
         "secret_wiring_policy: 'SecretWiringPolicy | None' = None, user_id: 'str | None' = None, "
         "blob_get_metadata: 'Callable[[UUID], BlobRecord | None] | None' = None, "
         "blob_get_content: 'Callable[[UUID], tuple[BlobRecord, bytes]] | None' = None, "
-        "allow_pending_interpretation_placeholders: 'bool' = False, session_id: 'str | None' = None) -> 'ValidationResult'"
+        "allow_pending_interpretation_placeholders: 'bool' = False, session_id: 'str | None' = None, "
+        "mcp_root_authority: 'McpConfiguredRootAuthority | None' = None) -> 'ValidationResult'"
     )
 
     # The single literal comparison IS the whole guarantee: inspect.signature

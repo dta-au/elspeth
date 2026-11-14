@@ -77,6 +77,26 @@ WRITE_INTENT_OPTION = "elspeth_write_intent"
 # that text reaches exception chains, logs and any wrap that interpolates it.
 LANDSCAPE_HIDE_BOUND_PARAMETERS = True
 
+_LANDSCAPE_METADATA_CREATE_LOCK = threading.Lock()
+
+
+def _create_landscape_tables(bind: Engine | Connection, *, checkfirst: bool = True) -> None:
+    """Create tables without leaking SQLAlchemy's transient constraint rules.
+
+    PostgreSQL defers cyclic foreign keys to ALTER statements, which leave
+    ``_create_rule`` annotations on the shared metadata. Those annotations
+    suppress inline foreign keys in a later SQLite initialization. Serialize
+    creation and restore the exact original rules, including on DDL failure.
+    """
+    with _LANDSCAPE_METADATA_CREATE_LOCK:
+        original_rules = [(constraint, constraint._create_rule) for table in metadata.tables.values() for constraint in table.constraints]
+        try:
+            metadata.create_all(bind=bind, checkfirst=checkfirst)
+        finally:
+            for constraint, rule in original_rules:
+                constraint._create_rule = rule
+
+
 _JOURNAL_WORKER_SUFFIX_RE = re.compile(r"[0-9a-f]+")
 
 # Canonical SQLite PRAGMA invariants for the Landscape audit DB.
@@ -1385,7 +1405,7 @@ class LandscapeDB:
 
     def _create_tables(self) -> None:
         """Create all tables if they don't exist."""
-        metadata.create_all(self.engine)
+        _create_landscape_tables(self.engine)
 
     def _create_additive_indexes(self) -> None:
         """Create non-gating performance indexes for existing schemas."""
@@ -1890,7 +1910,7 @@ class LandscapeDB:
         cls._verify_sqlite_pragmas(engine, "sqlite:///:memory:")
         instance = cls._from_parts("sqlite:///:memory:", engine)
         instance._sync_sqlite_schema_epoch()
-        metadata.create_all(engine)
+        _create_landscape_tables(engine)
         instance._sync_schema_identity()
         instance._sync_sqlite_schema_epoch()
         return instance
@@ -2085,7 +2105,7 @@ class LandscapeDB:
 
             if create_tables:
                 instance._sync_sqlite_schema_epoch()
-                metadata.create_all(engine)
+                _create_landscape_tables(engine)
                 instance._create_additive_indexes()
                 instance._sync_schema_identity()
                 instance._sync_sqlite_schema_epoch()

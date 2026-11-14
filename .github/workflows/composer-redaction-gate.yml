@@ -24,8 +24,15 @@ on:
     branches: [main, master, "RC*", "release/**"]
     types: [opened, reopened, synchronize, edited, labeled, unlabeled]
 
+# A newer event on the same pull request replaces the run for the older one,
+# so superseded runs do not hold a shared self-hosted runner.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   redaction-gate:
+    timeout-minutes: 10
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     env:

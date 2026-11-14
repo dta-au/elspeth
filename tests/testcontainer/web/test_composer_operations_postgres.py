@@ -188,6 +188,12 @@ from tests.unit.web.sessions.test_atomic_pipeline_review_evidence import (
 from tests.unit.web.sessions.test_atomic_pipeline_review_evidence import (
     test_terminal_failure_required_coordinator_observes_each_actual_attempt as test_terminal_failure_required_coordinator_observes_each_actual_attempt,
 )
+from tests.unit.web.sessions.test_composer_recovery_security import (
+    test_completed_restore_refusal_preserves_head_and_pending_proposal as test_completed_restore_refusal_preserves_head_and_pending_proposal,
+)
+from tests.unit.web.sessions.test_composer_recovery_security import (
+    test_restore_other_session_park_matches_unknown_refusal_and_preserves_head as test_restore_other_session_park_matches_unknown_refusal_and_preserves_head,
+)
 
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository

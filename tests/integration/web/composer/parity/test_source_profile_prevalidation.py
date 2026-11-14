@@ -55,6 +55,7 @@ def profiled_source_harness(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Profil
     settings = WebSettings.model_validate(
         {
             "composer_max_composition_turns": 4,
+            "composer_context_max_prompt_tokens": 200_000,
             "composer_max_discovery_turns": 4,
             "composer_timeout_seconds": 60,
             "composer_rate_limit_per_minute": 20,

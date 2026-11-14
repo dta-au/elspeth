@@ -136,6 +136,7 @@ type ComposerOperationPublicFailureType = Literal[
     "stale_compose_state",
     "fingerprint_key_missing",
     "secret_decryption_failed",
+    "context_budget_exceeded",
 ]
 COMPOSER_OPERATION_PUBLIC_FAILURE_TYPES: Final[frozenset[str]] = frozenset(
     (
@@ -149,8 +150,15 @@ COMPOSER_OPERATION_PUBLIC_FAILURE_TYPES: Final[frozenset[str]] = frozenset(
         "stale_compose_state",
         "fingerprint_key_missing",
         "secret_decryption_failed",
+        "context_budget_exceeded",
     )
 )
+# The closed failure code of a request the context budget refused, carried in
+# the HTTP error body of both refusal sources (the compose loop and the
+# planner). The operation's own ``failure_code`` stays ``http_error``; the
+# sealed error's public category is this code, so retained history can name
+# the refusal without exposing the private body.
+CONTEXT_BUDGET_FAILURE_CODE: Final = "context_budget_exceeded"
 
 
 class ComposerOperationFailureOutcome(BaseModel):

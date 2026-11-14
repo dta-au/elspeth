@@ -220,6 +220,7 @@ def _hung_worker(started: threading.Event, release: threading.Event, started_cou
     return "released"
 
 
+@pytest.mark.timing_sensitive
 def test_admission_is_bounded_while_timed_out_workers_continue() -> None:
     """Timed-out callers must not free admission; a saturated pool rejects fast.
 

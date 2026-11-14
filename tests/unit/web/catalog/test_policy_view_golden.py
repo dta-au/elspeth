@@ -17,6 +17,7 @@ _SOURCE_GOLDEN = Path("tests/golden/web/catalog/policy_view/source__llm.json")
 def test_profiled_llm_policy_schema_matches_golden() -> None:
     settings = WebSettings(
         composer_max_composition_turns=4,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=4,
         composer_timeout_seconds=60,
         composer_rate_limit_per_minute=20,
@@ -54,6 +55,7 @@ def test_profiled_llm_policy_schema_matches_golden() -> None:
 def _bedrock_public_schema(plugin_name: str, alias: str) -> dict[str, object]:
     settings = WebSettings(
         composer_max_composition_turns=4,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=4,
         composer_timeout_seconds=60,
         composer_rate_limit_per_minute=20,

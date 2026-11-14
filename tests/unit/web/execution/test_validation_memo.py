@@ -161,6 +161,7 @@ def _service(tmp_path: Path, custody: ExecutionTestCustody) -> ExecutionServiceI
             settings=WebSettings(
                 data_dir=tmp_path,
                 composer_max_composition_turns=10,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=5,
                 composer_timeout_seconds=30.0,
                 composer_rate_limit_per_minute=60,

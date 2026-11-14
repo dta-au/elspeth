@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import re
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal, cast
 
 from elspeth.core.config import load_bounded_pipeline_yaml
@@ -12,6 +14,7 @@ from elspeth.core.secrets import (
     collect_credential_field_violations,
     collect_disallowed_secret_ref_markers,
 )
+from elspeth.core.template_materialization import FILE_BACKED_TEMPLATE_OPTION_REGISTRY, TemplateOptionMaterializer
 from elspeth.plugins.infrastructure.base import BaseSink, BaseSource, BaseTransform
 from elspeth.plugins.infrastructure.manager import PluginManager
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
@@ -151,6 +154,34 @@ def _expected_section(reference: BuiltinReference) -> str:
     return "transform"
 
 
+def materialize_example_file_options(plugin_name: str, options: Mapping[str, Any], base_dir: Path) -> dict[str, Any]:
+    """Expand an example's nested file-backed options the way the settings loader does.
+
+    An ``example_use`` that binds files (``files.<name>.content_file``) names
+    files that exist only beside a real settings file. Each named file is
+    written under ``base_dir`` as plain text, then the options go through the
+    real ``TemplateOptionMaterializer``. Options that name no file come back
+    equal to what went in.
+    """
+    for rule in FILE_BACKED_TEMPLATE_OPTION_REGISTRY:
+        if rule.nested_in is None or rule.nested_in[0] != plugin_name:
+            continue
+        container = options.get(rule.nested_in[1])
+        if not isinstance(container, Mapping):
+            continue
+        for entry in container.values():
+            if isinstance(entry, Mapping) and rule.file_key in entry:
+                bound_file = base_dir / entry[rule.file_key]
+                bound_file.parent.mkdir(parents=True, exist_ok=True)
+                bound_file.write_text("Example file content.\n", encoding="utf-8")
+    loaded = TemplateOptionMaterializer(base_dir / "settings.yaml").materialize_config(
+        {"transforms": [{"name": "example", "plugin": plugin_name, "options": dict(options)}]}
+    )
+    materialized = loaded["transforms"][0]["options"]
+    assert isinstance(materialized, dict)
+    return materialized
+
+
 def parse_and_validate_example(reference: BuiltinReference) -> None:
     """Parse and config-validate one bounded catalogue component fragment."""
     plugin_cls = reference.plugin_cls
@@ -207,6 +238,8 @@ def parse_and_validate_example(reference: BuiltinReference) -> None:
 
     resolved = _replace_secret_refs_for_validation(options)
     assert isinstance(resolved, dict)
+    with tempfile.TemporaryDirectory() as settings_dir:
+        resolved = materialize_example_file_options(plugin_cls.name, resolved, Path(settings_dir))
     config_model = plugin_cls.get_config_model(resolved)
     if config_model is None:
         assert not resolved, f"{plugin_cls.name}.example_use supplies options but has no config model"

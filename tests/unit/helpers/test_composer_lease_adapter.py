@@ -63,7 +63,9 @@ async def test_adapter_forwards_exact_remaining_budget_and_owned_provider_pair(t
         recovery_context=None,
         retained_operation_context: RetainedOperationContext | None = None,
         advisor_history: AdvisorTranscriptHistory | None = None,
+        context_budget_history: object | None = None,
     ):
+        assert context_budget_history is None
         calls.append(
             (self, message, messages, state, session_operation_context, budget_seconds, required_work, provider_owner, advisor_history)
         )
@@ -148,7 +150,9 @@ async def test_adapter_legacy_call_preserves_budget_and_closes_actual_owned_leas
         recovery_context=None,
         retained_operation_context: RetainedOperationContext | None = None,
         advisor_history: AdvisorTranscriptHistory | None = None,
+        context_budget_history: object | None = None,
     ):
+        assert context_budget_history is None
         contexts.append(session_operation_context)
         budgets.append(budget_seconds)
         assert type(required_work) is RequiredWorkBinding
@@ -217,9 +221,11 @@ async def test_adapter_preserves_original_body_and_close_outcomes(tmp_path, monk
         recovery_context=None,
         retained_operation_context=None,
         advisor_history: AdvisorTranscriptHistory | None = None,
+        context_budget_history: object | None = None,
     ):
         assert type(required_work) is RequiredWorkBinding
         assert advisor_history is None
+        assert context_budget_history is None
         assert type(provider_owner) is ProviderInvocationOwner
         assert provider_owner.required_work is required_work
         assert provider_owner.service is self._sessions_service

@@ -205,3 +205,81 @@ async def test_repeated_caller_cancel_joins_actual_watchdog_ack(fail):
             await join
         assert watchdog.signals == [signal.SIGTERM]
     assert recovery._escalation_task.done()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, "ack", "monitor"])
+async def test_recovery_uses_semantic_owner_operations(failure):
+    """Recovery must work with an owner that has no Unix signal authority."""
+
+    class SemanticOwner(OwnedTestProcessWatchdog):
+        def __init__(self, draining):
+            super().__init__(draining)
+            self.operations = []
+
+        async def begin_recovery(self, reason):
+            if failure == "ack":
+                raise original
+            result = await super().begin_recovery(reason)
+            self.operations.append("ack")
+            return result
+
+        def request_graceful_termination(self):
+            self.operations.append("graceful")
+
+        def force_termination(self):
+            self.operations.append("force")
+
+        def request_signal(self, sig):
+            raise AssertionError("portable recovery attempted Unix signal dispatch")
+
+    original = ProcessWatchdogFailure("semantic owner failed")
+    draining = threading.Event()
+    owner = SemanticOwner(draining)
+    recovery = ProcessRecovery(watchdog=owner, instance_draining=draining)
+    if failure == "monitor":
+        recovery.start_monitor()
+        owner.fail(original)
+        with pytest.raises(ProcessWatchdogFailure) as caught:
+            await recovery.join_monitor_after_completion()
+        assert caught.value is original
+        assert owner.operations == ["force"]
+    else:
+        recovery.request_shutdown()
+        recovery.request_shutdown()
+        if failure == "ack":
+            with pytest.raises(ProcessWatchdogFailure) as caught:
+                await recovery.join_escalation()
+            assert caught.value is original
+            assert owner.operations == ["force"]
+        else:
+            await recovery.join_escalation()
+            assert owner.operations == ["ack", "graceful"]
+    assert draining.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("monitor", [False, True])
+async def test_failed_force_preserves_original_supervision_failure(monitor):
+    original = ProcessWatchdogFailure("supervision failed")
+    termination = OSError("force termination failed")
+
+    class FailedOwner(OwnedTestProcessWatchdog):
+        async def begin_recovery(self, reason):
+            raise original
+
+        def force_termination(self):
+            raise termination
+
+    draining = threading.Event()
+    owner = FailedOwner(draining)
+    recovery = ProcessRecovery(watchdog=owner, instance_draining=draining)
+    with pytest.raises(BaseExceptionGroup) as caught:
+        if monitor:
+            recovery.start_monitor()
+            owner.fail(original)
+            await recovery.join_monitor_after_completion()
+        else:
+            recovery.request_shutdown()
+            await recovery.join_escalation()
+    assert caught.value.exceptions == (original, termination)

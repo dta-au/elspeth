@@ -1697,6 +1697,27 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
     ),
     # ------ tests/unit/web/sessions/* — targeted chat transcript fixtures ------
     ReviewedWriter(
+        path="tests/unit/web/blobs/test_mutation_admission.py",
+        enclosing_symbol="admission_message",
+        table="chat_messages",
+        operation="sqlalchemy_table_insert",
+        purpose="Blob admission fixture: seeds the actual user-message anchor for verbatim replacement provenance, without invoking the destructive handler.",
+    ),
+    ReviewedWriter(
+        path="tests/testcontainer/web/test_blob_mutation_admission_postgres.py",
+        enclosing_symbol="_setup",
+        table="chat_messages",
+        operation="sqlalchemy_table_insert",
+        purpose="PostgreSQL blob admission fixture: seeds replacement provenance under the real independently fenced repository before exercising contention.",
+    ),
+    ReviewedWriter(
+        path="tests/testcontainer/web/test_blob_mutation_admission_postgres.py",
+        enclosing_symbol="test_postgres_admission_waiting_on_container_sees_committed_output_reservation",
+        table="composition_states",
+        operation="sqlalchemy_table_insert",
+        purpose="PostgreSQL admission contention fixture: seeds another identity's parent state for a completed run whose real output reservation must be included in container quota admission.",
+    ),
+    ReviewedWriter(
         path="tests/unit/web/sessions/test_blob_inline_resolutions_schema.py",
         enclosing_symbol="_seed_run_and_blob",
         table="composition_states",
@@ -2540,19 +2561,6 @@ _TEST_FIXTURE_REVIEWED_WRITERS: tuple[ReviewedWriter, ...] = (
             "written via `from sqlalchemy import insert as _insert` (line 7054). "
             "Invisible to this gate until the callable was resolved from imports "
             "rather than matched by spelling — the one live writer that widening surfaced."
-        ),
-    ),
-    ReviewedWriter(
-        path="tests/integration/web/test_shareable_reviews_routes.py",
-        enclosing_symbol="test_preview_reports_llm_authored_file_as_not_importable",
-        table="chat_messages",
-        operation="sqlalchemy_table_insert",
-        purpose=(
-            "shareable-files preview fixture: seeds the one originating user message that the "
-            "blob provenance FK (fk_blobs_created_from_message_session) requires before the "
-            "uploaded blob row can be re-marked llm_generated, so the route's refusal of an "
-            "assistant-written file is exercised against a real row; no production sequence "
-            "allocation is under test"
         ),
     ),
 )

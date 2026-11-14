@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
-from elspeth.contracts.composer_llm_audit import ToolContractDialect
+from elspeth.contracts.composer_llm_audit import ComposerContextBudgetRecord, ToolContractDialect
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.web.composer._compose_loop_carriers import (
     _CallModelOutcome,
@@ -19,9 +19,10 @@ from elspeth.web.composer._compose_loop_carriers import (
     _ToolOutcome,
     _ToolOutcomeResponse,
 )
+from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion, _MalformedLLMResponseError, composer_loop_tool_definitions
-from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.service import ComposerServiceImpl, _ContextBudgetFrame
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._common import ToolResult
 from tests.unit.web.composer._helpers import (
@@ -32,6 +33,22 @@ from tests.unit.web.composer._helpers import (
     _mock_catalog,
     _stub_advisor_end_gate_clean,  # noqa: F401  (autouse end-gate CLEAN stub)
 )
+
+
+def _turn_messages(service: ComposerServiceImpl, state: CompositionState, message: str) -> tuple[list[dict[str, Any]], _ContextBudgetFrame]:
+    """The compose loop's opening request for ``message`` and its context-budget frame."""
+    plugin_snapshot, policy_catalog = service._policy_context.build(None)
+    llm_messages = service._build_messages([], state, message, plugin_snapshot=plugin_snapshot, policy_catalog=policy_catalog)
+    frame = service._context_budget_frame(
+        chat_history=[],
+        llm_messages=llm_messages,
+        state=state,
+        session_id=None,
+        plugin_snapshot=plugin_snapshot,
+        policy_catalog=policy_catalog,
+        history=ContextBudgetHistory.empty(),
+    )
+    return llm_messages, frame
 
 
 class _UnstableProviderMessage:
@@ -204,6 +221,7 @@ async def test_model_turn_admits_one_snapshot_and_discards_raw_provider_objects(
     later_choice = SimpleNamespace(message=message, finish_reason="drifted")
     provider_response = _UnstableProviderResponse(first_choice, later_choice)
     recorder = BufferingRecorder()
+    turn_messages, budget_frame = _turn_messages(service, state, "build it")
     executed_tool_names: list[str] = []
 
     def _execute_admitted_tool(tool_name: str, *args: Any, **kwargs: Any) -> ToolResult:
@@ -215,7 +233,7 @@ async def test_model_turn_admits_one_snapshot_and_discards_raw_provider_objects(
         patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=_execute_admitted_tool),
     ):
         outcome = await service._call_model_turn(
-            llm_messages=[{"role": "user", "content": "build it"}],
+            llm_messages=turn_messages,
             tools=composer_loop_tool_definitions(ToolContractDialect.NONE),
             state=state,
             initial_version=state.version,
@@ -226,6 +244,7 @@ async def test_model_turn_admits_one_snapshot_and_discards_raw_provider_objects(
             composition_turns_used=0,
             discovery_turns_used=0,
             failed_turn=None,
+            budget_frame=budget_frame,
         )
 
         assert provider_response.choices_reads == 1
@@ -294,13 +313,14 @@ async def test_malformed_model_turn_retains_only_admitted_provider_facts() -> No
     choice = SimpleNamespace(message=message, finish_reason="stop")
     provider_response = _UnstableProviderResponse(choice, choice)
     recorder = BufferingRecorder()
+    turn_messages, budget_frame = _turn_messages(service, state, "build it")
 
     with (
         patch("elspeth.web.composer.provider_gateway._litellm_acompletion", return_value=provider_response),
         pytest.raises(_MalformedLLMResponseError) as exc_info,
     ):
         await service._call_model_turn(
-            llm_messages=[{"role": "user", "content": "build it"}],
+            llm_messages=turn_messages,
             tools=[],
             state=state,
             initial_version=state.version,
@@ -311,6 +331,7 @@ async def test_malformed_model_turn_retains_only_admitted_provider_facts() -> No
             composition_turns_used=0,
             discovery_turns_used=0,
             failed_turn=None,
+            budget_frame=budget_frame,
         )
 
     assert not hasattr(exc_info.value, "response")
@@ -336,6 +357,17 @@ async def test_malformed_model_turn_retains_only_admitted_provider_facts() -> No
 
 def _timeout_service() -> ComposerServiceImpl:
     return ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+
+
+def _no_shed_budget_record() -> ComposerContextBudgetRecord:
+    return ComposerContextBudgetRecord.from_shed_keys(
+        policy_hash="0" * 64,
+        bytes_per_token=3.0,
+        estimated_tokens_before=0,
+        estimated_tokens_after=0,
+        request_wire_bytes=1200,
+        shed_keys=(),
+    )
 
 
 def _failed_turn() -> FailedTurnMetadata:
@@ -364,6 +396,7 @@ async def test_elapsed_deadline_timeout_carries_caller_turn_context() -> None:
             composition_turns_used=2,
             discovery_turns_used=1,
             failed_turn=failed_turn,
+            context_budget=_no_shed_budget_record(),
         )
 
     exc = exc_info.value
@@ -398,6 +431,7 @@ async def test_provider_timeout_carries_caller_turn_context() -> None:
             composition_turns_used=4,
             discovery_turns_used=0,
             failed_turn=failed_turn,
+            context_budget=_no_shed_budget_record(),
         )
 
     exc = exc_info.value

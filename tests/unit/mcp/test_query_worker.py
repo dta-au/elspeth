@@ -214,6 +214,7 @@ async def test_mcp_input_budget_refuses_before_spawn(audit_target: tuple[str, st
 
 
 @pytest.mark.asyncio
+@pytest.mark.timing_sensitive
 async def test_deadline_reaps_query_and_allows_next_query(
     audit_target: tuple[str, str | None], monkeypatch: pytest.MonkeyPatch, process_pids: list[int]
 ) -> None:

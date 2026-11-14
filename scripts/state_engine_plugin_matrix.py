@@ -7,12 +7,14 @@ import argparse
 import inspect
 import json
 import sys
+import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal, cast, get_args
 
 from elspeth.contracts.plugin_capabilities import WebConfigAuthority
 from elspeth.core.config import load_bounded_pipeline_yaml
+from elspeth.core.template_materialization import FILE_BACKED_TEMPLATE_OPTION_REGISTRY, TemplateOptionMaterializer
 from elspeth.plugins.infrastructure.azure_auth import AzureAuthMethod
 from elspeth.plugins.infrastructure.base import BaseSink, BaseSource, BaseTransform
 from elspeth.plugins.infrastructure.clients.dataverse import DataverseAuthConfig
@@ -48,8 +50,8 @@ from elspeth.plugins.transforms.rag.config import RAGRetrievalConfig, RetrievalP
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 V3_CATALOG_PATH = REPOSITORY_ROOT / "docs/architecture/state_engine/proof-catalog/v3/catalog.json"
 UNCLASSIFIED = "UNCLASSIFIED"
-EXPECTED_COUNTS = {"source": 10, "transform": 40, "sink": 10}
-EXPECTED_VARIANT_COUNT = 84
+EXPECTED_COUNTS = {"source": 10, "transform": 41, "sink": 10}
+EXPECTED_VARIANT_COUNT = 85
 ALLOWED_PB_BOUNDARIES = frozenset({"PB-01", "PB-02", "PB-04", "PB-06", "PB-07", "PB-09"})
 ALLOWED_LOCAL_FIXTURES = frozenset({"hermetic", "provider-contract-fake", "real-process-http"})
 ALLOWED_RELEASE_LANES = frozenset({"local", "live-aws", "live-azure", "live-chroma", "live-dataverse", "live-provider"})
@@ -322,6 +324,35 @@ def _live_plugin_types_by_key() -> dict[str, PluginType]:
     return plugin_types
 
 
+def _bind_example_files(plugin_name: str, options: dict[str, Any], settings_dir: Path) -> dict[str, Any]:
+    """Expand an example's nested file-backed options the way the settings loader does.
+
+    An example that binds files (``files.<name>.content_file``) names files
+    that exist only beside a real settings file, so its options are not yet
+    what the config model validates. Each named file is written under
+    ``settings_dir`` as plain text and the options go through the real
+    ``TemplateOptionMaterializer``; options naming no file come back equal.
+    """
+    for rule in FILE_BACKED_TEMPLATE_OPTION_REGISTRY:
+        if rule.nested_in is None or rule.nested_in[0] != plugin_name:
+            continue
+        container = options.get(rule.nested_in[1])
+        if not isinstance(container, Mapping):
+            continue
+        for entry in container.values():
+            if isinstance(entry, Mapping) and rule.file_key in entry:
+                bound_file = settings_dir / entry[rule.file_key]
+                bound_file.parent.mkdir(parents=True, exist_ok=True)
+                bound_file.write_text("Example file content.\n", encoding="utf-8")
+    loaded = TemplateOptionMaterializer(settings_dir / "settings.yaml").materialize_config(
+        {"transforms": [{"name": "example", "plugin": plugin_name, "options": options}]}
+    )
+    bound = loaded["transforms"][0]["options"]
+    if not isinstance(bound, dict):
+        raise ValueError(f"{plugin_name} example options did not stay a dictionary through file binding")
+    return bound
+
+
 def _validate_default_config(plugin_key: str, plugin_type: PluginType) -> None:
     example = plugin_type.example_use
     if not isinstance(example, str) or not example.strip():
@@ -344,6 +375,8 @@ def _validate_default_config(plugin_key: str, plugin_type: PluginType) -> None:
         resolved = _replace_secret_refs_for_validation(options)
     if not isinstance(resolved, dict):
         raise ValueError(f"{plugin_key} resolved example options must be a dictionary")
+    with tempfile.TemporaryDirectory() as settings_dir:
+        resolved = _bind_example_files(plugin_type.name, resolved, Path(settings_dir))
     config_model = plugin_type.get_config_model(resolved)
     if config_model is None:
         if resolved:

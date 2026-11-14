@@ -27,6 +27,7 @@ from elspeth.web.sessions.models import sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.resource_identity import UUID_SPELLINGS, uuid_spelling
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -229,6 +230,20 @@ class TestSetSourceFromBlobs:
 
         assert not result.success
         assert "Duplicate blob id" in _first_error(result)
+
+    @pytest.mark.parametrize("spelling", UUID_SPELLINGS)
+    def test_equivalent_selector_duplicates_leave_existing_binding_unchanged(self, harness, spelling) -> None:
+        blob_id = _create_ready_blob(harness, content=_PNG, filename="p.png", mime_type="image/png")
+        prior = _run(harness, {"blob_ids": [blob_id], "on_success": "docs", "on_validation_failure": "discard"}).updated_state
+        result = _run(
+            harness,
+            {"blob_ids": [blob_id, uuid_spelling(blob_id, spelling)], "on_success": "changed", "on_validation_failure": "discard"},
+            prior,
+        )
+        assert not result.success
+        assert result.validation.errors[0].error_code == "source_blob_duplicate"
+        assert "Duplicate blob id" in _first_error(result)
+        assert result.updated_state is prior
 
     def test_duplicate_content_across_blobs_rejected(self, harness) -> None:
         first = _create_ready_blob(harness, content=_PNG, filename="a.png", mime_type="image/png")

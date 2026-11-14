@@ -687,6 +687,7 @@ async def test_auto_title_cancellation_propagates_after_accounting(monkeypatch) 
 
 
 @pytest.mark.asyncio
+@pytest.mark.timing_sensitive
 async def test_auto_title_repeated_cancellation_finishes_settlement_and_preserves_original(monkeypatch) -> None:
     original = asyncio.CancelledError("provider cancellation")
     settlement_started = asyncio.Event()

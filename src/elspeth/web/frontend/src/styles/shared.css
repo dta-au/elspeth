@@ -159,8 +159,9 @@
   justify-content: center;
   gap: var(--space-xs);
   padding: var(--space-sm) var(--space-lg);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
+  /* ARGOnite: pill shape with a strong border (raised pill look). */
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-pill);
   background-color: var(--color-surface-elevated);
   color: var(--color-text);
   font-family: var(--font-sans);
@@ -181,23 +182,25 @@
    wash at the moment of use (elspeth-b293bbd3c0). Gated by
    styles/buttonCascade.test.ts — keep the guards inside :where(). */
 .btn:hover:where(:not(:disabled)):where(:not([aria-disabled="true"])) {
-  background-color: var(--color-surface-hover);
+  background-color: var(--color-well);
   border-color: var(--color-border-strong);
 }
 
 /* Disabled state: desaturate via tokenised colour pair rather than opacity:0.4,
    which silently fails WCAG 1.4.3 contrast against any non-white chrome. We
-   use --color-bg as the background (rather than --color-surface-elevated) so
-   the disabled button reads as "merged into the page" — the muted text on
-   page-background pair passes AA in both themes (dark 6.45:1, light 6.32:1).
+   use --color-well (ARGOnite: the recessed well, so a disabled pill reads as
+   sunken, not raised) as the background; box-shadow: none removes the pill
+   shadow from filled variants. Specificity (0,2,0) outranks .btn-primary /
+   .btn-danger (0,1,0). Muted-on-well AA is gated by colorContrast.test.ts.
    The border stays at --color-border-strong so the button outline remains
    distinguishable from the page. aria-disabled gets the same treatment
    because we use it on the Save-for-review button while validation pends. */
 .btn:disabled,
 .btn[aria-disabled="true"] {
-  background-color: var(--color-bg);
+  background-color: var(--color-well);
   color: var(--color-text-muted);
   border-color: var(--color-border-strong);
+  box-shadow: none;
   cursor: not-allowed;
 }
 
@@ -211,8 +214,8 @@
   justify-content: center;
   gap: var(--space-xs);
   padding: var(--space-2xs) var(--space-sm);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-pill);
   background-color: var(--color-surface-elevated);
   color: var(--color-text);
   font-family: var(--font-sans);
@@ -229,15 +232,16 @@
    .btn-compact composes with .btn-primary (e.g. the inline-source fallback
    Accept button), so this base hover must stay below (0,3,0). */
 .btn-compact:hover:where(:not(:disabled)):where(:not([aria-disabled="true"])) {
-  background-color: var(--color-surface-hover);
+  background-color: var(--color-well);
   border-color: var(--color-border-strong);
 }
 
 .btn-compact:disabled,
 .btn-compact[aria-disabled="true"] {
-  background-color: var(--color-bg);
+  background-color: var(--color-well);
   color: var(--color-text-muted);
   border-color: var(--color-border-strong);
+  box-shadow: none;
   cursor: not-allowed;
 }
 
@@ -309,7 +313,15 @@
 .btn-primary {
   background-color: var(--color-btn-primary-bg);
   border-color: var(--color-btn-primary-bg);
-  color: var(--color-text-inverse);
+  color: var(--color-btn-primary-text);
+  box-shadow: var(--shadow-pill);
+}
+
+/* ARGOnite: filled pills carry a shadow, so the outline alone would be lost
+   against it; add a double ring that survives the fill. */
+.btn-primary:focus-visible,
+.btn-danger:focus-visible {
+  box-shadow: 0 0 0 2px var(--color-surface), 0 0 0 4px var(--color-focus-ring);
 }
 
 .btn-primary:hover:not(:disabled) {
@@ -321,6 +333,7 @@
   background-color: var(--color-btn-danger-bg);
   border-color: var(--color-btn-danger-bg);
   color: var(--color-text-inverse);
+  box-shadow: var(--shadow-pill);
 }
 
 .btn-danger:hover:not(:disabled) {
@@ -339,6 +352,102 @@
 .btn-ghost:hover:not(:disabled):not([aria-disabled="true"]) {
   background-color: var(--color-surface-hover);
   border-color: var(--color-border);
+}
+
+/* ---------------------------------------------------------------------------
+   Switch (ARGOnite) — recessed track, raised thumb.
+   Markup: <label class="switch"><input type="checkbox" role="switch"
+   class="switch-input" /><span class="switch-track" aria-hidden="true"><span
+   class="switch-thumb"></span></span><span class="switch-label">…</span></label>
+   The input is visually hidden but stays focusable; the track carries the
+   focus ring. The label row provides the --size-control-compact hit target.
+   Contrast (thumb on track >= 3:1, both themes) is gated by
+   styles/switchPrimitive.test.ts.
+   --------------------------------------------------------------------------- */
+/* ARGOnite: from ARGO (dta-au) client ElspethWorkflowEditor.module.css — reuse assumed MIT, see design doc
+   (ARGO's .switch recipe: a visually hidden checkbox over a pill track,
+   checked = the primary fill, the thumb slides across, focus ring on the
+   track. Geometry retuned here: 40x24 track, 18px thumb, 16px travel.) */
+.switch {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-sm);
+  min-height: var(--size-control-compact);
+  cursor: pointer;
+}
+
+.switch-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  opacity: 0;
+}
+
+.switch-track {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  box-sizing: border-box;
+  width: 40px;
+  height: 24px;
+  padding: 3px;
+  border-radius: var(--radius-pill);
+  background-color: var(--color-border-strong);
+  box-shadow: var(--shadow-track);
+  transition: background-color var(--transition-fast);
+}
+
+.switch-thumb {
+  box-sizing: border-box;
+  width: 18px;
+  height: 18px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-pill);
+  background-color: var(--color-pill);
+  box-shadow: var(--shadow-pill);
+  transition: transform var(--transition-fast),
+    background-color var(--transition-fast);
+}
+
+.switch-input:checked + .switch-track {
+  background-color: var(--color-btn-primary-bg);
+}
+
+.switch-input:checked + .switch-track .switch-thumb {
+  background-color: var(--color-btn-primary-text);
+  border-color: var(--color-btn-primary-text);
+  transform: translateX(16px);
+}
+
+.switch-input:focus-visible + .switch-track {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+.switch-input:disabled + .switch-track,
+.switch-input:disabled ~ .switch-label {
+  opacity: 0.6;
+}
+
+.switch:has(.switch-input:disabled) {
+  cursor: not-allowed;
+}
+
+/* ARGOnite: a blocked button must not look runnable under the pointer. Variant
+   hovers (.btn-primary:hover:not(:disabled), 0,3,0) exclude native :disabled
+   but not aria-disabled, so a hovered aria-disabled Run would take the live
+   fill. Re-assert the disabled look at equal specificity, AFTER the variant
+   hovers (order wins the tie). Gated by styles/buttonCascade.test.ts. */
+.btn:disabled:hover,
+.btn[aria-disabled="true"]:hover,
+.btn-compact:disabled:hover,
+.btn-compact[aria-disabled="true"]:hover {
+  background-color: var(--color-well);
+  border-color: var(--color-border-strong);
+  color: var(--color-text-muted);
+  box-shadow: none;
 }
 
 /* .btn-small predates .btn-compact and is retained at its existing call sites.
@@ -543,6 +652,11 @@
   display: flex;
   flex-direction: column;
   background-color: var(--color-surface);
+  /* ARGOnite: a dialog owns its ink. Dialogs are not portalled, so one
+     mounted under .app-header (the session switcher's archive confirm) would
+     otherwise inherit --color-on-nav, which is white in the light theme, for
+     any text that does not set its own colour. */
+  color: var(--color-text);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-modal);

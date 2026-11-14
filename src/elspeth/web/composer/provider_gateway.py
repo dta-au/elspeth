@@ -13,7 +13,7 @@ from typing import Any, Final
 
 from openai import OpenAIError
 
-from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus, ToolContractDialect
+from elspeth.contracts.composer_llm_audit import ComposerContextBudgetRecord, ComposerLLMCallStatus, ToolContractDialect
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.prompt_guard import (
     PromptGuardContentPart,
@@ -753,8 +753,13 @@ class ProviderGateway:
         recorder: BufferingRecorder | None,
         provider_custody: ProviderCallCustody | None = None,
         credential_state: CompositionState | None = None,
+        context_budget: ComposerContextBudgetRecord | None = None,
     ) -> _AdmittedLLMCompletion:
-        """Call the primary model once and record the exact marked request."""
+        """Call the primary model once and record the exact marked request.
+
+        ``context_budget`` is the compose loop's decision for this request;
+        it is ``None`` for every other caller.
+        """
         evidence = detach_prompt_guard_evidence(messages)
         wire_messages, trusted_indexes = evidence.messages, evidence.trusted_message_indexes
         wire_tools = [dict(tool) for tool in tools]
@@ -915,6 +920,7 @@ class ProviderGateway:
                             provider_custody=provider_custody,
                             failure=failure_to_capture,
                             private_request=private_request,
+                            context_budget=context_budget,
                         )
                         if recovery_batch is not None:
                             if call.call_id is None:
@@ -1118,8 +1124,11 @@ class ProviderGateway:
         timeout: float,
         recorder: BufferingRecorder | None,
         credential_state: CompositionState | None = None,
+        context_budget: ComposerContextBudgetRecord | None = None,
     ) -> _AdmittedLLMCompletion:
-        return await self._call_llm_with_audit_body(messages, tools, timeout=timeout, recorder=recorder, credential_state=credential_state)
+        return await self._call_llm_with_audit_body(
+            messages, tools, timeout=timeout, recorder=recorder, credential_state=credential_state, context_budget=context_budget
+        )
 
     async def _call_llm_with_audit(
         self,
@@ -1130,10 +1139,11 @@ class ProviderGateway:
         recorder: BufferingRecorder | None,
         provider_custody: ProviderCallCustody | None = None,
         credential_state: CompositionState | None = None,
+        context_budget: ComposerContextBudgetRecord | None = None,
     ) -> _AdmittedLLMCompletion:
         if provider_custody is None:
             return await self._call_llm_with_audit_legacy(
-                messages, tools, timeout=timeout, recorder=recorder, credential_state=credential_state
+                messages, tools, timeout=timeout, recorder=recorder, credential_state=credential_state, context_budget=context_budget
             )
         async with provider_call_scope(provider_custody):
             return await self._call_llm_with_audit_body(
@@ -1143,6 +1153,7 @@ class ProviderGateway:
                 recorder=recorder,
                 provider_custody=provider_custody,
                 credential_state=credential_state,
+                context_budget=context_budget,
             )
 
     @quota_provider_calls

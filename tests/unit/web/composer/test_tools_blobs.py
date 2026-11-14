@@ -12,6 +12,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import event, select
 
+from elspeth.contracts.credential_material import DEFAULT_CREDENTIAL_TRAVERSAL_POLICY
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
@@ -2679,6 +2680,35 @@ class TestGetBlobContentGuards:
             conn.execute(blobs_table.update().where(blobs_table.c.id == self.blob_id).values(size_bytes=len(data), content_hash=digest))
         return digest
 
+    @pytest.mark.parametrize(("character", "extra_bytes"), [("x", 1), ("é", 1), ("x", 0)], ids=["ascii-over", "utf8-over", "at-limit"])
+    def test_content_inspection_size_limit_is_distinct_from_credentials(self, character: str, extra_bytes: int) -> None:
+        limit = DEFAULT_CREDENTIAL_TRAVERSAL_POLICY.max_string_bytes
+        content = character * (limit // len(character.encode("utf-8"))) + "x" * extra_bytes
+        assert len(content.encode("utf-8")) == limit + extra_bytes
+        self._replace_content(content)
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            result = execute_tool(
+                "get_blob_content",
+                {"blob_id": self.blob_id},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
+        if extra_bytes:
+            assert not result.success
+            assert result.data is None
+            assert result.validation.errors[0].error_code == "blob_content_size_limit"
+            assert f"{limit}-byte" in result.validation.errors[0].message
+            assert "inspection limit" in result.validation.errors[0].message
+        else:
+            assert result.success, result
+            assert result.data["content"]
+            assert result.data["start_char"] == 0
+
     @pytest.mark.parametrize(
         "content",
         ["", "x" * 50_000, "x" * 50_001, "\x00" * 50_001, "🙂e\u0301" * 20_000],
@@ -3660,6 +3690,61 @@ class TestUpdateBlobActiveRunGuard:
         assert row.creating_provider == "openai"
         assert row.creating_composer_skill_hash == "a" * 64
         assert row.creating_arguments_hash == "b" * 64
+
+    @pytest.mark.parametrize(
+        ("authored", "expected_modality"),
+        [
+            ("invented", CreationModality.LLM_GENERATED),
+            ("verbatim", CreationModality.VERBATIM),
+        ],
+    )
+    def test_update_records_the_rewritten_user_upload_as_the_assistants_file(
+        self, authored: str, expected_modality: CreationModality
+    ) -> None:
+        """An agent write is an agent write: rewriting an upload makes it the assistant's file.
+
+        ``file_inject`` accepts only a user upload, judged by creator and
+        modality together. A verbatim-substring rewrite keeps modality
+        ``VERBATIM`` and a fork copy resets modality to ``VERBATIM``, so only
+        the creator can carry "the agent rewrote this" across both routes.
+        """
+        new_content = "name,score\nada,42\n"
+        if authored == "verbatim":
+            provenance = _verbatim_blob_context(self.engine, self.session_id, new_content)
+        else:
+            user_message_content = "Generate a replacement CSV for the current scratch blob."
+            provenance = {
+                "user_message_id": _insert_user_message(self.engine, self.session_id, user_message_content),
+                "user_message_content": user_message_content,
+                "composer_model_identifier": "openai/gpt-5-mini",
+                "composer_model_version": "gpt-5-mini-2026-05-01",
+                "composer_provider": "openai",
+                "composer_skill_hash": "a" * 64,
+                "tool_arguments_hash": "b" * 64,
+            }
+        with self.engine.begin() as conn:
+            before = conn.execute(select(blobs_table.c.created_by).where(blobs_table.c.id == self.blob_id)).scalar_one()
+        assert before == "user"
+
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "update_blob",
+                {"blob_id": self.blob_id, "content": new_content},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **provenance,
+            )
+
+        assert result.success is True, [error.message for error in result.validation.errors]
+        with self.engine.begin() as conn:
+            row = conn.execute(select(blobs_table).where(blobs_table.c.id == self.blob_id)).one()
+        assert row.creation_modality == expected_modality.value
+        assert row.created_by == "assistant"
 
     def test_update_rejected_when_pending_run_linked(self) -> None:
         self._insert_run_and_link("pending")

@@ -179,11 +179,29 @@ def test_valid_preview_call_does_not_claim_valid_pipeline(producer_results):
 
 
 def test_proof_evidence_rejects_unknown_nested_field_and_wrong_count(producer_results):
-    for key, value in (("unpublished", "hidden"), ("observed_header_count", True), ("blob_id", None)):
+    for key, value in (
+        ("unpublished", "hidden"),
+        ("observed_header_count", True),
+        ("selected_record_count", True),
+        ("sample_extra_record_count", "1"),
+        ("all_rows_inspected", 1),
+        ("blob_id", None),
+    ):
         raw = deep_thaw(producer_results["preview_proof"].data)
         raw["proof_diagnostics"][0]["evidence_locator"][key] = value
         with pytest.raises(FrameworkBugError):
             responses.PREVIEW_PIPELINE_RESPONSE_CONTRACT.admit(raw)
+
+
+@pytest.mark.parametrize("count_key", ["selected_record_count", "sample_extra_record_count"])
+def test_preview_contract_preserves_json_warning_and_record_counts(producer_results, count_key):
+    raw = deep_thaw(producer_results["preview_proof"].data)
+    diagnostic = raw["proof_diagnostics"][0]
+    diagnostic["severity"] = "warning"
+    diagnostic["evidence_locator"].update({count_key: 2, "all_rows_inspected": False})
+    admitted = responses.PREVIEW_PIPELINE_RESPONSE_CONTRACT.admit(raw)
+    assert admitted.to_wire() == raw
+    assert admitted.readmit(responses.PREVIEW_PIPELINE_RESPONSE_CONTRACT).to_wire() == raw
 
 
 def test_preview_contract_admits_declared_input_type_budget_evidence(producer_results):
@@ -216,9 +234,18 @@ def test_failed_diff_stays_validation_only():
         admit_discovery_result("diff_pipeline", replace(result, data={"error_code": "diff_baseline_unavailable"}))
 
 
-def test_successful_explanation_code_survives(producer_results):
-    wire = responses.EXPLAIN_VALIDATION_ERROR_RESPONSE_CONTRACT.admit(producer_results["explain_noisy"].data).to_wire()
-    assert wire["error_code"] == "quarantine_unknown_output"
+@pytest.mark.parametrize(
+    ("case", "code"),
+    [("explain_exact", "unknown_node_type"), ("explain_hint", "unknown_node_type"), ("explain_noisy", "quarantine_unknown_output")],
+)
+def test_successful_explanation_code_survives(producer_results, case, code):
+    wire = responses.EXPLAIN_VALIDATION_ERROR_RESPONSE_CONTRACT.admit(producer_results[case].data).to_wire()
+    assert wire["error_code"] == code
+
+
+def test_unknown_explanation_does_not_acquire_a_code(producer_results):
+    wire = responses.EXPLAIN_VALIDATION_ERROR_RESPONSE_CONTRACT.admit(producer_results["explain_none"].data).to_wire()
+    assert "error_code" not in wire
 
 
 def test_assistance_reuses_owned_examples_and_closes_json_leaves(producer_results):

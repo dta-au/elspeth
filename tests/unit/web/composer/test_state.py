@@ -732,6 +732,24 @@ class TestCompositionState:
         result = self._empty_state().without_output("nope")
         assert result is None
 
+    def test_without_output_removes_incident_edges_and_preserves_unrelated_edges(self) -> None:
+        incoming = replace(self._make_edge("incoming"), to_node="out")
+        outgoing = replace(self._make_edge("outgoing"), from_node="out")
+        retained = self._make_edge("retained")
+        other = self._make_output("other")
+        state = self._empty_state().with_output(self._make_output("out")).with_output(other)
+        state = replace(state, edges=(incoming, retained, outgoing))
+
+        updated = state.without_output("out")
+
+        assert updated is not None
+        assert updated.edges == (retained,)
+        assert updated.edges[0] is retained
+        assert updated.outputs == (other,)
+        assert updated.version == state.version + 1
+        assert state.edges == (incoming, retained, outgoing)
+        assert tuple(output.name for output in state.outputs) == ("out", "other")
+
     # --- with_metadata ---
 
     def test_with_metadata_partial_update(self) -> None:

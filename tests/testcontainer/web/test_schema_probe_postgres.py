@@ -36,6 +36,7 @@ from elspeth.core.landscape.database import _REQUIRED_TRIGGERS, LandscapeDB, Sch
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction, fenced_member_transaction
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH, audit_export_snapshot_chunks_table
+from elspeth.core.landscape.schema import metadata as landscape_metadata
 from elspeth.core.landscape.schema import schema_identity_table as landscape_schema_identity_table
 from elspeth.core.schema_identity import SCHEMA_IDENTITY_APPLICATION_ID
 from elspeth.core.schema_shape import _text_builtin_identity_rows_on_connection, database_target_is_empty
@@ -496,6 +497,42 @@ def test_postgres_session_init_does_not_poison_later_sqlite_schema(postgres_engi
     initialize_session_schema(sqlite_engine)
 
     assert inspect(sqlite_engine).get_foreign_keys("chat_messages")
+
+
+@pytest.mark.parametrize("postgres_creation", ["constructor", "from_url", "web_init"])
+@pytest.mark.parametrize("sqlite_creation", ["constructor", "from_url", "in_memory"])
+def test_postgres_landscape_creation_preserves_later_sqlite_schema(
+    postgres_engine: Engine, tmp_path: Path, postgres_creation: str, sqlite_creation: str
+) -> None:
+    """PostgreSQL's deferred FK DDL must not suppress SQLite's inline FKs."""
+    from elspeth.core.landscape.database import LandscapeSchemaShape, probe_schema_shape
+    from elspeth.core.landscape.schema import metadata
+
+    original_rules = [(constraint, constraint._create_rule) for table in metadata.tables.values() for constraint in table.constraints]
+    try:
+        postgres_url = postgres_engine.url.render_as_string(hide_password=False)
+        if postgres_creation == "web_init":
+            init_landscape_schema(postgres_engine)
+        else:
+            postgres_db = LandscapeDB(postgres_url) if postgres_creation == "constructor" else LandscapeDB.from_url(postgres_url)
+            postgres_db.close()
+
+        sqlite_url = f"sqlite:///{tmp_path / 'after-postgres.db'}"
+        if sqlite_creation == "in_memory":
+            sqlite_db = LandscapeDB.in_memory()
+        else:
+            sqlite_db = LandscapeDB(sqlite_url) if sqlite_creation == "constructor" else LandscapeDB.from_url(sqlite_url)
+        with sqlite_db:
+            sqlite_db._validate_schema()
+            assert probe_schema_shape(sqlite_db.engine) is LandscapeSchemaShape.MATCHES
+        if sqlite_creation != "in_memory":
+            with LandscapeDB.from_url(sqlite_url, create_tables=False) as reopened:
+                assert probe_schema_shape(reopened.engine) is LandscapeSchemaShape.MATCHES
+        assert all(constraint._create_rule is rule for constraint, rule in original_rules)
+    finally:
+        # A failing regression must not contaminate later cases in this process.
+        for constraint, rule in original_rules:
+            constraint._create_rule = rule
 
 
 def _seed_postgres_trigger_rows(postgres_engine: Engine, *, session_id: str, include_completion: bool) -> None:
@@ -1606,7 +1643,7 @@ def test_concurrent_initializers_serialize_to_one_create_all(
     kind: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    metadata = session_metadata if kind == "session" else schema_probe_module.landscape_metadata
+    metadata = session_metadata if kind == "session" else landscape_metadata
     initializer = init_session_schema if kind == "session" else init_landscape_schema
     original_create_all = metadata.create_all
     holder_entered = threading.Event()

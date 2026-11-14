@@ -133,6 +133,7 @@ def _observe_single_process_profile(db: LandscapeDB, request: pytest.FixtureRequ
         raw.close()
 
 
+@pytest.mark.timing_sensitive
 def test_non_resumable_finalization_survives_abrupt_post_commit_process_death(
     tmp_path: Path,
     request: pytest.FixtureRequest,
@@ -177,6 +178,7 @@ def test_non_resumable_finalization_survives_abrupt_post_commit_process_death(
         assert len(image.tables["token_outcomes"]) == 1
 
 
+@pytest.mark.timing_sensitive
 def test_resumable_finalization_preserves_open_effect_after_process_death(tmp_path: Path) -> None:
     database_url = f"sqlite:///{tmp_path / 'resumable.db'}"
     run_id = "run-task10-process-resumable"

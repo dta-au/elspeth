@@ -133,9 +133,8 @@
 /* Gate legibility (elspeth-088bf83922 T-2): the plain-language reason line
    ExecuteButton.tsx renders under the button — either which gate is
    currently blocking Run, or a one-line note that a non-green advisory row
-   did not block it. Muted text, same token as every other secondary label
-   in the rail; the "advisory" modifier exists for future differentiation
-   but intentionally shares the base rule today (no colour-only signal).
+   did not block it. A block reason reads at body-text colour (ARGOnite); the
+   "advisory" modifier keeps the muted secondary-label token.
    Margin is 0 here because the only shipped mount point is inside
    .completion-bar, whose `.completion-bar > *` rule (below) forces
    margin:0 / width:100% on every direct child at equal specificity and
@@ -145,6 +144,12 @@
   margin: 0;
   padding: 0 var(--space-sm);
   font-size: var(--font-size-xs);
+  /* ARGOnite: a block reason explains why Run is unavailable, so it reads at
+     body-text colour; only the advisory note below stays muted. */
+  color: var(--color-text);
+}
+
+.side-rail-execute-reason--advisory {
   color: var(--color-text-muted);
 }
 

@@ -81,6 +81,59 @@ def test_planner_request_instruction_carries_the_terminal_contract() -> None:
     assert "set_pipeline" in PLANNER_TERMINAL_INSTRUCTION
 
 
+def test_planner_request_instruction_orients_the_planner_on_its_own_surface() -> None:
+    # The shared skill is written for the incremental tool loop and cannot name
+    # the planner's terminal tool, so the per-request instruction is the only
+    # place the planner learns which described tools it lacks. Each claim is
+    # checked against the live palettes so the sentence cannot drift from them.
+    from elspeth.web.composer.pipeline_planner import PLANNER_TERMINAL_INSTRUCTION
+    from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
+
+    planner_palette = {tool["function"]["name"] for tool in planner_tool_definitions(dialect=ToolContractDialect.NONE)}
+    loop_palette = {tool["function"]["name"] for tool in composer_loop_tool_definitions(ToolContractDialect.NONE)}
+
+    assert "This is the proposal-only surface" in PLANNER_TERMINAL_INSTRUCTION
+    assert "apply them to emit_pipeline_proposal" in PLANNER_TERMINAL_INSTRUCTION
+    named_as_absent = (
+        "set_source",
+        "upsert_node",
+        "patch_node_options",
+        "create_blob",
+        "request_interpretation_review",
+        "request_advisor_hint",
+    )
+    for tool_name in named_as_absent:
+        assert tool_name in PLANNER_TERMINAL_INSTRUCTION
+        assert tool_name not in planner_palette
+        assert tool_name in loop_palette
+    assert {"emit_pipeline_proposal", "handoff_to_user", "restore_parked_graph"} <= planner_palette
+
+    assert "Author vague_term and registered pipeline_decision rows inside the proposal's node options" in PLANNER_TERMINAL_INSTRUCTION
+    assert (
+        "never author invented_source, llm_prompt_template, llm_model_choice or source_data_contract rows" in PLANNER_TERMINAL_INSTRUCTION
+    )
+    # The rejection shape named here is the planner's own feedback wire, not
+    # the incremental loop's envelope the skill teaches.
+    from elspeth.web.composer.pipeline_planner import _PlannerFeedbackError, _PlannerFeedbackWire
+
+    assert {"success", "validation"} <= set(_PlannerFeedbackWire.__annotations__)
+    for key in ("component", "error_code", "explanation", "suggested_fix", "detail", "plugin_contracts"):
+        assert key in PLANNER_TERMINAL_INSTRUCTION
+        assert key in _PlannerFeedbackError.__annotations__
+
+
+def test_interaction_skill_scopes_review_calls_to_surfaces_that_offer_the_tool() -> None:
+    interaction = " ".join(load_skill("pipeline_composer").split())
+
+    assert interaction.startswith("# Pipeline Composer Interaction Policy")
+    assert "A rule that names a tool your palette does not offer does not apply to you as written." in interaction
+    assert "there is no call to make and nothing to look for" in interaction
+    assert "then surface it where your palette offers the review tool" in interaction
+    assert "Surface every staged assumption with `request_interpretation_review` (where your palette offers it)" in interaction
+    assert 'every "YOU" in the matrix\'s "Review surfaced by" column, applies where your palette offers that tool' in interaction
+    assert "On a proposal-only surface, states 1 and 2 are replaced by one" in interaction
+
+
 def test_capability_core_explains_digest_budget_omissions() -> None:
     core = load_pipeline_capability_core()
 
@@ -182,6 +235,31 @@ def test_interpretation_requirement_guidance_uses_exact_public_shell() -> None:
     assert "You author ONLY `kind`, `user_term`, `draft`, and optional `display_title`." in interaction
     assert "plus `id`" not in interaction
     assert "`status` defaults to `pending`" not in interaction
+
+
+def test_invented_source_authorship_has_one_answer_across_skill_aids_and_schema_note() -> None:
+    # The server stages the invented_source row when it binds generated source
+    # rows (tools/sources.py::_options_with_source_blob_review, with
+    # replace_kind=INVENTED_SOURCE). The skill, the authoring aids and the tool
+    # schema note once gave three different answers on who authors that row.
+    from elspeth.web.composer import planner_authoring_aids as aids
+    from elspeth.web.composer.tools import _common
+
+    interaction = " ".join(load_skill("pipeline_composer").split())
+    assert "never author that row yourself on any surface" in interaction
+    assert "NEVER author this row on any surface" in interaction
+
+    rules = " ".join((*aids._SOURCE_CUSTODY_RULES, *aids._FORK_COALESCE_RULES, *aids._REVIEW_REGISTRY_RULES))
+    owned_kind_sentences = re.findall(r"planner-owned kinds[^.]*\.", rules)
+    assert len(owned_kind_sentences) == 2
+    assert all("invented_source" not in sentence for sentence in owned_kind_sentences)
+    assert rules.count("Never author invented_source: the server stages") == 2
+    assert "stage the invented_source interpretation review" not in rules
+
+    for note in (_common._INTERPRETATION_REVIEW_FOLLOWUP, _common._INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE):
+        assert "never author invented_source" in note
+        assert "the rows you author ride in the proposal" in note
+        assert "pending requirements" not in note
 
 
 def test_capability_coverage_is_exactly_derived_from_canonical_authorities() -> None:

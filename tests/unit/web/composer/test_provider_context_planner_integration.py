@@ -208,7 +208,10 @@ async def test_application_projection_boundary_preserves_parts_and_complete_byte
         rejected = BufferingRecorder()
         with patch.object(application, "_settings", bounded), pytest.raises(PipelinePlannerError) as caught:
             await request(rejected)
-        assert caught.value.code == "REQUEST_BYTES_EXHAUSTED"
+        # Nothing is sheddable, so the context budget refuses on the same
+        # measure before the planner's final request byte check is reached.
+        assert caught.value.code == "CONTEXT_BUDGET_EXHAUSTED"
+        assert caught.value.detail_codes[0] == "context_ceiling_bytes"
         assert sdk.await_count == 1 and rejected.llm_calls == ()
     assert state.to_dict() == before and composition_content_hash(state) == before_hash
 

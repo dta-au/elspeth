@@ -75,6 +75,7 @@ docker run --rm --name elspeth-web \
   -e ELSPETH_WEB__SECRET_KEY="${ELSPETH_WEB_SECRET_KEY}" \
   -e ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY="${ELSPETH_WEB_SHAREABLE_LINK_SIGNING_KEY}" \
   -e ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS=15 \
+  -e ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS=200000 \
   -e ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS=10 \
   -e ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=300.0 \
   -e ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS=360.0 \
@@ -83,6 +84,9 @@ docker run --rm --name elspeth-web \
   ghcr.io/dta-au/elspeth:${IMAGE_TAG} \
   web --host 0.0.0.0 --port 8451
 ```
+
+`ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS` is required; `200000` is a
+placeholder. Set it to your model gateway's prompt-token limit.
 
 The explicit `0.0.0.0` bind is required for Docker's published port to reach
 the process; the native CLI keeps its safer `127.0.0.1` default. From another
@@ -665,7 +669,7 @@ docker run --rm \
 - [AWS ECS Full Acceptance Runbook](../runbooks/aws-ecs-deployment.md) - Disposable two-scenario provisioning and acceptance
 - [Azure Container Apps Cold Install](../runbooks/azure-container-apps-cold-install.md) - Bicep environment with external PostgreSQL and NFS Azure Files
 - [Azure Container Apps Existing-Service Redeploy](../runbooks/azure-container-apps-existing-service-redeploy.md) - Digest-pinned revision rollout
-- [Azure Container Apps Full Acceptance Runbook](../runbooks/azure-container-apps-deployment.md) - Disposable 0.8.10 test and fix-on-fail procedure
+- [Azure Container Apps Full Acceptance Runbook](../runbooks/azure-container-apps-deployment.md) - Disposable 0.8.13 test and fix-on-fail procedure
 - [Your First Pipeline](your-first-pipeline.md) - Getting started guide
 - [Configuration Reference](../reference/configuration.md) - Complete config options
 - [Runbooks](../runbooks/) - Operational procedures

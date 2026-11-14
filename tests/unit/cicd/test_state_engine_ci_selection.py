@@ -137,6 +137,7 @@ def test_suites_report_independently_and_ci_success_requires_static_analysis() -
     assert "needs" not in _job("test")
     assert "needs" not in _job("testcontainer")
     assert _job("integration")["needs"] == ["test"]
+    assert _job("timing-sensitive")["needs"] == ["test"]
     for dependant in ("state-engine-validation", "azure-container-apps-bicep", "supply-chain-audit"):
         assert _job(dependant)["needs"] == ["static-analysis"], dependant
     ci_success = _job("ci-success")
@@ -200,7 +201,7 @@ def test_integration_job_carries_no_marker_expression_of_its_own() -> None:
     assert not any(token.startswith("-m=") or token.startswith("--markexpr") for token in tokens), pytest_steps[0].get("name")
 
 
-def test_no_job_restates_the_marker_selection_except_the_testcontainer_override() -> None:
+def test_no_job_restates_the_marker_selection_except_required_partition_overrides() -> None:
     """One assertion over every job, because two job-named pins stop two jobs.
 
     The two pins above name ``test`` and ``integration``, which is the shape of
@@ -210,17 +211,15 @@ def test_no_job_restates_the_marker_selection_except_the_testcontainer_override(
     twice (elspeth-6128fc7f95, elspeth-7103e36698) — so the rule is stated once,
     over ``jobs``, and holds for jobs nobody has written yet.
 
-    Measured at 85fee5cfa: six pytest steps across five jobs (``test`` twice,
-    then ``integration``, ``testcontainer``, ``host-runner-unit`` and
-    ``azure-container-apps-bicep``), and exactly one marker expression among
-    them. That one is the testcontainer job's, and it is the single override
-    that cannot be avoided: selecting those ids REQUIRES replacing addopts'
+    The testcontainer override cannot be avoided: selecting those ids REQUIRES replacing addopts'
     ``not testcontainer``. It is safe for the same reason it is narrow —
     ``testcontainer and live_provider`` and ``testcontainer and (slow or stress
     or performance)`` each collect zero ids tree-wide, so no guard it drops has
     anything to catch. Pinning the expression to exactly ``testcontainer``
     keeps it that way: a widened override here would silently re-select the
-    live lanes, which is the failure this whole family is about.
+    live lanes, which is the failure this whole family is about. Timing tests
+    likewise require an override, pinned below to the default expression with
+    only their exclusion reversed, preserving every other guard.
     """
     steps_with_pytest: list[tuple[str, str]] = []
     marker_expressions: dict[str, list[str]] = {}
@@ -241,8 +240,13 @@ def test_no_job_restates_the_marker_selection_except_the_testcontainer_override(
                 marker_expressions.setdefault(job_name, []).extend(markers)
     assert len(steps_with_pytest) >= 6, steps_with_pytest  # never pass by finding nothing to check
     assert sum(job_name == "landscape-proof/proof" for job_name, _ in steps_with_pytest) == 2
-    assert set(marker_expressions) == {"testcontainer"}, marker_expressions
+    assert set(marker_expressions) == {"testcontainer", "timing-sensitive"}, marker_expressions
     assert marker_expressions["testcontainer"] == ["testcontainer"], marker_expressions
+    addopts = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["tool"]["pytest"]["ini_options"]["addopts"]
+    default_expression = addopts[addopts.index("-m") + 1]
+    assert default_expression.count("not timing_sensitive") == 1
+    timing_expression = default_expression.replace("not timing_sensitive", "timing_sensitive")
+    assert marker_expressions["timing-sensitive"] == [timing_expression, timing_expression], marker_expressions
 
 
 def test_testcontainer_job_selects_the_postgresql_matrix() -> None:

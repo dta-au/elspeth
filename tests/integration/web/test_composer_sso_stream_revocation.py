@@ -66,6 +66,7 @@ async def test_mounted_sso_revocation_during_send_preserves_actual_custody(
         secret_key="mounted-sso-token-signing-test-only-key",
         shareable_link_signing_key=bytes(range(32)),
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=60,
         composer_boot_probe_enabled=False,

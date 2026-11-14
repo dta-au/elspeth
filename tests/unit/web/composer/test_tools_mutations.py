@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
@@ -17,7 +18,7 @@ from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginSummary
-from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
+from elspeth.web.composer.state import CompositionState, EdgeSpec, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools import ToolContext, _apply_merge_patch, _credential_wiring_contract_failure
 from elspeth.web.composer.tools.sources import _options_with_source_blob_review
 from elspeth.web.config import WebSettings
@@ -2574,6 +2575,20 @@ class TestSetOutput:
 
 
 class TestRemoveOutput:
+    def test_remove_output_removes_edges_to_sink(self) -> None:
+        target = OutputSpec(name="main", plugin="csv", options={"schema": {"mode": "observed"}}, on_write_failure="discard")
+        other = replace(target, name="other")
+        incident = EdgeSpec(id="to_main", from_node="source", to_node="main", edge_type="on_success", label=None)
+        retained = replace(incident, id="to_other", to_node="other")
+        state = replace(_empty_state(), outputs=(target, other), edges=(incident, retained))
+
+        result = execute_tool("remove_output", {"sink_name": "main"}, state, _mock_catalog())
+
+        assert result.success, result
+        assert result.updated_state.outputs == (other,)
+        assert result.updated_state.edges == (retained,)
+        assert state.edges == (incident, retained)
+
     def test_removes_output(self) -> None:
         state = _empty_state()
         catalog = _mock_catalog()
@@ -3873,6 +3888,7 @@ class TestTransformProviderConfigPathSecurity:
         settings = WebSettings.model_validate(
             {
                 "composer_max_composition_turns": 4,
+                "composer_context_max_prompt_tokens": 200_000,
                 "composer_max_discovery_turns": 4,
                 "composer_timeout_seconds": 60,
                 "composer_rate_limit_per_minute": 20,

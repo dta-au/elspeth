@@ -36,6 +36,7 @@ def _textract_policy_context() -> tuple[object, object, object]:
     settings = WebSettings.model_validate(
         {
             "composer_max_composition_turns": 4,
+            "composer_context_max_prompt_tokens": 200_000,
             "composer_max_discovery_turns": 4,
             "composer_timeout_seconds": 60,
             "composer_rate_limit_per_minute": 20,
@@ -199,6 +200,7 @@ def test_validate_plugin_policy_rejects_textract_identity_from_a_non_textract_co
     settings = WebSettings.model_validate(
         {
             "composer_max_composition_turns": 4,
+            "composer_context_max_prompt_tokens": 200_000,
             "composer_max_discovery_turns": 4,
             "composer_timeout_seconds": 60,
             "composer_rate_limit_per_minute": 20,
@@ -684,6 +686,7 @@ def _search_policy_context(*, secret_wiring_allowlist: tuple[str, ...] = ()) -> 
     settings = WebSettings.model_validate(
         {
             "composer_max_composition_turns": 4,
+            "composer_context_max_prompt_tokens": 200_000,
             "composer_max_discovery_turns": 4,
             "composer_timeout_seconds": 60,
             "composer_rate_limit_per_minute": 20,

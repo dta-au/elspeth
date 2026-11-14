@@ -71,6 +71,7 @@ def test_progress_http_and_token_settlement_do_not_deadlock(progress_database: t
     app.state.settings = WebSettings(
         auth_provider="local",
         composer_max_composition_turns=20,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=20,
         composer_timeout_seconds=300,
         composer_transport_idle_ceiling_seconds=360,

@@ -66,6 +66,7 @@ def test_power_automate_origins_decode_from_environment(monkeypatch: pytest.Monk
         if name.startswith("ELSPETH_WEB__"):
             monkeypatch.delenv(name)
     monkeypatch.setenv("ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS", "4")
+    monkeypatch.setenv("ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS", "200000")
     monkeypatch.setenv("ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS", "4")
     monkeypatch.setenv("ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS", "120")
     monkeypatch.setenv("ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE", "20")

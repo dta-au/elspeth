@@ -24,6 +24,7 @@ from elspeth.contracts.blobs import (
     BlobAtomicDeletionObligation,
     BlobCreationObligation,
     BlobDeletionPlan,
+    BlobMutationObservation,
     BlobRecord,
     BlobReplacementPlan,
     BlobRunLinkDirection,
@@ -1136,6 +1137,32 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
                         ("accepting_proposal_id", inspect.Parameter.KEYWORD_ONLY, UUID | None),
                     ),
                     BlobDeletionPlan,
+                ),
+                "inspect_blob_mutation": (
+                    (
+                        ("blob_id", inspect.Parameter.KEYWORD_ONLY, UUID),
+                        ("tool_name", inspect.Parameter.KEYWORD_ONLY, Literal["update_blob", "delete_blob"]),
+                    ),
+                    BlobMutationObservation,
+                ),
+                "admit_blob_replacement": (
+                    (
+                        ("expected", inspect.Parameter.KEYWORD_ONLY, BlobRecord),
+                        ("replacement", inspect.Parameter.KEYWORD_ONLY, BlobRecord),
+                        ("max_storage_per_session", inspect.Parameter.KEYWORD_ONLY, int),
+                        ("accepting_proposal_id", inspect.Parameter.KEYWORD_ONLY, UUID | None),
+                    ),
+                    type(None),
+                ),
+                "admit_blob_deletion": (
+                    (
+                        ("expected", inspect.Parameter.KEYWORD_ONLY, BlobRecord),
+                        ("expected_file_present", inspect.Parameter.KEYWORD_ONLY, bool),
+                        ("expected_file_size", inspect.Parameter.KEYWORD_ONLY, int | None),
+                        ("expected_file_hash", inspect.Parameter.KEYWORD_ONLY, str | None),
+                        ("accepting_proposal_id", inspect.Parameter.KEYWORD_ONLY, UUID | None),
+                    ),
+                    type(None),
                 ),
                 "prepare_blob_replacement": (
                     (

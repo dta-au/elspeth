@@ -506,6 +506,7 @@ def test_failed_app_constructor_arms_before_lexical_telemetry_cleanup(tmp_path, 
                 data_dir=tmp_path,
                 composer_boot_probe_enabled=False,
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85,
                 composer_rate_limit_per_minute=100,
@@ -536,6 +537,7 @@ def test_production_closed_record_and_reset_refusal_are_permanent(monkeypatch: p
     runtime = operator_telemetry.bootstrap_operator_telemetry(
         WebSettings(
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85,
             composer_rate_limit_per_minute=100,
@@ -652,6 +654,7 @@ def test_unsupported_sdk_version_refuses_before_reader_allocation(package: str, 
         operator_telemetry.bootstrap_operator_telemetry(
             WebSettings(
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85,
                 composer_rate_limit_per_minute=100,
@@ -674,6 +677,7 @@ def test_unsupported_sdk_shape_refuses_before_reader_allocation(field: str, monk
         operator_telemetry.bootstrap_operator_telemetry(
             WebSettings(
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85,
                 composer_rate_limit_per_minute=100,
@@ -704,3 +708,43 @@ def test_prometheus_registration_insert_then_raise_retains_original_and_exact_cl
     witness = custody.shutdown_sync()
     assert witness is custody.witness
     assert not reader.registered()
+
+
+def test_reviewed_sdk_versions_are_admitted() -> None:
+    from elspeth.web.operator_telemetry_custody import verify_telemetry_sdk
+
+    verify_telemetry_sdk()
+
+
+def test_prometheus_upgrade_preserves_existing_sample_labels_and_registry() -> None:
+    custody = owner()
+    registry = custody.installation.registry
+    reader = custody.acquire_prometheus(registry)
+    provider = custody.acquire_provider(OwnedProviderFactory(), resource=Resource({"service.name": "custody"}), views=())
+    try:
+        provider.get_meter("custody", "1.0").create_counter("custody.requests").add(7, {"outcome": "success"})
+        samples = [sample for metric in registry.collect() for sample in metric.samples if sample.name == "custody_requests_total"]
+        assert len(samples) == 1
+        assert samples[0].value == 7
+        assert samples[0].labels == {"outcome": "success"}
+        assert reader._registry is registry
+        assert reader._prefix == ""
+    finally:
+        custody.shutdown_sync()
+    assert not reader.registered()
+
+
+def test_changed_provider_reader_binding_refuses_completion_and_preserves_foreign_state() -> None:
+    custody = owner()
+    reader = custody.acquire_prometheus(custody.installation.registry)
+    provider = custody.acquire_provider(OwnedProviderFactory(), resource=Resource({}), views=())
+    provider._metric_readers = ()
+    try:
+        with pytest.raises(BaseExceptionGroup):
+            custody.shutdown_sync()
+        assert custody.witness is None
+        assert not reader.registered()
+        assert provider._metric_readers == ()
+    finally:
+        with provider.registration_lock:
+            provider.registration_set.remove(reader)

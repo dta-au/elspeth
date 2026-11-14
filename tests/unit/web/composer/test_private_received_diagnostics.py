@@ -716,7 +716,7 @@ async def test_owned_physical_receipt_reaches_private_sql_read_without_reaccount
     )
     from elspeth.web.sessions.protocol import CompositionStateData
     from elspeth.web.sessions.routes._helpers import _persist_turn_audit_cohort
-    from tests.unit.web.composer.test_pipeline_planner import _budget, _custody, _empty_state, _lifecycle, _model
+    from tests.unit.web.composer.test_pipeline_planner import _budget, _context_policy, _custody, _empty_state, _lifecycle, _model
     from tests.unit.web.composer.test_pipeline_planner_protocol_rejections import _length_stopped_tool_response
     from tests.unit.web.sessions.test_record_audit_grade_view import _get
     from tests.unit.web.sessions.test_token_usage_adapters import _ledger, _quota_service
@@ -789,6 +789,7 @@ async def test_owned_physical_receipt_reaches_private_sql_read_without_reaccount
                 rendered_skill=load_pipeline_capability_core(),
                 repair_budget=1,
                 budget_policy=_budget(),
+                context_policy=_context_policy(),
                 custody_config=replace(
                     _custody(tmp_path), session_engine=engine, session_operation_context=context, session_operation_authority=authority
                 ),

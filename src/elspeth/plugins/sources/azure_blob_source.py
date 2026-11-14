@@ -40,6 +40,7 @@ from elspeth.plugins.infrastructure.config_base import (
     NormalizedFieldMappingOption,
     declared_source_schema_field_names,
 )
+from elspeth.plugins.infrastructure.config_content import reject_nonfinite_constant
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,
@@ -52,7 +53,6 @@ from elspeth.plugins.sources.field_normalization import (
 )
 from elspeth.plugins.sources.json_source import (
     _contains_surrogateescape_chars,
-    _reject_nonfinite_constant,
     _surrogateescape_line_to_bytes,
 )
 
@@ -424,7 +424,7 @@ class AzureBlobSource(BaseSource):
     name = "azure_blob"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9b3702740122b8f8"
+    source_file_hash: str | None = "sha256:c5f9aa22ec4da71d"
     config_model = AzureBlobSourceConfig
 
     usage_when_to_use: str = (
@@ -982,7 +982,7 @@ class AzureBlobSource(BaseSource):
             return
 
         try:
-            data = json.loads(text_data, parse_constant=_reject_nonfinite_constant)
+            data = json.loads(text_data, parse_constant=reject_nonfinite_constant)
         except (json.JSONDecodeError, ValueError) as e:
             error_msg = f"Invalid JSON in blob: {e}"
             yield from _record_file_level_error(error_msg, "parse")
@@ -1061,7 +1061,7 @@ class AzureBlobSource(BaseSource):
 
                 # Catch JSON parse errors at the trust boundary
                 try:
-                    row = json.loads(line, parse_constant=_reject_nonfinite_constant)
+                    row = json.loads(line, parse_constant=reject_nonfinite_constant)
                 except (json.JSONDecodeError, ValueError) as e:
                     # External data parse failure - quarantine, don't crash
                     # Store raw line + metadata for audit traceability

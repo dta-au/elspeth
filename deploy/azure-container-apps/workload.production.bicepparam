@@ -24,6 +24,8 @@ param terminationGracePeriodSeconds = 60
 // Ingress request timeout is a fixed 240 s; keep headroom (facts §2.2).
 param composerTransportIdleCeilingSeconds = 210
 param composerMaxCompositionTurns = 50
+// Placeholder: set to your model gateway's prompt-token limit before deploying.
+param composerContextMaxPromptTokens = 200000
 param composerMaxDiscoveryTurns = 20
 param composerTimeoutSeconds = 180
 param composerRateLimitPerMinute = 10

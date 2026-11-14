@@ -843,6 +843,7 @@ class TestProfilingInstrumentation:
             finally:
                 transform.close()
 
+    @pytest.mark.timing_sensitive
     def test_batch_processing_overhead(self, chaosllm_server) -> None:
         """Measure overhead of batch processing logic."""
 

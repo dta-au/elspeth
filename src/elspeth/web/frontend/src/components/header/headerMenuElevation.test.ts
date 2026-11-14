@@ -98,6 +98,42 @@ describe("header floating surfaces (elspeth-4d38a73632)", () => {
     ).toEqual([]);
   });
 
+  // ARGOnite: .app-header sets `color: var(--color-on-nav)` for the green
+  // band, and a floating surface opened from it paints an ordinary surface
+  // fill. A surface that inherits the band's ink shows on-nav text on a body
+  // surface (about 1:1 in the light theme), so each one must name its own
+  // text colour. Like the rest of this file the scan is header.css only: the
+  // version dropdown floats from inspector.css and is pinned by name below.
+  it("gives every floating surface its own text colour, not the band's", () => {
+    const inheriting = floatingRules
+      .filter((rule) => declaredValue(rule, "color") === undefined)
+      .flatMap((rule) => rule.selectors);
+
+    expect(
+      inheriting,
+      "floating header surfaces that inherit --color-on-nav from .app-header",
+    ).toEqual([]);
+
+    const versionDropdown = rules.find((rule) =>
+      rule.selectors.includes(
+        ".header-version-selector .version-selector-dropdown",
+      ),
+    );
+    expect(versionDropdown).toBeDefined();
+    expect(declaredValue(versionDropdown as Rule, "color")).toBe(
+      "var(--color-text)",
+    );
+
+    // Dialogs are not portalled: the session switcher mounts its archive
+    // confirm inside the header, so the shared dialog surface owes the same.
+    const sharedCss = stripComments(
+      readFileSync("src/styles/shared.css", "utf8"),
+    );
+    expect(sharedCss).toMatch(
+      /\.app-dialog,\s*\.confirm-dialog\s*\{[^}]*position:\s*fixed[^}]*(?:^|;)\s*color:\s*var\(--color-text\)/m,
+    );
+  });
+
   // z-index is deliberately NOT compared here: the two menus sit on different
   // documented tiers, and moving one is a system-wide call that also binds the
   // chat, workspace and inspector menus. The scale test above is what holds —

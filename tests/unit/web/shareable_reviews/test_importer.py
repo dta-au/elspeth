@@ -69,6 +69,7 @@ def client(tmp_path: Path, actor: _Actor) -> Iterator[SyncASGITestClient]:
         landscape_url=f"sqlite:///{tmp_path}/runs/audit.db",
         payload_store_path=tmp_path / "payloads",
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_boot_probe_enabled=False,

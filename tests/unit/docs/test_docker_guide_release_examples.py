@@ -63,6 +63,7 @@ def test_docker_guide_has_a_runnable_standalone_web_container() -> None:
     assert "-p 8451:8451" in section
     assert "web --host 0.0.0.0 --port 8451" in section
     assert "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS=15" in section
+    assert "ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS=200000" in section
     assert "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS=10" in section
     assert "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=300.0" in section
     assert "ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS=360.0" in section
@@ -71,6 +72,7 @@ def test_docker_guide_has_a_runnable_standalone_web_container() -> None:
         "ELSPETH_WEB__SECRET_KEY",
         "ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY",
         "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS",
+        "ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS",
         "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS",
         "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS",
         "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE",

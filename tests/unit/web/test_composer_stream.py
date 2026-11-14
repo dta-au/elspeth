@@ -137,6 +137,7 @@ async def test_subscriber_cancellation_retains_permit_until_owned_read_or_auth_f
 
 
 @pytest.mark.asyncio
+@pytest.mark.timing_sensitive
 async def test_default_asgi_send_deadline_bounds_actual_send_and_keeps_resistant_permit() -> None:
     permits = ComposerStreamPermits()
     permit = permits.acquire("op", "alice")
@@ -176,6 +177,7 @@ async def test_default_asgi_send_deadline_bounds_actual_send_and_keeps_resistant
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["authorization", "read"])
+@pytest.mark.timing_sensitive
 async def test_actual_default_read_auth_deadline_retains_pending_custody(phase: str) -> None:
     from starlette.exceptions import HTTPException
 

@@ -390,3 +390,188 @@ def test_historical_read_recovery_requires_owned_writer_and_exact_parent_operati
     event = json.loads(owner.snapshot().provider_json)["events"][1]
     assert event["read_body_availability"].startswith("unavailable_")
     assert not calls and "recovered_read" not in event
+
+
+# --- Context-budget reduction --------------------------------------------------------------------
+
+
+def _transcript_with_history():
+    """Two prior human events, the current request (a reference), then current tool round events."""
+    sid = uuid4()
+    first = _row(sid, "user", "First requirement", writer="route_user_message", sequence_no=1)
+    second = _row(sid, "user", 'Second "quoted" requirement é', writer="route_user_message", sequence_no=2)
+    current = _row(sid, "user", "Complete current request", writer="route_user_message", sequence_no=3)
+    history = AdvisorTranscriptHistory.from_records(
+        session_id=str(sid),
+        actor_user_id="actor",
+        current_request_id=str(current.id),
+        request=current.content,
+        records=(first, second, current),
+    )
+    owner = AdvisorTranscriptOwner(request=current.content, history=history)
+    owner.begin_messages([])
+    owner.observe_messages(
+        [
+            {
+                "role": "assistant",
+                "content": "Checking the state",
+                "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "get_pipeline_state", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": json.dumps({"success": True, "data": {"nodes": []}})},
+        ]
+    )
+    return owner.snapshot().with_request_reference("initial_planner_request.intent")
+
+
+def test_every_event_but_the_current_request_reference_is_sheddable():
+    transcript = _transcript_with_history()
+    events = json.loads(transcript.provider_json)["events"]
+
+    assert len(events) == 5 and events[2]["content_ref"] == "initial_planner_request.intent"
+    assert transcript.sheddable_event_indices() == (0, 1, 3, 4)
+
+
+def _legacy_invocation(call_id: str, arguments: dict, result: dict) -> dict:
+    arguments_canonical = json.dumps(arguments, separators=(",", ":"), sort_keys=True)
+    result_canonical = json.dumps(result, separators=(",", ":"), sort_keys=True)
+    return {
+        "tool_call_id": call_id,
+        "tool_name": "get_blob_content",
+        "status": "success",
+        "arguments_canonical": arguments_canonical,
+        "arguments_hash": hashlib.sha256(arguments_canonical.encode()).hexdigest(),
+        "result_canonical": result_canonical,
+        "result_hash": hashlib.sha256(result_canonical.encode()).hexdigest(),
+    }
+
+
+def legacy_history_transcript(*, reference: str | None = "initial_planner_request.intent"):
+    """A forked/legacy history: humans and legacy tool rows whose content is a reference into their own invocation."""
+    sid = uuid4()
+    rows = []
+    for sequence_no, (call_id, body) in enumerate(
+        [("legacy-1", 'Rows: "a","b" \u00e9 \\ ' * 40), ("legacy-2", "Second result \n with a newline " * 30)], start=1
+    ):
+        rows.append(_row(sid, "user", f"Read part {sequence_no}", writer="route_user_message", sequence_no=2 * sequence_no - 1))
+        invocation = _legacy_invocation(call_id, {"blob_id": call_id, "offset": sequence_no}, {"success": True, "data": {"content": body}})
+        rows.append(
+            _row(
+                sid,
+                "tool",
+                invocation["result_canonical"],
+                sequence_no=2 * sequence_no,
+                tool_call_id=call_id,
+                tool_calls=[{"_kind": "audit", "invocation": invocation}],
+            )
+        )
+    current = _row(sid, "user", "Continue", writer="route_user_message", sequence_no=5)
+    history = AdvisorTranscriptHistory.from_records(
+        session_id=str(sid), actor_user_id="actor", current_request_id=str(current.id), request="Continue", records=(*rows, current)
+    )
+    snapshot = AdvisorTranscriptOwner(request="Continue", history=history).snapshot()
+    return snapshot.with_request_reference(reference) if reference is not None else snapshot
+
+
+@pytest.mark.parametrize("reference", [None, "initial_planner_request.intent"], ids=["original-section", "planner-intent"])
+def test_legacy_reference_events_are_sheddable_and_only_the_current_request_reference_is_protected(reference):
+    transcript = legacy_history_transcript(reference=reference)
+    events = json.loads(transcript.provider_json)["events"]
+
+    refs = [event.get("content_ref") for event in events]
+    assert refs == [
+        None,
+        "legacy_invocations[0].result_canonical",
+        None,
+        "legacy_invocations[0].result_canonical",
+        reference or "complete_original_user_request_section",
+    ]
+    # Each legacy reference points inside its own event.
+    assert all(events[index]["legacy_invocations"][0]["result_canonical"] for index in (1, 3))
+    assert transcript.sheddable_event_indices() == (0, 1, 2, 3)
+    reduced = json.loads(transcript.without_events(frozenset({0, 1})).provider_json)["events"]
+    assert reduced == events[2:]
+    with pytest.raises(ValueError, match="sheddable"):
+        transcript.without_events(frozenset({4}))
+
+
+def test_event_bytes_are_each_events_serialization_in_the_transcript_plus_its_separator():
+    transcript = _transcript_with_history()
+    events = json.loads(transcript.provider_json)["events"]
+
+    sizes = transcript.event_bytes()
+
+    assert sizes == tuple(len(json.dumps(event, ensure_ascii=False).encode("utf-8")) + 1 for event in events)
+    # Each event's serialization is a verbatim substring of the transcript.
+    assert all(json.dumps(event, ensure_ascii=False) in transcript.provider_json for event in events)
+
+
+def test_event_wire_bytes_are_each_events_escaped_serialization_inside_a_message_plus_one():
+    """The transcript rides inside a JSON string: an event's wire share is its escaped serialization."""
+    from elspeth.core.canonical import canonical_json
+
+    transcript = _transcript_with_history()
+    events = json.loads(transcript.provider_json)["events"]
+
+    wire = transcript.event_wire_bytes()
+
+    escaped = [canonical_json(json.dumps(event, ensure_ascii=False))[1:-1] for event in events]
+    assert wire == tuple(len(text.encode("utf-8")) + 1 for text in escaped)
+    # Each escaped serialization is a verbatim substring of the escaped transcript.
+    carried = canonical_json(transcript.provider_json)
+    assert all(text in carried for text in escaped)
+    # Events carry quotes, so the wire share is larger than the transcript share.
+    assert all(w > b for w, b in zip(wire, transcript.event_bytes(), strict=True))
+
+
+def test_without_events_drops_exactly_the_named_events_and_discloses_the_omission_once():
+    from elspeth.contracts.hashing import stable_hash
+    from elspeth.web.composer.advisor_transcript import CONTEXT_BUDGET_TRANSCRIPT_OMISSION_GAP
+
+    transcript = _transcript_with_history()
+    original = json.loads(transcript.provider_json)
+
+    reduced = transcript.without_events(frozenset({0, 1}))
+
+    payload = json.loads(reduced.provider_json)
+    assert payload["events"] == original["events"][2:]
+    assert payload["availability_gaps"] == [*original["availability_gaps"], CONTEXT_BUDGET_TRANSCRIPT_OMISSION_GAP]
+    assert {key: value for key, value in payload.items() if key not in ("events", "availability_gaps")} == {
+        key: value for key, value in original.items() if key not in ("events", "availability_gaps")
+    }
+    # The rest of the transcript is byte-identical: only the dropped events, their separators and the gap differ.
+    dropped = "".join(json.dumps(event, ensure_ascii=False) + ", " for event in original["events"][:2])
+    assert reduced.provider_json == transcript.provider_json.replace(dropped, "", 1).replace(
+        '"availability_gaps": []', f'"availability_gaps": ["{CONTEXT_BUDGET_TRANSCRIPT_OMISSION_GAP}"]', 1
+    )
+    assert reduced.binding == stable_hash({"transcript": transcript.binding, "omitted_events": [0, 1]})
+    assert reduced.binding != transcript.binding
+    assert reduced.semantic_binding == transcript.semantic_binding
+    assert reduced.request == transcript.request
+    # Reducing a reduced transcript records the gap once.
+    again = json.loads(reduced.without_events(frozenset({1})).provider_json)
+    assert again["availability_gaps"].count(CONTEXT_BUDGET_TRANSCRIPT_OMISSION_GAP) == 1
+    assert again["events"] == [original["events"][2], original["events"][4]]
+
+
+def test_without_events_keeps_the_current_request_reference_and_events_after_it():
+    transcript = _transcript_with_history()
+    original = json.loads(transcript.provider_json)["events"]
+
+    reduced = json.loads(transcript.without_events(frozenset({0, 1, 3})).provider_json)["events"]
+
+    assert reduced == [original[2], original[4]]
+    assert reduced[0]["content_ref"] == "initial_planner_request.intent"
+
+
+def test_without_no_events_is_the_same_transcript():
+    transcript = _transcript_with_history()
+
+    assert transcript.without_events(frozenset()) is transcript
+
+
+@pytest.mark.parametrize("indices", [frozenset({2}), frozenset({0, 2}), frozenset({5}), frozenset({-1})])
+def test_without_events_refuses_the_current_request_and_indices_it_does_not_hold(indices):
+    transcript = _transcript_with_history()
+
+    with pytest.raises(ValueError, match="sheddable"):
+        transcript.without_events(indices)

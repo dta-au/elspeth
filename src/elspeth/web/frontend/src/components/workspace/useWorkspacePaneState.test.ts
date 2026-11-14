@@ -12,6 +12,7 @@ import {
   ARTIFACT_MIN,
   AUTHORING_MAX,
   AUTHORING_MIN,
+  WORKSPACE_INLINE_GUTTERS,
   clampAuthoringWidth,
   nearestAvailableArtifactTab,
   paneBoundsForWidth,
@@ -170,18 +171,38 @@ describe("workspace pane state", () => {
         defaultWidth: AUTHORING_MIN,
         resizable: false,
       });
-      expect(paneBoundsForWidth(1100).max).toBe(1100 - ARTIFACT_MIN);
+      // Card widths exclude both slots' padding; retain the 640px artifact card.
+      expect(paneBoundsForWidth(1100).max).toBe(1100 - ARTIFACT_MIN - WORKSPACE_INLINE_GUTTERS);
       expect(paneBoundsForWidth(1100).resizable).toBe(true);
-      expect(paneBoundsForWidth(1280).max).toBe(AUTHORING_MAX);
+      expect(paneBoundsForWidth(1280).max).toBe(598);
       expect(paneBoundsForWidth(1280).resizable).toBe(true);
+      expect(paneBoundsForWidth(1322).max).toBe(AUTHORING_MAX);
     });
+
+    it.each([1000, 1041, 1042, 1043, 1100, 1280, 1322, 1920])(
+      "preserves card floors and the exact resize threshold at %ipx",
+      (width) => {
+        const bounds = paneBoundsForWidth(width);
+        expect(bounds.min).toBe(360);
+        expect(bounds.max).toBe(Math.max(360, Math.min(640, width - 640 - 42)));
+        expect(bounds.resizable).toBe(width > 1042);
+        if (width >= 1042) {
+          expect(width - bounds.max - WORKSPACE_INLINE_GUTTERS).toBeGreaterThanOrEqual(640);
+        } else {
+          // Compact fallback keeps the card minimum and spends the remainder
+          // on the artifact, without pretending both floors fit.
+          expect(bounds.max).toBe(360);
+        }
+      },
+    );
 
     it("clamps preferred widths into the supplied bounds", () => {
       const bounds = paneBoundsForWidth(1100);
 
       expect(clampAuthoringWidth(300, bounds)).toBe(360);
-      expect(clampAuthoringWidth(420, bounds)).toBe(420);
-      expect(clampAuthoringWidth(620, bounds)).toBe(460);
+      expect(clampAuthoringWidth(400, bounds)).toBe(400);
+      expect(clampAuthoringWidth(420, bounds)).toBe(418);
+      expect(clampAuthoringWidth(620, bounds)).toBe(418);
     });
 
     it.each([
@@ -292,7 +313,7 @@ describe("workspace pane state", () => {
       rerender({ width: 1100 });
 
       expect(result.current.preferredAuthoringWidth).toBe(620);
-      expect(result.current.effectiveAuthoringWidth).toBe(460);
+      expect(result.current.effectiveAuthoringWidth).toBe(418);
       expect(storedLayout()?.preferredAuthoringWidth).toBe(620);
     });
 
@@ -318,11 +339,11 @@ describe("workspace pane state", () => {
         result.current.commitResize(620);
       });
 
-      expect(result.current.preferredAuthoringWidth).toBe(460);
-      expect(result.current.effectiveAuthoringWidth).toBe(460);
+      expect(result.current.preferredAuthoringWidth).toBe(418);
+      expect(result.current.effectiveAuthoringWidth).toBe(418);
       expect(storedLayout()).toEqual({
         version: 1,
-        preferredAuthoringWidth: 460,
+        preferredAuthoringWidth: 418,
         authoringCollapsed: false,
       });
     });
@@ -647,7 +668,7 @@ describe("workspace pane state", () => {
       );
       view.rerender(createElement(ResizeHarness, { workspaceWidth: 1100 }));
 
-      expect(storedLayout()?.preferredAuthoringWidth).toBe(460);
+      expect(storedLayout()?.preferredAuthoringWidth).toBe(418);
     });
 
     it.each([
@@ -748,7 +769,7 @@ describe("workspace pane state", () => {
       rerender({ width: 1100 });
 
       expect(result.current.preferredAuthoringWidth).toBe(620);
-      expect(result.current.effectiveAuthoringWidth).toBe(460);
+      expect(result.current.effectiveAuthoringWidth).toBe(418);
       expect(storedLayout()?.preferredAuthoringWidth).toBe(620);
     });
 

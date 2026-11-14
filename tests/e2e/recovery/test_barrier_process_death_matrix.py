@@ -1466,6 +1466,7 @@ def _observe_single_process(db: LandscapeDB, request: pytest.FixtureRequest) -> 
         "collector_realistic_shape_resume",
     ),
 )
+@pytest.mark.timing_sensitive
 def test_single_process_leader_barrier_process_death_matrix(
     tmp_path: Path,
     request: pytest.FixtureRequest,

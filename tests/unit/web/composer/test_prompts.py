@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ControlMode, PluginCapability
@@ -25,6 +27,7 @@ from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService, PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSecretRequirement, PluginSummary
+from elspeth.web.composer.capability_skill import load_pipeline_capability_core
 from elspeth.web.composer.discovery_cache import serialize_tool_result, tool_result_content_parts
 from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids
 from elspeth.web.composer.prompts import (
@@ -474,6 +477,7 @@ class TestBuildContextString:
         settings = WebSettings.model_validate(
             {
                 "composer_max_composition_turns": 4,
+                "composer_context_max_prompt_tokens": 200_000,
                 "composer_max_discovery_turns": 4,
                 "composer_timeout_seconds": 60,
                 "composer_rate_limit_per_minute": 20,
@@ -652,6 +656,17 @@ class TestBuildSystemPrompt:
         result = build_system_prompt("")
         assert result == SYSTEM_PROMPT
 
+    def test_core_skill_gate_mismatch_row_defers_to_the_diagnostic_by_kind(self) -> None:
+        """The repair row must not tell the model to type fields for every gate evaluation failure."""
+        flattened = " ".join(build_system_prompt(None).split())
+        row_start = flattened.index("| `gate_expression_type_mismatch_against_source_schema` |")
+        row = flattened[row_start : flattened.index(" |", row_start + 60)]
+
+        assert "Apply the diagnostic's own `suggested_repair`" in row
+        assert "a misspelt field" in row
+        assert "For the string-vs-number case: declare numeric fields in source schema" in row
+        assert not row.split("| ")[2].startswith("Declare numeric fields")
+
     def test_core_skill_batches_complex_new_pipeline_builds(self) -> None:
         """Large builds save coherent batches and continue to the requested topology."""
         result = build_system_prompt(None)
@@ -762,6 +777,47 @@ class TestBuildSystemPrompt:
         assert "For a user-uploaded LLM prompt, wire the ready user-verbatim blob" in flattened
         assert "Do not synthesize a replacement artifact" in flattened
         assert "ask one narrow file-selection question" in flattened
+
+    def test_file_inject_guidance_names_path_and_upload_rule(self) -> None:
+        """file_inject content is an attached user upload: never a planner blob, never literal text."""
+        flattened = " ".join(build_system_prompt(None).split())
+
+        assert "`mode: select`" in flattened and "`mode: all`" in flattened
+        assert "State `format` on every entry" in flattened
+        # The rule, said once: a user upload, never a planner-created blob, never literal text.
+        assert (
+            "In the composer, `file_inject` content must be a file the user uploaded; anything else is refused, "
+            "so do not create the blob yourself or write literal text into `content`."
+        ) in flattened
+        steps = (
+            "(1) Tell the user to save the text as a file and upload it.",
+            "(2) Once it is uploaded, find it with `list_blobs` / `get_blob_metadata`.",
+            "(3) Attach it: for an entry that already exists, `wire_blob_inline_ref` at "
+            "`node:<node_id>.options.files.<entry_name>.content`;",
+            # A node cannot exist without content, so creating one carries the marker in the same call.
+            "when the call creates the node or the entry, set that entry's `content` to "
+            '`{"blob_ref": "<blob_id>", "mode": "inline_content", "sha256": "<content_hash>"}`',
+        )
+        positions = [flattened.find(step) for step in steps]
+        assert -1 not in positions, positions
+        assert positions == sorted(positions)
+        assert "`default_content` is not accepted either: use `on_miss: null` or `on_miss: fail`" in flattened
+        # Scoped to this plugin: other planner-created content keeps its own rules.
+        assert "This rule is specific to `file_inject`; it changes nothing about a source or prompt text you author." in flattened
+        # Non-duplication: the upload instruction and the marker shape each appear once.
+        assert flattened.count("save the text as a file and upload it") == 1
+        assert flattened.count('"mode": "inline_content"') == 1
+
+    def test_capability_core_teaches_file_inject_modes(self) -> None:
+        """The shared core carries the mode semantics once; the interaction skill does not repeat them."""
+        core = " ".join(load_pipeline_capability_core().split())
+
+        assert "For a selected `file_inject`" in core
+        assert "`mode: select`" in core and "`mode: all`" in core
+        assert "`key_field`" in core and "`on_miss`" in core
+        assert "State `format` on every entry" in core
+        # Said once: the interaction skill must not carry a second copy of the passage.
+        assert " ".join(build_system_prompt(None).split()).count("For a selected `file_inject`") == 1
 
     def test_core_skill_rejects_persona_column_and_format_fabrication(self) -> None:
         """Panel-persona prose must not override inspected source facts."""
@@ -1010,7 +1066,7 @@ class TestBuildSystemPrompt:
             "Do not call `request_interpretation_review` or tell the user review cards are waiting while the latest mutation reports non-review validation errors"
             in flattened
         )
-        assert "repair the topology first, then surface the review cards" in flattened
+        assert "Repair the topology first, then surface the review cards from the repaired state" in flattened
         assert "Review acceptance is not required before adding a missing schema-proven cleanup transform" in flattened
         assert "Do not treat a subset of pending review cards as enough" in flattened
         assert "missing `vague_term` or prompt-injection recommendation review is still non-terminal" in flattened
@@ -1530,6 +1586,135 @@ class TestReplyRegisterRule:
         assert "no tool-argument keys, validation fields, or enum values in prose" in checklist
 
 
+class TestSkillFollowsCurrentToolBehaviour:
+    """Skill sentences that had drifted from what the tools now do."""
+
+    def test_approval_required_is_not_reported_as_validated(self) -> None:
+        # tool_batch.py builds the APPROVAL_REQUIRED result with the unchanged
+        # state and that state's validation; proposals.py refuses a proposal
+        # whose base_state_id is no longer current.
+        flattened = " ".join(SYSTEM_PROMPT.split())
+
+        assert "describes the unchanged saved graph, not the proposed change" in flattened
+        assert "never report the proposal as validated" in flattened
+
+    def test_approval_mode_sends_one_composition_change_per_response(self) -> None:
+        # tool_batch.py refuses a multi-mutation response whole
+        # (approval_batch_not_atomic) and a further mutation while a proposal
+        # is pending (approval_proposal_pending); the narrowest-tool guidance
+        # would otherwise walk the model straight into both.
+        flattened = " ".join(SYSTEM_PROMPT.split())
+
+        assert "send exactly ONE composition-changing call per response" in flattened
+        assert "one complete `set_pipeline` carrying every part of a multi-part change" in flattened
+        assert "`approval_batch_not_atomic`" in flattened
+        assert "`approval_proposal_pending`" in flattened
+        assert "applies only where changes apply directly" in flattened
+        assert "tell the user to accept or reject it, and stop" in flattened
+
+    def test_declared_schema_modes_say_which_need_fields(self) -> None:
+        # contracts.schema refuses mode fixed/flexible without `fields`; three
+        # live planner candidates were rejected for a bare `mode: flexible`.
+        flattened = " ".join(SYSTEM_PROMPT.split())
+
+        assert "`fixed` and `flexible` both require `fields`; only `observed` takes none." in flattened
+
+    def test_unchanged_result_and_hints_are_taught_as_the_server_sends_them(self) -> None:
+        # tool_batch._unapplied_admission appends a server-authored hint to a
+        # no-op result, so hints are not only plugin-authored.
+        from elspeth.web.composer import tool_batch
+
+        flattened = " ".join(SYSTEM_PROMPT.split())
+
+        assert "`post_call_hints` are plugin-authored next steps" not in flattened
+        assert "advisory next-step notes from the plugin or the server" in flattened
+        assert "saying the pipeline is unchanged and no proposal was submitted" in flattened
+        assert "The pipeline is unchanged; no proposal was submitted for approval." in Path(tool_batch.__file__).read_text()
+
+    def test_edit_table_does_not_send_an_edgeless_pipeline_to_splice(self) -> None:
+        flattened = " ".join(SYSTEM_PROMPT.split())
+
+        assert "it refuses a pipeline whose `edges` is empty" in flattened
+        assert "use `upsert_node` for the new node and re-point the successor's `input`" in flattened
+
+    def test_preview_and_diff_limits_are_stated(self) -> None:
+        flattened = " ".join(SYSTEM_PROMPT.split())
+
+        assert "`preview_pipeline` reports structure and contract verdicts, never row data" in flattened
+        assert "never tell the user that earlier versions do not exist" in flattened
+        assert "then preview and diff it" not in flattened
+
+    def test_stale_claims_stay_removed(self) -> None:
+        flattened = " ".join(SYSTEM_PROMPT.split())
+
+        assert "Landscape/run-analysis tools" not in flattened
+        assert "Recipes accelerate common builds" not in flattened
+        assert "Every authoring surface receives these exact bytes" not in flattened
+        assert "each key is a name from the upstream gate's `fork_to`" in flattened
+        assert "declare its input requirements as `schema.required_fields`" in flattened
+
+
+class TestHotPathAuthoringFacts:
+    """Facts a traced planner had to guess, each stated once and checked against code."""
+
+    def test_boolean_gate_labels_match_the_gate_settings_validator(self) -> None:
+        import pytest
+        from pydantic import ValidationError
+
+        from elspeth.core.config import GateSettings
+
+        flattened = " ".join(SYSTEM_PROMPT.split())
+        assert 'A boolean `condition` routes on exactly the labels `"true"` and `"false"`' in flattened
+
+        GateSettings(name="g", input="rows", condition="row['n'] >= 20", routes={"true": "a", "false": "b"})
+        with pytest.raises(ValidationError, match="route labels"):
+            GateSettings(name="g", input="rows", condition="row['n'] >= 20", routes={"big": "a", "small": "b"})
+
+    def test_source_coercion_spellings_match_the_schema_factory(self) -> None:
+        import pytest
+        from pydantic import ValidationError
+
+        from elspeth.contracts.schema import SchemaConfig
+        from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+
+        flattened = " ".join(SYSTEM_PROMPT.split())
+        assert "turns integer text into `int`, numeric text into `float`, and `true`/`false`, `yes`/`no`, `1`/`0` into `bool`" in flattened
+        assert "a cell that does not parse fails source validation" in flattened
+        assert "Sinks never coerce" in flattened
+
+        config = SchemaConfig.from_dict({"mode": "flexible", "fields": ["flag: bool", "count: int", "rate: float"]})
+        coercing = create_schema_from_config(config, "CoercingRow", allow_coercion=True)
+        for text, expected in (("true", True), ("false", False), ("yes", True), ("no", False), ("1", True), ("0", False)):
+            assert coercing.model_validate({"flag": text, "count": "42", "rate": "1.5"}).model_dump()["flag"] is expected
+        row = coercing.model_validate({"flag": "true", "count": "42", "rate": "1.5"}).model_dump()
+        assert (row["count"], row["rate"]) == (42, 1.5)
+        with pytest.raises(ValidationError):
+            coercing.model_validate({"flag": "maybe", "count": "42", "rate": "1.5"})
+        strict = create_schema_from_config(config, "StrictRow", allow_coercion=False)
+        with pytest.raises(ValidationError):
+            strict.model_validate({"flag": "true", "count": "42", "rate": "1.5"})
+
+    def test_inline_blob_position_and_downgrade_disclosure_are_stated(self) -> None:
+        flattened = " ".join(SYSTEM_PROMPT.split())
+
+        assert "`inline_blob` sits on `source` beside `options`, never inside it" in flattened
+        assert "you need not author `guaranteed_fields`" in flattened
+        # contracts/schema.py: only REQUIRED declared fields are implicitly guaranteed.
+        from elspeth.contracts.schema import SchemaConfig
+
+        assert "Non-optional fields declared under `fixed`/`flexible` are guaranteed" in flattened
+        declared = SchemaConfig.from_dict({"mode": "flexible", "fields": ["kept: str", "maybe: str?"]})
+        assert declared.get_effective_guaranteed_fields() == frozenset({"kept"})
+        # Disclosure is conditioned on a named gap: it is not a third outcome
+        # beside "repair the node, or refuse with a named gap".
+        assert (
+            "If a non-core part of the request is a named gap and you deliver the rest, say so first in your reply and in "
+            "`metadata.description`" in flattened
+        )
+        assert "if the gap is the request's core operation, decline instead" in flattened
+        assert "omits or substitutes any part of the request" not in flattened
+
+
 class TestMutationEchoOperatingContract:
     """The high-salience freeform contract prevents post-success reread loops."""
 
@@ -1555,3 +1740,54 @@ class TestMutationEchoOperatingContract:
         assert "Only when that mutation omitted the echo or its echo does not cover the affected component" in flattened
         assert "Read `get_pipeline_state`" not in flattened
         assert "Read the current pipeline state" not in flattened
+
+
+class TestConversationOmissions:
+    """``build_context_string(conversation_omissions=...)`` carries only integer counts."""
+
+    def test_counts_above_zero_are_emitted_at_top_level(self) -> None:
+        context = build_context_string(
+            _empty_state(),
+            _stub_catalog(),
+            conversation_omissions={"prior_user_requests_omitted": 1, "prior_assistant_messages_omitted": 3},
+        )
+        payload = json.loads(context.split("\n", 1)[1])
+        assert payload["conversation_omissions"] == {"prior_user_requests_omitted": 1, "prior_assistant_messages_omitted": 3}
+
+    def test_the_largest_omission_counts_fit_the_context_budget_allowance(self) -> None:
+        from elspeth.web.composer.context_budget_apply import CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES
+
+        largest = 10**20 - 1
+        baseline = build_context_string(_empty_state(), _stub_catalog())
+        with_counts = build_context_string(
+            _empty_state(),
+            _stub_catalog(),
+            conversation_omissions={"prior_user_requests_omitted": largest, "prior_assistant_messages_omitted": largest},
+        )
+        assert len(with_counts.encode()) - len(baseline.encode()) <= CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES
+
+    @pytest.mark.parametrize(
+        "omissions", [None, {"prior_user_requests_omitted": 0, "prior_assistant_messages_omitted": 0}], ids=["absent", "zero"]
+    )
+    def test_no_omission_leaves_the_context_unchanged(self, omissions: dict[str, int] | None) -> None:
+        baseline = build_context_string(_empty_state(), _stub_catalog())
+        assert build_context_string(_empty_state(), _stub_catalog(), conversation_omissions=omissions) == baseline
+        assert "conversation_omissions" not in baseline
+
+    @pytest.mark.parametrize(
+        "omissions",
+        [
+            {"prior_user_requests_omitted": 1},
+            {"prior_assistant_messages_omitted": 1},
+            {},
+            {"prior_user_requests_omitted": 1, "prior_assistant_messages_omitted": 1, "recap": 1},
+            {"prior_user_requests_omitted": 1, "assistant_omitted": 1},
+            {"prior_user_requests_omitted": -1, "prior_assistant_messages_omitted": 1},
+            {"prior_user_requests_omitted": True, "prior_assistant_messages_omitted": 1},
+            {"prior_user_requests_omitted": 1, "prior_assistant_messages_omitted": 1.0},
+        ],
+        ids=["missing-assistant", "missing-user", "empty", "extra-key", "wrong-key", "negative", "bool", "float"],
+    )
+    def test_malformed_omissions_raise_value_error(self, omissions: dict[str, Any]) -> None:
+        with pytest.raises(ValueError, match="conversation_omissions must hold exactly the two non-negative omission counts"):
+            build_context_string(_empty_state(), _stub_catalog(), conversation_omissions=omissions)

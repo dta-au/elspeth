@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import signal
 import threading
 from typing import TYPE_CHECKING
 
@@ -33,19 +32,27 @@ class ProcessRecovery:
     async def _monitor(self) -> None:
         try:
             await self.watchdog.observe_helper_outcome()
-        except BaseException:
+        except BaseException as original:
             self.instance_draining.set()
-            self.watchdog.request_signal(signal.SIGKILL)
+            self._force_after_failure(original)
             raise
+
+    def _force_after_failure(self, original: BaseException) -> None:
+        try:
+            self.watchdog.force_termination()
+        except BaseException as termination:
+            if termination is original:
+                raise
+            raise BaseExceptionGroup("Process supervision and forced termination failed", [original, termination]) from None
 
     async def _escalate(self, reason: RecoveryReason, *, signal_target: bool) -> None:
         try:
             await self.watchdog.begin_recovery(reason)
-        except BaseException:
-            self.watchdog.request_signal(signal.SIGKILL)
+        except BaseException as original:
+            self._force_after_failure(original)
             raise
         if signal_target:
-            self.watchdog.request_signal(signal.SIGTERM)
+            self.watchdog.request_graceful_termination()
 
     def _begin(self, reason: RecoveryReason, *, signal_target: bool) -> None:
         self.instance_draining.set()

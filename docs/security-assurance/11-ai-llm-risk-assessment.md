@@ -184,7 +184,7 @@ Defaults measured from the Web settings model at the review baseline
 | Limit | Setting | Product default |
 |---|---|---|
 | Planner calls per composition | `composer_planner_max_provider_calls` | 75 |
-| Planner request size | `composer_planner_max_request_bytes` | 2 MiB |
+| Planner request size | `composer_planner_max_request_bytes` | 960 KiB (983,040 bytes; was 2 MiB) |
 | Planner completion tokens per call | `composer_planner_max_completion_tokens` | 16,384 |
 | Planner cumulative provider cost | `composer_planner_max_cumulative_provider_cost` | USD 5.00 |
 | Planner repair attempts | `composer_planner_repair_budget` | 2 |

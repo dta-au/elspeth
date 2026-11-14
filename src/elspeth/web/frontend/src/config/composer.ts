@@ -13,6 +13,12 @@ export function isComposeRefreshOnlyFailureCode(code: string | undefined): boole
 export const COMPOSE_TIMEOUT_ABORT_REASON = "compose_timeout";
 export const COMPOSE_USER_CANCEL_ABORT_REASON = "compose_user_cancel";
 
+/** The request does not fit the composer's context budget: permanent for the session, so no Retry. */
+export const COMPOSE_CONTEXT_BUDGET_EXCEEDED = "context_budget_exceeded";
+/** The server's detail for that refusal, for surfaces that carry only its code. */
+export const COMPOSE_CONTEXT_BUDGET_EXCEEDED_DETAIL =
+  "This conversation is too large for the composer to continue. Start a new session, or shorten your request.";
+
 export function isComposePermanentRefusal(code: string | undefined): boolean {
-  return ["policy_blocked", "admission_refused", "token_accounting_unavailable", "composer_operation_conflict", "recompose_user_message_mismatch"].includes(code ?? "");
+  return ["policy_blocked", "admission_refused", "token_accounting_unavailable", "composer_operation_conflict", "recompose_user_message_mismatch", COMPOSE_CONTEXT_BUDGET_EXCEEDED].includes(code ?? "");
 }

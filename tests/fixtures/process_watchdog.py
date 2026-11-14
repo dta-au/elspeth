@@ -75,6 +75,12 @@ class OwnedTestProcessWatchdog(ProcessWatchdogControl):
     def request_signal(self, sig: signal.Signals) -> None:
         self.signals.append(sig)
 
+    def request_graceful_termination(self) -> None:
+        self.request_signal(signal.SIGTERM)
+
+    def force_termination(self) -> None:
+        self.request_signal(signal.SIGKILL)
+
     def fail(self, error: BaseException) -> None:
         self.failure = error
         self._outcome.set()

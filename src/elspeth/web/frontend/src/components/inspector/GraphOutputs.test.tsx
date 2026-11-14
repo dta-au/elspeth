@@ -5,7 +5,35 @@ import type { CompositionState, NodeSpec } from "@/types";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 import { GraphOutputs } from "./GraphOutputs";
 
+// ARGOnite: the count sits in its own pill span, so the summary's text is no
+// longer one text node; match the <summary> by its whole text content.
+function wiringSummary(count: number) {
+  return (_content: string, element: Element | null) =>
+    element?.tagName === "SUMMARY" && element.textContent === `Wiring (${count})`;
+}
+
 describe("GraphOutputs", () => {
+  it("shows the Wiring count in a pill while the summary text stays \"Wiring (n)\"", () => {
+    const state: CompositionState = {
+      id: "session", ...compositionStateAuthorityFields, version: 1,
+      metadata: { name: null, description: null }, sources: {}, edges: [],
+      nodes: [],
+      outputs: [
+        { name: "first", plugin: "json", options: {} },
+        { name: "second", plugin: "json", options: {} },
+      ],
+    };
+    render(<GraphOutputs state={state} />);
+    const summary = screen.getByText(wiringSummary(2));
+    const pill = summary.querySelector(".graph-outputs-count");
+    expect(pill).not.toBeNull();
+    expect(pill!.textContent).toBe("2");
+    // The parentheses stay in the text (screen readers and e2e locators keep
+    // reading "Wiring (2)"); only the pill is visible.
+    const hidden = [...summary.querySelectorAll(".visually-hidden")].map((node) => node.textContent);
+    expect(hidden).toEqual(["(", ")"]);
+  });
+
   it("mirrors hidden failure routes while retaining ordinary false branches and structural diagnostics", async () => {
     const state: CompositionState = {
       id: "session", ...compositionStateAuthorityFields, version: 1,
@@ -21,7 +49,7 @@ describe("GraphOutputs", () => {
     };
     const before = JSON.stringify(state);
     render(<GraphOutputs state={state} showFailureRoutes={false} hiddenOutputNames={new Set(["quarantine"])} />);
-    await userEvent.setup().click(screen.getByText("Wiring (3)"));
+    await userEvent.setup().click(screen.getByText(wiringSummary(3)));
     expect(screen.getByRole("row", { name: /Gate: decision/ })).toHaveTextContent("false: Send to business");
     expect(screen.queryByText(/rejected:/)).not.toBeInTheDocument();
     expect(screen.queryByRole("row", { name: /Sink: quarantine/ })).not.toBeInTheDocument();
@@ -52,7 +80,7 @@ describe("GraphOutputs", () => {
 
     render(<GraphOutputs state={state} />);
 
-    const summary = screen.getByText("Wiring (3)");
+    const summary = screen.getByText(wiringSummary(3));
     expect(summary.closest("details")).not.toHaveAttribute("open");
     await userEvent.setup().click(summary);
     expect(summary.closest("details")).toHaveAttribute("open");
@@ -94,7 +122,7 @@ describe("GraphOutputs", () => {
       ],
     };
     render(<GraphOutputs state={state} />);
-    await userEvent.setup().click(screen.getByText("Wiring (7)"));
+    await userEvent.setup().click(screen.getByText(wiringSummary(7)));
     const source = screen.getByRole("row", { name: /Source: source/ });
     expect(source).toHaveTextContent("Send to classify");
     expect(within(source).getByText("classify").tagName).toBe("CODE");

@@ -453,6 +453,7 @@ def _workload_regression_parameters(role: str = "") -> dict[str, Any]:
         "revisionSuffix": "candidate" + role,
         "composerTransportIdleCeilingSeconds": 210,
         "composerMaxCompositionTurns": 50,
+        "composerContextMaxPromptTokens": 200000,
         "composerMaxDiscoveryTurns": 20,
         "composerTimeoutSeconds": 180,
         "composerRateLimitPerMinute": 10,
@@ -613,7 +614,13 @@ def test_native_azure_application_example_rejects_undeclared_guard_secret(secret
 
 def test_required_startup_parameters_are_explicit_and_positive() -> None:
     parameters = _template("workload")["parameters"]
-    for name in ("composerMaxCompositionTurns", "composerMaxDiscoveryTurns", "composerTimeoutSeconds", "composerRateLimitPerMinute"):
+    for name in (
+        "composerMaxCompositionTurns",
+        "composerContextMaxPromptTokens",
+        "composerMaxDiscoveryTurns",
+        "composerTimeoutSeconds",
+        "composerRateLimitPerMinute",
+    ):
         assert parameters[name]["type"] == "int"
         assert parameters[name]["minValue"] == 1
         assert "defaultValue" not in parameters[name]

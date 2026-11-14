@@ -428,7 +428,8 @@ export async function expectResizeGeometry(
 ): Promise<void> {
   const separator = composer.separator();
   const expectedDefault = viewportWidth < 1536 ? 360 : 420;
-  const expectedMaximum = Math.min(640, viewportWidth - 640);
+  // Task B: both card widths exclude the slots' two outer + one seam gutter.
+  const expectedMaximum = Math.min(640, viewportWidth - 640 - 42);
   await expect.poll(() => boxWidth(composer.authoringPane())).toBe(expectedDefault);
   const separatorBounds = await separator.boundingBox();
   if (separatorBounds === null) throw new Error("workspace separator has no pointer target");
@@ -450,6 +451,7 @@ export async function expectResizeGeometry(
   await expectComposerInputGeometry(composer, "wide");
   await expect(separator).toHaveAttribute("aria-valuemin", "360");
   await expect(separator).toHaveAttribute("aria-valuemax", String(expectedMaximum));
+  await expect(separator).toHaveAttribute("aria-valuenow", String(expectedMaximum));
 }
 
 /**
@@ -476,7 +478,18 @@ export async function expectComposerInputGeometry(
       const r = element.getBoundingClientRect();
       return { top: r.top, bottom: r.bottom, left: r.left, right: r.right };
     };
+    // ARGOnite made the row the composer well: a bordered, padded box around
+    // the textarea and controls. "Nothing beneath the textarea" now means
+    // nothing beyond the well's own bottom padding and border.
+    const rowElement = document.querySelector(".chat-input-row");
+    const rowStyle = rowElement === null ? null : getComputedStyle(rowElement);
+    const rowBottomChrome =
+      rowStyle === null
+        ? 0
+        : Number.parseFloat(rowStyle.paddingBottom) +
+          Number.parseFloat(rowStyle.borderBottomWidth);
     return {
+      rowBottomChrome,
       row: box(".chat-input-row"),
       textarea: box(".chat-input-textarea"),
       send: box(".chat-input-send-btn"),
@@ -489,8 +502,13 @@ export async function expectComposerInputGeometry(
   }
   const { row, textarea, send, hint } = geometry;
   if (arrangement === "wide") {
-    // The row is the textarea's height — nothing beneath the box.
-    expect(Math.abs(row!.bottom - textarea!.bottom)).toBeLessThanOrEqual(1);
+    // The row is the textarea's height plus the well's own bottom chrome
+    // (padding + border) — nothing else beneath the box. The chrome is read
+    // from the rendered row, and must be non-zero (the well exists).
+    expect(geometry.rowBottomChrome).toBeGreaterThan(0);
+    expect(
+      Math.abs(row!.bottom - textarea!.bottom - geometry.rowBottomChrome),
+    ).toBeLessThanOrEqual(1);
     // Send shares the textarea's bottom edge; the hint sits above Send, inside
     // the row, and shares its right edge.
     expect(Math.abs(send!.bottom - textarea!.bottom)).toBeLessThanOrEqual(1);

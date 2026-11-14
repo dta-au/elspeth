@@ -24,7 +24,12 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer import pipeline_commit
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.authority_hashing import composer_authority_hash
-from elspeth.web.composer.pipeline_commit import PipelineCommitConfig, PreparedPipelineCommit, prepare_pipeline_proposal_commit
+from elspeth.web.composer.pipeline_commit import (
+    PipelineCommitConfig,
+    PipelineCommitError,
+    PreparedPipelineCommit,
+    prepare_pipeline_proposal_commit,
+)
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
 from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
 from elspeth.web.composer.protocol import ToolArgumentError
@@ -34,6 +39,7 @@ from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.plugin_policy.validation import ProfileAwareValidationResult
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import AuthoritativePipelineProposal
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -171,10 +177,15 @@ async def _prepare(
     context: SessionOperationContext,
     *,
     recorder: BufferingRecorder | None = None,
+    current_state: CompositionState | None = None,
+    recovery_dispatch: pipeline_commit.PipelineDispatchAuditBinding | None = None,
+    recovery_executor_content_hash: str | None = None,
 ) -> PreparedPipelineCommit:
     result = await prepare_pipeline_proposal_commit(
         authority=proposal.authority,
-        current_state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+        current_state=current_state
+        if current_state is not None
+        else CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
         current_state_id=None,
         policy_catalog=proposal.policy,
         plugin_snapshot=proposal.snapshot,
@@ -192,9 +203,47 @@ async def _prepare(
         ),
         recorder=recorder if recorder is not None else BufferingRecorder(),
         actor="user:alice",
+        recovery_dispatch=recovery_dispatch,
+        recovery_executor_content_hash=recovery_executor_content_hash,
     )
     assert isinstance(result, PreparedPipelineCommit)
     return result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery", ["fresh", "matching", "mismatch", "missing_pair"])
+async def test_equal_candidate_only_rejects_after_recovery_integrity(proposal: _Proposal, recovery: str) -> None:
+    operations = proposal.service.session_operation_authority
+    context = operations.acquire(
+        session_id=proposal.authority.row.session_id,
+        operation_kind=SessionOperationKind.PROPOSAL,
+        owner_instance_id=proposal.service.session_operation_owner_instance_id,
+        lease_seconds=300,
+    )
+    try:
+        prepared = await _prepare(proposal, context)
+        current = replace(prepared.result.updated_state, version=19)
+        recorder = BufferingRecorder()
+        binding = prepared.dispatch if recovery != "fresh" else None
+        executor_hash = prepared.executor_content_hash if recovery == "matching" else "0" * 64 if recovery == "mismatch" else None
+        expected_error = AuditIntegrityError if recovery == "missing_pair" else PipelineCommitError
+        with pytest.raises(expected_error) as caught:
+            await _prepare(
+                proposal,
+                context,
+                recorder=recorder,
+                current_state=current,
+                recovery_dispatch=binding,
+                recovery_executor_content_hash=executor_hash,
+            )
+        if isinstance(caught.value, PipelineCommitError):
+            assert caught.value.code == ("CANDIDATE_EXECUTOR_MISMATCH" if recovery == "mismatch" else "NO_CHANGE")
+            assert caught.value.dispatch is binding
+            assert caught.value.invocation is None
+        assert recorder.invocations == ()
+        assert current.version == 19
+    finally:
+        operations.release(context)
 
 
 @pytest.mark.asyncio
@@ -354,8 +403,12 @@ async def test_executor_argument_error_persists_its_category_as_the_error_code(
     )
     recorder = BufferingRecorder()
     try:
-        with pytest.raises(ToolArgumentError):
+        with pytest.raises(PipelineCommitError) as caught:
             await _prepare(proposal, context, recorder=recorder)
+        assert caught.value.code == "ARGUMENT_ERROR"
+        assert caught.value.invocation is None
+        assert caught.value.dispatch is None
+        assert str(caught.value) == reject_schema_error_message()
     finally:
         operations.release(context)
 
@@ -365,3 +418,114 @@ async def test_executor_argument_error_persists_its_category_as_the_error_code(
     assert (invocation.error_class, invocation.error_category) == ("ToolArgumentError", ToolArgumentErrorCategory.SCHEMA_SHAPE)
     assert invocation.result_canonical is not None
     assert json.loads(invocation.result_canonical) == {"error_class": "ToolArgumentError", "error_code": "schema_shape"}
+
+
+def reject_schema_error_message() -> str:
+    return ToolArgumentError(
+        argument="set_pipeline arguments",
+        expected="object conforming to SetPipelineArgumentsModel (arguments contains unsupported properties)",
+        actual_type="invalid_schema",
+        code="SCHEMA_VALIDATION",
+        category=ToolArgumentErrorCategory.SCHEMA_SHAPE,
+    ).safe_message
+
+
+@pytest.mark.asyncio
+async def test_candidate_argument_error_has_no_executor_or_success_binding(proposal: _Proposal, monkeypatch: pytest.MonkeyPatch) -> None:
+    original = ToolArgumentError(argument="source", expected="an object", actual_type="str")
+
+    def invalid_candidate(*_args: Any, **_kwargs: Any) -> Any:
+        raise original
+
+    monkeypatch.setattr(pipeline_commit, "build_set_pipeline_candidate", invalid_candidate)
+    operations = proposal.service.session_operation_authority
+    context = operations.acquire(
+        session_id=proposal.authority.row.session_id,
+        operation_kind=SessionOperationKind.PROPOSAL,
+        owner_instance_id=proposal.service.session_operation_owner_instance_id,
+        lease_seconds=300,
+    )
+    recorder = BufferingRecorder()
+    try:
+        with pytest.raises(PipelineCommitError) as caught:
+            await _prepare(proposal, context, recorder=recorder)
+        assert caught.value.code == "ARGUMENT_ERROR"
+        assert str(caught.value) == original.safe_message
+        assert caught.value.__cause__ is original
+        assert caught.value.invocation is None and caught.value.dispatch is None
+        assert recorder.invocations == ()
+    finally:
+        operations.release(context)
+
+
+class _RejectCompletePolicy(PolicyCatalogView):
+    def validate_composition_state(self, state: CompositionState) -> ProfileAwareValidationResult:
+        from elspeth.web.composer.state import ValidationEntry, ValidationSummary
+
+        validation = state.validate()
+        if state.sources:
+            validation = ValidationSummary(
+                is_valid=False,
+                errors=(
+                    ValidationEntry(
+                        component="policy:final",
+                        message="Current policy refuses this complete composition.",
+                        severity="high",
+                        error_code="profile_complete_state_rejected",
+                    ),
+                ),
+            )
+        return ProfileAwareValidationResult(authored_state=state, executable_state=state, policy_findings=(), validation=validation)
+
+
+@pytest.mark.asyncio
+async def test_equal_content_with_failed_authored_validation_remains_validation_failure(proposal: _Proposal) -> None:
+    operations = proposal.service.session_operation_authority
+    context = operations.acquire(
+        session_id=proposal.authority.row.session_id,
+        operation_kind=SessionOperationKind.PROPOSAL,
+        owner_instance_id=proposal.service.session_operation_owner_instance_id,
+        lease_seconds=300,
+    )
+    try:
+        accepted = await _prepare(proposal, context)
+        refusing_policy = _RejectCompletePolicy.for_trained_operator(create_catalog_service(), proposal.snapshot)
+        recorder = BufferingRecorder()
+        with pytest.raises(PipelineCommitError) as caught:
+            await _prepare(
+                replace(proposal, policy=refusing_policy), context, current_state=accepted.result.updated_state, recorder=recorder
+            )
+        assert caught.value.code == "VALIDATION_FAILED"
+        assert recorder.invocations == ()
+    finally:
+        operations.release(context)
+
+
+@pytest.mark.asyncio
+async def test_real_candidate_malformed_arguments_are_safe_argument_failure(proposal: _Proposal) -> None:
+    from elspeth.contracts.freeze import deep_thaw
+
+    arguments = deep_thaw(proposal.authority.proposal.pipeline)
+    arguments["source"] = "PRIVATE-INVALID-SOURCE"
+    authority = replace(
+        proposal.authority,
+        row=replace(proposal.authority.row, tool_arguments_hash=composer_authority_hash(arguments)),
+        proposal=PipelineProposal.create(pipeline=arguments, base=AbsentBase(), repair_count=0, skill_hash=stable_hash("test-skill")),
+    )
+    operations = proposal.service.session_operation_authority
+    context = operations.acquire(
+        session_id=proposal.authority.row.session_id,
+        operation_kind=SessionOperationKind.PROPOSAL,
+        owner_instance_id=proposal.service.session_operation_owner_instance_id,
+        lease_seconds=300,
+    )
+    try:
+        recorder = BufferingRecorder()
+        with pytest.raises(PipelineCommitError) as caught:
+            await _prepare(replace(proposal, authority=authority), context, recorder=recorder)
+        assert caught.value.code == "ARGUMENT_ERROR"
+        assert type(caught.value.__cause__) is ToolArgumentError
+        assert "PRIVATE" not in str(caught.value)
+        assert recorder.invocations == ()
+    finally:
+        operations.release(context)

@@ -162,6 +162,10 @@ a target.
 | `ELSPETH_WEB__SECRET_KEY` | Required session-token signing secret. Generate at least 32 random bytes and keep the value stable across restarts. |
 | `ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY` | Required base64-encoded shareable-link signing key. Generate with `openssl rand -base64 32` and keep the value stable across restarts. |
 | `ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS` | Required positive maximum for Composer build/revision turns. The standalone Docker example uses `15`. |
+| `ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS` | Required positive prompt-token limit of the model gateway in front of the Composer. There is no default; the server will not start without it. The Composer sheds old history to stay under it. The standalone Docker example uses `200000` as a placeholder; set your gateway's actual limit. |
+| `ELSPETH_WEB__COMPOSER_CONTEXT_SHED_ABOVE` | Optional fraction of the token cap above which history is shed. Default `0.85`; must be above 0 and at most 1. |
+| `ELSPETH_WEB__COMPOSER_CONTEXT_SHED_TO` | Optional fraction of the token cap that shedding reduces history to. Default `0.60`; must be above 0, below 1 and below `COMPOSER_CONTEXT_SHED_ABOVE`. |
+| `ELSPETH_WEB__COMPOSER_PLANNER_MAX_REQUEST_BYTES` | Optional positive maximum bytes per compose-loop or planner provider request, measured as sent (the JSON of its messages and tools). Default `983040` (960 KiB; it was 2 MiB before the context budget and now also applies to the compose loop). Advisor and review calls are not bounded by it. |
 | `ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS` | Required positive maximum for Composer discovery turns. The standalone Docker example uses `10`. |
 | `ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS` | Required positive Composer timeout in seconds. The standalone Docker example uses `180.0`. |
 | `ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE` | Required positive per-user Composer request limit. The standalone Docker example uses `60`. |
@@ -273,8 +277,22 @@ ELSPETH_WEB__COMPOSER_ALLOW_SAME_ADVISOR_MODEL=true
 Restart the web service after changing these settings.
 
 Composer and advisor also require independently configured authoring prompt
-guards. See [Composer prompt guard](composer-prompt-guard.md) for the Azure
-endpoint/credential objects and the explicit development mode.
+guards:
+
+| Variable | Purpose |
+| --- | --- |
+| `ELSPETH_WEB__COMPOSER_PROMPT_GUARD` | JSON object configuring the guard for primary Composer requests. Supply it through secret injection. |
+| `ELSPETH_WEB__COMPOSER_ADVISOR_PROMPT_GUARD` | The same, independently, for advisor requests. |
+| `ELSPETH_WEB__COMPOSER_PROMPT_GUARD_MODE` | `required` (default): protected authoring is refused while a guard is not configured. `debug-when-unconfigured`: authoring proceeds without a guard and each request is recorded as `debug_bypass`. |
+
+`debug-when-unconfigured` is for development and debugging only. Authoring is
+unprotected while it applies, so do not set it in production. It takes effect
+only for a role whose guard is not configured: it never bypasses a configured
+guard's block, timeout, service failure or invalid response. To debug without
+a guard on a deployment that has one, clear that role's object (a literal JSON
+`null`) as well as setting the mode. Restart the web service after changing
+either. See [Composer prompt guard](composer-prompt-guard.md) for the
+endpoint/credential objects and the failure behaviour.
 
 Composer credentials come from the web process environment, keyed by the
 inferred provider. Both the primary and the advisor contract must be

@@ -113,16 +113,20 @@ for (const { count, secondSink } of [{ count: 1, secondSink: false }, { count: 3
         })).sort((left, right) => (left.id ?? "").localeCompare(right.id ?? "")));
         const originalGeometry = await retainedGeometry();
         const originalViewport = await viewport.evaluate((element) => getComputedStyle(element).transform);
-        const hide = page.getByRole("button", { name: "Hide quarantine and discard routes" });
-        await hide.focus();
+        // ARGOnite: the Hide/Show aria-pressed button is now a switch with one
+        // fixed label; checked means the routes are shown. Space toggles it.
+        const routesSwitch = page.getByRole("switch", { name: "Show quarantine and discard routes" });
+        await expect(routesSwitch).toBeChecked();
+        await routesSwitch.focus();
         await page.keyboard.press("Space");
-        await expect(page.getByRole("button", { name: "Show quarantine and discard routes" })).toHaveAttribute("aria-pressed", "false");
+        await expect(routesSwitch).not.toBeChecked();
         await expect(quarantine).toHaveCount(0);
         await expect(sink).toBeVisible();
         await expect.poll(retainedGeometry).not.toEqual(originalGeometry);
         expect(await viewport.evaluate((element) => getComputedStyle(element).transform)).toBe(originalViewport);
-        await page.keyboard.press("Enter");
-        await expect(page.getByRole("button", { name: "Hide quarantine and discard routes" })).toHaveAttribute("aria-pressed", "true");
+        // ARGOnite: a checkbox switch toggles on Space, not Enter.
+        await page.keyboard.press("Space");
+        await expect(routesSwitch).toBeChecked();
         await expect(quarantine).toBeVisible();
         await expect.poll(retainedGeometry).toEqual(originalGeometry);
         expect(await viewport.evaluate((element) => getComputedStyle(element).transform)).toBe(originalViewport);

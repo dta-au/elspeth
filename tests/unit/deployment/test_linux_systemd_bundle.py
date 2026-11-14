@@ -112,6 +112,7 @@ def test_linux_environment_example_sets_production_composer_limits() -> None:
     assignments = _active_example_assignments()
 
     assert assignments["ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS"] == "15"
+    assert assignments["ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS"] == "200000"
     assert assignments["ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS"] == "10"
     assert assignments["ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS"] == "180"
     assert assignments["ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS"] == "240"

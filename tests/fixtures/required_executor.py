@@ -21,6 +21,10 @@ def assert_owned_executor_fixture_settled(generation: RequiredExecutorGeneration
         return
     failures: list[BaseException] = []
     with generation.submission_lock:
+        if generation.observer is not None and not generation.observer.done():
+            failures.append(AssertionError("Executor fixture retained unfinished recovery observer"))
+        if generation.drain_thread is not None and generation.drain_thread.is_alive():
+            failures.append(AssertionError("Executor fixture retained live physical drain thread"))
         for reservation in generation.reservations.values():
             if reservation.held and not reservation.released:
                 failures.append(AssertionError("Executor fixture retained charged invocation"))

@@ -15,6 +15,7 @@ import pytest
 import structlog
 from sqlalchemy import Connection, Engine, event, select, text
 from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.resource_identity import uuid_spelling
 from tests.unit.web.blobs import test_fork_deletion_recovery_ack as fork_ack_proofs
 from tests.unit.web.composer.test_tools import _empty_state, _mock_catalog
 
@@ -134,11 +135,20 @@ def blob_read_race_deployment(
         writer_engine.dispose()
 
 
-@pytest.mark.parametrize("contender", ["public_read", "get_blob_content", "update_blob", "delete_blob"])
+@pytest.mark.parametrize(
+    "contender,spelling",
+    [("public_read", "canonical")]
+    + [
+        (tool, spelling)
+        for tool in ("get_blob_content", "read_attachment", "update_blob", "delete_blob")
+        for spelling in ("canonical", "braced", "urn")
+    ],
+)
 def test_postgres_content_reader_waits_for_live_deletion_before_reconciliation(
     blob_read_race_deployment: tuple[Engine, Engine, SessionServiceImpl, Path],
     monkeypatch: pytest.MonkeyPatch,
     contender: str,
+    spelling: str,
 ) -> None:
     """Park deletion after rename: another replica must wait, then see deletion.
 
@@ -175,7 +185,7 @@ def test_postgres_content_reader_waits_for_live_deletion_before_reconciliation(
         def contend_for_blob() -> bytes | ToolResult:
             if contender == "public_read":
                 return asyncio.run(reader.read_blob_content(blob.id, session_operation_context=context))
-            arguments = {"blob_id": str(blob.id)}
+            arguments = {"blob_id": uuid_spelling(str(blob.id), spelling)}
             if contender == "update_blob":
                 arguments["content"] = "x\n2\n"
             return execute_tool(

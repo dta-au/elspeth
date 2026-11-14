@@ -17,6 +17,14 @@ describe("durable composer observation policy", () => {
     for (const code of [composer.COMPOSE_OUTCOME_UNCONFIRMED, "recompose_saved_proposal", "recompose_already_completed"]) expect(composer.isComposeRefreshOnlyFailureCode(code)).toBe(true);
     for (const code of [undefined, "request_cancelled", "stale_compose_state", "admission_refused", "token_accounting_unavailable"]) expect(composer.isComposeRefreshOnlyFailureCode(code)).toBe(false);
   });
+  it("treats a context budget refusal as permanent for the session", () => {
+    expect(composer.COMPOSE_CONTEXT_BUDGET_EXCEEDED).toBe("context_budget_exceeded");
+    expect(composer.isComposePermanentRefusal("context_budget_exceeded")).toBe(true);
+    expect(composer.isComposeRefreshOnlyFailureCode("context_budget_exceeded")).toBe(false);
+    expect(composer.COMPOSE_CONTEXT_BUDGET_EXCEEDED_DETAIL).toBe(
+      "This conversation is too large for the composer to continue. Start a new session, or shorten your request.",
+    );
+  });
   it("distinguishes observation detachment from explicit Stop", () => {
     expect(composer.COMPOSE_TIMEOUT_ABORT_REASON).toBe("compose_timeout");
     expect(composer.COMPOSE_USER_CANCEL_ABORT_REASON).toBe("compose_user_cancel");

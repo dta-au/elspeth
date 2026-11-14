@@ -1394,6 +1394,34 @@
       "release_lane": "local"
     },
     {
+      "plugin_key": "transform:file_inject",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.file_inject",
+      "qualname": "FileInject",
+      "source_path": "src/elspeth/plugins/transforms/file_inject.py",
+      "determinism": "deterministic",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.file_inject:FileInject",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.file_inject:FileInject"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
       "plugin_key": "transform:json_explode",
       "kind": "transform",
       "module": "elspeth.plugins.transforms.json_explode",

@@ -492,6 +492,8 @@ async def _settle_pipeline_proposal_under_compose_lock(
             reason_by_code: dict[str, PipelineProposalRejectionReason] = {
                 "CANDIDATE_EXECUTOR_MISMATCH": "candidate_executor_mismatch",
                 "VALIDATION_FAILED": "validation_failed",
+                "ARGUMENT_ERROR": "validation_failed",
+                "NO_CHANGE": "no_change",
                 "BASE_CONFLICT": "base_conflict",
             }
             if exc.code in reason_by_code:
@@ -522,6 +524,20 @@ async def _settle_pipeline_proposal_under_compose_lock(
             public_error = HTTPException(
                 status_code=504,
                 detail="Pipeline preparation timed out. Please retry this proposal.",
+            )
+        elif exc.code in {"NO_CHANGE", "ARGUMENT_ERROR"}:
+            diagnosis = (
+                "The composer's proposed change does not change the current composition. "
+                if exc.code == "NO_CHANGE"
+                else f"The composer's proposed change has invalid arguments: {exc} "
+            )
+            public_error = HTTPException(
+                status_code=422,
+                detail={
+                    "detail": diagnosis + "The proposal has been automatically rejected. Ask the composer to revise and resubmit.",
+                    "error_type": "proposal_no_change" if exc.code == "NO_CHANGE" else "proposal_argument_invalid",
+                    "tool_name": "set_pipeline",
+                },
             )
         else:
             status_code = 409 if exc.code in {"BASE_CONFLICT", "NOT_PENDING"} else 422

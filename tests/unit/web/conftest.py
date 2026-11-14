@@ -193,6 +193,7 @@ def test_client(tmp_path: Path) -> TestClient:
         WebSettings(
             data_dir=tmp_path,
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -213,6 +214,7 @@ def closed_local_settings(tmp_path: Path) -> WebSettings:
         quota_default_tokens_per_day=100_000,
         quota_default_storage_bytes=1_000_000,
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,

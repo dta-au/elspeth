@@ -8,12 +8,14 @@ import signal
 import socket
 import sys
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from elspeth.web.process_watchdog_codec import GRACE_NS, FrameKind, FrameReader, WatchdogFrame, WatchdogProtocolError, encode_frame
+    from elspeth.contracts.process_watchdog_wire import GRACE_NS, FrameKind, FrameReader, WatchdogFrame, WatchdogProtocolError, encode_frame
 else:
-    from process_watchdog_codec import GRACE_NS, FrameKind, FrameReader, WatchdogFrame, WatchdogProtocolError, encode_frame
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "contracts"))
+    from process_watchdog_wire import GRACE_NS, FrameKind, FrameReader, WatchdogFrame, WatchdogProtocolError, encode_frame
 
 
 def _verify_pidfd(pidfd: int, reflected_pid: int) -> None:

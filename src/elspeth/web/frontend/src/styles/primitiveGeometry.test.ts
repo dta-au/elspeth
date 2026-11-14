@@ -265,9 +265,11 @@ describe("shared modal surfaces (elspeth-03492be50b, elspeth-93afabcde8)", () =>
     }
   });
 
-  it("does not frame a --color-bg canvas in the warm paper family", () => {
-    // .graph-modal-body renders <GraphView />, whose React Flow canvas paints
-    // --color-bg. .yaml-modal already migrated off paper for this exact clash.
+  // ARGOnite: the graph canvas is now the recessed --color-well, not --color-bg.
+  it("does not frame the graph's green canvas in the warm paper family", () => {
+    // .graph-modal-body renders <GraphView />, whose canvas is the recessed
+    // --color-well (ARGOnite; it used to paint --color-bg). .yaml-modal already
+    // migrated off paper for this exact clash.
     expect(winningValue(".graph-modal", "background-color")).toBe(
       "var(--color-surface-elevated)",
     );

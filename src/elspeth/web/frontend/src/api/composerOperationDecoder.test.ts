@@ -33,6 +33,21 @@ describe("retained failure page admission", () => {
     for (const changes of [{ body: "private" }, { session_id: id }, { items: [outcome, outcome] }, { items: Array(101).fill(outcome) }, { next_cursor: "" }]) expect(() => decodeComposerOperationFailurePage({ ...page, ...changes }, sid)).toThrow();
     expect(() => decodeComposerOperationFailurePage(page, sid, sid)).toThrow();
   });
+  it("admits a context budget refusal as a public category of an HTTP error", () => {
+    const refusal = { ...outcome, failure_code: "http_error", error_type: "context_budget_exceeded", diagnostic_id: null };
+    expect(decodeComposerOperationFailurePage({ ...page, items: [refusal] }, sid).items[0].error_type).toBe("context_budget_exceeded");
+  });
+});
+describe("progress frame vocabulary", () => {
+  const progress = (reason: string, phase: string) => ({
+    ...heartbeat, sequence: 1, event: "progress",
+    payload: { session_operation_id: "op", session_operation_epoch: 1, request_token: "token", request_id: null, phase, headline: "Earlier conversation is no longer visible to the composer.", evidence: [], likely_next: null, reason, updated_at: "2026-11-10T00:00:00Z" },
+  });
+  it("admits the shed-history notice and the context budget refusal", () => {
+    expect(decodeComposerOperationFrame(progress("context_reduced", "calling_model"), sid, id)).toMatchObject({ payload: { reason: "context_reduced" } });
+    expect(decodeComposerOperationFrame(progress("context_budget_exceeded", "failed"), sid, id)).toMatchObject({ payload: { reason: "context_budget_exceeded" } });
+    expect(() => decodeComposerOperationFrame(progress("context_shrunk", "calling_model"), sid, id)).toThrow();
+  });
 });
 describe("composer operation external admission", () => {
   it("admits each UTF-8 byte split and split CRLF with coalesced frames", () => {

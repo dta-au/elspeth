@@ -913,6 +913,7 @@ def test_seat_liveness_preserves_window_and_dead_seat_controls(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="SIGKILL exit-code oracle is POSIX-specific")
+@pytest.mark.timing_sensitive
 def test_profile_leader_parked_at_the_follower_handoff_hook_stays_live_past_its_minted_seat_deadline(tmp_path: Path) -> None:
     """Control for the load-sensitive profile ids: the seat must not lapse while the leader waits for a follower.
 
@@ -958,6 +959,7 @@ def test_profile_leader_parked_at_the_follower_handoff_hook_stays_live_past_its_
 
 
 @pytest.mark.skipif(os.name != "posix", reason="SIGKILL exit-code oracle is POSIX-specific")
+@pytest.mark.timing_sensitive
 def test_same_host_leader_plus_claim_only_followers_profile_covers_sink_effect_process_death_matrix(
     tmp_path: Path,
     request: pytest.FixtureRequest,
@@ -980,6 +982,7 @@ def test_same_host_leader_plus_claim_only_followers_profile_covers_sink_effect_p
 
 
 @pytest.mark.skipif(os.name != "posix", reason="SIGKILL exit-code oracle is POSIX-specific")
+@pytest.mark.timing_sensitive
 def test_web_hosted_leader_plus_same_host_cli_followers_profile_covers_sink_effect_process_death_matrix(
     tmp_path: Path,
     request: pytest.FixtureRequest,

@@ -28,6 +28,7 @@ from elspeth.plugins.infrastructure.config_base import (
     SourceDataConfig,
     declared_source_schema_field_names,
 )
+from elspeth.plugins.infrastructure.config_content import reject_nonfinite_constant
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,
@@ -37,25 +38,6 @@ from elspeth.plugins.sources.field_normalization import (
     normalize_field_name,
     resolve_field_names,
 )
-
-
-def _reject_nonfinite_constant(value: str) -> None:
-    """Reject non-standard JSON constants (NaN, Infinity, -Infinity).
-
-    Python's json module accepts these by default, but they violate:
-    1. RFC 8259 (JSON standard) - only allows null, true, false
-    2. Canonical JSON policy - non-finite floats crash hashing
-
-    This function is passed to json.loads/json.load via parse_constant
-    parameter to reject these values at parse time.
-
-    Args:
-        value: The constant string (NaN, Infinity, or -Infinity)
-
-    Raises:
-        ValueError: Always - these constants are not allowed
-    """
-    raise ValueError(f"Non-standard JSON constant '{value}' not allowed. Use null for missing values, not NaN/Infinity.")
 
 
 def _contains_surrogateescape_chars(value: str) -> bool:
@@ -184,7 +166,7 @@ class JSONSource(BaseSource):
     name = "json"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:997ca99f1069c7e6"
+    source_file_hash: str | None = "sha256:0c356038d5722d0c"
     config_model = JSONSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str
@@ -330,7 +312,7 @@ class JSONSource(BaseSource):
                     # Catch JSON parse errors at the trust boundary
                     # parse_constant rejects NaN/Infinity at parse time (canonical JSON policy)
                     try:
-                        row = json.loads(line, parse_constant=_reject_nonfinite_constant)
+                        row = json.loads(line, parse_constant=reject_nonfinite_constant)
                     except (json.JSONDecodeError, ValueError) as e:
                         # External data parse failure - quarantine, don't crash
                         # Store raw line + metadata for audit traceability
@@ -373,14 +355,14 @@ class JSONSource(BaseSource):
             with open(self._path, encoding=self._encoding) as f:
                 # parse_constant rejects NaN/Infinity at parse time (canonical JSON policy)
                 try:
-                    data = json.load(f, parse_constant=_reject_nonfinite_constant)
+                    data = json.load(f, parse_constant=reject_nonfinite_constant)
                 except (json.JSONDecodeError, ValueError) as e:
                     # File-level parse error - treat as Tier 3 boundary
                     # External data can be malformed; don't crash the pipeline
                     if isinstance(e, json.JSONDecodeError):
                         error_msg = f"JSON parse error at line {e.lineno} col {e.colno}: {e.msg}"
                     else:
-                        # ValueError from _reject_nonfinite_constant (NaN/Infinity)
+                        # ValueError from reject_nonfinite_constant (NaN/Infinity)
                         error_msg = f"JSON parse error: {e}"
                     quarantined = self._record_parse_error(
                         ctx=ctx,

@@ -27,11 +27,13 @@ import yaml
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.canonical import canonical_json
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
-from elspeth.web.sessions.models import blobs_table, chat_messages_table, composer_completion_events_table
+from elspeth.web.sessions.models import blobs_table, composer_completion_events_table
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.shareable_reviews.signer import ShareTokenPayload
 from tests.fixtures.identities import ensure_test_identity
@@ -614,24 +616,36 @@ def test_preview_reports_llm_authored_file_as_not_importable(
 ) -> None:
     client, session_id = audit_readiness_client_with_state
     seeded = _seed_uploaded_file_source(client, session_id, b"id\n1\n")
-    with client.app.state.session_engine.begin() as conn:
-        conn.execute(
-            chat_messages_table.insert().values(
-                id="msg-1",
-                session_id=str(session_id),
-                role="user",
-                content="please write notes",
-                sequence_no=1,
-                writer_principal="route_user_message",
-                created_at=datetime.now(UTC),
-            )
+    service = client.app.state.session_service
+
+    async def _add_authoring_message() -> str:
+        # The blob's provenance needs a real chat row; write it through the
+        # reviewed session writer under a COMPOSE lease, not a direct insert.
+        lease = await SessionOperationLease.acquire(
+            service.session_operation_authority,
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
         )
+        async with lease:
+            message = await service.add_message(
+                session_id,
+                "user",
+                "please write notes",
+                writer_principal="route_user_message",
+                session_operation_context=lease.context,
+            )
+        return str(message.id)
+
+    message_id = asyncio.run(_add_authoring_message())
+    with client.app.state.session_engine.begin() as conn:
         conn.execute(
             blobs_table.update()
             .where(blobs_table.c.id == seeded["id"])
             .values(
                 creation_modality="llm_generated",
-                created_from_message_id="msg-1",
+                created_from_message_id=message_id,
                 creating_model_identifier="model",
                 creating_model_version="1",
                 creating_provider="provider",

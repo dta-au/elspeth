@@ -308,6 +308,7 @@ def _build_settings(data_dir: Path) -> WebSettings:
         composer_boot_probe_enabled=False,
         composer_prompt_guard_mode="debug-when-unconfigured",
         composer_max_composition_turns=4,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=3,
         composer_timeout_seconds=30.0,
         composer_rate_limit_per_minute=100,

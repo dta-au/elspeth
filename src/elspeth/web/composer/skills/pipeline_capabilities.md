@@ -3,8 +3,8 @@
 This is ELSPETH's static, public pipeline-language contract. It describes what
 every authoring surface can author; live discovery remains the authority for
 which plugins and models are installed and authorized in the current
-deployment. Every authoring surface receives these exact bytes before its
-interaction rules.
+deployment. The web composer's tool loop, proposal planner and advisor receive
+these exact bytes before their interaction rules.
 
 ## Canonical proposal and discovery
 
@@ -12,9 +12,9 @@ interaction rules.
 
 Author pipelines as one complete canonical pipeline document — the
 `set_pipeline` object shape. Each authoring surface accepts that document
-through its own terminal authoring tool; your interaction rules and
-per-request instructions name yours. Use the read-only discovery tools before
-authoring:
+through its own terminal authoring tool; your tool palette and any
+per-request instruction identify yours. Use the read-only discovery tools
+before authoring:
 
 1. Read the request's information manifest first. Its current pipeline
    projection and policy snapshot are already supplied facts; do not repeat a
@@ -58,17 +58,16 @@ leaves behind. When a successful mutation result includes `applied_component`,
 that field is the authoritative post-change state of everything it names; do
 not call `get_pipeline_state` to confirm those components. Use
 `get_pipeline_state` only for an untouched component, a whole-document
-question, or a successful mutation that omits the echo.
+question, or a successful mutation that omits the echo. A successful result
+whose hint reports the pipeline unchanged needs no confirming read.
 
 An absent policy-visible plugin is different from an unsupported pipeline
 shape. Say that a plugin is unavailable or policy-denied only when live
 discovery proves it — use the supplied discovery digest's `prohibited` entries
 first, an offered `list_sources` / `list_transforms` / `list_sinks` tool when
 that fact is missing, or an attempt failure (e.g. a rejected `set_source`),
-never a bare assertion. Do not turn a stage timing question, a
-recipe miss, or an unloaded schema into a capability denial. Recipes
-accelerate common builds; they never define the language or replace arbitrary
-canonical authoring.
+never a bare assertion. Do not turn a stage timing question or an unloaded
+schema into a capability denial.
 
 <!-- taught:begin tool-data list_sources data.available; tool-data list_sources data.prohibited; tool-data list_transforms data.available; tool-data list_transforms data.prohibited; tool-data list_sinks data.available; tool-data list_sinks data.prohibited -->
 When a user names a specific plugin and asks why it cannot be used, check the
@@ -139,7 +138,9 @@ component; `row_union` requires an explicit `on_success` connection.
   assignment-transform emulation. Condition expressions read row values ONLY
   by subscripting the row namespace — `row['field']`; a bare field name is
   not in scope and is rejected. `get_expression_grammar` is the full grammar
-  authority.
+  authority. A boolean `condition` routes on exactly the labels `"true"` and
+  `"false"`; each route value is a sink name, a downstream node's `input`
+  connection, `fork`, or `discard`.
   Gate expression-evaluation failures use the optional node-level `on_error`
   policy: set it to `discard`, a declared sink name, or an eligible enclosing
   bound-region closer as described above. Omit it to preserve
@@ -163,6 +164,8 @@ component; `row_union` requires an explicit `on_success` connection.
   with `trigger`, `output_mode`, and `expected_output_count` where its contract
   requires them. Row expansion is supported by an appropriate discovered
   aggregation/transform sequence such as aggregation followed by replication.
+  A batch-aware plugin never takes the row-mode `required_input_fields`
+  option; declare its input requirements as `schema.required_fields`.
   Give an aggregation `output_mode: transform` (the default): `passthrough`
   carries only a plugin whose flush emits exactly one row per buffered row.
   The catalogue's `aggregation_output_modes` says which discovered plugins
@@ -212,8 +215,10 @@ component; `row_union` requires an explicit `on_success` connection.
 - [capability-node:row_union] A `row_union` is a plugin-free, correlated
   barrier that waits for every declared fork branch, then releases the
   original branch rows in declared order without merging fields. Declare at
-  least two ordered `branches` as `{branch_name: input_connection}`; list form
-  normalizes to an identity mapping. Every branch value is a consuming
+  least two ordered `branches` as `{fork_branch_name: input_connection}`: each
+  key is a name from the upstream gate's `fork_to`, each value the connection
+  that branch's last node publishes; list form normalizes to an identity
+  mapping. Every branch value is a consuming
   binding. The schema-required `input` is only an adapter placeholder and must
   equal the first branch value. Set required `on_success` to a downstream
   processing connection, never a sink. Optional top-level `timeout_seconds`
@@ -256,7 +261,8 @@ inspection records, not a substitute for exact `set_pipeline_arguments`.
 <!-- taught:end -->
 
 Named sources use the same routing semantics as the singular source without
-inline custody fields.
+inline custody fields. `inline_blob` sits on `source` beside `options`, never
+inside it, and a source bound by `inline_blob` or `blob_id` authors no `path`.
 
 Use `source` only for the canonical single-source custody shape; use `sources`
 for plural named roots. Use stable, descriptive source/node/output ids. Edges
@@ -310,7 +316,17 @@ cleanup node and then from the cleanup node to the sink.
 
 Source plugins may coerce declared fields only where their live contract permits it.
 CSV fixed/flexible schemas coerce declared fields at ingestion; observed CSV cells remain strings.
+Declare fields as `name: type`. A coercing source turns integer text into `int`,
+numeric text into `float`, and `true`/`false`, `yes`/`no`, `1`/`0` into `bool`;
+a cell that does not parse fails source validation.
 Source validation failures use `on_validation_failure`.
+Non-optional fields declared under `fixed`/`flexible` are guaranteed. For rows you generated,
+declare typed `fields` for what a consumer requires; you need not author
+`guaranteed_fields`. Sinks never coerce: declare sink `schema.fields` with
+the types that arrive when the output's columns are known. A `fixed` schema
+refuses any field it does not declare; use `flexible`, or project first, when
+an upstream node adds fields. `fixed` and `flexible` both require `fields`;
+only `observed` takes none.
 A downstream input type declaration validates arriving values without converting them:
 value-dependent mismatches use `on_error`; provable contradictions may be refused
 at build. Only `int` widens to `float`. Declare actual types; use `any` for created
@@ -396,6 +412,12 @@ Self/forward references, duplicate outputs and overwriting arriving fields are
 refused. A failed lookup releases no partially enriched row; the node's error
 route receives the original entry row.
 
+For a selected `file_inject`, each `files` entry is one whole file written into
+a row field. `mode: select` writes the entry named by the row's `key_field`
+value to `output_field`, with `on_miss` for a row that names none; `mode: all`
+writes every entry to that entry's own `output_field`. State `format` on every
+entry.
+
 ### Optional operator-led chain compaction
 
 You may offer an optional combined LLM step after inspecting the complete linear
@@ -414,7 +436,7 @@ resume. Preserve interpretation tokens and fresh prompt/semantics review: per-qu
 templates cannot carry interpretation tokens. Ask whether the operator wants to
 review a combined version before changing graph or settings. Decline leaves both
 unchanged; do not pressure or compact automatically. Only the provider planner
-authors the proposal through ordinary node/edge tools, then preview and diff it.
+authors the proposal through ordinary node/edge tools, then previews it.
 
 Independent example: two unconditional tone/topic assessments of entry `text`
 with identical effective settings and already compatible prefixed outputs.
@@ -498,12 +520,3 @@ requested shape, apply required fields/enums/options from the returned schema or
 assistance, correct routing and field guarantees, then resubmit the complete
 proposal. Never delete a requested source, node,
 branch, output, cleanup, LLM, or failure path merely to make validation pass.
-
-## Capability and trust boundary
-
-This text is static public guidance. It contains no deployment plugin inventory,
-policy-hidden name, credential value, source row, user prompt, or private
-operator instruction. Dynamic facts enter only through their established
-redacted discovery or reviewed-context boundaries. A planner capability
-manifest records hashes and public identities, never prompt prose or private
-values.

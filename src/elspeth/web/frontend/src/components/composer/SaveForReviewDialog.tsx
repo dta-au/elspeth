@@ -30,6 +30,7 @@ import type { ShareLifetimeSeconds, ShareableFilesResponse } from "@/types/api";
 import { formatBytes } from "@/utils/bytes";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 import { useExecutionStore } from "@/stores/executionStore";
+import { useSessionStore } from "@/stores/sessionStore";
 import { useShareableReviewStore } from "@/stores/shareableReviewStore";
 
 const COPY_FEEDBACK_TIMEOUT_MS = 2000;
@@ -242,6 +243,28 @@ export function SaveForReviewDialog(): JSX.Element | null {
   // restore-on-cleanup runs.
   useFocusTrap(dialogRef, dialogOpen, ".save-for-review-close");
 
+  // The dialog is bound to the session it was opened for: Create link and Try
+  // again post that session's id and file-consent fingerprint. Back/forward,
+  // a hash edit or the command palette can change the active session while
+  // the dialog is up, and the readiness gate then reflects the new session.
+  // Close rather than rebind, so a link is never made for a session the owner
+  // is no longer looking at. Watching the field covers every writer of it.
+  useEffect(
+    () =>
+      useSessionStore.subscribe((state, prev) => {
+        if (state.activeSessionId === prev.activeSessionId) return;
+        const share = useShareableReviewStore.getState();
+        if (
+          share.dialogOpen &&
+          share.request.kind !== "idle" &&
+          share.request.sessionId !== state.activeSessionId
+        ) {
+          share.close();
+        }
+      }),
+    [],
+  );
+
   useEffect(() => {
     return () => {
       if (copyTimeoutRef.current !== null) {
@@ -441,9 +464,9 @@ export function SaveForReviewDialog(): JSX.Element | null {
                   : ""}
               </span>
               <p className="save-for-review-tip">
-                The link grants a different authenticated user read-only access
-                to a frozen snapshot of this pipeline. Recipients must have an
-                account on this deployment.
+                {request.kind === "resolved" && request.options.allowImport
+                  ? "The link lets a different authenticated user view a frozen snapshot of this pipeline. Because you allowed import, they can also make their own editable copy in a new session, including copies of the files you listed. Recipients must have an account on this deployment."
+                  : "The link grants a different authenticated user read-only access to a frozen snapshot of this pipeline. Recipients must have an account on this deployment."}
               </p>
             </div>
           )}

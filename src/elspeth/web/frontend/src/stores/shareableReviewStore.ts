@@ -56,7 +56,13 @@ export type RequestPhase =
       notice: string | null;
     }
   | { kind: "pending"; sessionId: string; epoch: number; options: MarkReadyOptions }
-  | { kind: "resolved"; sessionId: string; response: MarkReadyForReviewResponse }
+  | {
+      kind: "resolved";
+      sessionId: string;
+      response: MarkReadyForReviewResponse;
+      /** What the owner chose, so the success text can say what the link grants. */
+      options: MarkReadyOptions;
+    }
   | { kind: "error"; sessionId: string; message: string; options: MarkReadyOptions };
 
 export interface ShareableReviewState {
@@ -312,7 +318,7 @@ export const useShareableReviewStore = create<ShareableReviewState>((set, _get) 
         }
         _commit({
           ..._internal,
-          request: { kind: "resolved", sessionId, response },
+          request: { kind: "resolved", sessionId, response, options },
           lastSuccess: { sessionId, response },
         });
       } catch (exc) {

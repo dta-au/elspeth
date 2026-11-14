@@ -13,11 +13,22 @@ def create_server(*args, **kwargs):  # type: ignore[no-untyped-def]
     return _create_server(*args, **kwargs)
 
 
-def main(*args, **kwargs):  # type: ignore[no-untyped-def]
-    """Run the composer MCP server. Requires the [mcp] extra."""
-    from elspeth.composer_mcp.server import main as _main
+def main() -> None:
+    """Process-owning console entry; execute the dedicated stdlib supervisor.
 
-    return _main(*args, **kwargs)
+    This entry requires a fresh console interpreter. Embedded hosts construct
+    create_server instead, retaining their own process and executor lifecycle.
+    """
+    import runpy
+    import sys
+    from pathlib import Path
+
+    directory = Path(__file__).resolve().parent
+    supervisor = str(directory / "portable_supervisor.py")
+    sys.argv = [supervisor, sys.executable, str(directory / "runner.py"), *sys.argv[1:]]
+    # A Windows CRT exec overlay can change the observed process lifetime.
+    # Execute the same file in this already-fresh console process on every OS.
+    runpy.run_path(supervisor, run_name="__main__")
 
 
 __all__ = ["create_server", "main"]

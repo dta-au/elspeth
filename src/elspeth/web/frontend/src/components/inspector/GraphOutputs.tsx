@@ -113,7 +113,14 @@ export function GraphOutputs({ state, children, showFailureRoutes = true, hidden
     <details className="graph-detail-table">
       {/* Row kinds are the canonical node names (Source, Transform, Gate, ...,
           Sink); the section and its columns use routing vocabulary. */}
-      <summary>Wiring ({rows.length})</summary>
+      {/* ARGOnite: the count shows as a pill; the parentheses stay in the
+          text (visually hidden), so AT and text locators still read
+          "Wiring (n)". */}
+      <summary>
+        Wiring <span className="visually-hidden">(</span>
+        <span className="graph-outputs-count">{rows.length}</span>
+        <span className="visually-hidden">)</span>
+      </summary>
       {children}
       <div className="graph-detail-table-scroll" tabIndex={0} role="group" aria-label="Wiring table">
         <table>

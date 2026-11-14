@@ -165,6 +165,7 @@ def _quota_app(engine: Engine, tmp_path: Path, recorded: list[QuotaExceeded]) ->
         data_dir=tmp_path,
         max_upload_bytes=10 * 1024 * 1024,
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,

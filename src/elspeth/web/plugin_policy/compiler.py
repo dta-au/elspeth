@@ -29,6 +29,9 @@ REQUIRED_WEB_PLUGIN_IDS = frozenset(
         PluginId("sink", "json"),
         PluginId("sink", "text"),
         PluginId("transform", "field_mapper"),
+        # Feeds uploaded guidance text to prompts. The composer admits only a
+        # user-uploaded file as its content (web/execution upload-only guard).
+        PluginId("transform", "file_inject"),
         # The remedies text and document name in their own guidance. A remedy
         # the surface does not authorize is one the Composer cannot take.
         PluginId("transform", "line_explode"),

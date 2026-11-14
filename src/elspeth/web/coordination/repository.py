@@ -33,6 +33,7 @@ from elspeth.contracts.blobs import (
     BlobCreationObligation,
     BlobDeletionPlan,
     BlobInProgressForkError,
+    BlobMutationObservation,
     BlobPendingProposalError,
     BlobRecord,
     BlobReplacementPlan,
@@ -2120,6 +2121,121 @@ class _RepositoryBlobMutations:
         self._require_operation_kinds(_BLOB_READ_OPERATION_KINDS)
         return self._blob_record(state._require_blob(blob_id))
 
+    def inspect_blob_mutation(self, *, blob_id: UUID, tool_name: Literal["update_blob", "delete_blob"]) -> BlobMutationObservation:
+        """Read both ledgers and phase-consistent metadata without recovery."""
+        state = self.__state
+        state._require_active()
+        if tool_name == "update_blob":
+            self._require_operation_kinds(_BLOB_REPLACEMENT_OPERATION_KINDS)
+        elif tool_name == "delete_blob":
+            self._require_operation_kinds(_BLOB_DELETION_OPERATION_KINDS)
+        else:
+            raise ValueError("blob admission requires update_blob or delete_blob")
+        # Preserve global deletion-before-replacement lock order, including
+        # the atomic producer's all-NULL schema before qualified parsing.
+        atomic = self.read_atomic_blob_deletion(blob_id=blob_id)
+        deletion = atomic if atomic is not None else self._read_blob_deletion_locked(blob_id=blob_id)
+        replacement = self._read_blob_replacement_locked(blob_id=blob_id)
+        if deletion is not None and replacement is not None:
+            raise AuditIntegrityError("blob has mutually exclusive deletion and replacement ledgers")
+        row = (
+            _resolve_mutation_connection(state._connection_token)
+            .execute(
+                select(blobs_table).where(blobs_table.c.id == str(blob_id), blobs_table.c.session_id == state._session_id).with_for_update()
+            )
+            .one_or_none()
+        )
+        blob = self._blob_record(row) if row is not None else None
+        if replacement is not None:
+            replacement.require_current_metadata(blob)
+        return BlobMutationObservation(blob=blob, deletion=deletion, replacement=replacement)
+
+    def _require_blob_mutation_exclusion(self, accepting_proposal_id: UUID | None, *, replacement: bool) -> None:
+        context = self._require_operation_kinds(_BLOB_REPLACEMENT_OPERATION_KINDS if replacement else _BLOB_DELETION_OPERATION_KINDS)
+        if context.operation_kind is SessionOperationKind.PROPOSAL:
+            if type(accepting_proposal_id) is not UUID:
+                raise AuditIntegrityError("proposal blob mutation requires an exact accepting proposal identity")
+        elif accepting_proposal_id is not None:
+            raise AuditIntegrityError("non-proposal blob mutation cannot exclude proposal retention")
+
+    def _require_blob_replacement_prerequisites(
+        self, *, expected: BlobRecord, replacement: BlobRecord, max_storage_per_session: int, accepting_proposal_id: UUID | None
+    ) -> BlobRecord:
+        state = self.__state
+        actual = self._blob_record(state._require_blob(expected.id))
+        if actual != expected:
+            raise AuditIntegrityError("ready blob metadata changed before replacement intent")
+        if actual.status != "ready" or actual.content_hash is None:
+            raise AuditIntegrityError("blob replacement requires ready metadata with a content hash")
+        immutable_projection = (
+            ("id", replacement.id, expected.id),
+            ("session_id", replacement.session_id, expected.session_id),
+            ("filename", replacement.filename, expected.filename),
+            ("mime_type", replacement.mime_type, expected.mime_type),
+            ("storage_path", replacement.storage_path, expected.storage_path),
+            ("created_at", replacement.created_at, expected.created_at),
+            # created_by is not pinned: update_blob records an agent rewrite as the assistant's file.
+            ("source_description", replacement.source_description, expected.source_description),
+            ("status", replacement.status, expected.status),
+        )
+        for field_name, replacement_value, expected_value in immutable_projection:
+            if replacement_value != expected_value:
+                raise AuditIntegrityError(f"blob replacement changed immutable field {field_name}")
+        if replacement.content_hash is None or type(replacement.size_bytes) is not int or replacement.size_bytes < 0:
+            raise AuditIntegrityError("blob replacement requires exact proposed size and content hash")
+        self._require_blob_replacement_retention_and_quota(
+            actual, replacement=replacement, max_storage_per_session=max_storage_per_session, accepting_proposal_id=accepting_proposal_id
+        )
+        return actual
+
+    def _require_blob_replacement_retention_and_quota(
+        self, actual: BlobRecord, *, replacement: BlobRecord, max_storage_per_session: int, accepting_proposal_id: UUID | None
+    ) -> None:
+        state = self.__state
+        self._require_blob_deletion_retention_clear(
+            actual,
+            accepting_proposal_id=accepting_proposal_id,
+            accepting_tool_name="update_blob" if accepting_proposal_id is not None else None,
+        )
+        connection = _resolve_mutation_connection(state._connection_token)
+        current_total = session_storage_bytes_on_connection(connection, session_id=state._session_id)
+        if type(current_total) is not int:
+            raise AuditIntegrityError("Tier 1: blob quota total must be an exact integer")
+        if current_total - actual.size_bytes + replacement.size_bytes > max_storage_per_session:
+            from elspeth.contracts.blobs import BlobQuotaExceededError
+
+            raise BlobQuotaExceededError(state._session_id, current_bytes=current_total, limit_bytes=max_storage_per_session)
+        RepositoryQuotaAuthority.admit_storage_bytes(
+            state._connection_token,
+            session_id=state._session_id,
+            additional_bytes=replacement.size_bytes - actual.size_bytes,
+            operation="blob_replacement",
+            record=state._quota_exceeded_recorder,
+        )
+
+    def admit_blob_replacement(
+        self, *, expected: BlobRecord, replacement: BlobRecord, max_storage_per_session: int, accepting_proposal_id: UUID | None
+    ) -> None:
+        """Check fresh replacement prerequisites, without preparing an intent."""
+        state = self.__state
+        state._require_active()
+        self._require_blob_mutation_exclusion(accepting_proposal_id, replacement=True)
+        if type(expected) is not BlobRecord or type(replacement) is not BlobRecord:
+            raise TypeError("expected and replacement must be exact BlobRecord values")
+        if type(max_storage_per_session) is not int or max_storage_per_session < 0:
+            raise TypeError("max_storage_per_session must be a non-negative exact integer")
+        if str(expected.session_id) != state._session_id or replacement.session_id != expected.session_id:
+            raise SessionDerivedCustodyError
+        observation = self.inspect_blob_mutation(blob_id=expected.id, tool_name="update_blob")
+        if observation.deletion is not None or observation.replacement is not None:
+            raise AuditIntegrityError("blob debt changed during fresh replacement admission")
+        self._require_blob_replacement_prerequisites(
+            expected=expected,
+            replacement=replacement,
+            max_storage_per_session=max_storage_per_session,
+            accepting_proposal_id=accepting_proposal_id,
+        )
+
     @staticmethod
     def _blob_replacement_snapshot(record: BlobRecord) -> BlobSnapshotPayload:
         # One projection for receipts and the replacement ledger: a divergent
@@ -2322,48 +2438,14 @@ class _RepositoryBlobMutations:
                 raise AuditIntegrityError("a different blob replacement invocation is already in progress")
             return existing
 
-        actual = self._blob_record(state._require_blob(expected.id))
-        if actual != expected:
-            raise AuditIntegrityError("ready blob metadata changed before replacement intent")
-        if actual.status != "ready" or actual.content_hash is None:
-            raise AuditIntegrityError("blob replacement requires ready metadata with a content hash")
-        immutable_projection = (
-            ("id", replacement.id, expected.id),
-            ("session_id", replacement.session_id, expected.session_id),
-            ("filename", replacement.filename, expected.filename),
-            ("mime_type", replacement.mime_type, expected.mime_type),
-            ("storage_path", replacement.storage_path, expected.storage_path),
-            ("created_at", replacement.created_at, expected.created_at),
-            ("created_by", replacement.created_by, expected.created_by),
-            ("source_description", replacement.source_description, expected.source_description),
-            ("status", replacement.status, expected.status),
-        )
-        for field_name, replacement_value, expected_value in immutable_projection:
-            if replacement_value != expected_value:
-                raise AuditIntegrityError(f"blob replacement changed immutable field {field_name}")
-        if replacement.content_hash is None or type(replacement.size_bytes) is not int or replacement.size_bytes < 0:
-            raise AuditIntegrityError("blob replacement requires exact proposed size and content hash")
-        self._require_blob_deletion_retention_clear(
-            actual,
+        self._require_blob_replacement_prerequisites(
+            expected=expected,
+            replacement=replacement,
+            max_storage_per_session=max_storage_per_session,
             accepting_proposal_id=accepting_proposal_id,
-            accepting_tool_name="update_blob" if accepting_proposal_id is not None else None,
         )
+
         connection = _resolve_mutation_connection(state._connection_token)
-        current_total = session_storage_bytes_on_connection(connection, session_id=state._session_id)
-        if type(current_total) is not int:
-            raise AuditIntegrityError("Tier 1: blob quota total must be an exact integer")
-        if current_total - actual.size_bytes + replacement.size_bytes > max_storage_per_session:
-            from elspeth.contracts.blobs import BlobQuotaExceededError
-
-            raise BlobQuotaExceededError(state._session_id, current_bytes=current_total, limit_bytes=max_storage_per_session)
-        RepositoryQuotaAuthority.admit_storage_bytes(
-            state._connection_token,
-            session_id=state._session_id,
-            additional_bytes=replacement.size_bytes - actual.size_bytes,
-            operation="blob_replacement",
-            record=state._quota_exceeded_recorder,
-        )
-
         owner_instance_id = connection.execute(
             select(session_operation_fences_table.c.owner_instance_id)
             .where(
@@ -2500,26 +2582,13 @@ class _RepositoryBlobMutations:
         actual = self._blob_record(state._require_blob(exact.blob_id))
         if actual != exact.old_blob:
             raise AuditIntegrityError("blob metadata changed before replacement commit")
-        self._require_blob_deletion_retention_clear(
+        self._require_blob_replacement_retention_and_quota(
             actual,
+            replacement=exact.replacement_blob,
+            max_storage_per_session=max_storage_per_session,
             accepting_proposal_id=accepting_proposal_id,
-            accepting_tool_name="update_blob" if accepting_proposal_id is not None else None,
         )
         connection = _resolve_mutation_connection(state._connection_token)
-        current_total = session_storage_bytes_on_connection(connection, session_id=state._session_id)
-        if type(current_total) is not int:
-            raise AuditIntegrityError("Tier 1: blob quota total must be an exact integer")
-        if current_total - actual.size_bytes + exact.replacement_blob.size_bytes > max_storage_per_session:
-            from elspeth.contracts.blobs import BlobQuotaExceededError
-
-            raise BlobQuotaExceededError(state._session_id, current_bytes=current_total, limit_bytes=max_storage_per_session)
-        RepositoryQuotaAuthority.admit_storage_bytes(
-            state._connection_token,
-            session_id=state._session_id,
-            additional_bytes=exact.replacement_blob.size_bytes - actual.size_bytes,
-            operation="blob_replacement",
-            record=state._quota_exceeded_recorder,
-        )
         advanced = connection.execute(
             update(blob_replacement_cleanups_table)
             .where(and_(*self._blob_replacement_plan_predicates(exact)))
@@ -2541,6 +2610,7 @@ class _RepositoryBlobMutations:
             .values(
                 size_bytes=replacement.size_bytes,
                 content_hash=replacement.content_hash,
+                created_by=replacement.created_by,
                 creation_modality=replacement.creation_modality.value,
                 created_from_message_id=replacement.created_from_message_id,
                 creating_model_identifier=replacement.creating_model_identifier,
@@ -2552,8 +2622,7 @@ class _RepositoryBlobMutations:
         )
         if replaced.rowcount != 1:
             raise AuditIntegrityError("ready blob changed during exact replacement commit")
-        # Preserve recoverable sink-stage overhead when this formerly generated
-        # output is edited. Shrinkage is released only after backup cleanup.
+        # Keep recoverable sink-stage overhead for an edited generated output; shrinkage is released after backup cleanup.
         growth = max(replacement.size_bytes - actual.size_bytes, 0)
         connection.execute(
             update(output_storage_reservations_table)
@@ -3254,6 +3323,62 @@ class _RepositoryBlobMutations:
             )
         )
 
+    def _require_blob_deletion_prerequisites(
+        self,
+        *,
+        blob: BlobRecord,
+        blob_snapshot_hash: str,
+        expected_file_present: bool,
+        expected_file_size: int | None,
+        expected_file_hash: str | None,
+        accepting_proposal_id: UUID | None,
+    ) -> None:
+        self._require_blob_deletion_retention_clear(
+            blob,
+            accepting_proposal_id=accepting_proposal_id,
+            accepting_tool_name="delete_blob" if accepting_proposal_id is not None else None,
+        )
+        if blob_record_snapshot_hash(blob) != blob_snapshot_hash:
+            raise AuditIntegrityError("blob metadata changed before deletion intent admission")
+        if expected_file_present:
+            if expected_file_size != blob.size_bytes:
+                raise AuditIntegrityError("blob deletion file size evidence does not match metadata")
+            if blob.content_hash is not None and expected_file_hash != blob.content_hash:
+                raise AuditIntegrityError("blob deletion file hash evidence does not match metadata")
+        elif expected_file_size is not None or expected_file_hash is not None:
+            raise AuditIntegrityError("absent blob deletion file evidence cannot carry size or hash")
+        BlobDeletionPlan.require_file_evidence(expected_file_present, expected_file_size, expected_file_hash)
+
+    def admit_blob_deletion(
+        self,
+        *,
+        expected: BlobRecord,
+        expected_file_present: bool,
+        expected_file_size: int | None,
+        expected_file_hash: str | None,
+        accepting_proposal_id: UUID | None,
+    ) -> None:
+        """Check exact observed deletion evidence without creating a ledger."""
+        state = self.__state
+        state._require_active()
+        self._require_blob_mutation_exclusion(accepting_proposal_id, replacement=False)
+        if type(expected) is not BlobRecord:
+            raise TypeError("expected must be an exact BlobRecord")
+        if str(expected.session_id) != state._session_id:
+            raise SessionDerivedCustodyError
+        observation = self.inspect_blob_mutation(blob_id=expected.id, tool_name="delete_blob")
+        if observation.deletion is not None or observation.replacement is not None:
+            raise AuditIntegrityError("blob debt changed during fresh deletion admission")
+        blob = self._blob_record(state._require_blob(expected.id))
+        self._require_blob_deletion_prerequisites(
+            blob=blob,
+            blob_snapshot_hash=blob_record_snapshot_hash(expected),
+            expected_file_present=expected_file_present,
+            expected_file_size=expected_file_size,
+            expected_file_hash=expected_file_hash,
+            accepting_proposal_id=accepting_proposal_id,
+        )
+
     def prepare_blob_deletion(
         self,
         *,
@@ -3284,20 +3409,14 @@ class _RepositoryBlobMutations:
             return existing
 
         blob = self._blob_record(state._require_blob(blob_id))
-        self._require_blob_deletion_retention_clear(
-            blob,
+        self._require_blob_deletion_prerequisites(
+            blob=blob,
+            blob_snapshot_hash=blob_snapshot_hash,
+            expected_file_present=expected_file_present,
+            expected_file_size=expected_file_size,
+            expected_file_hash=expected_file_hash,
             accepting_proposal_id=accepting_proposal_id,
-            accepting_tool_name="delete_blob" if accepting_proposal_id is not None else None,
         )
-        if blob_record_snapshot_hash(blob) != blob_snapshot_hash:
-            raise AuditIntegrityError("blob metadata changed before deletion intent admission")
-        if expected_file_present:
-            if expected_file_size != blob.size_bytes:
-                raise AuditIntegrityError("blob deletion file size evidence does not match metadata")
-            if blob.content_hash is not None and expected_file_hash != blob.content_hash:
-                raise AuditIntegrityError("blob deletion file hash evidence does not match metadata")
-        elif expected_file_size is not None or expected_file_hash is not None:
-            raise AuditIntegrityError("absent blob deletion file evidence cannot carry size or hash")
         created_at = state._database_now
         candidate = BlobDeletionPlan(
             blob_id=blob_id,

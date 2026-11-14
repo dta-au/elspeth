@@ -43,11 +43,12 @@ from elspeth.contracts.blobs_inline import (
     is_widened_blob_ref,
 )
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+from elspeth.contracts.credential_material import DEFAULT_CREDENTIAL_TRAVERSAL_POLICY
 from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationContext
-from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.blobs.protocol import (
     AllowedMimeType,
     BlobActiveRunError,
@@ -103,9 +104,17 @@ from elspeth.web.composer.tools.declarations import (
     ToolKind,
 )
 from elspeth.web.credential_guard import CREDENTIAL_REFUSAL_DETAIL, CredentialMaterialRefused, require_no_credential_material
-from elspeth.web.execution._validation_materialization import is_llm_authored_prompt_surface_binding, llm_prompt_surface_field
+from elspeth.web.execution._validation_materialization import (
+    FILE_INJECT_PLUGIN,
+    FileInjectContentRefusal,
+    file_inject_blob_refusal,
+    file_inject_option_refusals,
+    is_llm_authored_prompt_surface_binding,
+    llm_prompt_surface_field,
+)
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, reconcile_authoritative_reviews
 from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
+from elspeth.web.resource_identity import canonical_resource_uuid
 from elspeth.web.sessions.models import (
     blobs_table,
 )
@@ -508,27 +517,12 @@ def _sync_get_blob(engine: Engine, blob_id: str, session_id: str | None = None) 
         return _blob_row_to_tool_dict(row)
 
 
-@observation_boundary(
-    tier=3,
-    source="LLM composer tool-call blob_id argument",
-    source_param="blob_id",
-    suppresses=("R5",),
-    invariant="returns a repairable error message for non-string or non-UUID blob_id and None for canonical input; never raises on blob_id",
+_BLOB_ID_UUID_ERROR = (
+    "blob_id is not a valid UUID. Use list_blobs or "
+    "list_composer_blobs to select an uploaded blob, ask the user to "
+    "upload the source file, or use create_blob for inline content "
+    "before calling this tool."
 )
-def _blob_id_uuid_validation_error(blob_id: Any) -> str | None:
-    """Return a repairable boundary error when ``blob_id`` is not canonical."""
-    if not isinstance(blob_id, str):
-        return f"blob_id must be a UUID string, got {type(blob_id).__name__}."
-    try:
-        UUID(blob_id)
-    except ValueError:
-        return (
-            "blob_id is not a valid UUID. Use list_blobs or "
-            "list_composer_blobs to select an uploaded blob, ask the user to "
-            "upload the source file, or use create_blob for inline content "
-            "before calling this tool."
-        )
-    return None
 
 
 def _sync_list_blobs(engine: Engine, session_id: str) -> list[BlobInventoryPayload]:
@@ -665,10 +659,10 @@ def _handle_get_blob_metadata(
     session_id = context.session_id
     if session_engine is None or session_id is None:
         return _failure_result(state, "Blob tools require session context.")
-    blob_id_error = _blob_id_uuid_validation_error(validated.blob_id)
-    if blob_id_error is not None:
-        return _failure_result(state, blob_id_error)
-    blob = _sync_get_blob(session_engine, validated.blob_id, session_id)
+    blob_id = canonical_resource_uuid(validated.blob_id)
+    if blob_id is None:
+        return _failure_result(state, _BLOB_ID_UUID_ERROR)
+    blob = _sync_get_blob(session_engine, blob_id, session_id)
     if blob is None:
         return _failure_result(state, "Blob not found for this session.")
     safe_blob: BlobMetadataPayload = {
@@ -927,10 +921,10 @@ def _llm_authored_prompt_surface_error(
     marker writer reports the missing node.
     """
     surface = llm_prompt_surface_field(field_path)
-    llm_node_names = frozenset(node.id for node in state.nodes if node.plugin == "llm")
+    node_plugins = {node.id: node.plugin for node in state.nodes if node.plugin is not None}
     if surface is None or not is_llm_authored_prompt_surface_binding(
         field_path,
-        llm_node_names=llm_node_names,
+        node_plugins=node_plugins,
         creation_modality=creation_modality,
     ):
         return None
@@ -1010,7 +1004,7 @@ def _llm_authored_inline_prompt_surface_error(
                 continue
             if is_llm_authored_prompt_surface_binding(
                 field_path,
-                llm_node_names=(node_id,),
+                node_plugins={node_id: plugin},
                 creation_modality=CreationModality(blob["creation_modality"]),
             ):
                 return _llm_authored_prompt_surface_message(
@@ -1019,6 +1013,121 @@ def _llm_authored_inline_prompt_surface_error(
                     node_id=node_id,
                     option_path=option_path,
                 )
+    return None
+
+
+def _file_inject_refusal_message(*, tool_name: str, refusal: FileInjectContentRefusal) -> str:
+    """The repairable refusal for ``file_inject`` content that is not a user-uploaded file.
+
+    One text for every tool and every cause (a blob the user did not upload,
+    literal content, ``default_content``); only the clause saying what was wrong
+    differs. The problem and the repair are the predicate module's, so
+    /validate words them the same way.
+    """
+    return (
+        f"{tool_name} cannot set file_inject node '{refusal.node_name}' option '{refusal.option_path}': {refusal.problem}. {refusal.repair}"
+    )
+
+
+@trust_boundary(
+    tier=3,
+    source=(
+        "node plugin options authored through an LLM composer tool call (upsert_node, patch_node_options, splice_transform, set_pipeline)"
+    ),
+    source_param="options",
+    suppresses=(),
+    invariant=(
+        "returns the repairable file_inject refusal text when the options carry literal content, any default_content, "
+        "or a marker naming a blob in this session that the user did not upload, and None for every other options shape; "
+        "never raises on options"
+    ),
+    non_raising=True,
+)
+def _file_inject_node_option_error(
+    context: ToolContext,
+    *,
+    tool_name: str,
+    node_id: str,
+    plugin: str | None,
+    options: Mapping[str, Any],
+) -> str | None:
+    """Refuse a node-option write that gives ``file_inject`` content other than a user-uploaded file.
+
+    Applied by every tool that can write node options (``upsert_node``,
+    ``patch_node_options``, ``splice_transform``, ``set_pipeline``), on the
+    options the node would hold. Literal content and ``default_content`` are
+    refused from the options alone. A marker's blob is looked up in this
+    session and refused unless the user uploaded it; a marker is not judged when no
+    session engine is attached or its blob is not in this session, and
+    /validate and run admission then apply the same rule to the blob they
+    resolve. Returns ``None`` for every other plugin.
+    """
+    if plugin != FILE_INJECT_PLUGIN:
+        return None
+    option_refusals = file_inject_option_refusals(node_id, options)
+    if option_refusals:
+        return _file_inject_refusal_message(tool_name=tool_name, refusal=option_refusals[0])
+    session_engine = context.session_engine
+    session_id = context.session_id
+    if session_engine is None or session_id is None:
+        return None
+    for key, value in deep_thaw(options).items():
+        for option_path, blob_id in _inline_content_marker_blob_ids(value, key):
+            blob = _sync_get_blob(session_engine, str(blob_id), session_id)
+            if blob is None:
+                continue
+            refusal = file_inject_blob_refusal(
+                f"node:{node_id}.options.{option_path}",
+                blob_id=blob_id,
+                node_plugins={node_id: plugin},
+                created_by=blob["created_by"],
+                creation_modality=CreationModality(blob["creation_modality"]),
+            )
+            if refusal is not None:
+                return _file_inject_refusal_message(tool_name=tool_name, refusal=refusal)
+    return None
+
+
+def _file_inject_blob_binding_error(
+    state: CompositionState,
+    field_path: str,
+    *,
+    blob_id: UUID,
+    created_by: str,
+    creation_modality: CreationModality,
+) -> str | None:
+    """Refuse a blob the user did not upload at or beneath a ``file_inject`` node's ``files``.
+
+    For the marker writers that bind one known blob: ``wire_blob_inline_ref``
+    and YAML-import re-binding. The rule is ``file_inject_blob_refusal``, which
+    /validate and run admission apply to the blob they resolve.
+    """
+    refusal = file_inject_blob_refusal(
+        field_path,
+        blob_id=blob_id,
+        node_plugins={node.id: node.plugin for node in state.nodes if node.plugin is not None},
+        created_by=created_by,
+        creation_modality=creation_modality,
+    )
+    return None if refusal is None else _file_inject_refusal_message(tool_name="wire_blob_inline_ref", refusal=refusal)
+
+
+def _file_inject_wired_marker_error(state: CompositionState, field_path: str) -> str | None:
+    """Refuse a wired marker that leaves a ``file_inject`` node with content that is not an attached upload.
+
+    ``wire_blob_inline_ref`` can only write a marker, so what it can break is
+    where the marker lands: ``default_content``, or beneath an entry's
+    ``content`` rather than at it. Judged on the node as written.
+    """
+    prefix, _separator, _rest = field_path.partition(".options.")
+    if not prefix.startswith("node:"):
+        return None
+    node_id = prefix.removeprefix("node:")
+    for node in state.nodes:
+        if node.id == node_id and node.plugin == FILE_INJECT_PLUGIN:
+            option_refusals = file_inject_option_refusals(node_id, node.options)
+            if option_refusals:
+                return _file_inject_refusal_message(tool_name="wire_blob_inline_ref", refusal=option_refusals[0])
     return None
 
 
@@ -1035,15 +1144,15 @@ def _execute_wire_blob_inline_ref(
         return _failure_result(state, "Blob tools require session context.")
 
     field_path = validated.field_path
-    blob_id_error = _blob_id_uuid_validation_error(validated.blob_id)
-    if blob_id_error is not None:
-        return _failure_result(state, blob_id_error)
-    blob_id = UUID(validated.blob_id)
+    selector = canonical_resource_uuid(validated.blob_id)
+    if selector is None:
+        return _failure_result(state, _BLOB_ID_UUID_ERROR)
+    blob_id = UUID(selector)
 
     # The argument model validates ContentEncoding and defaults absence to utf-8.
     encoding = validated.encoding
 
-    blob = _sync_get_blob(session_engine, str(blob_id), session_id)
+    blob = _sync_get_blob(session_engine, selector, session_id)
     if blob is None:
         return _failure_result(state, f"Blob '{blob_id}' not found.")
     if blob["status"] != "ready":
@@ -1070,6 +1179,15 @@ def _execute_wire_blob_inline_ref(
     )
     if prompt_surface_error is not None:
         return _failure_result(state, prompt_surface_error)
+    file_inject_blob_error = _file_inject_blob_binding_error(
+        state,
+        ref.field_path,
+        blob_id=blob_id,
+        created_by=blob["created_by"],
+        creation_modality=CreationModality(blob["creation_modality"]),
+    )
+    if file_inject_blob_error is not None:
+        return _failure_result(state, file_inject_blob_error, error_code="file_inject_content_not_uploaded")
 
     marker: dict[str, Any] = {
         "blob_ref": str(blob_id),
@@ -1083,6 +1201,9 @@ def _execute_wire_blob_inline_ref(
         new_state = _apply_inline_blob_marker(state, ref.field_path, marker)
     except ValueError as exc:
         return _failure_result(state, str(exc))
+    file_inject_error = _file_inject_wired_marker_error(new_state, ref.field_path)
+    if file_inject_error is not None:
+        return _failure_result(state, file_inject_error, error_code="file_inject_content_not_uploaded")
     canonical_error = _composition_canonical_interpretation_requirement_error(
         new_state,
         tool_name="wire_blob_inline_ref",
@@ -1712,6 +1833,149 @@ _CREATE_BLOB_DECLARATION = ToolDeclaration(
 )
 
 
+def _validated_blob_update(arguments: object) -> UpdateBlobArgumentsModel:
+    try:
+        return UpdateBlobArgumentsModel.model_validate(arguments)
+    except PydanticValidationError as exc:
+        raise ToolArgumentError(
+            argument="update_blob arguments",
+            expected="object conforming to UpdateBlobArgumentsModel",
+            actual_type=type(exc).__name__,
+            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
+        ) from exc
+
+
+def _blob_update_bytes(validated: UpdateBlobArgumentsModel) -> bytes:
+    try:
+        return validated.content.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ToolArgumentError(
+            argument="update_blob content",
+            expected="valid UTF-8 text",
+            actual_type=type(exc).__name__,
+        ) from exc
+
+
+def _blob_replacement_record(
+    expected: BlobRecord, content_bytes: bytes, provenance: _BlobCreationProvenance, context: ToolContext
+) -> BlobRecord:
+    return replace(
+        expected,
+        # An agent write is an agent write: a rewrite of a user upload (or any
+        # other blob) makes it the assistant's file, as a newly created one is.
+        created_by="assistant",
+        size_bytes=len(content_bytes),
+        content_hash=content_hash(content_bytes),
+        creation_modality=provenance.creation_modality,
+        created_from_message_id=_blob_provenance_message_id(context.user_message_id),
+        creating_model_identifier=provenance.creating_model_identifier,
+        creating_model_version=provenance.creating_model_version,
+        creating_provider=provenance.creating_provider,
+        creating_composer_skill_hash=provenance.creating_composer_skill_hash,
+        creating_arguments_hash=provenance.creating_arguments_hash,
+    )
+
+
+def admit_blob_mutation(tool_name: str, arguments: object, state: CompositionState, context: ToolContext) -> ToolResult | None:
+    """Observe update/delete prerequisites without invoking either effect handler.
+
+    None means stageable admission, including identical content. Only an
+    actual refusal produces feedback; acceptance repeats every prerequisite.
+    """
+    from elspeth.web.blobs.replacement import BlobReplacementCoordinator
+
+    if tool_name not in {"update_blob", "delete_blob"}:
+        raise AuditIntegrityError("blob admission requires update_blob or delete_blob")
+    deleting = tool_name == "delete_blob"
+    deletion_arguments = _validate_mutation_arguments(BlobIdArgumentsModel, arguments, "delete_blob arguments") if deleting else None
+    if context.session_engine is None or context.session_id is None:
+        return _failure_result(state, "Blob tools require session context.")
+    if context.data_dir is None:
+        return _failure_result(state, "Blob tools require data_dir for storage.")
+    if deletion_arguments is not None:
+        blob_id = deletion_arguments.blob_id
+        update_arguments = None
+    else:
+        update_arguments = _validated_blob_update(arguments)
+        blob_id = update_arguments.blob_id
+    selector = canonical_resource_uuid(blob_id)
+    if selector is None:
+        return _failure_result(state, _BLOB_ID_UUID_ERROR)
+    blob_id = selector
+    content_bytes = _blob_update_bytes(update_arguments) if update_arguments is not None else None
+    authority, operation = _require_blob_tool_authority(context)
+    provenance = _blob_creation_provenance(update_arguments.content, context) if update_arguments is not None else None
+    if context.executing_proposal_id is not None:
+        raise AuditIntegrityError("proposal preview cannot invent a retention exclusion")
+    with _blob_custody_session_lock(context.session_engine, context.session_id):
+        observed = authority.mutate(
+            operation,
+            lambda transaction: transaction.blobs.inspect_blob_mutation(
+                blob_id=UUID(blob_id), tool_name="delete_blob" if deleting else "update_blob"
+            ),
+        )
+        service = BlobServiceImpl(context.session_engine, Path(context.data_dir), session_operation_authority=authority)
+        driver = BlobReplacementCoordinator(
+            engine=context.session_engine, data_dir=Path(context.data_dir), session_operation_authority=authority
+        )
+        if observed.deletion is not None or observed.replacement is not None:
+            if observed.deletion is not None:
+                service._require_blob_deletion_recovery_content(observed.deletion)
+            if observed.replacement is not None:
+                with driver._directory(observed.replacement.session_id) as directory_fd:
+                    driver._require_recovery_content(observed.replacement, directory_fd)
+            current = authority.mutate(
+                operation,
+                lambda transaction: transaction.blobs.inspect_blob_mutation(
+                    blob_id=UUID(blob_id), tool_name="delete_blob" if deleting else "update_blob"
+                ),
+            )
+            if current != observed:
+                raise AuditIntegrityError("blob recovery evidence changed during admission")
+            return _failure_result(state, f"Blob '{blob_id}' requires recovery before another mutation can be proposed.")
+        expected = observed.blob
+        if expected is None:
+            return _failure_result(state, f"Blob '{blob_id}' not found.")
+        if expected.status != "ready":
+            return _failure_result(state, f"Blob '{blob_id}' is not ready and cannot be proposed for mutation.")
+        if _state_references_blob(state, blob_id, expected.storage_path):
+            return _failure_result(
+                state,
+                f"Blob '{blob_id}' is referenced by the current composition and cannot be {'deleted' if deleting else 'updated'}; unbind it first.",
+            )
+        try:
+            if deleting:
+                present, size, digest = service._observe_blob_deletion_content(expected)
+                authority.mutate(
+                    operation,
+                    lambda transaction: transaction.blobs.admit_blob_deletion(
+                        expected=expected,
+                        expected_file_present=present,
+                        expected_file_size=size,
+                        expected_file_hash=digest,
+                        accepting_proposal_id=None,
+                    ),
+                )
+            else:
+                if content_bytes is None or provenance is None:
+                    raise AuditIntegrityError("blob update admission lost prepared content or provenance")
+                replacement = _blob_replacement_record(expected, content_bytes, provenance, context)
+                with driver._directory(expected.session_id) as directory_fd:
+                    driver._require_canonical_replacement_content(expected, directory_fd)
+                authority.mutate(
+                    operation,
+                    lambda transaction: transaction.blobs.admit_blob_replacement(
+                        expected=expected,
+                        replacement=replacement,
+                        max_storage_per_session=_resolve_blob_quota_bytes(context.max_blob_storage_per_session_bytes),
+                        accepting_proposal_id=None,
+                    ),
+                )
+        except (BlobActiveRunError, BlobPendingProposalError, BlobInProgressForkError, BlobQuotaExceededError, BlobStateError) as exc:
+            return _failure_result(state, str(exc))
+    return None
+
+
 def _execute_update_blob(
     arguments: dict[str, Any],
     state: CompositionState,
@@ -1725,26 +1989,11 @@ def _execute_update_blob(
         return _failure_result(state, "Blob tools require session context.")
     if context.data_dir is None:
         return _failure_result(state, "Blob tools require data_dir for storage.")
-    try:
-        validated = UpdateBlobArgumentsModel.model_validate(arguments)
-    except PydanticValidationError as exc:
-        raise ToolArgumentError(
-            argument="update_blob arguments",
-            expected="object conforming to UpdateBlobArgumentsModel",
-            actual_type=type(exc).__name__,
-            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
-        ) from exc
-    blob_id_error = _blob_id_uuid_validation_error(validated.blob_id)
-    if blob_id_error is not None:
-        return _failure_result(state, blob_id_error)
-    try:
-        content_bytes = validated.content.encode("utf-8")
-    except UnicodeEncodeError as exc:
-        raise ToolArgumentError(
-            argument="update_blob content",
-            expected="valid UTF-8 text",
-            actual_type=type(exc).__name__,
-        ) from exc
+    validated = _validated_blob_update(arguments)
+    blob_id = canonical_resource_uuid(validated.blob_id)
+    if blob_id is None:
+        return _failure_result(state, _BLOB_ID_UUID_ERROR)
+    content_bytes = _blob_update_bytes(validated)
     authority, operation = _require_blob_tool_authority(context)
     provenance = _blob_creation_provenance(validated.content, context)
     driver = BlobReplacementCoordinator(
@@ -1757,25 +2006,14 @@ def _execute_update_blob(
     try:
         expected = authority.mutate(
             operation,
-            lambda transaction: transaction.blobs.read_blob(blob_id=UUID(validated.blob_id)),
+            lambda transaction: transaction.blobs.read_blob(blob_id=UUID(blob_id)),
         )
-        if _state_references_blob(state, validated.blob_id, expected.storage_path):
+        if _state_references_blob(state, blob_id, expected.storage_path):
             return _failure_result(
                 state,
-                f"Blob '{validated.blob_id}' is referenced by the current composition and cannot be updated; unbind it first.",
+                f"Blob '{blob_id}' is referenced by the current composition and cannot be updated; unbind it first.",
             )
-        replacement = replace(
-            expected,
-            size_bytes=len(content_bytes),
-            content_hash=content_hash(content_bytes),
-            creation_modality=provenance.creation_modality,
-            created_from_message_id=_blob_provenance_message_id(context.user_message_id),
-            creating_model_identifier=provenance.creating_model_identifier,
-            creating_model_version=provenance.creating_model_version,
-            creating_provider=provenance.creating_provider,
-            creating_composer_skill_hash=provenance.creating_composer_skill_hash,
-            creating_arguments_hash=provenance.creating_arguments_hash,
-        )
+        replacement = _blob_replacement_record(expected, content_bytes, provenance, context)
         result = driver.replace_blob(
             expected=expected,
             replacement=replacement,
@@ -1785,7 +2023,7 @@ def _execute_update_blob(
             accepting_proposal_id=UUID(context.executing_proposal_id) if context.executing_proposal_id is not None else None,
         )
     except SessionDerivedCustodyError:
-        return _failure_result(state, f"Blob '{validated.blob_id}' not found.")
+        return _failure_result(state, f"Blob '{blob_id}' not found.")
     except (BlobActiveRunError, BlobPendingProposalError, BlobInProgressForkError, BlobQuotaExceededError, BlobStateError) as exc:
         return _failure_result(state, str(exc))
     return _discovery_result(
@@ -1840,10 +2078,9 @@ def _execute_delete_blob(
         return _failure_result(state, "Blob tools require session context.")
     if context.data_dir is None:
         return _failure_result(state, "Blob tools require data_dir for storage.")
-    blob_id = validated.blob_id
-    blob_id_error = _blob_id_uuid_validation_error(blob_id)
-    if blob_id_error is not None:
-        return _failure_result(state, blob_id_error)
+    blob_id = canonical_resource_uuid(validated.blob_id)
+    if blob_id is None:
+        return _failure_result(state, _BLOB_ID_UUID_ERROR)
     authority, operation = _require_blob_tool_authority(context)
     service = BlobServiceImpl(
         context.session_engine,
@@ -2030,10 +2267,9 @@ def _execute_get_blob_content(
         return _failure_result(state, "Blob tools require session context.")
 
     validated = _validate_mutation_arguments(GetBlobContentArgumentsModel, arguments, "get_blob_content arguments")
-    blob_id = validated.blob_id
-    blob_id_error = _blob_id_uuid_validation_error(blob_id)
-    if blob_id_error is not None:
-        return _failure_result(state, blob_id_error)
+    blob_id = canonical_resource_uuid(validated.blob_id)
+    if blob_id is None:
+        return _failure_result(state, _BLOB_ID_UUID_ERROR)
     # Guards 1 + 2 (lifecycle, integrity) run inside the same-session
     # custody lock so the row and the bytes are one version — a read
     # racing update/delete must block rather than pair the old committed
@@ -2059,6 +2295,15 @@ def _execute_get_blob_content(
     if data is None:
         return _failure_result(state, f"Blob storage file missing for '{blob_id}'.")
 
+    inspection_limit = DEFAULT_CREDENTIAL_TRAVERSAL_POLICY.max_string_bytes
+    if len(data) > inspection_limit:
+        return _failure_result(
+            state,
+            f"The attachment is {len(data)} bytes, exceeding the current {inspection_limit}-byte "
+            "whole-input credential inspection limit; no content was returned.",
+            error_code="blob_content_size_limit",
+        )
+
     # Guard 3 — decode safety.  Non-UTF-8 bytes are a Tier-3 external
     # input condition (the operator supplied content in an encoding we
     # cannot losslessly round-trip to the LLM); surface as
@@ -2083,7 +2328,7 @@ def _execute_get_blob_content(
         return _failure_result(state, "Blob content offset exceeds its decoded character length.")
 
     payload: AttachmentContentPayload = {
-        "blob_id": blob_id,
+        "blob_id": blob["id"],
         "filename": blob["filename"],
         "mime_type": blob["mime_type"],
         "content": content,
@@ -2200,10 +2445,9 @@ def _execute_read_attachment(arguments: dict[str, Any], state: CompositionState,
     if session_engine is None or session_id is None:
         return _failure_result(state, "Blob tools require session context.")
     validated = _validate_mutation_arguments(ReadAttachmentArgumentsModel, arguments, "read_attachment arguments")
-    blob_id = validated.blob_id
-    blob_id_error = _blob_id_uuid_validation_error(blob_id)
-    if blob_id_error is not None:
-        return _failure_result(state, blob_id_error)
+    blob_id = canonical_resource_uuid(validated.blob_id)
+    if blob_id is None:
+        return _failure_result(state, _BLOB_ID_UUID_ERROR)
     blob, data = _locked_read_ready_blob(
         session_engine,
         session_id,
@@ -2235,7 +2479,7 @@ def _execute_read_attachment(arguments: dict[str, Any], state: CompositionState,
     if validated.expected_content_hash is not None and not hmac.compare_digest(validated.expected_content_hash, verified_hash):
         return _failure_result(state, "Blob content changed; restart inspection with its current content hash.")
     payload: AttachmentContentPayload = {
-        "blob_id": blob_id,
+        "blob_id": blob["id"],
         "filename": blob["filename"],
         "mime_type": blob["mime_type"],
         "content": content,

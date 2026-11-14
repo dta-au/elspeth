@@ -158,7 +158,6 @@ from elspeth.web.composer.tool_error_payloads import (
     arg_error_payload as _arg_error_payload,
 )
 from elspeth.web.composer.tools import (
-    _MUTATION_TOOLS,
     RuntimePreflight,
     ToolContext,
     ToolResult,
@@ -175,6 +174,8 @@ from elspeth.web.composer.tools import (
 )
 from elspeth.web.composer.tools._common import _candidate_rejection_result, _saved_graph_rejection_result
 from elspeth.web.composer.tools._registry import resolve_tool_effects, response_contract_for
+from elspeth.web.composer.tools.blobs import admit_blob_mutation
+from elspeth.web.composer.tools.declarations import EffectDomain
 from elspeth.web.composer.tools.generation import MalformedSourceProofClaim, _admit_source_proof_claims
 from elspeth.web.composer.tools.sessions import ADVISOR_TRIGGER_CANNOT_COMPLETE, RequestAdvisorHintArgumentsModel
 from elspeth.web.composer.tools.wire_projection import _WIRE_TOOL_DEFS, decode_wire_arguments, encode_semantic_arguments
@@ -190,6 +191,11 @@ from elspeth.web.interpretation_state import (
     interpretation_sites,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.sessions.proposal_blob_refs import (
+    PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE,
+    MalformedProposalBlobReferenceError,
+    ProposalResourceUnavailableError,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -211,6 +217,41 @@ if TYPE_CHECKING:
 
 
 _MAX_PENDING_PROPOSALS_PER_TURN: Final[int] = 10
+
+
+@dataclass(frozen=True, slots=True)
+class _UnappliedAdmission:
+    """An actual admission outcome reused by audited dispatch, never replayed."""
+
+    disposition: Literal["refused", "no_change"]
+    result: ToolResult
+
+
+def _unapplied_admission(
+    result: ToolResult,
+    disposition: Literal["refused", "no_change"],
+    *,
+    state: CompositionState,
+    validation: ValidationSummary,
+    runtime_preflight: ValidationResult | None,
+) -> _UnappliedAdmission:
+    return _UnappliedAdmission(
+        disposition,
+        replace(
+            result,
+            updated_state=state,
+            validation=validation if disposition == "no_change" else result.validation,
+            runtime_preflight=runtime_preflight,
+            affected_nodes=(),
+            prior_validation=None,
+            applied_component=None,
+            post_call_hints=(
+                (*result.post_call_hints, "The pipeline is unchanged; no proposal was submitted for approval.")
+                if disposition == "no_change"
+                else result.post_call_hints
+            ),
+        ),
+    )
 
 
 class _ProposalPayload(TypedDict):
@@ -377,11 +418,78 @@ async def _preflight_session_tool_call_ids(
         raise reused_id_error
 
 
+def _stages_composition_proposal(tool_name: str) -> bool:
+    """Whether explicit approval stages this tool as a composition-changing proposal.
+
+    Blob-store-only tools are excluded: ``create_blob`` stays immediate and the
+    destructive ``update_blob``/``delete_blob`` proposals never advance the
+    composition state, so they keep their existing staging behaviour.
+    """
+    return is_mutation_tool(tool_name) and not is_blob_store_only_mutation_tool(tool_name)
+
+
+async def _approval_containment_refusal(
+    calls: tuple[_AdmittedToolCall, ...],
+    *,
+    sessions_service: SessionServiceProtocol,
+    session_id: UUID,
+    current_state_id: str | None,
+) -> tuple[Literal["batch", "pending"], str] | None:
+    """Return ``(reason, message)`` when this batch may not stage a composition proposal.
+
+    Every staged composition edit is previewed against the committed pipeline
+    and recorded with that pipeline as its base; accepting one moves the base
+    and its siblings then fail the accept-time base check for ever. Until
+    proposals are cumulative, at most one composition proposal is outstanding:
+    a batch carrying several is refused whole, and a single one is refused
+    while an earlier proposal still awaits the user. The decision is made from
+    tool names and durable rows alone, before any call is previewed, so no
+    refused call has an effect.
+    """
+    staged = sum(1 for call in calls if _stages_composition_proposal(call.function.name))
+    if staged > 1:
+        return (
+            "batch",
+            # Counted by tool name, so a sibling that fails its own argument
+            # checks is included: the wording is true of every call whatever
+            # each one's own result says.
+            f"This session requires approval for pipeline changes and this response carried {staged} pipeline-change "
+            "calls. None of them was applied and no proposal was recorded. Separate proposals are each "
+            "drawn against the same saved pipeline, so the user could only ever accept one of them. Submit the whole "
+            "intended result as one change: a single set_pipeline call containing every edit, with no other pipeline "
+            "mutation in the same response.",
+        )
+    if staged == 1:
+        pending = [
+            proposal
+            for proposal in await sessions_service.list_composition_proposals(session_id, status="pending")
+            if not is_blob_store_only_mutation_tool(proposal.tool_name)
+        ]
+        if pending:
+            others = f" ({len(pending) - 1} more are also pending)" if len(pending) > 1 else ""
+            # Accept refuses a proposal whose recorded base is no longer the
+            # current state, so offering "accept" for one would be false.
+            base = pending[0].base_state_id
+            decision = (
+                "It can no longer be accepted because the saved pipeline changed after it was created: tell the user they "
+                "must reject it first, then ask again."
+                if base is not None and str(base) != current_state_id
+                else "Tell the user they must accept or reject the pending proposal first, then ask again."
+            )
+            return (
+                "pending",
+                f"Proposal {pending[0].id} ({pending[0].tool_name}) is still awaiting the user's decision{others}. Nothing "
+                f"from this call was applied and no new proposal was recorded. Do not retry or rephrase this change. {decision}",
+            )
+    return None
+
+
 def _pending_proposal_cap_error(
     observed: int,
     *,
     ctx: ToolBatchContext,
     state: CompositionState,
+    invocation_start: int,
 ) -> ComposerConvergenceError:
     """Build the failure for an explicit-approval turn over the pending-proposal cap.
 
@@ -391,10 +499,8 @@ def _pending_proposal_cap_error(
     provider completion that carried the batch is already in ``ctx.recorder``
     and rides out on the exception for the route's LLM-call persistence.
 
-    ``tool_invocations`` is empty: the cap applies only to a session-bound
-    explicit-approval turn, where every earlier tool turn was made durable by
-    P4, and the preflight site dispatches nothing from this batch, so the
-    route has no invocation to replay.
+    Retain the attempted prefix of this batch. Earlier turns were already
+    persisted by P4; the denied call and remaining suffix were never attempted.
 
     Mirrors ``ComposerServiceImpl._enforce_tool_call_cap``: the same reason
     code (the wire reason is derived from ``budget_exhausted``), with a
@@ -406,7 +512,7 @@ def _pending_proposal_cap_error(
         budget_exhausted="composition",
         state=state,
         initial_version=ctx.initial_version,
-        tool_invocations=(),
+        tool_invocations=ctx.recorder.invocations[invocation_start:],
         llm_calls=ctx.recorder.llm_calls,
         reason="tool_call_cap_exceeded",
         evidence={
@@ -963,6 +1069,7 @@ async def run_tool_batch(
     # Former service reads now use named collaborators and immutable batch facts.
     # ------------------------------------------------------------------
     recorder = ctx.recorder
+    batch_invocation_start = len(recorder.invocations)
     anti_anchor = ctx.anti_anchor
     discovery_cache = ctx.discovery_cache
     runtime_preflight_cache = ctx.runtime_preflight_cache
@@ -1035,23 +1142,6 @@ async def run_tool_batch(
             credential_state=batch_credential_state,
         )
     provider_model_version = completion.provider_metadata.model_returned or ctx.provenance.model_identifier
-    if (
-        turn_sessions_service is not None
-        and turn_session_uuid is not None
-        and turn_preferences is not None
-        and turn_preferences.trust_mode == "explicit_approve"
-    ):
-        approval_required_mutations = sum(
-            1
-            for tool_call in assistant_tool_calls
-            if is_mutation_tool(tool_call.function.name)
-            and (
-                not is_blob_store_only_mutation_tool(tool_call.function.name)
-                or is_approval_required_blob_store_only_mutation_tool(tool_call.function.name)
-            )
-        )
-        if approval_required_mutations > _MAX_PENDING_PROPOSALS_PER_TURN:
-            raise _pending_proposal_cap_error(approval_required_mutations, ctx=ctx, state=state)
     await _preflight_session_tool_call_ids(
         admitted_batch,
         sessions_service=turn_sessions_service,
@@ -1116,6 +1206,20 @@ async def run_tool_batch(
     refused_resources: set[Resource] = set()
     promises_by_call: dict[str, frozenset[Resource]] = {}
     from elspeth.web.composer.redaction import MANIFEST, redact_tool_call_arguments
+
+    approval_containment_refusal = (
+        await _approval_containment_refusal(
+            assistant_tool_calls,
+            sessions_service=turn_sessions_service,
+            session_id=turn_session_uuid,
+            current_state_id=current_state_id,
+        )
+        if turn_sessions_service is not None
+        and turn_session_uuid is not None
+        and turn_preferences is not None
+        and turn_preferences.trust_mode == "explicit_approve"
+        else None
+    )
 
     for tool_call in assistant_tool_calls:
         if ctx.cancellation_requested.is_set():
@@ -1546,10 +1650,19 @@ async def run_tool_batch(
             all_cache_hits = False
             continue
 
-        # A refused producer cannot supply a new prerequisite to another call
-        # authored in this same response. Existing saved resources remain usable.
-        if is_mutation_tool(tool_name) and has_unavailable_prerequisite(tool_name, arguments, refused_resources, state):
-            reject = _candidate_rejection_result if tool_name == "set_pipeline" else _saved_graph_rejection_result
+        # Explicit approval keeps at most one composition proposal outstanding
+        # (see ``_approval_containment_refusal``); the refusal is non-``None``
+        # only in that mode. Otherwise: a refused producer cannot supply a new
+        # prerequisite to another call authored in this same response.
+        # Existing saved resources remain usable.
+        containment = approval_containment_refusal if _stages_composition_proposal(tool_name) else None
+        reject = _candidate_rejection_result if tool_name == "set_pipeline" else _saved_graph_rejection_result
+        blocked: ToolResult | None = None
+        if containment is not None and containment[0] == "batch":
+            blocked = reject(state, containment[1], error_code="approval_batch_not_atomic", rejected_component=None)
+        elif containment is not None:
+            blocked = reject(state, containment[1], error_code="approval_proposal_pending", rejected_component=None)
+        elif is_mutation_tool(tool_name) and has_unavailable_prerequisite(tool_name, arguments, refused_resources, state):
             blocked = reject(
                 state,
                 "This mutation depends on a new resource or connection from an earlier refused call in this batch. "
@@ -1558,6 +1671,7 @@ async def run_tool_batch(
                 error_code="batch_dependency_refused",
                 rejected_component=None,
             )
+        if blocked is not None:
             blocked = finalize_tool_result(
                 blocked,
                 tool_name=tool_name,
@@ -1617,19 +1731,13 @@ async def run_tool_batch(
                     cached_result = normalize_tool_result_validation(cached_result, ctx.policy_catalog)
                     if cached_admitted is not None:
                         cached_admitted = AdmittedDiscoveryResult(cached_result, cached_admitted.response, cached_admitted.contract)
-                    cached_payload = {
-                        "success": cached_result.success,
-                        "data": cached_admitted.response.to_wire()
-                        if cached_admitted is not None and cached_admitted.response is not None
-                        else cached_result.data,
-                        "cache_hit": True,
-                    }
                     cached_outcome = cached_admitted.to_tool_result() if cached_admitted is not None else cached_result
                     cached_json = (
                         serialize_admitted_discovery_result(cached_admitted)
                         if cached_admitted is not None
                         else _serialize_tool_result(cached_result)
                     )
+                    cached_payload = (cached_admitted if cached_admitted is not None else cached_result).to_dict()
                 except Exception as cache_exc:
                     recorder.record(finish_plugin_crash(audit, exc=cache_exc))
                     raise
@@ -1718,7 +1826,7 @@ async def run_tool_batch(
             )
             continue
 
-        prevalidated_unapplied_result: ToolResult | None = None
+        unapplied_admission: _UnappliedAdmission | None = None
         preproposal_exception: BaseException | None = None
         candidate_prior_validation: ValidationSummary | None = None
         candidate_context: ToolContext | None = None
@@ -1799,6 +1907,26 @@ async def run_tool_batch(
                         semantic=True,
                     )
                     interpretation_requirements_are_internal = True
+                if (
+                    candidate.acceptable
+                    and candidate.prepared_inline_blob is None
+                    and composition_content_hash(candidate.result.updated_state) == composition_content_hash(state)
+                ):
+                    finalized_candidate_result = finalize_tool_result(
+                        candidate.result,
+                        tool_name=tool_name,
+                        catalog=ctx.policy_catalog,
+                        context=candidate_context,
+                        prior_validation=candidate_prior_validation,
+                    )
+                    if composition_content_hash(finalized_candidate_result.updated_state) == composition_content_hash(state):
+                        unapplied_admission = _unapplied_admission(
+                            finalized_candidate_result,
+                            "no_change",
+                            state=state,
+                            validation=candidate_prior_validation,
+                            runtime_preflight=last_runtime_preflight,
+                        )
             except BaseException as exc:
                 # Re-raise exactly once from inside dispatch_with_audit so the
                 # established ARG_ERROR / PLUGIN_CRASH authority records the
@@ -1808,12 +1936,6 @@ async def run_tool_batch(
         if explicit_approval_required:
             assert turn_sessions_service is not None
             assert turn_session_uuid is not None
-            if proposals_this_turn >= _MAX_PENDING_PROPOSALS_PER_TURN:
-                # Shadowed by the batch preflight above (same population, same
-                # cap); kept so a later change to either count cannot open an
-                # unbounded proposal turn.
-                raise _pending_proposal_cap_error(proposals_this_turn + 1, ctx=ctx, state=state)
-
             from pydantic import ValidationError as PydanticValidationError
 
             # The LLM may produce arguments that fail the redaction
@@ -1914,7 +2036,27 @@ async def run_tool_batch(
                             prior_validation=candidate_prior_validation,
                         )
                         proposal_acceptable = candidate.acceptable
+                        if (
+                            proposal_acceptable
+                            and candidate.prepared_inline_blob is None
+                            and composition_content_hash(finalized_candidate_result.updated_state) == composition_content_hash(state)
+                        ):
+                            unapplied_admission = _unapplied_admission(
+                                finalized_candidate_result,
+                                "no_change",
+                                state=state,
+                                validation=candidate_prior_validation,
+                                runtime_preflight=last_runtime_preflight,
+                            )
+                            redacted_arguments = None
                         if proposal_acceptable and candidate.prepared_inline_blob is not None:
+                            if proposals_this_turn >= _MAX_PENDING_PROPOSALS_PER_TURN:
+                                raise _pending_proposal_cap_error(
+                                    proposals_this_turn + 1,
+                                    ctx=ctx,
+                                    state=state,
+                                    invocation_start=batch_invocation_start,
+                                )
                             if session_id is None or ctx.custody.session_engine is None:
                                 raise AuditIntegrityError("Inline proposal custody requires session context")
                             custody = prepare_pipeline_custody(
@@ -1986,6 +2128,8 @@ async def run_tool_batch(
                                 )
                                 proposal_acceptable = candidate.acceptable
 
+                    except ComposerConvergenceError:
+                        raise
                     except BaseException as exc:
                         # Candidate finalization is one-time pre-proposal work.
                         # Re-raise it inside dispatch_with_audit below without
@@ -2042,19 +2186,63 @@ async def run_tool_batch(
                             # the APPROVAL_REQUIRED envelope's shape on the same
                             # path: unapplied state, empty affected_nodes, no
                             # delta.
-                            prevalidated_unapplied_result = replace(
-                                finalized_candidate_result,
-                                data=feedback_data,
-                                updated_state=state,
-                                prior_validation=None,
-                                affected_nodes=(),
+                            unapplied_admission = _unapplied_admission(
+                                replace(finalized_candidate_result, data=feedback_data),
+                                "refused",
+                                state=state,
+                                validation=candidate_prior_validation,
+                                runtime_preflight=last_runtime_preflight,
                             )
                             # Route the rejected result through canonical
                             # dispatch/outcome without proposal publication.
                             redacted_arguments = None
 
             proposal_redacted_arguments = redacted_arguments
-            if redacted_arguments is not None and tool_name in _MUTATION_TOOLS and tool_name != "set_pipeline":
+            if redacted_arguments is not None and tool_name in {"update_blob", "delete_blob"}:
+                try:
+                    blob_admission = await run_sync_in_worker(
+                        admit_blob_mutation,
+                        tool_name,
+                        arguments,
+                        state,
+                        ToolContext(
+                            catalog=ctx.policy_catalog,
+                            plugin_snapshot=ctx.plugin_snapshot,
+                            data_dir=ctx.custody.data_dir,
+                            require_data_dir_for_paths=True,
+                            session_engine=ctx.custody.session_engine,
+                            session_id=session_id,
+                            session_operation_context=ctx.session_operation_context,
+                            session_operation_authority=ctx.session_operation_authority,
+                            max_blob_storage_per_session_bytes=ctx.custody.max_blob_storage_per_session_bytes,
+                            user_message_id=user_message_id,
+                            user_message_content=user_message_content,
+                            composer_model_identifier=ctx.provenance.model_identifier,
+                            composer_model_version=provider_model_version,
+                            composer_provider=ctx.provenance.provider or "unknown",
+                            composer_skill_hash=ctx.provenance.skill_hash,
+                            tool_arguments_hash=audit.binding_arguments_hash,
+                        ),
+                    )
+                    if blob_admission is not None:
+                        unapplied_admission = _unapplied_admission(
+                            blob_admission,
+                            "refused",
+                            state=state,
+                            validation=last_validation
+                            if last_validation is not None
+                            else ctx.policy_catalog.validate_composition_state(state).validation,
+                            runtime_preflight=last_runtime_preflight,
+                        )
+                        proposal_redacted_arguments = None
+                except BaseException as exc:
+                    preproposal_exception = exc
+                    proposal_redacted_arguments = None
+            if (
+                redacted_arguments is not None
+                and tool_name != "set_pipeline"
+                and EffectDomain.BLOB_STORE not in resolve_tool_effects(tool_name, arguments).domains
+            ):
                 try:
                     preview_result = await run_sync_in_worker(
                         execute_tool,
@@ -2063,6 +2251,7 @@ async def run_tool_batch(
                         state,
                         ctx.policy_catalog,
                         plugin_snapshot=ctx.plugin_snapshot,
+                        baseline=ctx.turn_evidence.effects.initial_state if ctx.turn_evidence is not None else None,
                         data_dir=ctx.custody.data_dir,
                         session_engine=ctx.custody.session_engine,
                         session_id=session_id,
@@ -2111,11 +2300,22 @@ async def run_tool_batch(
                                 cast(dict[str, Any], proposal_summary_arguments),
                                 telemetry=ctx.redaction_telemetry,
                             )
-                except ToolArgumentError:
-                    # Preserve the established explicit-approval contract for
-                    # ordinary incremental proposals: semantic tool-argument
-                    # rejection occurs only if the user approves execution.
-                    pass
+                            preview_result = replace(preview_result, updated_state=finalized_validation.authored_state)
+                    if not preview_result.success or composition_content_hash(preview_result.updated_state) == composition_content_hash(
+                        state
+                    ):
+                        unapplied_admission = _unapplied_admission(
+                            preview_result,
+                            "no_change" if preview_result.success else "refused",
+                            state=state,
+                            validation=(
+                                last_validation
+                                if last_validation is not None
+                                else ctx.policy_catalog.validate_composition_state(state).validation
+                            ),
+                            runtime_preflight=last_runtime_preflight,
+                        )
+                        proposal_redacted_arguments = None
                 except BaseException as exc:
                     preproposal_exception = exc
                     proposal_redacted_arguments = None
@@ -2125,79 +2325,108 @@ async def run_tool_batch(
                 proposal_summary_arguments = arguments
 
             if proposal_redacted_arguments is not None:
+                if proposals_this_turn >= _MAX_PENDING_PROPOSALS_PER_TURN:
+                    raise _pending_proposal_cap_error(
+                        proposals_this_turn + 1,
+                        ctx=ctx,
+                        state=state,
+                        invocation_start=batch_invocation_start,
+                    )
                 proposal_summary = build_tool_proposal_summary(
                     tool_name=proposal_tool_name,
                     arguments=proposal_summary_arguments,
                     redacted_arguments=proposal_redacted_arguments,
                 )
-                if proposal_tool_name == "set_pipeline":
-                    proposal_base = (
-                        PresentBase(
-                            state_id=UUID(current_state_id),
-                            composition_content_hash=composition_content_hash(state),
+                try:
+                    if proposal_tool_name == "set_pipeline":
+                        proposal_base = (
+                            PresentBase(
+                                state_id=UUID(current_state_id),
+                                composition_content_hash=composition_content_hash(state),
+                            )
+                            if current_state_id is not None
+                            else AbsentBase()
                         )
-                        if current_state_id is not None
-                        else AbsentBase()
-                    )
-                    pipeline_proposal = PipelineProposal.create(
-                        pipeline=proposal_arguments,
-                        base=proposal_base,
-                        repair_count=0,
-                        skill_hash=ctx.provenance.skill_hash,
-                    )
-                    if type(ctx.session_operation_context) is not SessionOperationContext:
-                        raise AuditIntegrityError("Composition proposal creation requires exact session operation authority")
-                    proposal = await _await_started_tool_stage(
-                        turn_sessions_service.create_pipeline_composition_proposal(
-                            session_id=turn_session_uuid,
-                            session_operation_context=ctx.session_operation_context,
-                            plan=PipelinePlanResult(
-                                proposal=pipeline_proposal,
-                                tool_call_id=tool_call.id,
-                                custody_result=pipeline_custody_result,
-                                model_identifier=ctx.provenance.model_identifier,
-                                model_version=provider_model_version,
-                                provider=ctx.provenance.provider or "unknown",
+                        pipeline_proposal = PipelineProposal.create(
+                            pipeline=proposal_arguments,
+                            base=proposal_base,
+                            repair_count=0,
+                            skill_hash=ctx.provenance.skill_hash,
+                        )
+                        if type(ctx.session_operation_context) is not SessionOperationContext:
+                            raise AuditIntegrityError("Composition proposal creation requires exact session operation authority")
+                        proposal = await _await_started_tool_stage(
+                            turn_sessions_service.create_pipeline_composition_proposal(
+                                session_id=turn_session_uuid,
+                                session_operation_context=ctx.session_operation_context,
+                                plan=PipelinePlanResult(
+                                    proposal=pipeline_proposal,
+                                    tool_call_id=tool_call.id,
+                                    custody_result=pipeline_custody_result,
+                                    model_identifier=ctx.provenance.model_identifier,
+                                    model_version=provider_model_version,
+                                    provider=ctx.provenance.provider or "unknown",
+                                ),
+                                summary=proposal_summary.summary,
+                                rationale=proposal_summary.rationale,
+                                affects=proposal_summary.affects,
+                                arguments_redacted_json=proposal_summary.arguments_redacted_json,
+                                actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
+                                user_message_id=UUID(user_message_id) if user_message_id is not None else None,
+                                composer_model_identifier=ctx.provenance.model_identifier,
+                                composer_model_version=provider_model_version,
+                                composer_provider=ctx.provenance.provider or "unknown",
                             ),
-                            summary=proposal_summary.summary,
-                            rationale=proposal_summary.rationale,
-                            affects=proposal_summary.affects,
-                            arguments_redacted_json=proposal_summary.arguments_redacted_json,
-                            actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
-                            user_message_id=UUID(user_message_id) if user_message_id is not None else None,
-                            composer_model_identifier=ctx.provenance.model_identifier,
-                            composer_model_version=provider_model_version,
-                            composer_provider=ctx.provenance.provider or "unknown",
+                            audit=audit,
+                            recorder=recorder,
+                        )
+                    else:
+                        if type(ctx.session_operation_context) is not SessionOperationContext:
+                            raise AuditIntegrityError("Composition proposal creation requires exact session operation authority")
+                        proposal = await _await_started_tool_stage(
+                            turn_sessions_service.create_composition_proposal(
+                                session_id=turn_session_uuid,
+                                session_operation_context=ctx.session_operation_context,
+                                tool_call_id=tool_call.id,
+                                tool_name=proposal_tool_name,
+                                summary=proposal_summary.summary,
+                                rationale=proposal_summary.rationale,
+                                affects=proposal_summary.affects,
+                                arguments_json=proposal_arguments,
+                                arguments_redacted_json=proposal_summary.arguments_redacted_json,
+                                base_state_id=UUID(current_state_id) if current_state_id is not None else None,
+                                actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
+                                user_message_id=UUID(user_message_id) if user_message_id is not None else None,
+                                composer_model_identifier=ctx.provenance.model_identifier,
+                                composer_model_version=provider_model_version,
+                                composer_provider=ctx.provenance.provider or "unknown",
+                                composer_skill_hash=ctx.provenance.skill_hash,
+                                tool_arguments_hash=audit.binding_arguments_hash,
+                            ),
+                            audit=audit,
+                            recorder=recorder,
+                        )
+                except (ProposalResourceUnavailableError, MalformedProposalBlobReferenceError) as refusal:
+                    unapplied_admission = _unapplied_admission(
+                        _saved_graph_rejection_result(
+                            state,
+                            PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE
+                            if type(refusal) is ProposalResourceUnavailableError
+                            else f"Proposal refused: {refusal}. Fix the blob reference and retry.",
+                            error_code=(
+                                "proposal_resource_unavailable"
+                                if type(refusal) is ProposalResourceUnavailableError
+                                else "proposal_blob_reference_malformed"
+                            ),
+                            rejected_component=None,
                         ),
-                        audit=audit,
-                        recorder=recorder,
+                        "refused",
+                        state=state,
+                        validation=last_validation if last_validation is not None else state.validate(),
+                        runtime_preflight=last_runtime_preflight,
                     )
-                else:
-                    if type(ctx.session_operation_context) is not SessionOperationContext:
-                        raise AuditIntegrityError("Composition proposal creation requires exact session operation authority")
-                    proposal = await _await_started_tool_stage(
-                        turn_sessions_service.create_composition_proposal(
-                            session_id=turn_session_uuid,
-                            session_operation_context=ctx.session_operation_context,
-                            tool_call_id=tool_call.id,
-                            tool_name=proposal_tool_name,
-                            summary=proposal_summary.summary,
-                            rationale=proposal_summary.rationale,
-                            affects=proposal_summary.affects,
-                            arguments_json=proposal_arguments,
-                            arguments_redacted_json=proposal_summary.arguments_redacted_json,
-                            base_state_id=UUID(current_state_id) if current_state_id is not None else None,
-                            actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
-                            user_message_id=UUID(user_message_id) if user_message_id is not None else None,
-                            composer_model_identifier=ctx.provenance.model_identifier,
-                            composer_model_version=provider_model_version,
-                            composer_provider=ctx.provenance.provider or "unknown",
-                            composer_skill_hash=ctx.provenance.skill_hash,
-                            tool_arguments_hash=audit.binding_arguments_hash,
-                        ),
-                        audit=audit,
-                        recorder=recorder,
-                    )
+                    proposal_redacted_arguments = None
+            if proposal_redacted_arguments is not None:
                 proposals_this_turn += 1
                 proposal_result = ToolResult(
                     success=True,
@@ -2223,7 +2452,11 @@ async def run_tool_batch(
                         proposal_id=str(proposal.id),
                         tool_name=proposal_tool_name,
                         summary=proposal.summary,
-                        message="The requested pipeline change is pending human approval and has not been applied.",
+                        message=(
+                            "The proposal is recorded and awaits human approval; it has not been applied. This result's "
+                            "validation describes the unchanged current pipeline and does not validate the proposed change. "
+                            "Send no further pipeline changes until the user accepts or rejects this proposal."
+                        ),
                     ),
                 )
                 recorder.record(
@@ -2998,13 +3231,13 @@ async def run_tool_batch(
             _composer_skill_hash: str = ctx.provenance.skill_hash,
             _tool_arguments_hash: str = audit.binding_arguments_hash,
             _interpretation_requirements_are_internal: bool = interpretation_requirements_are_internal,
-            _prevalidated_unapplied_result: ToolResult | None = prevalidated_unapplied_result,
+            _unapplied_admission: _UnappliedAdmission | None = unapplied_admission,
             _preproposal_exception: BaseException | None = preproposal_exception,
         ) -> Any:
             if _preproposal_exception is not None:
                 raise _preproposal_exception
-            if _prevalidated_unapplied_result is not None:
-                return _prevalidated_unapplied_result
+            if _unapplied_admission is not None:
+                return _unapplied_admission.result
             dispatched_result = await run_sync_in_worker(
                 execute_tool,
                 _tool_name,
@@ -3012,6 +3245,7 @@ async def run_tool_batch(
                 _state,
                 ctx.policy_catalog,
                 plugin_snapshot=ctx.plugin_snapshot,
+                baseline=ctx.turn_evidence.effects.initial_state if ctx.turn_evidence is not None else None,
                 data_dir=ctx.custody.data_dir,
                 session_engine=ctx.custody.session_engine,
                 session_id=session_id,
@@ -3049,6 +3283,28 @@ async def run_tool_batch(
                     plugin_snapshot=ctx.plugin_snapshot,
                     policy_catalog=ctx.policy_catalog,
                 )
+            if (
+                _tool_name == "diff_pipeline"
+                and dispatched_result.success
+                and turn_sessions_service is not None
+                and turn_session_uuid is not None
+            ):
+                # The diff baseline is request-start state and held edits are not applied, so a
+                # pending proposal is invisible to it. Say so rather than let "0 changes" mislead.
+                pending = [
+                    proposal
+                    for proposal in await turn_sessions_service.list_composition_proposals(turn_session_uuid)
+                    if proposal.status == "pending"
+                ]
+                if pending:
+                    dispatched_result = replace(
+                        dispatched_result,
+                        post_call_hints=(
+                            *dispatched_result.post_call_hints,
+                            f"{len(pending)} proposed change(s) are pending approval and are not applied, "
+                            "so they do not appear in this diff. The user must accept them before they take effect.",
+                        ),
+                    )
             if is_discovery_tool(_tool_name) and response_contract_for(_tool_name) is not None:
                 return admit_discovery_result(_tool_name, dispatched_result)
             return dispatched_result
@@ -3066,13 +3322,13 @@ async def run_tool_batch(
 
         def _version_after(
             _result: Any,
-            _prevalidated_unapplied_result: ToolResult | None = prevalidated_unapplied_result,
+            _unapplied_admission: _UnappliedAdmission | None = unapplied_admission,
             _state: CompositionState = state,
         ) -> int:
             # The handler's ToolResult carries the new state on
             # ``updated_state``. Read here so the helper records
             # the post-mutation version inside the recorder call.
-            if _prevalidated_unapplied_result is not None:
+            if _unapplied_admission is not None:
                 return _state.version
             if isinstance(_result, AdmittedDiscoveryResult):
                 return _result.result.updated_state.version
@@ -3265,7 +3521,7 @@ async def run_tool_batch(
         admitted_result = outcome.result if isinstance(outcome.result, AdmittedDiscoveryResult) else None
         result = admitted_result.result if admitted_result is not None else outcome.result
         if (
-            prevalidated_unapplied_result is None
+            unapplied_admission is None
             and is_mutation_tool(tool_name)
             and result.success
             and result.updated_state.version > state.version
@@ -3286,7 +3542,7 @@ async def run_tool_batch(
                 ) from preflight_exc.original_exc
             if findings is not None:
                 result = replace(result, runtime_preflight=findings)
-        if prevalidated_unapplied_result is None:
+        if unapplied_admission is None:
             state = result.updated_state
             last_validation = result.validation
             last_runtime_preflight = result.runtime_preflight or last_runtime_preflight
@@ -3333,8 +3589,9 @@ async def run_tool_batch(
         # Mutation means a CompositionState version advance here.
         # Blob-store side effects such as create_blob/update_blob are
         # useful work, but they do not make an empty pipeline exist.
-        if prevalidated_unapplied_result is not None:
-            anti_anchor.record_failure(tool_name, audit.arguments_hash)
+        if unapplied_admission is not None:
+            if unapplied_admission.disposition == "refused":
+                anti_anchor.record_failure(tool_name, audit.arguments_hash)
         elif result.success:
             if _tool_result_mutated_composition_state(version_before=version_before_tool, result=result):
                 mutation_success_observed = True
@@ -3355,7 +3612,18 @@ async def run_tool_batch(
                 selected_content=result_json,
                 producer_call_id=ctx.turn_evidence.current_call_id("primary"),
             )
-        await emit_progress(progress, tool_completed_progress_event(tool_name, result.success))
+        if unapplied_admission is not None and unapplied_admission.disposition == "no_change":
+            await emit_progress(
+                progress,
+                ComposerProgressEvent(
+                    phase="using_tools",
+                    headline="The pipeline is unchanged.",
+                    evidence=("The tool completed successfully without a composition change or an approval proposal.",),
+                    likely_next="ELSPETH will continue with the current pipeline.",
+                ),
+            )
+        else:
+            await emit_progress(progress, tool_completed_progress_event(tool_name, result.success and unapplied_admission is None))
         _append_tool_outcome(
             response=admitted_result.to_tool_result() if admitted_result is not None else result,
             error_class=None,

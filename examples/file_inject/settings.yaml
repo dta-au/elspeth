@@ -1,0 +1,85 @@
+# file_inject, mode: select — one whole file per row, chosen by a row value
+#
+# Each ticket carries a `type`. The guidance for handling that type lives in a
+# file beside this one, and a later step (an LLM prompt, a reviewer's screen)
+# needs the whole of it on the row. `mode: select` writes the content of the
+# ONE entry whose name equals the row's `type` to `guidance`.
+#
+# The three entries show the three value shapes:
+#
+#   A  text  -> the file as one string, nothing trimmed
+#   B  json  -> the parsed value (here one member of it, via data_key)
+#   C  csv   -> a list of objects keyed by the header; cells stay strings
+#
+# The files are CONFIGURATION, not a second source. The settings loader reads
+# each `content_file` into the transform's options when the settings load, so
+# the content is part of the node's identity and the run's topology hash.
+# Edit guidance_a.md between a run and its resume and the resume is refused.
+#
+# `content_file` resolves relative to THIS FILE'S directory and is confined to
+# it, which is why the guidance files sit beside settings.yaml while the source
+# path is addressed from the repository root.
+
+sources:
+  tickets:
+    plugin: csv
+    on_success: attach_guidance
+    options:
+      path: examples/file_inject/input.csv
+      on_validation_failure: discard
+      schema:
+        mode: observed
+
+transforms:
+  - name: attach_guidance
+    plugin: file_inject
+    input: attach_guidance
+    on_success: output
+    on_error: unmatched
+    options:
+      schema:
+        mode: observed
+      mode: select
+      # key_field names the column on the ARRIVING ROW whose value picks the entry.
+      key_field: type
+      # output_field is the NEW field the selected content is written to.
+      output_field: guidance
+      # Entry names are the key values, compared exactly as written: no
+      # trimming, no case folding. Quote them.
+      files:
+        "A":
+          content_file: guidance_a.md
+          format: text
+        "B":
+          content_file: guidance_b.json
+          format: json
+          # Write only the `rubric` member of the file's top-level object.
+          data_key: rubric
+        "C":
+          content_file: guidance_c.csv
+          format: csv
+      # Every ticket in input.csv has a type listed above, so nothing misses
+      # here. on_miss defaults to `fail` regardless; settings_miss.yaml shows
+      # what that does to a row whose type names no entry.
+      on_miss: fail
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/file_inject/output/tickets_with_guidance.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+  unmatched:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/file_inject/output/unmatched_tickets.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/file_inject/runs/audit.db

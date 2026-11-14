@@ -65,6 +65,7 @@ TRIAGE_BY_CODE: dict[str, str] = {
     PC.DISCOVERY_CYCLE.value: "kit_misled_discovery",
     PC.REPAIR_BLIND_REPEAT.value: "error_message_not_actionable",
     PC.COMPOSITION_EXHAUSTED.value: "budget",
+    PC.CONTEXT_BUDGET_EXHAUSTED.value: "budget",
     PC.DISCOVERY_EXHAUSTED.value: "budget",
     PC.PROVIDER_CALLS_EXHAUSTED.value: "budget",
     PC.REPAIR_EXHAUSTED.value: "budget",

@@ -139,19 +139,20 @@ describe("filled-button hover direction (elspeth-3b57d9025b)", () => {
     );
   });
 
-  it("keeps inverse button text at WCAG AA on the hover fills in both themes", () => {
+  it("keeps filled-button text at WCAG AA on the hover fills in both themes", () => {
+    // ARGOnite: primary text is navy --color-btn-primary-text on DTA green;
+    // danger keeps --color-text-inverse (design doc §UX review).
     for (const [theme, token] of [
       ["dark", rootToken],
       ["light", lightToken],
     ] as const) {
-      const inverse = token("--color-text-inverse");
-      for (const hover of [
-        "--color-btn-primary-bg-hover",
-        "--color-btn-danger-bg-hover",
-      ]) {
+      for (const [text, hover] of [
+        ["--color-btn-primary-text", "--color-btn-primary-bg-hover"],
+        ["--color-text-inverse", "--color-btn-danger-bg-hover"],
+      ] as const) {
         expect(
-          contrastRatio(inverse, token(hover)),
-          `inverse text on ${hover} (${theme})`,
+          contrastRatio(token(text), token(hover)),
+          `${text} on ${hover} (${theme})`,
         ).toBeGreaterThanOrEqual(4.5);
       }
     }
@@ -244,5 +245,46 @@ describe("line-height ladder (elspeth-ec5ba7ba21)", () => {
     for (let i = 1; i < ladder.length; i += 1) {
       expect(ladder[i]).toBeGreaterThan(ladder[i - 1]);
     }
+  });
+});
+
+describe("ARGOnite role tokens are theme-paired", () => {
+  const PAIRED_TOKENS = [
+    "--size-header-pill-height",
+    "--color-brand-navy",
+    "--color-brand-yellow",
+    "--color-on-nav",
+    "--color-on-nav-muted",
+    "--color-nav-control",
+    "--color-pane-header",
+    "--color-well",
+    "--color-track",
+    "--color-pill",
+    "--color-on-pill",
+    "--color-graph-edge",
+    "--color-node-border",
+    "--color-btn-primary-text",
+    "--shadow-card",
+    "--shadow-pill",
+    "--shadow-track",
+  ];
+
+  it("declares every role and material token in both theme blocks", () => {
+    for (const name of PAIRED_TOKENS) {
+      expect(() => rootToken(name), `${name} missing from :root`).not.toThrow();
+      expect(() => lightToken(name), `${name} missing from light theme`).not.toThrow();
+    }
+  });
+
+  it("keeps the header pill register on the same compact rung in both themes", () => {
+    expect(rootToken("--size-header-pill-height")).toBe("var(--size-control-compact)");
+    expect(lightToken("--size-header-pill-height")).toBe(rootToken("--size-header-pill-height"));
+    expect(Number.parseFloat(rootToken("--size-control-compact"))).toBeGreaterThanOrEqual(24);
+  });
+
+  it("orders the radii node < card < pane", () => {
+    const px = (name: string): number => Number.parseFloat(rootToken(name));
+    expect(px("--radius-node")).toBeLessThan(px("--radius-card"));
+    expect(px("--radius-card")).toBeLessThan(px("--radius-pane"));
   });
 });

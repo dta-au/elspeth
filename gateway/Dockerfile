@@ -73,6 +73,13 @@ LABEL org.opencontainers.image.revision="${GATEWAY_REVISION}" \
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/venv/bin:$PATH"
 
+# Temporary. krb5-libs 1.22.2-r1 in the pinned base carries 16 HIGH advisories
+# (CVE-2026-107364 and others), fixed in 1.22.3-r0. On 2026-11-11 the
+# `3.12-alpine` tag still resolved to the pinned digest, so there was no patched
+# base to move to. This upgrades that one system package and nothing else.
+# Delete it when the base image is re-pinned to a digest that carries the fix.
+RUN apk add --no-cache --upgrade "krb5-libs>=1.22.3-r0"
+
 COPY --from=builder /venv /venv
 
 # Fixed, non-root, non-allocatable UID/GID (distroless convention) -- never

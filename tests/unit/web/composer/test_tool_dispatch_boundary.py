@@ -214,8 +214,7 @@ def test_source_path_arguments_require_data_dir_for_s2_confinement() -> None:
     entry = result.validation.errors[0]
     assert (entry.component, entry.error_code, entry.rejected_component) == ("rejected_mutation", "source_path_policy_invalid", "source")
     assert entry.message == (
-        "Source file path options (path or file) must use this session's permitted source locations. "
-        "Use the session's blob binding or an authorized source path."
+        "Local file paths require configured data root authority and must remain within the configured data root (--data-dir)."
     )
     assert result.validation.errors[1:] == standing.errors
     assert result.validation.warnings == standing.warnings and result.validation.suggestions == standing.suggestions
@@ -249,8 +248,7 @@ def test_source_path_arguments_require_data_dir_without_audit_hash() -> None:
     entry = result.validation.errors[0]
     assert (entry.component, entry.error_code, entry.rejected_component) == ("rejected_mutation", "source_path_policy_invalid", "source")
     assert entry.message == (
-        "Source file path options (path or file) must use this session's permitted source locations. "
-        "Use the session's blob binding or an authorized source path."
+        "Local file paths require configured data root authority and must remain within the configured data root (--data-dir)."
     )
     assert result.validation.errors[1:] == standing.errors
     assert result.validation.warnings == standing.warnings and result.validation.suggestions == standing.suggestions

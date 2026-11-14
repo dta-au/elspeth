@@ -31,6 +31,7 @@ from uuid import UUID
 
 from elspeth.config_loading import load_settings_from_config_dict, load_settings_from_yaml_string
 from elspeth.contracts.blobs import BlobRecord
+from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.trust_boundary import observation_boundary
@@ -135,6 +136,7 @@ from elspeth.web.interpretation_state import (
     materialize_state_for_authoring,
     materialize_state_for_execution,
 )
+from elspeth.web.paths import require_mcp_root_context
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginSnapshotAuthority
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
@@ -414,6 +416,7 @@ def _compiled_identity_settings(
     yaml_generator: YamlGenerator,
     data_dir: Path,
     session_id: str | None,
+    mcp_root_authority: McpConfiguredRootAuthority | None = None,
 ) -> _CompiledIdentityDocument:
     """Mirror the execution service's audit-safe settings for node identity.
 
@@ -435,7 +438,7 @@ def _compiled_identity_settings(
     yaml-generator bug that must surface (W18), not a state to tolerate.
     """
     identity_yaml = yaml_generator.generate_yaml(_identity_state_for_compiled_ids(authored_state))
-    identity_yaml = resolve_runtime_yaml_paths(identity_yaml, str(data_dir), session_id=session_id)
+    identity_yaml = resolve_runtime_yaml_paths(identity_yaml, str(data_dir), session_id=session_id, mcp_root_authority=mcp_root_authority)
     loaded = load_bounded_pipeline_yaml(identity_yaml)
     if type(loaded) is not dict:
         raise TypeError(f"generate_yaml() produced non-dict YAML (got {type(loaded).__name__}) — this is a bug in the YAML generator")
@@ -467,6 +470,7 @@ def validate_pipeline(
     blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
     allow_pending_interpretation_placeholders: bool = False,
     session_id: str | None = None,
+    mcp_root_authority: McpConfiguredRootAuthority | None = None,
 ) -> ValidationResult:
     """Compatibility facade that captures patchable runtime dependencies per call."""
     dependencies = ValidationDependencies(
@@ -491,6 +495,7 @@ def validate_pipeline(
         blob_get_content=blob_get_content,
         allow_pending_interpretation_placeholders=allow_pending_interpretation_placeholders,
         session_id=session_id,
+        mcp_root_authority=mcp_root_authority,
     )
 
 
@@ -509,6 +514,7 @@ def _validate_pipeline_impl(
     blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
     allow_pending_interpretation_placeholders: bool = False,
     session_id: str | None = None,
+    mcp_root_authority: McpConfiguredRootAuthority | None = None,
     dependencies: ValidationDependencies,
 ) -> ValidationResult:
     """Dry-run validation through the real engine code path.
@@ -554,6 +560,7 @@ def _validate_pipeline_impl(
         profile_registry: Frozen operator-profile resolver registry. Required
             when the snapshot exposes operator-profiled plugin aliases.
     """
+    require_mcp_root_context(mcp_root_authority, data_dir=settings.data_dir, session_id=session_id)
     # Empty compositions have a deliberate legacy producer shape rather than
     # entering the ordered core ledger: no authored phase can make them
     # executable, and engine settings diagnostics would leak internal names.
@@ -607,6 +614,7 @@ def _validate_pipeline_impl(
             policy,
             data_dir=settings.data_dir,
             session_id=session_id,
+            mcp_root_authority=mcp_root_authority,
         ),
     )
     network_validated = _apply_phase(
@@ -648,6 +656,7 @@ def _validate_pipeline_impl(
             yaml_generator=yaml_generator,
             data_dir=settings.data_dir,
             session_id=session_id,
+            mcp_root_authority=mcp_root_authority,
             blob_get_metadata=blob_get_metadata,
             blob_get_content=blob_get_content,
             load_yaml=dependencies.load_yaml,
@@ -719,6 +728,7 @@ def _validate_pipeline_impl(
             yaml_generator=yaml_generator,
             data_dir=settings.data_dir,
             session_id=session_id,
+            mcp_root_authority=mcp_root_authority,
         )
 
         def _build_graph_under_authored_identity(settings: ElspethSettings, bundle: PluginBundle) -> ExecutionGraph:

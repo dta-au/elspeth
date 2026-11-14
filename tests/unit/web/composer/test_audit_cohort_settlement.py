@@ -399,9 +399,16 @@ def _green_preflight() -> ValidationResult:
     )
 
 
-def _plan() -> PipelinePlanResult:
+def _plan(*, equal: bool = False) -> PipelinePlanResult:
+    metadata = PipelineMetadata() if equal else PipelineMetadata(name="Changed pipeline", description="")
     proposal = PipelineProposal.create(
-        pipeline={"sources": {}, "nodes": [], "edges": [], "outputs": []},
+        pipeline={
+            "sources": {},
+            "nodes": [],
+            "edges": [],
+            "outputs": [],
+            "metadata": {"name": metadata.name, "description": metadata.description},
+        },
         base=AbsentBase(),
         repair_count=0,
         skill_hash=stable_hash("planner-skill"),
@@ -413,7 +420,7 @@ def _plan() -> PipelinePlanResult:
         model_identifier="planner-model",
         model_version="planner-model-v1",
         provider="test",
-        candidate_state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+        candidate_state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=metadata, version=2),
     )
 
 
@@ -424,11 +431,13 @@ class _FakePreferences:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fail_at", [None, 0, 1, 2, 3, 4, 5], ids=["control", "index0", "index1", "index2", "index3", "index4", "index5"])
+@pytest.mark.parametrize("equal", [False, True], ids=["changed", "equal"])
 async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index(
     composer_service_with_real_sessions: ComposerServiceImpl,
     result_session_id: str,
     monkeypatch: pytest.MonkeyPatch,
     fail_at: int | None,
+    equal: bool,
 ) -> None:
     """``_stage_pipeline_plan``: a failure at any cohort row leaves zero rows AND no proposal."""
     service = composer_service_with_real_sessions
@@ -442,7 +451,7 @@ async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_inde
         async with acquire_compose_context(sessions_service, result_session_id) as compose_context:
             return await service._planning_application._stage_pipeline_plan(
                 session_operation_context=compose_context,
-                plan=_plan(),
+                plan=_plan(equal=equal),
                 state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
                 session_id=UUID(result_session_id),
                 current_state_id=None,
@@ -464,8 +473,29 @@ async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_inde
             assert result.message
             rows = _chat_rows(sessions_service, result_session_id)
             assert _invocation_occurrences(rows) == {inv.tool_call_id: 1 for inv in _PLANNER_COHORT}
-            assert _proposal_count(sessions_service, result_session_id) == 1
+            assert _proposal_count(sessions_service, result_session_id) == (0 if equal else 1)
             assert injector.calls == 2 * len(_PLANNER_COHORT)
+            if equal:
+                preflight.assert_not_awaited()
+                assert result.state.version == 1
+                assert result.raw_assistant_content == ""
+                assert result.runtime_preflight is None and result.pipeline_commit_intent is None
+                assert result.tool_invocations == () and result.llm_calls == ()
+                from elspeth.web.sessions.routes._helpers import _composer_history_content, composer_turn_end_assistant_row
+
+                draft = composer_turn_end_assistant_row(result)
+                assert draft.content == result.message and draft.raw_content == ""
+                async with acquire_compose_context(sessions_service, result_session_id) as context:
+                    stored = await sessions_service.add_message(
+                        UUID(result_session_id),
+                        "assistant",
+                        draft.content,
+                        raw_content=draft.raw_content,
+                        writer_principal="compose_loop",
+                        session_operation_context=context,
+                    )
+                assert stored.content == result.message and stored.raw_content == ""
+                assert _composer_history_content(stored) == ""
             return
 
         with pytest.raises(AuditIntegrityError, match="pipeline planner audit persistence failed before proposal creation"):
@@ -659,10 +689,12 @@ async def test_cancel_then_mid_cohort_failure_lands_nothing_and_keeps_the_cancel
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("equal", [False, True], ids=["changed", "equal"])
 async def test_planner_cohort_cancelled_mid_settlement_lands_whole_and_creates_no_proposal(
     composer_service_with_real_sessions: ComposerServiceImpl,
     result_session_id: str,
     monkeypatch: pytest.MonkeyPatch,
+    equal: bool,
 ) -> None:
     """End-to-end on the planner success path: evidence lands whole, cancel wins, no proposal follows."""
     service = composer_service_with_real_sessions
@@ -676,7 +708,7 @@ async def test_planner_cohort_cancelled_mid_settlement_lands_whole_and_creates_n
         async with acquire_compose_context(sessions_service, result_session_id) as compose_context:
             return await service._planning_application._stage_pipeline_plan(
                 session_operation_context=compose_context,
-                plan=_plan(),
+                plan=_plan(equal=equal),
                 state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
                 session_id=UUID(result_session_id),
                 current_state_id=None,
@@ -707,3 +739,82 @@ async def test_planner_cohort_cancelled_mid_settlement_lands_whole_and_creates_n
     assert _proposal_count(sessions_service, result_session_id) == 0, (
         "evidence-without-proposal is the safe direction; a proposal must not follow a cancelled request"
     )
+
+
+@pytest.mark.asyncio
+async def test_resource_race_after_planner_admission_preserves_cohort_once_and_no_candidate_verdict(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    tmp_path,
+) -> None:
+    from dataclasses import replace
+
+    from sqlalchemy import update
+
+    from elspeth.web.blobs.service import BlobServiceImpl
+    from elspeth.web.sessions.models import blobs_table, composition_states_table, proposal_events_table
+    from elspeth.web.sessions.proposal_blob_refs import validate_proposal_blob_references
+    from tests.integration.web.composer.test_freeform_proposal_prevalidation import _valid_pipeline_args
+
+    service = composer_service_with_real_sessions
+    sessions = service._sessions_service
+    user_message_id = await _seed_user_message(sessions, result_session_id)
+    state = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+    async with acquire_compose_context(sessions, result_session_id) as context:
+        blob = await BlobServiceImpl(sessions._engine, tmp_path).create_blob(
+            UUID(result_session_id), "input.csv", b"value\n1\n", "text/csv", session_operation_context=context
+        )
+        arguments = _valid_pipeline_args(tmp_path)
+        arguments["source"]["blob_id"] = str(blob.id)
+        candidate = CompositionState.from_dict(
+            {
+                **arguments,
+                "version": 2,
+                "metadata": {**arguments["metadata"], "description": ""},
+                "outputs": [{**output, "name": output["sink_name"]} for output in arguments["outputs"]],
+            }
+        )
+        assert candidate.validate().is_valid
+        plan = replace(
+            _plan(),
+            proposal=PipelineProposal.create(
+                pipeline=arguments, base=AbsentBase(), repair_count=0, skill_hash=stable_hash("planner-skill")
+            ),
+            candidate_state=candidate,
+        )
+        with sessions._engine.connect() as conn:
+            validate_proposal_blob_references(conn, session_id=result_session_id, tool_name="set_pipeline", arguments=arguments)
+
+        async def preflight_then_change_resource(*args, **kwargs):
+            assert args[0] is candidate
+            with sessions._engine.begin() as conn:
+                conn.execute(update(blobs_table).where(blobs_table.c.id == str(blob.id)).values(status="error"))
+            return _green_preflight()
+
+        with patch.object(service._preflight, "cached_runtime_preflight", new=preflight_then_change_resource):
+            result = await service._planning_application._stage_pipeline_plan(
+                session_operation_context=context,
+                plan=plan,
+                state=state,
+                session_id=UUID(result_session_id),
+                current_state_id=None,
+                user_message_id=user_message_id,
+                user_id="phase3-test-user",
+                preferences=_FakePreferences(trust_mode="explicit_approve"),
+                recorder=BufferingRecorder(),
+                planner_llm_calls=(),
+                planner_private_candidates=(),
+                planner_attempts=(),
+                planner_invocations=_PLANNER_COHORT,
+                planner_withheld_replies=(),
+                plugin_snapshot=None,
+            )
+    assert result.state is state
+    assert result.runtime_preflight is None and result.pipeline_commit_intent is None
+    assert result.raw_assistant_content == ""
+    assert result.tool_invocations == () and result.llm_calls == ()
+    assert _invocation_occurrences(_chat_rows(sessions, result_session_id)) == {inv.tool_call_id: 1 for inv in _PLANNER_COHORT}
+    assert _proposal_count(sessions, result_session_id) == 0
+    with sessions._engine.connect() as conn:
+        assert conn.execute(select(composition_states_table.c.id)).all() == []
+        assert conn.execute(select(proposal_events_table.c.id)).all() == []

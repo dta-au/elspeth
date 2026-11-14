@@ -2738,6 +2738,7 @@ def test_t6b_runtime_error_outside_judge_call_still_propagates(tmp_path: Path) -
         )
 
 
+@pytest.mark.timing_sensitive
 def test_t6c_concurrent_resume_rejected_across_processes(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

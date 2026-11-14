@@ -290,6 +290,7 @@ _WIRED_PLUGINS = [
 ]
 
 
+@pytest.mark.timing_sensitive  # its session lease expired under 12 parallel workers on 2026-11-11, passes alone
 @pytest.mark.asyncio
 async def test_auto_commit_finalization_replay_keeps_coalesce_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Required-control finalization rewrites the transcript (auto-commit caller).

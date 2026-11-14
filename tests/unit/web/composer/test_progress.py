@@ -15,9 +15,11 @@ from elspeth.contracts.composer_progress import (
     ComposerProgressEvent,
 )
 from elspeth.web.composer.progress import (
+    CONTEXT_BUDGET_REFUSAL_DETAIL,
     ComposerProgressRegistry,
     advisor_checkpoint_progress_event,
     client_cancelled_progress_event,
+    context_reduced_progress_event,
     convergence_progress_event,
 )
 from elspeth.web.sessions.routes._helpers import _composer_progress_sink
@@ -78,6 +80,8 @@ class TestComposerProgressEvent:
             "convergence_composition_budget",
             "convergence_discovery_budget",
             "convergence_wall_clock_timeout",
+            "context_budget_exceeded",
+            "context_reduced",
             "provider_auth_failed",
             "provider_unavailable",
             "plugin_crash",
@@ -182,6 +186,31 @@ class TestConvergenceProgressEvent:
             "Three convergence sub-causes collapsed back into fewer reason codes — "
             "elspeth-5030f7373d regression. Codes seen: " + repr(codes)
         )
+
+    def test_context_budget_refusal_names_its_own_cause_and_recourse(self) -> None:
+        # The compose loop raises the refusal with the composition budget
+        # discriminator; the reason, not the budget, decides the copy.
+        event = convergence_progress_event(budget_exhausted="composition", reason="context_budget_exceeded")
+        assert event.phase == "failed"
+        assert event.reason == "context_budget_exceeded"
+        assert event.headline == "This conversation is too large for the composer to continue."
+        assert event.likely_next == "Start a new session, or shorten your request."
+        assert CONTEXT_BUDGET_REFUSAL_DETAIL == (
+            "This conversation is too large for the composer to continue. Start a new session, or shorten your request."
+        )
+        assert "turn budget" not in " ".join((event.headline, *event.evidence, event.likely_next))
+
+    @pytest.mark.parametrize("reason", [None, "tool_call_cap_exceeded"])
+    def test_other_convergence_reasons_keep_the_budget_copy(self, reason: Any) -> None:
+        assert convergence_progress_event(budget_exhausted="composition", reason=reason) == convergence_progress_event(
+            budget_exhausted="composition"
+        )
+
+    def test_context_reduced_is_a_quiet_model_call_notice(self) -> None:
+        event = context_reduced_progress_event()
+        assert event.phase == "calling_model"
+        assert event.reason == "context_reduced"
+        assert event.headline == "Earlier conversation is no longer visible to the composer."
 
 
 class TestComposerProgressRegistry:
@@ -630,6 +659,30 @@ def test_composer_progress_reason_typescript_mirror_is_complete() -> None:
     assert declared == set(get_args(ComposerProgressReason.__value__)), (
         f"missing from TypeScript: {sorted(set(get_args(ComposerProgressReason.__value__)) - declared)}; "
         f"absent from Python: {sorted(declared - set(get_args(ComposerProgressReason.__value__)))}"
+    )
+
+
+def test_composer_progress_reason_stream_decoder_mirror_is_complete() -> None:
+    """The operation stream decoder rejects a progress frame whose reason it does not list.
+
+    Its ``reasons`` array is a second hand-written mirror of ``ComposerProgressReason``:
+    a member Python can emit but the array lacks fails the whole stream frame.
+    """
+    import re
+    from pathlib import Path
+    from typing import get_args
+
+    from elspeth.contracts.composer_progress import ComposerProgressReason
+
+    ts_path = Path(__file__).resolve().parents[4] / "src/elspeth/web/frontend/src/api/composerOperationDecoder.ts"
+    matches = re.findall(r"const reasons = \[([^\]]*)\] as const;", ts_path.read_text())
+    assert len(matches) == 1, "the decoder's reasons array was renamed, moved or duplicated; update this pin"
+    declared = re.findall(r'"([a-z_]+)"', matches[0])
+
+    assert len(declared) == len(set(declared)), f"duplicate reasons in the decoder: {sorted(declared)}"
+    assert set(declared) == set(get_args(ComposerProgressReason.__value__)), (
+        f"missing from the decoder: {sorted(set(get_args(ComposerProgressReason.__value__)) - set(declared))}; "
+        f"absent from Python: {sorted(set(declared) - set(get_args(ComposerProgressReason.__value__)))}"
     )
 
 

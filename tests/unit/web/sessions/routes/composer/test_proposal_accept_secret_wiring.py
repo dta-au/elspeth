@@ -1,0 +1,187 @@
+"""Proposal acceptance replays secret wiring with deployment-owned authorization."""
+
+from __future__ import annotations
+
+import asyncio
+import uuid
+from pathlib import Path
+from unittest.mock import create_autospec
+
+import pytest
+from tests.fixtures.audit_hashing import fake_sha256
+from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.test_routes import (
+    _close_app_session_engines as _close_app_session_engines,
+)
+from tests.unit.web.sessions.test_routes import (
+    _create_test_composition_proposal,
+    _make_app,
+    _save_test_composition_state,
+)
+
+from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.secrets import ResolvedSecret, SecretInventoryItem
+from elspeth.web.secrets.service import ScopedSecretResolver, WebSecretService
+from elspeth.web.secrets.wiring_policy import SecretWiringRuleSettings
+from elspeth.web.sessions.protocol import CompositionProposalRecord, CompositionStateData, CompositionStateRecord
+from elspeth.web.sessions.service import SessionServiceImpl
+
+
+def _rule(
+    *,
+    secret: str = "BLOB_TOKEN",
+    component_type: str = "sink",
+    plugin: str = "azure_blob",
+    option_key: str = "sas_token",
+) -> SecretWiringRuleSettings:
+    return SecretWiringRuleSettings.model_validate(
+        {"secret": secret, "component_type": component_type, "plugin": plugin, "option_key": option_key}
+    )
+
+
+def _prepare_accept(
+    tmp_path: Path,
+    rules: tuple[SecretWiringRuleSettings, ...],
+) -> tuple[TestClient, SessionServiceImpl, uuid.UUID, CompositionStateRecord, CompositionProposalRecord]:
+    app, service = _make_app(tmp_path)
+    app.state.settings = app.state.settings.model_copy(update={"secret_wiring_allowlist": rules})
+    secrets = create_autospec(WebSecretService, instance=True)
+    inventory = [
+        SecretInventoryItem(name=name, scope="user", available=True, source_kind="user_store")
+        for name in ("BLOB_TOKEN", "PREVIOUS_BLOB_TOKEN")
+    ]
+    resolved = {
+        item.name: ResolvedSecret(name=item.name, value=uuid.uuid4().hex, scope="user", fingerprint=fake_sha256(item.name))
+        for item in inventory
+    }
+    secrets.list_refs.return_value = inventory
+    secrets.has_ref.side_effect = lambda _user_id, name, *, auth_provider_type: name in resolved
+    secrets.resolve.side_effect = lambda _user_id, name, *, auth_provider_type: resolved[name]
+    secrets.resolve_scoped.side_effect = lambda _user_id, name, scope, *, auth_provider_type: resolved[name]
+    app.state.scoped_secret_resolver = ScopedSecretResolver(secrets, auth_provider_type=app.state.settings.auth_provider)
+    client = TestClient(app)
+    session_id = uuid.UUID(client.post("/api/sessions", json={"title": "Accept secret wiring"}).json()["id"])
+    input_path = tmp_path / "blobs" / str(session_id) / "input.csv"
+    input_path.parent.mkdir(parents=True, exist_ok=True)
+    input_path.write_text("value\n1\n", encoding="utf-8")
+    # An existing marker makes the write observable without putting credential
+    # values in the authored graph. Empty-policy cases deliberately preserve
+    # this prior graph; they do not claim it is execution-ready under that policy.
+    prior = asyncio.run(
+        _save_test_composition_state(
+            service,
+            session_id,
+            CompositionStateData(
+                sources={
+                    "primary": {
+                        "plugin": "csv",
+                        "on_success": "main",
+                        "on_validation_failure": "discard",
+                        "options": {"path": str(input_path), "schema": {"mode": "observed"}},
+                    }
+                },
+                nodes=[],
+                edges=[],
+                outputs=[
+                    {
+                        "name": "main",
+                        "plugin": "azure_blob",
+                        "options": {
+                            "schema": {"mode": "observed"},
+                            "account_url": "https://acceptfixture.blob.core.windows.net",
+                            "container": "results",
+                            "blob_path": "accepted.csv",
+                            "sas_token": {"secret_ref": "PREVIOUS_BLOB_TOKEN"},
+                        },
+                        "on_write_failure": "discard",
+                    }
+                ],
+                metadata_={"name": "secret-wiring", "description": ""},
+                is_valid=True,
+            ),
+            provenance="session_seed",
+        )
+    )
+    arguments = {"name": "BLOB_TOKEN", "target": "output", "target_id": "main", "option_key": "sas_token"}
+    proposal = asyncio.run(
+        _create_test_composition_proposal(
+            service,
+            session_id=session_id,
+            tool_call_id="call_wire_blob_token",
+            tool_name="wire_secret_ref",
+            summary="Wire the blob credential reference.",
+            rationale="Requested by the operator.",
+            affects=("graph", "validation"),
+            arguments_json=arguments,
+            arguments_redacted_json=arguments,
+            base_state_id=prior.id,
+            actor="composer-web:user:alice",
+            composer_model_identifier="test-model",
+            composer_model_version="test-model-v1",
+            composer_provider="test",
+            composer_skill_hash=fake_sha256("test-skill"),
+            tool_arguments_hash=stable_hash(arguments),
+        )
+    )
+    return client, service, session_id, prior, proposal
+
+
+def test_accept_secret_wiring_uses_exact_server_allowlist_and_persists_marker(tmp_path: Path) -> None:
+    """Dropping the accept dispatch policy must reject this authorized replay."""
+    client, service, session_id, prior, proposal = _prepare_accept(tmp_path, (_rule(),))
+    endpoint = f"/api/sessions/{session_id}/proposals/{proposal.id}/accept"
+
+    response = client.post(endpoint)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "committed"
+    persisted = asyncio.run(service.get_current_state(session_id))
+    assert persisted is not None
+    assert persisted.id != prior.id
+    assert persisted.version == prior.version + 1
+    assert deep_thaw(persisted.outputs)[0]["options"]["sas_token"] == {"secret_ref": "BLOB_TOKEN"}
+    # This is real runtime preflight, including supported-plugin config validation.
+    assert persisted.is_valid, persisted.validation_errors
+    proposals = asyncio.run(service.list_composition_proposals(session_id))
+    assert len(proposals) == 1
+    assert proposals[0].status == "committed"
+    assert proposals[0].committed_state_id == persisted.id
+
+    # An already committed legacy proposal cannot be applied a second time.
+    replay = client.post(endpoint)
+    assert replay.status_code == 409, replay.text
+    assert asyncio.run(service.get_current_state(session_id)) == persisted
+    assert len(asyncio.run(service.get_state_versions(session_id))) == 2
+
+
+@pytest.mark.parametrize(
+    "rules",
+    [
+        pytest.param((), id="absent-policy"),
+        pytest.param((_rule(secret="OTHER_TOKEN"),), id="different-secret"),
+        pytest.param((_rule(component_type="source"),), id="different-component"),
+        pytest.param((_rule(plugin="csv"),), id="different-plugin"),
+        pytest.param((_rule(option_key="sas_token.extra"),), id="different-option"),
+    ],
+)
+def test_accept_secret_wiring_refuses_unauthorized_destination_without_graph_write(
+    tmp_path: Path,
+    rules: tuple[SecretWiringRuleSettings, ...],
+) -> None:
+    """Missing or partially matching authorization must never permit a write."""
+    client, service, session_id, prior, proposal = _prepare_accept(tmp_path, rules)
+
+    response = client.post(f"/api/sessions/{session_id}/proposals/{proposal.id}/accept")
+
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert detail["error_type"] == "proposal_validation_failed"
+    assert "Secret wiring denied" in detail["detail"]
+    assert "secret_wiring_allowlist" in detail["detail"]
+    assert asyncio.run(service.get_current_state(session_id)) == prior
+    assert asyncio.run(service.get_state_versions(session_id)) == [prior]
+    proposals = asyncio.run(service.list_composition_proposals(session_id))
+    assert len(proposals) == 1
+    assert proposals[0].status == "rejected"
+    assert proposals[0].committed_state_id is None

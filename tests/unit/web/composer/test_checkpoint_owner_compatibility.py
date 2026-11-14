@@ -353,6 +353,7 @@ async def test_checkpoint_no_return_retains_projection_until_actual_generation_c
     from concurrent.futures import ThreadPoolExecutor
 
     from elspeth.web import async_workers
+    from elspeth.web.required_executor import RequiredGenerationUnavailable
     from elspeth.web.required_work import RequiredWorkIncomplete
     from tests.fixtures.required_executor import RecordingRequiredGenerationRecovery
     from tests.unit.web.test_required_executor_custody import QueueThenRaiseExecutor
@@ -470,5 +471,11 @@ async def test_checkpoint_no_return_retains_projection_until_actual_generation_c
             async with asyncio.timeout(5):
                 while not generation.recovery_finished.is_set():
                     await asyncio.sleep(0.001)
-        await async_workers.shutdown_async_workers()
+        if expire_generation:
+            # An expired drain escalates; process settlement retains that
+            # failed ownership and shutdown reports it rather than hiding it.
+            with pytest.raises(RequiredGenerationUnavailable, match="recovery escalated"):
+                await async_workers.shutdown_async_workers()
+        else:
+            await async_workers.shutdown_async_workers()
         authority.release(context)

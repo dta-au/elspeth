@@ -51,6 +51,7 @@ async def governed_app(tmp_path: Path) -> AsyncIterator[GovernedApp]:
         identity_dormancy_days=90,
         plugin_allowlist=("transform:passthrough",),
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_boot_probe_enabled=False,

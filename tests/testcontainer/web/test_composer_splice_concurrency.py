@@ -21,6 +21,7 @@ from tests.unit.web.sessions.test_routes import _make_app
 
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
+from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.graph_recovery import GraphRecoveryContext
 from elspeth.web.composer.protocol import ComposerResult, RetainedOperationContext
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
@@ -180,6 +181,7 @@ class _BlockingSpliceComposer:
         recovery_context: GraphRecoveryContext | None = None,
         retained_operation_context: RetainedOperationContext | None = None,
         advisor_history: AdvisorTranscriptHistory | None = None,
+        context_budget_history: ContextBudgetHistory | None = None,
     ) -> ComposerResult:
         del (
             message,
@@ -197,6 +199,7 @@ class _BlockingSpliceComposer:
             recovery_context,
             retained_operation_context,
             advisor_history,
+            context_budget_history,
         )
         result = execute_tool(
             "splice_transform",

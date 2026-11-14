@@ -7,23 +7,43 @@
 /* ---------------------------------------------------------------------------
    Colour Palette
    --------------------------------------------------------------------------- */
+/* ARGOnite: this palette no longer matches website/tokens/colors.css, which
+   still carries the whole pre-ARGOnite teal/navy palette (backgrounds, text,
+   borders, accents), not only the tokens whose comments say so. Per the
+   ARGOnite design doc the marketing site's tokens follow later, separately;
+   do not copy values in either direction to "restore" a mirror. */
 :root {
-  /* ── Backgrounds — DTA/AGDS three-family role palette ────────────────────── */
-  /* Workspace family — DTA Pacific teal (active editing surfaces) */
-  --color-bg:                #0f2d35;
-  --color-surface:           #122f37;
-  --color-surface-elevated:  #1a3d47;
+  /* ── Backgrounds — ARGOnite three-family role palette ────────────────────── */
+  /* Workspace family — ARGO's near-black green page under DTA-navy panels
+     (active editing surfaces). Ladder: bg 9.85 L*, surface 17.60, elevated
+     20.67 — elevated sits 3.07 L* above surface (surfaceElevation gate). */
+  --color-bg:                #141d1b;
+  --color-surface:           #182d3f;
+  --color-surface-elevated:  #1c3447;
   --color-surface-hover:     rgba(255, 255, 255, 0.04);
 
-  /* Navigation family — AGDS Foundation navy (header chrome) */
-  --color-surface-nav:        #0a1d2e;
-  --color-surface-nav-raised: #13283a;
+  /* Navigation family — DTA green band (header chrome). Header text on the
+     band is --color-on-nav / --color-on-nav-muted, not body ink.
+     --color-surface-nav-raised's only consumer is the session-switcher
+     popover (header.css), which carries BODY text, including muted, and
+     whose item/action :hover/:focus add the 4%-white --color-surface-hover
+     wash under that muted text. It was darkened from ARGO's #13553f to
+     #0f4433 (lightness only, same hue) so muted text clears AA on the washed
+     ground with headroom: bare 4.35 → 5.50:1, washed 3.90 → 4.94:1. It now
+     sits 0.82 L* below the band rather than above it; the popover reads off
+     the band by its border and --shadow-dropdown, not by lightness. */
+  --color-surface-nav:        #0f4636;
+  --color-surface-nav-raised: #0f4433;
 
   /* Inspection family — desaturated warm neutral (paper modals, inspection
-     panels) so they read as paper-on-desk against the navy/teal columns
-     instead of a third teal slab. The family separates from the workspace
-     teal by HUE, not lightness: dark bg is r-b = -38 (cool) while
-     --color-surface-inspector is r-b = +4 (warm) at almost the same L*.
+     panels) so they read as paper-on-desk against the green/navy columns
+     instead of a third cool slab. The family separates from the workspace
+     ground by HUE: dark bg is r-b = -7 (cool green) while
+     --color-surface-inspector is r-b = +9 (warm). ARGOnite nudged both
+     members' red channel up (inspector #2a2826 → #2f2826, paper #332f2c →
+     #352f2c) because ARGO's near-neutral ground left only an 11/14-point
+     warmth swing against the >= 15 gate in surfaceElevation.test.ts; both
+     now swing 16.
      --color-surface-paper is the live member (audit.css, inspector.css,
      recovery.css, common.css). --color-surface-inspector currently has NO
      consumer: its documented consumer .layout-siderail was deleted in
@@ -31,56 +51,56 @@
      (workspace.css:398) — tracked as elspeth-dec069e48f. Keep the token
      defined and gated so the repaint has a tuned value to land on; do not
      re-document a consumer that does not exist. */
-  --color-surface-inspector: #2a2826;
-  --color-surface-paper:     #332f2c;
+  --color-surface-inspector: #2f2826;
+  --color-surface-paper:     #352f2c;
 
   /* ── Text ────────────────────────────────────────────────────────────────── */
-  --color-text:              #dff0ee;
-  --color-text-secondary:    #a8d0d0;
+  --color-text:              #e8eef2;
+  --color-text-secondary:    #c3d0d8;
   /* Muted text must clear WCAG AA (4.5:1) on EVERY panel surface it composes
-     with, not just --color-bg — the old #7a9a9a passed on the page background
-     but failed on elevated cards (3.84:1 on #1a3d47) and paper modals
-     (4.37:1 on #332f2c), ~46 live axe hits (elspeth-dae08efdc9). #93b3b3
-     clears every surface family: bg 6.45, surface 6.28, elevated/raised 5.18,
-     inspector 6.53, paper 5.90, nav 7.61, nav-raised 6.71, and 4.60 on the
-     4%-white hover wash over elevated. Gated by the muted-on-panel-surface
-     composition tests in colorContrast.test.ts. Mirrored in
-     website/tokens/colors.css — change both. */
-  --color-text-muted:        #93b3b3;
+     with, not just --color-bg — an earlier #7a9a9a passed on the page
+     background but failed on elevated cards and paper modals, ~46 live axe
+     hits (elspeth-dae08efdc9). ARGO's #a9b9c4 clears every surface family:
+     bg 8.54, surface 7.02, elevated/raised 6.39, input 5.78, inspector 7.18,
+     paper 6.54, nav-raised 5.50, and on the 4%-white hover wash 5.68 over
+     elevated and 4.94 over nav-raised. Gated by the muted-on-panel-surface
+     composition tests in colorContrast.test.ts. The website mirror (website/tokens/colors.css)
+     still carries the pre-ARGOnite #93b3b3: per the ARGOnite design doc the
+     marketing site's tokens follow later, separately. */
+  --color-text-muted:        #a9b9c4;
   --color-text-inverse:      #ffffff;
 
-  /* ── Borders — teal-tinted ───────────────────────────────────────────────── */
-  --color-border:            rgba(143, 200, 200, 0.12);
-  --color-border-strong:     rgba(143, 200, 200, 0.25);
-  /* Interactive-option (chip) border. A brighter accent-green than --color-accent
-     (#1a7a52, only ~2.2:1 on the chip surface) so the resting button affordance
-     clears WCAG 1.4.11 (3:1) in the dark default theme: #3fa980 ≈ 4:1 vs
-     --color-surface-elevated #1a3d47. Light theme overrides to the plain accent
-     (already ~7.5:1 on white). */
+  /* ── Borders — ARGO's green-grey line and line-strong ────────────────────── */
+  --color-border:            #244a42;
+  --color-border-strong:     #5f8a7d;
+  /* Interactive-option (chip) border. A brighter green than the pre-ARGOnite
+     accent so the resting button affordance clears WCAG 1.4.11 (3:1) in the
+     dark default theme: #3fa980 is 4.41:1 vs --color-surface-elevated #1c3447.
+     Light theme overrides to the plain accent (already ~7.5:1 on white). */
   --color-chip-border:       #3fa980;
   /* Resting form-input boundary — the input fill ~matches surface, so the
-     border is the sole affordance and must clear WCAG 1.4.11 (3:1). 1px
-     --color-border-strong is only ~1.7:1; this solid teal-grey is ~3.1:1 on
-     --color-surface-elevated. */
-  --color-input-border:      #608a8a;
+     border is the sole affordance and must clear WCAG 1.4.11 (3:1). This is
+     ARGO's line-strong: 3.32:1 on --color-surface-elevated, 3.65:1 on
+     --color-surface. */
+  --color-input-border:      #5f8a7d;
 
   /* ── Chat bubbles ────────────────────────────────────────────────────────── */
-  /* The user (green) and assistant/reply (cool-teal) fills are pushed apart so
-     the two speakers read as two distinct shades even where they overlap in the
-     centred column. The reply was previously a 5%-white wash that all but
-     vanished into the teal workspace surface; a 10% cool-teal tint gives it a
-     visible "card" presence without competing with the user's green. */
-  --color-bubble-user:           rgba(40, 150, 112, 0.20);
-  --color-bubble-user-border:    rgba(40, 150, 112, 0.42);
-  --color-bubble-assistant:      rgba(174, 214, 214, 0.10);
-  --color-bubble-assistant-border: rgba(174, 214, 214, 0.24);
+  /* The user bubble is a 16% DTA-green tint; the assistant/reply bubble is an
+     opaque raised navy card (ARGO's raised surface), so the two speakers read
+     as two distinct shades even where they overlap in the centred column. */
+  --color-bubble-user:           rgba(41, 180, 128, 0.16);
+  --color-bubble-user-border:    rgba(41, 180, 128, 0.38);
+  --color-bubble-assistant:      #1c3447;
+  --color-bubble-assistant-border: #244a42;
   --color-bubble-system:         rgba(255, 255, 255, 0.03);
 
   /* ── Component type badges — functional colour coding ────────────────────── */
   --color-badge-source:      #4db89a;
   --color-badge-transform:   #e8a030;
   --color-badge-gate:        #c390f9;
-  --color-badge-sink:        #e07040;
+  /* ARGOnite: sink lifted from #e07040 (UX review D1) to clear 4.5:1 text on
+     its badge ground: 4.84:1 on #2e3737. */
+  --color-badge-sink:        #ea8a62;
   --color-badge-aggregation: #61daff;
   /* Coalesce stays in the cyan/teal family while success/completed now uses
      a greener semantic token, so a completed badge next to a coalesce node
@@ -98,7 +118,9 @@
      (clears the 3:1 badge gate). */
   --color-badge-collector:   #b9e07a;
 
-  /* ── Component type badge backgrounds — opaque pre-composited over --color-bg ──── */
+  /* ── Component type badge backgrounds — opaque, pre-composited over the
+     pre-ARGOnite teal ground and kept as-is: they are self-contained opaque
+     grounds, so the badge gates do not depend on --color-bg (UX review D1). */
   --color-badge-source-bg:   #184244;
   --color-badge-transform-bg: #303e34;
   --color-badge-gate-bg:     #2a3c52;
@@ -145,9 +167,11 @@
      --color-error-bg is a 12% tint, so it LIGHTENS a dark ground and shrinks
      the text/background gap: on --color-surface-raised the composite is
      rgb(51,64,72) and the old value measured 4.304:1, under AA. The lift
-     clears every tinted surface (worst 4.547:1 on raised/elevated) and
-     improves the untinted pairings too. colorContrast.test.ts now enumerates
-     raised and elevated, so this cannot silently regress again. */
+     cleared every tinted surface of the pre-ARGOnite palette (worst 4.547:1
+     on raised/elevated) and improved the untinted pairings too; on
+     ARGOnite's darker navy panels the worst tinted pair is 4.90:1 (paper).
+     colorContrast.test.ts now enumerates raised and elevated, so this cannot
+     silently regress again. */
   --color-error:             #f08e8b;
   /* Lifted from #e79761 (+0.032 L, hue and saturation held). Same mechanism as
      --color-error above, and worse here because --color-warning-bg is a 14%
@@ -169,15 +193,20 @@
   --color-info-border:       rgba(97, 218, 255, 0.25);
 
   /* ── Interactive / accent ────────────────────────────────────────────────── */
-  --color-accent:            #1a7a52;
+  /* DTA green primary under navy --color-btn-primary-text (5.64:1 resting,
+     6.69:1 on the lighter hover). The selected ring is solid, not
+     translucent (UX review). */
+  --color-accent:            #29b480;
   --color-focus-ring:        #ffffff;
-  --color-btn-primary-bg:    #16664a;
-  --color-btn-primary-bg-hover: #1c8258;
+  --color-btn-primary-bg:    #29b480;
+  --color-btn-primary-bg-hover: #3cc391;
   --color-btn-danger-bg:     #b23835;
   --color-btn-danger-bg-hover: #c23d3a;
   --color-link:              #61daff;
-  --color-highlight:         rgba(26, 122, 82, 0.14);
-  --color-selected-ring:     rgba(26, 122, 82, 0.55);
+  --color-highlight:         rgba(41, 180, 128, 0.14);
+  /* Gold, not the accent green: selection must read apart from the green
+     well and brand (operator choice 2026-11-11). 10.11:1 on --color-well. */
+  --color-selected-ring:     #f0c75e;
 
   /* ── Status badges ───────────────────────────────────────────────────────── */
   --color-status-pending:    #7a9a9a;
@@ -193,8 +222,11 @@
   --color-status-empty:      #a4a4a4;
 
   /* ── Surface variants ─────────────────────────────────────────────────── */
-  --color-surface-raised:    #1a3d47;
-  --color-surface-input:     #0f2d35;
+  /* Raised shares elevated's ARGO raised navy; the input field is ARGO's
+     field tone held darker than ARGO's own (UX review 4.4) so muted text
+     clears AA in it. */
+  --color-surface-raised:    #1c3447;
+  --color-surface-input:     #223b4e;
   --color-accent-muted:      rgba(20, 176, 174, 0.18);
 
   /* ── Scrollbar — teal-tinted ─────────────────────────────────────────────── */
@@ -203,17 +235,20 @@
   --color-scrollbar-thumb-hover: rgba(143, 200, 200, 0.28);
 
   /* ── React Flow canvas grid ──────────────────────────────────────────────── */
-  /* Used by GraphView's <Background> dot grid. Previously the grid painted
-     with --color-border (12% alpha) which fell to ~1.34:1 against the
-     workspace and read as flat. This token raises grid visibility to ~2.2:1
-     — clearly perceptible as a grid without competing with node content.
-     Note: orientation grids sit below WCAG 1.4.11's 3:1 UI-component bar by
-     design; pushing higher would visually fight with nodes. */
-  --color-canvas-grid:           rgba(170, 220, 220, 0.28);
+  /* Used by GraphView's <Background> dot grid. An early grid painted with
+     a 12%-alpha border tone and read as flat. This token is ARGO's
+     line-strong at 35% — clearly perceptible as a grid without competing
+     with node content. Note: orientation grids sit below WCAG 1.4.11's 3:1
+     UI-component bar by design; pushing higher would visually fight with
+     nodes. */
+  --color-canvas-grid:           rgba(95, 138, 125, 0.35);
 
-  /* ── Typography — Inter for body, system fallback ────────────────────────── */
-  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+  /* ── Typography — Instrument Sans for UI, Bricolage Grotesque for headings ── */
+  --font-sans: "Instrument Sans", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
     Oxygen, Ubuntu, Cantarell, "Helvetica Neue", sans-serif;
+  --font-display: "Bricolage Grotesque", "Instrument Sans", "Inter", -apple-system,
+    BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell,
+    "Helvetica Neue", sans-serif;
   --font-mono: "JetBrains Mono", "Fira Code", "SF Mono", "Cascadia Code",
     "Source Code Pro", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
 
@@ -295,15 +330,39 @@
      none of the downward tiers can express that offset. */
   --shadow-drawer-left: -8px 0 24px rgba(0, 0, 0, 0.24);
 
+  /* ARGOnite: from ARGO (dta-au) client index.css — reuse assumed MIT, see design doc */
+  --color-brand-navy:        #1e3c50;
+  --color-brand-yellow:      #fad673;
+  --color-on-nav:            #e8eef2;
+  --color-on-nav-muted:      #a8e3c4;
+  --color-nav-control:       rgba(255, 255, 255, 0.10);
+  --color-pane-header:       #11282e;
+  --color-well:              #0c2420;
+  --color-track:             #244a42;
+  --color-pill:              #e8eef2;
+  --color-on-pill:           #141d1b;
+  --color-graph-edge:        #5f8a7d;
+  --color-node-border:       #5f8a7d;
+  --color-btn-primary-text:  #13293a;
+  --shadow-card:  0 1px 3px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.45);
+  --shadow-pill:  0 1px 2px rgba(0, 0, 0, 0.4), 0 4px 10px rgba(0, 0, 0, 0.3);
+  --shadow-track: inset 0 2px 5px rgba(0, 0, 0, 0.7), inset 0 -1px 0 rgba(255, 255, 255, 0.05);
+  --radius-pane: 20px;
+  --radius-card: 16px;
+  --radius-node: 14px;
+  --size-pane-header: 46px;
+  --space-pane-gutter: 14px;
+
   /* ── Overlay scrim (elspeth-9ae8ee9ac2) ──────────────────────────────────── */
   /* THE page-dimming veil behind every blocking overlay — dialog backdrops,
      the catalog drawer, the command palette. One token so "blocked" always
      dims the page by the same amount: the corpus shipped eleven hand-copied
      rgba backdrops across three alphas (0.3 / 0.45 / 0.5), which made
      modality read differently per overlay. Backdrops consume this token,
-     never a literal. Light theme swaps the base to the house ink (#0f2d35)
-     at a lower alpha — plain black at 0.45 reads too heavy over light
-     surfaces — the same tinted-base swap the --shadow-* tiers make. */
+     never a literal. Light theme swaps the base to the pre-ARGOnite teal
+     ink (#0f2d35) at a lower alpha — plain black at 0.45 reads too heavy
+     over light surfaces — the same tinted-base swap the --shadow-* tiers
+     make. */
   --color-scrim: rgba(0, 0, 0, 0.45);
 
   /* ── Control heights ─────────────────────────────────────────────────────── */
@@ -314,10 +373,11 @@
      .btn or .btn-compact — do not redeclare min-height literally. */
   --size-control:         44px;
   --size-control-compact: 36px;
+  /* One register for the session, version, model and account header pills. */
+  --size-header-pill-height: var(--size-control-compact);
   /* Fixed app-header row height (desktop); the <=960px wrap rule reuses it as
      a min-height so a wrapped header never renders shorter than the fixed row. */
-  --size-header-height:   40px;
-  --size-workspace-band:  53px;
+  --size-header-height:   45px;
 
   /* ── Icon sizes (elspeth-7f63055e06) ─────────────────────────────────────── */
   --size-icon-sm: 16px;
@@ -351,37 +411,38 @@
 
 /* Light theme — applied via data-theme="light" attribute (set by useTheme hook) */
 [data-theme="light"] {
-  /* ── Backgrounds — DTA/AGDS three-family role palette (light) ──────────── */
-  /* Workspace family — light teal (active editing surfaces).
+  --size-header-pill-height: var(--size-control-compact);
+  /* ── Backgrounds — ARGOnite three-family role palette (light) ──────────── */
+  /* Workspace family — ARGO's pale green page under near-white panels
+     (active editing surfaces).
      elspeth-9e1a4935b0: --color-surface and --color-surface-elevated were
-     BYTE-IDENTICAL #ffffff here, so every elevation step that relies on a
-     lighter surface — the dark theme's primary elevation mechanism — was a
-     no-op in light and elevation fell entirely to the 12%-alpha border.
-     Since white is the ceiling, elevation is made by pulling --color-surface
-     DOWN off it and leaving --color-surface-elevated at #ffffff, which also
-     freezes every "…on elevated" assertion in colorContrast.test.ts at its
-     pre-change value. The resulting ladder mirrors the dark theme's SHAPE:
-     a whisper from ground to panel (dark +0.96 L*, light +1.11) and the
-     real step from panel to raised (dark +6.08 L*, light +1.58 — the white
-     ceiling caps it).
-     --color-bg is FROZEN at #f4f8f9 and must not be darkened here: the
-     chat-bubble link gate (colorContrast.test.ts, "keeps the link token at AA
-     over every chat bubble tint") composites --color-bubble-user over it and
-     measures 4.527:1 against --color-link — 0.027 above the 4.5 floor.
-     #eaf1f3 drops it to 4.264 and reddens the gate. Deepening the ground
-     therefore requires deepening --color-link too, which is a cross-cutting
-     palette decision left for the operator. */
-  --color-bg:                #f4f8f9;
-  --color-surface:           #f8fbfc;
+     once BYTE-IDENTICAL #ffffff here, so every elevation step that relies on
+     a lighter surface — the dark theme's primary elevation mechanism — was a
+     no-op in light and elevation fell entirely to the border. Since white is
+     the ceiling, elevation is made by pulling --color-surface DOWN off it and
+     leaving --color-surface-elevated at #ffffff. The ladder: ground 95.59 L*,
+     panel 98.69 (+3.10), elevated 100 (+1.31 — the white ceiling caps it;
+     surfaceElevation.test.ts needs >= 1, so do not lighten --color-surface).
+     The ground was deepened from the pre-ARGOnite #f4f8f9 to ARGO's #eaf5ef.
+     The chat-bubble link gate (colorContrast.test.ts, "keeps the link token
+     at AA over every chat bubble tint") was re-evaluated against it: the
+     user bubble is now an opaque #dcefe4, on which --color-link #176d8a
+     measures 4.88:1, so the link did not need deepening. */
+  --color-bg:                #eaf5ef;
+  --color-surface:           #f9fcfa;
   --color-surface-elevated:  #ffffff;
   --color-surface-hover:     rgba(15, 45, 53, 0.06);
 
-  /* Navigation family — pale navy chrome. Deepened and pushed navy-ward so
-     the chrome separates from the teal workspace by a real step: bg → nav is
-     now -4.99 L* (dark theme: -6.57 L*), and nav's r-b is -16 against the
-     workspace ground's -5. */
-  --color-surface-nav:        #e2eaf2;
-  --color-surface-nav-raised: #d5dfec;
+  /* Navigation family — ARGO's DTA green header band, with white
+     --color-on-nav text (4.70:1) and --color-on-nav-muted on the
+     --color-nav-control tint (5.17:1). --color-surface-nav-raised's only
+     consumer is the session-switcher popover (header.css), which carries
+     BODY text (text, secondary, muted) — not on-nav text. ARGO's band-dark
+     #23735a would put #414141 body text at 1.79:1 and muted at 1.08:1 there,
+     so it was lightened (same hue, lightness only) to a pale green: muted
+     5.30:1, secondary 6.37:1, body text 8.72:1. */
+  --color-surface-nav:        #288264;
+  --color-surface-nav-raised: #d8f3eb;
 
   /* Inspection family — warm cream (paper modals, inspection panels).
      The old values carried almost no warmth (#faf7f3 is r-b = 7) and sat
@@ -396,32 +457,36 @@
   --color-surface-paper:     #f2ead9;
 
   /* ── Surface variants ──────────────────────────────────────────────────── */
-  --color-surface-raised:    #eaf2f3;
+  --color-surface-raised:    #f1f8f4;
   --color-surface-input:     #ffffff;
   --color-accent-muted:      rgba(21, 96, 72, 0.12);
 
   /* ── Text ────────────────────────────────────────────────────────────────── */
-  --color-text:              #0f2d35;
-  --color-text-secondary:    #3a5a64;
-  --color-text-muted:        #426069;
+  /* ARGO's neutral ink. --color-heading is not introduced: headings use
+     --color-text unless a heading rule opts into --color-brand-navy. Muted is
+     held slightly darker than ARGO's #61686d for headroom (UX review 4.3). */
+  --color-text:              #414141;
+  --color-text-secondary:    #4f565b;
+  --color-text-muted:        #5b6267;
   --color-text-inverse:      #ffffff;
 
-  /* ── Borders — darker for light backgrounds ───────────────────────────── */
-  --color-border:            rgba(15, 45, 53, 0.12);
-  --color-border-strong:     rgba(15, 45, 53, 0.25);
+  /* ── Borders — ARGO's green-grey line and line-strong ──────────────────── */
+  --color-border:            #cde3d6;
+  --color-border-strong:     #7a9487;
   /* Light theme: the plain accent already clears 3:1 on the white chip surface. */
   --color-chip-border:       var(--color-accent);
-  --color-input-border:      #6c919d;
+  /* ARGO's line-strong: 3.27:1 on white elevated, 3.17:1 on --color-surface. */
+  --color-input-border:      #7a9487;
 
   /* ── Chat bubbles ────────────────────────────────────────────────────────── */
-  /* Light-theme mirror of the dark widened split: a stronger green for the user
-     and a more present navy tint for the reply so the two speakers stay clearly
-     distinct on the light paper surface (the old 5% navy reply was nearly
-     invisible), while keeping dark text well above AA on both fills. */
-  --color-bubble-user:           rgba(40, 130, 100, 0.15);
-  --color-bubble-user-border:    rgba(40, 130, 100, 0.40);
-  --color-bubble-assistant:      rgba(15, 45, 53, 0.09);
-  --color-bubble-assistant-border: rgba(15, 45, 53, 0.22);
+  /* Light-theme mirror of the dark split: an opaque pale-green user bubble and
+     an opaque white reply card, each with its own visible border, so the two
+     speakers stay clearly distinct on the green-tinted page while keeping
+     dark text well above AA on both fills. */
+  --color-bubble-user:           #dcefe4;
+  --color-bubble-user-border:    #b6dcc6;
+  --color-bubble-assistant:      #ffffff;
+  --color-bubble-assistant-border: #cde3d6;
   --color-bubble-system:         rgba(15, 45, 53, 0.03);
 
   /* ── Semantic backgrounds — adjusted for light theme ────────────────────── */
@@ -436,8 +501,9 @@
 
   /* ── Semantic colours — slightly darkened for light backgrounds ───────── */
   /* --color-info and --color-link were deepened from #2890b8 to #176d8a so
-     they meet WCAG AA (4.5:1) as text on --color-bg (#f4f8f9). Verified by
-     colorContrast.test.ts. The semantic-colour-on-tinted-bg pairings (e.g.
+     they meet WCAG AA (4.5:1) as text on --color-bg (5.24:1 on ARGOnite's
+     #eaf5ef). Verified by colorContrast.test.ts. The
+     semantic-colour-on-tinted-bg pairings (e.g.
      --color-info on --color-info-bg) become slightly higher-contrast, which
      is the desired direction. */
   --color-success:           #0b6e6c;
@@ -447,10 +513,12 @@
   --color-state-positive:    #056e6c;
 
   /* ── Component type badges — verified at 3:1 non-text contrast on opaque backgrounds ──── */
-  --color-badge-source:      #257963;
-  --color-badge-transform:   #926414;
-  --color-badge-gate:        #8356b6;
-  --color-badge-sink:        #ad502d;
+  /* ARGOnite: source, transform, gate and sink darkened slightly (UX review
+     L12) so badge text clears 4.5:1 on its opaque ground, not just 3:1. */
+  --color-badge-source:      #1f6f5a;
+  --color-badge-transform:   #875c12;
+  --color-badge-gate:        #7a4fab;
+  --color-badge-sink:        #a04a29;
   --color-badge-aggregation: #207595;
   /* Coalesce shifted cyan-ward to break the proximity to --color-success
      (#0d8a88) on light mode; sits between aggregation and success. */
@@ -463,7 +531,9 @@
      ~4.23:1 (clears the 3:1 badge gate). */
   --color-badge-collector:   #5a7a1f;
 
-  /* ── Component type badge backgrounds — opaque pre-composited over --color-bg ──── */
+  /* ── Component type badge backgrounds — opaque, pre-composited over the
+     pre-ARGOnite light ground and kept as-is (self-contained opaque grounds;
+     the badge gates do not depend on --color-bg). */
   --color-badge-source-bg:   #dcebe9;
   --color-badge-transform-bg: #ece9de;
   --color-badge-gate-bg:     #e7e5f2;
@@ -486,15 +556,21 @@
   --color-badge-collector-border:   rgba(90, 122, 31, 0.35);
 
   /* ── Interactive / accent ────────────────────────────────────────────────── */
+  /* The primary fill is ARGO's DTA green in both themes, under navy
+     --color-btn-primary-text (5.64:1 resting, 4.56:1 on the darker hover —
+     the thinnest pair here; do not darken the hover further). The selected
+     ring is solid (UX review), not a translucent ring. */
   --color-accent:            #156048;
   --color-focus-ring:        #0f2d35;
-  --color-btn-primary-bg:    #1a7a5a;
-  --color-btn-primary-bg-hover: #156048;
+  --color-btn-primary-bg:    #29b480;
+  --color-btn-primary-bg-hover: #22a172;
   --color-btn-danger-bg:     #b23835;
   --color-btn-danger-bg-hover: #912f2d;
   --color-link:              #176d8a;
   --color-highlight:         rgba(21, 96, 72, 0.12);
-  --color-selected-ring:     rgba(21, 96, 72, 0.45);
+  /* Gold, not the accent green (operator choice 2026-11-11). 5.77:1 on
+     --color-well. */
+  --color-selected-ring:     #7a5200;
 
   /* ── Status badges ───────────────────────────────────────────────────────── */
   --color-status-pending:    #5a7a84;
@@ -510,7 +586,7 @@
   --color-scrollbar-thumb-hover: rgba(15, 45, 53, 0.30);
 
   /* ── React Flow canvas grid (light) ──────────────────────────────────── */
-  --color-canvas-grid:           rgba(15, 45, 53, 0.20);
+  --color-canvas-grid:           rgba(122, 148, 135, 0.35);
 
   /* ── Elevation (light) ──────────────────────────────────────────────── */
   /* All three tiers swap to a tinted-navy base on light backgrounds — plain
@@ -526,6 +602,25 @@
   --shadow-dropdown: 0 8px 24px rgba(15, 45, 53, 0.10);
   --shadow-modal:    0 8px 32px rgba(15, 45, 53, 0.14);
   --shadow-drawer-left: -8px 0 24px rgba(15, 45, 53, 0.13);
+
+  /* ARGOnite: from ARGO (dta-au) client index.css — reuse assumed MIT, see design doc */
+  --color-brand-navy:        #1e3c50;
+  --color-brand-yellow:      #fad673;
+  --color-on-nav:            #ffffff;
+  --color-on-nav-muted:      #c8ebd7;
+  --color-nav-control:       rgba(0, 0, 0, 0.20);
+  --color-pane-header:       #ecf6f0;
+  --color-well:              #dcefe4;
+  --color-track:             #cde3d6;
+  --color-pill:              #ffffff;
+  --color-on-pill:           #13293a;
+  --color-graph-edge:        #5f7a6e;
+  --color-node-border:       #6b8a7c;
+  --color-btn-primary-text:  #13293a;
+  /* ARGOnite: light track blur unified to 5px (ARGO used 3px) for the theme-pair invariant */
+  --shadow-card:  0 1px 3px rgba(16, 40, 36, 0.1), 0 8px 24px rgba(16, 40, 36, 0.13);
+  --shadow-pill:  0 1px 2px rgba(16, 40, 36, 0.2), 0 4px 10px rgba(16, 40, 36, 0.16);
+  --shadow-track: inset 0 2px 5px rgba(16, 40, 36, 0.22), inset 0 -1px 0 rgba(255, 255, 255, 0.7);
 
   /* ── Overlay scrim (light) — ink-tinted, lighter veil; see the :root note. */
   --color-scrim: rgba(15, 45, 53, 0.35);

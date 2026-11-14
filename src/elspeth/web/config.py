@@ -369,13 +369,19 @@ class WebSettings(BaseModel):
     composer_max_composition_turns: int = Field(..., ge=1)
     composer_max_discovery_turns: int = Field(..., ge=1)
     composer_max_tool_calls_per_turn: int = Field(default=16, ge=1)
+    # Context budget: the operator's gateway prompt-token limit has no safe
+    # default, so it is required. The budgeter sheds history above
+    # ``shed_above`` of this cap down to ``shed_to`` of it.
+    composer_context_max_prompt_tokens: int = Field(..., strict=True, ge=1)
+    composer_context_shed_above: float = Field(default=0.85, strict=True, gt=0, le=1)
+    composer_context_shed_to: float = Field(default=0.60, strict=True, gt=0, lt=1)
     composer_timeout_seconds: float = Field(..., gt=0)
     # Canonical full-pipeline planner budgets. These are independent of the
     # ordinary incremental compose loop because the planner accounts for exact
     # request bytes, physical provider attempts, requested completion tokens,
     # and post-call provider cost.
     composer_planner_max_provider_calls: int = Field(default=75, strict=True, ge=1)
-    composer_planner_max_request_bytes: int = Field(default=2 * 1024 * 1024, strict=True, ge=1)
+    composer_planner_max_request_bytes: int = Field(default=960 * 1024, strict=True, ge=1)
     composer_planner_max_completion_tokens: int = Field(default=16_384, strict=True, ge=1)
     composer_planner_max_cumulative_provider_cost: Decimal = Field(default=Decimal("5.00"), ge=0)
     composer_planner_repair_budget: int = Field(default=2, strict=True, ge=0)
@@ -1293,6 +1299,13 @@ class WebSettings(BaseModel):
         max_backend_timeout_seconds = self.composer_transport_idle_ceiling_seconds - self.composer_transport_headroom_seconds
         if max_backend_timeout_seconds <= 0:
             raise ValueError("composer_transport_headroom_seconds must be less than composer_transport_idle_ceiling_seconds")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_composer_context_shed_marks(self) -> WebSettings:
+        """The shed target must sit below the shed trigger."""
+        if self.composer_context_shed_to >= self.composer_context_shed_above:
+            raise ValueError("composer_context_shed_to must be below composer_context_shed_above")
         return self
 
     @model_validator(mode="after")

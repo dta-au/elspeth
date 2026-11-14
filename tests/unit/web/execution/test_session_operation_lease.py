@@ -1071,6 +1071,7 @@ def _run_failed_shutdown_release_child(root: Path, error_type: type[Exception], 
     ],
 )
 @pytest.mark.parametrize("repeat_cancellation", [False, True])
+@pytest.mark.timing_sensitive  # failed under 12 parallel workers on 2026-11-11, passes alone
 def test_cancelled_http_execute_observes_cleanup_failure_without_losing_primary(
     tmp_path: Path,
     cleanup_error_type: type[Exception],

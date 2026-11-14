@@ -153,7 +153,12 @@ def _check_capabilities(request: ChatRequest, capabilities: frozenset[Capability
         raise GatewayError(GatewayErrorCode.CAPABILITY_UNSUPPORTED)
 
 
-def _validate_canonical_response(response: CanonicalResponse, request: ChatRequest, bounds: Bounds) -> None:
+def _validate_canonical_response(
+    response: CanonicalResponse,
+    request: ChatRequest,
+    bounds: Bounds,
+    capabilities: frozenset[Capability],
+) -> None:
     """Step 5's post-``parse_success`` validation.
 
     ``finish_reason`` is already pydantic-typed as ``FinishReason`` on
@@ -175,6 +180,10 @@ def _validate_canonical_response(response: CanonicalResponse, request: ChatReque
     ):
         raise GatewayError(GatewayErrorCode.UPSTREAM_RESPONSE_INVALID)
     if response.text is not None and (type(response.text) is not str or len(response.text) > bounds.max_string_chars):
+        raise GatewayError(GatewayErrorCode.UPSTREAM_RESPONSE_INVALID)
+    # Ingress refuses replayed thinking for an adapter that does not declare
+    # REASONING, so thinking returned by one could never be sent back.
+    if response.thinking_blocks and Capability.REASONING not in capabilities:
         raise GatewayError(GatewayErrorCode.UPSTREAM_RESPONSE_INVALID)
     # Returned thinking is replayed on the next request, where bounds_check
     # counts each of its strings. Refuse here rather than truncate: the
@@ -269,7 +278,7 @@ class CompletionService:
                 canonical_response = self._adapter.parse_success(result.body if result.body is not None else {})
             except Exception:
                 raise GatewayError(GatewayErrorCode.UPSTREAM_RESPONSE_INVALID) from None
-            _validate_canonical_response(canonical_response, request, self._config.bounds)
+            _validate_canonical_response(canonical_response, request, self._config.bounds, capabilities)
             return canonical_response
 
         # Step 6: classify_error.

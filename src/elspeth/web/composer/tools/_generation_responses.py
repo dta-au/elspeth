@@ -222,6 +222,9 @@ class ProofEvidence(_ResponseRecord):
     max_blob_sources: int | None = None
     max_declared_input_type_checks: int | None = None
     max_declared_input_type_diagnostics: int | None = None
+    selected_record_count: int | None = Field(default=None, ge=0)
+    sample_extra_record_count: int | None = Field(default=None, ge=0)
+    all_rows_inspected: bool | None = None
 
     @model_validator(mode="after")
     def _evidence_presence(self) -> Self:
@@ -242,7 +245,7 @@ class ProofEvidence(_ResponseRecord):
 
 class ProofDiagnostic(_ResponseRecord):
     code: str
-    severity: Literal["blocking", "info"]
+    severity: Literal["blocking", "warning", "info"]
     message: str
     suggested_repair: str | None
     evidence_locator: ProofEvidence

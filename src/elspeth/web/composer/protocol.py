@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.session_operation import SessionOperationContext
     from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
     from elspeth.web.composer.audit import BufferingRecorder
+    from elspeth.web.composer.context_budget_history import ContextBudgetHistory
     from elspeth.web.composer.graph_recovery import GraphRecoveryContext, GraphRecoveryIntent
     from elspeth.web.composer.prompt_guard import PromptGuardMount
     from elspeth.web.composer.provider_quota import ProviderCallCustody, ProviderInvocationOwner
@@ -37,7 +38,7 @@ if TYPE_CHECKING:
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
-from elspeth.contracts.composer_progress import ComposerProgressReason, ComposerProgressSink
+from elspeth.contracts.composer_progress import CONTEXT_BUDGET_REFUSAL_DETAIL, ComposerProgressReason, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata, FrameworkBugError
 from elspeth.web.composer.advisor_audit import AdvisorGraphReviewIdentity, AdvisorTerminalPublication
 from elspeth.web.composer.advisor_decision import AdvisorGateDecision
@@ -207,13 +208,18 @@ def retained_operation_context_message(context: RetainedOperationContext | None)
 # keeps them bare constants rather than wrapped diagnostics, so they need no
 # ``_wrapped_diagnostic_template`` shape or trusted-suffix registration.
 PIPELINE_STAGED_AUTO_COMMIT_MESSAGE: Final[str] = "I prepared and validated the requested pipeline. ELSPETH will commit it atomically."
-PIPELINE_STAGED_REVIEW_MESSAGE: Final[str] = "I prepared and validated the requested pipeline for your review."
+PIPELINE_STAGED_REVIEW_MESSAGE: Final[str] = (
+    "I prepared and validated the requested pipeline for your review. The proposal has not been applied. "
+    "Review and accept it to apply the pipeline, or reject it if it is not what you want."
+)
 # Staged over a RED Stage-2 verdict. Auto-commit is downgraded to review
 # rather than hard-failed (the Shape-14 report-don't-block posture): a human
 # still reads the proposal, and a preflight false-red must not destroy an
 # otherwise stageable plan. It must simply never commit unreviewed.
 PIPELINE_STAGED_REVIEW_FINDINGS_MESSAGE: Final[str] = (
-    "I prepared the requested pipeline and staged it for your review. Validation found issues that must be fixed before it can run."
+    "I prepared the requested pipeline and staged it for your review. The proposal has not been applied. "
+    "Validation found issues that must be fixed before it can run. Inspect the findings and request a correction. "
+    "Review and accept the proposal only if you want to apply it for further editing, or reject it."
 )
 # Staged when Stage 2 could not be measured at all — it raised, timed out, or
 # the plan carried no candidate state. Deliberately distinct from the findings
@@ -221,8 +227,9 @@ PIPELINE_STAGED_REVIEW_FINDINGS_MESSAGE: Final[str] = (
 # objection, and collapsing the two would report a hole as a finding. Fails
 # closed — it never reads as validated and never auto-commits.
 PIPELINE_STAGED_REVIEW_PREFLIGHT_NOT_RUN_MESSAGE: Final[str] = (
-    "I prepared the requested pipeline and staged it for your review. "
-    "ELSPETH could not complete validation, so it is not confirmed runnable."
+    "I prepared the requested pipeline and staged it for your review. The proposal has not been applied. "
+    "ELSPETH could not complete validation, so it is not confirmed runnable. Request a validation retry or revise your request. "
+    "Review and accept the proposal only if you want to apply it for further editing, or reject it."
 )
 # Staged over the pending-interpretation handoff shape. Held apart from the
 # findings wording because it is NOT a validator objection: the pipeline is
@@ -232,7 +239,8 @@ PIPELINE_STAGED_REVIEW_PREFLIGHT_NOT_RUN_MESSAGE: Final[str] = (
 # It still blocks auto-commit — an unresolved review must not become canonical
 # state unreviewed.
 PIPELINE_STAGED_REVIEW_PENDING_INTERPRETATION_MESSAGE: Final[str] = (
-    "I prepared the requested pipeline and staged it for your review. It has interpretation review cards to resolve before it can run."
+    "The pipeline proposal needs your acceptance. Review and accept it to open its interpretation cards, "
+    "then resolve those cards before running. Reject the proposal if it is not what you want."
 )
 
 
@@ -599,13 +607,17 @@ class ComposerConvergenceError(ComposerServiceError):
         # spent by tool-call turns, so the loop wording is true for those. A
         # timeout is not: the deadline can expire after the model's final
         # reply, while the END gate re-validates, so the timeout wording claims
-        # only what every timeout has in common.
-        cause = (
-            "The request ran out of time before the turn could be completed."
-            if budget_exhausted == "timeout"
-            else "The LLM kept making tool calls without producing a final response."
-        )
-        super().__init__(f"Composer did not converge within {max_turns} turns (budget exhausted: {budget_exhausted}). {cause}")
+        # only what every timeout has in common. A context budget refusal is
+        # neither: it is refused before the provider call and says so.
+        if reason == "context_budget_exceeded":
+            super().__init__(CONTEXT_BUDGET_REFUSAL_DETAIL)
+        else:
+            cause = (
+                "The request ran out of time before the turn could be completed."
+                if budget_exhausted == "timeout"
+                else "The LLM kept making tool calls without producing a final response."
+            )
+            super().__init__(f"Composer did not converge within {max_turns} turns (budget exhausted: {budget_exhausted}). {cause}")
         self.max_turns = max_turns
         self.budget_exhausted = budget_exhausted
         self.partial_state = partial_state
@@ -1663,6 +1675,15 @@ class ComposerSettings(Protocol):
     def composer_max_tool_calls_per_turn(self) -> int: ...
 
     @property
+    def composer_context_max_prompt_tokens(self) -> int: ...
+
+    @property
+    def composer_context_shed_above(self) -> float: ...
+
+    @property
+    def composer_context_shed_to(self) -> float: ...
+
+    @property
     def composer_timeout_seconds(self) -> float: ...
 
     @property
@@ -1774,6 +1795,7 @@ class ComposerService(Protocol):
         recovery_context: GraphRecoveryContext | None = None,
         retained_operation_context: RetainedOperationContext | None = None,
         advisor_history: AdvisorTranscriptHistory | None = None,
+        context_budget_history: ContextBudgetHistory | None = None,
     ) -> ComposerResult:
         """Run the LLM composition loop.
 

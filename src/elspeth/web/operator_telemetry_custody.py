@@ -34,6 +34,7 @@ from opentelemetry.sdk.metrics.export import (
 )
 from opentelemetry.sdk.metrics.view import View
 from opentelemetry.sdk.resources import Resource
+from opentelemetry.semconv._incubating.attributes.otel_attributes import OtelComponentTypeValues
 from opentelemetry.util._once import Once
 from prometheus_client import REGISTRY, CollectorRegistry
 
@@ -67,9 +68,9 @@ def _identity_present(values: object, target: object) -> bool:
 
 def verify_telemetry_sdk() -> None:
     for package, expected in (
-        ("opentelemetry-sdk", "1.40.0"),
-        ("opentelemetry-exporter-otlp-proto-grpc", "1.40.0"),
-        ("opentelemetry-exporter-prometheus", "0.61b0"),
+        ("opentelemetry-sdk", "1.45.2"),
+        ("opentelemetry-exporter-otlp-proto-grpc", "1.45.2"),
+        ("opentelemetry-exporter-prometheus", "0.66b1"),
     ):
         if importlib.metadata.version(package) != expected:
             raise TelemetryCustodyUnresolved("Telemetry SDK version unsupported")
@@ -192,8 +193,13 @@ class OwnedPrometheusMetricReader(PrometheusMetricReader):
                 ObservableUpDownCounter: AggregationTemporality.CUMULATIVE,
                 ObservableGauge: AggregationTemporality.CUMULATIVE,
             },
+            otel_component_type=OtelComponentTypeValues.PROMETHEUS_HTTP_TEXT_METRIC_EXPORTER,
         )
-        self._collector = _CustomCollector(False)
+        # Keep the pre-upgrade exposition shape: the reviewed exporter now
+        # adds instrumentation-scope labels by default.
+        self._collector = _CustomCollector(disable_target_info=False, prefix="", scope_info_enabled=False, resource_attribute_filter=None)
+        self._registry = self.retained_registry
+        self._prefix = ""
         self.retained_collector = self._collector
         failures: list[BaseException] = []
         try:
@@ -367,7 +373,11 @@ class OwnedMeterProvider(MeterProvider):
         self.verify_registration_authority()
         consumer = _sdk_field(self, "_measurement_consumer")
         config = _sdk_field(self, "_sdk_config")
-        if not isinstance(consumer, SynchronousMeasurementConsumer) or _sdk_field(config, "metric_readers") is not self.owned_readers:
+        if (
+            not isinstance(consumer, SynchronousMeasurementConsumer)
+            or _sdk_field(self, "_metric_readers") is not self.owned_readers
+            or _sdk_field(consumer, "_sdk_config") is not config
+        ):
             raise TelemetryCustodyUnresolved("Telemetry provider reader/consumer binding malformed")
         with self.registration_lock:
             for reader in self.owned_readers:

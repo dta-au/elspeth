@@ -33,6 +33,7 @@ class TestGetSettings:
     def test_returns_settings_from_app_state(self) -> None:
         settings = WebSettings(
             composer_max_composition_turns=1,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=1,
             composer_timeout_seconds=1.0,
             composer_rate_limit_per_minute=1,

@@ -102,6 +102,7 @@ def _resume_without_recomputing(db: LandscapeDB, work_dir: str) -> None:
 
 
 @pytest.mark.parametrize("seam", ["after_flush_receipt", "first_continuation_leased", "second_continuation_leased"])
+@pytest.mark.timing_sensitive
 def test_committed_duplicate_decisions_survive_process_death_and_partial_release(tmp_path: Path, seam: str) -> None:
     control = build_pipeline(tmp_path / "control", _PIPELINE, _ROWS)
     assert run_pipeline(control).status is RunStatus.COMPLETED

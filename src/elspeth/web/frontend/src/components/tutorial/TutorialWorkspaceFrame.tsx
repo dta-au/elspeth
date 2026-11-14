@@ -12,6 +12,9 @@ interface TutorialWorkspaceFrameProps {
   header: TutorialStepHeaderProps;
   /** The authoring pane's content: the freeform ChatPanel, or the run's body. */
   children: ReactNode;
+  /** The authoring pane's title-bar heading. Defaults to ComposerWorkspace's
+   *  "Conversation" (the freeform build step); the run step names its body. */
+  authoringTitle?: string;
 }
 
 /**
@@ -34,12 +37,14 @@ export function TutorialWorkspaceFrame({
   ariaLabel,
   header,
   children,
+  authoringTitle,
 }: TutorialWorkspaceFrameProps): JSX.Element {
   return (
     <section className="tutorial-workspace-shell" aria-label={ariaLabel}>
       <TutorialStepHeader {...header} />
       <ComposerWorkspace
         authoring={children}
+        authoringTitle={authoringTitle}
         artifact={
           <ArtifactWorkspace
             checksValidationContent={<PipelineValidationSummary isTutorial />}

@@ -49,6 +49,7 @@ def pg_http_settings(session_url: str, landscape_url: str, data_dir: Path) -> We
         composer_advisor_prompt_guard=guard_settings,
         composer_prompt_guard_mode="required",
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_boot_probe_enabled=False,
         composer_timeout_seconds=85.0,

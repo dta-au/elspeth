@@ -164,17 +164,16 @@ async function assertScenario(
 }
 
 /**
- * The workspace's bottom bar row (elspeth-9c94a58500): ONE grid item spanning
- * both columns that paints the bottom rule and fill once, hosting the collapse
- * control in the authoring column and the action bar in the artifact column.
- * It replaced a mirrored band the authoring pane painted as a ::before to meet
- * the bar across the seam — first token-sized, then observer-sized
- * (elspeth-215c989bed, elspeth-97db9c22e5). Returned as boxes so a test can
- * state the row's contract directly: full width, exactly the bar's height,
- * and no second band anywhere.
+ * The content-sized bottom row belongs to the pipeline column. Authoring
+ * spans both rows and ends on the outer gutter; neither pane mirrors a band.
  */
 async function workspaceBottomRow(page: ComposerPage["page"]): Promise<{
   workspace: { left: number; right: number; bottom: number };
+  fold: number;
+  gutter: number;
+  rowBottomInset: number;
+  authoringBottom: number;
+  artifactBottom: number;
   row: { top: number; bottom: number; left: number; right: number; borderTop: number };
   bar: { top: number; bottom: number; height: number };
   collapse: { top: number; bottom: number } | null;
@@ -185,10 +184,12 @@ async function workspaceBottomRow(page: ComposerPage["page"]): Promise<{
     const row = document.querySelector('[data-workspace-part="action-bar"]');
     const bar = document.querySelector(".workspace-action-bar");
     const pane = document.querySelector(".workspace-authoring-pane");
+    const artifact = document.querySelector(".workspace-artifact-pane");
+    const separator = document.querySelector('[data-workspace-part="separator"]');
     const collapse = document.querySelector(
       'button[aria-label="Collapse authoring pane"]',
     );
-    if (workspace === null || row === null || bar === null || pane === null) {
+    if (workspace === null || row === null || bar === null || pane === null || artifact === null || separator === null) {
       return null;
     }
     const workspaceBox = workspace.getBoundingClientRect();
@@ -201,6 +202,11 @@ async function workspaceBottomRow(page: ComposerPage["page"]): Promise<{
         right: workspaceBox.right,
         bottom: workspaceBox.bottom,
       },
+      fold: separator.getBoundingClientRect().left,
+      gutter: Number.parseFloat(getComputedStyle(pane.parentElement!).paddingBottom),
+      rowBottomInset: Number.parseFloat(getComputedStyle(row).paddingBottom),
+      authoringBottom: pane.getBoundingClientRect().bottom,
+      artifactBottom: artifact.getBoundingClientRect().bottom,
       row: {
         top: rowBox.top,
         bottom: rowBox.bottom,
@@ -219,29 +225,27 @@ async function workspaceBottomRow(page: ComposerPage["page"]): Promise<{
 }
 
 /**
- * The bottom-row contract, stated once and asserted at every step of a
- * geometry change: the row spans the workspace's full width and sits on its
- * bottom edge; the action bar starts directly under the row's rule and ends on
- * the row's bottom (the row IS the bar's height — nothing above it, nothing
- * below it, so no rule that could have derived that height exists); the
- * collapse control is centred on the bar across the seam — which is where every
- * control in the bar sits, since the bar centres its groups and the completion
- * group centres its members (elspeth-b4e88f0f8c), so on a one-line bar the
- * control's top IS the chips' top; and the authoring pane paints no band of its
- * own. Centre-to-centre, not top-to-top: a reason-tall bar puts its controls
- * at (H - 44) / 2, and equal tops would fail there while it looked right.
+ * The row starts at the fold and sizes to its bar plus the outer bottom
+ * gutter. The authoring card extends through that row to the same gutter.
+ * The toggle stays centred against the content even when a reason wraps.
  */
 function expectBottomRowContract(
   edges: NonNullable<Awaited<ReturnType<typeof workspaceBottomRow>>>,
 ): void {
-  expect(Math.abs(edges.row.left - edges.workspace.left)).toBeLessThanOrEqual(1);
+  expect(Math.abs(edges.row.left - edges.fold)).toBeLessThanOrEqual(1);
   expect(Math.abs(edges.row.right - edges.workspace.right)).toBeLessThanOrEqual(1);
   expect(Math.abs(edges.row.bottom - edges.workspace.bottom)).toBeLessThanOrEqual(1);
-  expect(edges.row.borderTop).toBeGreaterThanOrEqual(1);
+  // ARGOnite: the row is transparent on the canvas with no top rule (design
+  // doc; workspaceChrome.test.ts pins the stylesheet side). The bar still
+  // starts at the row's top, which the next assertion keeps.
+  expect(edges.row.borderTop).toBe(0);
   expect(
     Math.abs(edges.row.top + edges.row.borderTop - edges.bar.top),
   ).toBeLessThanOrEqual(1);
-  expect(Math.abs(edges.row.bottom - edges.bar.bottom)).toBeLessThanOrEqual(1);
+  expect(Math.abs(edges.row.bottom - edges.rowBottomInset - edges.bar.bottom)).toBeLessThanOrEqual(1);
+  expect(edges.rowBottomInset).toBe(edges.gutter);
+  expect(Math.abs(edges.authoringBottom - (edges.workspace.bottom - edges.gutter))).toBeLessThanOrEqual(1);
+  expect(Math.abs(edges.authoringBottom - edges.artifactBottom - (edges.row.bottom - edges.row.top))).toBeLessThanOrEqual(1);
   expect(edges.collapse).not.toBeNull();
   const collapseCentre = (edges.collapse!.top + edges.collapse!.bottom) / 2;
   const barCentre = (edges.bar.top + edges.bar.bottom) / 2;
@@ -250,6 +254,43 @@ function expectBottomRowContract(
 }
 
 test.describe("Composer deterministic workspace geometry", () => {
+  for (const viewport of [{ width: 1280, height: 720 }, { width: 1440, height: 900 }]) {
+    test(`conversation reaches the bottom gutter and its toggle leads the pipeline bar at ${viewport.width}x${viewport.height}`, async ({ page }) => {
+      await page.setViewportSize(viewport);
+      const sessionId = await installWorkspaceScenario(page, "empty-freeform");
+      const composer = new ComposerPage(page);
+      try {
+        await composer.goto(sessionId);
+        await composer.waitForChatReady();
+        const edges = await workspaceBottomRow(page);
+        expect(edges).not.toBeNull();
+        expectBottomRowContract(edges!);
+        const toggle = composer.collapseAuthoring();
+        const share = page.getByRole("button", { name: "Share inspect link" });
+        const [toggleBox, shareBox] = await Promise.all([toggle.boundingBox(), share.boundingBox()]);
+        expect(toggleBox).not.toBeNull();
+        expect(shareBox).not.toBeNull();
+        expect(toggleBox!.x).toBeGreaterThanOrEqual(edges!.fold);
+        expect(toggleBox!.x + toggleBox!.width).toBeLessThanOrEqual(shareBox!.x);
+        expect(Math.abs(toggleBox!.y + toggleBox!.height / 2 - shareBox!.y - shareBox!.height / 2)).toBeLessThanOrEqual(1);
+
+        await toggle.click();
+        const restoreBox = await composer.restoreAuthoring().boundingBox();
+        const collapsedRow = await page.locator('[data-workspace-part="action-bar"]').boundingBox();
+        expect(restoreBox).not.toBeNull();
+        expect(collapsedRow).not.toBeNull();
+        expect(restoreBox!.width).toBe(toggleBox!.width);
+        expect(restoreBox!.height).toBe(toggleBox!.height);
+        expect(Math.abs(restoreBox!.x - collapsedRow!.x - (toggleBox!.x - edges!.row.left))).toBeLessThanOrEqual(1);
+        expect(Math.abs(restoreBox!.y - toggleBox!.y)).toBeLessThanOrEqual(1);
+        await expect(composer.authoringPane()).toBeHidden();
+        await expect(composer.workspace()).toHaveCSS("grid-template-columns", `0px ${viewport.width}px`);
+      } finally {
+        await deleteWorkspaceScenario(page, sessionId);
+      }
+    });
+  }
+
   for (const viewport of DESKTOP_VIEWPORTS) {
     for (const scenario of WORKSPACE_SCENARIOS) {
       if (
@@ -310,7 +351,20 @@ test.describe("Composer deterministic workspace geometry", () => {
       await composer.waitForChatReady();
       await expect(composer.workspace()).toHaveAttribute("data-layout-mode", "compact");
       await expect.poll(() => boxWidth(composer.authoringPane())).toBe(360);
-      await expect.poll(() => boxWidth(composer.artifactRegion())).toBe(620);
+      // Task B: remainder excludes two outer gutters and the shared gutter;
+      // neither card includes its slot padding. Keep the 360px card contract.
+      await expect.poll(() => boxWidth(composer.artifactRegion())).toBe(578);
+      const [authoring, artifact, separator] = await Promise.all([
+        composer.authoringPane().boundingBox(),
+        composer.artifactRegion().boundingBox(),
+        composer.separator().boundingBox(),
+      ]);
+      expect(authoring).not.toBeNull();
+      expect(artifact).not.toBeNull();
+      expect(separator).not.toBeNull();
+      expect(artifact!.x - (authoring!.x + authoring!.width)).toBe(14);
+      expect(separator!.x + separator!.width / 2).toBe(authoring!.x + authoring!.width + 7);
+      await expect(composer.separator()).toHaveAttribute("aria-valuenow", "360");
       await expectNoDocumentHorizontalOverflow(page);
     } finally {
       await deleteWorkspaceScenario(page, sessionId);
@@ -642,13 +696,8 @@ test.describe("Composer deterministic workspace geometry", () => {
   test("collapsed restore control shares the action bar's line and stays clickable", async ({
     page,
   }) => {
-    // Operator decision 2026-08-15: no reserved banner row, no visible
-    // "Authoring pane collapsed" text — the » icon joins the action bar's
-    // own line at the bottom-left. The elementFromPoint probe is the
-    // load-bearing assertion: the affordance and the opaque action bar now
-    // occupy the same pixels on a shared z rung, so a stacking regression
-    // paints the bar OVER the button and this probe (not the bounding box)
-    // is what catches it.
+    // The same in-flow toggle leads the bar in both states. Keep the centre
+    // hit probe as well as geometry so an overlapping surface cannot hide it.
     await page.setViewportSize({ width: 1280, height: 720 });
     const sessionId = await installWorkspaceScenario(page, "pending-acknowledgement");
     const composer = new ComposerPage(page);
@@ -669,11 +718,8 @@ test.describe("Composer deterministic workspace geometry", () => {
       // Same line: the button's vertical extent overlaps the action bar's.
       expect(restoreBox!.y).toBeLessThan(barBox!.y + barBox!.height);
       expect(restoreBox!.y + restoreBox!.height).toBeGreaterThan(barBox!.y);
-      // …but the bar's first control starts clear of the button (the bar
-      // reserves the slot via padding-left), not underneath it. With the
-      // status chips retired to the Checks tab, the completion group's
-      // first verb is the bar's first member.
-      const firstVerbBox = await composer.saveForReview().boundingBox();
+      // Share is the first workflow action, immediately beside the toggle.
+      const firstVerbBox = await page.getByRole("button", { name: "Share inspect link" }).boundingBox();
       expect(firstVerbBox).not.toBeNull();
       expect(firstVerbBox!.x).toBeGreaterThanOrEqual(
         restoreBox!.x + restoreBox!.width,
@@ -761,9 +807,8 @@ test.describe("Composer deterministic workspace geometry", () => {
      single control row — the defect family lives in the DEFAULT state of an
      unvalidated pipeline ("even blank ones"). This test exercises the gated
      state and pins the cross-element facts that remain: the reason line
-     shares the verbs' line, and the application's bottom rule is ONE row
-     spanning both columns with the collapse control registered against it
-     (elspeth-9c94a58500 / elspeth-27dc483116). Still asserted as RENDERED
+     shares the verbs' line, and the pipeline's content-sized bottom row
+     keeps the collapse control registered against it. Still asserted as RENDERED
      geometry, not by snapshot — --update-snapshots rewrites only failing
      files, and a sub-threshold offset passes silently. */
   test("a gated Run keeps the reason line and the bottom rule registered with the completion buttons", async ({
@@ -829,7 +874,7 @@ test.describe("Composer deterministic workspace geometry", () => {
       expect(barBox).not.toBeNull();
       expect(barBox!.height).toBeLessThanOrEqual(64);
 
-      // One bottom row, full width, the bar's exact height, the collapse
+      // One pipeline bottom row, the bar plus its bottom gutter, the collapse
       // control centred on the bar — which on this one-line bar is the
       // verbs' own top edge, asserted here as such so the registration is a
       // rendered fact and not only a consequence of the centring.
@@ -938,7 +983,7 @@ test.describe("Composer deterministic workspace geometry", () => {
      Getting a tall reason takes a real squeeze now: with the chips gone the
      1fr reason column reaches its 44ch cap at the default 360px pane, where
      this scenario's validation copy balances onto two lines (36px) — so the
-     authoring pane is widened to its 640px max via the separator's keyboard
+     authoring pane is widened to its 598px max via the separator's keyboard
      End, which shrinks the artifact column toward ARTIFACT_MIN and the
      reason column below the cap until the copy takes three lines and the
      group outgrows the buttons. 900 tall so the density regime is not also
@@ -967,10 +1012,14 @@ test.describe("Composer deterministic workspace geometry", () => {
         "Fix the validation errors shown in the Checks tab before running.",
       );
       await expect.poll(() => boxWidth(composer.authoringPane())).toBe(360);
-      // Apply the squeeze: pane to its 640 max, artifact column to its floor.
+      // Task B: 1280 - 640px artifact card - 42px slot gutters = 598px.
+      // Keep the artifact CARD at its floor when applying the squeeze.
       await composer.separator().focus();
       await composer.separator().press("End");
-      await expect.poll(() => boxWidth(composer.authoringPane())).toBe(640);
+      await expect.poll(() => boxWidth(composer.authoringPane())).toBe(598);
+      await expect.poll(() => boxWidth(composer.artifactRegion())).toBe(640);
+      await expect(composer.separator()).toHaveAttribute("aria-valuemax", "598");
+      await expect(composer.separator()).toHaveAttribute("aria-valuenow", "598");
 
       const [save, run, reasonBox, collapse] = await Promise.all([
         composer.saveForReview().boundingBox(),
@@ -1015,7 +1064,7 @@ test.describe("Composer deterministic workspace geometry", () => {
      by the three-line-reason row above, and this row keeps the relayout
      journey itself honest. 1024 is still desktop mode (narrow is 960) and
      the height stays 900 so the density regime is not also toggled. */
-  test("the bottom row is exactly the action bar's height through a resize and back, with the collapse control centred on it", async ({
+  test("the pipeline bottom row sizes to its actions and gutter through a resize and back, with the collapse control centred on it", async ({
     page,
   }) => {
     await page.setViewportSize({ width: 1600, height: 900 });

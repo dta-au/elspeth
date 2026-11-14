@@ -1,0 +1,31 @@
+# Landscape metadata repair review
+
+**Spec verdict: PASS. Quality verdict: APPROVE for this task.**
+
+No actionable findings at critical, high, medium, low, or nit severity. This verdict covers the frozen six-path repair, not combined-tree integration or broad suite clearance.
+
+Reviewed the requirements in `d1-landscape-metadata-brief.md` before the implementation report and full diff. Candidate: `/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata`, base `14fef5e5342ccbd79b4fdd69b276c20f77d66dc1`. Independently read and hashed the review artifact: 21,965 bytes, SHA-256 `6ce81d77ca5d8f06e01fab3294444b7c470d5fab9c1cbe17a5e1057e239b63b4`. The current production-file hashes match the report and updated source bindings.
+
+## Spec compliance
+
+- `database.py:80–97` adds one module-owned lock and one narrow helper. The lock is acquired before reading any original rule and held until restoration finishes. The snapshot retains each constraint object and its exact prior `_create_rule` object; the `finally` restores those identities on successful DDL and exception propagation, including pre-existing non-None rules. No blanket reset to None, exception translation, cloned metadata, or structural dispatch was introduced.
+- All four creation consumers delegate to that helper: `LandscapeDB._create_tables`, `LandscapeDB.in_memory`, `LandscapeDB.from_url(create_tables=True)`, and `init_landscape_schema`. Each forwards the original Engine or Connection; `checkfirst` remains true at the existing call sites and is forwarded by the helper. The Web initializer keeps the same Connection inside its existing target-locked transaction. Core gains no Web dependency.
+- The surrounding constructor, factory, and Web initializer retain their admission, identity, epoch, index, and validation ordering. Unsupported-store refusal remains before creation. Schema declarations, FK/CHECK definitions, indexes, triggers, stamp values, and current-schema validation are unchanged. The helper repairs shared metadata reuse; it grants no migration or repair-in-place authority.
+- The nine real PostgreSQL→SQLite cases cross all three applicable PostgreSQL entry points with SQLite constructor, factory, and in-memory creation. They call full schema validation and shape classification; file-backed SQLite stores are closed and reopened through ordinary admission. Rule identity assertions execute before cleanup, so the isolation cleanup cannot manufacture success.
+- The four focused unit cases exercise actual SQLAlchemy PostgreSQL deferred-constraint mutation, a pre-existing callable rule, successful and exceptional restoration, original exception identity, and concurrent initializers. The concurrency test pauses the first initializer after mutation, observes a real failed nonblocking acquisition by the second, and checks that the second DDL interval has not entered. It then checks schema validity and restored metadata after both success and deliberately failed predecessors. Timeouts bound failures; elapsed sleep is not the correctness oracle.
+
+## Quality and focused checks outside the diff
+
+The implementation follows the existing Sessions ownership pattern without introducing a shared framework or widening the production change. Reading the complete affected initialization functions confirms engine ownership and existing cleanup behavior remain unchanged. The full metadata-shape comparator reads declared constraints and reflected schemas rather than treating transient `_create_rule` values as schema truth. This keeps the regression's full-validation assertion independent of the restored annotation itself.
+
+The PostgreSQL test fixture provisions a fresh database per case, so the mixed-dialect tests actually exercise creation rather than merely hitting `checkfirst` against an existing schema. The existing concurrent Web initialization test now imports metadata from its owning schema module and retains its real `create_all` interception.
+
+Source-binding maintenance is narrow and justified. Only the two changed producer digests were updated; the existing database source dependency already includes the new helper. The proof still requires exact sources, source/AST agreement, the precise stamp node, and complete dependency membership. New negative controls reject removing the metadata lock and restoring every rule to None; existing target, EMPTY-only admission, scope, and completeness controls remain present. Comparison of the retained producer-identity records shows 17 sites on both sides: 15 database line changes of exactly +20 and one Web body fingerprint change, with all other fields unchanged. No writer grant, authority policy, scanner algorithm, or signature was changed. The separately recorded unresolved sites remain unresolved.
+
+## Evidence inspected and limits
+
+Read the retained commands, relevant failure output, terminal results, and recorded exit codes; did not rerun tests or scans. The red log records 13 failures: nine actual missing-FK schema failures, two failed exact-restoration assertions, and two failed lock-contention assertions. The corresponding green log records 13 passed with exit 0. The final command selects a real PostgreSQL Landscape construction before the mixed-dialect cases and complete seven-case admission module, then current/stale schema, concurrency, database, and narrow authority controls. Its terminal result is 190 passed in 65.91 seconds, process exit 0, freeze exit 0. The retained before/after manifest objects compare equal and contain 6,205 file entries. Both source-root provenance paths point inside the candidate.
+
+Scoped Ruff, formatting, and production mypy logs and their exit files show success. These results support this focused review; they do not certify the still-pending combined backend, PostgreSQL, whole-tree, or source-authority gates. The separate D1 test repair is not integrated here and has no changed-path overlap with this package. Parent-owned integration and broader verification remain required before a broader completion or merge claim.
+
+This review changed only this canonical lane review file. No tests, scans, Git commands, installs, source/index/HEAD edits, subagents, or Page edits were performed.

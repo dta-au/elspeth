@@ -84,7 +84,15 @@ export function TutorialTurn5AuditStory({
             </div>
             <div>
               <dt>LLM calls</dt>
-              <dd>{summary.llm_call_count}</dd>
+              <dd>
+                {summary.llm_call_count}
+                <p className="tutorial-audit-note">
+                  This includes one reachability check: before a run starts,
+                  ELSPETH makes one small call to each LLM the pipeline uses,
+                  and records it with the run. That is why the count is
+                  higher than the number of pages summarised.
+                </p>
+              </dd>
             </div>
             <div>
               <dt>Run</dt>

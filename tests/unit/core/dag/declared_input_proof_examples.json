@@ -199,6 +199,15 @@
   "examples/explicit_routing/settings.yaml": {
     "transform:enrich": []
   },
+  "examples/file_inject/settings.yaml": {
+    "transform:attach_guidance": []
+  },
+  "examples/file_inject/settings_all.yaml": {
+    "transform:attach_all": []
+  },
+  "examples/file_inject/settings_miss.yaml": {
+    "transform:attach_guidance": []
+  },
   "examples/fixed_web_search/settings_abn_page.yaml": {
     "transform:search_page": [
       "search_text"

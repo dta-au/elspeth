@@ -401,19 +401,35 @@ def _attributed_call_keys(call: ast.Call, *, prefix: str, site: str, depth: int,
     yield from _payload_keys(attribution, prefix)
 
 
-def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+def _splat_keys(
+    node: ast.AST,
+    site: str,
+    constants: dict[str, str],
+    resolve_name: _NameResolver | None,
+    *,
+    dict_forwarded: bool = False,
+) -> Iterator[str]:
     """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
-    producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
-    called helper, or — inside a handler — whatever the local resolves to. Anything else is a
-    refusal."""
+    producer), inline dicts and both conditional arms, attributed names/helpers, or — inside a
+    handler — whatever the local resolves to. Every unreadable alternative is a refusal."""
     if _is_own_data(node):
-        return iter(())
+        return
+    if isinstance(node, ast.Dict):
+        yield from _dict_literal_keys(node, "", site, constants, resolve_name, dict_forwarded=dict_forwarded)
+        return
+    if isinstance(node, ast.IfExp):
+        yield from _splat_keys(node.body, site, constants, resolve_name, dict_forwarded=dict_forwarded)
+        yield from _splat_keys(node.orelse, site, constants, resolve_name, dict_forwarded=dict_forwarded)
+        return
     if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
-        return iter(_SPLAT_KEYS[node.id])
+        yield from _SPLAT_KEYS[node.id]
+        return
     if isinstance(node, ast.Name) and resolve_name is not None:
-        return resolve_name(node)
+        yield from resolve_name(node)
+        return
     if isinstance(node, ast.Call):
-        return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+        yield from _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+        return
     raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
 
 
@@ -537,7 +553,7 @@ def _dict_literal_keys(
     assert isinstance(node, ast.Dict), f"{site}: expected a dict literal, got {type(node).__name__}"
     for key_node, value in zip(node.keys, node.values, strict=True):
         if key_node is None:
-            for key in _splat_keys(value, site, resolve_name):
+            for key in _splat_keys(value, site, constants, resolve_name, dict_forwarded=dict_forwarded):
                 yield f"{prefix}{key}"
             continue
         key = _key_of(key_node, constants, site)
@@ -1470,6 +1486,97 @@ def test_walker_refuses_shapes_it_cannot_read(source: str, message: str) -> None
     with pytest.raises(AssertionError, match=re.escape(message)):
         list(_dict_literal_keys(_initial_dict_assign(fn, "result", "probe"), "", "probe", constants))
         list(_subscript_assign_keys(fn, "result", "probe", constants))
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        ("{**{'inline': {'leaf': 1}}}", ["data.inline", "data.inline.leaf"]),
+        ("{**({'yes': 1} if flag else {})}", ["data.yes"]),
+        ("{**({} if flag else {'no': 1})}", ["data.no"]),
+        (
+            "{'first': 1, **({'yes': {'leaf': 1}} if flag else {'no': 1}), 'last': 1}",
+            ["data.first", "data.yes", "data.yes.leaf", "data.no", "data.last"],
+        ),
+        (
+            "{**({'yes': 1} if flag else {**({'nested': 1} if other else {'tail': 1})})}",
+            ["data.yes", "data.nested", "data.tail"],
+        ),
+    ],
+)
+def test_splat_walker_reads_inline_and_both_conditional_mappings(expression: str, expected: list[str]) -> None:
+    """Skipping either arm, nested mappings, or applying the outer prefix twice loses these paths."""
+    value = ast.parse(expression, mode="eval").body
+    assert list(_dict_literal_keys(value, "data.", "splat-probe", {})) == expected
+
+
+def test_conditional_splat_keeps_constant_local_and_helper_context() -> None:
+    """The conditional must not drop the dictionary reader's constants or handler-local resolver."""
+    source = """
+from elspeth.web.composer.tools._common import _SOURCE_BLOB_REF_OPTION_KEY
+MODULE_KEY = "module_key"
+
+def splat_context():
+    payload = {"local_key": {"inner": 1}}
+    return ToolResult(data={**({_SOURCE_BLOB_REF_OPTION_KEY: {MODULE_KEY: 1}, **payload} if flag else _blob_create_payload())})
+"""
+    assert _probe_data_keys(source, "splat_context") == [
+        "data.blob_ref",
+        "data.blob_ref.module_key",
+        "data.local_key",
+        "data.local_key.inner",
+        "data.blob_id",
+        "data.filename",
+        "data.mime_type",
+        "data.size_bytes",
+        "data.content_hash",
+        "data.originated_in",
+    ]
+
+
+@pytest.mark.parametrize("arm", ["body", "orelse"])
+@pytest.mark.parametrize(
+    ("unreadable", "reason"),
+    [
+        ("{dynamic_key: 1}", "non-literal key"),
+        ("missing", "** splat of Name("),
+        ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+        ("left | right", "** splat of BinOp("),
+        ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+        ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+    ],
+)
+def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+    """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+    body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+    value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+    with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+        list(_dict_literal_keys(value, "data.", "splat-probe", {}))
+
+
+@pytest.mark.parametrize("arm", ["body", "orelse"])
+@pytest.mark.parametrize("cast_arm", ["body", "orelse"])
+def test_conditional_splat_forwards_dict_wrapper_cast_refusal(arm: str, cast_arm: str) -> None:
+    """Losing dict_forwarded at either splat recursion permits a cast hidden in a nested value."""
+    body, orelse = ("cast(Payload, raw)", "{}") if cast_arm == "body" else ("{}", "cast(Payload, raw)")
+    unreadable = f"{{'nested': {body} if inner_flag else {orelse}}}"
+    body, orelse = (unreadable, "{}") if arm == "body" else ("{}", unreadable)
+    value = ast.parse(f"dict({{**({body} if flag else {orelse})}})", mode="eval").body
+    with pytest.raises(AssertionError, match="splat-probe: cast inside dict wrapper hides the value's shape"):
+        list(_nested_value_keys(value, "data.payload", "splat-probe", {}))
+
+
+def test_conditional_splat_does_not_treat_predicate_or_helper_inputs_as_payload_casts() -> None:
+    value = ast.parse("dict({**({'yes': 1} if cast(bool, flag) else _blob_create_payload(cast(Input, raw)))})", mode="eval").body
+    assert list(_nested_value_keys(value, "data.payload", "splat-probe", {})) == [
+        "data.payload.yes",
+        "data.payload.blob_id",
+        "data.payload.filename",
+        "data.payload.mime_type",
+        "data.payload.size_bytes",
+        "data.payload.content_hash",
+        "data.payload.originated_in",
+    ]
 
 
 def test_walker_recurses_through_tuple_of_dicts_and_nested_dicts() -> None:
@@ -2417,6 +2524,64 @@ def test_every_shipped_envelope_key_is_taught_or_fenced() -> None:
         "Teach each in skills/pipeline_composer.md ('Reading a tool result') or the tool's declaration "
         "description, or fence it with a checkable reason in tool_result_envelope_fence.json:\n" + "\n".join(lines)
     )
+
+
+def _diagnostic_conditional_splat(tree: ast.Module) -> tuple[ast.Call, ast.IfExp]:
+    """Locate the real legacy-diagnostic producer, rather than inventing a parallel payload."""
+    fn = _function(tree, "_execute_explain_validation_error")
+    found: list[tuple[ast.Call, ast.IfExp]] = []
+    for call in ast.walk(fn):
+        if not isinstance(call, ast.Call) or _call_name(call) != "ToolResult":
+            continue
+        payload = _data_expr(call)
+        if isinstance(payload, ast.Dict):
+            found.extend(
+                (call, value)
+                for key, value in zip(payload.keys, payload.values, strict=True)
+                if key is None and isinstance(value, ast.IfExp)
+            )
+    assert len(found) == 1, "probe premise: one conditional splat in the real diagnostic result"
+    return found[0]
+
+
+def test_real_diagnostic_conditional_splat_is_censused_at_its_constructor() -> None:
+    path = TOOLS_DIR / "generation.py"
+    call, splat = _diagnostic_conditional_splat(_parse(path))
+    assert isinstance(splat.body, ast.Dict) and isinstance(splat.orelse, ast.Dict)
+    rows = [row for row in _tool_data_sites([path]) if row.site == f"{_display(path)}:{call.lineno}"]
+    assert [(row.tool, row.key) for row in rows] == [
+        ("explain_validation_error", "data.error_text"),
+        ("explain_validation_error", "data.error_code"),
+        ("explain_validation_error", "data.explanation"),
+        ("explain_validation_error", "data.suggested_fix"),
+    ]
+
+
+@pytest.mark.parametrize("arm", ["body", "orelse"])
+@pytest.mark.parametrize("key", ["unexplained_diagnostic_splat_probe", "success"])
+def test_real_diagnostic_conditional_splat_rejects_planted_keys(monkeypatch: pytest.MonkeyPatch, arm: str, key: str) -> None:
+    """Skipping either actual branch must not hide an untaught key or nested envelope homonym."""
+    test_real_diagnostic_conditional_splat_is_censused_at_its_constructor()
+    gate = test_no_nested_key_is_a_homonym_of_an_envelope_key if key == "success" else test_every_shipped_envelope_key_is_taught_or_fenced
+    gate()
+    path = TOOLS_DIR / "generation.py"
+    original = _parse
+
+    def with_extra_key(parsed_path: Path) -> ast.Module:
+        tree = original(parsed_path)
+        if parsed_path == path:
+            _call, splat = _diagnostic_conditional_splat(tree)
+            payload = splat.body if arm == "body" else splat.orelse
+            assert isinstance(payload, ast.Dict), "probe premise: the actual conditional branch is a dict"
+            payload.keys.append(ast.Constant(value=key))
+            payload.values.append(ast.Constant(value=True))
+        return tree
+
+    monkeypatch.setattr(importlib.import_module(__name__), "_parse", with_extra_key)
+    call, _splat = _diagnostic_conditional_splat(original(path))
+    assert any(row.key == f"data.{key}" and row.site == f"{_display(path)}:{call.lineno}" for row in _tool_data_sites([path]))
+    with pytest.raises(AssertionError, match=rf"data\.{key}"):
+        gate()
 
 
 def test_no_nested_key_is_a_homonym_of_an_envelope_key() -> None:
@@ -3798,8 +3963,9 @@ def test_prevalidation_rejected_result_states_the_unapplied_envelope_on_every_fi
     the one field that stays the candidate's — it is the rejection the model
     repairs from, and the skill says so.
 
-    Read from the AST because what is pinned is that the ``replace()`` passes
-    each of them at all; the resulting WIRE is pinned behaviourally by
+    Read from the AST because what is pinned is that the real unapplied
+    admission helper restates each field, and that the rejected candidate
+    actually goes through it with the refused disposition. The WIRE is pinned by
     ``tests/integration/web/composer/test_freeform_proposal_prevalidation.py::
     test_final_profile_rejection_is_unapplied_audited_and_repairable``, which
     needs a candidate whose version differs and only the harness builds one.
@@ -3812,10 +3978,30 @@ def test_prevalidation_rejected_result_states_the_unapplied_envelope_on_every_fi
         if isinstance(node, ast.Call) and _call_name(node) == "replace" and any(kw.arg == "data" for kw in node.keywords)
     ]
     assert len(replaces) == 1, "premise: run_tool_batch re-datas exactly one result"
-    restated = {kw.arg: kw.value for kw in replaces[0].keywords}
-    assert set(restated) == {"data", "updated_state", "prior_validation", "affected_nodes"}, (
-        "the rejected result must restate every envelope field that describes a change, and nothing else"
-    )
+    assert {kw.arg for kw in replaces[0].keywords} == {"data"}
+    admissions = [
+        node
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call) and _call_name(node) == "_unapplied_admission" and node.args[0] is replaces[0]
+    ]
+    assert len(admissions) == 1, "the rejection data must pass through unapplied admission"
+    assert isinstance(admissions[0].args[1], ast.Constant) and admissions[0].args[1].value == "refused"
+    state_argument = next(kw.value for kw in admissions[0].keywords if kw.arg == "state")
+    assert isinstance(state_argument, ast.Name) and state_argument.id == "state"
+
+    helper = _function(tree, "_unapplied_admission")
+    normalizations = [node for node in ast.walk(helper) if isinstance(node, ast.Call) and _call_name(node) == "replace"]
+    assert len(normalizations) == 1, "unapplied admission must normalize the actual result once"
+    restated = {kw.arg: kw.value for kw in normalizations[0].keywords}
+    assert set(restated) == {
+        "updated_state",
+        "validation",
+        "runtime_preflight",
+        "prior_validation",
+        "affected_nodes",
+        "applied_component",
+        "post_call_hints",
+    }, "unapplied admission must restate every change field and preserve standing observations"
     updated = restated["updated_state"]
     assert isinstance(updated, ast.Name) and updated.id == "state", "the envelope's version must be the unapplied state's"
     prior = restated["prior_validation"]
@@ -3824,6 +4010,28 @@ def test_prevalidation_rejected_result_states_the_unapplied_envelope_on_every_fi
     )
     affected = restated["affected_nodes"]
     assert isinstance(affected, ast.Tuple) and not affected.elts, "nothing was applied, so no component was touched"
+    echo = restated["applied_component"]
+    assert isinstance(echo, ast.Constant) and echo.value is None, "nothing was applied, so no applied component may be echoed"
+
+
+@pytest.mark.parametrize("field", ("updated_state", "prior_validation", "affected_nodes", "applied_component"))
+def test_unapplied_admission_gate_rejects_a_missing_change_field(monkeypatch: pytest.MonkeyPatch, field: str) -> None:
+    test_prevalidation_rejected_result_states_the_unapplied_envelope_on_every_field()
+    original = _parse
+
+    def omit_change_field(path: Path) -> ast.Module:
+        tree = original(path)
+        if path == TOOL_BATCH:
+            helper = _function(tree, "_unapplied_admission")
+            normalization = next(node for node in ast.walk(helper) if isinstance(node, ast.Call) and _call_name(node) == "replace")
+            normalization.keywords = [kw for kw in normalization.keywords if kw.arg != field]
+        return tree
+
+    monkeypatch.setitem(
+        test_prevalidation_rejected_result_states_the_unapplied_envelope_on_every_field.__globals__, "_parse", omit_change_field
+    )
+    with pytest.raises(AssertionError, match="unapplied admission must restate every change field"):
+        test_prevalidation_rejected_result_states_the_unapplied_envelope_on_every_field()
 
 
 def test_is_taught_requires_the_quoted_form() -> None:

@@ -8,6 +8,7 @@ from typing import Protocol
 from uuid import UUID
 
 from elspeth.contracts.blobs import BlobRecord
+from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer.state import CompositionState
@@ -46,6 +47,7 @@ class _ValidationRunImpl(Protocol):
         blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
         allow_pending_interpretation_placeholders: bool = False,
         session_id: str | None = None,
+        mcp_root_authority: McpConfiguredRootAuthority | None = None,
         dependencies: ValidationDependencies,
     ) -> ValidationResult: ...
 
@@ -90,6 +92,7 @@ class ValidationPipeline:
         blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
         allow_pending_interpretation_placeholders: bool = False,
         session_id: str | None = None,
+        mcp_root_authority: McpConfiguredRootAuthority | None = None,
     ) -> ValidationResult:
         """Delegate to the injected implementation, converting terminations.
 
@@ -116,6 +119,7 @@ class ValidationPipeline:
                 blob_get_content=blob_get_content,
                 allow_pending_interpretation_placeholders=allow_pending_interpretation_placeholders,
                 session_id=session_id,
+                mcp_root_authority=mcp_root_authority,
                 dependencies=self.dependencies,
             )
         except PhaseTermination as termination:

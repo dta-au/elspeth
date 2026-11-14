@@ -1,6 +1,6 @@
 [project]
 name = "elspeth"
-version = "0.8.10"
+version = "0.8.13"
 description = "Auditable Sense/Decide/Act pipelines for high-reliability systems"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -61,9 +61,9 @@ dependencies = [
     "networkx>=3.6,<4",  # Graph algorithms
 
     # Observability
-    "opentelemetry-api>=1.40,<2",  # OpenTelemetry tracing API
-    "opentelemetry-sdk>=1.40,<2",  # OpenTelemetry SDK
-    "opentelemetry-exporter-otlp>=1.40,<2",  # OTLP exporter
+    "opentelemetry-api>=1.45.2,<2",  # CVE-2026-114603, CVE-2026-126360
+    "opentelemetry-sdk==1.45.2",  # Operator telemetry custody verifies these SDK internals
+    "opentelemetry-exporter-otlp==1.45.2",  # Keep the custody-reviewed exporter implementation
 
     # Structured logging
     "structlog>=25.5,<26",  # Structured logging
@@ -185,16 +185,16 @@ webui = [
     "aiohttp>=3.14.4,<4",  # Same security floor as the independently installable llm extra
     "multidict>=6.9.1,<7",  # Same security floor as the independently installable llm extra
     # Prometheus metrics exposition endpoint (B1-r3 MeterProvider precondition)
-    "opentelemetry-exporter-prometheus>=0.61b0,<0.62",
+    "opentelemetry-exporter-prometheus==0.66b1",  # Operator telemetry custody verifies these SDK internals
     "prometheus_client>=0.21,<1",
 ]
 
 tracing-langfuse = [
     # Tier 2: Langfuse tracing for LLM plugins
-    # v3 built on OpenTelemetry standards - uses context managers for lifecycle
+    # v5 built on OpenTelemetry standards - uses context managers for lifecycle
     # Thread-safe: uses OTEL thread-local context propagation
     # Ref: https://langfuse.com/docs/observability/sdk/python/upgrade-path
-    "langfuse>=3.14,<4",  # Langfuse SDK v3
+    "langfuse>=5.2,<6",  # SDK v5 permits packaging 26 for patched virtualenv
 ]
 
 tracing = [
@@ -250,7 +250,7 @@ all = [
     "mcp>=1.27,<2",
     # tracing dependencies
     "azure-monitor-opentelemetry>=1.8,<2",
-    "langfuse>=3.14,<4",
+    "langfuse>=5.2,<6",
     # security dependencies
     "sqlcipher3>=0.6.2,<1",
     # webui dependencies
@@ -261,7 +261,7 @@ all = [
     "websockets>=14.2,<15",
     "httpx>=0.28,<1",
     "bcrypt>=4.3,<5",
-    "opentelemetry-exporter-prometheus>=0.61b0,<0.62",
+    "opentelemetry-exporter-prometheus==0.66b1",
     "prometheus_client>=0.21,<1",
 ]
 
@@ -293,6 +293,7 @@ constraint-dependencies = [
     "typer-slim>=0.24.0",
     "oauthlib>=4,<5",
     "PyJWT>=2.15,<3",
+    "virtualenv>=21.14.9",  # Security fixes for environment creation and discovery
 ]
 
 [tool.uv.sources]
@@ -483,8 +484,8 @@ addopts = [
     "-ra",
     "--strict-markers",
     "--strict-config",
-    "-m", "not slow and not stress and not performance and not testcontainer and not live_provider",  # Remote-provider evidence is separately operator-gated
-    # The default selection IS the pre-merge gate (AGENTS.md), so it has to be
+    "-m", "not slow and not stress and not performance and not testcontainer and not live_provider and not timing_sensitive",  # Remote-provider evidence is separately operator-gated
+    # The default selection is the ordinary pre-merge gate (AGENTS.md), so it has to be
     # a run somebody can actually sit through. The marker expression above
     # selects 48,675 of the 49,121 collected tests (measured 2026-09-08 via
     # `pytest tests/ --collect-only -q`); serial, that is many hours. At -n 12
@@ -506,6 +507,7 @@ markers = [
     "composer_llm_eval: characterization/replay tests for the 2026-04-28 composer LLM evaluation scenarios",
     "chaosllm: Configure ChaosLLM server for the test (preset=None, **kwargs)",
     "testcontainer: marks tests requiring Docker via testcontainers-python (deselect with '-m \"not testcontainer\"')",
+    "timing_sensitive: tests that assert against a wall-clock deadline or spawn and kill real processes, fail when the host is busy while passing alone; run serially in their own CI job or locally with 'pytest tests/ -m timing_sensitive -n 0'",
     "fingerprint_baseline: Plan A baseline capture/verify across all elspeth-lints rules",
     "live_aws: marks opt-in tests that call live AWS services with operator-approved fixtures",
     "live_provider: marks protected tests that cross a real remote-provider boundary",

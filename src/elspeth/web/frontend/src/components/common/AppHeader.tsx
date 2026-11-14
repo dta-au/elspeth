@@ -35,7 +35,10 @@ export function AppHeader({
   return (
     <header className="app-header" role="banner">
       <div className="app-header-left">
-        <WordMark as="span" />
+        {/* ARGOnite: navy chip, yellow wordmark (header.css .app-header-brand). */}
+        <span className="app-header-brand">
+          <WordMark as="span" style={{ color: "var(--color-brand-yellow)" }} />
+        </span>
         <HeaderSessionSwitcher />
         <span className="app-header-separator" aria-hidden="true" />
         <HeaderVersionSelector />

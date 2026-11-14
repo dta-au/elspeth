@@ -64,6 +64,7 @@ vi.mock("@xyflow/react", () => ({
           <div
             key={n.id}
             data-testid={`node-${n.id}`}
+            className={n.className}
             style={n.style}
             // jsdom cannot compute a var()-bearing shorthand, and React Flow's
             // real geometry never runs here, so the node's style OBJECT is the
@@ -270,6 +271,15 @@ function makeState(overrides: Partial<CompositionState> = {}): CompositionState 
   };
 }
 
+// ARGOnite: the Wiring summary splits its count into a pill span (the
+// parentheses stay in the text, visually hidden), so getByText's own-text
+// match can no longer see "Wiring (n)" as one string. Match the <summary> by
+// its whole text content instead — the same text the user and AT receive.
+function wiringSummary(count: number) {
+  return (_content: string, element: Element | null) =>
+    element?.tagName === "SUMMARY" && element.textContent === `Wiring (${count})`;
+}
+
 it("toggles quarantine routes with the keyboard, retains shared sinks and restores the complete presentation", async () => {
   resetStore(useSessionStore);
   resetStore(useExecutionStore);
@@ -300,17 +310,26 @@ it("toggles quarantine routes with the keyboard, retains shared sinks and restor
     id: edge.getAttribute("data-testid"), source: edge.getAttribute("data-edge-source"), target: edge.getAttribute("data-edge-target"),
     sourceHandle: edge.getAttribute("data-source-handle"), targetHandle: edge.getAttribute("data-target-handle"),
   }));
-  const toggle = screen.getByRole("button", { name: "Hide quarantine and discard routes" });
-  expect(toggle).toHaveAttribute("aria-pressed", "true");
-  await user.click(screen.getByText("Wiring (4)"));
+  // ARGOnite: the Hide/Show aria-pressed button became a switch with one fixed
+  // label (design doc "Controls"); checked means the routes are shown.
+  const toggle = screen.getByRole("switch", { name: "Show quarantine and discard routes" });
+  expect(toggle).toBeChecked();
+  expect(screen.getByTestId("node-quarantine")).toBeInTheDocument();
+  await user.click(screen.getByText(wiringSummary(4)));
   const routeList = screen.getByRole("list", { name: "Inspect pipeline routes" });
   await user.click(within(routeList).getAllByRole("button", { name: /\(error\)/ })[0]);
   expect(screen.getByText(/Selected route:/)).toBeInTheDocument();
+  // ARGOnite: a selected route's endpoint carries the forced-colours class too.
+  expect(screen.getByTestId("node-quarantine")).toHaveClass("graph-node--selected");
+  // ARGOnite: and the same gap ring as a selected node (final review I5).
+  expect(JSON.parse(screen.getByTestId("node-quarantine").getAttribute("data-node-style") ?? "null").boxShadow).toBe(
+    "0 0 0 2px var(--color-well), 0 0 0 4px var(--color-selected-ring), var(--shadow-card)",
+  );
   await user.click(screen.getByRole("button", { name: /^sink: quarantine/ }));
   expect(useSessionStore.getState().selectedNodeId).toBe("quarantine");
   toggle.focus();
   await user.keyboard(" ");
-  expect(toggle).toHaveAttribute("aria-pressed", "false");
+  expect(toggle).not.toBeChecked();
   expect(toggle).toHaveAccessibleName("Show quarantine and discard routes");
   expect(layoutInputs()).toEqual({
     nodes: ["shared", "source", "step"],
@@ -325,8 +344,10 @@ it("toggles quarantine routes with the keyboard, retains shared sinks and restor
   expect(useSessionStore.getState().selectedNodeId).toBeNull();
   expect(screen.queryByText(/Selected route:/)).not.toBeInTheDocument();
   expect(screen.getByRole("list", { name: "Pipeline branch connections" })).not.toHaveTextContent("(error)");
-  await user.keyboard("{Enter}");
-  expect(toggle).toHaveAccessibleName("Hide quarantine and discard routes");
+  // ARGOnite: a checkbox switch toggles on Space, not Enter (native semantics).
+  await user.keyboard(" ");
+  expect(toggle).toBeChecked();
+  expect(toggle).toHaveAccessibleName("Show quarantine and discard routes");
   expect(layoutInputs()).toEqual(originalLayout);
   expect(screen.getByTestId("node-quarantine")).toBeInTheDocument();
   expect([...container.querySelectorAll("[data-edge-source]")].map((edge) => ({
@@ -335,9 +356,13 @@ it("toggles quarantine routes with the keyboard, retains shared sinks and restor
   }))).toEqual(originalEdges);
   expect(JSON.stringify(useSessionStore.getState().compositionState)).toBe(before);
   await user.click(toggle);
+  expect(toggle).not.toBeChecked();
+  expect(screen.queryByTestId("node-quarantine")).not.toBeInTheDocument();
   unmount();
   render(<GraphView />);
-  expect(screen.getByRole("button", { name: "Hide quarantine and discard routes" })).toHaveAttribute("aria-pressed", "true");
+  // ARGOnite: a fresh mount shows the routes again, so the switch is checked.
+  expect(screen.getByRole("switch", { name: "Show quarantine and discard routes" })).toBeChecked();
+  expect(screen.getByTestId("node-quarantine")).toBeInTheDocument();
 });
 
 it("keeps the toggle available when every node of an incomplete sink-only graph is hidden", async () => {
@@ -355,11 +380,16 @@ it("keeps the toggle available when every node of an incomplete sink-only graph 
   render(<GraphView />);
   expect(screen.getByTestId("node-first")).toBeInTheDocument();
   expect(screen.getByTestId("node-second")).toBeInTheDocument();
-  await user.click(screen.getByRole("button", { name: "Hide quarantine and discard routes" }));
+  // ARGOnite: one switch, one label; checked iff the routes are shown.
+  const toggle = screen.getByRole("switch", { name: "Show quarantine and discard routes" });
+  expect(toggle).toBeChecked();
+  await user.click(toggle);
+  expect(toggle).not.toBeChecked();
   expect(screen.queryByTestId("node-first")).not.toBeInTheDocument();
   expect(screen.queryByTestId("node-second")).not.toBeInTheDocument();
   expect(screen.getByTestId("react-flow")).toBeInTheDocument();
-  await user.click(screen.getByRole("button", { name: "Show quarantine and discard routes" }));
+  await user.click(toggle);
+  expect(toggle).toBeChecked();
   expect(screen.getByTestId("node-first")).toBeInTheDocument();
   expect(screen.getByTestId("node-second")).toBeInTheDocument();
   expect(JSON.stringify(useSessionStore.getState().compositionState)).toBe(before);
@@ -459,7 +489,7 @@ describe("GraphView", () => {
     });
 
     render(<GraphView />);
-    const summary = screen.getByText("Wiring (3)");
+    const summary = screen.getByText(wiringSummary(3));
     const policies = summary.closest("details");
     expect(policies).not.toHaveAttribute("open");
     await userEvent.setup().click(summary);
@@ -517,13 +547,13 @@ describe("GraphView", () => {
     });
 
     render(<GraphView />);
-    const wiring = screen.getByText("Wiring (1)").closest("details") as HTMLDetailsElement;
+    const wiring = screen.getByText(wiringSummary(1)).closest("details") as HTMLDetailsElement;
     expect(screen.queryByText(/^Approvals/)).not.toBeInTheDocument();
     expect(screen.queryByText(approved.accepted_value!)).not.toBeInTheDocument();
     expect(wiring.open).toBe(false);
-    await user.click(screen.getByText("Wiring (1)"));
+    await user.click(screen.getByText(wiringSummary(1)));
     expect(wiring.open).toBe(true);
-    await user.click(screen.getByText("Wiring (1)"));
+    await user.click(screen.getByText(wiringSummary(1)));
     expect(wiring.open).toBe(false);
   });
 
@@ -539,7 +569,7 @@ describe("GraphView", () => {
     useInterpretationEventsStore.setState({ resolvedBySession: { "session-1": [malformed] } });
     render(<GraphView />);
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-    expect(screen.getByText("Wiring (1)")).toBeInTheDocument();
+    expect(screen.getByText(wiringSummary(1))).toBeInTheDocument();
   });
 
   it("renders a pending proposal pill when proposal affects graph", () => {
@@ -949,13 +979,19 @@ describe("GraphView", () => {
     // facts, and they stay — it is the two SELECTOR assertions that used to
     // sit alongside them (`:root .react-flow.react-flow` and the light block's
     // selector) that were removed: they pinned a scope that reached nothing.
-    expect(appCss).toContain("--xy-background-color-default: var(--color-bg);");
+    // ARGOnite: the flow is transparent so the canvas's recessed well (fill
+    // and inset shadow) shows through, instead of painting the page bg.
+    expect(appCss).toContain("--xy-background-color-default: transparent;");
+    expect(appCss).toMatch(/\.graph-view-canvas\s*\{[^}]*background-color:\s*var\(--color-well\)/);
+    // ARGOnite: ordinary edges read the graph-edge role (3:1 on the well).
+    expect(appCss).toContain("--xy-edge-stroke-default: var(--color-graph-edge);");
     expect(appCss).toContain("--xy-controls-button-background-color-default: var(--color-surface-elevated);");
     expect(appCss).toContain("--xy-controls-button-background-color-hover-default: var(--color-surface-raised);");
     expect(appCss).toContain("--xy-controls-button-color-default: var(--color-text);");
     expect(appCss).toContain("--xy-minimap-background-color-default: var(--color-surface);");
     expect(appCss).toContain("--xy-minimap-mask-stroke-color-default: var(--color-border-strong);");
-    expect(appCss).toContain("--xy-edge-stroke-selected-default: var(--color-focus-ring);");
+    expect(appCss).toContain("--xy-edge-stroke-selected-default: var(--color-selected-ring);");
+    expect(appCss).not.toContain("--xy-edge-stroke-selected-default: var(--color-focus-ring);");
     expect(appCss).toMatch(
       /\[data-theme="light"\][\s\S]*--xy-minimap-mask-background-color-default:\s*rgba\(15, 45, 53, 0\.12\);/,
     );
@@ -3593,8 +3629,10 @@ describe("GraphView", () => {
       validatedState();
       render(<GraphView />);
 
+      // ARGOnite: the resting edge reads the node-border role (3:1 on the
+      // well, design doc "Colour and boundary fixes"), not border-strong.
       expect(styleOf("plain").border).toBe(
-        "1px solid var(--color-border-strong)",
+        "1px solid var(--color-node-border)",
       );
       expect(styleOf("needs_fix").border).toBe("1px solid var(--color-error)");
       expect(styleOf("needs_review").border).toBe(
@@ -3606,12 +3644,14 @@ describe("GraphView", () => {
       validatedState();
       render(<GraphView />);
 
-      expect(styleOf("plain").boxShadow).toBeUndefined();
+      // ARGOnite: every node card is raised on --shadow-card; the state ring
+      // is the FIRST shadow layer so it paints over the soft drop shadow.
+      expect(styleOf("plain").boxShadow).toBe("var(--shadow-card)");
       expect(styleOf("needs_fix").boxShadow).toBe(
-        "0 0 0 1px var(--color-error)",
+        "0 0 0 1px var(--color-error), var(--shadow-card)",
       );
       expect(styleOf("needs_review").boxShadow).toBe(
-        "0 0 0 1px var(--color-warning)",
+        "0 0 0 1px var(--color-warning), var(--shadow-card)",
       );
     });
 
@@ -3630,13 +3670,52 @@ describe("GraphView", () => {
       expect(styleOf("classify").border).toBe(
         "1px solid var(--color-selected-ring)",
       );
+      // ARGOnite: a solid 2px selected ring set off by a 2px gap in the well
+      // colour (final review I5). Selected and valid greens are close in
+      // tone, so the gap and the 4px reach, not hue, mark selection.
       expect(styleOf("classify").boxShadow).toBe(
-        "0 0 0 3px var(--color-selected-ring)",
+        "0 0 0 2px var(--color-well), 0 0 0 4px var(--color-selected-ring), var(--shadow-card)",
       );
+      expect(styleOf("other").boxShadow).toBe("var(--shadow-card)");
+      // ARGOnite: forced colours drops the ring, so selection also carries a
+      // class that themes.css turns into a Highlight outline.
+      expect(screen.getByTestId("node-classify")).toHaveClass(
+        "graph-node--selected",
+      );
+      expect(screen.getByTestId("node-other")).not.toHaveClass(
+        "graph-node--selected",
+      );
+      expect(styleOf("classify").borderRadius).toBe("var(--radius-node)");
       // The whole point: selecting a node cannot move anything inside it, so
       // its border is byte-identical in width to its unselected neighbour's.
       expect(styleOf("classify").border.split(" ")[0]).toBe(
         styleOf("other").border.split(" ")[0],
+      );
+    });
+
+    it("keeps the validation colour on a selected node's border", () => {
+      // The selected green is close to the valid green, so a selected error
+      // node whose border took the selection colour would read as valid.
+      // Selection is the gap ring; the border goes on saying what validation
+      // found.
+      validatedState();
+      useSessionStore.setState({ selectedNodeId: "needs_fix" } as never);
+      const { unmount } = render(<GraphView />);
+
+      expect(styleOf("needs_fix").border).toBe("1px solid var(--color-error)");
+      expect(styleOf("needs_fix").boxShadow).toBe(
+        "0 0 0 2px var(--color-well), 0 0 0 4px var(--color-selected-ring), var(--shadow-card)",
+      );
+      unmount();
+
+      useSessionStore.setState({ selectedNodeId: "needs_review" } as never);
+      render(<GraphView />);
+      expect(styleOf("needs_review").border).toBe(
+        "1px solid var(--color-warning)",
+      );
+      // The unselected sibling is back on its own 1px validation ring.
+      expect(styleOf("needs_fix").boxShadow).toBe(
+        "0 0 0 1px var(--color-error), var(--shadow-card)",
       );
     });
   });
@@ -3780,14 +3859,15 @@ describe("GraphView", () => {
       ]
         .map((edge) => markerOf(edge).color)
         .sort();
+      // ARGOnite: ordinary edges and their arrowheads read --color-graph-edge.
       expect(laneMarkerColors).toEqual(
-        ["var(--color-error)", "var(--color-text-muted)"].sort(),
+        ["var(--color-error)", "var(--color-graph-edge)"].sort(),
       );
 
       const lone = container.querySelector(
         '[data-edge-source="b"][data-edge-target="c"]',
       );
-      expect(markerOf(lone!).color).toBe("var(--color-text-muted)");
+      expect(markerOf(lone!).color).toBe("var(--color-graph-edge)");
     });
   });
 

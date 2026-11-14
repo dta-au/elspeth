@@ -232,7 +232,7 @@ WRAPPER = "settle_pipeline_proposal_under_compose_lock"
 INTERNAL = "_settle_pipeline_proposal_under_compose_lock"
 GRAMMARS = {
     WRAPPER: "7c7465be32aeab7821c08a1a511541f23bb394aa39cd756b2f2215cda3cde599",
-    INTERNAL: "07455a11c3149e3fea7dd0bd23d8e6892a6f0f8d4015e980e37ebffcb6cc8a7d",
+    INTERNAL: "41a7539d1c621b6fb72c02f1a0735049c330ceb7e1c8ac4b2ffe7727a6d42ea8",
 }
 PRODUCER_GRAMMARS = {
     "begin_proposal_child": "12e18ac0cd24c08443b2170d4961359f3dfc0933dfe4f15661d1592a3f6b0534",

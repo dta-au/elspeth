@@ -170,6 +170,7 @@ class TestRetryableErrorHandling:
         assert results[0].result.reason is not None
         assert "401" in results[0].result.reason["error"]
 
+    @pytest.mark.timing_sensitive
     def test_retryable_error_timeout_after_max_retry_seconds(
         self,
         pool_config: PoolConfig,
@@ -447,6 +448,7 @@ class TestCapacityErrorShutdownPath:
 class TestFatalBatchFailureHandling:
     """Unexpected worker bugs should fail fast instead of waiting on retry loops."""
 
+    @pytest.mark.timing_sensitive
     def test_fatal_worker_exception_is_not_blocked_by_sibling_retry_loop(self) -> None:
         config = PoolConfig(
             pool_size=2,
@@ -492,6 +494,7 @@ class TestFatalBatchFailureHandling:
 class TestStrictRetryBudget:
     """Retry timeout should be a hard wall-clock boundary for retry work."""
 
+    @pytest.mark.timing_sensitive
     def test_retry_timeout_prevents_post_deadline_success_dispatch(self) -> None:
         config = PoolConfig(
             pool_size=1,

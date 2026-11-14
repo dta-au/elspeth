@@ -357,6 +357,7 @@ class TestLockAtBegin:
             thread.join(timeout=10)
             db.close()
 
+    @pytest.mark.timing_sensitive
     def test_deferred_read_then_write_hazard_is_what_immediate_eliminates(self, tmp_path: Path) -> None:
         """Document the hazard (raw DEFERRED control): BUSY_SNAPSHOT is
         immediate and non-retryable — busy_timeout does NOT apply to it.

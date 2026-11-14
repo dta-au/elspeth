@@ -136,6 +136,7 @@ class TestSharedBatchAdapter:
 
         thread.join()
 
+    @pytest.mark.timing_sensitive
     def test_emit_before_wait(self) -> None:
         """Test that emit() before wait() still works correctly.
 

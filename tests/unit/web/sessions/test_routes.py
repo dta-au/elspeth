@@ -55,6 +55,7 @@ from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
+from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.control_messages import advisor_signoff_withheld_control_envelope, anti_anchor_control_envelope
 from elspeth.web.composer.diagnostic_evidence import (
     DIAGNOSTIC_EVIDENCE_KIND,
@@ -684,10 +685,11 @@ class _BlockingRecordingComposer:
         recovery_context=None,
         retained_operation_context: RetainedOperationContext | None = None,
         advisor_history: AdvisorTranscriptHistory | None = None,
+        context_budget_history: object | None = None,
     ) -> ComposerResult:
         del state, session_id, current_state_id, user_id, progress, user_message_id
         del session_operation_context, completion_gates, budget_seconds, required_work, provider_owner, recovery_context
-        del retained_operation_context, advisor_history
+        del retained_operation_context, advisor_history, context_budget_history
 
         self.calls.append(
             {
@@ -733,9 +735,10 @@ class _ProgressAwareComposer:
         recovery_context=None,
         retained_operation_context: RetainedOperationContext | None = None,
         advisor_history: AdvisorTranscriptHistory | None = None,
+        context_budget_history: object | None = None,
     ) -> ComposerResult:
         del message, chat_messages, session_id, current_state_id, user_id, user_message_id, completion_gates, budget_seconds
-        del required_work, provider_owner, recovery_context, retained_operation_context, advisor_history
+        del required_work, provider_owner, recovery_context, retained_operation_context, advisor_history, context_budget_history
         assert session_operation_context is not None
         assert progress is not None, "session routes must pass a composer progress sink"
         self.progress_sink_seen = True
@@ -917,6 +920,7 @@ def _make_app(
         data_dir=tmp_path,
         max_upload_bytes=max_upload_bytes,
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
@@ -4834,6 +4838,7 @@ class TestIDORProtection:
             app.state.settings = WebSettings(
                 data_dir=tmp_path,
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -5102,6 +5107,7 @@ class TestSendMessageStateIdValidation:
             app.state.settings = WebSettings(
                 data_dir=tmp_path,
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -6154,7 +6160,7 @@ class TestMessageRoutes:
         assert review["saved_effects"]["net_changed"] is False
         advisor_context = json.dumps(provider_requests[1]["messages"])
         assert all(canary in advisor_context for canary in canaries.values())
-        transcript_prefix = "Complete available same-session visible conversation evidence."
+        transcript_prefix = "Available same-session visible conversation evidence;"
         hatch_transcript = next(
             message["content"]
             for message in provider_requests[1]["messages"]
@@ -7704,6 +7710,89 @@ class TestRecomposeConvergencePartialState:
         detail = response.json()["detail"]
         assert detail["reason"] == "convergence_composition_budget"
         assert "timeout_seconds" not in detail
+
+    def test_compose_loop_context_budget_refusal_names_its_cause_on_the_operation_record(self, tmp_path) -> None:
+        """The compose loop's pre-dispatch refusal is not a non-convergence and must not read as one.
+
+        It is raised as a ``ComposerConvergenceError`` (the composition budget
+        discriminator, the ``context_budget_exceeded`` reason), whose default
+        detail claims the model kept calling tools. No provider call was made,
+        so the operation record is where the ceiling and the largest
+        component must be found.
+        """
+        import json as _json
+
+        from sqlalchemy import select
+
+        from elspeth.web.composer.protocol import ComposerConvergenceError
+        from elspeth.web.sessions.models import composer_async_operations_table
+
+        mock_composer = SimpleNamespace()
+        mock_composer.compose = AsyncMock(
+            spec=ComposerService.compose,
+            side_effect=ComposerConvergenceError(
+                max_turns=2,
+                budget_exhausted="composition",
+                partial_state=None,
+                reason="context_budget_exceeded",
+                evidence={
+                    "ceiling": "bytes",
+                    "estimated_tokens": 400_000,
+                    "request_bytes": 1_200_000,
+                    "max_prompt_tokens": 200_000,
+                    "max_request_bytes": 983_040,
+                    "largest_component": "latest_tool_round",
+                },
+            ),
+        )
+        app, _service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+        client = TestClient(app, raise_server_exceptions=False)
+
+        session_id = client.post("/api/sessions", json={"title": "context budget"}).json()["id"]
+        operation_id = str(uuid.uuid4())
+        response = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("Build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=operation_id),
+        )
+
+        expected_detail = "This conversation is too large for the composer to continue. Start a new session, or shorten your request."
+        assert response.status_code == 422, response.text
+        detail = response.json()["detail"]
+        assert detail["error_type"] == "convergence"
+        assert detail["failure_code"] == "context_budget_exceeded"
+        assert detail["reason"] == "context_budget_exceeded"
+        assert detail["detail"] == expected_detail
+        assert detail["recovery_text"] == "Start a new session, or shorten your request."
+        assert detail["detail_codes"] == ["context_ceiling_bytes", "largest_component_latest_tool_round"]
+        assert "did not converge" not in response.text
+        assert "kept making tool calls" not in response.text
+
+        snapshot = client.get(f"/api/sessions/{session_id}/composer-progress").json()
+        assert snapshot["phase"] == "failed"
+        assert snapshot["reason"] == "context_budget_exceeded"
+
+        with app.state.session_engine.connect() as conn:
+            operation = (
+                conn.execute(select(composer_async_operations_table).where(composer_async_operations_table.c.operation_id == operation_id))
+                .mappings()
+                .one()
+            )
+        assert operation["status"] == "failed"
+        assert operation["failure_code"] == "http_error"
+        recorded = _json.loads(operation["result_json"])
+        assert recorded["error_type"] == "context_budget_exceeded"
+        assert recorded["body"]["detail"]["failure_code"] == "context_budget_exceeded"
+        assert recorded["body"]["detail"]["detail"] == expected_detail
+        assert recorded["body"]["detail"]["detail_codes"] == ["context_ceiling_bytes", "largest_component_latest_tool_round"]
+        assert "did not converge" not in operation["result_json"]
+
+        history = client.get(f"/api/sessions/{session_id}/operations", params={"operation_id": operation_id})
+        assert history.status_code == 200, history.text
+        (outcome,) = history.json()["items"]
+        assert outcome["error_type"] == "context_budget_exceeded"
 
     def test_convergence_redacts_blob_path_from_response_but_preserves_in_db(self, tmp_path) -> None:
         """When partial_state has a blob-backed source, the HTTP response must
@@ -11891,7 +11980,9 @@ class TestSendMessageTranscriptSnapshot:
                     role="audit",
                     content=json.dumps({"_kind": "llm_call_audit"}),
                     raw_content=None,
-                    tool_calls=[{"_kind": "llm_call_audit", "call": {}}],
+                    tool_calls=[
+                        {"_kind": "llm_call_audit", "call": {"status": "error", "prompt_tokens": None, "request_byte_split": None}}
+                    ],
                     created_at=record.created_at,
                     sequence_no=record.sequence_no + 1,
                     composition_state_id=None,
@@ -11920,6 +12011,75 @@ class TestSendMessageTranscriptSnapshot:
             f"a trailing audit row must not trip the conversation-scoped snapshot guard; got {resp.status_code}: {resp.text!r}"
         )
         assert resp.json()["message"]["content"] == "Still fine"
+
+    def test_send_message_passes_context_budget_history_from_the_transcript(self, tmp_path) -> None:
+        """The route derives the context-budget history from the turn's records and hands it to compose.
+
+        A stored budgeted call record that shed history index 1, with a
+        recorded 400 wire bytes over 100 prompt tokens, must reach the composer as
+        exactly that ratio, for its model, and that shed set.
+        """
+        mock_composer = _make_composer_mock(response_text="Budgeted")
+        app, _service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+
+        class _ShedAuditRowService(SessionServiceImpl):
+            """The real service, with one stored call record that shed history appended to the transcript."""
+
+            async def add_message_with_transcript(self, *args: Any, **kwargs: Any):
+                result = await super().add_message_with_transcript(*args, **kwargs)
+                assert isinstance(result, MessageIngressFresh)
+                record, transcript = result.message, result.transcript
+                assert record.sequence_no is not None
+                shed_audit_row = ChatMessageRecord(
+                    id=uuid.uuid4(),
+                    session_id=record.session_id,
+                    role="audit",
+                    content=json.dumps({"_kind": "llm_call_audit"}),
+                    raw_content=None,
+                    tool_calls=[
+                        {
+                            "_kind": "llm_call_audit",
+                            "call": {
+                                "model_requested": "test/composer-model",
+                                "status": "success",
+                                "prompt_tokens": 100,
+                                "request_byte_split": {"message_bytes": [90], "tools_bytes": None, "total_bytes": 90},
+                                "context_budget": {"shed_history_indices": [1], "request_wire_bytes": 400},
+                            },
+                        }
+                    ],
+                    created_at=record.created_at,
+                    sequence_no=record.sequence_no + 1,
+                    composition_state_id=None,
+                    writer_principal="compose_loop",
+                    tool_call_id=None,
+                    parent_assistant_id=None,
+                )
+                return replace(result, transcript=[*transcript, shed_audit_row])
+
+        app.state.session_service = _ShedAuditRowService(
+            app.state.session_engine,
+            telemetry=app.state.sessions_telemetry,
+            log=structlog.get_logger("test"),
+        )
+        client = TestClient(app)
+        session_id = client.post("/api/sessions", json={"title": "Budget history"}).json()["id"]
+
+        resp = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("hello", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert mock_composer.compose.await_count == 1
+        assert mock_composer.compose.await_args.kwargs["context_budget_history"] == ContextBudgetHistory(
+            bytes_per_token=4.0,
+            previously_shed_history=frozenset({"history:1"}),
+            bytes_per_token_by_model=(("test/composer-model", 4.0),),
+        )
 
     def test_send_message_transcript_snapshot_contains_prior_turns(self, tmp_path) -> None:
         """The combined method feeds real history to the composer.

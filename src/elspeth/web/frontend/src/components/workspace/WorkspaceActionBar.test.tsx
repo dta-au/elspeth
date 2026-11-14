@@ -48,8 +48,8 @@ describe("WorkspaceActionBar", () => {
 
   it("keeps every control in the action bar on one height register", () => {
     // elspeth-5413e4221e lineage: the strip used to mix two registers. With
-    // the status chips retired to the Checks tab, the collapse control across
-    // the pane divider is the register's remaining owner — asserted as a SET
+    // the status chips retired to the Checks tab, the stable pane toggle in
+    // the pipeline bar owns the register in both states — asserted as a SET
     // so a future action-bar rule cannot silently reintroduce a second
     // register (min-height) in this strip.
     const css = readFileSync(
@@ -61,7 +61,7 @@ describe("WorkspaceActionBar", () => {
     for (const rule of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
       const selector = rule[1].trim();
       if (
-        !/^\.workspace-(status-control|collapse-control)\b/.test(
+        !/^\.workspace-(status-control|pane-toggle|collapse-control|restore-control)\b/.test(
           selector,
         )
       ) {
@@ -74,7 +74,7 @@ describe("WorkspaceActionBar", () => {
     }
 
     expect([...barRegisters.keys()].sort()).toEqual([
-      ".workspace-collapse-control",
+      ".workspace-pane-toggle",
     ]);
     expect([...new Set(barRegisters.values())]).toEqual([
       "var(--size-control)",

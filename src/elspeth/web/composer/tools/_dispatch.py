@@ -27,6 +27,7 @@ from jsonschema.exceptions import ValidationError
 from sqlalchemy import Engine
 
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
 from elspeth.contracts.freeze import deep_freeze, deep_thaw
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext
@@ -823,6 +824,7 @@ def execute_tool(
     executing_proposal_id: str | None = None,
     validate_arguments: bool = False,
     require_data_dir_for_paths: bool = False,
+    mcp_root_authority: McpConfiguredRootAuthority | None = None,
     raise_schema_argument_errors: bool = False,
     _interpretation_requirements_are_internal: bool = False,
 ) -> ToolResult:
@@ -953,6 +955,7 @@ def execute_tool(
         catalog=catalog,
         plugin_snapshot=plugin_snapshot,
         data_dir=data_dir,
+        mcp_root_authority=mcp_root_authority,
         require_data_dir_for_paths=require_data_dir_for_paths,
         session_engine=session_engine,
         session_id=session_id,

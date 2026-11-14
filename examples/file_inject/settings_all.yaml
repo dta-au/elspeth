@@ -1,0 +1,57 @@
+# file_inject, mode: all — every bound file on every row
+#
+# `mode: all` has no key and so no miss: each entry is written to its own
+# `output_field` on every row. The entry names (`style`, `rules`,
+# `checklist`) are labels only. A single unconditional file is `mode: all`
+# with one entry.
+#
+# The same three files as settings.yaml, so the two outputs can be compared:
+# here the JSON file is written whole (no data_key), and every row carries all
+# three values.
+
+sources:
+  tickets:
+    plugin: csv
+    on_success: attach_all
+    options:
+      path: examples/file_inject/input.csv
+      on_validation_failure: discard
+      schema:
+        mode: observed
+
+transforms:
+  - name: attach_all
+    plugin: file_inject
+    input: attach_all
+    on_success: output
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+      mode: all
+      files:
+        "style":
+          content_file: guidance_a.md
+          format: text
+          output_field: style_guide
+        "rules":
+          content_file: guidance_b.json
+          format: json
+          output_field: review_rules
+        "checklist":
+          content_file: guidance_c.csv
+          format: csv
+          output_field: checklist
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/file_inject/output/tickets_with_everything.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/file_inject/runs/audit_all.db

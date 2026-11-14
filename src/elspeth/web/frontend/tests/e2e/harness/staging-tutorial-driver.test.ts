@@ -34,7 +34,9 @@ describe("standalone staging tutorial driver contract", () => {
       }),
     };
 
-    await driveFreeformTutorial(page, { timeoutMs: 5_000 });
+    // A partial double, like the graduation pages below: the driver only calls
+    // getByRole here, and the declared parameter is the full Playwright Page.
+    await driveFreeformTutorial(page as never, { timeoutMs: 5_000 });
 
     expect(continueClick).toHaveBeenCalledTimes(2);
     expect(page.getByRole).toHaveBeenCalledWith("button", { name: "Run", exact: true });

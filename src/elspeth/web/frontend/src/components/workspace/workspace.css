@@ -25,8 +25,8 @@
 
   /* Action-bar rhythm. ONE pair of values feeds every gap and standoff in the
      bottom bar — the bar's own gap, the status and overflow group gaps, the
-     completion group's gap, and the collapse control's standoff across the
-     divider — so the short-screen density regime at the end of this file can
+     completion group's gap, and the pane control's standoff — so the
+     short-screen density regime at the end of this file can
      tighten all of them by overriding just these two. Overriding only the
      bar's own gap (as it used to) left the group BOUNDARIES at 4px while the
      gaps INSIDE the groups stayed 8px, inverting the grouping so "Audit" read
@@ -47,17 +47,13 @@
 
   position: relative;
   display: grid;
-  /* Two rows: the panes, then the application's bottom bar
-     (.workspace-action-bar-slot, one item spanning both columns). Row 1 is
-     minmax(0, 1fr), not minmax(420px, 1fr): the 420px canvas floor is this
-     container's min-height below, and the bar row is carved out of that floor
-     exactly as the bar used to be carved out of the artifact pane's height —
-     so at the floor the panes and the artifact panel measure what they did
-     before, and above it the fr row fills. Pinning 420 on the row as well
-     would make the grid taller than its floor by one bar and clip the bar
-     itself under overflow: hidden. */
+  /* Conversation spans both rows; pipeline and its content-sized action row
+     share the second column. The canvas floor belongs to this container,
+     so a wrapped action row takes space from the pipeline without clipping. */
   grid-template-rows: minmax(0, 1fr) auto;
-  grid-template-columns: var(--authoring-pane-width) minmax(0, 1fr);
+  /* Width preferences and separator values describe the card. The track
+     also contains its full outer gutter and half of the seam gutter. */
+  grid-template-columns: calc(var(--authoring-pane-width) + 1.5 * var(--space-pane-gutter)) minmax(0, 1fr);
   width: 100%;
   height: 100%;
   min-width: 0;
@@ -75,11 +71,22 @@
   min-height: 0;
 }
 
+/* ARGOnite pane cards: the gutter lives on the SLOTS, never on
+   .composer-workspace, whose content box is what the ResizeObserver measures
+   for the layout-mode thresholds. Half a gutter each side of the column seam
+   makes one full gutter between the cards, and the separator (centred on the
+   seam) lands in the middle of it. Collapsed and narrow states re-cut the
+   padding further down. */
 .workspace-authoring-slot {
-  grid-row: 1;
+  grid-row: 1 / 3;
   grid-column: 1;
+  padding: var(--space-pane-gutter) calc(var(--space-pane-gutter) / 2)
+    var(--space-pane-gutter) var(--space-pane-gutter);
 }
 
+/* ARGOnite: from ARGO (dta-au) client ElspethWorkflowEditor.module.css — reuse assumed MIT, see design doc
+   (ARGO's .pane: surface fill, 1px edge, 20px radius, the card shadow tier).
+   overflow: hidden clips the title bar and body to the rounded corners. */
 .workspace-authoring-pane,
 .workspace-artifact-pane {
   display: flex;
@@ -89,6 +96,36 @@
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pane);
+  background-color: var(--color-surface);
+  box-shadow: var(--shadow-card);
+}
+
+/* ARGOnite: from ARGO (dta-au) client ElspethWorkflowEditor.module.css — reuse assumed MIT, see design doc
+   (ARGO's .paneHeader: a 46px bar with a bottom rule on a tinted fill).
+   The authoring pane's title bar. Same band, fill and rule as the artifact
+   toolbar (the pipeline pane's title bar), so the two bars register across
+   the gutter. Name only: the pane toggles stay in the bar row. */
+.workspace-pane-header {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  min-height: var(--size-pane-header);
+  padding: 0 var(--artifact-gutter);
+  border-bottom: 1px solid var(--color-border, currentcolor);
+  background-color: var(--color-pane-header);
+}
+
+.workspace-pane-title {
+  flex: 0 0 auto;
+  margin: 0;
+  color: var(--color-text);
+  font-family: var(--font-display);
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-bold);
+  line-height: var(--line-height-tight);
+  white-space: nowrap;
 }
 
 .workspace-authoring-body,
@@ -99,44 +136,34 @@
   overflow: hidden;
 }
 
-/* The application's bottom bar: the rule and the fill are painted ONCE, by
-   this one grid item spanning both columns (elspeth-9c94a58500). Its cells are
-   the parent grid's own columns via subgrid, so the collapse control lands in
-   the authoring column and the action bar in the artifact column at whatever
-   width the pane has — the resized one, the collapsed 0px one, narrow mode's
-   single column — with no second copy of the column formula. The row is auto:
-   exactly as tall as the taller of its two children, so it grows with the bar
-   when .completion-bar wraps or carries ExecuteButton's block-reason line, and
-   it is the collapse control's margin box tall in narrow Compose view where
-   the bar is hidden. Nothing derives that height and nothing measures it.
-
-   History, because this row has absorbed seven fixes and the seam is what
-   kept regenerating them: the bar used to be a child of the ARTIFACT column,
-   so the bottom of the application was a half-drawn line — no rule and no
-   fill left of the pane seam, "Collapse authoring pane" floating on bare page
-   ground beside a bordered, filled bar (elspeth-215c989bed). The fix taken was
-   a MIRRORED band on the authoring pane, first sized by the token formula
-   (2 * inset + --size-control), which encoded "the bar is exactly one control
-   row" and broke the day the block-reason line made the bar 87px
-   (elspeth-97db9c22e5); then sized by a ResizeObserver publishing the bar's
-   rendered height, which was correct and still two elements agreeing about
-   one number. This wrapper was the other remediation elspeth-215c989bed
-   offered. It has no height to keep in sync. */
+/* One content-sized row under the pipeline holds the toggle and workflow
+   actions. The conversation needs no mirrored band or measured bar height. */
 .workspace-action-bar-slot {
-  display: grid;
+  display: flex;
   grid-row: 2;
-  grid-column: 1 / -1;
-  grid-template-columns: subgrid;
+  grid-column: 2;
+  gap: var(--workspace-bar-gap);
+  align-items: center;
   min-width: 0;
-  border-top: 1px solid var(--color-border, currentcolor);
-  background: var(--color-surface, Canvas);
+  padding: 0 var(--artifact-gutter) var(--space-pane-gutter) var(--space-pane-gutter);
+  /* ARGOnite: transparent on the canvas, no top rule. Forced colours needs no
+     restatement in themes.css: the bar has no boundary of its own in any
+     mode, and the pane cards above it and the controls inside it each keep
+     their own border. */
+  background: transparent;
 }
 
 .workspace-action-bar-main {
-  grid-column: 2;
+  flex: 1;
   min-width: 0;
 }
 
+/* The pipeline pane's query container (ARGOnite title collapse, below). Safe
+   to contain: this box is width: 100% of the pane body, which the grid track
+   sizes, so inline-size containment cannot shrink it to its contents.
+   container-type applies style + inline-size containment only, not layout
+   containment, so position: fixed descendants (the inline modals) still
+   resolve against the viewport. */
 .artifact-workspace {
   display: flex;
   flex-direction: column;
@@ -145,6 +172,7 @@
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+  container: pipeline-pane / inline-size;
 }
 
 .artifact-workspace-toolbar {
@@ -153,19 +181,87 @@
   gap: var(--space-sm);
   align-items: center;
   justify-content: space-between;
-  /* Band height from --size-workspace-band, content centred (no vertical
-     padding). The short-screen density regime below shrinks the token. The
-     authoring pane has no matching band any more — the chat column's
-     header row held only a constant "Auto-apply on" chip and was removed
-     (2026-10-08), so the conversation starts at the top of its pane. */
-  min-height: var(--size-workspace-band);
+  /* ARGOnite: the toolbar IS the pipeline pane's title bar — title, tab
+     track, catalog — on the same --size-pane-header band and fill as the
+     authoring pane's .workspace-pane-header, so the two bars register across
+     the gutter. Content centred (no vertical padding): the 44px track (36px
+     tabs + 4px inset) fits the 46px band. */
+  min-height: var(--size-pane-header);
   padding: 0 var(--artifact-gutter);
   border-bottom: 1px solid var(--color-border, currentcolor);
+  background-color: var(--color-pane-header);
+}
+
+/* Too narrow for title, track and catalog together: the title goes
+   visually hidden (base.css .visually-hidden recipe — clipped, not removed,
+   so it stays in the heading outline). 900px per the design doc; the browser
+   pass measures the real threshold. */
+@container pipeline-pane (width < 900px) {
+  .workspace-pane-title--collapsible {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
 }
 
 .artifact-workspace-toolbar [role="tablist"] {
   display: flex;
   gap: var(--space-xs);
+}
+
+/* ARGOnite: from ARGO (dta-au) client ViewToggle.module.css — reuse assumed MIT, see design doc
+   (ARGO's ViewToggle: a recessed pill track holding a raised pill). Shared by
+   the artifact tablist and the narrow Compose/Pipeline view tabs. */
+.artifact-workspace-toolbar [role="tablist"],
+.composer-workspace[data-layout-mode="narrow"] .workspace-view-tabs {
+  padding: 4px;
+  border-radius: var(--radius-pill);
+  background-color: var(--color-track);
+  box-shadow: var(--shadow-track);
+}
+
+/* Tabs in a track. :where() keeps each rule at the specificity of the
+   shared.css .artifact-tab rule it overrides, so these win on source order
+   (workspace.css imports after shared.css), not on weight. Inactive tabs are
+   muted text in the track (4.59:1 light / 4.89:1 dark, the thinnest pair in
+   the design — do not go lighter); hover lifts the text, not a fill, because
+   a surface wash would paint a box on the recess. */
+:where(.artifact-workspace-toolbar, .workspace-view-tabs) .artifact-tab {
+  border-radius: var(--radius-pill);
+  color: var(--color-text-muted);
+}
+
+:where(.artifact-workspace-toolbar, .workspace-view-tabs)
+  .artifact-tab:hover:where(:not(:disabled)):where(:not([aria-selected="true"])) {
+  background-color: transparent;
+  color: var(--color-text);
+}
+
+/* Muted is ALSO shared.css's :disabled colour, so in the track a gated tab
+   (Spec/YAML/Checks before there is a composition) would read exactly like an
+   available inactive one. Dim it, the same 0.6 the disabled .switch uses;
+   WCAG 1.4.3 exempts inactive controls from the text floor. */
+:where(.artifact-workspace-toolbar, .workspace-view-tabs) .artifact-tab:disabled {
+  opacity: 0.6;
+}
+
+/* The pill's edge is a real border, not the shadow alone: light --color-pill
+   on --color-track is 1.35:1, so the selected-state boundary needs a token at
+   3:1 against the track (muted: 4.59 light / 4.89 dark, gated in
+   colorContrast.test.ts). Unselected tabs keep shared.css's 1px transparent
+   border, so selecting a tab never shifts the layout. */
+:where(.artifact-workspace-toolbar, .workspace-view-tabs)
+  .artifact-tab[aria-selected="true"] {
+  border-color: var(--color-text-muted);
+  background-color: var(--color-pill);
+  color: var(--color-on-pill);
+  box-shadow: var(--shadow-pill);
 }
 
 .artifact-workspace-toolbar button {
@@ -183,6 +279,11 @@
   flex: 0 0 auto;
   gap: var(--space-sm);
   align-items: center;
+  /* ARGOnite: with the title as a third item, space-between would float the
+     track mid-bar. The auto margin takes the free space instead, so the title
+     and track pack left and the catalog holds the right edge — the same
+     arrangement as before when the title is visually hidden. */
+  margin-inline-start: auto;
 }
 
 /* Run-tab outcome/live badge (elspeth-3a7b7c7b37). aria-hidden dot appended
@@ -245,20 +346,27 @@
 /* The Checks tab's badge is PERSISTENT — unlike the Run dot it outlives any
    toast — so per the contract above the glyph form is mandatory for every
    settled verdict: the finding count, ✓ for the all-clear, ! for a
-   zero-count failure. It follows the .status-badge tint-plus-tone-text
-   pairing already proven for contrast on every surface in both themes;
-   the dot forms (neutral "not checked", busy pulse below) carry no verdict
-   and stay colour-quiet on purpose — green means checked-and-clean, never
-   merely "nothing red yet". */
+   zero-count failure. The dot forms (neutral "not checked", busy pulse
+   below) carry no verdict and stay colour-quiet on purpose — green means
+   checked-and-clean, never merely "nothing red yet".
+
+   ARGOnite: a 20px pill that can hold a two-digit count ("Checks 25"),
+   FILLED with the tone colour and the glyph knocked out in --color-surface
+   (AA on all three tones in both themes, gated in colorContrast.test.ts).
+   This replaces the .status-badge tint-plus-tone-text pairing. */
 .artifact-tab-badge--glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   width: auto;
   height: auto;
-  min-width: 1.4em;
-  padding: 0 0.35em;
-  border-radius: var(--radius-sm);
+  min-width: 20px;
+  min-height: 20px;
+  padding: 0 6px;
+  border-radius: var(--radius-pill);
   font-size: var(--font-size-xs);
   font-weight: var(--font-weight-medium);
-  line-height: 1.5;
+  line-height: 1;
   text-align: center;
   background-color: var(--color-surface-elevated);
 }
@@ -270,18 +378,18 @@
 }
 
 .artifact-tab-badge--glyph[data-tone="success"] {
-  background-color: var(--color-success-bg);
-  color: var(--color-success);
+  background-color: var(--color-success);
+  color: var(--color-surface);
 }
 
 .artifact-tab-badge--glyph[data-tone="warning"] {
-  background-color: var(--color-warning-bg);
-  color: var(--color-warning);
+  background-color: var(--color-warning);
+  color: var(--color-surface);
 }
 
 .artifact-tab-badge--glyph[data-tone="error"] {
-  background-color: var(--color-error-bg);
-  color: var(--color-error);
+  background-color: var(--color-error);
+  color: var(--color-surface);
 }
 
 /* In-flight checks share the live pulse; reduced-motion stills it below,
@@ -353,18 +461,9 @@
   max-width: 74ch;
 }
 
-/* The bar carries no border-top and no background of its own: the rule and
-   the fill belong to .workspace-action-bar-slot above, which spans both
-   columns, and drawing them here as well would put two elements back in
-   charge of the bottom edge (elspeth-9c94a58500). Nor is it positioned or on
-   a z rung any more — it was position: sticky on --z-panel-controls, which
-   was dead as sticky (nothing here scrolls) but live as a compositor layer:
-   with the opaque background gone, that layer stopped being opaque and Chrome
-   dropped the bar's text from subpixel to grayscale antialiasing (measured:
-   ~4000 differing pixels in every visual baseline's bar controls, none once
-   the bar was in flow). Nothing needs to paint over it: the desktop collapsed
-   restore control is positioned on --z-panel-controls and an in-flow bar is
-   below any positioned box. */
+/* Transparent workflow actions share the pipeline's bottom row with the
+   toggle. Keep them in flow: sticky positioning created a compositor layer
+   that changed text antialiasing without providing any scrolling behavior. */
 .workspace-action-bar {
   display: flex;
   flex-wrap: wrap;
@@ -395,10 +494,9 @@
      holds the right edge, and the status/overflow arrangement is identical
      whether or not a completion bar is present. */
   justify-content: flex-start;
-  /* Block inset stays the shared --workspace-bar-inset (the collapse-control
-     registration contract, elspeth-fca731fb28); the INLINE inset is the
-     artifact column's shared gutter (elspeth-87195dda2c). */
-  padding: var(--workspace-bar-inset) var(--artifact-gutter);
+  /* Shared block inset registers the bar with the pane toggle. The enclosing
+     slot owns the inline and bottom gutters once for both children. */
+  padding: var(--workspace-bar-inset) 0;
 }
 
 /* Completion actions in the horizontal bar (recut 2026-08-15, operator
@@ -575,49 +673,18 @@
   pointer-events: none;
 }
 
-/* The « control is the bar row's authoring-column cell (see
-   .workspace-action-bar-slot): right-aligned against the seam, centred on
-   the row like every control in the cell beside it. justify-self: end keeps
-   it where the pane's flex-end used to put it. align-self: center is the
-   registration: the bar centres its groups and the completion group centres
-   its members (elspeth-b4e88f0f8c), so when a multi-line reason makes the bar
-   taller than one control row every control sits at (H - 44) / 2 — and so
-   does this one, with the same margin above and below. It was align-self:
-   start when the bar was flex-start, registered with the first line and
-   leaving the rest of the row empty beneath it; the two moved together. In
-   the one state where the bar still holds two lines (the completion group
-   wrapped under the chips) the control centres between them. */
-.workspace-collapse-control {
-  grid-column: 1;
-  align-self: center;
-  justify-self: end;
-
-  /* Vertical registration with the action bar across the divider: both take
-     the same --workspace-bar-inset standoff and the full --size-control
-     height (the shared .workspace-pane-toggle chrome above carries the
-     min-height), so they share one top edge and one optical center.
-     Expressed in tokens on both sides of the seam, so the contract no longer
-     depends on the browser root staying at 16px (elspeth-fca731fb28). This
-     margin and the bar's padding are the ONLY two places the standoff is
-     applied in the row — the wrapper carries none — so the density regime's
-     inset override tightens both, once each. */
-  margin: var(--workspace-bar-inset) var(--space-sm);
-  min-height: var(--size-control);
+/* The same in-flow control survives both states, centred beside the action
+   bar even when a block reason makes that bar taller. */
+.workspace-pane-controls {
+  display: flex;
+  flex: 0 0 auto;
+  gap: var(--workspace-bar-gap);
+  align-items: center;
+  margin: var(--workspace-bar-inset) 0;
 }
 
 .workspace-collapsed-affordance {
-  position: absolute;
-  z-index: var(--z-panel-controls);
-  top: var(--space-sm);
-  left: var(--space-sm);
-  display: flex;
-  gap: var(--space-sm);
-  align-items: center;
-  max-width: min(416px, calc(100% - 2 * var(--space-sm)));
-  padding: var(--space-sm);
-  border: 1px solid var(--color-border, currentcolor);
-  border-radius: var(--radius-md, 6px);
-  background: var(--color-surface, Canvas);
+  border-color: var(--color-border, currentcolor);
 }
 
 /* Same busy/warning split the retired status chips used (elspeth-7161879770).
@@ -666,43 +733,18 @@
   grid-template-columns: 0 minmax(0, 1fr);
 }
 
-/* The restore control joins the action bar's own line (operator decision,
-   2026-08-15): no reserved row, no banner box, no visible text — just the »
-   icon at the bottom-left, where the expanded state's « control sits in the
-   bar row's authoring cell, so the toggle pair occupies one spot in both
-   states. It stays the DOM child of .workspace-authoring-slot it always was —
-   the narrow-mode DOM-order test depends on that — only its desktop position
-   changes, from the narrow badge's top-left anchor to a bottom anchor on the
-   bar's inset token (its containing block is the positioned workspace root,
-   so that anchor is the bar row's bottom edge regardless of which grid row
-   the slot occupies). Column 1 is 0-width when collapsed, so the artifact
-   cell's .workspace-action-bar lays out at the same pixels — and the button
-   wins those pixels because it is positioned on --z-panel-controls (the base
-   rule above) while the bar row and the bar are in-flow, unpositioned boxes.
-   The bar used to sit on that same rung itself (position: sticky) with tree
-   order in its favour, and this rule carried a one-step-raised token so the
-   button stayed clickable; the bar left the rung with elspeth-9c94a58500 and
-   the raised token went with it. The clickability is pinned as a rendered
-   fact (elementFromPoint) in composer-workspace-geometry.spec.ts. */
+/* ARGOnite gutter, collapsed desktop: column 1 is 0px, and a padded slot
+   cannot shrink below its padding — it would overflow into the artifact
+   column as an invisible box. Drop its padding and give the artifact card the
+   full outer gutter on the left instead of the half seam gutter. */
 .composer-workspace[data-authoring-collapsed="true"]:not([data-layout-mode="narrow"])
-  .workspace-collapsed-affordance {
-  top: auto;
-  bottom: var(--workspace-bar-inset);
+  .workspace-authoring-slot {
   padding: 0;
-  border: none;
-  background: transparent;
-  max-width: none;
 }
 
-/* Reserve the restore control's slot at the bar's left edge: the » is an
-   absolutely-positioned sibling from the authoring slot painting above the
-   in-flow bar, so without this the bar's first chip renders UNDERNEATH it
-   (still hit-testable through the button, but visually collided).
-   Reservation = the button's left offset (--space-sm) + its --size-control
-   width + one more --space-sm of breathing room before the first chip. */
 .composer-workspace[data-authoring-collapsed="true"]:not([data-layout-mode="narrow"])
-  .workspace-action-bar {
-  padding-left: calc(2 * var(--space-sm) + var(--size-control));
+  .workspace-artifact-slot {
+  padding-left: var(--space-pane-gutter);
 }
 
 /* The status text goes sr-only on desktop (base.css .sr-only recipe): the
@@ -723,11 +765,8 @@
   border: 0;
 }
 
-/* The pane row only, NOT both rows. The seam never visibly ran through the
-   bar: the old sticky bar's opaque background painted over it there, and the
-   grip mark centres on the slot's height. Stopping at the bar row's rule keeps
-   both facts as they were, and keeps the separator's 24px pointer target out
-   of the « control's cell in the row below. */
+/* Stop the separator above the action row so its pointer target stays clear
+   of the toggle at the pipeline's bottom-left. */
 .workspace-separator-slot {
   position: relative;
   z-index: var(--z-panel-controls);
@@ -740,10 +779,13 @@
   overflow: visible;
 }
 
+/* ARGOnite: the seam spans the cards' height, not the gutters above and
+   below them, so it reads as the handle between two cards rather than a rule
+   drawn across the canvas. */
 .workspace-separator {
   position: absolute;
-  top: 0;
-  bottom: 0;
+  top: var(--space-pane-gutter);
+  bottom: var(--space-pane-gutter);
   left: -12px;
   width: 24px;
   min-width: 24px;
@@ -824,9 +866,13 @@
   outline-offset: -2px;
 }
 
+/* ARGOnite gutter: the artifact card's half of the seam gutter on the left,
+   the full outer gutter on the other three sides (see the authoring slot). */
 .workspace-artifact-slot {
   grid-row: 1;
   grid-column: 2;
+  padding: var(--space-pane-gutter) var(--space-pane-gutter)
+    var(--space-pane-gutter) calc(var(--space-pane-gutter) / 2);
 }
 
 .composer-workspace[data-layout-mode="narrow"] {
@@ -838,15 +884,35 @@
      scroller; cancelling the floor here instead compressed the conversation
      log below a readable height and stranded the docked composer controls.
 
-     The floor is 480, not the desktop 420, because at 320px wide the docked
-     .chat-input's controls wrap to ~181px — measured at 320x256, the shared
-     420 floor left the conversation log 81px against WCAG-reflow's 120px
-     readable minimum (elspeth-7aa9787996). The floor exists precisely to
-     stop that compression, so it has to clear the NARROWEST supported width,
-     not the desktop one. Costs scroll distance only: .app-main already owns
-     the outer scroll path, and on any viewport tall enough for the flow
-     layout the floor never binds. */
-  min-height: 480px;
+     The original 480px floor accommodated the ~181px input at 320px wide
+     (the desktop 420px floor left only 81px of log, elspeth-7aa9787996).
+     ARGOnite's narrow chrome costs more height than the card gutters alone:
+     the card gutters (2 x 14px) plus the Compose/Pipeline track's top margin
+     and inset (measured 52px row) beyond the old tab row. The floor therefore
+     adds four gutters (56px) to 480px, and the 46px Conversation title band is
+     clipped in this layout (the track names the view). Measured at the first
+     attempt, 2 gutters (508px): log 113.4px at 375x667, below the 120px
+     reflow floor; two more gutters add 28px, ~141px at 375x667 (the e2e
+     reflow spec owns the rendered numbers). Costs scroll distance only:
+     .app-main owns the outer scroll path; on a tall viewport the floor does
+     not bind. */
+  min-height: calc(480px + 4 * var(--space-pane-gutter));
+}
+
+/* The Compose/Pipeline track already names the narrow view. Clip the whole
+   title band out of flow with base.css's visually-hidden recipe, retaining
+   its h2 in the accessibility tree without spending a second header row. */
+.composer-workspace[data-layout-mode="narrow"] .workspace-pane-header {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  min-height: 0;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 /* A decision dock needs room alongside the transcript and wrapped input
@@ -861,6 +927,10 @@
   grid-row: 1;
   grid-column: 1;
   gap: var(--space-xs);
+  /* ARGOnite: the track hugs its two tabs on the canvas, on the cards'
+     outer gutter. */
+  justify-self: start;
+  margin: var(--space-pane-gutter) var(--space-pane-gutter) 0;
 }
 
 .composer-workspace[data-layout-mode="narrow"]
@@ -870,26 +940,20 @@
   min-height: var(--size-control);
 }
 
+/* ARGOnite: one visible card at a time, with the full gutter on every side. */
 .composer-workspace[data-layout-mode="narrow"] .workspace-authoring-slot,
 .composer-workspace[data-layout-mode="narrow"] .workspace-artifact-slot {
   grid-row: 2;
   grid-column: 1;
+  padding: var(--space-pane-gutter);
 }
 
-/* One column, so the bar row's two cells share it. Only one is ever visible
-   in narrow mode — the « control with the Compose view, the action bar with
-   the Pipeline view (each hides on the same fact that hides its view) — so
-   the row holds one item at a time and is exactly that item tall. Placed
-   explicitly rather than left to auto-placement: an item placed in column 2
-   of a one-column subgrid would otherwise depend on the subgrid clamping
-   rule, and "clamped into the last track" is a fact worth not relying on. */
+/* Compose shows the toggle (and collapsed status); Pipeline shows actions.
+   The same content-sized row serves either view in the single column. */
 .composer-workspace[data-layout-mode="narrow"] .workspace-action-bar-slot {
   grid-row: 3;
-}
-
-.composer-workspace[data-layout-mode="narrow"] .workspace-collapse-control,
-.composer-workspace[data-layout-mode="narrow"] .workspace-action-bar-main {
   grid-column: 1;
+  padding-inline: var(--space-pane-gutter);
 }
 
 .composer-workspace[data-layout-mode="narrow"] .workspace-separator-slot {
@@ -898,9 +962,13 @@
 
 .composer-workspace[data-layout-mode="narrow"]
   .workspace-collapsed-affordance {
-  position: static;
+  flex-wrap: wrap;
   max-width: 100%;
-  margin: var(--space-sm);
+  padding: var(--space-sm);
+  border-width: 1px;
+  border-style: solid;
+  border-radius: var(--radius-md);
+  background: var(--color-surface, Canvas);
 }
 
 /* Component display rules outrank the user-agent [hidden] rule. Keep this
@@ -913,6 +981,7 @@
 .composer-workspace .workspace-authoring-pane[hidden],
 .composer-workspace .workspace-artifact-pane[hidden],
 .composer-workspace .workspace-action-bar-slot[hidden],
+.composer-workspace .workspace-pane-controls[hidden],
 .composer-workspace .workspace-collapse-control[hidden],
 .composer-workspace .workspace-action-bar-main[hidden] {
   display: none;
@@ -935,19 +1004,18 @@
 }
 
 @media (min-width: 961px) and (max-height: 800px) {
-  /* Short-screen density: drop the band token so the artifact toolbar
-     compresses. 45px = the regime's historic toolbar height (4px + 36px
-     compact control + 4px + 1px seam). */
+  /* Short-screen density. ARGOnite: the artifact toolbar is the pipeline
+     pane's title bar, on the 46px --size-pane-header shared with the
+     authoring pane (1px off the regime's historic 45px band), so the band
+     override that used to compress it is gone. */
   .composer-workspace {
-    --size-workspace-band: 45px;
-
     /* Tighten the WHOLE action-bar rhythm, not just the bar's own outer gap.
        Overriding only the bar left the group BOUNDARIES at 4px while the gaps
        INSIDE the status and completion groups stayed at 8px — measured
        8/4/8/8/4 at 1280x720 and 1536x760 — so the eye bonded "Audit N issues"
        to "Share inspect link" and split controls that belong together, at exactly
        the viewport where the bar is most crowded. Both the bar's padding and
-       the collapse control's standoff across the divider read the inset, so
+       the pane control's standoff read the inset, so
        the shared bottom edge holds here too (elspeth-fca731fb28). */
     --workspace-bar-gap: var(--space-xs);
     --workspace-bar-inset: var(--space-xs);

@@ -81,6 +81,7 @@ def _client() -> TestClient:
     app.dependency_overrides[get_current_user] = _mock_user
     app.state.settings = WebSettings(
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=100,
@@ -158,6 +159,7 @@ def test_snapshot_composition_state_not_found_does_not_emit_fetch_failure() -> N
     app.dependency_overrides[get_current_user] = _mock_user
     app.state.settings = WebSettings(
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=100,
@@ -246,6 +248,7 @@ def _explain_app(session_service: object) -> FastAPI:
     app.dependency_overrides[get_current_user] = _mock_user
     app.state.settings = WebSettings(
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=100,

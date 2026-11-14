@@ -134,6 +134,37 @@ class BlobReplacementCoordinator:
     def _matches(evidence: _Evidence, expected: Literal["old", "new"]) -> bool:
         return evidence in {expected, "both"}
 
+    def _require_canonical_replacement_content(self, expected: BlobRecord, directory_fd: _CustodyDirectory) -> None:
+        session_dir = self._data_dir / "blobs" / str(expected.session_id)
+        storage = session_dir / f"{expected.id}_{expected.filename}"
+        if storage.parent != session_dir or Path(expected.storage_path) != storage:
+            raise AuditIntegrityError("blob replacement storage escaped exact custody")
+        old_data = self._read_bytes(storage, directory_fd)
+        if old_data is None or expected.content_hash is None:
+            raise AuditIntegrityError("replacement requires existing canonical content with a hash")
+        digest = content_hash(old_data)
+        if len(old_data) != expected.size_bytes or not hmac.compare_digest(digest, expected.content_hash):
+            raise BlobIntegrityError(str(expected.id), expected=expected.content_hash, actual=digest)
+
+    def _require_recovery_content(self, plan: BlobReplacementPlan, directory_fd: _CustodyDirectory) -> _Evidence:
+        """Only observe supported interrupted alternatives; never repair them."""
+        storage, staging, backup, temporary = self._validated_paths(plan)
+        for path in (storage, staging, backup, temporary):
+            self._regular_or_absent(path, directory_fd)
+        storage_evidence = self._evidence(storage, plan, directory_fd)
+        staging_evidence = self._evidence(staging, plan, directory_fd)
+        backup_evidence = self._evidence(backup, plan, directory_fd)
+        if staging_evidence != "absent" and not self._matches(staging_evidence, "new"):
+            raise AuditIntegrityError("replacement staging does not contain proposed bytes")
+        if backup_evidence != "absent" and not self._matches(backup_evidence, "old"):
+            raise AuditIntegrityError("replacement backup does not contain old bytes")
+        if plan.phase == "purge_pending":
+            if not self._matches(storage_evidence, "new") and not self._matches(staging_evidence, "new"):
+                raise AuditIntegrityError("committed replacement lost exact proposed bytes")
+        elif not self._matches(storage_evidence, "old") and not self._matches(backup_evidence, "old"):
+            raise AuditIntegrityError("uncommitted replacement lost exact old bytes")
+        return storage_evidence
+
     def _read_plan(self, context: SessionOperationContext, blob_id: UUID) -> BlobReplacementPlan | None:
         return self._authority.mutate(context, lambda transaction: transaction.blobs.read_blob_replacement(blob_id=blob_id))
 
@@ -167,29 +198,14 @@ class BlobReplacementCoordinator:
             raise AuditIntegrityError("replacement recovery escaped exact session custody")
         current = self._authority.mutate(context, lambda transaction: transaction.blobs.read_blob(blob_id=plan.blob_id))
         committed = plan.phase == "purge_pending"
-        if current != (plan.replacement_blob if committed else plan.old_blob):
-            raise AuditIntegrityError("replacement recovery metadata differs from the complete durable snapshot")
+        plan.require_current_metadata(current)
         storage, staging, backup, temporary = self._validated_paths(plan)
         with self._directory(plan.session_id) as directory_fd:
-            # Validate every artifact before the first mutation. A malformed
-            # temporary must preserve the ledger and the recoverable copies.
-            for path in (storage, staging, backup, temporary):
-                self._regular_or_absent(path, directory_fd)
-            storage_evidence = self._evidence(storage, plan, directory_fd)
-            staging_evidence = self._evidence(staging, plan, directory_fd)
-            backup_evidence = self._evidence(backup, plan, directory_fd)
-            if staging_evidence != "absent" and not self._matches(staging_evidence, "new"):
-                raise AuditIntegrityError("replacement staging does not contain proposed bytes")
-            if backup_evidence != "absent" and not self._matches(backup_evidence, "old"):
-                raise AuditIntegrityError("replacement backup does not contain old bytes")
+            storage_evidence = self._require_recovery_content(plan, directory_fd)
             if committed:
                 if not self._matches(storage_evidence, "new"):
-                    if not self._matches(staging_evidence, "new"):
-                        raise AuditIntegrityError("committed replacement lost exact proposed bytes")
                     self._rename(staging, storage, directory_fd, context)
             elif not self._matches(storage_evidence, "old"):
-                if not self._matches(backup_evidence, "old"):
-                    raise AuditIntegrityError("uncommitted replacement lost exact old bytes")
                 self._rename(backup, storage, directory_fd, context)
             for path in (staging, backup, temporary):
                 self._remove(path, directory_fd, context)
@@ -273,12 +289,7 @@ class BlobReplacementCoordinator:
             staging = storage.with_name(f"{stem}.stage")
             backup = storage.with_name(f"{stem}.backup")
             with self._directory(expected.session_id) as directory_fd:
-                old_data = self._read_bytes(storage, directory_fd)
-                if old_data is None or expected.content_hash is None:
-                    raise AuditIntegrityError("replacement requires existing canonical content with a hash")
-                digest = content_hash(old_data)
-                if len(old_data) != expected.size_bytes or not hmac.compare_digest(digest, expected.content_hash):
-                    raise BlobIntegrityError(str(expected.id), expected=expected.content_hash, actual=digest)
+                self._require_canonical_replacement_content(expected, directory_fd)
                 try:
                     plan = self._authority.mutate(
                         context,

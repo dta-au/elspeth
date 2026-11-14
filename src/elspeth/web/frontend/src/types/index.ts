@@ -381,6 +381,10 @@ export type ComposerProgressReason =
   | "convergence_discovery_budget"
   | "convergence_wall_clock_timeout"
   | "tool_call_cap_exceeded"
+  | "context_budget_exceeded"
+  // Not a failure: a turn's first model call that leaves earlier
+  // conversation out to fit the context budget announces it once.
+  | "context_reduced"
   | "provider_auth_failed"
   | "provider_unavailable"
   | "plugin_crash"

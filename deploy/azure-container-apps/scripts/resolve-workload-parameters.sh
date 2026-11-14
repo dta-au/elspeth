@@ -23,6 +23,7 @@ trap 'rm -f -- "$parameters"' EXIT
 jq -e '
   ["containerAppName", "minReplicas", "maxReplicas", "webCpu", "webMemory",
    "terminationGracePeriodSeconds", "tags", "composerMaxCompositionTurns",
+   "composerContextMaxPromptTokens",
    "composerMaxDiscoveryTurns", "composerTimeoutSeconds", "composerRateLimitPerMinute",
    "authProvider", "registrationMode", "composerEndpointBaseUrl",
    "composerAdvisorEndpointBaseUrl", "composerModel", "composerAdvisorModel",
