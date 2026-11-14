@@ -379,8 +379,9 @@ Transforms:
   - Per-row bucket mode bounds S3 keys in UTF-8 bytes (1024), as
     static-bucket mode does (#10).
 - **AWS guardrails** count botocore attempts as they are sent, so a transport
-  error reports the attempts actually made. They stop scanning at a 300 s row
-  deadline, honour shutdown between fields, and hand retryable failures to
+  error reports the attempts actually made. They stop scanning at a row
+  deadline, set by the new `row_deadline_seconds` option (positive integer,
+  default 300; not exposed on the web operator profile), honour shutdown between fields, and hand retryable failures to
   the engine retry policy (AWS review #4). The response parser records a
   wrong-typed `confidence`, `action` or `filterStrength` as a malformed
   response instead of crashing with an unaudited `TypeError` (#5), and the
@@ -549,8 +550,8 @@ Sinks and retrieval:
 - The Dataverse 300 s throttle-wait budget is not configurable, and the
   client retries only 429 and 503; 500, 502, 504 and timeouts are not
   retried in the client.
-- The 300 s guardrail row deadline is fixed, not configurable, and an engine
-  retry of a guardrail row re-scans, and re-bills, fields that already passed.
+- An engine retry of a guardrail row re-scans, and re-bills, fields that
+  already passed.
   The guardrails client also awaits operator re-signing of three tier-model
   allowlist entries for `BedrockGuardrailsClient.apply_guardrail`.
 - Fork copies made before the #365 fix stay VERBATIM; they are not rewritten.
