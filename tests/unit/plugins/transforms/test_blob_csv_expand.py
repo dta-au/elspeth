@@ -342,10 +342,19 @@ def test_blob_csv_expand_both_arms_report_a_parse_defect_identically() -> None:
 
     assert blob_result.status == "error"
     assert field_result.status == "error"
-    # A parse defect is a property of the CSV, not of where the CSV came from,
-    # so these reasons carry no arm-specific identity and must be EQUAL.
-    assert blob_result.reason == field_result.reason
     assert blob_result.reason is not None
+    assert field_result.reason is not None
+    # A parse defect is a property of the CSV, not of where the CSV came from:
+    # past the source identity every parse-phase reason carries (the same keys
+    # empty_csv and the load-phase errors carry), the two reasons are EQUAL.
+    identity_keys = {"field", "blob_ref"}
+    assert {k: v for k, v in blob_result.reason.items() if k not in identity_keys} == {
+        k: v for k, v in field_result.reason.items() if k not in identity_keys
+    }
+    assert blob_result.reason["field"] == "blob_ref"
+    assert blob_result.reason["blob_ref"] == blob_ref
+    assert field_result.reason["field"] == "content"
+    assert "blob_ref" not in field_result.reason
     assert blob_result.reason["reason"] == "csv_column_count_mismatch"
     assert blob_result.reason["expected"] == 2
     assert blob_result.reason["actual"] == 1

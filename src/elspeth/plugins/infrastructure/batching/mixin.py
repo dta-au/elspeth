@@ -536,13 +536,23 @@ class BatchTransformMixin(BatchTransformRuntime):
             True if entry was evicted, False if not found or already completed
         """
         key = (token_id, state_id)
+        # The tracking entry is dropped ONLY when the buffer actually evicts.
+        # A refused eviction (the entry already completed, held behind a
+        # slower predecessor) leaves the ticket in the buffer, and the release
+        # loop will delete its tracking key when it releases it; popping it
+        # here first made that delete raise KeyError, which the output-port
+        # failure path then emitted in place of the real result. Holding the
+        # submissions lock across buffer.evict() keeps the release loop from
+        # deleting the key between the lookup and the decision; the release
+        # loop never holds the buffer lock while taking this one, so the
+        # nesting cannot deadlock.
         with self._batch_submissions_lock:
-            ticket = self._batch_submissions.pop(key, None)
-
-        if ticket is None:
-            return False
-
-        return self._batch_buffer.evict(ticket)
+            if key not in self._batch_submissions:
+                return False
+            evicted = self._batch_buffer.evict(self._batch_submissions[key])
+            if evicted:
+                del self._batch_submissions[key]
+        return evicted
 
     def shutdown_batch_processing(self, timeout: float = 30.0, *, wait_for_workers: bool = True) -> None:
         """Shutdown batch processing gracefully.
