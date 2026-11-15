@@ -347,7 +347,7 @@ def test_shared_route_and_persistence_expose_only_public_projection(
     resolved_body = resolved.json()
 
     digest_hex = marked_body["payload_digest"].removeprefix("sha256:")
-    stored_bytes = client.app.state.payload_store.retrieve(digest_hex)
+    stored_bytes = client.app.state.share_payload_store.retrieve(digest_hex)
     stored_body = json.loads(stored_bytes)
     with client.app.state.session_engine.connect() as conn:
         audit_row = conn.execute(
@@ -377,7 +377,7 @@ def test_shared_route_projects_signed_blob_without_rewriting_evidence(
     marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review")
     assert marked.status_code == 200, marked.text
     service = client.app.state.shareable_review_service
-    payload_store = client.app.state.payload_store
+    payload_store = client.app.state.share_payload_store
     signed_payload = service._signer.verify(marked.json()["token"])
     stored = json.loads(payload_store.retrieve(signed_payload.payload_digest.removeprefix("sha256:")))
 
@@ -546,10 +546,26 @@ def test_get_shared_inspect_blob_expired_returns_404(
     token = body["token"]
     digest_hex = body["payload_digest"].removeprefix("sha256:")
     # Reach into the wired payload store and delete the blob.
-    payload_store = client.app.state.payload_store
+    payload_store = client.app.state.share_payload_store
     assert payload_store.delete(digest_hex), "blob should exist before deletion"
     response = client.get(f"/api/sessions/shared/{token}")
     assert response.status_code == 404
+
+
+def test_new_view_only_share_survives_main_store_purge(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+) -> None:
+    client, session_id = audit_readiness_client_with_state
+    marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review")
+    assert marked.status_code == 200, marked.text
+    digest = marked.json()["payload_digest"].removeprefix("sha256:")
+    main_store = client.app.state.payload_store
+    main_store.delete(digest)  # Simulate purge of a run with identical bytes.
+
+    inspected = client.get(f"/api/sessions/shared/{marked.json()['token']}")
+    assert inspected.status_code == 200, inspected.text
+    reminted = client.get(f"/api/sessions/{session_id}/shareable-link")
+    assert reminted.status_code == 200, reminted.text
 
 
 def _seed_uploaded_file_source(client: TestClient, session_id: UUID, content: bytes) -> dict[str, str]:
@@ -762,7 +778,7 @@ def test_mark_ready_for_review_audit_write_failure_returns_no_token(
     client, session_id = audit_readiness_client_with_state
 
     # Track payload_store.store calls so we can prove no blob was written.
-    payload_store = client.app.state.payload_store
+    payload_store = client.app.state.share_payload_store
     original_store = payload_store.store
     store_calls: list[bytes] = []
 
@@ -806,7 +822,7 @@ def test_mark_ready_accepts_absent_body(
     payload = service._signer.verify(response.json()["token"])
     lifetime = client.app.state.settings.shareable_link_lifetime_seconds
     assert payload.expires_at - payload.created_at == timedelta(seconds=lifetime)
-    stored = json.loads(client.app.state.payload_store.retrieve(payload.payload_digest.removeprefix("sha256:")))
+    stored = json.loads(client.app.state.share_payload_store.retrieve(payload.payload_digest.removeprefix("sha256:")))
     assert stored["import_allowed"] is False
     assert stored["files"] == []
 
@@ -826,7 +842,7 @@ def test_mark_ready_refuses_files_that_changed_since_the_preview(
     detail = refused.json()["detail"]
     assert detail["error_type"] == "share_files_changed"
     assert detail["detail"] == "the files this pipeline uses changed since you reviewed them; review the list and create the link again"
-    assert not client.app.state.payload_store.exists(swapped["content_hash"])
+    assert not client.app.state.share_payload_store.exists(swapped["content_hash"])
     with client.app.state.session_engine.connect() as conn:
         rows = conn.execute(
             select(composer_completion_events_table).where(composer_completion_events_table.c.session_id == str(session_id))
@@ -835,7 +851,7 @@ def test_mark_ready_refuses_files_that_changed_since_the_preview(
 
     confirmed = client.post(f"/api/sessions/{session_id}/mark-ready-for-review", json=_import_share_body(client, session_id))
     assert confirmed.status_code == 200, confirmed.text
-    assert client.app.state.payload_store.exists(swapped["content_hash"])
+    assert client.app.state.share_payload_store.exists(swapped["content_hash"])
 
 
 @pytest.mark.parametrize(
@@ -937,7 +953,7 @@ def test_mark_ready_with_import_freezes_an_uploaded_file(
     marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review", json=_import_share_body(client, session_id))
 
     assert marked.status_code == 200, marked.text
-    payload_store = client.app.state.payload_store
+    payload_store = client.app.state.share_payload_store
     assert payload_store.retrieve(blob["content_hash"]) == content
     stored = json.loads(payload_store.retrieve(marked.json()["payload_digest"].removeprefix("sha256:")))
     assert stored["import_allowed"] is True

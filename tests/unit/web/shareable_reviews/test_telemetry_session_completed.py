@@ -315,6 +315,7 @@ def _build_service_with_fresh_telemetry(  # type: ignore[no-untyped-def]
         sessions_db_engine=engine,
         session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
         payload_store=payload_store,
+        legacy_payload_store=None,
         telemetry=telemetry,
         blob_service=_UnreadBlobService(),
     )

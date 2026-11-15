@@ -519,6 +519,68 @@ def test_import_after_sharer_deletes_file_still_succeeds(client: SyncASGITestCli
     assert copies == {shared.blobs["a"]["content_hash"], shared.blobs["ref"]["content_hash"]}
 
 
+def test_import_survives_main_store_purge(client: SyncASGITestClient, actor: _Actor) -> None:
+    shared = _tom_shares(client, actor)
+    main_store = client.app.state.payload_store
+    main_store.delete(shared.payload_digest.removeprefix("sha256:"))
+    for blob in shared.blobs.values():
+        main_store.delete(blob["content_hash"])
+
+    inspected = client.get(f"/api/sessions/shared/{shared.token}")
+    assert inspected.status_code == 200, inspected.text
+    imported = _import(client, actor, shared.token)
+    assert imported.status_code == 201, imported.text
+
+
+def test_new_share_writes_only_to_share_store(client: SyncASGITestClient, actor: _Actor) -> None:
+    shared = _tom_shares(client, actor)
+    main_store = client.app.state.payload_store
+    share_store = client.app.state.share_payload_store
+    assert share_store.base_path == main_store.base_path / "shares"
+    digests = {shared.payload_digest.removeprefix("sha256:")}
+    digests.update(blob["content_hash"] for blob in shared.blobs.values())
+    for digest in digests:
+        assert share_store.exists(digest)
+        assert not main_store.exists(digest)
+
+
+def test_legacy_main_store_share_still_resolves_and_imports(client: SyncASGITestClient, actor: _Actor) -> None:
+    shared = _tom_shares(client, actor)
+    main_store = client.app.state.payload_store
+    share_store = client.app.state.share_payload_store
+    digests = {shared.payload_digest.removeprefix("sha256:")}
+    digests.update(blob["content_hash"] for blob in shared.blobs.values())
+    for digest in digests:
+        content = share_store.retrieve(digest)
+        assert main_store.store(content) == digest
+        assert share_store.delete(digest)
+
+    inspected = client.get(f"/api/sessions/shared/{shared.token}")
+    assert inspected.status_code == 200, inspected.text
+    reminted = client.get(f"/api/sessions/{shared.session_id}/shareable-link")
+    assert reminted.status_code == 200, reminted.text
+    imported = _import(client, actor, reminted.json()["token"])
+    assert imported.status_code == 201, imported.text
+
+
+def test_share_store_integrity_error_does_not_fall_back(client: SyncASGITestClient, actor: _Actor, monkeypatch: pytest.MonkeyPatch) -> None:
+    shared = _tom_shares(client, actor)
+    main_store = client.app.state.payload_store
+    share_store = client.app.state.share_payload_store
+    digest = shared.payload_digest.removeprefix("sha256:")
+    assert main_store.store(share_store.retrieve(digest)) == digest
+    original_retrieve = share_store.retrieve
+
+    def corrupt_snapshot(content_hash: str) -> bytes:
+        if content_hash == digest:
+            raise IntegrityError("share snapshot is corrupt")
+        return original_retrieve(content_hash)
+
+    monkeypatch.setattr(share_store, "retrieve", corrupt_snapshot)
+    with pytest.raises(IntegrityError, match="share snapshot is corrupt"):
+        client.get(f"/api/sessions/shared/{shared.token}")
+
+
 def test_sharer_can_import_own_link(client: SyncASGITestClient, actor: _Actor) -> None:
     shared = _tom_shares(client, actor)
 
@@ -549,7 +611,7 @@ def test_import_missing_frozen_file_is_404_and_creates_no_session(
     client: SyncASGITestClient, actor: _Actor, created_sessions: list[UUID]
 ) -> None:
     shared = _tom_shares(client, actor)
-    assert client.app.state.payload_store.delete(shared.blobs["ref"]["content_hash"])
+    assert client.app.state.share_payload_store.delete(shared.blobs["ref"]["content_hash"])
     created_sessions.clear()
 
     response = _import(client, actor, shared.token)
@@ -563,7 +625,7 @@ def test_import_corrupt_frozen_file_raises_and_creates_no_session(
     client: SyncASGITestClient, actor: _Actor, created_sessions: list[UUID], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     shared = _tom_shares(client, actor)
-    payload_store = client.app.state.payload_store
+    payload_store = client.app.state.share_payload_store
     original_retrieve = payload_store.retrieve
     corrupt = shared.blobs["ref"]["content_hash"]
 
@@ -639,7 +701,7 @@ def test_import_copy_hash_mismatch_archives_the_new_session(
 ) -> None:
     """R12: a copy whose content hash differs from the manifest is an integrity anomaly."""
     shared = _tom_shares(client, actor)
-    payload_store = client.app.state.payload_store
+    payload_store = client.app.state.share_payload_store
     original_retrieve = payload_store.retrieve
     tampered = shared.blobs["ref"]["content_hash"]
 

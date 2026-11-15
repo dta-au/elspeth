@@ -97,6 +97,7 @@ from elspeth.contracts.blobs import (
 )
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.payload_store import PayloadNotFoundError
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.core.canonical import canonical_json
 from elspeth.core.payload_store import FilesystemPayloadStore
@@ -703,6 +704,7 @@ class ShareableReviewService:
         sessions_db_engine: Engine,
         session_operation_authority: SessionOperationAuthority,
         payload_store: FilesystemPayloadStore,
+        legacy_payload_store: FilesystemPayloadStore | None,
         telemetry: SessionsTelemetry,
         blob_service: BlobServiceProtocol,
     ) -> None:
@@ -714,6 +716,7 @@ class ShareableReviewService:
         self._sessions_db_engine = sessions_db_engine
         self._session_operation_authority = session_operation_authority
         self._payload_store = payload_store
+        self._legacy_payload_store = legacy_payload_store
         # Phase 8 Sub-task 7c — composer.session.completed_total counter.
         # Mirrors the sessions/service.py pattern at line 48/2446 (the
         # cohort b1 interpretation-opt-out emit). The container is owned
@@ -988,11 +991,13 @@ class ShareableReviewService:
             )
         payload_digest = str(event.payload_digest)
         digest_hex = payload_digest.removeprefix(_DIGEST_PREFIX)
-        if not self._payload_store.exists(digest_hex):
+        try:
+            await run_sync_in_worker(self.retrieve_share_payload, digest_hex)
+        except PayloadNotFoundError:
             raise CompositionNotRunnableError(
                 reason="not_marked_ready",
                 detail=_NOT_MARKED_READY_DETAIL,
-            )
+            ) from None
         # Keep the lifespan the owner chose at mark time: a 1-day link must
         # not be stretched to the deployment maximum by "copy link again".
         # Clamped to the CURRENT maximum: if the operator lowered the cap
@@ -1081,11 +1086,25 @@ class ShareableReviewService:
         """
         payload = self._signer.verify(token)
         digest_hex = payload.payload_digest.removeprefix(_DIGEST_PREFIX)
-        blob_bytes = await run_sync_in_worker(self._payload_store.retrieve, digest_hex)
+        blob_bytes = await run_sync_in_worker(self.retrieve_share_payload, digest_hex)
         # The payload store has already verified the digest matches —
         # any tampering on the filesystem path raises IntegrityError
         # before we get here.
         return payload, self._parse_blob(blob_bytes)
+
+    def retrieve_share_payload(self, digest_hex: str) -> bytes:
+        """Read share bytes, including pre-namespace links stored beside run payloads.
+
+        Legacy objects remain purge-exposed; only new writes enter the shares
+        namespace. Corruption in the share store must never be hidden by a
+        healthy legacy copy.
+        """
+        try:
+            return self._payload_store.retrieve(digest_hex)
+        except PayloadNotFoundError:
+            if self._legacy_payload_store is None:
+                raise
+            return self._legacy_payload_store.retrieve(digest_hex)
 
     # ── private helpers ─────────────────────────────────────────────
 

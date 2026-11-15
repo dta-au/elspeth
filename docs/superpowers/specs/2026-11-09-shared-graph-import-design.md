@@ -129,9 +129,11 @@ continues to expose only the public projection plus a recipient-safe file list
   content-addressed, two shares of the same file share one stored copy.
   Reclamation is tracked in dta-au/elspeth#356. No startup retention check is
   added: there is no setting that governs share content to check against.
-- **Edge case:** `elspeth purge` reclaiming a run whose payload has bytes
-  identical to a live share's frozen file deletes that file; import then returns
-  the handled 404. Also tracked in dta-au/elspeth#356.
+- **Namespace amendment:** new share snapshots and frozen files live under
+  `<web payload store base>/shares`, outside the hash paths deleted by
+  `elspeth purge`. Pre-change links fall back to parent-store bytes only when
+  absent from `shares/`; those legacy bytes remain purge-exposed. Share
+  reclamation remains tracked in dta-au/elspeth#356.
 - **Re-minting keeps the chosen lifespan.** "Copy link again"
   (`get_shareable_link`) previously re-minted with the global maximum; it now
   reuses the original lifespan (`expires_at - created_at` from the
