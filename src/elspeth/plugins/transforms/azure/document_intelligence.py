@@ -148,7 +148,7 @@ class ExtractFields(BaseModel):
 class AzureDocumentIntelligenceConfig(AzureAnalyzeConfig):
     """Configuration for the azure_document_intelligence transform."""
 
-    endpoint: str = Field(..., description="Azure Document Intelligence resource endpoint URL (HTTPS, Azure host only).")
+    endpoint: str = Field(..., description="Azure Document Intelligence resource endpoint URL (HTTPS, Azure host only).", repr=False)
     api_version: str = Field("2024-11-30", description="REST api-version (GA 2024-11-30 only in v1).")
     model_id: str = Field(..., description="Prebuilt or custom model id, e.g. prebuilt-layout, prebuilt-invoice.")
 
@@ -268,7 +268,7 @@ class AzureDocumentIntelligence(AzureAnalyzeTransform):
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
     # Placeholder must be a sha256: literal so the hash normalizer matches it; recomputed by scripts/cicd/plugin_hash.
-    source_file_hash: str | None = "sha256:af3c39691fe2f540"
+    source_file_hash: str | None = "sha256:05dce85a2b49c66c"
     config_model = AzureDocumentIntelligenceConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED

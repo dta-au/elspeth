@@ -2,7 +2,7 @@
 
 import pytest
 
-from elspeth.core.security.web import SSRFBlockedError, parse_http_origin, validate_allowed_http_origin
+from elspeth.core.security.web import SSRFBlockedError, configured_url_refusal_message, parse_http_origin, validate_allowed_http_origin
 from elspeth.plugins.transforms.blob_fetch import BlobFetchHTTPConfig
 from elspeth.plugins.transforms.web_scrape import WebScrapeHTTPConfig
 
@@ -33,6 +33,16 @@ def test_exact_origin_rejects_other_destinations(requested: str) -> None:
     with pytest.raises(SSRFBlockedError, match="origin") as exc:
         validate_allowed_http_origin(requested, (parse_http_origin("https://example.gov.au"),))
     assert exc.value.kind == "origin_not_allowed"
+
+
+@pytest.mark.parametrize("requested", ["https://example.gov.au/a\\b", "https://example.gov.au%2e.evil.test/a", "https://other.gov.au/a"])
+def test_origin_refusal_explains_syntax_and_membership(requested: str) -> None:
+    with pytest.raises(SSRFBlockedError) as exc:
+        validate_allowed_http_origin(requested, (parse_http_origin("https://example.gov.au"),))
+    assert exc.value.kind == "origin_not_allowed"
+    message = configured_url_refusal_message(exc.value.kind)
+    assert "well-formed" in message
+    assert "http.allowed_origins" in message
 
 
 def test_exact_origin_refuses_control_character_as_malformed_url() -> None:

@@ -252,6 +252,10 @@ class PluginConfig(BaseModel):
         "frozen": True,
         "populate_by_name": True,  # Allow both "schema" (alias) and "schema_config" (field name)
         "field_title_generator": _plugin_config_field_title,
+        # A ValidationError chained as PluginConfigError.__cause__ must not echo
+        # the authored input: a model-level error's input is the whole options
+        # dict, whose truncated repr can open with a credential value.
+        "hide_input_in_errors": True,
     }
 
     schema_config: SchemaConfig | None = Field(

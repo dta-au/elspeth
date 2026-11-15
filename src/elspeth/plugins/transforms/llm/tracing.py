@@ -32,7 +32,7 @@ Example YAML Configuration:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from elspeth.core.url_validation import validate_credential_safe_https_url
@@ -95,7 +95,7 @@ class AzureAITracingConfig(TracingConfig):
     """
 
     provider: str = "azure_ai"
-    connection_string: str | None = None
+    connection_string: str | None = field(default=None, repr=False)
     enable_content_recording: bool = True
     enable_live_metrics: bool = False
 
@@ -143,8 +143,8 @@ class LangfuseTracingConfig(TracingConfig):
 
     provider: str = "langfuse"
     public_key: str | None = None
-    secret_key: str | None = None
-    host: str | None = None
+    secret_key: str | None = field(default=None, repr=False)
+    host: str | None = field(default=None, repr=False)
     tracing_enabled: bool = True
 
     def __post_init__(self) -> None:

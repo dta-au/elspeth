@@ -191,12 +191,14 @@ class AzureBlobSourceConfig(DataPluginConfig):
     connection_string: str | None = Field(
         default=None,
         description="Azure Storage connection string",
+        repr=False,
     )
 
     # Auth Option 2: SAS token
     sas_token: str | None = Field(
         default=None,
         description="Azure Storage SAS token (with or without leading '?')",
+        repr=False,
     )
 
     # Auth Option 3: Managed Identity
@@ -207,6 +209,7 @@ class AzureBlobSourceConfig(DataPluginConfig):
     account_url: str | None = Field(
         default=None,
         description="Azure Storage account URL (e.g., https://mystorageaccount.blob.core.windows.net)",
+        repr=False,
     )
 
     # Auth Option 4: Service Principal
@@ -221,6 +224,7 @@ class AzureBlobSourceConfig(DataPluginConfig):
     client_secret: str | None = Field(
         default=None,
         description="Azure AD client secret for Service Principal auth",
+        repr=False,
     )
 
     # Blob location (required for all auth methods)
@@ -426,7 +430,7 @@ class AzureBlobSource(BaseSource):
     name = "azure_blob"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:50003a51c8495a6b"
+    source_file_hash: str | None = "sha256:fd33f2630f7e2406"
     config_model = AzureBlobSourceConfig
 
     usage_when_to_use: str = (

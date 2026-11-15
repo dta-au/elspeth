@@ -109,8 +109,13 @@ The pipeline Azure LLM provider uses its configured API key and the OpenAI
 SDK directly. It does not use Composer's LiteLLM cost admission. Its config
 representation hides the API key; malformed response envelopes retain an
 error audit record and telemetry. Azure HTTP 429 is retryable, HTTP 401 is
-not made retryable by incidental numbers in its message, and `content_filter`
-is classified as a content-policy rejection.
+not made retryable by incidental numbers in its message. Empty or whitespace-only
+completions are audited as `ERROR` calls: `content_filter` or refusal is a
+content-policy rejection, `length` indicates an exhausted output budget, and
+other finish reasons indicate an unexplained empty completion. A `tool_calls`
+response is unsupported. Replay raises the recorded error; older blank
+`SUCCESS` or response-bearing null-content `ContentPolicyError` records require
+a new live run.
 
 ## Execution model and billing identity
 

@@ -9,9 +9,18 @@ share one validator rather than one per layer.
 from __future__ import annotations
 
 import re
-from urllib.parse import urlparse
+from urllib.parse import ParseResult, urlparse
 
 _ASCII_IPV4_LABEL_RE = re.compile(r"^[0-9]+$")
+
+
+def parse_credential_url_components(value: str) -> tuple[ParseResult | None, str | None, str | None, str | None]:
+    """Parse an authored URL without letting parser diagnostics escape the boundary."""
+    try:
+        parsed = urlparse(value)
+        return parsed, parsed.hostname, parsed.username, parsed.password
+    except ValueError:
+        return None, None, None, None
 
 
 def _is_loopback_host(hostname: str) -> bool:
@@ -38,15 +47,17 @@ def validate_credential_safe_https_url(value: str, *, field_name: str, allow_htt
     if not stripped:
         raise ValueError(f"{field_name} must not be empty")
 
-    parsed = urlparse(stripped)
-    if not parsed.hostname:
+    parsed, hostname, username, password = parse_credential_url_components(stripped)
+    if parsed is None:
+        raise ValueError(f"{field_name} must be a valid URL")
+    if not hostname:
         raise ValueError(f"{field_name} must include a hostname")
-    if parsed.username is not None or parsed.password is not None:
+    if username is not None or password is not None:
         raise ValueError(f"{field_name} must not contain embedded credentials")
     if parsed.scheme == "https":
         return stripped
-    if allow_http_loopback and parsed.scheme == "http" and _is_loopback_host(parsed.hostname):
+    if allow_http_loopback and parsed.scheme == "http" and _is_loopback_host(hostname):
         return stripped
     if allow_http_loopback:
         raise ValueError(f"{field_name} must use HTTPS unless targeting an HTTP loopback host")
-    raise ValueError(f"{field_name} must use HTTPS scheme, got {parsed.scheme!r}")
+    raise ValueError(f"{field_name} must use HTTPS scheme")

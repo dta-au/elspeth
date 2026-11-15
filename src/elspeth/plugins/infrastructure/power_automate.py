@@ -217,9 +217,11 @@ class _PowerAutomateOptions(DataPluginConfig):
     trigger_url: StrictStr | None = Field(
         default=None,
         description="Unsigned HTTPS trigger URL for OAuth authentication; omit when auth supplies a signed callback URL.",
+        repr=False,
     )
     allowed_origin: StrictStr = Field(
-        description="Exact approved HTTPS origin for the flow, without a path or query; every request must stay on this origin."
+        description="Exact approved HTTPS origin for the flow, without a path or query; every request must stay on this origin.",
+        repr=False,
     )
     timeout_seconds: float = Field(
         default=90,

@@ -25,6 +25,7 @@ from elspeth.plugins.infrastructure.clients.llm import (
     AuditedLLMClient,
     ContentPolicyError,
     ContextLengthError,
+    EmptyCompletionError,
     LLMClientError,
     LLMResponse,
     NetworkError,
@@ -312,7 +313,8 @@ def test_execution_pricing_identity_does_not_change_routing_or_returned_model(co
     )
     with patch.object(litellm, "cost_per_token", return_value=(0.01, 0.02)) as calculator:
         if content is None:
-            with pytest.raises(ContentPolicyError):
+            # Null content with finish_reason=stop is an unexplained empty completion.
+            with pytest.raises(EmptyCompletionError):
                 client.chat_completion(model="operator-datazone-alias", messages=[ChatMessage(role="user", content="Hello")])
         else:
             result = client.chat_completion(model="operator-datazone-alias", messages=[ChatMessage(role="user", content="Hello")])
@@ -2006,9 +2008,11 @@ class TestContentFabrication:
         assert call_kwargs["status"] == CallStatus.ERROR
         assert call_kwargs["state_id"] == "state_fab"
         assert call_kwargs["call_type"] == CallType.LLM
-        # Error should describe the content policy issue
+        # Error records the content-filter classification the call raised
         assert call_kwargs["error"] is not None
-        assert "null content" in call_kwargs["error"].message.lower() or "content-filtered" in call_kwargs["error"].message.lower()
+        assert call_kwargs["error"].type == "FilteredCompletionError"
+        assert call_kwargs["error"].category == "content_policy"
+        assert "filtered" in call_kwargs["error"].message
         assert call_kwargs["error"].retryable is False
         # Response data should still be recorded for audit completeness
         assert call_kwargs["response_data"] is not None
@@ -2086,8 +2090,8 @@ class TestContentFabrication:
         assert call_kwargs["status"] == CallStatus.ERROR
         assert call_kwargs["error"].type == "EmptyChoicesError"
 
-    def test_empty_string_content_is_valid(self) -> None:
-        """content="" is a legitimate response — must NOT raise."""
+    def test_empty_string_content_is_recorded_as_its_classified_error(self) -> None:
+        """content="" is an empty completion: recorded ERROR with its classification, never SUCCESS (#123)."""
         execution = self._create_mock_execution()
 
         openai_client = FakeOpenAIClient(
@@ -2100,11 +2104,17 @@ class TestContentFabrication:
 
         client = self._create_client(execution, openai_client)
 
-        result = client.chat_completion(
-            model="gpt-4",
-            messages=[ChatMessage(role="user", content="Hello")],
-        )
-        assert result.content == ""
+        with pytest.raises(EmptyCompletionError, match="without an explicit refusal"):
+            client.chat_completion(
+                model="gpt-4",
+                messages=[ChatMessage(role="user", content="Hello")],
+            )
+        execution.assert_recorded_once()
+        call_kwargs = execution.last_record_call_kwargs
+        assert call_kwargs["status"] == CallStatus.ERROR
+        assert call_kwargs["error"].type == "EmptyCompletionError"
+        assert call_kwargs["error"].category == "client"
+        assert call_kwargs["response_data"].content == ""
 
 
 class TestModelDumpFailureRecordsCall:
