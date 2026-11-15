@@ -328,8 +328,9 @@ proof that browser traffic cannot bypass audit and destination policy.
 whitespace collapsed, so only a change of the extracted text changes it.
 `fingerprint_mode: full` hashes the exact extracted content together with, for
 every fetched page in order, the HTTP status, the persisted final URL (as in
-`fetch_url_final`), the raw `Content-Type` header and the SHA-256 of the raw
-response body. Other response headers are not covered: values such as `Date`,
+`fetch_url_final`), the raw `Content-Type` header and the SHA-256 of the
+content-decoded body (after transfer and content decoding, before text
+extraction). Other response headers are not covered: values such as `Date`,
 `Age` and cookies change on every fetch and would defeat change detection.
 
 ## Text Extraction And Line Splitting

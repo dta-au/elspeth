@@ -350,7 +350,7 @@ class WebScrapeConfig(TransformDataConfig):
         default="content",
         description=(
             "Hash of the extracted content with whitespace collapsed (content), or of the exact content plus each "
-            "fetched page's HTTP status, final URL, content type and raw body hash (full)."
+            "fetched page's HTTP status, final URL, content type and content-decoded body hash (full)."
         ),
     )
     strip_elements: list[str] = Field(
@@ -757,6 +757,8 @@ def _fetch_response_context(response: httpx.Response, final_hostname_url: str) -
 
     ``final_url`` is the persisted ``fetch_url_final`` rendering, so the
     fingerprint never hashes a raw URL secret the row itself does not carry.
+    ``response.content`` is the body after transfer and content decoding,
+    before text extraction.
     """
     return FetchResponseContext(
         status_code=response.status_code,
@@ -811,7 +813,7 @@ class WebScrapeTransform(BaseTransform):
         format: Output format ("markdown", "text", "raw")
         text_separator: Separator between DOM text nodes when format is text
         fingerprint_mode: Fingerprinting mode ("content": whitespace-normalized content;
-            "full": exact content plus each page's status, final URL, content type and raw body hash)
+            "full": exact content plus each page's status, final URL, content type and content-decoded body hash)
         strip_elements: HTML tags to remove (default: ["script", "style"])
         http:
             abuse_contact: Email for abuse reports (required)
@@ -845,7 +847,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "2.0.0"
-    source_file_hash: str | None = "sha256:ec168ed0f04544a3"
+    source_file_hash: str | None = "sha256:4c81c5d216a479f8"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True

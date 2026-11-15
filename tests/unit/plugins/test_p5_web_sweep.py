@@ -7,7 +7,7 @@ final URL, content type or raw body that left the extracted text unchanged was
 invisible to it. ``full`` now hashes the extracted content together with, for
 every fetched page in order, the HTTP status, the persisted final URL
 (``fetch_url_final`` rendering), the raw ``Content-Type`` header and the
-SHA-256 of the raw response body. ``content`` is unchanged.
+SHA-256 of the content-decoded body. ``content`` is unchanged.
 
 Shared URL helpers: ``core/security/web.py`` admitted DEL (``\\x7f``) everywhere
 and, with an empty ``allowed_origins``, every C0 control character, although
@@ -16,15 +16,16 @@ in its own row path. Every SSRF / origin helper now refuses ASCII C0 and DEL
 with ``SSRFBlockedError(kind="malformed_url")``, so every caller (blob_fetch,
 the browser boundary, discovered links, the HTTP clients) inherits it.
 
-Every test fails at an assertion on the pre-fix tree: refusals are captured
-explicitly rather than allowed to escape as uncaught exceptions, and the new
-fingerprint API is asserted to exist before it is used.
+The pre-fix tree fails the behavior regressions; some tests also exercise
+behavior that was already correct. Refusals are checked through process results
+where possible, and the fingerprint API is asserted to exist before use.
 """
 
 from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import socket
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -110,11 +111,13 @@ def test_full_fingerprint_requires_response_context() -> None:
 class _Recorder:
     def __init__(self) -> None:
         self.count = 0
+        self.indices: list[int] = []
 
     def allocate_call_index(self, *_args: Any, **_kwargs: Any) -> int:
         return self.count
 
     def record_call(self, *_args: Any, **_kwargs: Any) -> Call:
+        self.indices.append(self.count)
         self.count += 1
         return Call(
             call_id=f"call-{self.count}",
@@ -146,9 +149,9 @@ def _plugin_context() -> PluginContext:
         run_id="run-123",
         **mock_item_audit_authority("run-123"),
         config={},
-        landscape=_Recorder(),
-        payload_store=_PayloadStore(),
-        rate_limit_registry=_LimiterRegistry(),
+        landscape=cast(Any, _Recorder()),
+        payload_store=cast(Any, _PayloadStore()),
+        rate_limit_registry=cast(Any, _LimiterRegistry()),
         state_id="state-123",
     )
 
@@ -231,13 +234,238 @@ def test_web_scrape_full_fingerprint_is_exactly_the_documented_context() -> None
     assert row["fingerprint"] == expected
 
 
+def _expected_full_fingerprint(content: str, pages: list[tuple[str, bytes]]) -> str:
+    document = {
+        "version": 1,
+        "content": content,
+        "responses": [
+            {
+                "status_code": 200,
+                "final_url": url,
+                "content_type": "text/html",
+                "body_sha256": hashlib.sha256(body).hexdigest(),
+            }
+            for url, body in pages
+        ],
+    }
+    encoded = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _pagination_process(first_body: str, second_body: str) -> tuple[Any, Any, Any]:
+    from elspeth.plugins.transforms.web_scrape import WebScrapeTransform
+
+    transform = WebScrapeTransform(
+        {
+            "schema": {"mode": "observed"},
+            "url_field": "url",
+            "content_field": "content",
+            "fingerprint_field": "fingerprint",
+            "fingerprint_mode": "full",
+            "format": "text",
+            "pagination": {"mode": "next_link_css", "next_link_selector": "a.next"},
+            "http": {
+                "abuse_contact": "test@example.com",
+                "scraping_reason": "pagination fingerprint test",
+                "allowed_origins": ["https://example.com"],
+            },
+        }
+    )
+    context = _plugin_context()
+    with respx.mock:
+        first = respx.get(f"https://{_PUBLIC_IP}:443/page").mock(
+            return_value=httpx.Response(200, headers={"content-type": "text/html"}, content=first_body.encode())
+        )
+        second = respx.get(f"https://{_PUBLIC_IP}:443/p2").mock(
+            return_value=httpx.Response(200, headers={"content-type": "text/html"}, content=second_body.encode())
+        )
+        transform.on_start(context)
+        with patch("socket.getaddrinfo", _dns):
+            result = transform.process(make_pipeline_row({"url": _PAGE}), context)
+        return result, first, second
+
+
+def test_full_fingerprint_collects_second_page_response_context() -> None:
+    first = '<p>first</p><a class="next" href="/p2">Next</a>'
+    second = "<p>second</p><!-- hidden -->"
+    changed = "<p>second</p><!-- revised -->"
+    initial, first_route, second_route = _pagination_process(first, second)
+    revised, _, _ = _pagination_process(first, changed)
+    assert initial.status == revised.status == "success"
+    assert first_route.call_count == second_route.call_count == 1
+    assert initial.row is not None and revised.row is not None
+    content = "first Next second"
+    assert initial.row["content"] == revised.row["content"] == content
+    assert initial.row["fingerprint"] == _expected_full_fingerprint(
+        content, [(_PAGE, first.encode()), ("https://example.com/p2", second.encode())]
+    )
+    assert revised.row["fingerprint"] == _expected_full_fingerprint(
+        content, [(_PAGE, first.encode()), ("https://example.com/p2", changed.encode())]
+    )
+    assert initial.row["fingerprint"] != revised.row["fingerprint"]
+
+
+def test_full_fingerprint_hashes_persisted_final_url_rendering() -> None:
+    body = b"<p>hi</p>"
+    requested = "https://example.com/page?q=a%20b"
+    row = _scrape("full", requested, httpx.Response(200, headers={"content-type": "text/html"}, content=body))
+    assert row["fetch_url_final"] == "https://example.com/page?q=a+b"
+    assert row["fingerprint"] == _expected_full_fingerprint("hi", [("https://example.com/page?q=a+b", body)])
+    assert row["fingerprint"] != _expected_full_fingerprint("hi", [(requested, body)])
+
+
+@pytest.mark.parametrize("char", ["\n", "\t", "\x01", "\x7f"])
+@pytest.mark.parametrize("position", ["path", "fragment"])
+def test_css_pagination_refuses_raw_control_href_before_second_fetch(char: str, position: str) -> None:
+    href = f"/p2{char}" if position == "path" else f"/p2#{char}"
+    body = f'<p>first</p><a class="next" href="{href}">Next</a>'
+    result, first, second = _pagination_process(body, "<p>second</p>")
+    assert result.status == "error"
+    assert result.reason is not None and result.reason["reason"] == "validation_failed"
+    assert first.call_count == 1
+    assert second.call_count == 0
+
+
+@pytest.mark.parametrize("char", ["\n", "\t", "\x01", "\x7f"])
+@pytest.mark.parametrize("position", ["path", "fragment"])
+def test_discovered_href_refuses_raw_control_before_fragment_removal(char: str, position: str) -> None:
+    from elspeth.plugins.transforms.web_scrape_links import resolve_discovered_href
+
+    href = f"/p2{char}" if position == "path" else f"/p2#{char}"
+    with pytest.raises(ValueError):
+        resolve_discovered_href(href, base_url=_PAGE, allowed_origins=_ORIGINS, allowed_ranges=())
+
+
+@pytest.mark.parametrize("char", ["\n", "\t", "\x01", "\x7f"])
+def test_redirect_location_control_is_nonretryable_and_never_fetched(char: str) -> None:
+    from elspeth.plugins.transforms.web_scrape import WebScrapeTransform
+
+    transform = WebScrapeTransform(
+        {
+            "schema": {"mode": "observed"},
+            "url_field": "url",
+            "content_field": "content",
+            "fingerprint_field": "fingerprint",
+            "http": {"abuse_contact": "test@example.com", "scraping_reason": "redirect admission test"},
+        }
+    )
+    context = _plugin_context()
+    with respx.mock:
+        first = respx.get(f"https://{_PUBLIC_IP}:443/page").mock(return_value=httpx.Response(302, headers={"location": f"/p2{char}"}))
+        second = respx.get(f"https://{_PUBLIC_IP}:443/p2").mock(return_value=_html())
+        transform.on_start(context)
+        with patch("socket.getaddrinfo", _dns):
+            result = transform.process(make_pipeline_row({"url": _PAGE}), context)
+    assert result.status == "error"
+    assert result.reason is not None and result.reason["error_type"] == "SSRFBlockedError"
+    assert first.call_count == 1
+    assert second.call_count == 0
+
+
+@pytest.mark.parametrize("char", ["\n", "\t", "\x01", "\x7f"])
+@pytest.mark.parametrize("position", ["path", "fragment"])
+def test_later_redirect_location_control_is_nonretryable_with_one_audit_per_request(char: str, position: str) -> None:
+    from elspeth.plugins.transforms.web_scrape import WebScrapeTransform
+
+    transform = WebScrapeTransform(
+        {
+            "schema": {"mode": "observed"},
+            "url_field": "url",
+            "content_field": "content",
+            "fingerprint_field": "fingerprint",
+            "http": {"abuse_contact": "test@example.com", "scraping_reason": "redirect admission test"},
+        }
+    )
+    context = _plugin_context()
+    recorder = cast(_Recorder, context.landscape)
+    location = f"/p2{char}" if position == "path" else f"/p2#{char}"
+    with respx.mock:
+        first = respx.get(f"https://{_PUBLIC_IP}:443/page").mock(return_value=httpx.Response(302, headers={"location": "/middle"}))
+        middle = respx.get(f"https://{_PUBLIC_IP}:443/middle").mock(return_value=httpx.Response(302, headers={"location": location}))
+        third = respx.get(f"https://{_PUBLIC_IP}:443/p2").mock(return_value=_html())
+        transform.on_start(context)
+        with patch("socket.getaddrinfo", _dns):
+            result = transform.process(make_pipeline_row({"url": _PAGE}), context)
+    assert result.status == "error"
+    assert result.reason is not None and result.reason["error_type"] == "SSRFBlockedError"
+    assert result.retryable is False
+    assert (first.call_count, middle.call_count, third.call_count) == (1, 1, 0)
+    assert recorder.indices == [0, 1]
+
+
+@pytest.mark.parametrize("status", [300, 304, 305, 306, 309])
+@pytest.mark.parametrize("later_response", [False, True], ids=["initial", "later"])
+@pytest.mark.parametrize("location", ["/p2#\t", "/p2\x7f"], ids=["tab-fragment", "del-path"])
+def test_manual_follow_refuses_malformed_location_on_additional_3xx(status: int, later_response: bool, location: str) -> None:
+    from elspeth.plugins.transforms.web_scrape import WebScrapeTransform
+
+    transform = WebScrapeTransform(
+        {
+            "schema": {"mode": "observed"},
+            "url_field": "url",
+            "content_field": "content",
+            "fingerprint_field": "fingerprint",
+            "http": {"abuse_contact": "test@example.com", "scraping_reason": "redirect admission test"},
+        }
+    )
+    context = _plugin_context()
+    recorder = cast(_Recorder, context.landscape)
+    with respx.mock:
+        first_location = "/middle" if later_response else location
+        first_status = 302 if later_response else status
+        first = respx.get(f"https://{_PUBLIC_IP}:443/page").mock(
+            return_value=httpx.Response(first_status, headers={"location": first_location})
+        )
+        middle = respx.get(f"https://{_PUBLIC_IP}:443/middle").mock(return_value=httpx.Response(status, headers={"location": location}))
+        target = respx.get(f"https://{_PUBLIC_IP}:443/p2").mock(return_value=_html())
+        transform.on_start(context)
+        with patch("socket.getaddrinfo", _dns):
+            result = transform.process(make_pipeline_row({"url": _PAGE}), context)
+
+    assert result.status == "error"
+    assert result.reason is not None and result.reason["error_type"] == "SSRFBlockedError"
+    assert result.retryable is False
+    assert (first.call_count, middle.call_count, target.call_count) == ((1, 1, 0) if later_response else (1, 0, 0))
+    assert recorder.indices == ([0, 1] if later_response else [0])
+
+
+@pytest.mark.parametrize("status", [200, 201, 300, 302, 304, 305, 306, 309, 400, 500])
+def test_no_follow_admits_only_httpx_redirect_targets(status: int) -> None:
+    from elspeth.core.security.web import SSRFBlockedError, validate_url_for_ssrf
+    from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
+
+    context = _plugin_context()
+    recorder = cast(_Recorder, context.landscape)
+    client = AuditedHTTPClient(
+        member_token=context.require_member_token(),
+        work_item=context.require_work_item(),
+        execution=cast(Any, recorder),
+        state_id=context.state_id,
+        run_id=context.run_id,
+        telemetry_emit=lambda _event: None,
+        timeout=30.0,
+    )
+    with respx.mock:
+        route = respx.get(f"https://{_PUBLIC_IP}:443/page").mock(return_value=httpx.Response(status, headers={"location": "/p2\t"}))
+        with patch("socket.getaddrinfo", _dns):
+            request = validate_url_for_ssrf(_PAGE)
+            if status == 302:
+                with pytest.raises(SSRFBlockedError):
+                    client.get_ssrf_safe(request, follow_redirects=False)
+            else:
+                response, _, _ = client.get_ssrf_safe(request, follow_redirects=False)
+                assert response.status_code == status
+    assert route.call_count == 1
+    assert recorder.indices == [0]
+
+
 def test_fingerprint_mode_description_names_the_covered_context() -> None:
     from elspeth.plugins.transforms.web_scrape import WebScrapeConfig
 
     description = WebScrapeConfig.model_fields["fingerprint_mode"].description
     assert description is not None
     assert "neither mode covers" not in description
-    for term in ("status", "final URL", "content type", "raw body"):
+    for term in ("status", "final URL", "content type", "content-decoded body"):
         assert term in description, f"fingerprint_mode description must name {term!r} as covered by full"
 
 

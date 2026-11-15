@@ -151,6 +151,9 @@ def discover_next_url(response: httpx.Response, final_url: str, config: Paginati
         if href is None:
             return None
 
+    if contains_ascii_control_character(href):
+        raise ValueError("pagination next URL contains control characters")
+
     # URL joining may produce a non-HTTP scheme or another origin; the caller
     # rejects those before DNS. Strip fragment because it is not sent on wire.
     resolved = urljoin(final_url, href)

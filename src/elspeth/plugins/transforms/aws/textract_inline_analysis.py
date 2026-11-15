@@ -278,7 +278,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_inline_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "2.0.0"
-    source_file_hash: str | None = "sha256:672b761d01711c8f"
+    source_file_hash: str | None = "sha256:e10303cba8d646d7"
     config_model = AWSTextractInlineAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED

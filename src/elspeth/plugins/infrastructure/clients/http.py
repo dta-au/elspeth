@@ -15,6 +15,7 @@ import time
 import zlib
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
+from functools import partial
 from ipaddress import IPv4Network, IPv6Network
 from threading import Lock
 from types import MappingProxyType
@@ -51,7 +52,9 @@ from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.security.web import (
     HTTPOrigin,
     NetworkError,
+    SSRFBlockedError,
     SSRFSafeRequest,
+    contains_ascii_control_character,
     validate_allowed_http_origin,
     validate_url_for_ssrf,
 )
@@ -83,6 +86,14 @@ logger = structlog.get_logger(__name__)
 
 _HTTP_URL_IN_TEXT = re.compile(r"https?://\S+", re.IGNORECASE)
 _FINGERPRINTED_AUTH = re.compile(r"<fingerprint:[0-9a-f]{64}>\Z")
+
+
+def _admit_raw_redirect_location(response: httpx.Response, *, manual_follow: bool) -> None:
+    """Refuse raw control bytes before httpx builds a redirect request."""
+    if (
+        response.has_redirect_location or (manual_follow and response.is_redirect and "location" in response.headers)
+    ) and contains_ascii_control_character(response.headers["location"]):
+        raise SSRFBlockedError("Redirect Location contains an ASCII control character", kind="malformed_url")
 
 
 def _sanitize_http_error_message(message: str) -> str:
@@ -1872,6 +1883,7 @@ class AuditedHTTPClient(AuditedClientBase):
         multipart_body: bytes | None,
         params: dict[str, str | int | float] | None,
         deadline: HTTPDeadline,
+        follow_redirects: bool,
         before_send: Callable[[], None] | None = None,
     ) -> httpx.Response:
         """Send one IP-pinned request with method-specific httpx handling.
@@ -1885,6 +1897,7 @@ class AuditedHTTPClient(AuditedClientBase):
                 follow_redirects=False,
                 trust_env=False,
                 transport=DeadlineHTTPTransport(deadline),
+                event_hooks={"response": [partial(_admit_raw_redirect_location, manual_follow=follow_redirects)]},
             ) as deadline_client:
                 self._run_before_send(before_send)
                 return self._request_with_optional_body_cap(
@@ -2091,6 +2104,7 @@ class AuditedHTTPClient(AuditedClientBase):
                 with deadline_bound_client(
                     timeout=effective_timeout,
                     trust_env=self._audit_policy is HTTPAuditPolicy.GENERIC,
+                    event_hooks={"response": [partial(_admit_raw_redirect_location, manual_follow=follow_redirects)]},
                 ) as ssrf_client:
                     response = self._send_ssrf_safe_request(
                         ssrf_client,
@@ -2103,6 +2117,7 @@ class AuditedHTTPClient(AuditedClientBase):
                         multipart_body=multipart_body,
                         params=params,
                         deadline=deadline,
+                        follow_redirects=follow_redirects,
                         before_send=before_send,
                     )
 
@@ -2489,7 +2504,10 @@ class AuditedHTTPClient(AuditedClientBase):
                     if self._audit_policy is HTTPAuditPolicy.GENERIC:
                         raise httpx.ConnectTimeout("HTTP redirect exceeded its remaining deadline") from exc
                     raise
-                with deadline_bound_client(timeout=timeout) as hop_client:
+                with deadline_bound_client(
+                    timeout=timeout,
+                    event_hooks={"response": [partial(_admit_raw_redirect_location, manual_follow=True)]},
+                ) as hop_client:
                     response = self._request_with_optional_body_cap(
                         hop_client,
                         "GET",

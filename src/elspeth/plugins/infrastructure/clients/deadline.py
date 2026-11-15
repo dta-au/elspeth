@@ -23,12 +23,12 @@ import socket
 import ssl
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import partial
-from typing import ClassVar, Literal
+from typing import Any, ClassVar, Literal
 
 import httpcore
 import httpx
@@ -651,7 +651,12 @@ class DeadlineBoundTransport(httpx.HTTPTransport):
             raise ValueError(f"unsupported proxy scheme {proxy.url.scheme!r}")
 
 
-def deadline_bound_client(*, timeout: float, trust_env: bool = True) -> httpx.Client:
+def deadline_bound_client(
+    *,
+    timeout: float,
+    trust_env: bool = True,
+    event_hooks: Mapping[str, list[Callable[..., Any]]] | None = None,
+) -> httpx.Client:
     """The one httpx client factory for audited HTTP callers.
 
     Every request made with the returned client must run inside
@@ -663,7 +668,9 @@ def deadline_bound_client(*, timeout: float, trust_env: bool = True) -> httpx.Cl
     With ``trust_env`` httpx still selects proxies from ``HTTP(S)_PROXY`` /
     ``ALL_PROXY`` / ``NO_PROXY``; every proxy mount it would build is replaced,
     key for key from httpx's own environment reading, by a deadline-bound
-    transport, so no environment route escapes the deadline.
+    transport, so no environment route escapes the deadline. ``event_hooks``
+    are passed to httpx unchanged (the SSRF clients use one to admit each raw
+    redirect Location before httpx builds the next request).
     """
     mounts: dict[str, httpx.BaseTransport | None] = {}
     if trust_env:
@@ -675,4 +682,5 @@ def deadline_bound_client(*, timeout: float, trust_env: bool = True) -> httpx.Cl
         trust_env=trust_env,
         transport=DeadlineBoundTransport(trust_env=trust_env),
         mounts=mounts,
+        event_hooks=None if event_hooks is None else {name: list(hooks) for name, hooks in event_hooks.items()},
     )
