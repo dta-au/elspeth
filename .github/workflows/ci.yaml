@@ -929,7 +929,7 @@ jobs:
     timeout-minutes: 90
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-testcontainer
-      UV_PYTHON: "3.13"
+      UV_PYTHON: "3.14"
     defaults:
       run:
         shell: bash
@@ -1011,7 +1011,7 @@ jobs:
     timeout-minutes: 15
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-host-runner-unit
-      UV_PYTHON: "3.13"
+      UV_PYTHON: "3.14"
     defaults:
       run:
         shell: bash
@@ -1071,7 +1071,7 @@ jobs:
     timeout-minutes: 15
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-state-engine-validation
-      UV_PYTHON: "3.13"
+      UV_PYTHON: "3.14"
     defaults:
       run:
         shell: bash
@@ -1135,7 +1135,7 @@ jobs:
     timeout-minutes: 15
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-azure-container-apps-bicep
-      UV_PYTHON: "3.13"
+      UV_PYTHON: "3.14"
     defaults:
       run:
         shell: bash
