@@ -59,6 +59,7 @@ from elspeth.web.composer.yaml_generator import generate_public_yaml
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.paths import normalise_session_relative_path
+from elspeth.web.sessions.creation import create_session_with_cancellation_cleanup
 from elspeth.web.sessions.protocol import SessionRecord, SessionServiceProtocol
 from elspeth.web.sessions.routes.composer.state import (
     ImportStateYamlRequest,
@@ -324,7 +325,7 @@ async def import_shared_snapshot(*, token: str, request: Request, user: UserIden
         ) from exc
     settings: WebSettings = request.app.state.settings
     session_service: SessionServiceProtocol = request.app.state.session_service
-    session = await session_service.create_session(user.user_id, title, settings.auth_provider)
+    session = await create_session_with_cancellation_cleanup(session_service, user.user_id, title, settings.auth_provider)
     try:
         blob_ids = await _copy_files(
             request=request,

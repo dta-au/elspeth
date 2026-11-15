@@ -41,6 +41,7 @@ from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.credential_guard import require_no_credential_material_in_state
 from elspeth.web.sessions.converters import state_from_record
+from elspeth.web.sessions.creation import create_session_with_cancellation_cleanup
 from elspeth.web.sessions.protocol import SessionRecord, SessionServiceProtocol
 from elspeth.web.sessions.routes._helpers import _verify_session_ownership
 from elspeth.web.sessions.routes.composer.state import ComposerSeedMetaUpdates, ImportStateYamlRequest
@@ -479,7 +480,9 @@ def create_library_router() -> APIRouter:
                 detail={"error_type": "library_seed_unavailable", "detail": "Library fork seeding is unavailable"},
             ) from exc
         service: SessionServiceProtocol = request.app.state.session_service
-        session = await service.create_session(user.user_id, f"Fork of {source.entry.title}", settings.auth_provider)
+        session = await create_session_with_cancellation_cleanup(
+            service, user.user_id, f"Fork of {source.entry.title}", settings.auth_provider
+        )
         try:
             seeded = await seed(
                 session=session,
