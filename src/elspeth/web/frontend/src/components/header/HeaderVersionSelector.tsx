@@ -499,8 +499,8 @@ export function HeaderVersionSelector(): JSX.Element | null {
         <div className="version-selector-dropdown">
           <div role="status" className="version-selector-loading">
             {historyStatus === "loading" && (stateVersions.length === 0 ? "Loading versions..." : "Refreshing versions...")}
-            {historyStatus === "unsettled" && <>Versions changed while loading. <button type="button" onClick={() => { void loadStateVersions(); }}>Retry</button></>}
-            {historyStatus === "failed" && <>Could not load versions. <button type="button" onClick={() => { void loadStateVersions(); }}>Retry</button></>}
+            {historyStatus === "unsettled" && <>Versions changed while loading. <Button variant="ghost" compact onClick={() => { void loadStateVersions(); }}>Retry</Button></>}
+            {historyStatus === "failed" && <>Could not load versions. <Button variant="ghost" compact onClick={() => { void loadStateVersions(); }}>Retry</Button></>}
             {historyStatus === "settled" && currentRowIsMissing && `Version ${currentVersion} is not in the 50 most recent versions.`}
           </div>
           <ul
