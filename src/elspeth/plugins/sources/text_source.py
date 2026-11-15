@@ -27,7 +27,12 @@ from elspeth.contracts.schema_contract_factory import create_contract_from_confi
 from elspeth.plugins.infrastructure.base import BaseSource
 from elspeth.plugins.infrastructure.config_base import SourceDataConfig
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
-from elspeth.plugins.sources.json_source import BYTE_ESCAPE_ERRORS, contains_escaped_bytes, escaped_line_to_bytes
+from elspeth.plugins.sources.json_source import (
+    BYTE_ESCAPE_ERRORS,
+    contains_escaped_bytes,
+    escaped_line_to_bytes,
+    line_byte_codec,
+)
 
 
 class TextSourceConfig(SourceDataConfig):
@@ -66,7 +71,7 @@ class TextSource(BaseSource):
     name = "text"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:1010c5ab7ec5d18f"
+    source_file_hash: str | None = "sha256:32617f9bd0259140"
     config_model = TextSourceConfig
     _on_validation_failure: str
 
@@ -152,10 +157,11 @@ class TextSource(BaseSource):
             # BYTE_ESCAPE_ERRORS keeps an undecodable code unit on its own line
             # for every codec; surrogateescape cannot for UTF-16/UTF-32, where
             # the decode error aborted the whole read-ahead chunk.
+            line_codec = line_byte_codec(self._path, self._encoding)
             with open(self._path, encoding=self._encoding, errors=BYTE_ESCAPE_ERRORS, newline="") as f:
                 for line_num, raw_line in enumerate(f, start=1):
                     if contains_escaped_bytes(raw_line):
-                        raw_bytes = escaped_line_to_bytes(raw_line, self._encoding)
+                        raw_bytes = escaped_line_to_bytes(raw_line, line_codec, line_number=line_num)
                         quarantined = self._record_parse_error(
                             ctx=ctx,
                             row={

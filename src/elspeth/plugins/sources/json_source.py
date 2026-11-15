@@ -12,7 +12,9 @@ at parse time per canonical JSON policy. Use null for missing values.
 import codecs
 import json
 from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from itertools import groupby
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import Field, JsonValue, ValidationError, field_validator, model_validator
@@ -91,16 +93,59 @@ def contains_escaped_bytes(value: str) -> bool:
     return any(0xDC00 <= ord(char) <= 0xDCFF for char in value)
 
 
-def escaped_line_to_bytes(value: str, encoding: str) -> bytes:
+@dataclass(frozen=True, slots=True)
+class LineByteCodec:
+    """How to turn a decoded line back into the bytes the file holds.
+
+    ``codec`` has a fixed byte order and writes no BOM. ``first_line_prefix``
+    is the BOM the decoder consumed from the start of the stream; it belongs
+    to line 1 only.
+    """
+
+    codec: str
+    first_line_prefix: bytes
+
+
+_BOM_ORDERS: dict[str, tuple[tuple[bytes, str], ...]] = {
+    "utf-16": ((codecs.BOM_UTF16_LE, "utf-16-le"), (codecs.BOM_UTF16_BE, "utf-16-be")),
+    "utf-32": ((codecs.BOM_UTF32_LE, "utf-32-le"), (codecs.BOM_UTF32_BE, "utf-32-be")),
+    "utf-8-sig": ((codecs.BOM_UTF8, "utf-8"),),
+}
+_NO_BOM_FALLBACK = {"utf-16": "utf-16-le", "utf-32": "utf-32-le", "utf-8-sig": "utf-8"}
+
+
+def line_byte_codec(path: Path, read_encoding: str) -> LineByteCodec:
+    """Return how lines of ``path`` decoded with ``read_encoding`` map back to bytes.
+
+    ``utf-16``, ``utf-32`` and ``utf-8-sig`` take the byte order (or the BOM's
+    presence) from the stream and drop the BOM from the decoded text, so the
+    codec name alone cannot rebuild a line: re-encoding with it uses the host's
+    byte order and prefixes a BOM to every line. Every other codec rebuilds
+    with itself and has no prefix.
+    """
+    name = codecs.lookup(read_encoding).name
+    if name not in _BOM_ORDERS:
+        return LineByteCodec(codec=read_encoding, first_line_prefix=b"")
+    with path.open("rb") as raw:
+        head = raw.read(4)
+    for bom, fixed_codec in _BOM_ORDERS[name]:
+        if head.startswith(bom):
+            return LineByteCodec(codec=fixed_codec, first_line_prefix=bom)
+    # No BOM: utf-8-sig decodes as plain utf-8; utf-16 and utf-32 refuse the
+    # stream at its first read, before any line exists to rebuild.
+    return LineByteCodec(codec=_NO_BOM_FALLBACK[name], first_line_prefix=b"")
+
+
+def escaped_line_to_bytes(value: str, line_codec: LineByteCodec, *, line_number: int) -> bytes:
     """Rebuild the raw bytes of a line decoded with ``BYTE_ESCAPE_ERRORS``.
 
     Escaped code points become their original byte; every other run is
-    re-encoded with ``encoding`` (it decoded from that codec, so it encodes
-    back). A BOM-writing codec (``utf-16``, ``utf-32``) prefixes its BOM, as
-    ``str.encode`` would.
+    re-encoded with ``line_codec.codec`` (the fixed-order codec the stream was
+    decoded as, so it encodes back to the same bytes). Line 1 regains the BOM
+    the decoder consumed.
     """
-    encoder = codecs.getincrementalencoder(encoding)()
-    raw = bytearray()
+    encoder = codecs.getincrementalencoder(line_codec.codec)()
+    raw = bytearray(line_codec.first_line_prefix if line_number == 1 else b"")
     for escaped, run in groupby(value, key=lambda char: 0xDC00 <= ord(char) <= 0xDCFF):
         if escaped:
             raw.extend(ord(char) - 0xDC00 for char in run)
@@ -218,7 +263,7 @@ class JSONSource(BaseSource):
     name = "json"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:c299bae1329a63c2"
+    source_file_hash: str | None = "sha256:34cf4c72a5d26704"
     config_model = JSONSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str
@@ -348,10 +393,11 @@ class JSONSource(BaseSource):
             # (e.g., utf-16 / utf-32) instead of splitting on raw 0x0A bytes.
             # BYTE_ESCAPE_ERRORS keeps an undecodable code unit on its own line
             # for every codec; surrogateescape cannot for UTF-16/UTF-32.
+            line_codec = line_byte_codec(self._path, self._read_encoding)
             with open(self._path, encoding=self._read_encoding, errors=BYTE_ESCAPE_ERRORS, newline="") as f:
                 for line_num, raw_line in enumerate(f, start=1):
                     if contains_escaped_bytes(raw_line):
-                        raw_bytes = escaped_line_to_bytes(raw_line, self._encoding)
+                        raw_bytes = escaped_line_to_bytes(raw_line, line_codec, line_number=line_num)
                         raw_row = {"__raw_bytes_hex__": raw_bytes.hex(), "__line_number__": line_num}
                         error_msg = f"JSON parse error at line {line_num}: invalid {self._encoding} encoding"
                         quarantined = self._record_parse_error(
