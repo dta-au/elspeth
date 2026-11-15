@@ -345,11 +345,13 @@ Shared disclosure text (for example the advisor-cohort withheld-prose
 disclosure) lives as one constant in that module and is appended to every
 message that needs it; never fork a per-message copy.
 
-An END-gate blocked turn publishes the model's reply beside its notice, so
-every blocked notice is a `_PUBLISHED_` form without the withheld-prose
-disclosure, and so is the blocker `detail` built from it. Only the
-advisor-repair replacer (`_replace_advisor_repair_public_result`) withholds
-the model's prose. The two blocked notices it reuses, sign-off pending and
+An END-gate blocked turn publishes the model's reply only with current
+publication admission. Otherwise its raw reply is empty and a canonical
+withholding notice follows the graph-status notice. The graph-status notices
+remain `_PUBLISHED_` forms without a withholding disclosure, as does the
+blocker `detail`. The advisor-repair replacer
+(`_replace_advisor_repair_public_result`) also withholds model prose.
+The two blocked notices it reuses, sign-off pending and
 pending handoff, therefore also exist in a withheld form. That form is
 defined as the published notice plus the disclosure, so edit the published
 one. Only their composers take the required `prose_withheld` flag. A new

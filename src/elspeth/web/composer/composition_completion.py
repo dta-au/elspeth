@@ -73,7 +73,11 @@ from elspeth.web.composer.no_tool_policy import (
 from elspeth.web.composer.no_tool_policy import (
     compose_advisor_signoff_pending_message as _compose_advisor_signoff_pending_message,
 )
-from elspeth.web.composer.no_tool_policy import compose_checkpoint_receipt_message
+from elspeth.web.composer.no_tool_policy import (
+    compose_checkpoint_receipt_message,
+    compose_preflight_withheld_message,
+    compose_review_reply_withheld_message,
+)
 from elspeth.web.composer.no_tool_policy import (
     compose_interpretation_review_handoff_message as _compose_interpretation_review_handoff_message,
 )
@@ -2426,6 +2430,7 @@ class CompositionCompletion:
                     session_id=session_id,
                     session_operation_context=session_operation_context,
                 )
+                # The staged-review handoff below also consumes this carrier before a blocked result is built.
                 assistant_message = _AdmittedAssistantMessage(content=turn_evidence.render_saved_scope())
             runtime_findings = None
             if state.sources and state.outputs and interpretation_sites(state):
@@ -2460,6 +2465,25 @@ class CompositionCompletion:
                 )
             if orphan_result is not None:
                 orphan_result = _with_advisor_gate_decision(orphan_result, completion_gates, None)
+                if not publication_admitted:
+                    orphan_preflight = orphan_result.runtime_preflight
+                    assert orphan_preflight is not None
+                    orphan_result = replace(
+                        orphan_result,
+                        message=compose_review_reply_withheld_message(
+                            compose_preflight_withheld_message(runtime_result=orphan_preflight),
+                            reason="publication_withheld"
+                            if verdict.ok
+                            else "budget_exhausted"
+                            if verdict.failure_class == "budget_exhausted"
+                            else "unavailable"
+                            if verdict.failure_class == "unavailable"
+                            else "request_rejected"
+                            if verdict.failure_class == "request_rejected"
+                            else "malformed",
+                        ),
+                        raw_assistant_content="",
+                    )
                 return _TerminalNoToolAdvisorGateOutcome(
                     action="return",
                     result=replace(
@@ -2559,8 +2583,11 @@ class CompositionCompletion:
                 runtime_preflight=runtime_preflight,
                 outstanding_findings=outstanding_findings,
                 publication_binding=publication_review.binding,
-                saved_scope=turn_evidence.render_saved_scope(),
             )
+            if not publication_admitted:
+                publication = blocked.advisor_terminal_publication
+                assert publication is not None and publication.reason is not None
+                blocked = replace(blocked, message=compose_review_reply_withheld_message(blocked.message, reason=publication.reason))
             # Audit row for the branch that spoke, after the disclosure row
             # above and before the telemetry mirror — the replacer will pass
             # this result through without publishing it a second time.

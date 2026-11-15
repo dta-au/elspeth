@@ -505,6 +505,12 @@ def _announce_staged_review_handoff(result: ComposerResult, raw_content: str | N
 
     """
     runtime_result = result.runtime_preflight
+    publication = result.advisor_terminal_publication
+    if publication is not None and publication.branch == "terminal_block":
+        # Its runtime result includes the advisor block, not a fresh validator
+        # objection. Preserve the original graph notice and withholding reason
+        # and add the staged-card fact through the closed handoff grammar.
+        return _append_interpretation_review_handoff_message(result, raw_content)
     if (
         runtime_result is not None
         and not runtime_result.is_valid

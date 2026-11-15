@@ -876,14 +876,13 @@ class AdvisorCheckpointOwner:
         runtime_preflight: ValidationResult | None,
         outstanding_findings: ValidationResult | None,
         publication_binding: str | None = None,
-        saved_scope: str = "",
     ) -> ComposerResult:
         """Build the end-gate ``ComposerResult`` for a sign-off that did not pass.
 
         The graph outcome does not authorize prose publication. An explicit
         ADMIT verdict bound to the current candidate and request evidence
         permits the model's terminal prose beside the notice; otherwise only
-        trusted saved-scope facts may appear. ``assistant_message`` may be
+        backend notices may appear. ``assistant_message`` may be
         ``None`` for a turn that produced no admitted reply. ``reason`` is independent of the
         injection history in both directions: a first-pass advisor outage
         followed by a last-pass FLAG is ``flagged_final_pass`` with nothing
@@ -949,13 +948,13 @@ class AdvisorCheckpointOwner:
         )
         # Graph findings alone grant no publication permission. A missing or
         # mismatched binding cannot restore the original candidate through
-        # this renderer; the caller supplies only trusted saved facts then.
+        # this renderer; the caller supplies an empty raw reply then.
         publication_admitted = (
             verdict.publication_verdict == "ADMIT"
             and publication_binding is not None
             and verdict.publication_binding == publication_binding
         )
-        raw_content = ((assistant_message.content or "") if assistant_message is not None else "") if publication_admitted else saved_scope
+        raw_content = ((assistant_message.content or "") if assistant_message is not None else "") if publication_admitted else ""
         # elspeth-032ec69c41 (ruling 2026-09-22, "store, bounded"): computed
         # once for every shape below. The step ids are checked against THIS
         # state — an id the advisor invented, or an injection wearing an id's

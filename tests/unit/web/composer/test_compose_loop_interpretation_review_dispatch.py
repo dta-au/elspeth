@@ -1804,6 +1804,79 @@ async def test_staged_review_with_spent_budget_withholds_cards_for_invalid_graph
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("preflight_shape", ["absent", "green", "red"])
+async def test_staged_withheld_reply_preserves_notice_and_receipt(tmp_path, sessions_service, monkeypatch, preflight_shape):
+    from elspeth.web.composer import no_tool_policy
+    from tests.unit.web.composer.test_no_tool_policy_segments import _invalid_preflight
+
+    composer = _build_composer(tmp_path, sessions_service)
+    session_id = await _seed_bare_session(sessions_service, "Staged withheld reply")
+    original_gate = composer._completion._evaluate_terminal_no_tool_advisor_gate
+    publications = []
+
+    async def unavailable(**kwargs):
+        return AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text="", failure_class="unavailable")
+
+    async def gate_with_preflight(**kwargs):
+        # Drive the three residual preflight shapes at the real END boundary;
+        # tool dispatch, publication, staged reconstruction and receipt are real.
+        kwargs["runtime_preflight"] = (
+            None
+            if preflight_shape == "absent"
+            else ValidationResult(
+                is_valid=True,
+                checks=[],
+                errors=[],
+                readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
+            )
+            if preflight_shape == "green"
+            else _invalid_preflight(message="Invalid input.", suggestion="Check columns.")
+        )
+        outcome = await original_gate(**kwargs)
+        assert outcome.result is not None
+        publications.append(outcome.result.advisor_terminal_publication)
+        return outcome
+
+    monkeypatch.setattr(composer._advisor_checkpoint, "_run_advisor_checkpoint", unavailable)
+    monkeypatch.setattr(composer._completion, "_evaluate_terminal_no_tool_advisor_gate", gate_with_preflight)
+    llm = _ScriptedLLM(
+        [
+            _fake_response_with_tool_call(
+                tool_call_id="set", tool_name="set_pipeline", arguments=_set_pipeline_with_pending_interpretation_args()
+            ),
+            _fake_response_with_tool_call(
+                tool_call_id="review",
+                tool_name="request_interpretation_review",
+                arguments={"affected_node_id": "rate_node", "kind": "vague_term", "user_term": "cool", "llm_draft": "Useful and clear."},
+            ),
+            _fake_text_response("Unreviewed reply."),
+        ]
+    )
+    result = await composer._run_one_turn_for_test(
+        llm=llm, session_id=str(session_id), current_state_id=None, message="Rate how cool pages are."
+    )
+    assert [inv.tool_name for inv in result.tool_invocations] == ["set_pipeline", "request_interpretation_review"]
+    assert all(inv.status.value == "success" for inv in result.tool_invocations)
+    assert len(publications) == 1
+    assert publications[0] is not None
+    assert publications[0].preflight_shape == preflight_shape
+    assert result.raw_assistant_content == ""
+    segments = no_tool_policy.visible_message_segments(content=result.assistant_message, raw_content="")
+    diagnostic_segments = [segment for segment in segments if isinstance(segment, no_tool_policy.AssistantTextSegment)]
+    if preflight_shape == "red":
+        assert len(diagnostic_segments) == 1
+        assert "Invalid input." in diagnostic_segments[0].content
+    else:
+        assert diagnostic_segments == []
+    assert result.assistant_message.count(no_tool_policy._REVIEW_REPLY_UNREVIEWED_NOTICE) == 1
+    assert result.assistant_message.count("Checkpoint save status: ") == 1
+    assert result.assistant_message.count(no_tool_policy._INTERPRETATION_REVIEW_HANDOFF_NOTICE) == 1
+    assert "Unreviewed reply." not in result.assistant_message
+    if preflight_shape == "red":
+        assert "Invalid input." in result.assistant_message
+
+
+@pytest.mark.asyncio
 async def test_staged_handoff_branch_appends_exactly_one_suffix(
     tmp_path: Path,
     sessions_service: SessionServiceImpl,

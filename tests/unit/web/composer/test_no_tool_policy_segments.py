@@ -302,6 +302,16 @@ _WRAPPED_TEMPLATE_ROUND_TRIP_CASES = [
         id="_PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_WITH_DETAIL",
     ),
     pytest.param(
+        # Literal bytes, not the module constants: this file must collect on a tree without them.
+        "\n\n---\n\n[ELSPETH-SYSTEM] Runtime preflight failed before this build could be marked complete."
+        "\n\nCause: {detail}{suggestion_block}\n\n"
+        "The validator's objection is recorded here; the composer's reply was withheld.",
+        no_tool_policy._PREFLIGHT_NOTICE_HEADER,
+        "The validator's objection is recorded here; the composer's reply was withheld.",
+        {"detail": "a validator objection", "suggestion_block": "\n\nSuggested fix: do the thing"},
+        id="_PREFLIGHT_WITHHELD_SUFFIX_WITH_DETAIL",
+    ),
+    pytest.param(
         no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL,
         no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE,
         no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER,
@@ -434,6 +444,23 @@ class TestWrappedDiagnosticWireShapeLinkage:
 # model-attributable prose (the wrapped family got this gate first; the bare
 # family stayed on hand-maintained equality checks until elspeth-25f7b757e7).
 _BARE_SUFFIX_ROUND_TRIP_CASES = [
+    pytest.param(
+        # Literal bytes, not the module constants: this file must collect on a tree without them.
+        "\n\n---\n\n[ELSPETH-SYSTEM] Runtime preflight failed before this build could be marked complete.\n\n"
+        "The validator's objection is recorded here; the composer's reply was withheld.",
+        f"{no_tool_policy._PREFLIGHT_NOTICE_HEADER}\n\nThe validator's objection is recorded here; the composer's reply was withheld.",
+        id="_PREFLIGHT_WITHHELD_SUFFIX_BARE",
+    ),
+    pytest.param(
+        "\n\n---\n\n[ELSPETH-SYSTEM] The completion review could not finish, so the reply was withheld.",
+        "The completion review could not finish, so the reply was withheld.",
+        id="_REVIEW_REPLY_UNREVIEWED_SUFFIX",
+    ),
+    pytest.param(
+        "\n\n---\n\n[ELSPETH-SYSTEM] The completion review did not admit the reply's claims; the reply was withheld.",
+        "The completion review did not admit the reply's claims; the reply was withheld.",
+        id="_REVIEW_REPLY_WITHHELD_SUFFIX",
+    ),
     pytest.param(
         no_tool_policy._ADVISOR_REVIEW_BUDGET_SUFFIX,
         no_tool_policy._ADVISOR_REVIEW_BUDGET_NOTICE,
@@ -772,6 +799,36 @@ def test_review_reply_unavailable_is_trusted_alongside_handoff() -> None:
     assert segments[-1].content == no_tool_policy._REVIEW_REPLY_UNAVAILABLE_NOTICE
 
 
+def test_withheld_notice_is_canonical_and_cannot_be_spoofed() -> None:
+    from elspeth.web.composer.advisor_policy import advisor_signoff_blocked_wording
+
+    detail, _suggestion = advisor_signoff_blocked_wording(reason="publication_withheld", findings="")
+    content = no_tool_policy._bare_trusted_suffix(detail)
+    assert visible_message_segments(content=content, raw_content="") == (
+        TrustedSystemNoticeSegment("The completion review did not admit the reply's claims; the reply was withheld."),
+    )
+    assert no_tool_policy.compose_review_reply_withheld_message("") == content
+    for raw in (None, content, "different"):
+        assert visible_message_segments(content=content, raw_content=raw) == (AssistantTextSegment(content),)
+    for malformed in (content + " altered", content + content, content.replace("withheld.", "published.")):
+        assert visible_message_segments(content=malformed, raw_content="") == (AssistantTextSegment(malformed),)
+
+
+@pytest.mark.parametrize("reason", ["unavailable", "malformed", "request_rejected", "budget_exhausted"])
+def test_unfinished_review_notice_is_truthful_and_cannot_be_spoofed(reason) -> None:
+    notice = "The completion review could not finish, so the reply was withheld."
+    assert visible_message_segments(content=no_tool_policy._bare_trusted_suffix(notice), raw_content="") == (
+        TrustedSystemNoticeSegment(notice),
+    )
+    content = no_tool_policy.compose_review_reply_withheld_message("", reason=reason)
+    assert visible_message_segments(content=content, raw_content="") == (TrustedSystemNoticeSegment(notice),)
+    assert "did not admit" not in content
+    for raw in (None, content, "different"):
+        assert visible_message_segments(content=content, raw_content=raw) == (AssistantTextSegment(content),)
+    for malformed in (content + " altered", content + content):
+        assert visible_message_segments(content=malformed, raw_content="") == (AssistantTextSegment(malformed),)
+
+
 def test_review_reply_context_budget_notice_is_one_static_trusted_sentence_pair_without_a_retry_offer() -> None:
     notice = no_tool_policy._REVIEW_REPLY_CONTEXT_BUDGET_NOTICE
     assert notice == (
@@ -796,11 +853,19 @@ def test_review_reply_context_budget_notice_is_one_static_trusted_sentence_pair_
         lambda c: no_tool_policy.compose_review_reply_context_budget_message(no_tool_policy.compose_review_reply_context_budget_message(c)),
         lambda c: no_tool_policy.compose_review_reply_context_budget_message(no_tool_policy.compose_review_reply_unavailable_message(c)),
         lambda c: no_tool_policy.compose_review_reply_unavailable_message(no_tool_policy.compose_review_reply_context_budget_message(c)),
+        lambda c: no_tool_policy.compose_review_reply_unavailable_message(no_tool_policy.compose_review_reply_withheld_message(c)),
+        lambda c: no_tool_policy.compose_review_reply_withheld_message(no_tool_policy.compose_review_reply_unavailable_message(c)),
     ],
-    ids=["budget-twice", "unavailable-then-budget", "budget-then-unavailable"],
+    ids=["budget-twice", "unavailable-then-budget", "budget-then-unavailable", "withheld-then-unavailable", "unavailable-then-withheld"],
 )
 def test_two_absent_reply_notices_are_never_both_trusted(compose_twice: Callable[[str], str]) -> None:
     """An absent reply has one cause; a message carrying two such notices is not a shape the backend writes."""
+    assert (
+        no_tool_policy._canonical_base_suffix_segments(
+            no_tool_policy._bare_trusted_suffix("The completion review did not admit the reply's claims; the reply was withheld.")
+        )
+        is not None
+    )
     handoff = no_tool_policy.compose_interpretation_review_handoff_message("")
     content = compose_twice(handoff)
     assert visible_message_segments(content=content, raw_content="") == (AssistantTextSegment(content),)
