@@ -399,7 +399,7 @@ class TestTruncateFields:
     """truncate's ``fields`` keys (plugin review #146): ``declared_string_input_fields``, like keyword_filter's.
 
     truncate used to resolve a header-spelled key through the row contract and
-    rewrite the normalized field: a spelling-free lookup no sibling has. Its
+    rewrite the normalized field: unlike the named text-scanning siblings, it
     keys are now read declarations; a header spelling is refused like any other.
     """
 

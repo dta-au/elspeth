@@ -147,6 +147,16 @@ class TestTruncateBehavior:
         assert result.reason is not None
         assert result.reason["reason"] == "missing_field"
         assert result.reason["field"] == "missing"
+        assert result.retryable is False
+
+    def test_wrong_type_is_non_retryable(self, ctx: PluginContext) -> None:
+        transform = Truncate({"fields": {"title": 5}, "schema": DYNAMIC_SCHEMA})
+        result = transform.process(make_pipeline_row({"title": 42}), ctx)
+
+        assert result.status == "error"
+        assert result.reason is not None
+        assert result.reason["reason"] == "type_mismatch"
+        assert result.retryable is False
 
     def test_unconfigured_fields_pass_through(self, ctx: PluginContext) -> None:
         """Fields not in the truncation config are unmodified."""

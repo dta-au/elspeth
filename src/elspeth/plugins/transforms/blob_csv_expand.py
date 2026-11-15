@@ -305,8 +305,8 @@ class BlobCSVExpand(BaseTransform):
     output_naming_config_keys = frozenset({"row_index_field"})
     name = "blob_csv_expand"
     determinism = Determinism.IO_READ
-    plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:64de4207fc6d2406"
+    plugin_version = "2.0.0"
+    source_file_hash: str | None = "sha256:e667985d6429a8ee"
     config_model = BlobCSVExpandConfig
     usage_when_to_use: str = (
         "Use when each input row carries a payload-store reference to a CSV blob and you need to "
@@ -343,6 +343,7 @@ class BlobCSVExpand(BaseTransform):
         super().__init__(options)
         cfg = BlobCSVExpandConfig.from_dict(options, plugin_name=self.name)
         self._initialize_declared_input_fields(cfg)
+        self.declared_string_input_fields = frozenset({cfg.active_input_field})
 
         self._blob_ref_field = cfg.read_blob_ref_field
         self._source = cfg.source
@@ -498,15 +499,10 @@ class BlobCSVExpand(BaseTransform):
         # document, but a CSV header colliding with the text column is still a
         # genuine collision on the row that arrived. Only the inline arm
         # removes anything; this runtime removal stays separate from the
-        # static declaration, which may abstain for an original-header name.
-        # `base` carries NORMALIZED keys while the configured name may be the
-        # original header, so resolve it through the contract exactly as
-        # line_explode/json_explode do. `_load_field_text` already routed a row
-        # on which the name does not resolve, so on this path the key exists.
+        # static declaration. The configured name is the carried payload key.
         runtime_removed_fields = (self._text_field,) if self._source == "field" else ()
         for removed in runtime_removed_fields:
-            normalized_removed = removed if removed in base else row.contract.resolve_name(removed)
-            del base[normalized_removed]
+            del base[removed]
 
         output_rows: list[dict[str, Any]] = []
         for row_index, csv_row in enumerate(parsed.rows):
@@ -581,7 +577,10 @@ class BlobCSVExpand(BaseTransform):
         return self._load_blob_text(row)
 
     def _load_blob_text(self, row: PipelineRow) -> _CSVSourceText:
-        blob_ref = row[self._blob_ref_field]
+        values = row.to_dict()
+        if self._blob_ref_field not in values:
+            raise _BlobCSVParseError(_csv_error_reason("invalid_input", field=self._blob_ref_field, error_type="missing_blob_ref_field"))
+        blob_ref = values[self._blob_ref_field]
         if type(blob_ref) is not str:
             # Routed, not raised: a wrong-typed ref is a fact about THIS row,
             # the same kind as the malformed-hash rejection directly below.
@@ -668,11 +667,9 @@ class BlobCSVExpand(BaseTransform):
         return _CSVSourceText(text=text, field=self._blob_ref_field, blob_ref=blob_ref)
 
     def _load_field_text(self, row: PipelineRow) -> _CSVSourceText:
-        # Read through ``row`` rather than the ``to_dict()`` copy: __getitem__
-        # resolves an original header name to its normalized key via the
-        # contract, which a raw dict lookup would silently miss.
+        # The configured name is the payload key as carried by the row.
         try:
-            value = row[self._text_field]
+            value = row.to_dict()[self._text_field]
         except KeyError as exc:
             raise _BlobCSVParseError(
                 _csv_error_reason(

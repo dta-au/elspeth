@@ -48,15 +48,15 @@ def test_line_explode_splits_string_into_indexed_rows(ctx: PluginContext) -> Non
     ]
 
 
-def test_line_explode_original_header_abstains_and_keeps_collision_guard(ctx: PluginContext) -> None:
-    """Runtime lineage owns an unnameable removal without permitting overwrite."""
+def test_line_explode_keeps_collision_guard(ctx: PluginContext) -> None:
+    """Removing the literal input key cannot permit an output overwrite."""
     from elspeth.contracts.errors import PluginContractViolation
     from elspeth.plugins.transforms.line_explode import LineExplode
 
     transform = LineExplode(
         {
             "schema": DYNAMIC_SCHEMA,
-            "source_field": "Body Text",
+            "source_field": "body_text",
             "output_field": "line",
             "include_index": False,
         }
@@ -70,10 +70,28 @@ def test_line_explode_original_header_abstains_and_keeps_collision_guard(ctx: Pl
         locked=True,
     )
 
-    assert transform.forwards_input_fields is False
-    assert transform.removed_input_fields == frozenset()
+    assert transform.forwards_input_fields is True
+    assert transform.removed_input_fields == frozenset({"body_text"})
     with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
         transform.process(PipelineRow({"body_text": "one\ntwo", "line": "existing"}, contract), ctx)
+
+
+def test_line_explode_does_not_read_an_original_header_alias(ctx: PluginContext) -> None:
+    from elspeth.plugins.transforms.line_explode import LineExplode
+
+    transform = LineExplode({"schema": DYNAMIC_SCHEMA, "source_field": "Body Text"})
+    contract = SchemaContract(
+        mode="OBSERVED",
+        fields=(make_field("body_text", str, original_name="Body Text"),),
+        locked=True,
+    )
+
+    result = transform.process(PipelineRow({"body_text": "one\ntwo"}, contract), ctx)
+
+    assert result.status == "error"
+    assert result.reason is not None
+    assert result.reason["error_type"] == "missing_field"
+    assert result.retryable is False
 
 
 def test_line_explode_preserves_empty_lines(ctx: PluginContext) -> None:
@@ -265,8 +283,8 @@ def test_line_explode_routes_non_string_input_as_a_failed_row(ctx: PluginContext
     assert result.reason["reason"] == "invalid_input"
     assert result.reason["error_type"] == "wrong_type"
     assert result.reason["field"] == "html"
-    # PipelineRow deep-freezes lists to tuples, so the reported type is tuple.
-    assert "must be a string, got tuple" in result.reason["error"]
+    # The carried payload view thaws the frozen tuple to the original list shape.
+    assert "must be a string, got list" in result.reason["error"]
     assert result.rows is None
 
 

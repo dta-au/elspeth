@@ -218,8 +218,8 @@ class BlobTextExpand(BaseTransform):
     output_naming_config_keys = frozenset({"output_field", "index_field"})
     name = "blob_text_expand"
     determinism = Determinism.IO_READ
-    plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ec0fca240d0e979f"
+    plugin_version = "2.0.0"
+    source_file_hash: str | None = "sha256:0bac1c41215bd9a3"
     config_model = BlobTextExpandConfig
     usage_when_to_use: str = (
         "Use when each input row carries a payload-store reference to a plain-text blob and you need "
@@ -263,6 +263,7 @@ class BlobTextExpand(BaseTransform):
         super().__init__(options)
         cfg = BlobTextExpandConfig.from_dict(options, plugin_name=self.name)
         self._initialize_declared_input_fields(cfg)
+        self.declared_string_input_fields = frozenset({cfg.blob_ref_field})
 
         self._blob_ref_field = cfg.blob_ref_field
         self._output_field = cfg.output_field

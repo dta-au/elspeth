@@ -331,8 +331,8 @@ class BlobFetch(BaseTransform):
     )
     name = "blob_fetch"
     determinism = Determinism.EXTERNAL_CALL
-    plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9c75f8515498a8a4"
+    plugin_version = "2.0.0"
+    source_file_hash: str | None = "sha256:2ca17fe8f4416377"
     config_model = BlobFetchConfig
     passes_through_input = True
     fetches_http = True
@@ -380,6 +380,7 @@ class BlobFetch(BaseTransform):
         self._initialize_declared_input_fields(cfg)
 
         self._url_field = cfg.url_field
+        self.declared_string_input_fields = frozenset({cfg.url_field}) if cfg.url_field is not None else frozenset()
         self._url = cfg.url
         self._blob_ref_field = cfg.blob_ref_field
         self._content_type_field = cfg.content_type_field
@@ -531,7 +532,7 @@ class BlobFetch(BaseTransform):
             if self._url is not None:
                 url = self._url
             elif self._url_field is not None:
-                url = row[self._url_field]
+                url = row.to_dict()[self._url_field]
             else:
                 raise FrameworkBugError("blob_fetch has no configured URL source")
             if type(url) is not str:

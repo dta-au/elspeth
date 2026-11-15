@@ -162,6 +162,7 @@ class TestTruncateRequiredFieldContract(TransformErrorContractTestBase):
         assert result.status == "error"
         assert result.reason is not None
         assert result.reason["reason"] == "missing_field"
+        assert result.retryable is False
 
     def test_wrong_type_returns_error(
         self,
@@ -177,6 +178,7 @@ class TestTruncateRequiredFieldContract(TransformErrorContractTestBase):
         assert result.reason["field"] == "required_field"
         assert result.reason["expected"] == "str"
         assert result.reason["actual"] == "int"
+        assert result.retryable is False
 
     def test_none_value_returns_error(
         self,

@@ -337,6 +337,8 @@ class RetrievalTransformBase(BaseTransform):
 
         self._retrieval_config = retrieval_config
         self._initialize_declared_input_fields(self._retrieval_config)
+        if self._retrieval_config.query_template is None:
+            self.declared_string_input_fields = frozenset({self._retrieval_config.query_field})
         self.header_spelled_lookups = MappingProxyType(self._retrieval_config.header_spelled_row_lookups())
         prefix = self._retrieval_config.output_prefix
 

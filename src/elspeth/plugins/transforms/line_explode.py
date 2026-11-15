@@ -341,8 +341,8 @@ class LineExplode(BaseTransform):
     output_naming_config_keys = frozenset({"output_field", "index_field"})
     name = "line_explode"
     determinism = Determinism.DETERMINISTIC
-    plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9650af524c9f0b51"
+    plugin_version = "2.0.0"
+    source_file_hash: str | None = "sha256:eba479de6d05e7c2"
     config_model = LineExplodeConfig
     usage_when_to_use: str = (
         "Use to split one newline-framed text field into rows while preserving the rest of the input "
@@ -379,6 +379,7 @@ class LineExplode(BaseTransform):
         super().__init__(config)
         cfg = LineExplodeConfig.from_dict(config, plugin_name=self.name)
         self._initialize_declared_input_fields(cfg)
+        self.declared_string_input_fields = frozenset({cfg.source_field})
 
         self._source_field = cfg.source_field
         self._output_field = cfg.output_field
@@ -392,9 +393,8 @@ class LineExplode(BaseTransform):
         # upstream llm's <response_field>_usage / _model — really do reach the
         # next consumer. `passes_through_input` cannot say that (source_field
         # is dropped), which is what hid those columns from the extras firewall
-        # (elspeth-15c72686f2). An original-header spelling cannot name the
-        # normalized key removed at runtime, so the static declaration
-        # abstains while process() resolves that key from row lineage.
+        # (elspeth-15c72686f2). The configured name is the payload key read
+        # and removed at runtime.
         self.forwards_input_fields = is_normalized_field_name(cfg.source_field)
         self.removed_input_fields = frozenset({cfg.source_field}) if self.forwards_input_fields else frozenset()
 
@@ -488,7 +488,13 @@ class LineExplode(BaseTransform):
 
     def process(self, row: PipelineRow, ctx: TransformContext) -> TransformResult:
         """Explode a string field into multiple rows."""
-        source_value = row[self._source_field]
+        row_data = row.to_dict()
+        if self._source_field not in row_data:
+            return TransformResult.error(
+                {"reason": "invalid_input", "field": self._source_field, "error_type": "missing_field"},
+                retryable=False,
+            )
+        source_value = row_data[self._source_field]
         if type(source_value) is not str:
             # A ROW-level fact, so it takes the same routable exit as the
             # empty-string and too-many-lines rejections below rather than
@@ -526,18 +532,13 @@ class LineExplode(BaseTransform):
                 retryable=False,
             )
 
-        row_data = row.to_dict()
-        if self._source_field in row_data:
-            normalized_source_field = self._source_field
-        else:
-            normalized_source_field = row.contract.resolve_name(self._source_field)
-        collisions = detect_field_collisions(set(row_data) - {normalized_source_field}, self.declared_output_fields)
+        collisions = detect_field_collisions(set(row_data) - {self._source_field}, self.declared_output_fields)
         if collisions:
             raise PluginContractViolation(
                 f"Transform '{self.name}' would overwrite existing input fields {collisions}. "
                 "This is a pipeline configuration error — the transform's output fields collide with fields already present in the row."
             )
-        base = {k: v for k, v in row_data.items() if k != normalized_source_field}
+        base = {k: v for k, v in row_data.items() if k != self._source_field}
 
         # Refuse the amplification before deepcopy() materializes it.  A line
         # count alone is not a memory bound: every output retains a full copy

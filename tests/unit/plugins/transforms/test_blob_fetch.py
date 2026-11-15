@@ -15,8 +15,9 @@ from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.audit import Call
 from elspeth.contracts.call_mode import ReplaySSRFRequest
 from elspeth.contracts.enums import RunMode
+from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.security.web import SSRFBlockedError, SSRFSafeRequest
-from elspeth.testing import make_pipeline_row
+from elspeth.testing import make_field, make_pipeline_row
 from tests.fixtures.factories import make_context
 
 DYNAMIC_SCHEMA = {"mode": "observed", "guaranteed_fields": ["url"]}
@@ -80,6 +81,29 @@ def _config(**overrides: Any) -> dict[str, Any]:
     }
     config.update(overrides)
     return config
+
+
+def test_blob_fetch_does_not_read_an_original_header_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+    import elspeth.plugins.transforms.blob_fetch as blob_fetch_module
+    from elspeth.plugins.transforms.blob_fetch import BlobFetch
+
+    def _url_validation_forbidden(*_args: Any, **_kwargs: Any) -> SSRFSafeRequest:
+        raise AssertionError("header alias must not reach URL validation")
+
+    monkeypatch.setattr(blob_fetch_module, "validate_url_for_ssrf", _url_validation_forbidden)
+    transform = BlobFetch(_config(url_field="Original URL"))
+    contract = SchemaContract(
+        mode="OBSERVED",
+        fields=(make_field("url", str, original_name="Original URL"),),
+        locked=True,
+    )
+
+    result = transform.process(PipelineRow({"url": "https://example.test/data.csv"}, contract), make_context())
+
+    assert result.status == "error"
+    assert result.reason is not None
+    assert result.reason["error_type"] == "KeyError"
+    assert result.retryable is False
 
 
 def test_blob_fetch_fixed_url_needs_no_url_column(monkeypatch: pytest.MonkeyPatch) -> None:

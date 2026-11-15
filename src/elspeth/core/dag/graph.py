@@ -224,7 +224,7 @@ class ExecutionGraph:
                 only — the batch plugin's ``schema_required_input_fields()``,
                 the fields every buffered row must carry. Read only by the
                 declared-input proof. Empty frozenset otherwise.
-            declared_string_input_fields: For TRANSFORM nodes only — the set of
+            declared_string_input_fields: For TRANSFORM and AGGREGATION nodes — the set of
                 fields the transform requires to be present AND string-valued
                 on every arriving row, failing the row closed otherwise.
                 Populated by the builder from

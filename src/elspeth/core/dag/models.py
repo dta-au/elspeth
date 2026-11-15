@@ -258,7 +258,7 @@ class NodeInfo:
     # (ADR-013 Amendment 2026-09-27). Empty frozenset for every other node.
     batch_required_input_fields: frozenset[str] = field(default_factory=frozenset)
 
-    # Populated only for TRANSFORM nodes by the builder from
+    # Populated for TRANSFORM and AGGREGATION nodes by the builder from
     # TransformProtocol.declared_string_input_fields — the fields the transform
     # requires to be PRESENT and STRING-VALUED on every arriving row, failing
     # the row closed otherwise (the text-scanning family: Bedrock/Azure
@@ -266,7 +266,7 @@ class NodeInfo:
     # intelligence's `source_field`). Used for build-time detection of the
     # provable 100%-fatal shape where a producer's schema declares such a field
     # as int/float/bool (elspeth-b19dfe41fb). Empty frozenset for all
-    # non-transform nodes.
+    # other node kinds.
     #
     # Type-side sibling of declared_input_fields above, and NOT derivable from
     # input_schema/input_schema_config for the same reason: the scan-field
@@ -475,14 +475,12 @@ class NodeInfo:
                 component_type=component_type,
             )
         # Offensive programming: declared_string_input_fields mirrors the
-        # declared_input_fields guard above and is TRANSFORM-only for the same
-        # reason — its only consumer,
-        # validate_transform_string_typed_input_fields, is scoped to TRANSFORM
-        # nodes, so any other node type would carry data with no reader
+        # declared_input_fields guard above. The consumer checks transforms
+        # and batch aggregations; other node kinds would have no reader
         # (elspeth-b19dfe41fb).
-        if self.declared_string_input_fields and self.node_type != NodeType.TRANSFORM:
+        if self.declared_string_input_fields and self.node_type not in (NodeType.TRANSFORM, NodeType.AGGREGATION):
             raise GraphValidationError(
-                f"NodeInfo.declared_string_input_fields is only meaningful for TRANSFORM nodes; "
+                f"NodeInfo.declared_string_input_fields is only meaningful for TRANSFORM or AGGREGATION nodes; "
                 f"node {self.node_id!r} has type {self.node_type.name} "
                 f"with declared_string_input_fields={sorted(self.declared_string_input_fields)!r}.",
                 component_id=self.node_id,

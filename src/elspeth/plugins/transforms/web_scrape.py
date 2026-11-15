@@ -826,8 +826,8 @@ class WebScrapeTransform(BaseTransform):
     output_naming_config_keys = frozenset({"content_field", "fingerprint_field"})
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
-    plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ef6e828ace325e3c"
+    plugin_version = "2.0.0"
+    source_file_hash: str | None = "sha256:ec168ed0f04544a3"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -883,6 +883,10 @@ class WebScrapeTransform(BaseTransform):
         # Parse and validate config
         cfg = WebScrapeConfig.from_dict(options, plugin_name=self.name)
         self._initialize_declared_input_fields(cfg)
+        string_fields = set(cfg.query_fields.values()) | set(cfg.header_fields.values())
+        if cfg.url_field is not None:
+            string_fields.add(cfg.url_field)
+        self.declared_string_input_fields = frozenset(string_fields)
 
         # Required fields
         self._url_field = cfg.url_field

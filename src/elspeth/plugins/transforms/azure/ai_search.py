@@ -81,8 +81,8 @@ class AzureAISearchTransform(RetrievalTransformBase):
     """RAG retrieval against an existing Azure AI Search index."""
 
     name = "azure_ai_search"
-    plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:aa1e5d1b37f919a6"
+    plugin_version = "2.0.0"
+    source_file_hash: str | None = "sha256:3aeec3ccc453be10"
     determinism: Determinism = Determinism.EXTERNAL_CALL
     config_model = AzureAISearchConfig
     passes_through_input = True
