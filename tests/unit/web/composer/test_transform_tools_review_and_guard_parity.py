@@ -25,6 +25,7 @@ from typing import Any
 import pytest
 
 from elspeth.contracts.hashing import stable_hash
+from elspeth.plugins.transforms.batch_rank import BatchRank
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
 from elspeth.web.composer.state import (
@@ -448,7 +449,7 @@ def test_required_input_fields_on_a_batch_aware_aggregation_is_rejected_the_same
 def test_batch_aware_plugin_placed_as_a_transform_is_rejected_the_same_way_on_every_path() -> None:
     """Input B: a batch-aware plugin in row-mode placement, on all four boundaries."""
     context = _context()
-    guard_message = _batch_aware_placement_error("agg", "transform", "batch_stats", None)
+    guard_message = _batch_aware_placement_error("agg", "transform", "batch_stats", None, None)
     assert guard_message is not None
     linear = _linear_state()
     misplaced = _state_holding(_spec("agg", "mid", "out", plugin="batch_stats", options=dict(_BATCH_OPTIONS)))
@@ -501,7 +502,7 @@ def test_a_flush_window_plugin_placed_as_a_collector_is_rejected_the_same_way_on
     collector; the other three boundaries meet the collector arm.
     """
     context = _context()
-    guard_message = _batch_aware_placement_error("agg", "collector", "report_assemble", None)
+    guard_message = _batch_aware_placement_error("agg", "collector", "report_assemble", None, None)
     assert guard_message is not None
     assert "aggregation flush window" in guard_message
     linear = _linear_state()
@@ -518,8 +519,8 @@ def test_a_flush_window_plugin_placed_as_a_collector_is_rejected_the_same_way_on
 
 def test_the_collector_arm_names_only_flush_window_plugins() -> None:
     """Negative controls: a windowless batch plugin is a legal collector, and report_assemble a legal aggregation."""
-    assert _batch_aware_placement_error("agg", "collector", "batch_stats", None) is None
-    assert _batch_aware_placement_error("agg", "aggregation", "report_assemble", "transform") is None
+    assert _batch_aware_placement_error("agg", "collector", "batch_stats", None, None) is None
+    assert _batch_aware_placement_error("agg", "aggregation", "report_assemble", "transform", None) is None
 
 
 def test_patch_on_a_batch_aware_aggregation_still_accepts_unrelated_options() -> None:
@@ -542,6 +543,40 @@ def test_patch_on_a_batch_aware_aggregation_still_accepts_unrelated_options() ->
 
     assert result.success is True
     assert _node(result.updated_state, "agg").options["value_field"] == "y"
+
+
+@pytest.mark.parametrize("tool_name", ["upsert_node", "patch_node_options", "set_pipeline"])
+@pytest.mark.parametrize("count", [4096, 4097])
+def test_capped_batch_count_is_checked_at_tool_step(tool_name: str, count: int) -> None:
+    context = _context()
+    node = {
+        "id": "agg",
+        "node_type": "aggregation",
+        "plugin": "batch_rank",
+        "input": "mid",
+        "on_success": "out",
+        "on_error": "discard",
+        "options": BatchRank.probe_config(),
+        "trigger": {"count": count},
+        "output_mode": "transform",
+    }
+    state = _linear_state()
+    if tool_name == "upsert_node":
+        result = _dispatch(tool_name, node, state, context)
+    elif tool_name == "patch_node_options":
+        state = _state_holding(_spec("agg", "mid", "out", **{k: v for k, v in node.items() if k not in {"id", "input", "on_success"}}))
+        result = _dispatch(tool_name, {"node_id": "agg", "patch": {"schema": {"mode": "observed"}}}, state, context)
+    else:
+        result = _dispatch(tool_name, _set_pipeline_arguments(node), state, context)
+
+    if count == 4097:
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.validation.errors[0].error_code == "batch_transform_misplaced"
+        assert "4097" in result.validation.errors[0].message
+        assert "4096" in result.validation.errors[0].message
+    else:
+        assert result.success is True
 
 
 # ── #8: splice forwards the candidate's own validation errors ───────────────

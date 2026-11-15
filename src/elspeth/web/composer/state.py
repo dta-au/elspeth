@@ -1811,7 +1811,7 @@ def _batch_aware_placement_error(
     node_type: str,
     plugin_name: str | None,
     output_mode: str | None,
-    trigger: Mapping[str, Any] | None = None,
+    trigger: Mapping[str, Any] | None,
 ) -> str | None:
     """Reject a batch-aware transform from a node kind it cannot run in.
 
