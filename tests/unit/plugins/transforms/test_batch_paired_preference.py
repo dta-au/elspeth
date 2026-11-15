@@ -372,10 +372,9 @@ class TestBatchPairedPreference:
         assert not result.retryable
 
     def test_excessive_batch_size_is_rejected_before_pair_work(self, ctx: PluginContext, monkeypatch: pytest.MonkeyPatch) -> None:
-        import elspeth.plugins.transforms.batch_paired_preference as module
         from elspeth.plugins.transforms.batch_paired_preference import BatchPairedPreference
 
-        monkeypatch.setattr(module, "_MAX_BATCH_ROWS", 3, raising=False)
+        monkeypatch.setattr(BatchPairedPreference, "max_batch_rows", 3)
         transform = BatchPairedPreference(
             {"schema": DYNAMIC_SCHEMA, "pair_field": "case_id", "variant_field": "variant", "score_field": "score"}
         )

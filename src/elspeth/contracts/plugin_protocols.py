@@ -411,6 +411,10 @@ class TransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protoco
     requires_aggregation_batch_context: bool
     requires_complete_source_batch: bool
 
+    # Largest batch the plugin's flush accepts (None: no cap). runtime_factory
+    # and the composer refuse an aggregation trigger.count above it.
+    max_batch_rows: int | None
+
     # True when every successful flush emits exactly one row per buffered row
     # (success_multi, buffered order, no quarantined_indices): the only shape
     # output_mode: passthrough carries. runtime_factory and the composer refuse
@@ -709,6 +713,10 @@ class BatchTransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Pr
     # aggregation flush supplies; runtime_factory refuses it as a collector.
     requires_aggregation_batch_context: bool
     requires_complete_source_batch: bool
+
+    # Largest batch the plugin's flush accepts (None: no cap). runtime_factory
+    # and the composer refuse an aggregation trigger.count above it.
+    max_batch_rows: int | None
 
     # True when every successful flush emits exactly one row per buffered row
     # (success_multi, buffered order, no quarantined_indices): the only shape
