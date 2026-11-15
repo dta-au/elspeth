@@ -83,15 +83,16 @@ For `export_yaml`, there is no blob; the audit row is the entire side effect. Th
 
 The precedent for `hmac.compare_digest` at boundary verifiers is `core/payload_store.py:111,163` and `web/blobs/service.py:759`, both of which compare a caller-supplied content_hash against a stored hash. `ShareTokenSigner.verify` follows that pattern.
 
-### D4. Store the save-for-review snapshot in the existing payload store
+### D4. Store the save-for-review snapshot in a dedicated payload namespace
 
-**Decision:** The frozen snapshot is a content-addressable blob in the existing `FilesystemPayloadStore`. The `payload_digest` (sha256 hex of the canonical-JSON bytes) is the blob's address; it also rides in the signed token envelope so tamper detection covers both the token AND the blob.
+**Decision:** The frozen snapshot is a content-addressable blob in a `FilesystemPayloadStore` rooted at `<web payload store base>/shares`. The `payload_digest` (sha256 hex of the canonical-JSON bytes) is the blob's address; it also rides in the signed token envelope so tamper detection covers both the token AND the blob. This uses the already mounted payload volume without a new setting. Run purge deletes only hash-addressed objects under the store it is pointed at; pointed at the parent store (the supported configuration), identical run bytes cannot delete a new share. Pointing purge's `--payload-dir` at `shares/` itself would defeat this, and the database-maintenance runbook says not to.
 
 **Why payload store, not a new table:**
 
-* The payload store already provides content-addressable, integrity-verified blob storage with a retention policy. Building a parallel storage mechanism would duplicate infrastructure.
-* The blob's lifetime is bounded by the retention policy, not by the token's expiry. If retention is shorter than `shareable_link_lifetime_seconds`, the token may verify but the blob may be gone — the route returns 404 with a "ask the sender for a fresh link" message. Operators choosing retention < lifetime accept this.
+* `FilesystemPayloadStore` already provides content-addressable, integrity-verified blob storage. The dedicated namespace reuses it while separating share bytes from run retention.
+* Share expiry is enforced by the token; the web app does not reclaim share bytes after expiry. A missing snapshot returns 404 with an "ask the sender for a fresh link" message.
 * Content-addressing dedupes identical snapshots automatically. Two re-mints over an unchanged composition produce the same `payload_digest` and reuse the same blob.
+* Reads try `shares/` first and fall back to the parent store only when the share object is absent. This preserves links minted before the namespace change without migration. Those legacy objects remain exposed to run purge when their bytes match a run payload. Integrity errors never trigger fallback.
 
 **Frozen-at-mark-time discipline.** The snapshot blob carries the entire `AuditReadinessSnapshot` from the moment of marking. `resolve_token` reads `audit_readiness` directly from the blob; it never re-calls `ReadinessService.compute_snapshot`. Three reasons:
 
@@ -127,6 +128,8 @@ The precedent for `hmac.compare_digest` at boundary verifiers is `core/payload_s
 
 **Decision:** `GET /api/sessions/shared/{token}` requires authentication (`Depends(get_current_user)`). The token authorizes a *specific authenticated user* to read a session they don't own — it does not log them in.
 
+The capability resolves its snapshot from the share namespace with the D4 legacy-read fallback; possession of a valid token does not change run purge's treatment of legacy bytes.
+
 **Why explicit authentication:**
 
 * A capability without authentication is a public URL. Anyone who learns the URL gets the data.
@@ -161,12 +164,12 @@ The precedent for `hmac.compare_digest` at boundary verifiers is `core/payload_s
 **What the opt-in changes:**
 
 * **Who can import.** Any signed-in identity holding the link that has the deployment-wide `user` role (`require_pipeline_user`); a signed-in identity without it gets 403 `user_role_required`. The token stays a capability, not an authenticator (D6), and the import uses the strict per-user rate limit, like opening a link.
-* **Frozen files.** At mark time, every uploaded file the graph is attached to (a source's `blob_ref`, a `blob_rows` source's entries, transform inline-content markers) is read under the owner's session, checked against its recorded hash and size, and stored in the payload store before the audit row is written. Only a ready file the user uploaded verbatim travels: a file the assistant wrote or a pipeline run produced refuses the share with 409 naming the file. The snapshot carries a private file manifest (names, MIME types, sha256 values, binding sites) and a private sink-path manifest, both bound by `payload_digest`; the inspect response exposes only file names and sizes. Later edits or deletion on the owner's side do not affect the frozen copy, and the owner cannot delete it.
+* **Frozen files.** At mark time, every uploaded file the graph is attached to (a source's `blob_ref`, a `blob_rows` source's entries, transform inline-content markers) is read under the owner's session, checked against its recorded hash and size, and stored in the `shares/` payload namespace before the audit row is written. Only a ready file the user uploaded verbatim travels: a file the assistant wrote or a pipeline run produced refuses the share with 409 naming the file. The snapshot carries a private file manifest (names, MIME types, sha256 values, binding sites) and a private sink-path manifest, both bound by `payload_digest`; the inspect response exposes only file names and sizes. Later edits or deletion on the owner's side do not affect the frozen copy, and the owner cannot delete it. Legacy frozen files in the parent store remain readable through D4's fallback and remain purge-exposed.
 * **Lifespan.** The owner picks 1, 7 or 30 days; `shareable_link_lifetime_seconds` becomes the maximum and the server refuses a longer value (422). Re-minting keeps the chosen lifespan, clamped to the current maximum. D5 is unchanged: there is still no per-link revocation.
 * **Import.** The token, snapshot and every frozen file are read and verified before anything is created. The recipient's session is seeded through the ordinary YAML importer (credential, plugin-policy and redaction checks included), with each file copied into the new session as an ordinary blob under the recipient's quotas and every binding re-attached to the copy. A failure after the session exists archives it. The import is recorded as `shared_import` provenance in the new state's `composer_meta`; nothing is written on the owner's side.
 * **Sink paths.** A sink `path`, `file` or `persist_directory` inside the owner's session `outputs/` or `blobs/` folder is recorded as a folder plus relative path and re-authored under the same folder of the recipient's session. Any other sink path does not travel. A recorded path that could leave the recipient's folder is an integrity error and no session is created.
 
-**Amends D4's retention bullet:** nothing in the web app reclaims payload-store content, so snapshots and frozen files stay stored after a link expires. Reclamation is tracked in [#356](https://github.com/dta-au/elspeth/issues/356).
+**Amends D4's retention bullet:** nothing in the web app reclaims share content, so snapshots and frozen files stay stored after a link expires. Reclamation is tracked in [#356](https://github.com/dta-au/elspeth/issues/356).
 
 **Design record:** [docs/superpowers/specs/2026-11-09-shared-graph-import-design.md](../../superpowers/specs/2026-11-09-shared-graph-import-design.md).
 
@@ -176,7 +179,7 @@ The precedent for `hmac.compare_digest` at boundary verifiers is `core/payload_s
 
 * The two-event-type `composer_completion_events_table` is now the canonical home for composer completion-gesture audit events. Adding a third event type (e.g. a hypothetical "save draft" gesture) requires extending the closed CHECK constraint in a schema-change cohort, OR adding a separate table per the Phase 18 precedent.
 * The HMAC-SHA256 + content-address envelope is the v1 signed-token contract. Bumping `ShareTokenPayload.version` is the forward-compat hook; a future v2 envelope would coexist via dual-version verify.
-* The payload store is now a Tier-1 dependency of the shareable-reviews path. Operators must provision sufficient retention for the configured `shareable_link_lifetime_seconds`.
+* The payload volume is a dependency of the shareable-reviews path. Operators must preserve its `shares/` subtree for links to remain usable; run payload retention does not govern new shares. Pre-change links still depend on parent-store bytes and can be broken by run purge.
 
 ### What this defers
 

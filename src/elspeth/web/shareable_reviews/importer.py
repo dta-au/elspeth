@@ -51,7 +51,6 @@ from elspeth.contracts.blobs_inline import ContentEncoding
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.session_operation import SessionOperationKind
-from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.state import CompositionState
@@ -295,9 +294,9 @@ async def import_shared_snapshot(*, token: str, request: Request, user: UserIden
     payload, snapshot = await service.load_snapshot(token=token)
     if not snapshot.import_allowed:
         raise ImportNotAllowedError("this share link does not allow import")
-    payload_store: FilesystemPayloadStore = request.app.state.payload_store
     copies = [
-        _FrozenCopy(entry=entry, content=await run_sync_in_worker(payload_store.retrieve, entry["sha256"])) for entry in snapshot.files
+        _FrozenCopy(entry=entry, content=await run_sync_in_worker(service.retrieve_share_payload, entry["sha256"]))
+        for entry in snapshot.files
     ]
     plan = _plan_bindings(snapshot.files, snapshot.sink_paths)
     composition = CompositionState.from_dict(snapshot.blob["composition_snapshot"])

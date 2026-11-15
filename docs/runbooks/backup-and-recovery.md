@@ -19,7 +19,7 @@ recovery points in the controlled deployment copy of the
 | Component | Runtime location | Restore relationship |
 |-----------|------------------|----------------------|
 | Landscape | CLI `landscape.url`; Web `landscape_url` or `<data_dir>/runs/audit.db` | Payload references and run evidence must agree with the payload store |
-| Payload store | CLI `payload_store.base_path`; Web `payload_store_path` or `<data_dir>/payloads` | Content-addressed bytes referenced by Landscape |
+| Payload store | CLI `payload_store.base_path`; Web `payload_store_path` or `<data_dir>/payloads`, including its `shares/` subtree | Content-addressed run bytes referenced by Landscape and share snapshots/files referenced by Sessions |
 | Sessions | Web `session_db_url` or `<data_dir>/sessions.db` | Blob metadata, identities, sessions and Composer state |
 | Managed blobs | `<data_dir>/blobs` | Files whose paths, sizes and hashes are held in Sessions |
 | Local credentials | `<data_dir>/auth.db` when local authentication is enabled | Separate credential database; never infer it from Sessions |

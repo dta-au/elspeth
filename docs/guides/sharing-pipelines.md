@@ -73,14 +73,15 @@ keeps the chosen lifetime, clamped to the current maximum. The signer's
 signature. Operators may lower or raise this to match their review cadence;
 values must be `> 0`.
 
-Nothing in the web application deletes stored snapshots, or the files
-frozen into a link that allows import, from the payload store: they remain
-after the link expires (`payload_store_retention_days` does not apply to
-them). Identical bytes are stored once. Reclamation is tracked in
-[#356](https://github.com/dta-au/elspeth/issues/356). A snapshot or file
-removed by other means, for example by `elspeth purge` of a run payload with
-identical bytes, makes the link answer 404 with an "ask the sender for a
-fresh link" message.
+New snapshots and frozen files live under `<web payload store base>/shares` on
+the existing payload volume. Nothing in the web application deletes them after
+the link expires (`payload_store_retention_days` does not apply). Identical
+share bytes are stored once. Reclamation is tracked in
+[#356](https://github.com/dta-au/elspeth/issues/356). Links minted before
+this namespace change still read from the parent payload store when a share
+object is absent. Those legacy bytes can be removed by `elspeth purge` when
+identical to a run payload, making the link answer 404 with an "ask the sender
+for a fresh link" message.
 
 ## First-deploy operator action
 

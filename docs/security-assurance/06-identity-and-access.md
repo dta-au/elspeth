@@ -674,10 +674,11 @@ into a new session of their own (ADR-022 D9).
   `shareable_link_lifetime_seconds` (default 30 days), which is the maximum;
   the server refuses a longer lifetime. An expired link stops working for
   viewing and import alike. Nothing in the web application deletes stored
-  snapshots or frozen files, so they remain in the payload store after the
-  link expires and an imported copy is unaffected by expiry. A snapshot or
-  file removed by other means (for example `elspeth purge` of a run payload
-  with identical bytes) answers 404 asking for a fresh link.
+  snapshots or frozen files. New shares use `<web payload store base>/shares`,
+  outside the hash paths deleted by `elspeth purge`; an imported copy is
+  unaffected by expiry. Pre-change links fall back to the parent store, where
+  identical run bytes can still be purged and cause a 404 asking for a fresh
+  link.
 - **Revocation.** Rotating `shareable_link_signing_key` invalidates every
   outstanding link at once. Copies already imported are separate sessions and
   are not affected. The deployment records its treatment of link
