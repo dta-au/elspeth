@@ -561,7 +561,12 @@ Sinks and retrieval:
   - An empty or duplicate document id in an effect group is diverted per row
     at prepare; the whole effect previously failed, and an empty id was
     recommitted forever.
-  - An upsert value error diverts the row.
+  - A row is diverted only when chromadb rejects it before sending
+    (validation, embedding, metadata preparation). A failure after the write
+    is sent, such as an unreadable HTTP response, is reconciled by reading the
+    write back; it used to be recorded as a diversion of a row that had been
+    written. This uses chromadb's private upsert path, so `chromadb` is pinned
+    to 1.5.5.
   - Startup refuses an existing collection whose `hnsw:space` differs from
     `distance_function`.
 - **HTTP replay** re-raises a recorded transport failure and records the
@@ -616,7 +621,9 @@ Sinks and retrieval:
     that used its 2 s CPU budget is a row `TemplateError`, anything else a
     retryable worker-lost error (#6).
   - Parallel LLM multi-query records the pool execution context in
-    `context_after` (#100).
+    `context_after` (#100). The context is captured under the batch lock, so
+    with concurrent rows each row records its own batch's retries, throttling
+    and concurrency rather than another row's.
   - Control credit no longer reads a `detect_only` option that no plugin
     config admits (#1).
   - A template render whose context carries a row reports failures by
