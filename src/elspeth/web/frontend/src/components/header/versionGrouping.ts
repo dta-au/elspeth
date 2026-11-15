@@ -31,7 +31,7 @@ export function groupId(members: CompositionStateVersion[]): string {
 
 export function buildVersionRows(
   displayVersions: CompositionStateVersion[],
-  kindFor: (version: CompositionStateVersion) => VersionLabelKind | "snapshot",
+  kindFor: (version: CompositionStateVersion) => VersionLabelKind | "snapshot" | "milestone",
   currentVersion: number | null,
   showAdvanced: boolean,
   expandedGroupIds: ReadonlySet<string>,

@@ -70,6 +70,7 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginI
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
 from elspeth.web.sessions.operation_receipts import operation_receipt_response_hash
 from elspeth.web.sessions.protocol import (
+    CompositionStateRecord,
     OperationReceiptResult,
     OperationReceiptSettlementConflictError,
     SessionRecord,
@@ -82,7 +83,8 @@ from elspeth.web.sessions.routes.operation_receipts import (
     raise_operation_receipt_failure,
     reserve_or_replay_operation_receipt,
 )
-from elspeth.web.sessions.schemas import CompositionHeadResponse
+from elspeth.web.sessions.schemas import CompositionHeadResponse, CompositionStateVersionResponse
+from elspeth.web.sessions.validation_milestone import is_validation_milestone
 from elspeth.web.validation import reject_credential_material
 
 from .._helpers import (
@@ -1023,9 +1025,17 @@ async def get_composition_head(
     return CompositionHeadResponse(state_id=str(head.state_id) if head.state_id is not None else None, version=head.version)
 
 
+def _state_version_response(
+    record: CompositionStateRecord, *, policy_catalog: PolicyCatalogView | None = None
+) -> CompositionStateVersionResponse:
+    """Project a history row without widening single-state or receipt responses."""
+    response = _state_response(record, policy_catalog=policy_catalog, degrade_unbindable_custody=True)
+    return CompositionStateVersionResponse(**response.model_dump(), is_milestone=is_validation_milestone(record))
+
+
 @router.get(
     "/{session_id}/state/versions",
-    response_model=list[CompositionStateResponse],
+    response_model=list[CompositionStateVersionResponse],
 )
 async def get_state_versions(
     session_id: UUID,
@@ -1033,7 +1043,7 @@ async def get_state_versions(
     user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
-) -> list[CompositionStateResponse]:
+) -> list[CompositionStateVersionResponse]:
     """Get composition state versions for a session."""
     session = await _verify_session_ownership(session_id, user, request)
     service = request.app.state.session_service
@@ -1043,7 +1053,7 @@ async def get_state_versions(
     # cannot bind serves the degraded (masked, custody_unavailable-named)
     # projection beside untouched siblings, so a bindable version stays
     # reachable for restore. The single-tip GET /state keeps its named 409.
-    return [_state_response(v, policy_catalog=catalog, degrade_unbindable_custody=True) for v in versions]
+    return [_state_version_response(v, policy_catalog=catalog) for v in versions]
 
 
 @router.post(

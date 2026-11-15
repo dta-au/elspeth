@@ -621,10 +621,9 @@ is `last_validated`, say nothing has changed since the compared validated versio
 say nothing has changed in this turn.
 When available, a broken pipeline compares with its last validated version; a
 valid one with the previous validated version. Name `from_version` and envelope
-`version`: `version` is the working pipeline's number at this call; later saves
-this turn take higher numbers, so give it as the compared version, not the user's
-final version. `from_version` can be looked for in the version menu, which
-hides versions identical to their predecessors and lists only recent ones.
+`version`: `version` is the working pipeline's number at this call. Give it as
+the compared version, not the user's final version. For `last_validated`, `from_version` is a validated milestone
+selectable in the version menu, which marks milestones; older history may be missing from the menu.
 Planner and commit routes use `request_start`. If `diff_pipeline`
 refuses with `diff_baseline_unavailable`, this surface gave it no usable baseline: do
 not retry it, describe the change from this turn's own results, and never tell

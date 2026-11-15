@@ -867,7 +867,7 @@ interface SessionState {
   ) => ApplyRecoveredStateResult;
   discardRecovery: () => void;
   loadStateVersions: () => Promise<void>;
-  isLoadingVersions: boolean;
+  historyStatus: "idle" | "loading" | "settled" | "unsettled" | "failed";
   revertToVersion: (stateId: string) => Promise<void>;
   applyResolvedInterpretation: (newState: CompositionState | null) => void;
 
@@ -899,7 +899,7 @@ const initialState = {
   composerModel: null as string | null,
   composerAdvisorModel: null as string | null,
   stateVersions: [] as CompositionStateVersion[],
-  isLoadingVersions: false,
+  historyStatus: "idle" as const,
   error: null as string | null,
   errorDetails: null as string[] | null,
   selectedNodeId: null as string | null,
@@ -1056,7 +1056,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       proposalActionPendingIds: [],
       composerProgress: null,
       stateVersions: [],
-      isLoadingVersions: false,
+      historyStatus: "idle",
       isComposing: false,
       error: null,
       errorDetails: null,
@@ -1167,7 +1167,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       proposalActionPendingIds: [],
       composerProgress: null,
       stateVersions: [],
-      isLoadingVersions: false,
+      historyStatus: "idle",
       isComposing: composerSessionHasCustody(id),
       error: null,
       errorDetails: null,
@@ -1963,13 +1963,24 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     const publicationIsCurrent = captureSessionPublicationGuard(activeSessionId);
     const readSequence = ++stateVersionsReadSequence;
     const isCurrent = () => publicationIsCurrent() && readSequence === stateVersionsReadSequence;
-    set({ isLoadingVersions: true });
+    set({ historyStatus: "loading" });
     try {
-      const versions = await api.fetchStateVersions(activeSessionId);
-      if (isCurrent()) set({ stateVersions: versions, isLoadingVersions: false });
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        let historyWasMoving = false;
+        const versions = await api.fetchStateVersions(activeSessionId, () => { historyWasMoving = true; });
+        if (!isCurrent()) return;
+        const currentVersion = get().compositionState?.version ?? 0;
+        const highestVersion = versions[versions.length - 1]?.version ?? 0;
+        if (highestVersion >= currentVersion || attempt === 2) {
+          set({
+            stateVersions: versions,
+            historyStatus: historyWasMoving || highestVersion < currentVersion ? "unsettled" : "settled",
+          });
+          return;
+        }
+      }
     } catch {
-      // Version history is non-critical -- fail silently
-      if (isCurrent()) set({ isLoadingVersions: false });
+      if (isCurrent()) set({ historyStatus: "failed" });
     }
   },
 

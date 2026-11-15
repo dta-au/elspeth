@@ -5,7 +5,7 @@ import fixture from "../../../../../../tests/fixtures/web/composer/composition_s
 import emptyStateResponse from "../../../../../../tests/fixtures/web/composer/empty_composition_state_response.json";
 
 import { fetchCompositionState, fetchStateVersions, importCompositionYaml, revertToVersion } from "./client";
-import { decodeCompositionState } from "./compositionDecoder";
+import { decodeCompositionState, decodeCompositionStateVersions } from "./compositionDecoder";
 
 function stateWithErrors(validation_errors: unknown) {
   return {
@@ -21,6 +21,91 @@ function stateWithErrors(validation_errors: unknown) {
 const coded = { message: "Readable diagnosis", error_code: "schema_contract_violation", component: "step" };
 
 describe("composition state HTTP admission", () => {
+  it.each([51, 52])("refetches a milestone after the head advances from 50 to %s", async (latest) => {
+    const versions = Array.from({ length: latest }, (_, index) => ({
+      ...stateWithErrors(null), version: index + 1, is_milestone: index === 50,
+    }));
+    let headReads = 0;
+    const offsets: number[] = [];
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname.endsWith("/state/head")) {
+        headReads += 1;
+        return new Response(JSON.stringify({ state_id: "state-head", version: headReads === 1 ? 50 : latest }));
+      }
+      const offset = Number(url.searchParams.get("offset"));
+      offsets.push(offset);
+      return new Response(JSON.stringify(versions.slice(offset, offset + 50)));
+    });
+    const rows = await fetchStateVersions("session-1");
+    expect(offsets).toEqual([0, latest - 50]);
+    expect(rows.find((row) => row.version === 51)?.is_milestone).toBe(true);
+    expect(rows[rows.length - 1]?.version).toBe(latest);
+  });
+
+  it("marks a bounded history read as refreshing while the head keeps moving", async () => {
+    let headVersion = 50;
+    const moving = vi.fn();
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      if (String(input).endsWith("/state/head")) {
+        return new Response(JSON.stringify({ state_id: "state-head", version: headVersion++ }));
+      }
+      return new Response("[]");
+    });
+    expect(await fetchStateVersions("session-1", moving)).toEqual([]);
+    expect(moving).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(9);
+  });
+
+  it("loads the newest 50 rows into the store for a history longer than 50", async () => {
+    const versions = Array.from({ length: 55 }, (_, index) => ({
+      ...stateWithErrors(null), version: index + 1, is_milestone: index === 53,
+    }));
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname.endsWith("/state/head")) {
+        return new Response(JSON.stringify({ state_id: "state-55", version: 55 }));
+      }
+    const offset = Number(url.searchParams.get("offset") ?? 0);
+      return new Response(JSON.stringify(versions.slice(offset, offset + 50)));
+    });
+    useSessionStore.setState({ activeSessionId: "session-1", stateVersions: [] });
+    await useSessionStore.getState().loadStateVersions();
+    expect(useSessionStore.getState().stateVersions.map((row) => row.version)).toEqual(
+      Array.from({ length: 50 }, (_, index) => index + 6),
+    );
+    expect(useSessionStore.getState().stateVersions[48].is_milestone).toBe(true);
+  });
+
+  it("requires the milestone boolean only on history rows", () => {
+    const state = stateWithErrors(null);
+    expect(() => decodeCompositionStateVersions([state])).toThrow(/is_milestone/);
+    expect(() => decodeCompositionStateVersions([{ ...state, is_milestone: "true" }])).toThrow(/is_milestone/);
+    expect(decodeCompositionStateVersions([{ ...state, is_milestone: false }])[0].is_milestone).toBe(false);
+    expect(() => decodeCompositionState({ ...state, is_milestone: true })).toThrow();
+  });
+
+  it.each([0, 1, 50])("uses offset zero for a head at version %s", async (version) => {
+    vi.mocked(fetch).mockImplementation(async (input) => new Response(
+      String(input).endsWith("/state/head")
+        ? JSON.stringify({ state_id: version === 0 ? null : "state-1", version })
+        : "[]",
+    ));
+    expect(await fetchStateVersions("session-1")).toEqual([]);
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/sessions/session-1/state/versions?limit=50&offset=0", expect.anything(),
+    );
+  });
+
+  it.each([null, {}, { state_id: null, version: -1 }, { state_id: null, version: "55" },
+    { state_id: 7, version: 1 }, { state_id: null, version: 1, unexpected: true }])(
+    "rejects a malformed head before requesting history", async (head) => {
+      vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify(head)));
+      await expect(fetchStateVersions("session-1")).rejects.toThrow(/composition_head/);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    },
+  );
+
   beforeEach(() => {
     vi.stubGlobal("fetch", vi.fn());
     localStorage.clear();
@@ -102,12 +187,18 @@ describe("composition state HTTP admission", () => {
 
   it("decodes full state history records using the same contract", async () => {
     const states = fixture.versions;
-    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify(states)));
+    vi.mocked(fetch).mockImplementation(async (input) => new Response(
+      String(input).endsWith("/state/head") ? JSON.stringify({ state_id: "state-1", version: 1 }) : JSON.stringify(states),
+    ));
     expect(await fetchStateVersions("session-1")).toEqual(states);
   });
 
   it("rejects legacy strings inside a state history row", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify([stateWithErrors(["legacy"])])));
+    vi.mocked(fetch).mockImplementation(async (input) => new Response(
+      String(input).endsWith("/state/head")
+        ? JSON.stringify({ state_id: "state-1", version: 1 })
+        : JSON.stringify([{ ...stateWithErrors(["legacy"]), is_milestone: false }]),
+    ));
     await expect(fetchStateVersions("session-1")).rejects.toThrow(/composition_states\[0\].validation_errors/);
   });
 

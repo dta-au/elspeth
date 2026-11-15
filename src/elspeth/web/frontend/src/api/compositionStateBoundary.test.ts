@@ -33,8 +33,8 @@ describe("composition state decoder boundaries", () => {
 
   it("rejects a malformed later version rather than returning a valid prefix", () => {
     expect(() => decodeCompositionStateVersions([
-      fixture.states.coded,
-      { ...fixture.states.empty, validation_errors: ["legacy"] },
+      { ...fixture.states.coded, is_milestone: false },
+      { ...fixture.states.empty, is_milestone: true, validation_errors: ["legacy"] },
     ])).toThrow(/composition_states\[1\].validation_errors/);
   });
 });

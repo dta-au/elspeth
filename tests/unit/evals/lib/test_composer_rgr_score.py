@@ -307,7 +307,9 @@ class TestHttpValidationErrorAuthority:
         assert json.loads(fixture.read_text()) == produced
         assert produced["states"]["null"]["validation_errors"] is None
         assert produced["states"]["empty"]["validation_errors"] == []
-        assert produced["versions"] == list(produced["states"].values())
+        # These producer fixtures are legacy unmarked rows: valid ones are
+        # milestones, while the single-state receipt domain stays unchanged.
+        assert produced["versions"] == [{**state, "is_milestone": state["is_valid"]} for state in produced["states"].values()]
         assert produced["states"]["guided_invalid"]["validation_errors"] == [
             {"message": "guided_composition_invalid", "error_code": "guided_composition_invalid", "component": None}
         ]

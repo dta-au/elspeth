@@ -339,8 +339,23 @@ export function decodeCompositionState(value: unknown, path = "composition_state
   };
 }
 
-export function decodeCompositionStateVersions(value: unknown): CompositionState[] {
-  return arrayValue(value, "composition_states").map((state, index) =>
-    decodeCompositionState(state, `composition_states[${index}]`),
-  );
+export function decodeCompositionStateVersions(value: unknown): (CompositionState & { is_milestone: boolean })[] {
+  return arrayValue(value, "composition_states").map((value, index) => {
+    const path = `composition_states[${index}]`;
+    const wire = record(value, path);
+    if (!Object.prototype.hasOwnProperty.call(wire, "is_milestone")) invalid(path, "missing is_milestone");
+    const { is_milestone, ...state } = wire;
+    return {
+      ...decodeCompositionState(state, path),
+      is_milestone: booleanValue(is_milestone, `${path}.is_milestone`),
+    };
+  });
+}
+
+export function decodeCompositionHeadVersion(value: unknown): number {
+  const head = exactRecord(value, "composition_head", ["state_id", "version"]);
+  nullableString(head.state_id, "composition_head.state_id");
+  const version = integerValue(head.version, "composition_head.version");
+  if (version < 0) invalid("composition_head.version", "expected non-negative version");
+  return version;
 }
