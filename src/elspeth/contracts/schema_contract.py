@@ -741,6 +741,26 @@ class PipelineRow:
             raise TypeError(f"deep_thaw(PipelineRow._data) must return dict, got {type(thawed).__name__}")
         return thawed
 
+    def carried_value(self, key: str) -> Any:
+        """Read one carried payload key literally: no name resolution, no thaw.
+
+        For a plugin whose configuration names the payload key it reads, not
+        an original header spelling. The value is the same frozen value
+        ``row[key]`` returns, so a wrong-type report names the type every
+        other reader sees, and the rest of the row is not copied.
+
+        Raises:
+            KeyError: If the row does not carry ``key``.
+        """
+        return self._data[key]
+
+    def carries(self, key: str) -> bool:
+        """Whether the row carries ``key`` literally (the test ``carried_value`` uses).
+
+        Unlike ``key in row``, an original header spelling is not resolved.
+        """
+        return key in self._data
+
     def get(self, key: str, default: Any = None) -> Any:
         """Get field value with optional default (Jinja2 compatibility).
 
