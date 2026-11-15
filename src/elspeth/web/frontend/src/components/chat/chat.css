@@ -145,6 +145,16 @@
   margin-bottom: 0;
 }
 
+.checkpoint-receipt {
+  padding: var(--space-xs) var(--space-sm);
+  border: 0;
+  background-color: transparent;
+}
+
+.checkpoint-receipt > summary {
+  cursor: pointer;
+}
+
 /* Interpretation-approval register (elspeth-3574f87208). A resolve
    confirmation is a SYSTEM attestation of an operator decision, not
    assistant speech — it must never compose .bubble-assistant, which asserts

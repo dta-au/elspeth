@@ -1067,12 +1067,15 @@ def _assert_completed_trace_ledger(
         if effects["net_changed"]
         else "There is no net authored change from the starting draft."
     )
-    assert result.raw_assistant_content == saved_scope
-    base = saved_scope + no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
+    assert result.raw_assistant_content == ""
+    base = no_tool_policy.compose_review_reply_withheld_message(
+        no_tool_policy.compose_advisor_signoff_unrendered_unverified_message("", failure_class="unavailable"),
+        reason="unavailable",
+    )
     notice = f"Checkpoint save status: {saved_scope} Checkpoint evidence does not establish task completion."
     assert result.assistant_message == base + "\n\n" + notice
-    assert no_tool_policy.visible_message_segments(content=result.assistant_message, raw_content=saved_scope) == (
-        *no_tool_policy.visible_message_segments(content=base, raw_content=saved_scope),
+    assert no_tool_policy.visible_message_segments(content=result.assistant_message, raw_content="") == (
+        *no_tool_policy.visible_message_segments(content=base, raw_content=""),
         no_tool_policy.TrustedSystemNoticeSegment(notice),
     )
     assert result.runtime_preflight is not None and result.runtime_preflight.readiness.completion_ready is False

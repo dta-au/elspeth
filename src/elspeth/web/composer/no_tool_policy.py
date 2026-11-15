@@ -14,6 +14,7 @@ from opentelemetry import metrics
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.provider_rejection import ReasonDisposition, RequestRejectionReason, SafeRequestRejection
+from elspeth.web.composer.advisor_audit import AdvisorTerminalBlockReason
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools import is_discovery_tool
 from elspeth.web.composer.turn_effects import CHECKPOINT_SCOPE_TEMPLATES, TurnEvidence
@@ -111,6 +112,10 @@ def compose_graph_recovery_refusal_message() -> str:
 
 _REVIEW_REPLY_UNAVAILABLE_NOTICE: Final = "The model's final reply is unavailable. Please retry your question."
 _REVIEW_REPLY_UNAVAILABLE_SUFFIX = _bare_trusted_suffix(_REVIEW_REPLY_UNAVAILABLE_NOTICE)
+_REVIEW_REPLY_WITHHELD_NOTICE: Final = "The completion review did not admit the reply's claims; the reply was withheld."
+_REVIEW_REPLY_WITHHELD_SUFFIX = _bare_trusted_suffix(_REVIEW_REPLY_WITHHELD_NOTICE)
+_REVIEW_REPLY_UNREVIEWED_NOTICE: Final = "The completion review could not finish, so the reply was withheld."
+_REVIEW_REPLY_UNREVIEWED_SUFFIX = _bare_trusted_suffix(_REVIEW_REPLY_UNREVIEWED_NOTICE)
 # The reply after staged review cards was not requested because its request
 # cannot fit the context budget. Retrying cannot help, so this notice gives
 # the context-budget refusal's recourse instead. One static sentence pair.
@@ -129,6 +134,16 @@ _ADVISOR_REVIEW_BUDGET_SUFFIX = _bare_trusted_suffix(_ADVISOR_REVIEW_BUDGET_NOTI
 def compose_review_reply_unavailable_message(content: str) -> str:
     """Keep a missing provider reply distinct from model-authored prose."""
     return content + _REVIEW_REPLY_UNAVAILABLE_SUFFIX
+
+
+def compose_review_reply_withheld_message(content: str, *, reason: AdvisorTerminalBlockReason = "publication_withheld") -> str:
+    """Disclose withheld prose after the existing graph-status notice."""
+    suffix = (
+        _REVIEW_REPLY_UNREVIEWED_SUFFIX
+        if reason in {"unavailable", "malformed", "request_rejected", "budget_exhausted"}
+        else _REVIEW_REPLY_WITHHELD_SUFFIX
+    )
+    return content + suffix
 
 
 def compose_review_reply_context_budget_message(content: str) -> str:
@@ -153,6 +168,13 @@ _CLARIFICATION_FINALIZE_SUFFIX = _bare_trusted_suffix(_CLARIFICATION_NOTICE)
 
 _PREFLIGHT_NOTICE_HEADER: Final = "Runtime preflight failed before this build could be marked complete."
 _PREFLIGHT_NOTICE_FOOTER: Final = "The composer's analysis above is preserved verbatim; the validator's objection is recorded here."
+_PREFLIGHT_WITHHELD_FOOTER: Final = "The validator's objection is recorded here; the composer's reply was withheld."
+_PREFLIGHT_WITHHELD_SUFFIX_WITH_DETAIL = _wrapped_diagnostic_template(
+    _PREFLIGHT_NOTICE_HEADER,
+    _PREFLIGHT_WITHHELD_FOOTER,
+    diagnostic_slots="{detail}{suggestion_block}",
+)
+_PREFLIGHT_WITHHELD_SUFFIX_BARE = _bare_trusted_suffix(_PREFLIGHT_NOTICE_HEADER + "\n\n" + _PREFLIGHT_WITHHELD_FOOTER)
 _PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_WITH_DETAIL = _wrapped_diagnostic_template(
     _PREFLIGHT_NOTICE_HEADER,
     _PREFLIGHT_NOTICE_FOOTER,
@@ -679,21 +701,30 @@ def _canonical_base_suffix_segments(suffix: str, *, allow_request_rejection: boo
         return (TrustedSystemNoticeSegment(_GRAPH_RECOVERY_REFUSAL_NOTICE),)
     if suffix == _ADVISOR_REVIEW_BUDGET_SUFFIX:
         return (TrustedSystemNoticeSegment(_ADVISOR_REVIEW_BUDGET_NOTICE),)
-    # One final notice for an absent reply: the provider's was unavailable, or
-    # the context budget refused its request. Never both, never twice.
+    if suffix.endswith(_INTERPRETATION_REVIEW_HANDOFF_FINALIZE_SUFFIX):
+        preceding = suffix[: -len(_INTERPRETATION_REVIEW_HANDOFF_FINALIZE_SUFFIX)]
+        if preceding:
+            segments = _canonical_base_suffix_segments(preceding)
+            if segments is not None and segments[-1] != TrustedSystemNoticeSegment(_INTERPRETATION_REVIEW_HANDOFF_NOTICE):
+                return (*segments, TrustedSystemNoticeSegment(_INTERPRETATION_REVIEW_HANDOFF_NOTICE))
+    # One final notice for an absent reply: unavailable, context-budget
+    # refusal, or withheld publication. Never multiple causes or duplicates.
     absent_reply_suffixes = (
         (_REVIEW_REPLY_UNAVAILABLE_SUFFIX, _REVIEW_REPLY_UNAVAILABLE_NOTICE),
         (_REVIEW_REPLY_CONTEXT_BUDGET_SUFFIX, _REVIEW_REPLY_CONTEXT_BUDGET_NOTICE),
+        (_REVIEW_REPLY_WITHHELD_SUFFIX, _REVIEW_REPLY_WITHHELD_NOTICE),
+        (_REVIEW_REPLY_UNREVIEWED_SUFFIX, _REVIEW_REPLY_UNREVIEWED_NOTICE),
     )
     for absent_suffix, absent_notice in absent_reply_suffixes:
         if suffix == absent_suffix:
             return (TrustedSystemNoticeSegment(absent_notice),)
         if suffix.endswith(absent_suffix):
             preceding = suffix[: -len(absent_suffix)]
-            if any(other_suffix in preceding for other_suffix, _notice in absent_reply_suffixes):
-                return None
             segments = _canonical_base_suffix_segments(preceding)
             if segments is not None:
+                absent_notices = {notice for _suffix, notice in absent_reply_suffixes}
+                if any(isinstance(segment, TrustedSystemNoticeSegment) and segment.content in absent_notices for segment in segments):
+                    return None
                 return (*segments, TrustedSystemNoticeSegment(absent_notice))
             return None
     if suffix == _EMPTY_STATE_FINALIZE_SUFFIX:
@@ -743,6 +774,15 @@ def _canonical_base_suffix_segments(suffix: str, *, allow_request_rejection: boo
     )
     if preflight_with_diagnostic is not None:
         return preflight_with_diagnostic
+    if suffix == _PREFLIGHT_WITHHELD_SUFFIX_BARE:
+        return (TrustedSystemNoticeSegment(f"{_PREFLIGHT_NOTICE_HEADER}\n\n{_PREFLIGHT_WITHHELD_FOOTER}"),)
+    withheld_preflight = _split_wrapped_diagnostic(
+        suffix,
+        header=_PREFLIGHT_NOTICE_HEADER,
+        footer=_PREFLIGHT_WITHHELD_FOOTER,
+    )
+    if withheld_preflight is not None:
+        return withheld_preflight
     return _split_legacy_grounding_correction(suffix)
 
 
@@ -903,6 +943,16 @@ def compose_preflight_failure_message(content: str, *, runtime_result: Validatio
     if not content:
         return suffix.lstrip("\n").lstrip("-").lstrip()
     return content + suffix
+
+
+def compose_preflight_withheld_message(*, runtime_result: ValidationResult) -> str:
+    """Report a blocked preflight when the composer's reply was withheld."""
+    suffix = _red_diagnostic_suffix(
+        runtime_result,
+        with_detail_template=_PREFLIGHT_WITHHELD_SUFFIX_WITH_DETAIL,
+        bare_suffix=_PREFLIGHT_WITHHELD_SUFFIX_BARE,
+    )
+    return suffix.lstrip("\n").lstrip("-").lstrip()
 
 
 def _append_advisor_suffix(content: str, suffix: str) -> str:

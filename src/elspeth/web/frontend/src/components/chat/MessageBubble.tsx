@@ -58,10 +58,10 @@ export function MessageBubble({
   const [toolsExpanded, setToolsExpanded] = useState(false);
   const hasToolCalls = !!(message.tool_calls && message.tool_calls.length > 0);
   const hasSourcesCreated = !!(sourcesCreated && sourcesCreated.length > 0);
+  const segments = useMemo(() => message.segments ?? [
+    { kind: "text" as const, content: message.content },
+  ], [message.content, message.segments]);
   const visibleSegments = useMemo(() => {
-    const segments = message.segments ?? [
-        { kind: "text" as const, content: message.content },
-      ];
     if (pendingReviewCreatedAt === undefined) return segments;
     const handoffAt = Date.parse(message.created_at);
     if (Number.isNaN(handoffAt) || pendingReviewCreatedAt.some((createdAt) => Date.parse(createdAt) <= handoffAt)) {
@@ -70,7 +70,7 @@ export function MessageBubble({
     return segments.filter((segment) =>
       !(segment.kind === "trusted_system_notice" && segment.content === PENDING_REVIEW_NOTICE),
     );
-  }, [message.content, message.created_at, message.segments, pendingReviewCreatedAt]);
+  }, [message.created_at, pendingReviewCreatedAt, segments]);
   const [copied, setCopied] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [editContent, setEditContent] = useState(message.content);
@@ -131,6 +131,7 @@ export function MessageBubble({
   // an AI surface, "did ELSPETH or I say this" is load-bearing (WCAG 1.3.1 / AI
   // legibility). An sr-only label, read first, supplies it. (elspeth-f700d8d8a5)
   const authorLabel = isUser ? "You said:" : isSystem ? "System note:" : "ELSPETH said:";
+  const systemAuthoredAssistantRow = !isUser && !isSystem && segments[0]?.kind === "trusted_system_notice";
 
   // Short audit markers remain centred and italic. The current validation
   // message can contain long error explanations, so it reads as a left-aligned
@@ -161,7 +162,10 @@ export function MessageBubble({
         {/* Author attribution, read first by assistive tech (DOM order). The
             copy button below is an absolutely-positioned overlay, so this stays
             the first thing announced. */}
-        <span className="sr-only">{authorLabel}</span>
+        {(!systemAuthoredAssistantRow && visibleSegments.some((segment) => segment.kind === "text" && segment.content.trim()) ||
+          (hasToolCalls && visibleSegments.every((segment) => !segment.content.trim()))) && (
+          <span className="sr-only">{authorLabel}</span>
+        )}
         {/* Copy button — visible on hover via CSS, always accessible on touch.
 
             The confirmation is a GLYPH, not the word "Copied!"
@@ -242,21 +246,28 @@ export function MessageBubble({
         ) : (
           visibleSegments.map((segment, index) =>
             segment.kind === "trusted_system_notice" ? (
-              <div
-                key={`trusted-system-notice-${index}`}
-                className="trusted-system-notice"
-                role="status"
-              >
-                <span className="sr-only">System note:</span>
-                <MarkdownRenderer content={segment.content} />
-              </div>
+              segment.content.startsWith("Checkpoint save status: ") ? (
+                <details key={`checkpoint-receipt-${index}`} className="trusted-system-notice checkpoint-receipt" role="group" aria-label="Checkpoint save status">
+                  <summary>Checkpoint save status</summary>
+                  <MarkdownRenderer content={segment.content.slice("Checkpoint save status: ".length)} />
+                </details>
+              ) : (
+                <div
+                  key={`trusted-system-notice-${index}`}
+                  className="trusted-system-notice"
+                  role="status"
+                >
+                  <span className="sr-only">System note:</span>
+                  <MarkdownRenderer content={segment.content} />
+                </div>
+              )
             ) : isUser ? (
               <span key={`message-text-${index}`}>{segment.content}</span>
             ) : (
-              <MarkdownRenderer
-                key={`message-text-${index}`}
-                content={segment.content}
-              />
+              <div key={`message-text-${index}`}>
+                {systemAuthoredAssistantRow && <span className="sr-only">Validation detail:</span>}
+                <MarkdownRenderer content={segment.content} />
+              </div>
             ),
           )
         )}

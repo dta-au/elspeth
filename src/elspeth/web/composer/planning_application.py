@@ -58,6 +58,7 @@ from elspeth.web.composer.graph_recovery import GraphRecoveryContext
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.llm_response_parsing import attach_llm_calls
 from elspeth.web.composer.no_tool_policy import (
+    compose_review_reply_withheld_message,
     is_pending_interpretation_handoff,
     state_is_structurally_empty,
 )
@@ -1033,7 +1034,7 @@ class PlanningApplication:
                 reason=reason,
                 verdict=verdict,
                 state=state,
-                assistant_message=_AdmittedAssistantMessage(content=turn_evidence.render_saved_scope()),
+                assistant_message=_AdmittedAssistantMessage(content=""),
                 recorder=recorder,
                 repair_turns_used=0,
                 persisted_assistant_message_id=None,
@@ -1042,8 +1043,8 @@ class PlanningApplication:
                 runtime_preflight=None,
                 outstanding_findings=None,
                 publication_binding=None,
-                saved_scope=turn_evidence.render_saved_scope(),
             )
+            blocked = replace(blocked, message=compose_review_reply_withheld_message(blocked.message, reason=reason))
             # Planner audit was already committed. Only the new END call cohort
             # remains for the ordinary route terminal transaction to persist.
             blocked = replace(blocked, advisor_gate_decision=None, tool_invocations=(), llm_calls=recorder.llm_calls[end_call_start:])
