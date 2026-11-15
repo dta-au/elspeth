@@ -75,7 +75,8 @@ def _authority(engine: Engine, tmp_path: Path) -> RepositoryLibraryAuthority:
             ensure_test_identity(conn, identity_id=identity_id)
     _grant(engine, "alice", role="user")
     _grant(engine, "bob", role="user")
-    return RepositoryLibraryAuthority(engine, payload_store=FilesystemPayloadStore(tmp_path / "payloads"))
+    parent_store = FilesystemPayloadStore(tmp_path / "payloads")
+    return RepositoryLibraryAuthority(engine, payload_store=FilesystemPayloadStore(parent_store.base_path / "library"))
 
 
 def _grant(
@@ -363,8 +364,23 @@ def test_missing_or_corrupt_projection_is_integrity_failure(engine: Engine, tmp_
     entry = _publish(authority)
     authority.accept(entry_id=entry.entry_id, curator="carol", note=None, record=lambda event: None)
     authority._payload_store.delete(entry.payload_digest)
-    with pytest.raises(AuditIntegrityError, match="payload"):
+    with pytest.raises((AuditIntegrityError, library_module.LibraryAuthorityRefusal)) as refused:
         authority.authorize_fork_source(entry_id=entry.entry_id, forker_identity_id="bob", provider="local")
+    assert type(refused.value).__name__ == "LibraryPayloadUnavailable"
+    assert "republish" in str(refused.value)
+
+
+def test_parent_only_library_payload_is_unavailable(engine: Engine, tmp_path: Path) -> None:
+    authority = _authority(engine, tmp_path)
+    _grant(engine, "carol")
+    entry = _publish(authority)
+    authority.accept(entry_id=entry.entry_id, curator="carol", note=None, record=lambda event: None)
+    parent = FilesystemPayloadStore(tmp_path / "payloads")
+    parent.store(authority._payload_store.retrieve(entry.payload_digest))
+    authority._payload_store.delete(entry.payload_digest)
+    with pytest.raises((AuditIntegrityError, library_module.LibraryAuthorityRefusal)) as refused:
+        authority.authorize_fork_source(entry_id=entry.entry_id, forker_identity_id="bob", provider="local")
+    assert type(refused.value).__name__ == "LibraryPayloadUnavailable"
 
 
 def test_fork_authorization_returns_frozen_source_and_recall_refuses_new_authorization(engine: Engine, tmp_path: Path) -> None:

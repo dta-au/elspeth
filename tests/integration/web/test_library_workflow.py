@@ -21,6 +21,7 @@ from elspeth.web.config import WebSettings
 from elspeth.web.sessions.models import identity_roles_table
 from tests.fixtures.identities import ensure_test_identity
 from tests.integration.web.conftest import _lifespan_test_client, _seed_session_with_state
+from tests.unit.web._sync_asgi_client import SyncASGITestClient
 
 
 @dataclass
@@ -76,6 +77,13 @@ def test_library_round_trip_preserves_frozen_provenance_and_audit(tmp_path: Path
         assert published.status_code == 201, published.text
         entry = published.json()
         assert (entry["state"], entry["compartment_id"]) == ("pending", "local-team")
+        parent_store = client.app.state.payload_store
+        digest = entry["payload_digest"]
+        parent_had_publish = parent_store.exists(digest)
+        published_yaml = client.app.state.library_authority._payload_store.retrieve(digest)
+        assert parent_store.store(published_yaml) == digest
+        assert parent_store.delete(digest)
+        assert not parent_store.exists(digest)
 
         actor.identity_id = "carol"
         accepted = client.post(f"/api/library/{entry['entry_id']}/accept", json={"note": "reviewed"})
@@ -87,8 +95,11 @@ def test_library_round_trip_preserves_frozen_provenance_and_audit(tmp_path: Path
         assert browse.json()["entries"][0]["published_from_session_id"] is None
         assert client.get(f"/api/sessions/{source_session_id}").status_code == 404
 
-        forked = client.post(f"/api/library/{entry['entry_id']}/fork")
+        forked = SyncASGITestClient(client.app, raise_server_exceptions=False).post(f"/api/library/{entry['entry_id']}/fork")
         assert forked.status_code == 201, forked.text
+        assert not parent_had_publish
+        assert "library_payload_store" in vars(client.app.state)["_state"]
+        assert client.app.state.library_payload_store.retrieve(digest) == published_yaml
         fork_session_id = UUID(forked.json()["session_id"])
         fork_session = asyncio.run(client.app.state.session_service.get_session(fork_session_id))
         assert fork_session.user_id == "bob" and fork_session.forked_from_session_id is None

@@ -956,7 +956,9 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.payload_store = payload_store
         share_payload_store = FilesystemPayloadStore(payload_store.base_path / "shares")
         app.state.share_payload_store = share_payload_store
-        app.state.library_authority = RepositoryLibraryAuthority(app.state.session_engine, payload_store=payload_store)
+        library_payload_store = FilesystemPayloadStore(payload_store.base_path / "library")
+        app.state.library_payload_store = library_payload_store
+        app.state.library_authority = RepositoryLibraryAuthority(app.state.session_engine, payload_store=library_payload_store)
         # ``shareable_link_signing_key`` is a ``SecretBytes`` (DC-2 FIX-L —
         # masks repr to prevent plaintext leakage in tracebacks/logs).
         # ``.get_secret_value()`` returns the raw bytes the HMAC primitive needs.

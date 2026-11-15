@@ -32,6 +32,7 @@ from elspeth.web.coordination.library_authority import (
     LibraryEntryState,
     LibraryForkerNotActive,
     LibraryNoteTooLong,
+    LibraryPayloadUnavailable,
     LibraryPublished,
     LibraryPublisherNotActive,
     LibraryRejectionNoteRequired,
@@ -69,6 +70,7 @@ _ERROR_TYPES: dict[type[LibraryAuthorityRefusal], str] = {
     LibraryRejectionNoteRequired: "library_rejection_note_required",
     LibraryNoteTooLong: "library_note_too_long",
     LibraryEntryNotForkable: "library_entry_not_forkable",
+    LibraryPayloadUnavailable: "library_payload_unavailable",
 }
 
 
