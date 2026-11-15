@@ -37,7 +37,6 @@ from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import FrameworkBugError, RuntimePreflightFailedError
 from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.freeze import freeze_fields
-from elspeth.contracts.node_state_context import PoolExecutionContext
 from elspeth.contracts.plugin_assistance import PluginAssistance, PluginAssistanceExample
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ContentTrust, PluginCapability, WebConfigAuthority
 from elspeth.contracts.schema import FieldDefinition
@@ -1167,14 +1166,15 @@ class MultiQueryStrategy:
             )
 
         if shutdown_event is None:
-            entries = self.executor.execute_batch(contexts=contexts, process_fn=_process_fn)
+            batch = self.executor.execute_batch_with_context(contexts=contexts, process_fn=_process_fn)
         else:
-            entries = self.executor.execute_batch(contexts=contexts, process_fn=_process_fn, shutdown_event=shutdown_event)
+            batch = self.executor.execute_batch_with_context(contexts=contexts, process_fn=_process_fn, shutdown_event=shutdown_event)
+        entries = batch.entries
         query_results = [entry.result for entry in entries]
         # Pool behaviour behind this row (AIMD backoff, capacity retries,
         # throttle wait, concurrency) and each query's submit/complete order,
         # recorded in the node state's context_after (sweep finding #100).
-        pool_context = PoolExecutionContext.from_executor_stats(self.executor.get_stats(), entries)
+        pool_context = batch.context
 
         # Check for failures — atomic: any failure fails the row
         failed = [(i, r) for i, r in enumerate(query_results) if r.status == "error"]
@@ -1274,7 +1274,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f6ef87bfdf2fac79"
+    source_file_hash: str | None = "sha256:f3e9f297b64e5bdf"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True

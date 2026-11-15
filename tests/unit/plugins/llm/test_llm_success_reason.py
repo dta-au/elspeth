@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event, Lock
 from types import MappingProxyType
 from typing import Any
 from unittest.mock import Mock
@@ -16,11 +18,14 @@ from unittest.mock import Mock
 import pytest
 
 from elspeth.contracts.engine import BufferEntry
+from elspeth.contracts.errors import CapacityError
 from elspeth.contracts.identity import TokenInfo
+from elspeth.contracts.node_state_context import PoolExecutionContext
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.results import TransformResult
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
+from elspeth.plugins.infrastructure.pooling import PoolConfig, PooledExecutor
 from elspeth.plugins.infrastructure.templates import ALL_FIELDS
 from elspeth.plugins.transforms.llm.multi_query import QuerySpec
 from elspeth.plugins.transforms.llm.provider import FinishReason, LLMAuditParent, LLMProvider, LLMQueryResult
@@ -85,6 +90,15 @@ class _PooledExecutorDouble:
                 "max_concurrent_reached": 0,
             },
         }
+
+    def execute_batch_with_context(self, *args: Any, **kwargs: Any) -> Any:
+        from elspeth.plugins.infrastructure.pooling.executor import BatchExecutionResult
+
+        entries = self.execute_batch(*args, **kwargs)
+        return BatchExecutionResult(
+            entries=tuple(entries),
+            context=PoolExecutionContext.from_executor_stats(self.get_stats(), entries),
+        )
 
 
 def _make_ctx() -> PluginContext:
@@ -168,6 +182,70 @@ def _make_multi_query_strategy(*, executor: _PooledExecutorDouble | None = None)
         apply_declared_output_field_contracts=_identity_contract,
         executor=executor,
     )
+
+
+def test_parallel_rows_keep_their_own_pool_stats_after_next_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A later row must not replace a completed row's retry audit context."""
+    executor = PooledExecutor(PoolConfig(pool_size=2, recovery_step_ms=1))
+    strategy = _make_multi_query_strategy(executor=executor)
+    provider = _make_mock_provider()
+    original_query = provider.execute_query.side_effect
+    a_calls = 0
+    calls_lock = Lock()
+
+    def retry_a_once(*args: Any, **kwargs: Any) -> LLMQueryResult:
+        nonlocal a_calls
+        if "Analyze: A" in args[0][-1].content:
+            with calls_lock:
+                a_calls += 1
+                if a_calls == 1:
+                    raise CapacityError(429, "rate limited")
+        return original_query(*args, **kwargs)
+
+    provider.execute_query.side_effect = retry_a_once
+    a_batch_returned = Event()
+    b_batch_finished = Event()
+
+    def pause_after_batch(method: Callable[..., Any]) -> Callable[..., Any]:
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            result = method(*args, **kwargs)
+            if kwargs["contexts"][0].state_id == "state-A":
+                a_batch_returned.set()
+                assert b_batch_finished.wait(timeout=10), "row B did not finish its batch"
+            return result
+
+        return wrapped
+
+    monkeypatch.setattr(executor, "execute_batch", pause_after_batch(executor.execute_batch))
+    snapshot_method = PooledExecutor.__dict__.get("execute_batch_with_context")
+    if snapshot_method is not None:
+        monkeypatch.setattr(executor, "execute_batch_with_context", pause_after_batch(snapshot_method.__get__(executor)))
+
+    def run_row(label: str) -> TransformResult:
+        ctx = make_context(
+            state_id=f"state-{label}",
+            run_id="run-123",
+            token=TokenInfo(row_id=f"row-{label}", token_id=f"token-{label}", row_data=make_pipeline_row({})),
+        )
+        return strategy.execute(make_pipeline_row({"text": label}), ctx, provider=provider, tracer=_TracerDouble())
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as rows:
+            a_future = rows.submit(run_row, "A")
+            assert a_batch_returned.wait(timeout=10), "row A did not finish its batch"
+            b_future = rows.submit(run_row, "B")
+            b_result = b_future.result(timeout=10)
+            b_batch_finished.set()
+            a_result = a_future.result(timeout=10)
+    finally:
+        b_batch_finished.set()
+        executor.shutdown()
+
+    assert a_calls == 3  # Two queries plus one retry.
+    assert a_result.context_after is not None
+    assert b_result.context_after is not None
+    assert a_result.context_after.pool_stats.capacity_retries == 1
+    assert b_result.context_after.pool_stats.capacity_retries == 0
 
 
 # ---------------------------------------------------------------------------
