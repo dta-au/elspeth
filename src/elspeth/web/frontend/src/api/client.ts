@@ -51,6 +51,7 @@ import type {
 import {
   decodeCompositionState,
   decodeCompositionStateVersions,
+  decodeCompositionHeadVersion,
 } from "./compositionDecoder";
 import { decodeUserComposerPreferences } from "./preferencesDecoder";
 import type {
@@ -1172,14 +1173,31 @@ export async function fetchCompositionState(
   return body === null ? null : decodeCompositionState(body);
 }
 
-/** Get all composition state versions for a session. */
+/** Get the newest 50 versions, in the API's ascending order. */
 export async function fetchStateVersions(
   sessionId: string,
+  onMovingHead?: () => void,
 ): Promise<CompositionStateVersion[]> {
-  const response = await authFetch(`/api/sessions/${sessionId}/state/versions`, {
-    headers: authHeaders(),
-  });
-  return decodeCompositionStateVersions(await parseResponse<unknown>(response));
+  const limit = 50;
+  const readHead = async () => {
+    const response = await authFetch(`/api/sessions/${sessionId}/state/head`, { headers: authHeaders() });
+    return decodeCompositionHeadVersion(await parseResponse<unknown>(response));
+  };
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const headVersion = await readHead();
+    const offset = Math.max(0, headVersion - limit);
+    const response = await authFetch(`/api/sessions/${sessionId}/state/versions?limit=${limit}&offset=${offset}`, {
+      headers: authHeaders(),
+    });
+    const versions = decodeCompositionStateVersions(await parseResponse<unknown>(response));
+    const latestHead = await readHead();
+    if (latestHead <= headVersion) return versions;
+    if (attempt === 2) {
+      onMovingHead?.();
+      return versions;
+    }
+  }
+  throw new Error("Version history retry exhausted");
 }
 
 /**

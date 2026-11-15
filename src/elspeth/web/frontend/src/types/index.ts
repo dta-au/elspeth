@@ -295,6 +295,7 @@ export interface CompositionStateVersion {
   version: number;
   created_at: string;
   node_count?: number;
+  is_milestone?: boolean;
   sources?: Record<string, SourceSpec>;
   nodes?: NodeSpec[];
   edges?: EdgeSpec[];

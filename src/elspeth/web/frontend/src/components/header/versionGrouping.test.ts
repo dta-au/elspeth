@@ -14,6 +14,13 @@ const kindFor = (row: CompositionStateVersion): VersionLabelKind =>
   row.version === 14 ? "applied" : "edited";
 
 describe("buildVersionRows", () => {
+  it("splits edited runs at the structural milestone kind", () => {
+    const rows = buildVersionRows(versions, (row) => row.version === 14 ? "milestone" : "edited", 19, false, new Set());
+    expect(rows.map((row) => row.kind === "group" ? row.id : `v${row.version.version}`)).toEqual([
+      "v19", "v15-v18", "v14", "v11-v13",
+    ]);
+  });
+
   it("groups consecutive edited runs, keeps current and applied rows standalone", () => {
     const rows = buildVersionRows(versions, kindFor, 19, false, new Set());
     expect(rows.map((row) => (row.kind === "group" ? row.id : `v${row.version.version}`))).toEqual([

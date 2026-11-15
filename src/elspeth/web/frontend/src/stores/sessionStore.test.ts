@@ -882,7 +882,7 @@ describe("sessionStore", () => {
       vi.mocked(api.fetchComposerProgress).mockResolvedValue({ phase: "idle", inflight_requests: 0 } as ComposerProgressSnapshot);
       useSessionStore.setState({
         activeSessionId: "20000000-0000-4000-8000-000000000006", lastComposeChangedPipeline: true,
-        errorDetails: ["Old validation issue"], isLoadingVersions: true,
+        errorDetails: ["Old validation issue"], historyStatus: "loading",
       });
       const pending = useSessionStore.getState().sendMessage("Assess old data");
       expect(api.sendMessage).toHaveBeenCalledTimes(1);
@@ -901,7 +901,7 @@ describe("sessionStore", () => {
       expect(activated.isComposing).toBe(false);
       expect(activated.lastComposeChangedPipeline).toBeNull();
       expect(activated.errorDetails).toBeNull();
-      expect(activated.isLoadingVersions).toBe(false);
+      expect(activated.historyStatus).toBe("idle");
       expect(useSessionStore.getState()).toMatchObject({
         activeSessionId: "20000000-0000-4000-8000-000000000007", messages: [], compositionState: null,
         compositionProposals: [], composerProgress: null, isComposing: false,

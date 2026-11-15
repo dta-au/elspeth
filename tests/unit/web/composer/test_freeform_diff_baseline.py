@@ -115,10 +115,9 @@ async def test_zero_change_diff_teaches_provider_what_to_report(
     assert "With no edits yet this turn, `last_validated` compares with the validated version before the current one." in description
     assert "Name `from_version` and envelope `version`" in description
     assert "`version` is the working pipeline's number at this call" in description
-    assert "later saves this turn take higher numbers" in description
-    assert "give it as the compared version, not the user's final version" in description
-    assert "`from_version` can be looked for in the version menu" in description
-    assert "hides versions identical to their predecessors and lists only recent ones" in description
+    assert "Give it as the compared version, not the user's final version" in description
+    assert "For `last_validated`, `from_version` is a validated milestone" in description
+    assert "older history may be missing from the menu" in description
     assert "a broken pipeline compares with its last validated version; a valid one with the previous validated version" in description
     if baseline_kind == "last_validated":
         assert "nothing has changed since the compared validated version `from_version`" in description

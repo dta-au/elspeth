@@ -32,7 +32,7 @@ export function HeaderVersionSelector(): JSX.Element | null {
   const messages = useSessionStore((s) => s.messages);
   const stateVersions = useSessionStore((s) => s.stateVersions);
   const isComposing = useSessionStore((s) => s.isComposing);
-  const isLoadingVersions = useSessionStore((s) => s.isLoadingVersions);
+  const historyStatus = useSessionStore((s) => s.historyStatus);
   const loadStateVersions = useSessionStore((s) => s.loadStateVersions);
   const revertToVersion = useSessionStore((s) => s.revertToVersion);
   const showAdvanced = useShowAdvanced();
@@ -58,8 +58,31 @@ export function HeaderVersionSelector(): JSX.Element | null {
   const containerRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
+  const requestedVersionRef = useRef<string | null>(null);
+  const followUpCountRef = useRef(0);
 
   const currentVersion = compositionState?.version ?? null;
+  const currentRowIsMissing = currentVersion !== null && !stateVersions.some((version) => version.version === currentVersion);
+  const requestKey = `${activeSessionId}:${currentVersion}`;
+
+  useEffect(() => {
+    if (isOpen && currentRowIsMissing && requestedVersionRef.current !== requestKey) {
+      requestedVersionRef.current = requestKey;
+      void loadStateVersions();
+    }
+  }, [isOpen, requestKey, currentRowIsMissing, loadStateVersions]);
+
+  useEffect(() => {
+    if (!isOpen || historyStatus !== "unsettled") return;
+    const delay = Math.min(1000 * 2 ** followUpCountRef.current, 8000);
+    followUpCountRef.current += 1;
+    const timer = window.setTimeout(() => { void loadStateVersions(); }, delay);
+    return () => window.clearTimeout(timer);
+  }, [isOpen, activeSessionId, historyStatus, loadStateVersions]);
+
+  useEffect(() => {
+    followUpCountRef.current = 0;
+  }, [activeSessionId, isOpen]);
 
   // Adjacent predecessor by version number, from the FULL fetched list —
   // never the filtered one, or every row after a hidden snapshot would be
@@ -89,24 +112,26 @@ export function HeaderVersionSelector(): JSX.Element | null {
     }
     stateVersions
       .filter((version) => version.version !== currentVersion)
-      // Snapshot-only rows offer nothing a user can decide on, so they are
-      // hidden. Only on POSITIVE evidence: any row the projection cannot
+      // Non-milestone snapshot-only rows are hidden on POSITIVE evidence:
+      // any row the projection cannot
       // prove unchanged stays visible. Version numbers keep honest gaps —
       // they must agree with the chat revert message and the audit trail.
-      // The current version is exempt above: it anchors the trigger.
-      .filter((version) => !isSnapshotOnly(version, findPredecessor(version)))
+      // Milestones preserve saved validation verdicts; current anchors the trigger.
+      .filter((version) => version.is_milestone || !isSnapshotOnly(version, findPredecessor(version)))
       .sort((left, right) => right.version - left.version)
       .forEach((version) => sortedVersions.push(version));
   }
 
   // Grouping keys on the STRUCTURAL kind, never on the visible copy: a
   // register rewrite of the word "Edited" must not be able to turn grouping
-  // off. Snapshot-only rows report their own kind so they can never be
+  // off. Milestones and snapshot-only rows report their own kinds so they cannot be
   // folded into an "edited" run.
   const kindFor = (version: CompositionStateVersion) =>
-    isSnapshotOnly(version, findPredecessor(version))
-      ? ("snapshot" as const)
-      : versionLabelKind(version, stateVersions, messages);
+    version.is_milestone
+      ? ("milestone" as const)
+      : isSnapshotOnly(version, findPredecessor(version))
+        ? ("snapshot" as const)
+        : versionLabelKind(version, stateVersions, messages);
   const rows = buildVersionRows(
     sortedVersions,
     kindFor,
@@ -173,13 +198,14 @@ export function HeaderVersionSelector(): JSX.Element | null {
     setIsOpen((prev) => {
       const next = !prev;
       if (next) {
+        requestedVersionRef.current = requestKey;
         void loadStateVersions();
         setFocusedIndex(0);
         setSelectedVersionNumber(currentVersion);
       }
       return next;
     });
-  }, [loadStateVersions, currentVersion]);
+  }, [loadStateVersions, currentVersion, requestKey]);
 
   const close = useCallback(() => {
     setIsOpen(false);
@@ -374,16 +400,23 @@ export function HeaderVersionSelector(): JSX.Element | null {
     const isCurrent = version.version === currentVersion;
     const isFocused = focusedIndex === index;
     const nodeCount = version.nodes?.length ?? version.node_count ?? 0;
-    // Only the current row can reach here snapshot-only — the filter above
-    // hides every other one.
+    // Current and milestone rows remain visible even when snapshot-only.
     const snapshotOnly = isSnapshotOnly(version, findPredecessor(version));
     // "no VISIBLE change", not "no pipeline change": isSnapshotOnly
     // compares the redacted wire projection, so the strongest honest claim
     // is about what this surface can see. Do not strengthen the wording
     // without a backend content hash.
-    const operationLabel = snapshotOnly
-      ? "no visible change"
-      : deriveVersionLabel(version, stateVersions, messages);
+    const operationLabel = version.id === ""
+      ? historyStatus === "loading" || historyStatus === "idle"
+        ? "Checking saved version"
+        : historyStatus === "settled"
+          ? `Not in the 50 most recent versions`
+          : "Saved version unavailable"
+      : version.is_milestone
+      ? `Validated version — passed validation when saved${snapshotOnly ? "; no visible change since the previous version" : ""}`
+      : snapshotOnly
+        ? "no visible change"
+        : deriveVersionLabel(version, stateVersions, messages);
     const operationTitle = snapshotOnly
       ? undefined
       : (versionOperationIdentifier(version, messages) ?? undefined);
@@ -464,6 +497,12 @@ export function HeaderVersionSelector(): JSX.Element | null {
 
       {isOpen && (
         <div className="version-selector-dropdown">
+          <div role="status" className="version-selector-loading">
+            {historyStatus === "loading" && (stateVersions.length === 0 ? "Loading versions..." : "Refreshing versions...")}
+            {historyStatus === "unsettled" && <>Versions changed while loading. <button type="button" onClick={() => { void loadStateVersions(); }}>Retry</button></>}
+            {historyStatus === "failed" && <>Could not load versions. <button type="button" onClick={() => { void loadStateVersions(); }}>Retry</button></>}
+            {historyStatus === "settled" && currentRowIsMissing && `Version ${currentVersion} is not in the 50 most recent versions.`}
+          </div>
           <ul
             ref={listRef}
             id={treeId}
@@ -474,9 +513,6 @@ export function HeaderVersionSelector(): JSX.Element | null {
             tabIndex={0}
             className="version-selector-list"
           >
-            {isLoadingVersions && sortedVersions.length === 0 && (
-              <li className="version-selector-loading">Loading versions...</li>
-            )}
             {renderEntries.map(({ row, index, memberIndices }) => {
               if (row.kind === "version") {
                 return renderVersionItem(row.version, index);
