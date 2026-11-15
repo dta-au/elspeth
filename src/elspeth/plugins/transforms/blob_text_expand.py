@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import codecs
 import copy
 import re
 from collections.abc import Mapping
@@ -19,9 +18,10 @@ from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
-from elspeth.plugins.infrastructure.config_base import TransformDataConfig
+from elspeth.plugins.infrastructure.config_base import TextEncoding, TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+from elspeth.plugins.infrastructure.text_decoding import decoding_codec
 from elspeth.plugins.transforms.blob_expand_contract import (
     BLOB_REF_FIELD_DESCRIPTION,
     DEFAULT_BLOB_REF_FIELD,
@@ -87,7 +87,7 @@ class BlobTextExpandConfig(TransformDataConfig):
         default=None,
         description="Literal separator to split on. Omitted (the default) splits on CRLF, CR, or LF line endings.",
     )
-    encoding: str = Field(default="utf-8", description="Encoding used to decode the text blob. Decoding is strict.")
+    encoding: TextEncoding = Field(default="utf-8", description="Encoding used to decode the text blob. Decoding is strict.")
     skip_blank_lines: bool = Field(default=False, description="Whether to drop empty chunks instead of emitting a row for each.")
     max_output_rows: int = Field(default=DEFAULT_MAX_OUTPUT_ROWS, gt=0, description="Maximum rows emitted for one input blob.")
     max_blob_bytes: int = Field(default=DEFAULT_MAX_BLOB_BYTES, gt=0, description="Maximum payload size accepted from the blob store.")
@@ -114,15 +114,6 @@ class BlobTextExpandConfig(TransformDataConfig):
     def _reject_empty_delimiter(cls, value: str | None) -> str | None:
         if value is not None and not value:
             raise ValueError("delimiter must not be the empty string; omit it to split on line endings")
-        return value
-
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, value: str) -> str:
-        try:
-            codecs.lookup(value)
-        except LookupError as exc:
-            raise ValueError(f"unknown encoding: {value!r}") from exc
         return value
 
     @model_validator(mode="after")
@@ -219,7 +210,7 @@ class BlobTextExpand(BaseTransform):
     name = "blob_text_expand"
     determinism = Determinism.IO_READ
     plugin_version = "2.0.0"
-    source_file_hash: str | None = "sha256:0bac1c41215bd9a3"
+    source_file_hash: str | None = "sha256:b38f48478dbe8f43"
     config_model = BlobTextExpandConfig
     usage_when_to_use: str = (
         "Use when each input row carries a payload-store reference to a plain-text blob and you need "
@@ -434,7 +425,7 @@ class BlobTextExpand(BaseTransform):
         # onto the row and hand a corrupted value downstream under a success
         # status; an undecodable blob is a quarantine case, not a repair case.
         try:
-            text = body.decode(self._encoding)
+            text = body.decode(decoding_codec(self._encoding))
         except UnicodeDecodeError as exc:
             return TransformResult.error(
                 {

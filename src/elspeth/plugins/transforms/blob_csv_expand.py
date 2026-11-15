@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import codecs
 import copy
 import csv
 import io
@@ -23,13 +22,15 @@ from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import (
+    CSVDelimiter,
     NormalizedColumnsOption,
     NormalizedFieldMappingOption,
+    TextEncoding,
     TransformDataConfig,
-    validate_csv_delimiter,
 )
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+from elspeth.plugins.infrastructure.text_decoding import decoding_codec
 from elspeth.plugins.sources.field_normalization import ExternalHeaderError, is_normalized_field_name, resolve_field_names
 from elspeth.plugins.transforms.blob_expand_contract import (
     BLOB_REF_FIELD_DESCRIPTION,
@@ -75,8 +76,8 @@ class BlobCSVExpandConfig(TransformDataConfig):
     # for missing the field the transform exists to create (elspeth-d6eeb3a71d), from
     # a config that never mentions ``source``. None names no column, so nothing leaks.
     text_field: str | None = Field(default=None, description=f"{TEXT_FIELD_DESCRIPTION} Defaults to {DEFAULT_TEXT_FIELD!r}.")
-    delimiter: str = Field(default=",", description="Single-character delimiter used to split CSV fields.")
-    encoding: str = Field(default="utf-8", description="Encoding used to decode the CSV blob. Applies to source: blob only.")
+    delimiter: CSVDelimiter = Field(default=",", description="Single-character delimiter used to split CSV fields.")
+    encoding: TextEncoding = Field(default="utf-8", description="Encoding used to decode the CSV blob. Applies to source: blob only.")
     skip_rows: int = Field(default=0, ge=0, description="Number of leading CSV records to skip before reading headers or data.")
     columns: NormalizedColumnsOption = Field(default=None, description="Explicit normalized column names for headerless CSV blobs.")
     field_mapping: NormalizedFieldMappingOption = Field(
@@ -106,20 +107,6 @@ class BlobCSVExpandConfig(TransformDataConfig):
         if not value.strip():
             raise ValueError("text_field must not be empty")
         return value.strip()
-
-    @field_validator("delimiter")
-    @classmethod
-    def _validate_delimiter(cls, value: str) -> str:
-        return validate_csv_delimiter(value)
-
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, value: str) -> str:
-        try:
-            codecs.lookup(value)
-        except LookupError as exc:
-            raise ValueError(f"unknown encoding: {value!r}") from exc
-        return value
 
     @field_validator("row_index_field")
     @classmethod
@@ -306,7 +293,7 @@ class BlobCSVExpand(BaseTransform):
     name = "blob_csv_expand"
     determinism = Determinism.IO_READ
     plugin_version = "2.0.0"
-    source_file_hash: str | None = "sha256:e667985d6429a8ee"
+    source_file_hash: str | None = "sha256:90551d3fb1c1db63"
     config_model = BlobCSVExpandConfig
     usage_when_to_use: str = (
         "Use when each input row carries a payload-store reference to a CSV blob and you need to "
@@ -652,7 +639,7 @@ class BlobCSVExpand(BaseTransform):
             )
 
         try:
-            text = body.decode(self._encoding)
+            text = body.decode(decoding_codec(self._encoding))
         except UnicodeDecodeError as exc:
             raise _BlobCSVParseError(
                 _csv_error_reason(

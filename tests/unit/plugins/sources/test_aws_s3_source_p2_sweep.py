@@ -80,11 +80,11 @@ class TestRecordsAfterUnreadableRecord:
         assert [rows[0].row, rows[2].row, rows[3].row] == [{"id": 1}, {"id": 3}, {"id": 4}]
 
     def test_jsonl_resumes_when_oversized_line_newline_lands_on_the_bound(self) -> None:
-        # The oversized line is exactly max_record_chars + 1 characters
-        # including its newline, so the bounded read consumes the whole line.
+        # The oversized content is max_record_chars + 1 characters. The
+        # newline is framing and does not count toward the record limit.
         # Resync must not swallow the following line.
-        oversized = b'{"id":"' + b"x" * 11 + b'"}\n'
-        assert len(oversized) == 21
+        oversized = b'{"id":"' + b"x" * 12 + b'"}\n'
+        assert len(oversized) == 22
         payload = oversized + b'{"id":2}\n{"id":3}\n'
         source, _, ctx = _source_for(payload, format="jsonl", max_record_chars=20)
         rows = list(source.load(ctx))

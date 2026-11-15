@@ -37,13 +37,22 @@ from elspeth.contracts.wire_visible_identity import reject_operator_required_pla
 from elspeth.plugins.infrastructure.azure_auth import AzureAuthConfig, AzureAuthMethod
 from elspeth.plugins.infrastructure.base import BaseSource
 from elspeth.plugins.infrastructure.config_base import (
+    CSVDelimiter,
     DataPluginConfig,
     NormalizedColumnsOption,
     NormalizedFieldMappingOption,
+    TextEncoding,
     declared_source_schema_field_names,
 )
 from elspeth.plugins.infrastructure.config_content import reject_nonfinite_constant
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+from elspeth.plugins.infrastructure.text_decoding import (
+    BYTE_ESCAPE_ERRORS,
+    contains_escaped_bytes,
+    decoding_codec,
+    escaped_line_to_bytes,
+    line_byte_codec_from_head,
+)
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,
     FieldMappingCollisionError,
@@ -52,10 +61,6 @@ from elspeth.plugins.sources.field_normalization import (
     extend_field_resolution,
     normalize_field_name,
     resolve_field_names,
-)
-from elspeth.plugins.sources.json_source import (
-    _contains_surrogateescape_chars,
-    _surrogateescape_line_to_bytes,
 )
 
 if TYPE_CHECKING:
@@ -94,27 +99,9 @@ class CSVOptions(BaseModel):
 
     model_config = {"extra": "forbid"}
 
-    delimiter: str = ","
+    delimiter: CSVDelimiter = ","
     has_header: bool = True
-    encoding: str = "utf-8"
-
-    @field_validator("delimiter")
-    @classmethod
-    def _validate_delimiter(cls, v: str) -> str:
-        if len(v) != 1:
-            raise ValueError(f"delimiter must be a single character, got {v!r}")
-        return v
-
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, v: str) -> str:
-        import codecs
-
-        try:
-            codecs.lookup(v)
-        except LookupError as exc:
-            raise ValueError(f"unknown encoding: {v!r}") from exc
-        return v
+    encoding: TextEncoding = "utf-8"
 
 
 class JSONOptions(BaseModel):
@@ -122,19 +109,8 @@ class JSONOptions(BaseModel):
 
     model_config = {"extra": "forbid"}
 
-    encoding: str = "utf-8"
+    encoding: TextEncoding = "utf-8"
     data_key: str | None = None
-
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, v: str) -> str:
-        import codecs
-
-        try:
-            codecs.lookup(v)
-        except LookupError as exc:
-            raise ValueError(f"unknown encoding: {v!r}") from exc
-        return v
 
 
 class AzureBlobSourceConfig(DataPluginConfig):
@@ -430,7 +406,7 @@ class AzureBlobSource(BaseSource):
     name = "azure_blob"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:fd33f2630f7e2406"
+    source_file_hash: str | None = "sha256:a5c6b2404038c1a2"
     config_model = AzureBlobSourceConfig
 
     usage_when_to_use: str = (
@@ -709,6 +685,7 @@ class AzureBlobSource(BaseSource):
         delimiter = self._csv_options.delimiter
         has_header = self._csv_options.has_header
         encoding = self._csv_options.encoding
+        line_codec = line_byte_codec_from_head(blob_data[:4], decoding_codec(encoding))
 
         def _quarantine_undecodable_file(error_msg: str) -> Iterator[SourceRow]:
             raw_row = {
@@ -731,17 +708,18 @@ class AzureBlobSource(BaseSource):
                 )
 
         # THEIR DATA: Parsing blob content - wrap operations.
-        # surrogateescape (as _load_jsonl does) keeps undecodable bytes as
-        # lone surrogates so each bad record is quarantined on its own line
-        # below instead of one byte discarding every decodable row. The
-        # strict fallback remains for the bytes surrogateescape cannot carry.
+        # BYTE_ESCAPE_ERRORS (as _load_jsonl does) keeps every undecodable
+        # code unit, for every codec, on the record that carried it, so each
+        # bad record is quarantined on its own line below instead of one bad
+        # unit discarding every decodable row. A codec that refuses the
+        # stream outright still raises and quarantines the whole blob.
         try:
-            text_data = blob_data.decode(encoding, errors="surrogateescape")
+            text_data = blob_data.decode(decoding_codec(encoding), errors=BYTE_ESCAPE_ERRORS)
         except UnicodeDecodeError as e:
             yield from _quarantine_undecodable_file(f"Failed to decode CSV blob as {encoding}: {e}")
             return
         # Header-level quarantine previews must never carry lone surrogates.
-        blob_preview = "".join("\ufffd" if _contains_surrogateescape_chars(char) else char for char in text_data[:200])
+        blob_preview = "".join("\ufffd" if contains_escaped_bytes(char) else char for char in text_data[:200])
 
         # Physical lines consumed by the record csv.reader is assembling; the
         # reader pulls lines on demand, so after each next() this holds
@@ -814,7 +792,7 @@ class AzureBlobSource(BaseSource):
                     )
                 return
 
-            if _contains_surrogateescape_chars("".join(record_lines)):
+            if contains_escaped_bytes("".join(record_lines)):
                 yield from _quarantine_undecodable_file(
                     f"Failed to decode CSV blob header as {encoding}: undecodable bytes in the header record"
                 )
@@ -948,8 +926,9 @@ class AzureBlobSource(BaseSource):
             # Undecodable bytes — quarantine this record only, with its exact
             # raw bytes (mirrors _load_jsonl), and keep reading.
             raw_record = "".join(record_lines)
-            if _contains_surrogateescape_chars(raw_record):
-                raw_bytes = _surrogateescape_line_to_bytes(raw_record.rstrip("\r\n"), encoding)
+            if contains_escaped_bytes(raw_record):
+                record_start_line = physical_line - len(record_lines) + 1
+                raw_bytes = escaped_line_to_bytes(raw_record.rstrip("\r\n"), line_codec, line_number=record_start_line)
                 raw_row = {
                     "__raw_bytes_hex__": raw_bytes.hex(),
                     "__line_number__": str(physical_line),
@@ -1035,7 +1014,7 @@ class AzureBlobSource(BaseSource):
 
         # THEIR DATA: JSON parsing - quarantine failures at boundary
         try:
-            text_data = blob_data.decode(encoding)
+            text_data = blob_data.decode(decoding_codec(encoding))
         except UnicodeDecodeError as e:
             error_msg = f"Failed to decode blob as {encoding}: {e}"
             yield from _record_file_level_error(error_msg, "parse")
@@ -1086,12 +1065,13 @@ class AzureBlobSource(BaseSource):
         encoding = self._json_options.encoding
 
         non_empty_count = 0
+        line_codec = line_byte_codec_from_head(blob_data[:4], decoding_codec(encoding))
         line_num = 0
         try:
             text_stream = io.TextIOWrapper(
                 io.BytesIO(blob_data),
-                encoding=encoding,
-                errors="surrogateescape",
+                encoding=decoding_codec(encoding),
+                errors=BYTE_ESCAPE_ERRORS,
                 newline="",
             )
             for line_num, raw_line in enumerate(text_stream, start=1):
@@ -1101,8 +1081,8 @@ class AzureBlobSource(BaseSource):
 
                 non_empty_count += 1
 
-                if _contains_surrogateescape_chars(raw_line):
-                    raw_bytes = _surrogateescape_line_to_bytes(raw_line.rstrip("\r\n"), encoding)
+                if contains_escaped_bytes(raw_line):
+                    raw_bytes = escaped_line_to_bytes(raw_line.rstrip("\r\n"), line_codec, line_number=line_num)
                     raw_row = {
                         "__raw_bytes_hex__": raw_bytes.hex(),
                         "__line_number__": line_num,

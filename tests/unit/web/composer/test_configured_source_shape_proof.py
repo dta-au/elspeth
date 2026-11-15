@@ -378,18 +378,17 @@ def test_json_proof_quarantines_known_nontext_codec_decode_failure(tmp_path: Pat
     if encoding == "utf-8":
         assert [row.row for row in rows] == [{"id": 1}]
     else:
-        # The runtime constructor currently accepts registry-known nontext
-        # codecs; file decoding refuses them. Proof must return repair feedback.
-        runtime = JSONSource(
-            {
-                "path": str(tmp_path / "source.json"),
-                "schema": {"mode": "observed"},
-                "encoding": encoding,
-                "on_validation_failure": "discard",
-            }
-        )
-        with pytest.raises(LookupError):
-            list(runtime.load(Mock(spec=SourceContext)))
+        # The runtime refuses the codec at config, through the same shared
+        # TextEncoding validator as every other source and sink.
+        with pytest.raises(PluginConfigError, match="not a text encoding"):
+            JSONSource(
+                {
+                    "path": str(tmp_path / "source.json"),
+                    "schema": {"mode": "observed"},
+                    "encoding": encoding,
+                    "on_validation_failure": "discard",
+                }
+            )
 
 
 @pytest.mark.parametrize("plugin", ["csv", "json"])

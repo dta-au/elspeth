@@ -17,7 +17,6 @@ avoid.
 
 from __future__ import annotations
 
-import codecs
 import keyword
 from collections.abc import Iterator, Mapping
 from typing import Any, Literal
@@ -85,17 +84,6 @@ class DocumentSinkConfig(LocalFileSinkConfig):
             raise ValueError(f"field {value!r} must be a non-keyword Python identifier")
         return value
 
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, value: str) -> str:
-        try:
-            canonical = codecs.lookup(value).name
-        except LookupError as exc:
-            raise ValueError(f"unknown encoding: {value!r}") from exc
-        if canonical not in {"utf-8", "ascii", "iso8859-1", "cp1252"}:
-            raise ValueError("encoding must be one of utf-8, ascii, latin-1, or cp1252")
-        return value
-
     @model_validator(mode="after")
     def _validate_collision_mode(self) -> DocumentSinkConfig:
         validate_output_collision_policy_mode(
@@ -112,7 +100,7 @@ class DocumentSink(BaseSink):
     name = "document"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:121ff2e7f4e07f78"
+    source_file_hash: str | None = "sha256:3863d7830213da2a"
     config_model = DocumentSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
