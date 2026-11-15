@@ -210,7 +210,7 @@ this one environment.
 | 3 | CTX-A | Context budget: estimate anchored on provider token counts; stable shed state | Deferred: CTX-A review found a blocking defect | next patch |
 | 4 | CTX-B | Context budget: shed order; Anthropic thinking-block rules | Deferred: CTX-A review found a blocking defect | next patch |
 | 5 | CTX-C | Context budget: refusal copy per cause, figures recorded | Deferred: CTX-A review found a blocking defect | next patch |
-| 6 | CTX-D | Context budget: tests for surviving mutants | Not briefed | 0.8.14 |
+| 6 | CTX-D | Context budget: tests for surviving mutants | Not briefed; follows CTX-A to CTX-C | 0.8.15 |
 | 7 | CDA-07a | Advisor capability record, rubric, repair copy | Merged (`b823e3665`) | 0.8.14 |
 | 8 | CDA-18 | Credential-shaped reasoning withheld, turn kept; closes the CDA-06 surface gap | Merged (`1ca4dd363`) | 0.8.14 |
 | 9 | CDA-03 | `report_assemble` honest framing labels; text sink widened | Merged (`6efa87ba9`) | 0.8.14 |
@@ -220,7 +220,7 @@ this one environment.
 | 13 | CDA-27 | The prompt "structural directive" guard is removed | Merged (`aa56b3c7d`) | 0.8.14 |
 | 14 | CDA-01b | Tutorial interpretation card offers no "Change…" in script mode | Merged (`3413aa1c0`) | 0.8.14 |
 | 15 | P-B11 with batch plugins | Three batch plugins generally available; `copy_index` repair text corrected | Merged (`597554311`) | 0.8.14 |
-| 16 | CDA-08, then CDA-09 | Withheld reply as a system notice; preflight on question-only turns | CDA-08 merged (`6052b0330`). CDA-09 not merged; CDA-09's brief must still account for string-matching finding 9 (notices recognised by shape) | CDA-08: 0.8.14; CDA-09: to be confirmed |
+| 16 | CDA-08, then CDA-09 | Withheld reply as a system notice; preflight on question-only turns | CDA-08 merged (`6052b0330`). CDA-09 waits for the typed-facts notice cutover (TP-07/08, row 21) so it emits typed notices instead of adding recognised shapes | CDA-08: 0.8.14; CDA-09: after TP-07/08 |
 | 17 | CRED-A1 to CRED-E2 | Credential redesign: one pattern list, narrowing with detector version 2, wider checking at user ingress only, reasons on every block, browser paste and send block, egress redaction | Designed (`.lanes/cred-design/design-r2.md`), reviewed once. Absorbs CDA-19. Follows CDA-18 and CDA-26 | next patch |
 | 18 | CDA-11 → CDA-10 → P-B1 → CDA-12a → CDA-12b → CDA-13 | Wave 3, serial | Not briefed. CDA-10, P-B12 and P-B9a join the "producer carries the code" programme (string-matching findings 9 to 12) | later |
 | 19 | CDA-21 → CDA-23; CDA-17; CDA-22 → CDA-20; CDA-14; CDA-15; CDA-16 | Wave 4 | Not briefed. CDA-23 must keep a skipped turn-end version a milestone. CDA-14 may be dropped | later |
