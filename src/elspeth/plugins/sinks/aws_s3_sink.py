@@ -7,6 +7,7 @@ import binascii
 import codecs
 import csv
 import hashlib
+import io
 import json
 import math
 import re
@@ -503,13 +504,9 @@ def _csv_scalar_text(value: Any) -> str:
 
 
 def _csv_record_chars(values: Sequence[str], delimiter: str) -> int:
-    total = max(0, len(values) - 1) + 2
-    for value in values:
-        if delimiter in value or '"' in value or "\r" in value or "\n" in value:
-            total += len(value) + value.count('"') + 2
-        else:
-            total += len(value)
-    return total
+    buffer = io.StringIO(newline="")
+    csv.writer(buffer, delimiter=delimiter, lineterminator="\r\n").writerow(values)
+    return len(buffer.getvalue()) - 2
 
 
 def _serialize_rows_to_spool(
@@ -728,7 +725,7 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
     name = "aws_s3"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:70e7cc91680f16cc"
+    source_file_hash: str | None = "sha256:ef42f750a3679d1f"
     config_model = AWSS3SinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP

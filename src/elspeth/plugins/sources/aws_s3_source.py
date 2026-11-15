@@ -559,6 +559,7 @@ class _BoundedDecodedLineIterator:
         self._stream = stream
         self._max_record_chars = max_record_chars
         self._logical_chars = 0
+        self._pending_terminator_chars = 0
         self._last_read_ended_line = True
         self._last_read_ended_cr = False
 
@@ -572,6 +573,8 @@ class _BoundedDecodedLineIterator:
         """
         line = self._stream.readline(limit)
         if self._last_read_ended_cr and line == "\n":
+            if self._pending_terminator_chars:
+                self._pending_terminator_chars += 1
             line = self._stream.readline(limit)
         self._last_read_ended_cr = line.endswith("\r")
         return line
@@ -580,20 +583,29 @@ class _BoundedDecodedLineIterator:
         return self
 
     def __next__(self) -> str:
-        remaining = self._max_record_chars - self._logical_chars
-        if remaining < 0:
-            raise _RecordLimitExceeded("decoded record exceeds configured character limit")
-        line = self._readline(remaining + 1)
+        # Defer the previous physical terminator until another physical line
+        # proves it was embedded in this logical CSV record. finish_record()
+        # drops the final framing terminator for both CSV and JSONL.
+        line = self._readline(self._max_record_chars + 1)
         if line == "":
             raise StopIteration
+        self._logical_chars += self._pending_terminator_chars
+        self._pending_terminator_chars = 0
         self._last_read_ended_line = line.endswith(("\n", "\r"))
-        self._logical_chars += len(line)
+        if line.endswith("\r\n"):
+            content_chars, self._pending_terminator_chars = len(line) - 2, 2
+        elif self._last_read_ended_line:
+            content_chars, self._pending_terminator_chars = len(line) - 1, 1
+        else:
+            content_chars = len(line)
+        self._logical_chars += content_chars
         if self._logical_chars > self._max_record_chars:
             raise _RecordLimitExceeded("decoded record exceeds configured character limit")
         return line
 
     def finish_record(self) -> None:
         self._logical_chars = 0
+        self._pending_terminator_chars = 0
 
     def skip_rest_of_line(self) -> None:
         """Discard the unread remainder of an oversized physical line.
@@ -919,7 +931,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:988da8638e5b9c87"
+    source_file_hash: str | None = "sha256:d84d272b6ff2ea82"
     config_model = AWSS3SourceConfig
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 

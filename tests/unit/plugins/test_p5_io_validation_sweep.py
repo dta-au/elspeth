@@ -9,10 +9,12 @@ validator, instead of crashing on the first row or at publication.
 
 from __future__ import annotations
 
+import csv
 import importlib.util
+import io
 import typing
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from pydantic import BaseModel, ValidationError, create_model
@@ -284,16 +286,164 @@ def _s3(payload: bytes, **overrides: Any) -> list[Any]:
     return list(source.load(ctx))
 
 
+@pytest.mark.parametrize("terminator", [b"\n", b"\r", b"\r\n"], ids=["lf", "cr", "crlf"])
+@pytest.mark.parametrize("record_chars", [32, 33], ids=["at-limit", "over-limit"])
+def test_s3_jsonl_record_limit_excludes_final_terminator(terminator: bytes, record_chars: int) -> None:
+    record = b'{"id":"' + b"x" * (record_chars - 9) + b'"}'
+    assert len(record) == record_chars
+    rows = _s3(record + terminator + b'{"id":"ok"}' + terminator, format="jsonl", max_record_chars=32)
+
+    assert _shape(rows) == [(record_chars > 32, 0), (False, 1)]
+    if record_chars == 32:
+        assert rows[0].row == {"id": "x" * 23}
+    assert rows[1].row == {"id": "ok"}
+
+
+def test_s3_jsonl_utf16_oversized_line_with_distant_bad_unit_keeps_next_record() -> None:
+    long_line = ('{"id":"' + "x" * 5_000 + '"}').encode("utf-16-le")
+    payload = b"\xff\xfe" + long_line + b"\x00\xd8" + '\n{"id":2}\n'.encode("utf-16-le")
+
+    try:
+        rows = _s3(payload, format="jsonl", json_options={"encoding": "utf-16"}, max_record_chars=32)
+    except UnicodeDecodeError as exc:
+        pytest.fail(f"run aborted while skipping the oversized line: {exc}")
+
+    assert _shape(rows) == [(True, 0), (False, 1)]
+    assert rows[1].row == {"id": 2}
+
+
+def test_s3_jsonl_utf16_drain_at_limit_64_quarantines_a_line_with_a_bad_unit_after_5000_chars() -> None:
+    """Third release review reproduction: the drain loop reaches the bad unit, the run continues."""
+    long_line = ('{"id":"' + "y" * 5_000).encode("utf-16-le") + b"\x00\xd8" + '"}'.encode("utf-16-le")
+    payload = b"\xff\xfe" + long_line + '\n{"id":2}\n'.encode("utf-16-le")
+
+    try:
+        rows = _s3(payload, format="jsonl", json_options={"encoding": "utf-16"}, max_record_chars=64)
+    except UnicodeDecodeError as exc:
+        pytest.fail(f"run aborted while draining the oversized line: {exc}")
+
+    assert _shape(rows) == [(True, 0), (False, 1)]
+    assert rows[1].row == {"id": 2}
+
+
+@pytest.mark.parametrize(
+    ("limit", "expected"),
+    [(7, [(False, 0), (False, 1)]), (6, [(True, 0), (False, 1)])],
+    ids=["exactly-at-limit", "oversized-drained"],
+)
+def test_s3_jsonl_crlf_is_one_terminator_across_bounded_reads_and_the_drain(limit: int, expected: list[tuple[bool, int]]) -> None:
+    """Third release review reproduction: '{"x":1}' is 7 chars; the next record keeps index 1 either way."""
+    rows = _s3(b'{"x":1}\r\n{}\r\n', format="jsonl", max_record_chars=limit)
+
+    assert _shape(rows) == expected
+    assert rows[1].row == {}
+
+
+@pytest.mark.parametrize("embedded", [b"\n", b"\r", b"\r\n"], ids=["lf", "cr", "crlf"])
+@pytest.mark.parametrize("record_chars", [32, 33], ids=["at-limit", "over-limit"])
+def test_s3_csv_embedded_newline_counts_but_final_terminator_does_not(embedded: bytes, record_chars: int) -> None:
+    record = b'"' + b"x" * (record_chars - len(embedded) - 3) + embedded + b'y"'
+    assert len(record) == record_chars
+    rows = _s3(record + b"\r\n", format="csv", csv_options={"has_header": False}, columns=["v"], max_record_chars=32)
+
+    assert _shape(rows) == [(record_chars > 32, 0)]
+    if record_chars == 32:
+        assert rows[0].row == {"v": "x" * (record_chars - len(embedded) - 3) + embedded.decode() + "y"}
+
+
+@pytest.mark.parametrize("terminators", [(b"\r",) * 3, (b"\r", b"\n", b"\r\n")], ids=["cr-only", "mixed"])
+def test_s3_csv_consecutive_exact_limit_records_reset_terminator(terminators: tuple[bytes, ...]) -> None:
+    values = ["a" * 32, "b" * 32, "c" * 32]
+    payload = b"".join(value.encode() + ending for value, ending in zip(values, terminators, strict=True))
+    rows = _s3(payload, format="csv", csv_options={"has_header": False}, columns=["v"], max_record_chars=32)
+
+    assert _shape(rows) == [(False, 0), (False, 1), (False, 2)]
+    assert [row.row["v"] for row in rows] == values
+
+
+@pytest.mark.parametrize("value", ["", None], ids=["empty-string", "none-converted-to-empty"])
+def test_s3_csv_single_empty_field_limit_matches_source(value: str | None) -> None:
+    from elspeth.plugins.sinks.aws_s3_sink import CSVWriteOptions, S3RecordSizeLimitError, _serialize_rows_to_spool
+
+    with pytest.raises(S3RecordSizeLimitError):
+        _serialize_rows_to_spool(
+            [{"v": value}],
+            format="csv",
+            csv_options=CSVWriteOptions(include_header=False),
+            fieldnames=["v"],
+            max_object_bytes=1024,
+            max_record_chars=1,
+        )
+    serialized = _serialize_rows_to_spool(
+        [{"v": value}],
+        format="csv",
+        csv_options=CSVWriteOptions(include_header=False),
+        fieldnames=["v"],
+        max_object_bytes=1024,
+        max_record_chars=2,
+    )
+    try:
+        payload = serialized.body.read()
+    finally:
+        serialized.close()
+    assert payload == b'""\r\n'
+    rows = _s3(payload, format="csv", csv_options={"has_header": False}, columns=["v"], max_record_chars=2)
+    assert _shape(rows) == [(False, 0)]
+    assert rows[0].row == {"v": ""}
+
+
+@pytest.mark.parametrize("values", [[""], ["", ""], ["a,b"], ['a"b'], ["a\rb"], ["a\nb"], ["a\r\nb"], ["a", "b"]])
+def test_s3_csv_record_measurement_matches_writer(values: list[str]) -> None:
+    from elspeth.plugins.sinks.aws_s3_sink import _csv_record_chars
+
+    buffer = io.StringIO(newline="")
+    csv.writer(buffer, delimiter=",", lineterminator="\r\n").writerow(values)
+    assert _csv_record_chars(values, ",") == len(buffer.getvalue()) - 2
+
+
+@pytest.mark.parametrize("format", ["csv", "jsonl"])
+def test_s3_sink_record_at_limit_round_trips_through_source(format: Literal["csv", "jsonl"]) -> None:
+    from elspeth.plugins.sinks.aws_s3_sink import CSVWriteOptions, _serialize_rows_to_spool
+
+    value = "x" * (32 if format == "csv" else 24)  # JSONL adds {"v":""}: eight characters.
+    serialized = _serialize_rows_to_spool(
+        [{"v": value}],
+        format=format,
+        csv_options=CSVWriteOptions(include_header=False),
+        fieldnames=["v"],
+        max_object_bytes=1024,
+        max_record_chars=32,
+    )
+    try:
+        payload = serialized.body.read()
+    finally:
+        serialized.close()
+    assert len(payload.rstrip(b"\r\n")) == 32
+
+    options: dict[str, Any] = {"format": format, "max_record_chars": 32}
+    if format == "csv":
+        options["csv_options"] = {"has_header": False}
+        options["columns"] = ["v"]
+    rows = _s3(payload, **options)
+    assert _shape(rows) == [(False, 0)]
+    assert rows[0].row == {"v": value}
+
+
 @pytest.mark.parametrize("oversized_chars", [20, 41], ids=["cr-at-first-bounded-read", "cr-at-skip-chunk"])
 def test_s3_jsonl_crlf_split_by_a_bounded_read_is_one_terminator(oversized_chars: int) -> None:
     oversized = b'{"id":"' + b"x" * (oversized_chars - 9) + b'"}'
     assert len(oversized) == oversized_chars
-    payload = b'{"id":1}\r\n' + oversized + b'\r\n{"id":3}\r\n{"id":4}\r\n'
+    payload = b'{"id":"1"}\r\n' + oversized + b'\r\n{"id":"3"}\r\n{"id":"4"}\r\n'
 
     rows = _s3(payload, format="jsonl", max_record_chars=20)
 
-    assert _shape(rows) == [(False, 0), (True, 1), (False, 2), (False, 3)]
-    assert [rows[2].row, rows[3].row] == [{"id": 3}, {"id": 4}]
+    assert _shape(rows) == [(False, 0), (oversized_chars > 20, 1), (False, 2), (False, 3)]
+    assert rows[0].row == {"id": "1"}
+    if oversized_chars == 20:
+        assert rows[1].row == {"id": "x" * 11}
+    else:
+        assert rows[1].quarantine_error == "JSONL record exceeds configured character limit"
+    assert [rows[2].row, rows[3].row] == [{"id": "3"}, {"id": "4"}]
 
 
 def test_s3_jsonl_utf16_bad_code_unit_quarantines_only_its_line() -> None:

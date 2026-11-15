@@ -322,11 +322,11 @@ class TestSerialization:
             with pytest.raises(S3RecordSizeLimitError):
                 _serialize([row], format="json", fieldnames=["v"], max_record_chars=100)
 
-    @pytest.mark.parametrize(("value_size", "accepted"), [(97, True), (98, True), (99, False)])
+    @pytest.mark.parametrize(("value_size", "accepted"), [(99, True), (100, True), (101, False)])
     def test_csv_record_limit_max_minus_one_max_and_max_plus_one(self, value_size: int, accepted: bool) -> None:
         from elspeth.plugins.sinks.aws_s3_sink import S3RecordSizeLimitError
 
-        row = {"v": "x" * value_size}  # one value plus CRLF is value_size + 2
+        row = {"v": "x" * value_size}  # the final CRLF frames the record and is excluded
         if accepted:
             serialized = _serialize(
                 [row],
