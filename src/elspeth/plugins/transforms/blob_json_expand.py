@@ -397,7 +397,7 @@ class BlobJSONExpand(BaseTransform):
     name = "blob_json_expand"
     determinism = Determinism.IO_READ
     plugin_version = "2.0.0"
-    source_file_hash: str | None = "sha256:a3f3ecf430e280cb"
+    source_file_hash: str | None = "sha256:7cf76c4cf5b55de5"
     config_model = BlobJSONExpandConfig
     usage_when_to_use: str = (
         "Use when a row carries a JSON document — either a payload-store reference from blob_fetch or JSON text in a "
@@ -681,10 +681,9 @@ class BlobJSONExpand(BaseTransform):
 
     def _load_field_text(self, row: PipelineRow) -> tuple[str, str, dict[str, str]]:
         """Read JSON text straight from a row field. No payload store involved."""
-        values = row.to_dict()
-        if self._text_field not in values:
+        if not row.carries(self._text_field):
             raise _BlobJSONParseError(_json_error_reason("missing_field", field=self._text_field))
-        text = values[self._text_field]
+        text = row.carried_value(self._text_field)
         if type(text) is not str:
             raise _BlobJSONParseError(
                 _json_error_reason(
@@ -704,10 +703,9 @@ class BlobJSONExpand(BaseTransform):
 
     def _load_blob_text(self, row: PipelineRow) -> tuple[str, str, dict[str, str]]:
         """Read bytes from the payload store and decode them."""
-        values = row.to_dict()
-        if self._blob_ref_field not in values:
+        if not row.carries(self._blob_ref_field):
             raise _BlobJSONParseError(_json_error_reason("missing_field", field=self._blob_ref_field))
-        blob_ref = values[self._blob_ref_field]
+        blob_ref = row.carried_value(self._blob_ref_field)
         if type(blob_ref) is not str:
             # Routed, not raised: a wrong-typed ref is a fact about THIS row,
             # the same kind as the malformed-hash rejection directly below.
@@ -790,8 +788,7 @@ class BlobJSONExpand(BaseTransform):
         # omitted, so a pipeline that cannot guarantee the column is rejected at
         # build time. A row that still arrives without it is refused here rather
         # than guessed at.
-        row_data = row.to_dict()
-        if self._content_type_field not in row_data:
+        if not row.carries(self._content_type_field):
             raise _BlobJSONParseError(
                 _json_error_reason(
                     "unsupported_content_type",
@@ -799,7 +796,7 @@ class BlobJSONExpand(BaseTransform):
                     error=f"no content type on the row to infer the parse format from — set the 'format' option on {self.name}",
                 )
             )
-        content_type = row_data[self._content_type_field]
+        content_type = row.carried_value(self._content_type_field)
         if type(content_type) is not str:
             raise _BlobJSONParseError(
                 _json_error_reason(

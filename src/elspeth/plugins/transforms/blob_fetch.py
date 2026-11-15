@@ -339,7 +339,7 @@ class BlobFetch(BaseTransform):
     name = "blob_fetch"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "2.0.0"
-    source_file_hash: str | None = "sha256:df15b7ca9a91468f"
+    source_file_hash: str | None = "sha256:9a34b36970aa9a49"
     config_model = BlobFetchConfig
     passes_through_input = True
     fetches_http = True
@@ -539,7 +539,7 @@ class BlobFetch(BaseTransform):
             if self._url is not None:
                 url = self._url
             elif self._url_field is not None:
-                url = row.to_dict()[self._url_field]
+                url = row.carried_value(self._url_field)
             else:
                 raise FrameworkBugError("blob_fetch has no configured URL source")
             if type(url) is not str:

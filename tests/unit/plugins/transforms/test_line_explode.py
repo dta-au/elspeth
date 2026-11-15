@@ -283,8 +283,8 @@ def test_line_explode_routes_non_string_input_as_a_failed_row(ctx: PluginContext
     assert result.reason["reason"] == "invalid_input"
     assert result.reason["error_type"] == "wrong_type"
     assert result.reason["field"] == "html"
-    # The carried payload view thaws the frozen tuple to the original list shape.
-    assert "must be a string, got list" in result.reason["error"]
+    # PipelineRow deep-freezes lists to tuples, so the reported type is tuple.
+    assert "must be a string, got tuple" in result.reason["error"]
     assert result.rows is None
 
 

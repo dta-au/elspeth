@@ -293,7 +293,7 @@ class BlobCSVExpand(BaseTransform):
     name = "blob_csv_expand"
     determinism = Determinism.IO_READ
     plugin_version = "2.0.0"
-    source_file_hash: str | None = "sha256:90551d3fb1c1db63"
+    source_file_hash: str | None = "sha256:92ce0032bdc9635e"
     config_model = BlobCSVExpandConfig
     usage_when_to_use: str = (
         "Use when each input row carries a payload-store reference to a CSV blob and you need to "
@@ -564,10 +564,9 @@ class BlobCSVExpand(BaseTransform):
         return self._load_blob_text(row)
 
     def _load_blob_text(self, row: PipelineRow) -> _CSVSourceText:
-        values = row.to_dict()
-        if self._blob_ref_field not in values:
+        if not row.carries(self._blob_ref_field):
             raise _BlobCSVParseError(_csv_error_reason("invalid_input", field=self._blob_ref_field, error_type="missing_blob_ref_field"))
-        blob_ref = values[self._blob_ref_field]
+        blob_ref = row.carried_value(self._blob_ref_field)
         if type(blob_ref) is not str:
             # Routed, not raised: a wrong-typed ref is a fact about THIS row,
             # the same kind as the malformed-hash rejection directly below.
@@ -656,7 +655,7 @@ class BlobCSVExpand(BaseTransform):
     def _load_field_text(self, row: PipelineRow) -> _CSVSourceText:
         # The configured name is the payload key as carried by the row.
         try:
-            value = row.to_dict()[self._text_field]
+            value = row.carried_value(self._text_field)
         except KeyError as exc:
             raise _BlobCSVParseError(
                 _csv_error_reason(

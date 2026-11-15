@@ -342,7 +342,7 @@ class LineExplode(BaseTransform):
     name = "line_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "2.0.0"
-    source_file_hash: str | None = "sha256:eba479de6d05e7c2"
+    source_file_hash: str | None = "sha256:25cd21caa2c36295"
     config_model = LineExplodeConfig
     usage_when_to_use: str = (
         "Use to split one newline-framed text field into rows while preserving the rest of the input "
@@ -488,13 +488,12 @@ class LineExplode(BaseTransform):
 
     def process(self, row: PipelineRow, ctx: TransformContext) -> TransformResult:
         """Explode a string field into multiple rows."""
-        row_data = row.to_dict()
-        if self._source_field not in row_data:
+        if not row.carries(self._source_field):
             return TransformResult.error(
                 {"reason": "invalid_input", "field": self._source_field, "error_type": "missing_field"},
                 retryable=False,
             )
-        source_value = row_data[self._source_field]
+        source_value = row.carried_value(self._source_field)
         if type(source_value) is not str:
             # A ROW-level fact, so it takes the same routable exit as the
             # empty-string and too-many-lines rejections below rather than
@@ -532,6 +531,7 @@ class LineExplode(BaseTransform):
                 retryable=False,
             )
 
+        row_data = row.to_dict()
         collisions = detect_field_collisions(set(row_data) - {self._source_field}, self.declared_output_fields)
         if collisions:
             raise PluginContractViolation(
