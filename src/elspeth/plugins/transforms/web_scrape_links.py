@@ -15,7 +15,7 @@ from elspeth.core.security.web import (
 from elspeth.plugins.infrastructure.clients.fingerprinting import (
     MAX_AUDIT_QUERY_CHARS,
     MAX_AUDIT_QUERY_FIELDS,
-    fingerprint_url,
+    is_capability_query_param,
     is_sensitive_query_param,
 )
 
@@ -59,14 +59,16 @@ def resolve_discovered_href(
         # value, so fail this link instead of persisting a navigable secret.
         if len(parsed.query) > MAX_AUDIT_QUERY_CHARS:
             raise ValueError("discovered link query exceeds the audit limit")
-        query = parse_qsl(parsed.query, keep_blank_values=True, max_num_fields=MAX_AUDIT_QUERY_FIELDS)
-        if any(is_sensitive_query_param(name) for name, _ in query):
+        # The query is emitted exactly as the page wrote it, and some servers
+        # split parameters on ';' as well as '&', so inspect both separators.
+        query = parse_qsl(parsed.query.replace(";", "&"), keep_blank_values=True, max_num_fields=MAX_AUDIT_QUERY_FIELDS)
+        if any(is_sensitive_query_param(name) or is_capability_query_param(name) for name, _ in query):
             raise ValueError("discovered link contains a sensitive query parameter")
 
-        safe_url = fingerprint_url(candidate)
-        validate_allowed_http_origin(safe_url, allowed_origins)
-        validate_configured_url_for_ssrf(safe_url, allowed_ranges=allowed_ranges)
-        return safe_url
+        # Userinfo was refused by the origin gate and the fragment was dropped
+        # above; nothing is left to fingerprint, and re-encoding the query
+        # would make the next request differ from the href the page linked.
+        return candidate
     except (SSRFBlockedError, TypeError, UnicodeError, ValueError):
         # Policy errors and URL parsing errors can contain the raw href. Never
         # forward their text into a TransformResult or the audit trail.

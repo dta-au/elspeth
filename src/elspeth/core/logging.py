@@ -13,7 +13,9 @@ Architecture:
 
 import io
 import logging
+import os
 import sys
+import traceback
 from typing import Any, Literal, TextIO
 
 import structlog
@@ -84,6 +86,67 @@ _elspeth_handler_ids: set[int] = set()
 _elspeth_stream_handler: logging.StreamHandler[Any] | None = None
 
 
+# asyncio reports exceptions no code can receive (a task failure nobody
+# retrieved, a failed loop callback, and since Python 3.14 a shielded task that
+# fails after its awaiter was cancelled) through the loop exception handler,
+# whose default writes the exception message and traceback to this logger.
+_ASYNCIO_LOGGER_NAME = "asyncio"
+_ASYNCIO_DIAGNOSTIC_FRAME_LIMIT = 20
+
+
+class _AsyncioDiagnosticScrubber(logging.Filter):
+    """Reduce asyncio's exception diagnostics to class and code location.
+
+    An exception raised while handling a prompt, a tool call or a SQL write
+    can carry that content in its message, and asyncio's own message text can
+    carry a callback's arguments. Logs may hold neither, so a record with an
+    exception is rewritten to the exception class plus the file, line and
+    function of each traceback frame: where it failed, never what it said.
+    Records without an exception pass unchanged.
+
+    It filters the logger rather than replacing a loop's exception handler
+    because the default handler of every loop in the process (stdlib and
+    uvloop alike) logs here, including loops ELSPETH did not start.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        exc_info = record.exc_info
+        if exc_info is None or exc_info[0] is None:
+            return True
+        frames = traceback.extract_tb(exc_info[2], limit=-_ASYNCIO_DIAGNOSTIC_FRAME_LIMIT)
+        locations = ",".join(f"{frame.filename}:{frame.lineno}:{frame.name}" for frame in frames)
+        record.msg = "asyncio_unhandled_exception exc_class=%s frames=%s"
+        record.args = (exc_info[0].__name__, locations)
+        record.exc_info = None
+        record.exc_text = None
+        return True
+
+
+_asyncio_diagnostic_scrubber = _AsyncioDiagnosticScrubber()
+
+
+def install_asyncio_diagnostic_scrubber() -> None:
+    """Keep exception content out of asyncio's diagnostics, process-wide.
+
+    Idempotent. ``configure_logging`` calls it; an entry point that owns
+    stdout and therefore configures no ELSPETH handler (the MCP servers)
+    calls it directly before starting its event loop.
+
+    Refuses to run with ``JSON_LOGS=true``: LiteLLM then replaces the loop
+    exception handler and ``sys.excepthook`` with ones that log
+    ``str(exception)`` through its own handler, which no filter here can
+    reach. ELSPETH's JSON output is selected by its own settings.
+    """
+    if "JSON_LOGS" in os.environ and os.environ["JSON_LOGS"].lower() == "true":
+        raise RuntimeError(
+            "JSON_LOGS=true is not supported: it makes LiteLLM log unhandled exception messages verbatim, "
+            "bypassing ELSPETH's log scrubbing. Unset JSON_LOGS and select JSON output through ELSPETH's own logging settings."
+        )
+    asyncio_logger = logging.getLogger(_ASYNCIO_LOGGER_NAME)
+    if _asyncio_diagnostic_scrubber not in asyncio_logger.filters:
+        asyncio_logger.addFilter(_asyncio_diagnostic_scrubber)
+
+
 def _remove_internal_fields(
     logger: logging.Logger | None,
     method_name: str,
@@ -123,6 +186,7 @@ def configure_logging(
             disable them. If None, auto-detect from stdout interactivity.
     """
     global _elspeth_stream_handler
+    install_asyncio_diagnostic_scrubber()
     normalized_level = level.upper()
     if normalized_level == "DEBUG":
         log_level = logging.DEBUG

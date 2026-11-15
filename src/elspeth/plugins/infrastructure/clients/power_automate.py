@@ -178,6 +178,9 @@ class PowerAutomateOperationClient:
             self._require_fingerprint_key()
             return auth.trigger_url_secret.get_secret_value()
         if isinstance(auth, ArchivedPowerAutomateSASAuth):
+            # Deferred resolution fingerprints the secret; without a key that
+            # would surface as an authentication failure, not the real cause.
+            self._require_fingerprint_key()
             return self._resolve_credential()
         endpoint = self._config.trigger_url
         if endpoint is None:

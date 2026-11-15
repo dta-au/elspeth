@@ -33,6 +33,10 @@ class _PayloadStoreFake:
     def retrieve(self, content_hash: str) -> bytes:
         return self.content_by_hash[content_hash]
 
+    def retrieve_bounded(self, content_hash: str, *, max_bytes: int) -> bytes | None:
+        content = self.retrieve(content_hash)
+        return None if len(content) > max_bytes else content
+
     def exists(self, content_hash: str) -> bool:
         return content_hash in self.content_by_hash
 
@@ -338,10 +342,19 @@ def test_blob_csv_expand_both_arms_report_a_parse_defect_identically() -> None:
 
     assert blob_result.status == "error"
     assert field_result.status == "error"
-    # A parse defect is a property of the CSV, not of where the CSV came from,
-    # so these reasons carry no arm-specific identity and must be EQUAL.
-    assert blob_result.reason == field_result.reason
     assert blob_result.reason is not None
+    assert field_result.reason is not None
+    # A parse defect is a property of the CSV, not of where the CSV came from:
+    # past the source identity every parse-phase reason carries (the same keys
+    # empty_csv and the load-phase errors carry), the two reasons are EQUAL.
+    identity_keys = {"field", "blob_ref"}
+    assert {k: v for k, v in blob_result.reason.items() if k not in identity_keys} == {
+        k: v for k, v in field_result.reason.items() if k not in identity_keys
+    }
+    assert blob_result.reason["field"] == "blob_ref"
+    assert blob_result.reason["blob_ref"] == blob_ref
+    assert field_result.reason["field"] == "content"
+    assert "blob_ref" not in field_result.reason
     assert blob_result.reason["reason"] == "csv_column_count_mismatch"
     assert blob_result.reason["expected"] == 2
     assert blob_result.reason["actual"] == 1
@@ -1128,6 +1141,9 @@ def test_blob_csv_expand_propagates_integrity_error_rather_than_routing_it() -> 
         def retrieve(self, content_hash: str) -> bytes:
             raise IntegrityError(f"checksum mismatch for {content_hash}")
 
+        def retrieve_bounded(self, content_hash: str, *, max_bytes: int) -> bytes | None:
+            return self.retrieve(content_hash)
+
     blob_ref = _hash(b"id,name\n1,alice\n")
     transform = _build_transform()
     transform._payload_store = _CorruptPayloadStore()
@@ -1182,6 +1198,9 @@ def test_blob_csv_expand_integrity_wins_when_an_error_is_both_kinds() -> None:
     class _AmbiguousPayloadStore:
         def retrieve(self, content_hash: str) -> bytes:
             raise _CorruptAndMissingError(f"corrupt and missing: {content_hash}")
+
+        def retrieve_bounded(self, content_hash: str, *, max_bytes: int) -> bytes | None:
+            return self.retrieve(content_hash)
 
     blob_ref = _hash(b"id,name\n1,alice\n")
     transform = _build_transform()

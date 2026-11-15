@@ -23,6 +23,7 @@ from elspeth.contracts.field_collision import detect_field_collisions
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import FieldDefinition
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.contracts.union_merge import join_batch_contracts
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import PluginConfigError, TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -131,7 +132,7 @@ class BatchReplicate(BaseTransform):
     name = "batch_replicate"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a00352057226befe"
+    source_file_hash: str | None = "sha256:16baea08f1c1df3b"
     config_model = BatchReplicateConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
     # Not passthrough-capable: each row asks for its own number of copies.
@@ -375,19 +376,16 @@ class BatchReplicate(BaseTransform):
 
         # Build the emitted contract from rows that actually produced output.
         # Quarantined-only fields must not leak into successful child tokens.
-        first_contract = rows[0].contract
-        for i, row in enumerate(rows[1:], start=1):
-            if row.contract.mode != first_contract.mode:
-                raise ValueError(
-                    f"Heterogeneous contract modes in batch: row 0 has mode "
-                    f"'{first_contract.mode}', row {i} has mode '{row.contract.mode}'. "
-                    f"All rows in a batch must share the same contract mode."
-                )
-        merged_fields: dict[str, FieldContract] = {}
-        for contract in emitted_contracts:
-            for fc in contract.fields:
-                if fc.normalized_name not in merged_fields:
-                    merged_fields[fc.normalized_name] = fc
+        # ``success_multi`` needs one shared contract, and buffered rows can
+        # come from several producers (two sources on one queue, row_union
+        # branches), so the carried fields are the J1 description join of the
+        # emitting rows' own contracts: a field they type differently is
+        # ``object``, nullable is OR, a field some row lacks is optional, and
+        # the mode is the most restrictive. Every copy's contract therefore
+        # admits the values it carries; a single-producer batch joins to its
+        # contract unchanged.
+        joined = join_batch_contracts(list({id(contract): contract for contract in emitted_contracts}.values()))
+        merged_fields: dict[str, FieldContract] = {fc.normalized_name: fc for fc in joined.fields}
 
         # copy_index enters as a placeholder; the ONE stamp rewrites it to the
         # plugin's declaration (``int``, ADR-050) and the batch postflight
@@ -402,7 +400,7 @@ class BatchReplicate(BaseTransform):
             )
 
         output_contract = SchemaContract(
-            mode=first_contract.mode,
+            mode=joined.mode,
             fields=tuple(merged_fields.values()),
             locked=True,
         )

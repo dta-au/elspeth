@@ -690,7 +690,13 @@ def test_saturated_workers_make_good_rows_wait_not_fail() -> None:
     assert {name: outcomes[name] for name in ("benign0", "benign1", "benign2")} == {"benign0": "ok0", "benign1": "ok1", "benign2": "ok2"}
     for name in ("crafted0", "crafted1"):
         error = outcomes[name]
-        # Their own limit ends the crafted rows: RLIMIT_CPU, or the wall clock on a starved host.
+        # Their own limit ends the crafted rows: RLIMIT_CPU, or the wall clock
+        # after they used their CPU budget. On a host so starved that a worker
+        # ran out of wall clock before using its budget, the timeout is not the
+        # row's (sweep finding #6): a retryable worker loss.
+        if type(error) is TemplateWorkerLostError:
+            assert str(error).startswith("Template worker did not reply within ")
+            continue
         assert type(error) is TemplateError
         assert str(error) in ("Template exceeded the CPU limit", "Template exceeded the execution time limit")
 

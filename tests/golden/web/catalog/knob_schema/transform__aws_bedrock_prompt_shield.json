@@ -58,6 +58,16 @@
         "nullable": false,
         "required": true,
         "tier": "common"
+      },
+      {
+        "default": 300,
+        "description": "Seconds after a row starts within which each further field call must start; fields left unscanned at the deadline fail the row as row_deadline_exceeded.",
+        "kind": "number-int",
+        "label": "Row Deadline Seconds",
+        "name": "row_deadline_seconds",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
       }
     ]
   },

@@ -505,13 +505,14 @@ Limits an assessor should weigh:
 ### 6.1 Build inputs
 
 - **Base images pinned by digest** in the `Dockerfile`: the Node frontend
-  builder (`node:24.18.0-bookworm-slim@sha256:…`), the Python builder
-  (`python:3.13-slim@sha256:…`), the `uv` binary image and the distroless
-  runtime (`gcr.io/distroless/python3-debian13:debug-nonroot@sha256:…`)
-  [EV-627].
+  builder (`node:24.18.0-bookworm-slim@sha256:…`), the Debian 13 Python
+  builder (`debian:trixie-slim@sha256:…`), the `uv` binary image and the
+  distroless runtime (`gcr.io/distroless/cc-debian13:debug-nonroot@sha256:…`)
+  [EV-627]. The CPython 3.14 interpreter is installed by that pinned `uv` from
+  its checksummed build list and copied into the runtime image.
 - **Locked dependencies:** the root `uv.lock`, the separate `gateway/uv.lock`
   and the frontend `package-lock.json` [EV-704] [EV-706].
-- **Gateway build inputs pinned and frozen:** its Python 3.12 Alpine builder
+- **Gateway build inputs pinned and frozen:** its Python 3.14 Alpine builder
   and runtime and its `uv` source are pinned by digest. Separate build and
   runtime environments consume `gateway/uv.lock` with `--frozen`; the exact
   local wheel is installed with `--no-deps` [EV-722].

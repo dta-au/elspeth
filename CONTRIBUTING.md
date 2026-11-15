@@ -4,7 +4,7 @@ Thanks for your interest in contributing to ELSPETH! This document covers the ba
 
 ## Development Setup
 
-Install Python 3.12 or newer, `uv`, Node.js 24, and npm 11. The repository's
+Install Python 3.14 or newer, `uv`, Node.js 24, and npm 11. The repository's
 `.node-version`, `package.json`, and lockfiles are the toolchain authority.
 
 ```bash

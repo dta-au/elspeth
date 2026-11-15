@@ -1099,7 +1099,11 @@ def _preflight_raw_settings_sink_effects(settings_path: Path, *, purpose: object
         deferrable_env_vars=deferrable_env_vars,
     )
     if purpose is SinkEffectExecutionPurpose.FRESH:
-        export_settings = validate_landscape_export_settings_from_raw_config(raw_config)
+        export_settings = validate_landscape_export_settings_from_raw_config(
+            raw_config,
+            expand_env_placeholders=not projected_nonlive,
+            deferrable_env_vars=deferrable_env_vars,
+        )
         if export_settings.enabled:
             validate_sink_effect_eligibility_from_raw_config(
                 raw_config,

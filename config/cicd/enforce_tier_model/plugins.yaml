@@ -96,13 +96,6 @@ per_file_rules:
     content type validation
   expires: null
   max_hits: 3
-- pattern: plugins/infrastructure/clients/replayer.py
-  rules:
-  - R5
-  reason: Deep-freeze guards and Tier 1 deep_thaw type validation for recorded call
-    data
-  expires: null
-  max_hits: 1
 - pattern: plugins/infrastructure/schema_factory.py
   rules:
   - R5

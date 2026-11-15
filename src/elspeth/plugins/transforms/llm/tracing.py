@@ -40,6 +40,26 @@ from elspeth.core.url_validation import validate_credential_safe_https_url
 SUPPORTED_TRACING_PROVIDERS = frozenset({"none", "azure_ai", "langfuse"})
 
 
+# ``parse_tracing_config`` splats the untyped ``tracing`` options dict into the
+# dataclasses below, and ``${VAR}`` expansion always yields ``str``. Policy
+# flags are therefore checked by exact type: ``bool("false")`` is True, so a
+# truthiness read would turn content recording ON when the operator asked for
+# OFF. Credentials must be non-empty strings. Neither check echoes the value.
+
+
+def _require_bool(cls_name: str, field_name: str, value: object) -> None:
+    if type(value) is not bool:
+        raise ValueError(
+            f"{cls_name} requires {field_name} to be a boolean (true/false), got {type(value).__name__}. "
+            "Quoted or environment-expanded values such as 'false' are strings and are refused, not coerced."
+        )
+
+
+def _require_credential(cls_name: str, field_name: str, value: object) -> None:
+    if type(value) is not str or not value.strip():
+        raise ValueError(f"{cls_name} requires {field_name} to be a non-empty string, got {type(value).__name__}.")
+
+
 @dataclass(frozen=True, slots=True)
 class TracingConfig:
     """Base tracing configuration.
@@ -84,6 +104,9 @@ class AzureAITracingConfig(TracingConfig):
             raise ValueError(f"AzureAITracingConfig requires provider='azure_ai', got {self.provider!r}")
         if self.connection_string is None:
             raise ValueError("AzureAITracingConfig requires connection_string. Use ${APPLICATIONINSIGHTS_CONNECTION_STRING} in YAML.")
+        _require_credential("AzureAITracingConfig", "connection_string", self.connection_string)
+        _require_bool("AzureAITracingConfig", "enable_content_recording", self.enable_content_recording)
+        _require_bool("AzureAITracingConfig", "enable_live_metrics", self.enable_live_metrics)
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,8 +119,11 @@ class LangfuseTracingConfig(TracingConfig):
     - Evaluation scores and feedback
     - A/B testing for prompts
 
-    Langfuse uses per-instance clients, so multiple plugins can have
-    different Langfuse configurations (e.g., different hosts).
+    Multiple plugins can have different Langfuse configurations (e.g.,
+    different hosts) only under distinct public keys: the Langfuse SDK shares
+    one exporter (host and secret_key) per public_key per process, so
+    ``create_langfuse_tracer`` refuses a second config that reuses a
+    public_key with a different host or secret_key.
 
     Attributes:
         provider: Always 'langfuse'
@@ -130,6 +156,9 @@ class LangfuseTracingConfig(TracingConfig):
             raise ValueError("LangfuseTracingConfig requires secret_key. Use ${LANGFUSE_SECRET_KEY} in YAML.")
         if self.host is None:
             raise ValueError("LangfuseTracingConfig requires host (e.g. 'https://cloud.langfuse.com' or your on-prem URL).")
+        _require_credential("LangfuseTracingConfig", "public_key", self.public_key)
+        _require_credential("LangfuseTracingConfig", "secret_key", self.secret_key)
+        _require_bool("LangfuseTracingConfig", "tracing_enabled", self.tracing_enabled)
         # ``parse_tracing_config`` splats untrusted YAML into this dataclass, so
         # a non-string host would reach the shared validator's ``.strip()`` as an
         # AttributeError rather than a configuration rejection.
@@ -167,8 +196,9 @@ def parse_tracing_config(config: dict[str, Any] | None) -> TracingConfig | None:
     if config is None:
         return None
 
-    # "provider" absence is a valid shorthand for "no tracing": it is the
-    # discriminator, not data, so its absence is read by membership.
+    # "provider" absence is a valid shorthand for "no tracing" only when no
+    # other key is given (``{}``): it is the discriminator, not data, so its
+    # absence is read by membership; the 'none' arm refuses extra keys.
     provider = config["provider"] if "provider" in config else "none"
 
     # Pass remaining config fields through to the dataclass, which owns all
@@ -182,6 +212,16 @@ def parse_tracing_config(config: dict[str, Any] | None) -> TracingConfig | None:
         case "langfuse":
             return LangfuseTracingConfig(**fields)
         case "none":
+            # 'none' carries no settings. Keys beside it mean the operator
+            # configured a destination but omitted (or mistyped as none) the
+            # provider; dropping them would disable tracing silently. Name
+            # the keys only: their values may be credentials.
+            if fields:
+                raise ValueError(
+                    f"Tracing provider resolved to 'none' (provider {'omitted' if 'provider' not in config else 'none'}) "
+                    f"but other tracing keys were given: {sorted(fields)}. Set provider to "
+                    f"{', '.join(sorted(SUPPORTED_TRACING_PROVIDERS - {'none'}))}, or remove the other keys to disable tracing."
+                )
             return TracingConfig(provider="none")
         case _:
             raise ValueError(

@@ -294,6 +294,25 @@ class SharedBatchAdapter:
             # No entry: stale result from timed-out attempt.
             # Already signaled: duplicate emit — preserve first-result-wins.
 
+    def fail_pending(self, failure: Exception) -> None:
+        """Wake every waiter still blocked on a result with ``failure``.
+
+        Called by the batch transform when its release thread has died: no
+        result can arrive any more, so each pending ``wait()`` re-raises the
+        failure now instead of timing out after ``batch_wait_timeout``. An
+        entry already holding a result keeps it (first result wins).
+        """
+        import traceback as tb_mod
+
+        exception_result = ExceptionResult(
+            exception=failure,
+            traceback="".join(tb_mod.format_exception(failure)),
+        )
+        with self._lock:
+            for entry in self._entries.values():
+                if not entry.event.is_set():
+                    entry.deliver(exception_result)
+
     def clear(self) -> None:
         """Clear all pending entries.
 

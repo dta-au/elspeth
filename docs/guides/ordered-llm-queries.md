@@ -38,9 +38,9 @@ To preserve an exact structured output name, set a query's
 `<stem>_answer`; omitted or null keeps `<query_name>_answer`. Provider JSON keys
 remain the suffixes. Raw replies and usage/model fields retain their query-name
 prefixes. This option requires 0.8.9 and applies only to multi-query transforms.
-Any non-null override activates complete generated-name collision refusal across
-all queries, even in upstream mode. Null preserves upstream mode's legacy
-overwrite rules; ordered mode always refuses collisions.
+Every multi-query configuration, upstream or ordered and whatever the stem,
+refuses a generated-name collision across all queries at config time, including
+a structured name equal to a raw reply or usage/model field.
 
 For a separate semantic review, bind a later query's `input_fields` to the actual
 validated writer outputs and relevant original evidence. Give the review a real

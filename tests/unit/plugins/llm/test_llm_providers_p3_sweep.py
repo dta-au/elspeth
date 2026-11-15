@@ -1,0 +1,358 @@
+"""Regression tests for the 20261111-plugins-review P3 LLM-provider sweep findings."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any
+from unittest.mock import patch
+
+import httpx
+import pytest
+
+from elspeth.contracts.chat_parts import ChatMessage
+from elspeth.plugins.infrastructure.clients.llm import ContentPolicyError, LLMClientError, NetworkError
+from elspeth.plugins.llm.config_validation import normalize_openrouter_base_url, validate_openrouter_base_url
+from elspeth.plugins.sources.llm.config import (
+    AzureOpenAILLMSourceConfig,
+    GatewayLLMSourceConfig,
+    LLMSourceConfig,
+    OpenRouterLLMSourceConfig,
+)
+from elspeth.plugins.transforms.llm.provider import LLMAuditParent
+from elspeth.plugins.transforms.llm.providers.gateway import _validate_gateway_success_response, _validate_readyz_payload
+from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterLLMProvider
+from tests.unit.plugins.llm.test_provider_azure import FakeLLMClient as AzureFakeLLMClient
+from tests.unit.plugins.llm.test_provider_azure import _make_llm_response as _make_azure_llm_response
+from tests.unit.plugins.llm.test_provider_azure import _make_provider as _make_azure_provider
+from tests.unit.plugins.llm.test_provider_azure import _provider_llm_client as _azure_provider_llm_client
+from tests.unit.plugins.llm.test_provider_bedrock import _LEADER_TOKEN as _BEDROCK_LEADER_TOKEN
+from tests.unit.plugins.llm.test_provider_bedrock import MODEL as _BEDROCK_MODEL
+from tests.unit.plugins.llm.test_provider_bedrock import _provider as _bedrock_provider
+from tests.unit.plugins.llm.test_provider_bedrock import _response as _bedrock_response
+from tests.unit.plugins.llm.test_provider_gateway import _CONTRACT_HEADER, _completion_body, _gateway_response, _readyz_body
+from tests.unit.plugins.llm.test_provider_openrouter import _MEMBER_TOKEN as _OPENROUTER_MEMBER_TOKEN
+from tests.unit.plugins.llm.test_provider_openrouter import _WORK_ITEM as _OPENROUTER_WORK_ITEM
+from tests.unit.plugins.llm.test_provider_openrouter import FakeAuditRecorder as OpenRouterFakeAuditRecorder
+from tests.unit.plugins.llm.test_provider_openrouter import FakeHTTPClient, _provider_http_client
+from tests.unit.plugins.llm.test_provider_openrouter import FakeTelemetryEmit as OpenRouterFakeTelemetryEmit
+
+
+def _raised_by(call: Callable[[], object]) -> BaseException | None:
+    """Return what ``call`` raised (or None) so every outcome lands on an assertion."""
+    try:
+        call()
+    except Exception as exc:
+        return exc
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Finding #62: a required 'usage' capability must fail closed on malformed usage
+# ---------------------------------------------------------------------------
+
+
+def _completion_with_usage(usage: object) -> dict[str, Any]:
+    body = _completion_body()
+    body["usage"] = usage
+    return body
+
+
+class TestGatewayRequiredUsageFailsClosed:
+    @pytest.mark.parametrize(
+        "usage",
+        [
+            pytest.param({}, id="empty-object"),
+            pytest.param("junk", id="string"),
+            pytest.param({"prompt_tokens": "10", "completion_tokens": "5"}, id="string-counts"),
+            pytest.param(5, id="int"),
+            pytest.param({"prompt_tokens": 10}, id="completion-missing"),
+            pytest.param({"completion_tokens": 5}, id="prompt-missing"),
+            pytest.param({"prompt_tokens": True, "completion_tokens": 5}, id="bool-count"),
+        ],
+    )
+    def test_malformed_usage_is_rejected_when_required(self, usage: object) -> None:
+        response = _gateway_response(_completion_with_usage(usage))
+        raised = _raised_by(lambda: _validate_gateway_success_response(response, usage_required=True))
+        assert isinstance(raised, LLMClientError), f"malformed usage {usage!r} was accepted: {raised!r}"
+        assert raised.retryable is False
+        assert "usage" in str(raised)
+
+    def test_well_formed_usage_is_accepted_when_required(self) -> None:
+        response = _gateway_response(_completion_with_usage({"prompt_tokens": 10, "completion_tokens": 5}))
+        _, _, usage, _, _ = _validate_gateway_success_response(response, usage_required=True)
+        assert usage.prompt_tokens == 10
+        assert usage.completion_tokens == 5
+
+    def test_malformed_usage_stays_unknown_when_not_required(self) -> None:
+        response = _gateway_response(_completion_with_usage("junk"))
+        _, _, usage, _, _ = _validate_gateway_success_response(response, usage_required=False)
+        assert usage.prompt_tokens is None
+        assert usage.completion_tokens is None
+
+
+# ---------------------------------------------------------------------------
+# Finding #63: readyz capabilities elements and contract_major are typed
+# ---------------------------------------------------------------------------
+
+
+def _readyz_response(**overrides: object) -> httpx.Response:
+    body: dict[str, Any] = _readyz_body()
+    body.update(overrides)
+    return httpx.Response(200, json=body, headers={_CONTRACT_HEADER: "1"})
+
+
+def _validate_readyz(response: httpx.Response, *, required_capabilities: tuple[str, ...] = ("usage",)) -> object:
+    return _validate_readyz_payload(response, contract_major=1, model="standard", required_capabilities=required_capabilities)
+
+
+class TestReadyzPayloadTyping:
+    @pytest.mark.parametrize(
+        "capabilities",
+        [
+            pytest.param([{"x": 1}], id="unhashable-dict"),
+            pytest.param([["usage"]], id="unhashable-list"),
+            pytest.param(["usage", 5], id="int-element"),
+            pytest.param(["usage", None], id="null-element"),
+        ],
+    )
+    def test_non_str_capability_element_raises_typed_error(self, capabilities: list[object]) -> None:
+        raised = _raised_by(lambda: _validate_readyz(_readyz_response(capabilities=capabilities)))
+        assert isinstance(raised, LLMClientError), f"capabilities {capabilities!r} produced {raised!r}"
+        assert raised.retryable is False
+
+    @pytest.mark.parametrize(
+        "contract_major",
+        [
+            pytest.param(True, id="bool"),
+            pytest.param(1.0, id="float"),
+            pytest.param("1", id="str"),
+        ],
+    )
+    def test_non_int_contract_major_is_rejected(self, contract_major: object) -> None:
+        raised = _raised_by(lambda: _validate_readyz(_readyz_response(contract_major=contract_major)))
+        assert isinstance(raised, LLMClientError), f"contract_major {contract_major!r} produced {raised!r}"
+        assert raised.retryable is False
+
+    def test_well_formed_readyz_document_is_accepted(self) -> None:
+        identity = _validate_readyz(_readyz_response())
+        assert identity == {"name": "reference_v1_invoke", "version": "1.0.0", "adapter_api_major": 1, "fingerprint": "abc123"}
+
+
+# ---------------------------------------------------------------------------
+# Finding #97: OpenRouter transport errors never carry the raw httpx text
+# ---------------------------------------------------------------------------
+
+_TRANSPORT_SENTINEL = "SENTINEL-transport-text-7c1e"
+
+
+class TestOpenRouterTransportErrorRedaction:
+    @pytest.mark.parametrize(
+        "transport_error",
+        [
+            pytest.param(httpx.RemoteProtocolError(f"illegal header line: b'X-Leak: {_TRANSPORT_SENTINEL}'"), id="remote-protocol"),
+            pytest.param(httpx.ConnectError(f"connect to https://{_TRANSPORT_SENTINEL}.example failed"), id="connect"),
+        ],
+    )
+    def test_network_error_message_and_audit_row_use_fixed_text(self, transport_error: httpx.RequestError) -> None:
+        recorder = OpenRouterFakeAuditRecorder()
+        provider = OpenRouterLLMProvider(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            timeout_seconds=30.0,
+            recorder=recorder,
+            run_id="run-1",
+            telemetry_emit=OpenRouterFakeTelemetryEmit(),
+        )
+        http_client = FakeHTTPClient(error=transport_error)
+        with _provider_http_client(provider, http_client):
+            raised = _raised_by(
+                lambda: provider.execute_query(
+                    messages=[ChatMessage(role="user", content="hi")],
+                    model="gpt-4o",
+                    temperature=0.0,
+                    max_tokens=100,
+                    audit_parent=LLMAuditParent.for_row(
+                        member_token=_OPENROUTER_MEMBER_TOKEN,
+                        work_item=_OPENROUTER_WORK_ITEM,
+                        state_id="state-1",
+                        token_id="tok-1",
+                    ),
+                )
+            )
+
+        assert isinstance(raised, NetworkError), f"expected NetworkError, got {raised!r}"
+        assert raised.retryable is True
+        assert _TRANSPORT_SENTINEL not in str(raised)
+        assert _TRANSPORT_SENTINEL not in repr(raised)
+        assert raised.__cause__ is transport_error
+        assert recorder.calls, "the logical LLM error row was not recorded"
+        assert _TRANSPORT_SENTINEL not in repr(recorder.calls)
+
+
+# ---------------------------------------------------------------------------
+# Finding #125: Bedrock readiness requires a usable completion
+# ---------------------------------------------------------------------------
+
+
+class TestBedrockPreflightRequiresUsableCompletion:
+    @pytest.mark.parametrize(
+        ("content", "finish_reason"),
+        [
+            pytest.param("", "stop", id="empty-stop"),
+            pytest.param("   ", "stop", id="whitespace-stop"),
+            pytest.param("ok", "length", id="length"),
+            pytest.param("ok", "content_filter", id="content-filter"),
+            pytest.param("ok", "tool_calls", id="tool-calls"),
+        ],
+    )
+    def test_unusable_preflight_completion_is_not_readiness(self, content: str, finish_reason: str) -> None:
+        provider = _bedrock_provider()
+        with patch("litellm.completion", return_value=_bedrock_response(content=content, finish_reason=finish_reason)):
+            raised = _raised_by(
+                lambda: provider.runtime_preflight(
+                    operation_id="op-1", model=_BEDROCK_MODEL, temperature=0.0, coordination_token=_BEDROCK_LEADER_TOKEN
+                )
+            )
+        assert isinstance(raised, LLMClientError), f"preflight accepted content={content!r} finish_reason={finish_reason!r}"
+        assert raised.retryable is False
+        assert content.strip() == "" or content not in str(raised)
+
+    def test_usable_preflight_completion_is_readiness(self) -> None:
+        provider = _bedrock_provider()
+        with patch("litellm.completion", return_value=_bedrock_response(content="ok", finish_reason="stop")):
+            provider.runtime_preflight(operation_id="op-1", model=_BEDROCK_MODEL, temperature=0.0, coordination_token=_BEDROCK_LEADER_TOKEN)
+
+
+# ---------------------------------------------------------------------------
+# Finding #123: Azure classifies empty content by finish_reason
+# ---------------------------------------------------------------------------
+
+
+def _azure_empty_completion_error(content: str, finish_reason: str | None) -> BaseException | None:
+    provider = _make_azure_provider()
+    client = AzureFakeLLMClient(response=_make_azure_llm_response(content=content, finish_reason=finish_reason))
+    with _azure_provider_llm_client(provider, client):
+        return _raised_by(
+            lambda: provider.execute_query(
+                messages=[ChatMessage(role="user", content="hi")],
+                model="gpt-4o",
+                temperature=0.0,
+                max_tokens=100,
+                audit_parent=LLMAuditParent.for_row(
+                    member_token=_OPENROUTER_MEMBER_TOKEN,
+                    work_item=_OPENROUTER_WORK_ITEM,
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
+            )
+        )
+
+
+class TestAzureEmptyContentClassification:
+    @pytest.mark.parametrize(
+        ("content", "finish_reason"),
+        [
+            pytest.param("", "length", id="empty-length"),
+            pytest.param("   ", "length", id="whitespace-length"),
+            pytest.param("", "stop", id="empty-stop"),
+            pytest.param("", None, id="empty-no-finish-reason"),
+        ],
+    )
+    def test_empty_content_without_a_refusal_is_not_content_policy(self, content: str, finish_reason: str | None) -> None:
+        raised = _azure_empty_completion_error(content, finish_reason)
+        assert isinstance(raised, LLMClientError), f"expected an LLMClientError, got {raised!r}"
+        assert not isinstance(raised, ContentPolicyError), f"finish_reason={finish_reason!r} was labelled content_policy"
+        assert raised.category == "client"
+        assert raised.retryable is False
+
+    def test_budget_exhaustion_names_the_output_token_budget(self) -> None:
+        raised = _azure_empty_completion_error("", "length")
+        assert isinstance(raised, LLMClientError)
+        assert "output token budget" in str(raised)
+
+    def test_content_filter_stays_content_policy(self) -> None:
+        raised = _azure_empty_completion_error("", "content_filter")
+        assert isinstance(raised, ContentPolicyError)
+
+    def test_tool_calls_stays_unsupported_response(self) -> None:
+        raised = _azure_empty_completion_error("", "tool_calls")
+        assert type(raised) is LLMClientError
+        assert "tool_calls" in str(raised)
+
+
+# ---------------------------------------------------------------------------
+# Finding #128: every LLM source config hides its api_key from repr/str
+# ---------------------------------------------------------------------------
+
+_SOURCE_KEY_SENTINEL = "SENTINEL-source-api-key-4b9d"  # secret-scan: allow-this-line
+_SOURCE_COMMON: dict[str, Any] = {
+    "prompt_template": "Summarise the audit topic.",
+    "schema": {"mode": "observed"},
+    "on_validation_failure": "discard",
+}
+
+
+class TestLLMSourceConfigHidesApiKey:
+    @pytest.mark.parametrize(
+        ("config_cls", "options"),
+        [
+            pytest.param(
+                AzureOpenAILLMSourceConfig,
+                {"provider": "azure", "deployment_name": "gpt-4o-mini", "endpoint": "https://example.openai.azure.com"},
+                id="azure",
+            ),
+            pytest.param(OpenRouterLLMSourceConfig, {"provider": "openrouter", "model": "openai/gpt-4o-mini"}, id="openrouter"),
+            pytest.param(
+                GatewayLLMSourceConfig,
+                {"provider": "gateway", "model": "summariser", "endpoint": "https://gateway.example/v1"},
+                id="gateway",
+            ),
+        ],
+    )
+    def test_api_key_is_not_in_repr_or_str(self, config_cls: type[LLMSourceConfig], options: dict[str, Any]) -> None:
+        config = config_cls.from_dict({**_SOURCE_COMMON, **options, "api_key": _SOURCE_KEY_SENTINEL})
+        assert _SOURCE_KEY_SENTINEL not in repr(config)
+        assert _SOURCE_KEY_SENTINEL not in str(config)
+
+
+# ---------------------------------------------------------------------------
+# Finding #133: the OpenRouter base_url admits no query string or fragment
+# ---------------------------------------------------------------------------
+
+
+class TestOpenRouterBaseUrlRejectsQueryAndFragment:
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            pytest.param("https://openrouter.ai/api/v1?token=x", id="query"),
+            pytest.param("https://openrouter.ai/api/v1#frag", id="fragment"),
+            pytest.param("https://openrouter.ai/api/v1/?a=1#b", id="both"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "validator",
+        [
+            pytest.param(validate_openrouter_base_url, id="validate"),
+            pytest.param(normalize_openrouter_base_url, id="normalize"),
+        ],
+    )
+    def test_query_or_fragment_is_rejected(self, validator: Callable[[str], str], base_url: str) -> None:
+        raised = _raised_by(lambda: validator(base_url))
+        assert isinstance(raised, ValueError), f"{base_url!r} was admitted as {raised!r}"
+
+    def test_source_config_rejects_query_base_url(self) -> None:
+        raised = _raised_by(
+            lambda: OpenRouterLLMSourceConfig.from_dict(
+                {
+                    **_SOURCE_COMMON,
+                    "provider": "openrouter",
+                    "model": "openai/gpt-4o-mini",
+                    "api_key": "test-key",
+                    "base_url": "https://openrouter.ai/api/v1?token=x",
+                }
+            )
+        )
+        assert raised is not None, "a query-string base_url was admitted"
+
+    def test_canonical_base_url_still_normalizes(self) -> None:
+        assert validate_openrouter_base_url("https://OpenRouter.ai:443/api/v1/") == "https://openrouter.ai/api/v1"

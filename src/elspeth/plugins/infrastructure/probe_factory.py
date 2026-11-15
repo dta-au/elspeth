@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any, Protocol, cast
 
 from pydantic import ValidationError
@@ -57,12 +58,29 @@ class ChromaCollectionProbe:
         import chromadb  # ImportError crashes — missing package is a config bug, not "unreachable"
         import httpx  # httpx transport errors inherit only from Exception, not ChromaError
 
+        if self._conn.mode == "persistent":
+            # persist_directory guaranteed non-None by validate_mode_fields
+            assert self._conn.persist_directory is not None
+            # chromadb.PersistentClient CREATES a missing directory and a fresh
+            # chroma.sqlite3. A readiness probe is read-only: a mistyped path is
+            # a missing store, reported as unreachable, and nothing is created.
+            if not Path(self._conn.persist_directory).is_dir():
+                return CollectionReadinessResult(
+                    collection=self.collection_name,
+                    reachable=False,
+                    count=None,
+                    message=(
+                        f"Collection '{self.collection_name}' unreachable: persist_directory "
+                        f"{self._conn.persist_directory!r} does not exist or is not a directory"
+                    ),
+                )
+
         client = None
         try:
             # Client construction CAN fail for infrastructure reasons (server down,
             # TLS errors, path permissions) — caught below as "unreachable".
             if self._conn.mode == "persistent":
-                # persist_directory guaranteed non-None by validate_mode_fields
+                # persist_directory checked non-None and present above
                 assert self._conn.persist_directory is not None
                 client = chromadb.PersistentClient(path=self._conn.persist_directory)
             else:

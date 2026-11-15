@@ -167,7 +167,7 @@ def test_source_checkout_install_docs_use_locked_toolchains() -> None:
     assert "npm --prefix src/elspeth/web/frontend ci" in web_local
     assert "Node.js 24, and npm 11" in contributing
     assert "npm --prefix src/elspeth/web/frontend ci" in contributing
-    assert "Python 3.12+" in first_pipeline
+    assert "Python 3.14+" in first_pipeline
     assert "Node.js 24, npm 11" in first_pipeline
     assert "npm --prefix src/elspeth/web/frontend ci" in first_pipeline
     assert "uv sync --frozen --all-extras" in user_manual

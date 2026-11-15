@@ -39,7 +39,7 @@ files:
     Mapping[str, Any]: 8
     dict[str, Any]: 17
   src/elspeth/contracts/call_mode.py:
-    Mapping[str, Any]: 15
+    Mapping[str, Any]: 16
   src/elspeth/contracts/chat_parts.py:
     dict[str, Any]: 7
   src/elspeth/contracts/coalesce_metadata.py:
@@ -285,7 +285,7 @@ files:
   src/elspeth/engine/orchestrator/audit_export_effects.py:
     Mapping[str, object]: 1
   src/elspeth/engine/orchestrator/call_mode_session.py:
-    Mapping[str, Any]: 17
+    Mapping[str, Any]: 18
     dict[str, Any]: 1
     dict[str, object]: 1
   src/elspeth/engine/orchestrator/preflight.py:
@@ -353,9 +353,6 @@ files:
     dict[str, Any]: 1
   src/elspeth/plugins/infrastructure/clients/power_automate.py:
     Mapping[str, object]: 3
-  src/elspeth/plugins/infrastructure/clients/replayer.py:
-    Mapping[str, Any]: 2
-    dict[str, Any]: 6
   src/elspeth/plugins/infrastructure/clients/retrieval/azure_search.py:
     boundary: 1
     dict[str, Any]: 7
@@ -367,9 +364,6 @@ files:
     dict[str, Any]: 1
   src/elspeth/plugins/infrastructure/clients/vendor_logging.py:
     Mapping[str, object]: 1
-  src/elspeth/plugins/infrastructure/clients/verifier.py:
-    Mapping[str, Any]: 12
-    dict[str, Any]: 2
   src/elspeth/plugins/infrastructure/config_base.py:
     dict[str, Any]: 2
   src/elspeth/plugins/infrastructure/config_content.py:
@@ -432,8 +426,8 @@ files:
   src/elspeth/plugins/sinks/database_sink.py:
     Mapping[str, object]: 4
     boundary: 1
-    dict[str, Any]: 9
-    dict[str, object]: 4
+    dict[str, Any]: 10
+    dict[str, object]: 3
   src/elspeth/plugins/sinks/dataverse.py:
     Mapping[str, object]: 1
     dict[str, Any]: 5
@@ -511,17 +505,34 @@ files:
     dict[str, Any]: 19
   src/elspeth/plugins/transforms/azure/ai_search.py:
     dict[str, Any]: 2
+  src/elspeth/plugins/transforms/azure/analyze_lro.py:
+    Mapping[str, Any]: 6
+    dict[str, Any]: 1
+  src/elspeth/plugins/transforms/azure/analyze_result.py:
+    Mapping[str, Any]: 2
+    boundary: 2
+    dict[str, Any]: 3
   src/elspeth/plugins/transforms/azure/base.py:
     dict[str, Any]: 2
   src/elspeth/plugins/transforms/azure/content_safety.py:
     Mapping[str, object]: 1
     dict[str, Any]: 4
+  src/elspeth/plugins/transforms/azure/content_understanding.py:
+    Mapping[str, Any]: 2
+    dict[str, Any]: 2
+  src/elspeth/plugins/transforms/azure/content_understanding_result.py:
+    Mapping[str, Any]: 3
+    boundary: 1
+    dict[str, Any]: 1
   src/elspeth/plugins/transforms/azure/document_intelligence.py:
     Mapping[str, Any]: 2
-    dict[str, Any]: 4
+    dict[str, Any]: 2
   src/elspeth/plugins/transforms/azure/document_intelligence_result.py:
-    Mapping[str, Any]: 3
+    Mapping[str, Any]: 2
+    boundary: 2
+    dict[str, Any]: 1
   src/elspeth/plugins/transforms/azure/prompt_shield.py:
+    Mapping[str, object]: 1
     dict[str, Any]: 2
   src/elspeth/plugins/transforms/batch_classifier_metrics.py:
     dict[str, Any]: 2
@@ -606,7 +617,6 @@ files:
     dict[str, Any]: 13
     dict[str, object]: 2
   src/elspeth/plugins/transforms/llm/validation.py:
-    Mapping[str, Any]: 1
     dict[str, Any]: 3
   src/elspeth/plugins/transforms/passthrough.py:
     dict[str, Any]: 2
@@ -1100,10 +1110,10 @@ files:
   src/elspeth/web/shareable_reviews/service.py:
     dict[str, object]: 1
 totals:
-  Mapping[str, Any]: 798
-  Mapping[str, object]: 317
+  Mapping[str, Any]: 797
+  Mapping[str, object]: 318
   MutableMapping[str, Any]: 8
-  boundary: 65
-  dict[str, Any]: 1125
-  dict[str, object]: 402
-  soft: 2650
+  boundary: 70
+  dict[str, Any]: 1124
+  dict[str, object]: 401
+  soft: 2648

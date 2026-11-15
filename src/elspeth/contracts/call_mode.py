@@ -156,6 +156,24 @@ class CallModeSession(Protocol):
         """Read the exact source request without matching run-scoped fields."""
         ...
 
+    def has_source_call(
+        self,
+        *,
+        call_type: CallType,
+        request_data: Mapping[str, Any],
+        current_state_id: str | None,
+        current_operation_id: str | None,
+        current_call_index: int,
+    ) -> bool:
+        """Whether the source parent made exactly this request at this parent-local index.
+
+        A read-only existence query on the request hash: it consumes nothing,
+        admits nothing and reads no payload. Adapters whose call sequence is
+        decided by a clock or a thread race in the source run use it to make
+        the same decision from the archive in replay.
+        """
+        ...
+
     def admit_verify_call(
         self,
         *,

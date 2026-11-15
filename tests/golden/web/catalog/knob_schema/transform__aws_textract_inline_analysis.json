@@ -207,7 +207,7 @@
         "tier": "common"
       },
       {
-        "default": 420.0,
+        "default": 480.0,
         "description": "Maximum engine wait for one pipelined document row.",
         "kind": "number-float",
         "label": "Batch Wait Timeout Seconds",

@@ -55,6 +55,7 @@ class FakeLifecycleContext:
         self.landscape = None
         self.payload_store = None
         self.concurrency_config = None
+        self.shutdown_event = None
 
 
 class FakeSourceContext:
@@ -209,7 +210,8 @@ class TestDataverseSourceStructuredQuery:
         metadata_url = mock_client.get_page.call_args.args[0]
         assert metadata_url.endswith("EntityDefinitions(LogicalName='contact')?$select=LogicalName,EntitySetName")
         mock_client.paginate_odata.assert_called_once_with(
-            "https://testorg.crm.dynamics.com/api/data/v9.2/contacts?$select=fullname,emailaddress1"
+            "https://testorg.crm.dynamics.com/api/data/v9.2/contacts?$select=fullname,emailaddress1",
+            annotations=(),
         )
 
         # Verify audit recording
@@ -312,6 +314,7 @@ class TestDataverseSourceFetchXML:
         mock_client.paginate_fetchxml.assert_called_once_with(
             "contacts",
             '<fetch><entity name="contact"><attribute name="fullname"/></entity></fetch>',
+            annotations=(),
         )
 
 

@@ -5,7 +5,7 @@ name = "yourorg-adapter"
 # adapter before building or publishing anything from this scaffold.
 version = "0.1.0"
 description = "TEMPLATE: an ELSPETH LLM gateway adapter for <your agency>'s invoke API"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 dependencies = [
     # TEMPLATE: 0.1.0 is a placeholder so this file parses as valid PEP 440
     # -- pin the exact gateway runtime version this adapter is built and

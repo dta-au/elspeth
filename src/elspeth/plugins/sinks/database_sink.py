@@ -16,14 +16,13 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import Boolean, Column, Float, Integer, MetaData, String, Table, Text, create_engine, insert, select, text
+from sqlalchemy import Boolean, Column, Integer, MetaData, String, Table, Text, create_engine, insert, select, text
 from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.exc import DataError, IntegrityError, SQLAlchemyError
 
 if TYPE_CHECKING:
     from elspeth.contracts.sink import OutputValidationResult
 from sqlalchemy.engine import Engine
-from sqlalchemy.types import TypeEngine
 
 from elspeth.contracts import ArtifactDescriptor, Determinism, PluginSchema
 from elspeth.contracts.contexts import SinkContext
@@ -35,6 +34,7 @@ from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
     ResolvedSinkEffectMode,
+    RestagingSinkEffectCapability,
     RestrictedSinkEffectContext,
     SinkEffectCommitResult,
     SinkEffectDescriptorMode,
@@ -56,20 +56,6 @@ from elspeth.plugins.infrastructure.base import BaseSink
 from elspeth.plugins.infrastructure.config_base import DataPluginConfig
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.sinks._diversion_attribution import DiversionAttribution, build_diversion_attribution
-
-# Map schema field types to SQLAlchemy column types.
-# Text (not String) is used for string columns because String() without a length
-# argument causes truncation or errors on MySQL/MSSQL — Text maps to TEXT on all
-# backends and accepts arbitrary-length values without portability issues.
-SCHEMA_TYPE_TO_SQLALCHEMY: Mapping[str, type[TypeEngine[Any]]] = MappingProxyType(
-    {
-        "str": Text,
-        "int": Integer,
-        "float": Float,
-        "bool": Boolean,
-        "any": Text,  # Fallback to Text for 'any' type
-    }
-)
 
 # The stable failure kind a row's diversion reason names, keyed by the
 # driver's value-free condition name: PostgreSQL's per-SQLSTATE error class
@@ -254,12 +240,13 @@ class DatabaseSinkConfig(DataPluginConfig):
         return reject_operator_required_placeholder_value(v, field_name="table")
 
 
-class DatabaseSink(BaseSink):
-    """Write rows to a database table.
+class DatabaseSink(BaseSink, RestagingSinkEffectCapability):
+    """Append rows to an existing table.
 
-    Creates the table on first write. When schema is explicit, columns are
-    derived from schema field definitions with proper type mapping. When schema
-    is dynamic, columns are inferred from the first row's keys.
+    Supports SQLite and PostgreSQL only. The target table and the declared
+    target-side effect ledger must already exist: the sink performs no DDL and
+    refuses a missing table. Only ``if_exists: append`` is accepted at
+    effect-mode resolution; ``replace`` is refused.
 
     Uses SQLAlchemy Core for direct SQL control.
 
@@ -274,7 +261,8 @@ class DatabaseSink(BaseSink):
         url: Database connection URL (required)
         table: Table name (required)
         schema: Schema configuration (required, via DataPluginConfig)
-        if_exists: "append" or "replace" (default: "append")
+        if_exists: "append" (default; "replace" is refused at validation)
+        effect_ledger: Operator-provisioned exactly-once ledger table (required)
 
     Input validation is always enabled. Incoming rows are validated against
     the schema before INSERT — wrong types indicate an upstream plugin bug
@@ -289,7 +277,7 @@ class DatabaseSink(BaseSink):
     name = "database"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a795c378119554ea"
+    source_file_hash: str | None = "sha256:d8b9d59430a7d1bd"
     config_model = DatabaseSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.SQL
@@ -421,6 +409,11 @@ class DatabaseSink(BaseSink):
 
         self._engine: Engine | None = None
         self._metadata: MetaData | None = None
+        # Commit rows per prepared effect, keyed by effect_id and bound to the
+        # plan's payload hash. The bounded plan evidence carries only the
+        # member count; rows are re-derived from durable members by
+        # restage_effect before every executor commit (resume included).
+        self._staged_effect_rows: dict[str, tuple[str, list[tuple[int, dict[str, Any]]]]] = {}
 
     def _target_reference(self) -> str:
         ledger = self._require_effect_ledger_config()
@@ -605,31 +598,17 @@ class DatabaseSink(BaseSink):
             raise DatabaseEffectLedgerError("Database sink effect inspection lacks exact target columns")
         target_columns = set(target_columns_value)
 
-        members: list[dict[str, object]] = []
-        source_rows = [deep_thaw(member.row) for member in effect_input.members]
-        serialized_rows = self._serialize_any_typed_fields(source_rows)
-        for member, serialized_row in zip(effect_input.members, serialized_rows, strict=True):
-            extra = sorted(set(serialized_row) - target_columns)
-            if extra:
-                raise DatabaseEffectLedgerError(
-                    f"Database sink effect member {member.ordinal} has fields absent from target table: {extra}"
-                )
-            members.append(
-                {
-                    "ordinal": member.ordinal,
-                    "payload_hash": member.payload_hash,
-                    "row": serialized_row,
-                }
-            )
-        payload_hash = hashlib.sha256(canonical_json(members).encode("utf-8")).hexdigest()
+        payload_hash, members = self._effect_member_rows(effect_input, target_columns)
+        # Row values are bound by payload_hash, never embedded: the plan
+        # evidence is bounded at 64 KiB and must not grow with the batch.
         safe_evidence: dict[str, object] = {
             "dialect": inspection.evidence["dialect"],
             "diversion_policy": "constraint-savepoint-v1",
             "ledger_contract_hash": inspection.evidence["ledger_contract_hash"],
             "ledger_schema_version": ledger.schema_version,
             "ledger_table": ledger.table,
-            "members": members,
-            "schema": "database-effect-plan-v1",
+            "member_count": len(members),
+            "schema": "database-effect-plan-v2",
             "serializer": "rfc8785-sql-payload-v1",
             "target_columns": sorted(target_columns),
             "target_table": self._table_name,
@@ -640,7 +619,7 @@ class DatabaseSink(BaseSink):
             target=target,
             safe_evidence=safe_evidence,
         )
-        return SinkEffectPlan(
+        plan = SinkEffectPlan(
             effect_id=request.effect_id,
             protocol_version=SINK_EFFECT_PROTOCOL_VERSION,
             input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
@@ -652,6 +631,52 @@ class DatabaseSink(BaseSink):
             expected_descriptor=None,
             safe_evidence=safe_evidence,
         )
+        self._staged_effect_rows[plan.effect_id] = (payload_hash, members)
+        return plan
+
+    def _effect_member_rows(
+        self,
+        effect_input: SinkEffectPipelineMembersInput,
+        target_columns: set[str],
+    ) -> tuple[str, list[tuple[int, dict[str, Any]]]]:
+        """Serialize members to SQL rows and hash them with their ordinals and payload hashes.
+
+        Deterministic over the canonical member payload, so recovery re-derives
+        the exact rows the plan bound from durable members.
+        """
+        source_rows = [deep_thaw(member.row) for member in effect_input.members]
+        serialized_rows = self._serialize_any_typed_fields(source_rows)
+        members: list[tuple[int, dict[str, Any]]] = []
+        hashed_members: list[dict[str, object]] = []
+        for member, serialized_row in zip(effect_input.members, serialized_rows, strict=True):
+            extra = sorted(set(serialized_row) - target_columns)
+            if extra:
+                raise DatabaseEffectLedgerError(
+                    f"Database sink effect member {member.ordinal} has fields absent from target table: {extra}"
+                )
+            members.append((member.ordinal, serialized_row))
+            hashed_members.append({"ordinal": member.ordinal, "payload_hash": member.payload_hash, "row": serialized_row})
+        return hashlib.sha256(canonical_json(hashed_members).encode("utf-8")).hexdigest(), members
+
+    def restage_effect(
+        self,
+        plan: SinkEffectPlan,
+        effect_input: SinkEffectPipelineMembersInput,
+        ctx: RestrictedSinkEffectContext,
+    ) -> None:
+        """Re-derive this plan's commit rows from durable members and verify them against the plan."""
+        del ctx
+        if type(effect_input) is not SinkEffectPipelineMembersInput:
+            raise TypeError("DatabaseSink effects require pipeline member input")
+        member_count = self._parse_database_effect_plan(plan)
+        staged = self._staged_effect_rows.get(plan.effect_id)
+        if staged is not None and staged[0] == plan.payload_hash:
+            return
+        planned_columns = set(deep_thaw(plan.safe_evidence)["target_columns"])
+        payload_hash, members = self._effect_member_rows(effect_input, planned_columns)
+        if len(members) != member_count or payload_hash != plan.payload_hash:
+            raise DatabaseEffectLedgerError("Database effect restage members diverge from the plan payload hash")
+        self._staged_effect_rows[plan.effect_id] = (payload_hash, members)
 
     @staticmethod
     def _require_canonical_json(value: object, *, field_name: str) -> object:
@@ -665,7 +690,8 @@ class DatabaseSink(BaseSink):
             raise DatabaseEffectMarkerDivergence(f"Database effect marker {field_name} is not canonical JSON")
         return decoded
 
-    def _parse_database_effect_plan(self, plan: SinkEffectPlan) -> list[tuple[int, dict[str, Any]]]:
+    def _parse_database_effect_plan(self, plan: SinkEffectPlan) -> int:
+        """Validate a plan against the configured target and return its bound member count."""
         if (
             plan.protocol_version != SINK_EFFECT_PROTOCOL_VERSION
             or plan.input_kind is not SinkEffectInputKind.PIPELINE_MEMBERS
@@ -682,7 +708,7 @@ class DatabaseSink(BaseSink):
             "ledger_contract_hash",
             "ledger_schema_version",
             "ledger_table",
-            "members",
+            "member_count",
             "schema",
             "serializer",
             "target_columns",
@@ -692,7 +718,7 @@ class DatabaseSink(BaseSink):
         ledger = self._require_effect_ledger_config()
         dialect = make_url(self._url).get_backend_name()
         if (
-            evidence["schema"] != "database-effect-plan-v1"
+            evidence["schema"] != "database-effect-plan-v2"
             or evidence["serializer"] != "rfc8785-sql-payload-v1"
             or evidence["diversion_policy"] != "constraint-savepoint-v1"
             or evidence["target_table"] != self._table_name
@@ -701,29 +727,11 @@ class DatabaseSink(BaseSink):
             or evidence["dialect"] != dialect
         ):
             raise DatabaseEffectLedgerError("Database effect plan evidence diverges from configured target authority")
-        raw_members = evidence["members"]
-        if type(raw_members) is not list or not raw_members:
-            raise DatabaseEffectLedgerError("Database effect plan requires a non-empty ordered member list")
-        members: list[tuple[int, dict[str, Any]]] = []
-        payload_members: list[dict[str, object]] = []
-        for expected_ordinal, raw_member in enumerate(raw_members):
-            if type(raw_member) is not dict or set(raw_member) != {"ordinal", "payload_hash", "row"}:
-                raise DatabaseEffectLedgerError("Database effect plan member has a divergent field set")
-            ordinal = raw_member["ordinal"]
-            payload_hash = raw_member["payload_hash"]
-            row = raw_member["row"]
-            if type(ordinal) is not int or ordinal != expected_ordinal:
-                raise DatabaseEffectLedgerError("Database effect plan member ordinals must be dense and ordered")
-            if type(payload_hash) is not str or re.fullmatch(r"[0-9a-f]{64}", payload_hash) is None:
-                raise DatabaseEffectLedgerError("Database effect plan member payload hash is invalid")
-            if type(row) is not dict or any(type(key) is not str for key in row):
-                raise DatabaseEffectLedgerError("Database effect plan member row must be a canonical object")
-            detached_row = dict(row)
-            members.append((ordinal, detached_row))
-            payload_members.append({"ordinal": ordinal, "payload_hash": payload_hash, "row": detached_row})
-        expected_payload_hash = hashlib.sha256(canonical_json(payload_members).encode("utf-8")).hexdigest()
-        if plan.payload_hash != expected_payload_hash:
-            raise DatabaseEffectLedgerError("Database effect plan payload hash does not bind the ordered members")
+        member_count = evidence["member_count"]
+        if type(member_count) is not int or member_count < 1:
+            raise DatabaseEffectLedgerError("Database effect plan requires a positive member count")
+        if re.fullmatch(r"[0-9a-f]{64}", plan.payload_hash) is None:
+            raise DatabaseEffectLedgerError("Database effect plan payload hash is invalid")
         expected_plan_hash = self._database_effect_plan_hash(
             effect_id=plan.effect_id,
             payload_hash=plan.payload_hash,
@@ -732,7 +740,7 @@ class DatabaseSink(BaseSink):
         )
         if plan.plan_hash != expected_plan_hash:
             raise DatabaseEffectLedgerError("Database effect plan hash does not bind its exact evidence")
-        return members
+        return member_count
 
     @staticmethod
     def _descriptor_json(descriptor: ArtifactDescriptor) -> str:
@@ -923,7 +931,7 @@ class DatabaseSink(BaseSink):
         ctx: RestrictedSinkEffectContext,
     ) -> SinkEffectCommitResult:
         del ctx
-        members = self._parse_database_effect_plan(plan)
+        member_count = self._parse_database_effect_plan(plan)
         self._ensure_engine_and_metadata_initialized()
         engine = self._engine
         if engine is None:  # pragma: no cover - paired initializer invariant
@@ -934,7 +942,14 @@ class DatabaseSink(BaseSink):
                 ledger = Table(ledger_config.table, MetaData(), autoload_with=conn)
                 existing = self._read_effect_marker(conn, ledger, plan.effect_id)
                 if existing is not None:
-                    return self._result_from_marker(existing, plan, member_count=len(members))
+                    self._staged_effect_rows.pop(plan.effect_id, None)
+                    return self._result_from_marker(existing, plan, member_count=member_count)
+                staged = self._staged_effect_rows.get(plan.effect_id)
+                if staged is None or staged[0] != plan.payload_hash:
+                    raise DatabaseEffectLedgerError(
+                        "Database effect commit has no rows bound to this plan; restage them from durable members first"
+                    )
+                members = staged[1]
                 target = Table(self._table_name, MetaData(), autoload_with=conn)
                 if engine.dialect.name == "sqlite":
                     # Python's sqlite3 legacy transaction mode does not BEGIN
@@ -989,10 +1004,12 @@ class DatabaseSink(BaseSink):
                     diverted_ordinals=diverted,
                 )
         except IntegrityError:
-            winner = self._read_committed_effect_result(plan, member_count=len(members))
+            winner = self._read_committed_effect_result(plan, member_count=member_count)
             if winner is None:
                 raise
+            self._staged_effect_rows.pop(plan.effect_id, None)
             return winner
+        self._staged_effect_rows.pop(plan.effect_id, None)
         return result
 
     def reconcile_effect(
@@ -1001,9 +1018,9 @@ class DatabaseSink(BaseSink):
         ctx: RestrictedSinkEffectContext,
     ) -> SinkEffectReconcileResult:
         del ctx
-        members = self._parse_database_effect_plan(plan)
+        member_count = self._parse_database_effect_plan(plan)
         try:
-            result = self._read_committed_effect_result(plan, member_count=len(members))
+            result = self._read_committed_effect_result(plan, member_count=member_count)
         except (DatabaseEffectLedgerError, SQLAlchemyError):
             return SinkEffectReconcileResult.unknown(
                 evidence={"ledger_table": self._require_effect_ledger_config().table, "reason": "marker_divergent_or_unreadable"}
@@ -1035,7 +1052,8 @@ class DatabaseSink(BaseSink):
         SQL TEXT columns cannot store Python dicts or lists. This method
         converts non-scalar values to their JSON string representation
         before INSERT, ensuring valid 'any' payloads (e.g., {"k": 1})
-        are stored as '{"k": 1}' rather than crashing with a driver error.
+        are stored as RFC 8785 canonical JSON ('{"k":1}') rather than crashing
+        with a driver error.
 
         For observed-mode schemas, ALL fields are checked since any field
         could contain a complex value when the schema is inferred.
@@ -1065,7 +1083,10 @@ class DatabaseSink(BaseSink):
                 if field in new_row:
                     value = new_row[field]
                     if type(value) is dict or type(value) is list:
-                        new_row[field] = json.dumps(value)
+                        # RFC 8785, matching the plan serializer: the text must
+                        # be identical for an in-run row and its canonical
+                        # payload-store form, or recovery cannot restage it.
+                        new_row[field] = canonical_json(value)
             result.append(new_row)
         return result
 
@@ -1104,7 +1125,7 @@ class DatabaseSink(BaseSink):
 
         inspector = inspect(self._engine)
         if not inspector.has_table(self._table_name):
-            return OutputValidationResult.success()  # Will create table
+            return OutputValidationResult.success()  # No columns to compare; effect inspection refuses a missing table
 
         # Get existing columns
         columns = inspector.get_columns(self._table_name)
@@ -1153,6 +1174,7 @@ class DatabaseSink(BaseSink):
 
     def close(self) -> None:
         """Close database connection."""
+        self._staged_effect_rows.clear()
         if self._engine is not None:
             self._engine.dispose()
             self._engine = None
@@ -1164,12 +1186,13 @@ class DatabaseSink(BaseSink):
             return PluginAssistance(
                 plugin_name="database",
                 issue_code=None,
-                summary="Write rows to a SQL table (Postgres, SQLite, SQL Server) via SQLAlchemy. Write behaviour is set by if_exists: 'append' (default) or 'replace'.",
+                summary="Append rows to an operator-provisioned SQLite or PostgreSQL table via SQLAlchemy, exactly once through a required target-side effect_ledger.",
                 composer_hints=(
-                    "if_exists: 'append' (default — insert into the existing table, creating it if missing) or 'replace' (drops and recreates the table on the FIRST write — destructive). These are the only two values; there is no insert/upsert mode.",
+                    "Only SQLite and PostgreSQL URLs are accepted; any other dialect fails validation.",
+                    "The target table must already exist with compatible columns: the sink performs no DDL and refuses a missing table. Ask the operator for a provisioned table name.",
+                    "effect_ledger is REQUIRED: declare the operator-provisioned ledger (table, schema_version, permissions insert/select) on the same database, or validation fails.",
+                    "if_exists must be 'append' (the default). 'replace' is not supported and fails validation; there is no insert/upsert mode.",
                     "url is sanitised and audit-recorded — never put credentials inline; use the secrets store.",
-                    "Schema fields map to column types: string→TEXT, int→Integer, float→Float, bool→Boolean. Other types need explicit type_coerce upstream.",
-                    "if_exists='replace' is irreversible — it drops the table on first write. Confirm with the operator before declaring 'replace' on existing data.",
                     "on_write_failure routes per-row constraint violations (UNIQUE / NOT NULL / CHECK / foreign-key) — the offending row is diverted and the rest of the batch commits. Batch-integrity failures (connection loss, lock timeout, bad SQL) are not row-attributable and crash the run.",
                 ),
             )
@@ -1195,6 +1218,6 @@ class DatabaseSink(BaseSink):
         hints: list[str] = []
         if config_snapshot.get("if_exists") == "replace":
             hints.append(
-                "if_exists: 'replace' DROPS and recreates the target table on the first write. Confirm with the operator that the existing data is expendable before running."
+                "if_exists: 'replace' is not supported and fails validation. Use if_exists: 'append' against an operator-provisioned table."
             )
         return tuple(hints)

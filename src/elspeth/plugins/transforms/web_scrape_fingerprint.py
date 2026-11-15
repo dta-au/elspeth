@@ -2,6 +2,7 @@
 
 import hashlib
 import re
+from typing import Literal
 
 
 def normalize_for_fingerprint(content: str) -> str:
@@ -22,20 +23,23 @@ def normalize_for_fingerprint(content: str) -> str:
     return normalized.strip()
 
 
-def compute_fingerprint(content: str, mode: str) -> str:
+def compute_fingerprint(content: str, mode: Literal["content", "full"]) -> str:
     """Compute SHA-256 fingerprint of content.
 
     Args:
         content: Content to fingerprint
-        mode: Fingerprint mode ("content", "full", "structure")
+        mode: Fingerprint mode ("content" normalizes whitespace, "full" hashes raw content)
 
     Returns:
         SHA-256 hex digest (64 characters)
+
+    Raises:
+        ValueError: ``mode`` is not a known fingerprint mode. An unknown mode
+            must not fall through to a different hash and break change detection.
     """
     if mode == "content":
         content = normalize_for_fingerprint(content)
-    elif mode == "structure":
-        raise NotImplementedError("Structure mode not yet implemented")
-    # mode == "full" uses raw content as-is
+    elif mode != "full":
+        raise ValueError(f"unknown fingerprint mode {mode!r}")
 
     return hashlib.sha256(content.encode("utf-8")).hexdigest()

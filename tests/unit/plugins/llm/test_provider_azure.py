@@ -725,8 +725,8 @@ class TestExecuteQuery:
         assert result.content == "hi"
 
     def test_empty_content_raises_content_policy_error(self, provider: AzureLLMProvider) -> None:
-        """Empty string content (from AuditedLLMClient's None→'' conversion)
-        must raise ContentPolicyError, not ValueError from LLMQueryResult invariant."""
+        """Empty string content with finish_reason=content_filter must raise
+        ContentPolicyError, not ValueError from LLMQueryResult invariant."""
         client = FakeLLMClient(
             response=_make_llm_response(
                 content="",
@@ -748,8 +748,9 @@ class TestExecuteQuery:
                 ),
             )
 
-    def test_whitespace_only_content_raises_content_policy_error(self, provider: AzureLLMProvider) -> None:
-        """Whitespace-only content from provider must raise ContentPolicyError."""
+    def test_whitespace_only_content_raises_client_error(self, provider: AzureLLMProvider) -> None:
+        """Whitespace-only content with finish_reason=stop is an unexplained
+        empty reply: a non-retryable client error, not a content-policy refusal."""
         client = FakeLLMClient(
             response=_make_llm_response(
                 content="   ",
@@ -757,7 +758,7 @@ class TestExecuteQuery:
             )
         )
 
-        with _provider_llm_client(provider, client), pytest.raises(ContentPolicyError, match="empty content"):
+        with _provider_llm_client(provider, client), pytest.raises(LLMClientError, match="empty content") as exc_info:
             provider.execute_query(
                 messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
@@ -770,6 +771,8 @@ class TestExecuteQuery:
                     token_id="tok-1",
                 ),
             )
+        assert not isinstance(exc_info.value, ContentPolicyError)
+        assert exc_info.value.retryable is False
 
     def test_empty_content_with_tool_calls_finish_reason(self, provider: AzureLLMProvider) -> None:
         """Tool-call responses (content=None→'', finish_reason=tool_calls)

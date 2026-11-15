@@ -16,6 +16,9 @@ describe("pluginBindingLabel", () => {
   it("shows the public Azure Document Intelligence model selection", () => {
     expect(pluginBindingLabel("azure_document_intelligence", { model_id: "prebuilt-layout" })).toBe("model prebuilt-layout");
     expect(pluginBindingLabel("azure_document_intelligence", { model_id: "https://private.example" })).toBe("configured model");
+    expect(pluginBindingLabel("azure_content_understanding", { analyzer_id: "prebuilt-invoice" })).toBe("analyzer prebuilt-invoice");
+    expect(pluginBindingLabel("azure_content_understanding", { analyzer_id: "https://private.example" })).toBe("configured analyzer");
+    expect(pluginBindingLabel("azure_content_understanding", {})).toBe("configured analyzer");
   });
 
   it.each(["arn:aws:private", "https://private.example", "bad profile", 42, null])(

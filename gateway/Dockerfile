@@ -6,10 +6,10 @@
 # runtime venv onto a fresh, pinned base and runs as a non-root UID with no
 # further installation. There is no shell entrypoint or build tool at runtime.
 #
-# Base image is pinned by digest (not just the ``3.12-alpine`` tag) so a
+# Base image is pinned by digest (not just the ``3.14-alpine`` tag) so a
 # repository push behind that tag can never silently change what this
 # image is built FROM.
-FROM python:3.12-alpine@sha256:e064671ca452259bab50e8e2c7bd896e39e9a343bb06ca25234adf6fe18d0fc7 AS builder
+FROM python:3.14-alpine@sha256:a18b20ad69e74df6cf6d2e1b1a260d7a1ecf5380fd83b310f83ba88c461cf894 AS builder
 
 ARG GATEWAY_REVISION
 RUN test -n "$GATEWAY_REVISION"
@@ -54,7 +54,7 @@ RUN VIRTUAL_ENV=/build-venv PATH="/build-venv/bin:$PATH" uv build \
       --active && \
     uv pip install --python /venv/bin/python --no-deps /dist/elspeth_llm_gateway-*.whl
 
-FROM python:3.12-alpine@sha256:e064671ca452259bab50e8e2c7bd896e39e9a343bb06ca25234adf6fe18d0fc7
+FROM python:3.14-alpine@sha256:a18b20ad69e74df6cf6d2e1b1a260d7a1ecf5380fd83b310f83ba88c461cf894
 
 ARG GATEWAY_REVISION
 LABEL org.opencontainers.image.revision="${GATEWAY_REVISION}" \
@@ -72,13 +72,6 @@ LABEL org.opencontainers.image.revision="${GATEWAY_REVISION}" \
 # of the base image's system interpreter.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/venv/bin:$PATH"
-
-# Temporary. krb5-libs 1.22.2-r1 in the pinned base carries 16 HIGH advisories
-# (CVE-2026-107364 and others), fixed in 1.22.3-r0. On 2026-11-11 the
-# `3.12-alpine` tag still resolved to the pinned digest, so there was no patched
-# base to move to. This upgrades that one system package and nothing else.
-# Delete it when the base image is re-pinned to a digest that carries the fix.
-RUN apk add --no-cache --upgrade "krb5-libs>=1.22.3-r0"
 
 COPY --from=builder /venv /venv
 

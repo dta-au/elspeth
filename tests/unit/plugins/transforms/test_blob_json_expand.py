@@ -35,6 +35,10 @@ class _PayloadStoreFake:
     def retrieve(self, content_hash: str) -> bytes:
         return self.content_by_hash[content_hash]
 
+    def retrieve_bounded(self, content_hash: str, *, max_bytes: int) -> bytes | None:
+        content = self.retrieve(content_hash)
+        return None if len(content) > max_bytes else content
+
     def exists(self, content_hash: str) -> bool:
         return content_hash in self.content_by_hash
 
@@ -52,6 +56,9 @@ class _FakeLifecycleContext:
 class _IntegrityFailingPayloadStore:
     def retrieve(self, content_hash: str) -> bytes:
         raise IntegrityError(f"stored payload for {content_hash} failed its own hash check")
+
+    def retrieve_bounded(self, content_hash: str, *, max_bytes: int) -> bytes | None:
+        return self.retrieve(content_hash)
 
 
 def _hash(content: bytes) -> str:
@@ -101,6 +108,9 @@ class _CorruptAndMissingError(IntegrityError, PayloadNotFoundError):
 class _CorruptAndMissingStore:
     def retrieve(self, content_hash: str) -> bytes:
         raise _CorruptAndMissingError(content_hash)
+
+    def retrieve_bounded(self, content_hash: str, *, max_bytes: int) -> bytes | None:
+        return self.retrieve(content_hash)
 
 
 def test_integrity_failure_propagates_even_when_the_error_is_also_a_not_found() -> None:
@@ -891,7 +901,8 @@ def test_max_blob_bytes_is_enforced_before_decode() -> None:
     assert result.reason is not None
     assert result.reason["reason"] == "blob_too_large"
     assert result.reason["max_blob_bytes"] == 8
-    assert result.reason["body_size"] == len(body)
+    # The bounded read stops at max_blob_bytes + 1, so the full size is never measured.
+    assert "body_size" not in result.reason
 
 
 def test_malformed_json_is_a_value_level_error() -> None:

@@ -295,7 +295,8 @@ are refused.
 ### Unavailable authenticated and browser execution
 
 Authenticated execution remains unavailable: configured `auth` is hidden
-from Composer's catalog and refuses the row before DNS or HTTP. Response
+from Composer's catalog and a correctly bound `auth` block fails config
+validation, so pre-run validation reports it and no row is processed. Response
 validation does not protect confidential authenticated bodies, which the
 ordinary audit client persists before extraction. Enabling auth requires the
 retention and access policy and a protected response-evidence boundary before

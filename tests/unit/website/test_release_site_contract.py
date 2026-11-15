@@ -54,6 +54,7 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
     current_heading = f"\n## {CURRENT_VERSION} - "
     assert changelog.count(current_heading) == 1
     current_release = changelog.split(current_heading, maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
+    release_0813 = changelog.split("\n## 0.8.13 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_0812 = changelog.split("\n## 0.8.12 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_0810 = changelog.split("\n## 0.8.10 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_086 = changelog.split("\n## 0.8.6 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
@@ -67,19 +68,31 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
     current_text = " ".join(current_release.split())
     release_date = current_release.splitlines()[0].strip()
     assert date.fromisoformat(release_date).isoformat() == release_date
-    assert "Composer context budget" in current_text
-    assert "`ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS` is required" in current_text
-    assert "is now 960 KiB" in current_text
-    assert "Advisor and review calls are not yet bounded by the context budget (dta-au/elspeth#364)" in current_text
+    assert "ELSPETH now requires and runs on Python 3.14 only" in current_text
+    assert "**Python 3.14 is required**" in current_text
+    assert "**Startup refuses `JSON_LOGS=true`.**" in current_text
+    assert "a run checkpointed under 3.13 refuses to resume under 3.14" in current_text
+    assert "`gcr.io/distroless/cc-debian13:debug-nonroot`" in current_text
+    assert "the repository ruleset must be updated to match" in current_text
     assert (
         f"Session epoch {SESSION_SCHEMA_EPOCH} and Landscape epoch {SQLITE_SCHEMA_EPOCH} are unchanged from the previous release"
         in current_text
     )
     assert "this release adds no schema-epoch cutover" in current_text
-    assert "Existing 0.8.12 session and Landscape stores need no action" in current_text
+    assert "Existing 0.8.13 session and Landscape stores need no action" in current_text
     assert "This authorizes no migration, reset, restamping or downgrade" in current_text
     assert "Session epoch advances" not in current_text
     assert "Landscape advances from epoch" not in current_text
+    # 0.8.13 is history, pinned against its own section.
+    text_0813 = " ".join(release_0813.split())
+    assert release_0813.splitlines()[0].strip() == "2026-11-11"
+    assert "Composer context budget" in text_0813
+    assert "`ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS` is required" in text_0813
+    assert "is now 960 KiB" in text_0813
+    assert "Advisor and review calls are not yet bounded by the context budget (dta-au/elspeth#364)" in text_0813
+    assert "Existing 0.8.12 session and Landscape stores need no action" in text_0813
+    assert "This authorizes no migration, reset, restamping or downgrade" in text_0813
+    assert "The 0.8.13 tag and container publication follow successful required checks and the protected merge" in text_0813
     # 0.8.12 is history, pinned against its own section.
     text_0812 = " ".join(release_0812.split())
     assert release_0812.splitlines()[0].strip() == "2026-11-10"

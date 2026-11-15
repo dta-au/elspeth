@@ -78,9 +78,30 @@ class _CallRecorder:
         assert self.calls == []
 
 
+def _pool_stats_double() -> dict[str, Any]:
+    """A PooledExecutor.get_stats() shaped reply for executor doubles.
+
+    _execute_parallel records it in context_after (sweep finding #100).
+    """
+    return {
+        "pool_config": {"pool_size": 4, "max_capacity_retry_seconds": 3600, "dispatch_delay_at_completion_ms": 0.0},
+        "pool_stats": {
+            "capacity_retries": 0,
+            "successes": 0,
+            "peak_delay_ms": 0.0,
+            "current_delay_ms": 0.0,
+            "total_throttle_time_ms": 0.0,
+            "max_concurrent_reached": 0,
+        },
+    }
+
+
 class _ExecutorDouble:
     def __init__(self) -> None:
         self.execute_batch = _CallRecorder()
+
+    def get_stats(self) -> dict[str, Any]:
+        return _pool_stats_double()
 
 
 class _RegistryDouble:
@@ -90,8 +111,9 @@ class _RegistryDouble:
 
 
 class _LangfuseClientDouble:
-    def __init__(self, **_: Any) -> None:
-        pass
+    def __init__(self, *, host: str, secret_key: str, **_: Any) -> None:
+        # Models the SDK's per-public_key resource manager bound to this config.
+        self._resources = SimpleNamespace(base_url=host, secret_key=secret_key)
 
 
 def _noop_tracer() -> Any:
@@ -231,8 +253,11 @@ def test_observed_success_preserves_dynamic_schema_and_upstream_contract(multi_q
 
 @pytest.mark.parametrize("response_field", ["llm_response", "custom_response"])
 @pytest.mark.parametrize("collision_suffix", ["", "_model", "_usage"])
-def test_multi_query_operational_fields_keep_emission_precedence(response_field: str, collision_suffix: str) -> None:
-    """Accepted name collisions must describe the operational value that wins at emission."""
+def test_multi_query_operational_collision_is_refused(response_field: str, collision_suffix: str) -> None:
+    """A structured name the transform's own operational write would overwrite is a config error."""
+    from elspeth.plugins.infrastructure.config_base import PluginConfigError
+    from elspeth.plugins.transforms.llm.transform import LLMTransform
+
     suffix = f"{response_field}{collision_suffix}"
     config = _make_config(
         response_field=response_field,
@@ -244,88 +269,24 @@ def test_multi_query_operational_fields_keep_emission_precedence(response_field:
             }
         },
     )
-    transform, provider = _make_transform_with_mock_provider(config)
-    content = json.dumps({suffix: 42, "answer": 7})
-    usage = TokenUsage.known(10, 5)
-    provider.execute_query.return_value = LLMQueryResult(content=content, usage=usage, model="gpt-4o", finish_reason=FinishReason.STOP)
-    result = transform._process_row(_make_row(), _make_ctx())
-    assert result.status == "success"
-    assert result.row is not None
-    _run_post_emission_check(transform, result.row)
-    transform.output_schema.model_validate(result.row.to_dict(), strict=True)
-    prefix = f"quality_{response_field}"
-    assert result.row[prefix] == content
-    assert result.row[f"{prefix}_model"] == "gpt-4o"
-    assert result.row[f"{prefix}_usage"] == usage.to_dict()
-    assert result.row["quality_answer"] == 7
-    assert transform._output_schema_config is not None
-    assert transform._output_schema_config.fields is not None
-    names = [field.name for field in transform._output_schema_config.fields]
-    assert names == ["text", prefix, f"{prefix}_usage", f"{prefix}_model", "quality_answer"]
-    assert list(transform.output_schema.model_fields) == names
-    for name, expected_type in ((prefix, str), (f"{prefix}_model", str), (f"{prefix}_usage", object), ("quality_answer", int)):
-        emitted = result.row.contract.get_field(name)
-        assert emitted.python_type is expected_type
-        assert emitted.required is True
-        assert emitted.nullable is (expected_type is object)
-        model_field = transform.output_schema.model_fields[name]
-        assert model_field.annotation is (Any if expected_type is object else expected_type)
-        assert model_field.is_required()
-
-
-@pytest.mark.parametrize("compatible", [False, True])
-@pytest.mark.parametrize("suffix", ["llm_response", "llm_response_model", "llm_response_usage"])
-def test_operational_collision_output_admission_matches_the_emitted_type(compatible: bool, suffix: str) -> None:
-    from elspeth.plugins.infrastructure.config_base import PluginConfigError
-    from elspeth.plugins.transforms.llm.transform import LLMTransform
-
-    emitted_type = "any" if suffix.endswith("_usage") else "str"
-    authored_type = emitted_type if compatible else "int"
-    config = _make_config(
-        schema={"mode": "flexible", "fields": ["text: str", f"quality_{suffix}: {authored_type}"]},
-        queries={"quality": {"input_fields": {"text": "text"}, "output_fields": [{"suffix": suffix, "type": "integer"}]}},
-    )
-    if not compatible:
-        with pytest.raises(PluginConfigError, match=r"never admits|token-usage mapping"):
-            LLMTransform(config)
-    else:
-        transform = LLMTransform(config)
-        declarations = {field.name: field.field_type for field in transform.created_output_fields()}
-        assert declarations[f"quality_{suffix}"] == emitted_type
+    with pytest.raises(PluginConfigError, match="collides with the transform's own response/operational fields"):
+        LLMTransform(config)
 
 
 @pytest.mark.parametrize("operational_last", [False, True])
-def test_multi_query_overlapping_generated_fields_follow_query_order(operational_last: bool) -> None:
-    """Cross-query overlap follows the same last-query precedence as row assembly."""
+def test_multi_query_cross_query_operational_overlap_is_refused_in_either_order(operational_last: bool) -> None:
+    """A structured name equal to another query's operational field is refused, whatever the query order."""
+    from elspeth.plugins.infrastructure.config_base import PluginConfigError
+    from elspeth.plugins.transforms.llm.transform import LLMTransform
+
     queries = {
         "quality": {"input_fields": {"text": "text"}, "output_fields": [{"suffix": "detail_llm_response", "type": "integer"}]},
         "quality_detail": {"input_fields": {"text": "text"}},
     }
     if not operational_last:
         queries = dict(reversed(tuple(queries.items())))
-    transform, provider = _make_transform_with_mock_provider(
-        _make_config(schema={"mode": "flexible", "fields": ["text: str"]}, queries=queries)
-    )
-    content = '{"detail_llm_response": 42}'
-    provider.execute_query.return_value = LLMQueryResult(
-        content=content, usage=TokenUsage.known(10, 5), model="gpt-4o", finish_reason=FinishReason.STOP
-    )
-    result = transform._process_row(_make_row(), _make_ctx())
-    assert result.status == "success"
-    assert result.row is not None
-    _run_post_emission_check(transform, result.row)
-    transform.output_schema.model_validate(result.row.to_dict(), strict=True)
-    name = "quality_detail_llm_response"
-    assert result.row[name] == (content if operational_last else 42)
-    emitted = result.row.contract.get_field(name)
-    assert emitted.python_type is (str if operational_last else int)
-    assert emitted.required is True
-    assert emitted.nullable is False
-    assert transform._output_schema_config is not None
-    assert transform._output_schema_config.fields is not None
-    names = [field.name for field in transform._output_schema_config.fields]
-    assert len(names) == len(set(names))
-    assert list(transform.output_schema.model_fields) == names
+    with pytest.raises(PluginConfigError, match="quality_detail_llm_response"):
+        LLMTransform(_make_config(schema={"mode": "flexible", "fields": ["text: str"]}, queries=queries))
 
 
 def _make_config(*, provider: str = "azure", **overrides: Any) -> dict[str, Any]:
@@ -3041,6 +3002,8 @@ class TestConfigureAzureMonitor:
         an incompatible SDK version or a bug in our call, both of which we
         need to know about immediately.
         """
+        import sys
+
         from elspeth.plugins.transforms.llm.providers.azure import _configure_azure_monitor
         from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig
 
@@ -3049,8 +3012,11 @@ class TestConfigureAzureMonitor:
         def broken_sdk(**kwargs: Any) -> None:
             raise TypeError("unexpected keyword argument 'enable_live_metrics'")
 
+        # The instrumentor dependency is checked before configure_azure_monitor
+        # runs, so it must be present for the SDK call to be reached at all.
         with (
             patch("elspeth.plugins.transforms.llm.providers.azure.configure_azure_monitor", broken_sdk),
+            patch.dict(sys.modules, {"azure.ai.inference.tracing": self._fake_inference_tracing_module()}),
             pytest.raises(TypeError, match="unexpected keyword argument"),
         ):
             _configure_azure_monitor(config)

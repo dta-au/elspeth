@@ -31,6 +31,7 @@ from elspeth.contracts.errors import (
     AuditIntegrityError,
     BucketRegionVerificationEvidence,
     FrameworkBugError,
+    PluginRetryableError,
     TransformErrorCategory,
     TransformErrorReason,
 )
@@ -85,7 +86,11 @@ from elspeth.plugins.transforms.aws.textract_result import (
 )
 
 _BUCKET_PATTERN = re.compile(r"^[0-9A-Za-z.\-_]*$")
+_SURROGATE_PATTERN = re.compile("[\ud800-\udfff]")
 _TEXTRACT_SDK_TIMEOUT_HEADROOM_SECONDS = 90.0
+# Poll-sleep slice: the plugin waits on the engine's shutdown event and
+# re-checks its private close() event at least this often.
+_SHUTDOWN_WAIT_SLICE_SECONDS = 0.25
 
 # Hard ceilings on what an author may configure. Each row holds the shared
 # execution worker until its job reaches a terminal status or the poll deadline
@@ -200,7 +205,10 @@ class AWSTextractDocumentAnalysisConfig(TransformDataConfig):
         default=MAX_POLL_TIMEOUT_SECONDS,
         gt=0,
         le=MAX_POLL_TIMEOUT_SECONDS,
-        description="Total submit-through-terminal-status deadline in seconds.",
+        description=(
+            "Total submit-through-terminal-status deadline in seconds; transient poll failures are retried in place "
+            "within it, and reaching it is a permanent poll_timeout row error."
+        ),
     )
     batch_wait_timeout_seconds: float = Field(
         default=MAX_BATCH_WAIT_TIMEOUT_SECONDS,
@@ -340,7 +348,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:bd472cf7bdb1f53b"
+    source_file_hash: str | None = "sha256:e45dc8dbaf712404"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -461,6 +469,8 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         self._row_clients: dict[str, TextractClient] = {}
         self._row_clients_lock = threading.Lock()
         self._shutdown = threading.Event()
+        self._run_shutdown: threading.Event | None = None
+        self._run_mode: RunMode | None = None
         self._batch_initialized = False
 
     def _bind_profiled_audit_identity(
@@ -523,8 +533,12 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         self._node_id = node_id
         self._telemetry_emit = ctx.telemetry_emit
         self._limiter = ctx.rate_limit_registry.get_limiter(self.name) if ctx.rate_limit_registry is not None else None
-        if ctx.shutdown_event is not None:
-            self._shutdown = ctx.shutdown_event
+        # A fresh private event per start: close() sets it, so a restarted
+        # instance must not inherit the previous run's stop. The engine's
+        # event is only ever read.
+        self._shutdown = threading.Event()
+        self._run_shutdown = ctx.shutdown_event
+        self._run_mode = ctx.run_mode
         self._bucket_region_coordinator = BucketRegionCoordinator()
         created_s3 = False
         created_textract = False
@@ -687,7 +701,9 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 {"reason": "invalid_input", "field": bucket_field, "error_type": "invalid_s3_bucket"},
                 retryable=False,
             )
-        if not 1 <= len(key) <= 1024 or not key.strip() or "#" in key:
+        # S3 bounds keys in UTF-8 bytes, as the static-bucket branch checks; a
+        # lone surrogate has no UTF-8 encoding at all.
+        if not key.strip() or "#" in key or _SURROGATE_PATTERN.search(key) is not None or len(key.encode("utf-8")) > S3_MAX_KEY_BYTES:
             return TransformResult.error(
                 {"reason": "invalid_input", "field": self._key_field, "error_type": "invalid_s3_key"},
                 retryable=False,
@@ -772,27 +788,73 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             digest.update(encoded)
         return digest.hexdigest()
 
+    def _shutdown_requested(self) -> bool:
+        """Whether close() (private event) or the engine (run event) asked work to stop.
+
+        The engine's ``ctx.shutdown_event`` is read-only to this plugin:
+        close() stops this plugin's workers through the private
+        ``_shutdown`` event and never raises the run-wide cancellation signal.
+        """
+        run_shutdown = self._run_shutdown
+        return self._shutdown.is_set() or (run_shutdown is not None and run_shutdown.is_set())
+
+    def _wait_for_shutdown(self, timeout: float) -> bool:
+        """Sleep up to ``timeout`` seconds; return True as soon as either stop event is set.
+
+        Waits on the engine event in short slices so a close()-driven private
+        stop is also observed promptly without ever writing the engine event.
+        """
+        deadline = time.monotonic() + timeout
+        while not self._shutdown_requested():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            wait_on = self._shutdown if self._run_shutdown is None else self._run_shutdown
+            if wait_on.wait(timeout=min(remaining, _SHUTDOWN_WAIT_SLICE_SECONDS)):
+                return True
+        return True
+
     def _process_single_with_state(
         self, row: PipelineRow, state_id: str, *, ctx: TransformContext, token_id: str | None
     ) -> TransformResult:
         if not self._run_id or not self._node_id or token_id is None:
             raise FrameworkBugError("Amazon Textract processing requires run, node, and token identity")
-        if self._shutdown.is_set():
+        if self._shutdown_requested():
             return TransformResult.error({"reason": "shutdown_requested"}, retryable=False)
         location = self._read_document_location(row)
         if isinstance(location, TransformResult):
             return location
         bucket, key, version = location
         try:
-            verification = self._bucket_region_coordinator.verify(
-                bucket,
-                lambda: self._verify_bucket_region_live(bucket, state_id=state_id, token_id=token_id, ctx=ctx),
-            )
+            if self._run_mode is RunMode.REPLAY:
+                # Finding 3: in replay the source run's leader/follower split
+                # comes from the archive, not from which thread wins the lock.
+                head_bucket = self._head_bucket_client(state_id=state_id, token_id=token_id, ctx=ctx)
+                audit_identity = self._audit_location_identity(None)
+                verification = self._bucket_region_coordinator.verify_replay(
+                    bucket,
+                    lambda: head_bucket.verify_bucket_region(bucket, audit_identity=audit_identity),
+                    source_led=head_bucket.source_made_head_bucket_call(bucket, audit_identity=audit_identity),
+                    wait_seconds=S3_HEAD_BUCKET_SDK_ALLOWANCE_SECONDS,
+                )
+            else:
+                verification = self._bucket_region_coordinator.verify(
+                    bucket,
+                    lambda: self._verify_bucket_region_live(bucket, state_id=state_id, token_id=token_id, ctx=ctx),
+                )
         except BucketRegionUnverifiedError as error:
-            return TransformResult.error(
-                {"reason": "bucket_region_unverified", "error_type": error.code},
-                retryable=error.retryable,
-            )
+            if error.retryable:
+                # A transient HeadBucket failure (throttle, 5xx, transport) is
+                # an engine row retry: the engine reads only a raised
+                # PluginRetryableError, never TransformResult.retryable.
+                raise PluginRetryableError(
+                    f"Amazon S3 HeadBucket could not verify the bucket region (transient): {error.code}",
+                    retryable=True,
+                ) from error
+            unverified_reason: TransformErrorReason = {"reason": "bucket_region_unverified", "error_type": error.code}
+            if error.inherited:
+                unverified_reason["cache_status"] = "shared_failure"
+            return TransformResult.error(unverified_reason, retryable=False)
         result = self._process_verified_document(
             row,
             state_id=state_id,
@@ -870,16 +932,25 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         except TextractIdempotencyInvariantError as error:
             raise FrameworkBugError("Amazon Textract idempotency invariant failed") from error
         except TextractServiceError as error:
+            if error.retryable:
+                # The audited client has already recorded the failed call. A
+                # row retry resubmits with the same deterministic
+                # ClientRequestToken, so Textract re-attaches to any job this
+                # attempt started instead of starting (and billing) another.
+                raise PluginRetryableError(
+                    f"Amazon Textract StartDocumentAnalysis failed (transient): {error.code}",
+                    retryable=True,
+                ) from error
             submit_error: TransformErrorReason = {"reason": "submit_failed", "error_type": "service_error", "code": error.code}
             if error.code == _S3_OBJECT_UNREADABLE_CODE:
                 submit_error["cause"] = _S3_OBJECT_UNREADABLE_CAUSE
                 submit_error["error"] = _S3_OBJECT_UNREADABLE_HINT
-            return TransformResult.error(submit_error, retryable=error.retryable)
+            return TransformResult.error(submit_error, retryable=False)
         except TextractResponseError as error:
             submit_reason: TransformErrorCategory = "result_too_large" if error.category == "response_too_large" else "malformed_response"
             return TransformResult.error({"reason": submit_reason, "error_type": "submit_response"}, retryable=False)
 
-        collected = self._poll_and_collect(client, receipt, started_at=started_at)
+        collected = self._poll_and_collect(client, receipt, started_at=started_at, replay=self._run_mode is RunMode.REPLAY)
         if isinstance(collected, TransformResult):
             return collected
         result_pages = collected
@@ -893,14 +964,9 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 max_result_bytes=self._max_result_bytes,
             )
         except MalformedTextractResponse as error:
-            safe_message = str(error)
-            validation_reason: TransformErrorCategory
-            if "max_blocks" in safe_message:
-                validation_reason = "too_many_blocks"
-            elif "max_result_bytes" in safe_message:
-                validation_reason = "result_too_large"
-            else:
-                validation_reason = "malformed_response"
+            # Dispatch on the structured category, never the message: the
+            # message can embed provider-controlled block text.
+            validation_reason: TransformErrorCategory = error.category
             return TransformResult.error({"reason": validation_reason, "error_type": "result_validation"}, retryable=False)
         return self._build_enriched_result(row, receipt, normalized)
 
@@ -937,6 +1003,11 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         return result
 
     def _verify_bucket_region_live(self, bucket: str, *, ctx: TransformContext, state_id: str, token_id: str) -> BucketRegionProof:
+        return self._head_bucket_client(state_id=state_id, token_id=token_id, ctx=ctx).verify_bucket_region(
+            bucket, audit_identity=self._audit_location_identity(None)
+        )
+
+    def _head_bucket_client(self, *, ctx: TransformContext, state_id: str, token_id: str) -> HeadBucketClient:
         if self._recorder is None or self._s3_sdk_client is None or not self._run_id:
             raise FrameworkBugError("Amazon Textract bucket verification used before on_start")
         return HeadBucketClient(
@@ -950,7 +1021,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             sdk_client=self._s3_sdk_client,
             token_id=token_id,
             call_mode_session=ctx.call_mode_session,
-        ).verify_bucket_region(bucket, audit_identity=self._audit_location_identity(None))
+        )
 
     def _poll_and_collect(
         self,
@@ -958,7 +1029,32 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         receipt: StartAnalysisReceipt,
         *,
         started_at: float,
+        replay: bool = False,
     ) -> tuple[Mapping[str, Any], ...] | TransformResult:
+        """Poll the accepted job to a terminal status and collect every result page.
+
+        Deadline policy (AWS review 2026-11-13, finding 1):
+
+        - ``poll_timeout`` — the job did not reach a terminal status within the
+          author's ``poll_timeout_seconds`` — is a permanent row error. The
+          deadline is the author's own bound on worker occupancy; an engine
+          retry would silently multiply it by the retry budget.
+        - A retryable ``GetDocumentAnalysis`` failure (throttle, 5xx,
+          transport) is retried in place against the same job and the same
+          page request, never by resubmitting. Only one that is still failing
+          when the deadline arrives escalates to an engine row retry
+          (``PluginRetryableError``); that retry resubmits with the same
+          deterministic ClientRequestToken and so re-attaches to this job.
+
+        Replay (finding 3): the source run's deadline was wall-clock time,
+        which replay cannot reproduce because it answers each poll at once.
+        In replay the loop never sleeps, and "the deadline arrived" means "the
+        source run made no further poll" (``source_has_next_poll``), so the
+        replayed call sequence and outcome are the archived ones. Known
+        residual: a final SUCCEEDED page that arrived after the source
+        deadline (source outcome ``poll_timeout``) replays as success, since
+        the call archive does not record that the deadline had passed.
+        """
         deadline = started_at + self._poll_timeout_seconds
         interval = self._poll_interval_seconds
         next_token: str | None = None
@@ -966,28 +1062,50 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         pages: list[Mapping[str, Any]] = []
         block_count = 0
         retained_result_bytes = 0
+        transient: TextractServiceError | None = None
         while True:
-            if self._shutdown.is_set():
+            if self._shutdown_requested():
                 return TransformResult.error({"reason": "shutdown_requested"}, retryable=False)
-            if time.monotonic() >= deadline:
-                return TransformResult.error({"reason": "poll_timeout"}, retryable=True)
+            deadline_reached = (
+                not client.source_has_next_poll(job_id=receipt.job_id, next_token=next_token) if replay else time.monotonic() >= deadline
+            )
+            if deadline_reached:
+                if transient is not None:
+                    raise self._transient_poll_escalation(transient)
+                return TransformResult.error({"reason": "poll_timeout"}, retryable=False)
             try:
                 page = client.get_document_analysis(job_id=receipt.job_id, next_token=next_token)
             except TextractIdempotencyInvariantError as error:
                 raise FrameworkBugError("Amazon Textract idempotency invariant failed") from error
             except TextractServiceError as error:
-                return TransformResult.error(
-                    {"reason": "poll_failed", "error_type": "service_error", "code": error.code},
-                    retryable=error.retryable,
-                )
+                if not error.retryable:
+                    return TransformResult.error(
+                        {"reason": "poll_failed", "error_type": "service_error", "code": error.code},
+                        retryable=False,
+                    )
+                # The audited client recorded the failed poll. Retry the same
+                # request in place after the poll backoff; the accepted job
+                # keeps running, so resubmitting would only add risk.
+                transient = error
+                if replay:
+                    continue
+                now = time.monotonic()
+                if now >= deadline:
+                    raise self._transient_poll_escalation(error) from error
+                sleep_seconds = min(interval, deadline - now)
+                if sleep_seconds > 0 and self._wait_for_shutdown(sleep_seconds):
+                    return TransformResult.error({"reason": "shutdown_requested"}, retryable=False)
+                interval = min(interval * self._poll_backoff_multiplier, self._poll_max_interval_seconds)
+                continue
             except TextractResponseError as error:
                 poll_reason: TransformErrorCategory = "result_too_large" if error.category == "response_too_large" else "malformed_response"
                 return TransformResult.error({"reason": poll_reason, "error_type": "poll_response"}, retryable=False)
+            transient = None
 
-            if self._shutdown.is_set():
+            if self._shutdown_requested():
                 return TransformResult.error({"reason": "shutdown_requested"}, retryable=False)
-            if time.monotonic() >= deadline:
-                return TransformResult.error({"reason": "poll_timeout"}, retryable=True)
+            if not replay and time.monotonic() >= deadline:
+                return TransformResult.error({"reason": "poll_timeout"}, retryable=False)
 
             semantic_response = page.semantic_response
             if "JobStatus" not in semantic_response or type(semantic_response["JobStatus"]) is not str:
@@ -996,11 +1114,13 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             if status == "IN_PROGRESS":
                 if page.next_token is not None:
                     return TransformResult.error({"reason": "malformed_response", "error_type": "premature_next_token"}, retryable=False)
+                if replay:
+                    continue
                 now = time.monotonic()
                 if now >= deadline:
-                    return TransformResult.error({"reason": "poll_timeout"}, retryable=True)
+                    return TransformResult.error({"reason": "poll_timeout"}, retryable=False)
                 sleep_seconds = min(interval, deadline - now)
-                if sleep_seconds > 0 and self._shutdown.wait(timeout=sleep_seconds):
+                if sleep_seconds > 0 and self._wait_for_shutdown(sleep_seconds):
                     return TransformResult.error({"reason": "shutdown_requested"}, retryable=False)
                 interval = min(interval * self._poll_backoff_multiplier, self._poll_max_interval_seconds)
                 continue
@@ -1043,6 +1163,13 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             if len(pages) >= self._max_result_pages:
                 return TransformResult.error({"reason": "pagination_limit_exceeded"}, retryable=False)
             next_token = returned_token
+
+    @staticmethod
+    def _transient_poll_escalation(error: TextractServiceError) -> PluginRetryableError:
+        return PluginRetryableError(
+            f"Amazon Textract GetDocumentAnalysis still failing (transient) at the poll deadline: {error.code}",
+            retryable=True,
+        )
 
     def _build_enriched_result(
         self,
@@ -1154,6 +1281,8 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         prior_limiter = self._limiter
         prior_clients = self._row_clients
         prior_shutdown = self._shutdown
+        prior_run_shutdown = self._run_shutdown
+        prior_run_mode = self._run_mode
         try:
             self._recorder = ctx.landscape
             self._run_id = ctx.run_id
@@ -1165,6 +1294,8 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             self._limiter = None
             self._row_clients = {}
             self._shutdown = threading.Event()
+            self._run_shutdown = None
+            self._run_mode = None
             state_id = ctx.state_id or "textract-invariant-probe-state"
             token_id = ctx.token.token_id if ctx.token is not None else "textract-invariant-probe-token"
             return self._process_single_with_state(probe_rows[0], state_id, token_id=token_id, ctx=ctx)
@@ -1179,6 +1310,8 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             self._limiter = prior_limiter
             self._row_clients = prior_clients
             self._shutdown = prior_shutdown
+            self._run_shutdown = prior_run_shutdown
+            self._run_mode = prior_run_mode
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:

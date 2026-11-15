@@ -23,7 +23,7 @@ building and running auditable pipelines.
 
 ### Installation
 
-Install Python 3.12 or newer and `uv`, then synchronize the locked source
+Install Python 3.14 or newer and `uv`, then synchronize the locked source
 checkout:
 
 ```bash
@@ -230,6 +230,7 @@ TRANSFORMS:
   aws_textract_inline_analysis - Enrich managed-blob document rows through synchronous Amazon Textract analysis.
   azure_ai_search      - RAG retrieval against an existing Azure AI Search index.
   azure_content_safety - Analyze content using Azure Content Safety API.
+  azure_content_understanding - Enrich rows with Azure AI Content Understanding analysis (async analyze LRO).
   azure_document_intelligence - Enrich rows with Azure Document Intelligence extraction (async analyze LRO).
   azure_prompt_shield  - Detect jailbreak attempts and prompt injection using Azure Prompt Shield.
   llm                  - Unified LLM transform with provider dispatch and strategy selection.
@@ -515,7 +516,7 @@ elspeth health --json
   "checks": {
     "version": {"status": "ok", "value": "0.8.0"},
     "commit": {"status": "ok", "value": "abc123f"},
-    "python": {"status": "ok", "value": "3.13.1"},
+    "python": {"status": "ok", "value": "3.14.5"},
     "database": {"status": "ok", "value": "connected"},
     "config_dir": {"status": "ok", "value": "./config"},
     "output_dir": {"status": "ok", "value": "./output"},

@@ -92,7 +92,7 @@ may select, so a deployment exposes a subset [EV-009], [EV-013].
 | Kind | Count | Registered plugins that can reach outside the process |
 |---|---:|---|
 | Sources | 9 | `aws_s3`, `azure_blob`, `dataverse`, `llm` |
-| Transforms | 39 | `llm`, `blob_fetch`, `web_scrape`, `azure_ai_search`, `rag_retrieval`, `azure_content_safety`, `azure_prompt_shield`, `azure_document_intelligence`, `aws_bedrock_content_safety`, `aws_bedrock_prompt_shield`, `aws_textract_document_analysis`, `aws_textract_inline_analysis` |
+| Transforms | 39 | `llm`, `blob_fetch`, `web_scrape`, `azure_ai_search`, `rag_retrieval`, `azure_content_safety`, `azure_prompt_shield`, `azure_document_intelligence`, `azure_content_understanding`, `aws_bedrock_content_safety`, `aws_bedrock_prompt_shield`, `aws_textract_document_analysis`, `aws_textract_inline_analysis` |
 | Sinks | 9 | `aws_s3`, `azure_blob`, `chroma_sink`, `database`, `dataverse` |
 
 The exact enabled set and its operator profiles belong in the controlled
@@ -103,7 +103,7 @@ corresponding boundary crossings.
 
 | Layer | Product baseline at the reviewed commit | Evidence |
 |---|---|---|
-| Language and runtime | Python 3.12+ from source; Python 3.13 in the official distroless container runtime | [EV-627] |
+| Language and runtime | Python 3.14+ from source; CPython 3.14, shipped with the application, on the distroless `cc-debian13` container runtime | [EV-627] |
 | Web | FastAPI served by uvicorn; React and TypeScript frontend built with Vite | [EV-003] |
 | Data access | SQLAlchemy Core | [EV-003] |
 | Databases | SQLite, with optional SQLCipher for the Landscape, for single-host use; PostgreSQL 16 for external-state deployment profiles | [EV-003], [EV-320] |

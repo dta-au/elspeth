@@ -14,6 +14,7 @@ Example usage:
     path = cfg.path  # Direct access, fails fast if missing
 """
 
+import csv
 import json
 from pathlib import Path
 from typing import Annotated, Any, ClassVar, Final, Literal, Self
@@ -611,6 +612,25 @@ def validate_headers_value(v: str | dict[str, str] | None) -> str | dict[str, st
             raise ValueError(f"Invalid header mode '{v}'. Expected 'normalized', 'original', or mapping dict.")
         return v
     raise ValueError(f"headers must be 'normalized', 'original', or a dict mapping, got {type(v).__name__}")
+
+
+def validate_csv_delimiter(value: str) -> str:
+    """Validate a CSV ``delimiter`` option the way ``csv.reader`` will.
+
+    A single character is necessary but not sufficient: the csv module also
+    rejects the default quotechar (``"``) and line terminators. Probing a
+    reader with the same dialect settings refuses those at config load, so the
+    error cannot first surface as an uncaught ``ValueError`` on a row.
+
+    Returns the value unchanged. Raises ValueError for invalid inputs.
+    """
+    if len(value) != 1:
+        raise ValueError(f"delimiter must be a single character, got {value!r}")
+    try:
+        csv.reader((), delimiter=value, strict=True)
+    except ValueError as exc:
+        raise ValueError(f"delimiter {value!r} is not usable by the csv module: {exc}") from exc
+    return value
 
 
 class LocalFileSinkConfig(PathConfig):

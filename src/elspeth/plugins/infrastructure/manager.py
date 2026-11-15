@@ -26,6 +26,7 @@ from elspeth.plugins.infrastructure.hookspecs import (
     ElspethTransformSpec,
 )
 from elspeth.plugins.infrastructure.validation import (
+    UnknownPluginTypeError,
     ValidationError,
     validate_sink_config,
     validate_source_config,
@@ -257,12 +258,16 @@ class PluginManager:
         Raises:
             ValueError: If config is invalid or plugin type not found
         """
-        # Validate config first
-        errors = validate_source_config(source_type, config)
+        # Resolve the class from THIS manager and validate against it, so the
+        # config is checked against the model of the class actually built
+        # (sweep finding #126: validation used to resolve through the shared
+        # manager while construction used this instance's registry).
+        try:
+            plugin_cls = self.get_source_by_name(source_type)
+        except PluginNotFoundError as exc:
+            raise UnknownPluginTypeError(f"Unknown source type: {source_type}") from exc
+        errors = validate_source_config(source_type, config, plugin_cls=plugin_cls)
         _raise_if_invalid(errors, "source", source_type)
-
-        # Get plugin class
-        plugin_cls = self.get_source_by_name(source_type)
 
         # Instantiate with validated config
         return plugin_cls(config)
@@ -280,12 +285,16 @@ class PluginManager:
         Raises:
             ValueError: If config is invalid or plugin type not found
         """
-        # Validate config first
-        errors = validate_transform_config(transform_type, config)
+        # Resolve the class from THIS manager and validate against it, so the
+        # config is checked against the model of the class actually built
+        # (sweep finding #126: validation used to resolve through the shared
+        # manager while construction used this instance's registry).
+        try:
+            plugin_cls = self.get_transform_by_name(transform_type)
+        except PluginNotFoundError as exc:
+            raise UnknownPluginTypeError(f"Unknown transform type: {transform_type}") from exc
+        errors = validate_transform_config(transform_type, config, plugin_cls=plugin_cls)
         _raise_if_invalid(errors, "transform", transform_type)
-
-        # Get plugin class
-        plugin_cls = self.get_transform_by_name(transform_type)
 
         # Instantiate with validated config
         return plugin_cls(config)
@@ -303,12 +312,16 @@ class PluginManager:
         Raises:
             ValueError: If config is invalid or plugin type not found
         """
-        # Validate config first
-        errors = validate_sink_config(sink_type, config)
+        # Resolve the class from THIS manager and validate against it, so the
+        # config is checked against the model of the class actually built
+        # (sweep finding #126: validation used to resolve through the shared
+        # manager while construction used this instance's registry).
+        try:
+            plugin_cls = self.get_sink_by_name(sink_type)
+        except PluginNotFoundError as exc:
+            raise UnknownPluginTypeError(f"Unknown sink type: {sink_type}") from exc
+        errors = validate_sink_config(sink_type, config, plugin_cls=plugin_cls)
         _raise_if_invalid(errors, "sink", sink_type)
-
-        # Get plugin class
-        plugin_cls = self.get_sink_by_name(sink_type)
 
         # Instantiate with validated config
         return plugin_cls(config)

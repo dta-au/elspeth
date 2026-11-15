@@ -11,6 +11,7 @@ from __future__ import annotations
 import csv
 import ctypes
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -410,7 +411,8 @@ def _csv_relative_path(record_type: object, seen: dict[str, str]) -> str:
     return relative_path
 
 
-def _neutralize_csv_formula(value: object) -> object:
+def neutralize_csv_formula(value: object) -> object:
+    """Prefix a spreadsheet-formula-leading string cell with a quote so it reads as text."""
     if type(value) is str and value.startswith(_CSV_FORMULA_PREFIXES):
         return f"'{value}"
     return value
@@ -445,7 +447,7 @@ def _parse_verified_records(
                 record = cast(dict[str, object], value)
                 relative_path = _csv_relative_path(record["record_type"], seen_names)
                 flattened = formatter.format(record)
-                safe_record = {key: _neutralize_csv_formula(item) for key, item in flattened.items()}
+                safe_record = {key: neutralize_csv_formula(item) for key, item in flattened.items()}
                 spool: _RecordSpool | None = None
                 if relative_path in spools:
                     spool = spools[relative_path]
@@ -808,6 +810,10 @@ def _create_private_building_tree_at(parent_fd: int, target_name: str, effect_id
         descriptor = os.open(name, _directory_read_flags(), dir_fd=parent_fd)
         completed = False
         try:
+            # Liveness proof for the stale-scratch sweep: the exclusive flock is
+            # held on this descriptor until prepare closes it (or the process
+            # dies), so a sweep never deletes a tree whose prepare is running.
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             os.fchmod(descriptor, 0o700)
             identity = os.fstat(descriptor)
             observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -1126,7 +1132,11 @@ def reconcile_audit_export_bundle(plan: SinkEffectPlan) -> SinkEffectReconcileRe
                 if not parent.is_still_bound():
                     return SinkEffectReconcileResult.unknown(evidence={"reason": "parent_replaced"})
                 return SinkEffectReconcileResult.not_applied(evidence={"staging": "exact", "target": "absent"})
-            return SinkEffectReconcileResult.unknown(evidence={"staging": "divergent", "target": target_kind})
+            # Record the MEASURED staging state: a tree is called divergent
+            # only when it was compared against the plan (target absent).
+            staging_kind = _target_kind_at(parent.descriptor, staging.name)
+            staging_state = "divergent" if staging_kind == "directory" and target_kind == "absent" else staging_kind
+            return SinkEffectReconcileResult.unknown(evidence={"staging": staging_state, "target": target_kind})
         finally:
             parent.close()
     except OSError as exc:
@@ -1231,6 +1241,10 @@ def _remove_scratch_path_at(parent_fd: int, name: str) -> bool:
     except OSError:
         return False
     try:
+        # A live prepare holds an exclusive flock on its building tree; an old
+        # mtime alone does not prove the tree was abandoned. A held lock raises
+        # BlockingIOError (an OSError), which skips the entry below.
+        fcntl.flock(directory_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         identity = os.fstat(directory_fd)
         child_names = os.listdir(directory_fd)
         for child_name in child_names:
@@ -1262,6 +1276,8 @@ def cleanup_stale_audit_export_bundle_scratch(
 
     Building trees are pre-staging scratch: prepare removes them in-process,
     so one only survives a hard crash and is never credited by recovery.
+    A building tree whose prepare is still running is skipped whatever its
+    mtime: prepare holds an exclusive flock on it for its whole lifetime.
     Never scans outside parent.
     """
     if older_than_seconds < 0 or type(max_entries) is not int or max_entries < 0:
@@ -1316,9 +1332,13 @@ def preflight_audit_export_bundle(target_path: Path) -> AuditExportBundlePreflig
         raise AuditExportBundlePreflightError("bundle filesystem statfs probe failed") from exc
     if filesystem_magic not in SUPPORTED_LOCAL_FILESYSTEM_MAGIC:
         raise AuditExportBundlePreflightError(f"bundle filesystem 0x{filesystem_magic:x} is not in the local allowlist")
+    # The publish rename (staging -> target) is only atomic within one device,
+    # so compare the parent the staging layout actually uses, not the target
+    # parent with itself.
+    staging_parent = _staging_path(target, "preflight").parent
     try:
         target_parent_device = _device_id(parent)
-        staging_parent_device = _device_id(parent)
+        staging_parent_device = _device_id(staging_parent)
     except OSError as exc:
         raise AuditExportBundlePreflightError("bundle parent device identity is unavailable") from exc
     if target_parent_device != staging_parent_device:
@@ -1382,17 +1402,22 @@ def preflight_audit_export_bundle(target_path: Path) -> AuditExportBundlePreflig
         for path in paths:
             try:
                 pinned = _open_pinned_bundle_parent(path)
+                try:
+                    # False also means "already absent" (e.g. ``source`` after
+                    # the rename), so only a probe still present after the
+                    # removal attempt is a cleanup failure.
+                    if not _remove_scratch_path_at(pinned.descriptor, path.name):
+                        remaining = _target_kind_at(pinned.descriptor, path.name)
+                        if remaining != "absent":
+                            probe_cleanup_failures.append(f"{path.name}: {remaining} could not be removed")
+                finally:
+                    pinned.close()
             except OSError as cleanup_exc:
                 # Recorded, then surfaced as the function's own failure below.
                 # When a probe failure is already propagating out of the try it
                 # stays primary; a preflight that cannot even pin the parent it
-                # just probed has failed either way.
+                # just probed, or measure what it left, has failed either way.
                 probe_cleanup_failures.append(f"{path.name}: {type(cleanup_exc).__name__}: {cleanup_exc}")
-                continue
-            try:
-                _remove_scratch_path_at(pinned.descriptor, path.name)
-            finally:
-                pinned.close()
     if probe_cleanup_failures:
         raise AuditExportBundlePreflightError(
             "bundle preflight probes succeeded but probe cleanup failed: " + "; ".join(probe_cleanup_failures)

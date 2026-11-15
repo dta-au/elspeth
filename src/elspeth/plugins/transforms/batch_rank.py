@@ -127,7 +127,7 @@ class BatchRank(BaseTransform):
     name = "batch_rank"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:bfcb04174bb43be1"
+    source_file_hash: str | None = "sha256:5b0ff7172e892b31"
     config_model = BatchRankConfig
     is_batch_aware = True
     # Passthrough-capable: every successful flush is a success_multi of exactly
@@ -180,6 +180,9 @@ class BatchRank(BaseTransform):
                     "it emits exactly one row per buffered row, in order, so the same tokens continue downstream.",
                     "It also runs under output_mode: transform, where each emitted row becomes a new child token.",
                     "Ranks restart in every batch: pick the trigger (count, timeout or condition) so a batch is the group to rank.",
+                    f"A flush over more than {_MAX_BATCH_ROWS} buffered rows fails the whole batch (batch_too_large): "
+                    f"keep trigger count at or below {_MAX_BATCH_ROWS}, and do not rely on an end-of-source flush "
+                    "(omitted trigger) when the input can exceed it.",
                     "A null, absent or non-finite value keeps its row with null rank and percentile; "
                     "a present text or boolean value fails the whole batch.",
                     "order: descending ranks the highest value 1; ties: competition gives 1, 2, 2, 4 and dense gives 1, 2, 2, 3.",

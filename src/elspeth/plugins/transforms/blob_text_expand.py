@@ -219,7 +219,7 @@ class BlobTextExpand(BaseTransform):
     name = "blob_text_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a351eb18517babff"
+    source_file_hash: str | None = "sha256:ec0fca240d0e979f"
     config_model = BlobTextExpandConfig
     usage_when_to_use: str = (
         "Use when each input row carries a payload-store reference to a plain-text blob and you need "
@@ -327,10 +327,15 @@ class BlobTextExpand(BaseTransform):
         """Drive the real process path with a hermetic text payload seam."""
 
         class _InvariantPayloadStore:
-            def retrieve(self, ref: str) -> bytes:
+            # Mirrors PayloadStore.retrieve_bounded: a negative cap is refused,
+            # an unknown ref is not found, an oversize payload yields None.
+            def retrieve_bounded(self, ref: str, *, max_bytes: int) -> bytes | None:
+                if max_bytes < 0:
+                    raise ValueError("max_bytes must be nonnegative")
                 if ref != _INVARIANT_PROBE_BLOB_REF:
                     raise PayloadNotFoundError(ref)
-                return b"blob_text_expand_probe_value\nprobe\n"
+                body = b"blob_text_expand_probe_value\nprobe\n"
+                return body if len(body) <= max_bytes else None
 
         had_payload_store = "_payload_store" in self.__dict__
         original_payload_store: Any = None
@@ -388,7 +393,10 @@ class BlobTextExpand(BaseTransform):
             )
 
         try:
-            body = self._payload_store.retrieve(blob_ref)
+            # Bounded read: the store stops after max_blob_bytes + 1 bytes and
+            # returns None for an oversize blob, so the cap limits memory, not
+            # just the accepted size (contracts/payload_store.py).
+            body = self._payload_store.retrieve_bounded(blob_ref, max_bytes=self._max_blob_bytes)
         except IntegrityError:
             # FIRST, and the order is load-bearing rather than stylistic.
             # `except` clauses match in source order, so a store error that is
@@ -410,14 +418,12 @@ class BlobTextExpand(BaseTransform):
                 retryable=False,
             )
 
-        body_size = len(body)
-        if body_size > self._max_blob_bytes:
+        if body is None:
             return TransformResult.error(
                 {
                     "reason": "blob_too_large",
                     "field": self._blob_ref_field,
                     "blob_ref": blob_ref,
-                    "body_size": body_size,
                     "max_blob_bytes": self._max_blob_bytes,
                 },
                 retryable=False,

@@ -133,6 +133,12 @@ def _describe_plugin_node(node: NodeSpec) -> str:
             f"document analysis request and the extracted content hash "
             f"recorded. External call to Azure AI Services."
         )
+    if plugin == "azure_content_understanding":
+        return (
+            f"- {name} (Azure Content Understanding) — for each row: the "
+            f"analyzer request and the analysis result recorded. External "
+            f"call to Azure AI Services."
+        )
     if node.node_type == "aggregation":
         return f"- {name} ({plugin} aggregation) — for each batch: the input row hash of every member row, the output row hash(es), and the batch outcome recorded."
     if node.node_type == "collector":

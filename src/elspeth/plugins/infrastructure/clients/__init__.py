@@ -24,25 +24,13 @@ Example:
         messages=[ChatMessage(role="user", content="Hello")],
     )
 
-For replay mode, use CallReplayer to return recorded responses:
-
-    from elspeth.plugins.infrastructure.clients import CallReplayer, ReplayMissError
-
-    replayer = CallReplayer(execution, source_run_id="run-abc123")
-    result = replayer.replay(call_type="llm", request_data={...})
-
-For verify mode, use CallVerifier to compare live responses to recorded:
-
-    from elspeth.plugins.infrastructure.clients import CallVerifier
-
-    verifier = CallVerifier(execution, source_run_id="run-abc123")
-    result = verifier.verify(
-        call_type="llm",
-        request_data={...},
-        live_response={...}
-    )
-    if result.has_differences:
-        print(f"Drift detected: {result.differences}")
+Replay and verify modes each have a single authority in the engine:
+``CallModeSession.replay_call`` and ``CallModeSession.verify_call``
+(``elspeth.engine.orchestrator.call_mode_session``). They bind each source
+call to its parent, enforce the Tier-1 status/payload/error invariants, and
+record exact-hash evidence; the audited clients reach them through their
+call-mode adapters. This package exports no separate replayer or verify
+comparator.
 """
 
 from elspeth.plugins.infrastructure.clients.base import AuditedClientBase
@@ -57,34 +45,16 @@ from elspeth.plugins.infrastructure.clients.llm import (
     RateLimitError,
     ServerError,
 )
-from elspeth.plugins.infrastructure.clients.replayer import (
-    CallReplayer,
-    ReplayedCall,
-    ReplayMissError,
-    ReplayPayloadMissingError,
-)
-from elspeth.plugins.infrastructure.clients.verifier import (
-    CallVerifier,
-    VerificationReport,
-    VerificationResult,
-)
 
 __all__ = [
     "AuditedClientBase",
     "AuditedHTTPClient",
     "AuditedLLMClient",
-    "CallReplayer",
-    "CallVerifier",
     "ContentPolicyError",
     "ContextLengthError",
     "LLMClientError",
     "LLMResponse",
     "NetworkError",
     "RateLimitError",
-    "ReplayMissError",
-    "ReplayPayloadMissingError",
-    "ReplayedCall",
     "ServerError",
-    "VerificationReport",
-    "VerificationResult",
 ]

@@ -25,7 +25,7 @@ from pydantic import Field, field_validator
 from elspeth.contracts import Determinism
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.contexts import LifecycleContext, LimiterProtocol, TransformContext
-from elspeth.contracts.errors import CapacityError, FrameworkBugError, PluginRetryableError, is_capacity_error
+from elspeth.contracts.errors import CapacityError, FrameworkBugError, PluginRetryableError, TransformSuccessReason, is_capacity_error
 from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.contracts.schema_contract import PipelineRow
@@ -37,7 +37,7 @@ from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.infrastructure.telemetry import make_warn_telemetry_before_start
 from elspeth.plugins.transforms.azure.errors import MalformedResponseError
-from elspeth.plugins.transforms.safety_utils import get_fields_to_scan
+from elspeth.plugins.transforms.safety_utils import get_fields_to_scan, unscanned_field_warnings
 from elspeth.plugins.transforms.safety_utils import validate_fields_not_empty as _validate_fields
 
 logger = structlog.get_logger(__name__)
@@ -385,6 +385,13 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
         capacity_retry_deadline = capacity_retry_started_at + float(self._max_capacity_retry_seconds)
 
         for field_name, value in validated_fields:
+            # The batch waiter allows the capacity budget plus ONE HTTP call
+            # (``_effective_batch_wait_timeout_seconds``). Every field shares
+            # this row deadline, so no field's call may start once it has
+            # passed; otherwise each remaining field adds another HTTP timeout
+            # and the waiter evicts a row whose worker is still calling Azure.
+            if time.monotonic() >= capacity_retry_deadline:
+                return self._row_deadline_result(field_name, capacity_retry_started_at)
             violation = self._analyze_field_with_capacity_retry(
                 value,
                 field_name,
@@ -397,10 +404,16 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
             if violation is not None:
                 return violation
 
-        # Pass through unchanged, under the node's declared contract.
+        # Pass through unchanged, under the node's declared contract. In
+        # "all" mode, name the non-string fields that were never sent for
+        # analysis so "validated" does not read as a whole-row verdict.
+        success_reason: TransformSuccessReason = {"action": "validated"}
+        unscanned = unscanned_field_warnings(self._fields, row)
+        if unscanned:
+            success_reason["validation_warnings"] = unscanned
         return TransformResult.success(
             PipelineRow(row.to_dict(), self._align_output_contract(self._apply_declared_output_field_contracts(row.contract))),
-            success_reason={"action": "validated"},
+            success_reason=success_reason,
         )
 
     def _analyze_field_once(
@@ -490,6 +503,21 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
             {
                 "reason": "shutdown_requested",
                 "error": "Azure safety capacity retry stopped because transform shutdown was requested",
+                "elapsed_seconds": elapsed,
+                "max_seconds": self._max_capacity_retry_seconds,
+            },
+            retryable=False,
+        )
+
+    def _row_deadline_result(self, field_name: str, started_at: float) -> TransformResult:
+        """Build the row result for a field left unscanned because the row deadline passed."""
+        elapsed = time.monotonic() - started_at
+        return TransformResult.error(
+            {
+                "reason": "retry_timeout",
+                "error": "Azure safety row deadline passed before this field was scanned",
+                "error_type": "row_deadline_exceeded",
+                "field": field_name,
                 "elapsed_seconds": elapsed,
                 "max_seconds": self._max_capacity_retry_seconds,
             },

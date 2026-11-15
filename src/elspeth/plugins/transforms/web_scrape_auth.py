@@ -17,6 +17,10 @@ _RESERVED_HEADERS = frozenset(
         "cookie",
         "host",
         "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-connection",
+        "forwarded",
         "content-length",
         "content-type",
         "transfer-encoding",
@@ -32,6 +36,8 @@ _RESERVED_HEADERS = frozenset(
         "x-scraping-reason",
     }
 )
+# Proxy-forwarding metadata is rewritten or stripped by intermediaries.
+_RESERVED_HEADER_PREFIXES = ("x-forwarded-",)
 
 
 class WebScrapeAuthConfig(BaseModel):
@@ -58,7 +64,8 @@ class WebScrapeAuthConfig(BaseModel):
             raise ValueError("auth.header_name is only valid for api_key")
         if self.scheme == "api_key":
             header_name = self.header_name or "X-API-Key"
-            if _HEADER_NAME.fullmatch(header_name) is None or header_name.casefold() in _RESERVED_HEADERS:
+            folded = header_name.casefold()
+            if _HEADER_NAME.fullmatch(header_name) is None or folded in _RESERVED_HEADERS or folded.startswith(_RESERVED_HEADER_PREFIXES):
                 raise ValueError("auth.header_name is not an allowed API-key header")
         return self
 
@@ -74,6 +81,8 @@ class WebScrapeAuthConfig(BaseModel):
         if self.scheme == "bearer" and " " in credential:
             raise ValueError("auth bearer credential must not contain spaces")
         if self.scheme == "basic":
+            if ":" not in credential:
+                raise ValueError("auth basic credential must be user-id:password (RFC 7617)")
             encoded = base64.b64encode(credential.encode("ascii")).decode("ascii")
             return "Authorization", f"Basic {encoded}"
         if self.scheme == "bearer":

@@ -50,6 +50,7 @@ const NETWORK_FETCH_PLUGINS = new Set([
   "azure_content_safety",
   "azure_prompt_shield",
   "azure_document_intelligence",
+  "azure_content_understanding",
 ]);
 
 /** True if `pluginName` is classified as reaching the network, per the

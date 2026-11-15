@@ -1496,10 +1496,14 @@ class TestRuntimePreflight:
             assert "content_type" not in message
 
     def test_preflight_error_message_omits_request_url(self, audit_recorder: FakeAuditRecorder) -> None:
-        """Configurable base URLs can carry query strings; exception text must not copy them."""
+        """Configurable base URLs can carry path text; exception text must not copy them.
+
+        (Query strings and fragments are rejected at validation, so the
+        secret-shaped segment rides in the path.)
+        """
         provider = OpenRouterLLMProvider(
             api_key="test-key",
-            base_url="https://openrouter.ai/api/v1?token=sk-or-v1-url-secret",
+            base_url="https://openrouter.ai/api/v1/sk-or-v1-url-secret",
             timeout_seconds=30.0,
             recorder=audit_recorder,
             run_id="run-1",

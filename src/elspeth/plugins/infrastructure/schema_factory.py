@@ -18,22 +18,38 @@ from pydantic import ConfigDict, create_model, model_validator
 from pydantic_core import PydanticCustomError
 
 from elspeth.contracts import PluginSchema
-from elspeth.contracts.safe_validation_errors import NON_CANONICAL_NUMBER_ERROR_TYPE
+from elspeth.contracts.safe_validation_errors import NESTING_TOO_DEEP_ERROR_TYPE, NON_CANONICAL_NUMBER_ERROR_TYPE
 from elspeth.contracts.schema import FIELD_TYPE_MAP as TYPE_MAP
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+from elspeth.contracts.source_read_verification import MAX_JSON_DEPTH
 from elspeth.core.canonical import is_non_canonical_number
 
 # Type alias for extra field handling modes
 ExtraMode = Literal["allow", "forbid"]
 
 
-def _find_non_canonical_number_path(value: Any, path: str = "$") -> str | None:
+def _reject_too_deep(path: str) -> PydanticCustomError:
+    """Build the closed nesting-bound error; the path goes in as context, never into the template."""
+    return PydanticCustomError(
+        NESTING_TOO_DEEP_ERROR_TYPE,
+        "Nesting deeper than {max_depth} levels at {path}: the row cannot be walked or hashed into the audit trail.",
+        {"max_depth": MAX_JSON_DEPTH, "path": path},
+    )
+
+
+def _find_non_canonical_number_path(value: Any, path: str = "$", depth: int = 0) -> str | None:
     """Find the first path holding a number canonical JSON refuses by value.
 
     ``is_non_canonical_number`` decides (NaN/Infinity, an integer outside the
     JSON safe range ±(2**53-1), a NumPy value beyond the double range); this
     walker only finds where it is. Such a value cannot be hashed into the audit
     trail, so a source must quarantine the row that carries it.
+
+    The walk recurses once per container level, so it refuses a value nested
+    more than ``MAX_JSON_DEPTH`` containers deep (``depth`` counts the
+    containers above ``value``) with a ``nesting_too_deep`` validation error.
+    Without the bound a deeply nested Tier-3 row raised ``RecursionError``
+    out of ``model_validate`` and crashed the run instead of being quarantined.
     """
     # isinstance (not exact-type) so container/scalar subclasses cannot fail open:
     # a value nested in an OrderedDict/Mapping subclass or a namedtuple (tuple
@@ -42,16 +58,19 @@ def _find_non_canonical_number_path(value: Any, path: str = "$") -> str | None:
     if is_non_canonical_number(value):
         return path
 
+    if isinstance(value, (Mapping, list, tuple)) and depth >= MAX_JSON_DEPTH:
+        raise _reject_too_deep(path)
+
     if isinstance(value, Mapping):
         for key, nested in value.items():
-            nested_path = _find_non_canonical_number_path(nested, f"{path}.{key!s}")
+            nested_path = _find_non_canonical_number_path(nested, f"{path}.{key!s}", depth + 1)
             if nested_path is not None:
                 return nested_path
         return None
 
     if isinstance(value, (list, tuple)):
         for idx, nested in enumerate(value):
-            nested_path = _find_non_canonical_number_path(nested, f"{path}[{idx}]")
+            nested_path = _find_non_canonical_number_path(nested, f"{path}[{idx}]", depth + 1)
             if nested_path is not None:
                 return nested_path
         return None

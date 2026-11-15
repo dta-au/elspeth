@@ -172,7 +172,7 @@
             },
             {
               "default": null,
-              "description": "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. Any non-null override requires unique final generated names across all queries.",
+              "description": "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. Final generated names, including raw/usage/model fields, must be unique across all queries.",
               "kind": "text",
               "label": "structured_output_prefix",
               "name": "structured_output_prefix",
@@ -780,7 +780,7 @@
             },
             {
               "default": null,
-              "description": "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. Any non-null override requires unique final generated names across all queries.",
+              "description": "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. Final generated names, including raw/usage/model fields, must be unique across all queries.",
               "kind": "text",
               "label": "structured_output_prefix",
               "name": "structured_output_prefix",
@@ -1376,7 +1376,7 @@
             },
             {
               "default": null,
-              "description": "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. Any non-null override requires unique final generated names across all queries.",
+              "description": "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. Final generated names, including raw/usage/model fields, must be unique across all queries.",
               "kind": "text",
               "label": "structured_output_prefix",
               "name": "structured_output_prefix",
@@ -2001,7 +2001,7 @@
             },
             {
               "default": null,
-              "description": "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. Any non-null override requires unique final generated names across all queries.",
+              "description": "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. Final generated names, including raw/usage/model fields, must be unique across all queries.",
               "kind": "text",
               "label": "structured_output_prefix",
               "name": "structured_output_prefix",

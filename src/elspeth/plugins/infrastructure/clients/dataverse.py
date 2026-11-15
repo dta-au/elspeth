@@ -9,13 +9,17 @@ each HTTP call.
 
 from __future__ import annotations
 
+import email.utils
 import fnmatch
+import math
 import re
+import threading
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
-from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
@@ -72,6 +76,27 @@ _ADDITIONAL_DOMAIN_PATTERN = re.compile(
 # Maximum consecutive empty pages before pagination terminates.
 _MAX_CONSECUTIVE_EMPTY_PAGES = 3
 
+# Dataverse returns the FetchXML paging annotations only when the request asks
+# for them (Microsoft "Page results using FetchXml", Web API tab).
+_FETCHXML_PAGING_ANNOTATIONS = (
+    "Microsoft.Dynamics.CRM.fetchxmlpagingcookie",
+    "Microsoft.Dynamics.CRM.morerecords",
+)
+
+
+def _include_annotations_headers(annotations: tuple[str, ...]) -> dict[str, str]:
+    """Build the one Prefer header asking Dataverse for these instance annotations.
+
+    Dataverse omits every instance annotation (formatted values, lookup
+    metadata, FetchXML paging) unless the request names it in
+    ``Prefer: odata.include-annotations``. The names share one comma-separated
+    preference so a request never carries two Prefer headers. No annotations,
+    no header.
+    """
+    if not annotations:
+        return {}
+    return {"Prefer": f'odata.include-annotations="{",".join(annotations)}"'}
+
 
 class DataverseClientError(Exception):
     """Exception for Dataverse protocol-level errors.
@@ -83,6 +108,14 @@ class DataverseClientError(Exception):
 
     error_category is a typed classification set at the raise site,
     enabling structured audit recording without fragile string-matching.
+
+    retry_after is the delay in seconds a 429/503 response's Retry-After
+    header asked for (delta-seconds or HTTP-date form), so a retry path can
+    wait at least that long; None when the server named no usable delay.
+
+    throttle_waits are the seconds the client already waited on throttled
+    (429/503) responses before giving up with this error; empty when it
+    never waited.
     """
 
     def __init__(
@@ -95,6 +128,8 @@ class DataverseClientError(Exception):
         error_category: str = "protocol_error",
         request_url: str | None = None,
         request_headers: dict[str, str] | None = None,
+        retry_after: float | None = None,
+        throttle_waits: tuple[float, ...] = (),
     ) -> None:
         super().__init__(message)
         self.retryable = retryable
@@ -103,6 +138,45 @@ class DataverseClientError(Exception):
         self.error_category = error_category
         self.request_url = request_url
         self.request_headers = request_headers
+        self.retry_after = retry_after
+        self.throttle_waits = throttle_waits
+
+
+# Throttling statuses the client waits out in place (service-protection 429
+# and server-busy 503). A throttled request was rejected before execution, so
+# re-sending it is safe for GET and the idempotent upsert PATCH alike.
+_THROTTLE_STATUS_CODES = frozenset({429, 503})
+# Wait used when a throttled response names no Retry-After; doubled per wait
+# up to retry_after_cap, and never shorter than the server's Retry-After.
+_THROTTLE_INITIAL_BACKOFF_SECONDS = 1.0
+# Total seconds one request may spend waiting on throttled responses.
+DEFAULT_THROTTLE_WAIT_BUDGET_SECONDS = 300.0
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse an RFC 9110 Retry-After value (delta-seconds or HTTP-date) to seconds.
+
+    Tier 3: a response header. Returns None for an absent or unusable value;
+    an HTTP-date in the past means "now" (0.0).
+    """
+    if value is None:
+        return None
+    text = value.strip()
+    try:
+        seconds = float(text)
+    except ValueError:
+        try:
+            when = email.utils.parsedate_to_datetime(text)
+        except (TypeError, ValueError):
+            return None
+        if when.tzinfo is None:
+            # RFC 9110 HTTP-dates are GMT; parsedate_to_datetime returns a
+            # naive datetime for the obsolete "-0000" zone.
+            when = when.replace(tzinfo=UTC)
+        return max(0.0, (when - datetime.now(UTC)).total_seconds())
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return seconds
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +197,8 @@ class DataversePageResponse:
     next_link: str | None  # @odata.nextLink URL, if present (structured queries)
     paging_cookie: str | None  # FetchXML paging cookie, if present
     more_records: bool | None  # True/False if Dataverse stated it; None if field absent
+    # Seconds waited on throttled (429/503) responses before this response.
+    throttle_waits: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         if self.next_link is not None and self.paging_cookie is not None:
@@ -130,6 +206,73 @@ class DataversePageResponse:
                 "next_link and paging_cookie are mutually exclusive — OData queries use next_link, FetchXML queries use paging_cookie"
             )
         freeze_fields(self, "rows", "headers", "request_headers")
+
+
+def _fetchxml_page_one_may_be_truncated(root: ET.Element, row_count: int) -> bool:
+    """Whether an unannotated FetchXML page 1 could be a truncated result set.
+
+    ``top`` is documented as incompatible with paging, so a ``top`` query is a
+    complete result. An empty page or one shorter than ``count`` is the end.
+    A page that fills ``count``, or any non-empty page when ``count`` is unset
+    (the server default page size applies), may have more rows behind it.
+    """
+    if "top" in root.attrib or row_count == 0:
+        return False
+    count = root.get("count")
+    if count is None:
+        return True
+    try:
+        return row_count >= int(count)
+    except ValueError:
+        # Unreadable count: the page size is unknown, so assume it may be full.
+        return True
+
+
+def _extract_fetchxml_paging_cookie(page: DataversePageResponse, annotation: str) -> str:
+    """Parse the Tier 3 fetchxmlpagingcookie annotation into the cookie to send back.
+
+    Dataverse returns a wrapper element such as
+    ``<cookie pagenumber="2" pagingcookie="%253ccookie..." istracking="False" />``
+    (Microsoft "Page results using FetchXml", Web API tab). The paging cookie
+    is the wrapper's ``pagingcookie`` attribute, URL-encoded twice.
+    """
+
+    def _violation(detail: str) -> DataverseClientError:
+        return DataverseClientError(
+            f"FetchXML pagination: malformed '@Microsoft.Dynamics.CRM.fetchxmlpagingcookie' annotation — {detail}",
+            retryable=False,
+            error_category="protocol_violation",
+            status_code=page.status_code,
+            latency_ms=page.latency_ms,
+            request_url=page.request_url,
+            request_headers=page.request_headers,
+        )
+
+    try:
+        wrapper = ET.fromstring(annotation)
+    except ET.ParseError as exc:
+        raise _violation(f"not a parseable XML element ({exc})") from exc
+
+    encoded_cookie = wrapper.get("pagingcookie")
+    if encoded_cookie is None:
+        raise _violation(f"<{wrapper.tag}> element has no 'pagingcookie' attribute")
+    return urllib.parse.unquote(urllib.parse.unquote(encoded_cookie))
+
+
+def _https_origin(url: str) -> tuple[str, int] | None:
+    """The (lower-cased host, port) of an https URL, or None for any other URL.
+
+    An unreadable port (``ValueError`` from urllib) also yields None, so the
+    caller rejects it rather than guessing an origin.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme.lower() != "https" or parsed.hostname is None:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    return parsed.hostname.lower(), 443 if port is None else port
 
 
 class DataverseAuthConfig(BaseModel):
@@ -259,7 +402,10 @@ class DataverseClient:
         limiter: LimiterProtocol | None = None,
         retry_after_cap: float = 60.0,
         additional_domains: tuple[str, ...] = (),
-        before_request: Callable[[str], None] | None = None,
+        before_request: Callable[[str, Mapping[str, str]], None] | None = None,
+        throttle_wait_budget_seconds: float = DEFAULT_THROTTLE_WAIT_BUDGET_SECONDS,
+        shutdown_event: threading.Event | None = None,
+        on_throttle: Callable[[DataverseClientError, float], None] | None = None,
     ) -> None:
         raw_environment_url = environment_url.rstrip("/")
         parsed = urllib.parse.urlparse(raw_environment_url)
@@ -276,12 +422,18 @@ class DataverseClient:
             raise DataverseClientError(str(exc), retryable=False) from exc
 
         self._environment_url = safe_environment_url.rstrip("/")
+        self._environment_origin = _https_origin(self._environment_url)
         self._credential = credential
         self._api_version = api_version
         self._limiter = limiter
         self._retry_after_cap = retry_after_cap
         self._additional_domains = additional_domains
         self._before_request = before_request
+        self._throttle_wait_budget = throttle_wait_budget_seconds
+        # The run's cooperative-shutdown signal ends a throttle wait early; a
+        # private, never-set Event makes the wait a plain sleep otherwise.
+        self._shutdown_event = shutdown_event if shutdown_event is not None else threading.Event()
+        self._on_throttle = on_throttle
 
         # Validate environment_url against domain allowlist
         if not _validate_domain_allowlist(hostname, self._additional_domains):
@@ -392,11 +544,8 @@ class DataverseClient:
         """
         # 429: Rate limited — check Retry-After
         if status_code == 429:
-            retry_after_raw = headers.get("retry-after", "")
-            try:
-                retry_after = float(retry_after_raw)
-            except (ValueError, TypeError):
-                retry_after = 1.0
+            parsed_retry_after = _parse_retry_after(headers["retry-after"] if "retry-after" in headers else None)
+            retry_after = 1.0 if parsed_retry_after is None else parsed_retry_after
 
             # Clamp for classification: floor=1, ceiling=retry_after_cap
             effective = max(1.0, min(retry_after, self._retry_after_cap))
@@ -412,6 +561,7 @@ class DataverseClient:
                     latency_ms=latency_ms,
                     request_url=request_url,
                     request_headers=request_headers,
+                    retry_after=parsed_retry_after,
                 )
             return DataverseClientError(
                 f"Rate limited (429) with Retry-After {effective}s",
@@ -420,6 +570,7 @@ class DataverseClient:
                 latency_ms=latency_ms,
                 request_url=request_url,
                 request_headers=request_headers,
+                retry_after=parsed_retry_after,
             )
 
         # 401: Auth failure — retryable once via credential reconstruction
@@ -452,7 +603,8 @@ class DataverseClient:
                 request_headers=request_headers,
             )
 
-        # 5xx: Retryable server errors
+        # 5xx: Retryable server errors. A 503 is Dataverse's server-busy
+        # throttle and may name a Retry-After, carried like the 429's.
         if 500 <= status_code < 600:
             return DataverseClientError(
                 f"Server error ({status_code})",
@@ -461,6 +613,9 @@ class DataverseClient:
                 latency_ms=latency_ms,
                 request_url=request_url,
                 request_headers=request_headers,
+                retry_after=(
+                    _parse_retry_after(headers["retry-after"] if "retry-after" in headers else None) if status_code == 503 else None
+                ),
             )
 
         # Any other error status
@@ -473,6 +628,67 @@ class DataverseClient:
             request_headers=request_headers,
         )
 
+    def _send_with_throttle_retry(self, send: Callable[[], DataversePageResponse]) -> DataversePageResponse:
+        """Run one request via ``send``, waiting out throttled (429/503) responses.
+
+        A retryable 429/503 is re-sent after waiting at least the server's
+        Retry-After (and at least an exponential backoff starting at 1s,
+        capped at retry_after_cap, so Retry-After: 0 cannot spin). The waits
+        of one request share throttle_wait_budget_seconds: a wait that does
+        not fit the remaining budget is never slept — the throttled error is
+        raised (still retryable) instead. A set shutdown_event ends a wait
+        early the same way. on_throttle sees each waited-out throttled error
+        and its wait once the wait completes and before the re-send, so the
+        caller records that call (a throttled error that ends retrying is
+        instead raised, for the caller's error path to record once); the waits are also carried on the returned page
+        and on the final error as throttle_waits. Other errors are raised
+        unchanged on their first occurrence.
+        """
+        waits: list[float] = []
+        backoff = _THROTTLE_INITIAL_BACKOFF_SECONDS
+        while True:
+            try:
+                page = send()
+            except DataverseClientError as exc:
+                if not exc.retryable or exc.status_code not in _THROTTLE_STATUS_CODES:
+                    raise
+                wait = backoff if exc.retry_after is None else max(backoff, exc.retry_after)
+                spent = sum(waits)
+                if wait > self._throttle_wait_budget - spent:
+                    if not waits:
+                        raise
+                    raise self._throttle_stop(
+                        exc,
+                        waits,
+                        f"throttle wait budget of {self._throttle_wait_budget}s exhausted "
+                        f"(waited {spent}s over {len(waits)} wait(s); next wait {wait}s)",
+                    ) from exc
+                if self._shutdown_event.wait(timeout=wait):
+                    raise self._throttle_stop(exc, waits, "shutdown requested during throttle wait") from exc
+                waits.append(wait)
+                if self._on_throttle is not None:
+                    self._on_throttle(exc, wait)
+                backoff = min(backoff * 2.0, self._retry_after_cap)
+                continue
+            if waits:
+                return replace(page, throttle_waits=tuple(waits))
+            return page
+
+    @staticmethod
+    def _throttle_stop(exc: DataverseClientError, waits: list[float], why: str) -> DataverseClientError:
+        """The still-retryable error that ends throttle retrying without another send."""
+        return DataverseClientError(
+            f"{exc} — {why}",
+            retryable=True,
+            status_code=exc.status_code,
+            latency_ms=exc.latency_ms,
+            error_category=exc.error_category,
+            request_url=exc.request_url,
+            request_headers=exc.request_headers,
+            retry_after=exc.retry_after,
+            throttle_waits=tuple(waits),
+        )
+
     def _execute_request(
         self,
         method: str,
@@ -482,7 +698,7 @@ class DataverseClient:
         extra_headers: dict[str, str] | None = None,
         ssrf_safe: SSRFSafeRequest | None = None,
     ) -> DataversePageResponse:
-        """Execute an HTTP request against Dataverse.
+        """Execute one HTTP request against Dataverse.
 
         Handles auth header injection, rate limiting, response parsing,
         and error classification. Returns a validated DataversePageResponse.
@@ -507,14 +723,17 @@ class DataverseClient:
             DataverseClientError: For protocol-level errors
         """
         if self._before_request is not None:
-            self._before_request(url)
+            # The hook sees the non-auth headers this request adds, so a
+            # VERIFY preflight can rebuild the request exactly as recorded.
+            self._before_request(url, extra_headers or {})
         self._acquire_rate_limit()
 
         auth_headers = self.get_auth_headers()
         headers = {**auth_headers, **(extra_headers or {})}
-        # Fingerprint auth headers early so every error path can carry
-        # request metadata for accurate audit trail recording.
-        fingerprinted = fingerprint_headers(auth_headers)
+        # Fingerprint every header that will be sent (sensitive values become
+        # fingerprints, the rest pass through) early so every error path can
+        # carry the request metadata for an accurate audit trail.
+        fingerprinted = fingerprint_headers(headers)
 
         # IP-pinning SSRF validation on every outbound request.
         # When ssrf_safe is pre-validated (e.g., from paginate_odata nextLink
@@ -730,10 +949,10 @@ class DataverseClient:
                     request_headers=fingerprinted,
                 )
         else:
-            # Field absent — record the absence, don't infer.
+            # Field absent — record the absence, don't infer here.
             # OData queries don't include morerecords (uses nextLink instead).
-            # FetchXML queries should always include it — absence there is
-            # an anomaly the consumer should detect, not one we paper over.
+            # FetchXML final pages omit it too; paginate_fetchxml interprets
+            # absence against the documented FetchXML contract.
             more_records = None
 
         return DataversePageResponse(
@@ -748,11 +967,12 @@ class DataverseClient:
             more_records=more_records,
         )
 
-    def get_page(self, url: str) -> DataversePageResponse:
+    def get_page(self, url: str, *, annotations: tuple[str, ...] = ()) -> DataversePageResponse:
         """Fetch a single page of data from Dataverse.
 
         Args:
             url: Full URL to fetch
+            annotations: Instance annotations to request via the Prefer header
 
         Returns:
             DataversePageResponse with validated page data
@@ -760,7 +980,8 @@ class DataverseClient:
         Raises:
             DataverseClientError: For protocol-level errors
         """
-        return self._execute_request("GET", url)
+        extra_headers = _include_annotations_headers(annotations)
+        return self._send_with_throttle_retry(lambda: self._execute_request("GET", url, extra_headers=extra_headers))
 
     def upsert(self, url: str, body: dict[str, Any]) -> DataversePageResponse:
         """PATCH upsert a record to Dataverse.
@@ -775,9 +996,9 @@ class DataverseClient:
         Raises:
             DataverseClientError: For protocol-level errors
         """
-        return self._execute_request("PATCH", url, json_body=body)
+        return self._send_with_throttle_retry(lambda: self._execute_request("PATCH", url, json_body=body))
 
-    def paginate_odata(self, initial_url: str) -> Iterator[DataversePageResponse]:
+    def paginate_odata(self, initial_url: str, *, annotations: tuple[str, ...] = ()) -> Iterator[DataversePageResponse]:
         """Paginate through structured OData query results.
 
         Follows @odata.nextLink URLs with SSRF validation and IP-pinning
@@ -786,6 +1007,8 @@ class DataverseClient:
 
         Args:
             initial_url: First page URL
+            annotations: Instance annotations to request on every page
+                (e.g. ``OData.Community.Display.V1.FormattedValue``)
 
         Yields:
             DataversePageResponse per page
@@ -797,9 +1020,15 @@ class DataverseClient:
         url = initial_url
         ssrf_safe: SSRFSafeRequest | None = None
         consecutive_empty = 0
+        extra_headers = _include_annotations_headers(annotations)
 
         while True:
-            page = self._execute_request("GET", url, ssrf_safe=ssrf_safe)
+            # Bind this hop's url and pinned IP (B023): the callable runs
+            # synchronously, but the loop rebinds both names for the next hop.
+            def send(hop_url: str = url, hop_ssrf: SSRFSafeRequest | None = ssrf_safe) -> DataversePageResponse:
+                return self._execute_request("GET", hop_url, extra_headers=extra_headers, ssrf_safe=hop_ssrf)
+
+            page = self._send_with_throttle_retry(send)
             yield page
 
             # Empty-page guard
@@ -824,16 +1053,36 @@ class DataverseClient:
             if page.next_link is None:
                 break
 
+            # The nextLink is Tier-3 data and the next request carries this
+            # environment's bearer token, so it must stay on the configured
+            # environment's https origin. The family-wide domain allowlist
+            # alone admits plaintext http and every other tenant's host.
+            if _https_origin(page.next_link) != self._environment_origin:
+                raise DataverseClientError(
+                    f"@odata.nextLink {fingerprint_url(page.next_link)!r} is not on the configured "
+                    f"environment's https origin — refusing to send credentials to it. "
+                    f"Possible SSRF attempt via @odata.nextLink redirection.",
+                    retryable=False,
+                    error_category="ssrf_rejected",
+                    request_url=page.next_link,
+                )
+
             # SSRF validate the nextLink and pin the resolved IP.
             # The returned SSRFSafeRequest is passed to _execute_request
             # so the HTTP call connects to the validated IP, preventing
             # DNS rebinding between validation and connection.
             if self._before_request is not None:
-                self._before_request(page.next_link)
+                self._before_request(page.next_link, extra_headers)
             ssrf_safe = self._validate_url_ssrf(page.next_link)
             url = page.next_link
 
-    def paginate_fetchxml(self, entity_set_name: str, fetch_xml: str) -> Iterator[DataversePageResponse]:
+    def paginate_fetchxml(
+        self,
+        entity_set_name: str,
+        fetch_xml: str,
+        *,
+        annotations: tuple[str, ...] = (),
+    ) -> Iterator[DataversePageResponse]:
         """Paginate through FetchXML query results.
 
         Uses paging cookie mechanism: injects cookie and page number into
@@ -844,6 +1093,8 @@ class DataverseClient:
         Args:
             entity_set_name: Dataverse EntitySetName for URL construction
             fetch_xml: FetchXML query string
+            annotations: Instance annotations to request in addition to the
+                FetchXML paging annotations, in the same Prefer header
 
         Yields:
             DataversePageResponse per page
@@ -868,30 +1119,58 @@ class DataverseClient:
             )
 
         current_page = 1
+        extra_headers = _include_annotations_headers(_FETCHXML_PAGING_ANNOTATIONS + annotations)
+
+        def fetch_current() -> DataversePageResponse:
+            encoded_xml = urllib.parse.quote(ET.tostring(root, encoding="unicode"))
+            url = f"{self._environment_url}/api/data/{self._api_version}/{entity_set_name}?fetchXml={encoded_xml}"
+            return self._send_with_throttle_retry(lambda: self._execute_request("GET", url, extra_headers=extra_headers))
 
         while True:
-            xml_str = ET.tostring(root, encoding="unicode")
-            encoded_xml = urllib.parse.quote(xml_str)
-            url = f"{self._environment_url}/api/data/{self._api_version}/{entity_set_name}?fetchXml={encoded_xml}"
-
-            page = self.get_page(url)
+            page = fetch_current()
             yield page
 
-            # Check if more records exist.
-            # FetchXML responses must include morerecords — its absence is a
-            # protocol anomaly we must not silently infer around.
+            # Check if more records exist. Per the Dataverse Web API contract
+            # the final page carries neither morerecords nor the paging
+            # cookie, so an absent morerecords means end of results. A cookie
+            # without morerecords matches no documented page shape.
             if page.more_records is None:
-                raise DataverseClientError(
-                    "FetchXML response missing '@Microsoft.Dynamics.CRM.morerecords' field "
-                    "— cannot determine pagination state. OData uses nextLink instead, "
-                    "but FetchXML pagination requires this field.",
-                    retryable=False,
-                    error_category="protocol_violation",
-                    status_code=page.status_code,
-                    latency_ms=page.latency_ms,
-                    request_url=page.request_url,
-                    request_headers=page.request_headers,
-                )
+                if page.paging_cookie is not None:
+                    raise DataverseClientError(
+                        "FetchXML response has a paging cookie but no "
+                        "'@Microsoft.Dynamics.CRM.morerecords' field — the documented final "
+                        "page carries neither annotation, so pagination state is contradictory.",
+                        retryable=False,
+                        error_category="protocol_violation",
+                        status_code=page.status_code,
+                        latency_ms=page.latency_ms,
+                        request_url=page.request_url,
+                        request_headers=page.request_headers,
+                    )
+                # Page-1 truncation guard. A server or proxy that ignored the
+                # Prefer header returns a full first page with no annotations,
+                # which is indistinguishable from a complete result set. Once
+                # any page carries annotations, Prefer is known to be honoured,
+                # so only page 1 is exposed. Probe page 2 once with simple
+                # paging (page number, no cookie): rows there mean the
+                # annotations were withheld; no rows means the end of results.
+                if current_page == 1 and _fetchxml_page_one_may_be_truncated(root, len(page.rows)):
+                    root.set("page", "2")
+                    probe = fetch_current()
+                    if probe.rows:
+                        raise DataverseClientError(
+                            "FetchXML pagination: paging annotations not honoured; refusing to truncate. "
+                            "Page 1 was full with no '@Microsoft.Dynamics.CRM.morerecords' annotation, "
+                            "but a simple-paging probe for page 2 returned rows.",
+                            retryable=False,
+                            error_category="protocol_violation",
+                            status_code=probe.status_code,
+                            latency_ms=probe.latency_ms,
+                            request_url=probe.request_url,
+                            request_headers=probe.request_headers,
+                        )
+                    yield probe
+                break
             if not page.more_records:
                 break
 
@@ -914,7 +1193,7 @@ class DataverseClient:
             # Inject paging cookie into the existing ET root.
             # The paging cookie is Tier 3 data — ET.set() handles
             # attribute escaping automatically (no string formatting).
-            decoded_cookie = urllib.parse.unquote(page.paging_cookie)
+            decoded_cookie = _extract_fetchxml_paging_cookie(page, page.paging_cookie)
 
             current_page += 1
             root.set("paging-cookie", decoded_cookie)

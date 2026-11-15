@@ -5,7 +5,12 @@ from __future__ import annotations
 import hashlib
 from functools import lru_cache
 from importlib import metadata
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+# The native PDFium library pypdfium2 ships in its platform wheels: Linux,
+# macOS and Windows respectively. The worker supports all three (its rlimits
+# are Linux-only and a no-op elsewhere), so the identity must too.
+_NATIVE_PDFIUM_NAMES = frozenset({"libpdfium.so", "libpdfium.dylib", "pdfium.dll"})
 
 
 @lru_cache(maxsize=1)
@@ -16,9 +21,12 @@ def renderer_identity() -> str:
     parent process. Replay does not call this function at all.
     """
     distribution = metadata.distribution("pypdfium2")
-    binary_files = [path for path in distribution.files or () if str(path).endswith("/libpdfium.so")]
+    binary_files = [path for path in distribution.files or () if PurePosixPath(str(path)).name in _NATIVE_PDFIUM_NAMES]
     if len(binary_files) != 1:
-        raise RuntimeError("PDF renderer identity requires exactly one installed libpdfium.so")
+        raise RuntimeError(
+            f"PDF renderer identity requires exactly one installed native PDFium binary "
+            f"({', '.join(sorted(_NATIVE_PDFIUM_NAMES))}); found {len(binary_files)}"
+        )
     module_dir = Path(__file__).resolve().parent
     owned_files = (
         module_dir / "protocol.py",
