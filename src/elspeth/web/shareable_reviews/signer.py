@@ -195,7 +195,10 @@ class ShareTokenSigner:
         function deliberately raises with generic messages — see ``InvalidToken``.
         """
         try:
-            blob = base64.urlsafe_b64decode(token.encode("ascii"))
+            token_bytes = token.encode("ascii")
+            if any(character not in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_=" for character in token_bytes):
+                raise ValueError("non-URL-safe base64 character")
+            blob = base64.b64decode(token_bytes, altchars=b"-_", validate=True)
         except (binascii.Error, ValueError) as exc:
             raise InvalidToken("malformed token") from exc
         if len(blob) < _LENGTH_PREFIX_BYTES + _SIGNATURE_BYTES:
