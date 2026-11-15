@@ -2023,7 +2023,7 @@ def validate_transform_string_typed_input_fields(graph: ExecutionGraph) -> None:
     from it dies at this node, whatever the other inbound paths carry.
 
     ``NodeInfo`` enforces the same boundary by guarding
-    ``declared_string_input_fields`` to TRANSFORM nodes.
+    ``declared_string_input_fields`` to TRANSFORM and AGGREGATION nodes.
 
     Names are compared as written. A header spelling of a scanned field
     (``Count`` for ``count``) never reaches this check against a closed
@@ -2036,7 +2036,7 @@ def validate_transform_string_typed_input_fields(graph: ExecutionGraph) -> None:
     """
     for node_id, data in graph._graph.nodes(data=True):
         info = data["info"]
-        if info.node_type != NodeType.TRANSFORM:
+        if info.node_type not in (NodeType.TRANSFORM, NodeType.AGGREGATION):
             continue
 
         declared = info.declared_string_input_fields
@@ -2058,16 +2058,16 @@ def validate_transform_string_typed_input_fields(graph: ExecutionGraph) -> None:
 
             described = ", ".join(f"'{name}' is declared {field_type}" for name, field_type in mismatches)
             raise GraphValidationError(
-                f"Transform '{info.plugin_name}' (node '{node_id}') scans input "
+                f"{'Aggregation' if info.node_type == NodeType.AGGREGATION else 'Transform'} "
+                f"'{info.plugin_name}' (node '{node_id}') scans input "
                 f"fields that must be text, but its upstream '{predecessor_id}' "
                 f"declares them non-string: {described}. The transform fails "
                 f"closed on any non-string value in an explicitly configured "
-                f"scan field, so every row from this producer is quarantined "
-                f"and the pipeline fails on the first row. "
-                f"Fix: point the scan option ('fields', or 'source_field' for "
-                f"document intelligence) at a text column, or declare the "
+                f"input field, so every row from this producer reaches a failed "
+                f"transform or batch. "
+                f"Fix: point the configured input field at a text column, or declare the "
                 f"field as 'str' in the upstream schema if the values are "
                 f"genuinely text.",
                 component_id=str(node_id),
-                component_type="transform",
+                component_type="aggregation" if info.node_type == NodeType.AGGREGATION else "transform",
             )

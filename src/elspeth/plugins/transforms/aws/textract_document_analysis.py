@@ -342,8 +342,8 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     output_naming_config_keys = frozenset({"text_field", "page_count_field", "metadata_field", "result_field"})
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
-    plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a5f1d2416cbcdc3d"
+    plugin_version = "2.0.0"
+    source_file_hash: str | None = "sha256:9eca8d5ef4c1e874"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -391,6 +391,12 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         super().__init__(config)
         cfg = AWSTextractDocumentAnalysisConfig.from_dict(config, plugin_name=self.name)
         self._initialize_declared_input_fields(cfg)
+        string_fields = {cfg.key_field}
+        if cfg.bucket_field is not None and cfg.bucket is None:
+            string_fields.add(cfg.bucket_field)
+        if cfg.version_field is not None:
+            string_fields.add(cfg.version_field)
+        self.declared_string_input_fields = frozenset(string_fields)
         self._cfg = cfg
 
         self._region = cfg.region

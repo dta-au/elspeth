@@ -277,8 +277,8 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
     output_naming_config_keys = frozenset({"text_field", "page_count_field", "metadata_field", "result_field"})
     name = "aws_textract_inline_analysis"
     determinism = Determinism.EXTERNAL_CALL
-    plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:90beb1e1b3308d91"
+    plugin_version = "2.0.0"
+    source_file_hash: str | None = "sha256:672b761d01711c8f"
     config_model = AWSTextractInlineAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -325,6 +325,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         super().__init__(config)
         cfg = AWSTextractInlineAnalysisConfig.from_dict(config, plugin_name=self.name)
         self._initialize_declared_input_fields(cfg)
+        self.declared_string_input_fields = frozenset({cfg.blob_ref_field})
         self._cfg = cfg
 
         self._region = cfg.region
