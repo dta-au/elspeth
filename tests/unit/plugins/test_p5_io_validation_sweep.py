@@ -306,6 +306,51 @@ def test_s3_jsonl_utf16_bad_code_unit_quarantines_only_its_line() -> None:
     assert rows[1].row["__line_number__"] == 2
 
 
+def test_s3_jsonl_first_line_crlf_split_at_third_skip_chunk_keeps_next_row_index() -> None:
+    """Review reproduction: a 41-char first line at a 20-char limit ends its third chunk on CR.
+
+    The LF that the next read returns completes that terminator; the valid second line
+    must keep source_row_index 1.
+    """
+    oversized = b'{"id":"' + b"x" * 32 + b'"}'
+    assert len(oversized) == 41
+    payload = oversized + b'\r\n{"id":2}\r\n'
+
+    rows = _s3(payload, format="jsonl", max_record_chars=20)
+
+    assert _shape(rows) == [(True, 0), (False, 1)]
+    assert rows[1].row == {"id": 2}
+
+
+@pytest.mark.parametrize("tail", ["bad-unit-then-next-line", "bad-unit-past-decoder-buffer", "odd-byte-at-eof"])
+def test_s3_jsonl_utf16_oversized_line_with_undecodable_remainder_is_quarantined(tail: str) -> None:
+    """Skipping the rest of an oversized line must not raise on bytes the codec cannot decode.
+
+    The undecodable bytes sit after the record limit, so only skip_rest_of_line reads
+    them. Raising there escaped the oversized-record handler and aborted the run. The
+    past-decoder-buffer case puts the bad unit beyond the wrapper's first ~8 KiB read.
+    """
+    filler = 10_000 if tail == "bad-unit-past-decoder-buffer" else 40
+    oversized = ('{"id":"' + "x" * filler + '"}').encode("utf-16-le")
+    head = b"\xff\xfe" + '{"id":1}\n'.encode("utf-16-le")
+    if tail in ("bad-unit-then-next-line", "bad-unit-past-decoder-buffer"):
+        payload = head + oversized + b"\x00\xd8" + '\n{"id":3}\n'.encode("utf-16-le")
+        expected = [(False, 0), (True, 1), (False, 2)]
+    else:
+        payload = head + oversized + b"\x41"
+        expected = [(False, 0), (True, 1)]
+
+    try:
+        rows = _s3(payload, format="jsonl", json_options={"encoding": "utf-16"}, max_record_chars=20)
+    except UnicodeDecodeError as exc:
+        pytest.fail(f"run aborted while skipping the oversized line instead of quarantining it: {exc}")
+
+    assert _shape(rows) == expected
+    assert rows[0].row == {"id": 1}
+    if tail != "odd-byte-at-eof":
+        assert rows[2].row == {"id": 3}
+
+
 @pytest.mark.parametrize(("fmt", "body"), [("jsonl", b'{"id":1}\n{"id":2}\n'), ("json", b'[{"id":1},{"id":2}]')])
 def test_s3_json_strips_a_leading_utf8_bom(fmt: str, body: bytes) -> None:
     rows = _s3(_BOM + body, format=fmt)
