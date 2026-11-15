@@ -300,6 +300,19 @@ class TestFamilyDeclarations:
 
         assert transform.declared_string_input_fields == frozenset({"doc_url"})
 
+    def test_truncate_declares_fields(self) -> None:
+        """truncate requires every configured field present and string-valued (plugin review #146).
+
+        It declares that exactly like the scanners: its ``fields`` keys are
+        string-typed declared inputs, with no rules of its own.
+        """
+        from elspeth.plugins.transforms.truncate import Truncate
+
+        transform = Truncate({"fields": {"title": 5, "notes": 80}, "schema": {"mode": "observed"}})
+
+        assert transform.declared_string_input_fields == frozenset({"title", "notes"})
+        assert frozenset({"title", "notes"}) <= transform.declared_read_fields
+
 
 # ---------------------------------------------------------------------------
 # Production build path — projection wiring, end to end (the g11 repro)
@@ -392,3 +405,59 @@ class TestBedrockShieldBuildPath:
         transform_nodes = [data["info"] for _nid, data in graph._graph.nodes(data=True) if data["info"].node_type == NodeType.TRANSFORM]
         assert len(transform_nodes) == 1
         assert transform_nodes[0].declared_string_input_fields == frozenset({"sentence_num"})
+
+
+def _truncate_settings(*, field_spec: str) -> Any:
+    """Fixed-mode CSV source -> truncate on its only column (plugin review #146)."""
+    from elspeth.core.config import (
+        ElspethSettings,
+        SinkSettings,
+        SourceSettings,
+        TransformSettings,
+    )
+
+    return ElspethSettings(
+        sources={
+            "primary": SourceSettings(
+                plugin="csv",
+                on_success="seed_rows",
+                options={
+                    "path": "seed.csv",
+                    "on_validation_failure": "discard",
+                    "schema": {"mode": "fixed", "fields": [field_spec]},
+                },
+            )
+        },
+        transforms=[
+            TransformSettings(
+                name="trim",
+                plugin="truncate",
+                input="seed_rows",
+                on_success="output",
+                on_error="discard",
+                options={"fields": {"count": 3}, "schema": {"mode": "observed"}},
+            )
+        ],
+        sinks={
+            "output": SinkSettings(
+                plugin="json",
+                on_write_failure="discard",
+                options={"path": "out.jsonl", "format": "jsonl", "schema": {"mode": "observed"}},
+            )
+        },
+    )
+
+
+class TestTruncateBuildPath:
+    """truncate fails every non-string value, so a provably non-string producer must not build."""
+
+    def test_truncate_on_declared_int_field_is_rejected(self, plugin_manager: Any) -> None:
+        """Before #146 this built green and then failed 100% of rows with type_mismatch."""
+        with pytest.raises(GraphValidationError, match="'count' is declared int"):
+            _build(_truncate_settings(field_spec="count: int"))
+
+    def test_truncate_on_declared_str_field_builds(self, plugin_manager: Any) -> None:
+        graph = _build(_truncate_settings(field_spec="count: str"))
+
+        transform_nodes = [data["info"] for _nid, data in graph._graph.nodes(data=True) if data["info"].node_type == NodeType.TRANSFORM]
+        assert [info.declared_string_input_fields for info in transform_nodes] == [frozenset({"count"})]
