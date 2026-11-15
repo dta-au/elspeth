@@ -90,6 +90,28 @@ class TestRowContext:
 class TestPooledExecutorBatch:
     """Test batch execution with ordering."""
 
+    def test_empty_batches_leave_buffer_and_stats_unchanged(self) -> None:
+        executor = PooledExecutor(PoolConfig(pool_size=1))
+
+        def process(row: dict[str, Any], state_id: str) -> TransformResult:
+            return TransformResult.success(make_pipeline_row(dict(row)), success_reason={"action": "processed"})
+
+        try:
+            executor.execute_batch([RowContext(row={"value": 1}, state_id="state-1", row_index=0)], process)
+            buffer = executor._buffer
+            stats = executor.get_stats()
+
+            assert executor.execute_batch([], process) == []
+            assert executor._buffer is buffer
+            assert executor.get_stats() == stats
+
+            with pytest.raises(ValueError, match="execute_batch_with_context requires at least one row context"):
+                executor.execute_batch_with_context([], process)
+            assert executor._buffer is buffer
+            assert executor.get_stats() == stats
+        finally:
+            executor.shutdown()
+
     def test_execute_batch_returns_results_in_order(self) -> None:
         """Results should be in submission order regardless of completion."""
         import time

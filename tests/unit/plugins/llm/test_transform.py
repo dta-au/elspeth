@@ -103,6 +103,16 @@ class _ExecutorDouble:
     def get_stats(self) -> dict[str, Any]:
         return _pool_stats_double()
 
+    def execute_batch_with_context(self, *args: Any, **kwargs: Any) -> Any:
+        from elspeth.contracts.node_state_context import PoolExecutionContext
+        from elspeth.plugins.infrastructure.pooling.executor import BatchExecutionResult
+
+        entries = self.execute_batch(*args, **kwargs)
+        return BatchExecutionResult(
+            entries=tuple(entries),
+            context=PoolExecutionContext.from_executor_stats(self.get_stats(), entries),
+        )
+
 
 class _RegistryDouble:
     def __init__(self) -> None:
