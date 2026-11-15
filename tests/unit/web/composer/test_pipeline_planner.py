@@ -334,6 +334,12 @@ _CDA04_REVIEWED_SLOT_CANONICAL_BYTES = 153
 # diff_pipeline declaration by 762 canonical bytes; the skill paragraph is not
 # carried in this planner request. Preserve the existing 17-byte headroom.
 _CDA02B_DIFF_GUIDANCE_CANONICAL_BYTES = 762
+# BATCH-GA (2026-11-15): ordinary web-policy fixed scaffolding grew by a
+# measured +1,335 canonical bytes (119,627 -> 120,962 on the pre-3.14 base)
+# when the three batch plugins became required. The maintainer ruled the same
+# day that there is no strict byte allowance: a pin moves by the measured
+# amount. Preserve the baseline and overflow control.
+_BATCH_GA_CATALOG_CANONICAL_BYTES = 1335
 # azure_content_understanding transform catalog entry (2026-11-11), awaiting
 # maintainer review like the allowances above: measured with the same live
 # request, removing only that entry from the discovery digest and its name
@@ -370,6 +376,7 @@ _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     + _VALIDATED_DIFF_BASELINE_CANONICAL_BYTES
     + _CDA04_REVIEWED_SLOT_CANONICAL_BYTES
     + _CDA02B_DIFF_GUIDANCE_CANONICAL_BYTES
+    + _BATCH_GA_CATALOG_CANONICAL_BYTES
     + _CONTENT_UNDERSTANDING_CATALOG_CANONICAL_BYTES
     + _DRIFT_COMPARE_CHI_SQUARE_DISCLOSURE_CANONICAL_BYTES
 )

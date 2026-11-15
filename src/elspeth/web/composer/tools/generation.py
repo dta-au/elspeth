@@ -998,7 +998,11 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "INTERSECTION of its arms; a union coalesce the intersection of its participating branches, or their UNION under "
         "policy require_all. A nested coalesce guarantees only its branch NAMES, only under require_all, never their "
         "inner fields.",
-        "Make 'producer' guarantee every 'missing_fields' name (patch_source_options for a source — source_name is the "
+        "First check whether the consumer creates the missing field itself. For batch_replicate with "
+        "include_copy_index=true, copy_index is an OUTPUT field: remove it from the consumer's input schema "
+        "(fields, required_fields, and guaranteed_fields) via patch_node_options, resending the full schema; "
+        "do not add it to the source. Otherwise, make 'producer' guarantee every 'missing_fields' name "
+        "(patch_source_options for a source — source_name is the "
         "part after 'source:', bare 'source' is the default; patch_node_options for a transform, aggregation or "
         "collector). A queue, row_union, or non-require_all union coalesce is named only by its id: find its arms in your "
         "candidate and add the field to EVERY arm (one for a require_all union). Nested coalesce with policy require_all: "
