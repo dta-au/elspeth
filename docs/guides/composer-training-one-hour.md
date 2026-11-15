@@ -189,6 +189,7 @@ human response after a change commits.
   page, have an LLM write a short summary of the page. Remove the raw HTML and
   write the rows to a JSON file named project_brief_summaries.json."
 - It is the *same* machinery as every real session — its only privilege is a frozen prompt (ADR-031).
+- After the brief is sent, the Build step offers only the card decisions the script needs: no chat input, and no `Change…` on the interpretation card.
 - `Composer preferences → Reset tutorial` brings it back any time.
 
 *Notes.* Two ways to use it. **(A) Pre-work:** ask participants to complete it
