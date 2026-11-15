@@ -97,6 +97,7 @@ from elspeth.web.composer.context_budget import (
     SheddableSegment,
     decide_context_budget,
     escaped_bytes,
+    protected_reference_bytes,
 )
 from elspeth.web.composer.context_budget_apply import (
     CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
@@ -3548,7 +3549,9 @@ def _fit_planner_context_budget(
             anchor_shared_bytes=anchor.shared_bytes,
             anchor_wire_bytes=anchor.wire_bytes,
             anchor_status=anchor.reason,
-            authored_bytes=shipped_skill_bytes + (message_wire_split([], scratch_tools).tools_bytes or 0),
+            authored_bytes=shipped_skill_bytes
+            + (message_wire_split([], scratch_tools).tools_bytes or 0)
+            + protected_reference_bytes(scratch_messages, excluded_positions=frozenset({0, *mutable_positions})),
             bytes_per_token=history.ratio_for(model),
             previously_shed=previously_shed_keys(history, earlier_calls),
             held=held_tool_keys(earlier_calls),
@@ -3567,7 +3570,7 @@ def _fit_planner_context_budget(
         ) from refusal
     record = ComposerContextBudgetRecord.from_shed_keys(
         policy_hash=decision.policy_hash,
-        bytes_per_token=decision.bytes_per_token,
+        bytes_per_token=(policy.fallback_bytes_per_token if decision.pricing.mode == "authored_prefix" else 1.0),
         estimated_tokens_before=decision.estimated_tokens_before,
         estimated_tokens_after=decision.estimated_tokens_after,
         request_wire_bytes=decision.request_bytes_after,

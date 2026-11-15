@@ -125,7 +125,8 @@ successful provider call in the same exchange, on the same model and tool
 dialect, when its exact private request capture and usable prompt count exist.
 Historical session ratios remain readable diagnostics, not admission inputs.
 
-`estimated_tokens = min(wire_bytes, anchor_tokens + wire_bytes - shared_bytes)`.
+`estimated_tokens = min(wire_bytes - authored_bytes + ceil(authored_bytes / fallback_bytes_per_token), anchor_tokens + wire_bytes - shared_bytes)`
+when an anchor is usable; without one, use the authored arm alone.
 
 Shared bytes are entire unchanged protected messages and an unchanged tool
 block, matched with multiplicity. Any message that can be shed, stubbed or
@@ -136,7 +137,7 @@ assumes unchanged independently framed messages/tools on the same provider
 route retain their tokenization and the reported count includes their cost.
 Hidden provider expansion is outside the byte bound.
 
-Without a usable anchor, the shipped skill core, owned tool definitions,
+With or without an anchor, the shipped skill core, owned tool definitions,
 catalogue and producer-labelled nominal schema references in protected compose
 messages are priced at the policy's fallback of 3 wire bytes per token. Their
 producers supply their provenance; no text classifier decides authorship.
@@ -146,9 +147,9 @@ remain entirely byte-priced so savings cannot exceed their token charge.
 Counts must be positive exact integers between `ceil(bytes / 8)` and `bytes`;
 rejected counts and unavailable private-capture reasons are recorded. The
 plausibility check can reject valid highly compressible content safely.
-Separately reported cached, cache-read and cache-creation counts are added.
-This can double-count adapters whose prompt count already includes them;
-under-reported usage with no separate counters cannot be detected reliably.
+Separately reported cached, cache-read and cache-creation counts are treated
+as breakdowns of the provider prompt total, not added to it. Under-reported
+usage with no separate counters cannot be detected reliably.
 The original skill/tools-only measurement of the default first request was
 291,347 wire bytes, 62,626 o200k tokens and a 145,593-token estimate. Catalogue
 and nominal-schema classification further reduces that estimate. The nominal
@@ -293,7 +294,9 @@ On every budgeted composer call record and in the public call envelope,
 beside `request_byte_split`, a `context_budget` record:
 
 - `policy_hash`;
-- `bytes_per_token`, the legacy ratio field (1.0 for v2);
+- `bytes_per_token`, the legacy ratio field (the fallback rate for newly emitted
+  authored-arm records, 1.0 for anchored or conservative growth). Historical
+  authored-arm records may contain `"1.0"` and are not rewritten;
 - `pricing_mode` (`anchored`, `conservative`, or `authored_prefix`), `anchor_status`,
   `anchor_prompt_tokens`, `anchor_wire_bytes`, `anchor_shared_bytes`, and
   `decision_wire_bytes` / `decision_wire_bytes_after` (including allowances),

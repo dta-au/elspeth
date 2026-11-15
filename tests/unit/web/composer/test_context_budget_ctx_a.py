@@ -416,16 +416,21 @@ def test_static_authorship_prices_only_explicitly_labelled_bytes():
         decide(2000)
 
 
+@pytest.mark.parametrize("model", ["anthropic/claude-sonnet-4.5", "bedrock/converse/claude-sonnet-4.5", "openai/gpt-4o"])
 @pytest.mark.parametrize("cache_field", ["cached_prompt_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"])
-def test_anchor_includes_separately_reported_cached_usage(cache_field):
+def test_anchor_does_not_double_count_normalized_cached_usage(model, cache_field):
     messages = [{"role": "system", "content": "normal prose " * 200}]
     call = replace(
-        _earlier_call(()), prompt_tokens=500, private_request=capture_provider_context(messages=messages, tools=None), **{cache_field: 200}
+        _earlier_call(()),
+        model_requested=model,
+        prompt_tokens=500,
+        private_request=capture_provider_context(messages=messages, tools=None),
+        **{cache_field: 200},
     )
     anchor = request_anchor(
         calls=[call], model=call.model_requested, dialect=None, messages=messages, tools=None, mutable_positions=frozenset()
     )
-    assert anchor.tokens == 700
+    assert anchor.tokens == 500
 
 
 @pytest.mark.parametrize("numerator,accepted", [(1, False), (2, True)])
@@ -568,6 +573,58 @@ def test_compose_anchor_excludes_state_and_reply_messages(reply_stage):
     expected = 2 + sum(len(canonical_json(sent[i]).encode()) for i in ((0, 1) if reply_stage else (0, 1, 5)))
     assert record.anchor_shared_bytes == expected
     assert record.pricing_mode == "anchored"
+
+
+@pytest.mark.parametrize("reply_stage", [False, True])
+def test_freeform_authored_allowance_excludes_sheddable_labels(reply_stage):
+    from elspeth.contracts.prompt_guard import PROMPT_GUARD_CONTENT_PARTS_KEY, PromptGuardContentPart, PromptGuardTrust
+    from tests.unit.web.composer.test_compose_loop_context_budget import _tool_round
+
+    service, _ = _service(10_000_000)
+    service._context_budget_policy = replace(service._context_budget_policy, fallback_bytes_per_token=3.0)
+    snapshot, catalog = service._policy_context.build("test-user")
+    state = _empty_state()
+    chat = [_user(0, "Earlier request " * 100), _assistant("Earlier reply " * 100)]
+    base = service._build_messages(chat, state, "Current request", plugin_snapshot=snapshot, policy_catalog=catalog)
+    frame = service._context_budget_frame(
+        chat_history=chat,
+        llm_messages=base,
+        state=state,
+        session_id=None,
+        plugin_snapshot=snapshot,
+        policy_catalog=catalog,
+        history=ContextBudgetHistory.empty(),
+    )
+    messages = [*base, *_tool_round("old-result", "older schema " * 200), *_tool_round("latest-result", "latest schema " * 100)]
+    history_index = next(
+        frame.state_index - len(frame.history_entries) + position
+        for position, (_chat_index, kind) in enumerate(frame.history_entries)
+        if kind is not None
+    )
+    older_result_index = next(index for index, message in enumerate(messages) if message.get("tool_call_id") == "old-result")
+    latest_result_index = next(index for index, message in enumerate(messages) if message.get("tool_call_id") == "latest-result")
+
+    def allowance(labelled: tuple[int, ...]) -> int:
+        candidate = deepcopy(messages)
+        for index in labelled:
+            candidate[index][PROMPT_GUARD_CONTENT_PARTS_KEY] = (
+                PromptGuardContentPart(candidate[index]["content"], PromptGuardTrust.REFERENCE),
+            )
+        recorder = BufferingRecorder()
+        _, record, _ = service._shed_to_context_budget(
+            messages=candidate,
+            tools=[],
+            frame=frame,
+            recorder=recorder,
+            refusal_scope=_ContextBudgetRefusalScope(state, state.version, 0, 0, None, recorder),
+            reply_stage=reply_stage,
+        )
+        assert record.bytes_per_token == repr(3.0)
+        return record.authored_bytes
+
+    baseline = allowance(())
+    assert allowance((history_index, older_result_index)) == baseline
+    assert allowance((history_index, older_result_index, latest_result_index)) > baseline
 
 
 @pytest.mark.parametrize("hatch", [False, True])

@@ -9,12 +9,13 @@ translate messages into :class:`SheddableSegment` and apply the decision.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final, Literal
 
 from elspeth.contracts.composer_llm_audit import ContextBudgetAnchorStatus
+from elspeth.contracts.prompt_guard import PROMPT_GUARD_TRUST_KEY, PromptGuardTrust, detach_prompt_guard_evidence
 from elspeth.core.canonical import canonical_json, stable_hash
 
 CONTEXT_BUDGET_FALLBACK_BYTES_PER_TOKEN: Final[float] = 3.0
@@ -39,6 +40,23 @@ def escaped_bytes(text: str) -> int:
     content (a serialized payload or transcript) with it.
     """
     return len(canonical_json(text).encode("utf-8")) - 2
+
+
+def protected_reference_bytes(messages: Sequence[Mapping[str, object]], *, excluded_positions: frozenset[int]) -> int:
+    """Count only producer-labelled reference content in protected messages."""
+    evidence = detach_prompt_guard_evidence(messages)
+    total = 0
+    for index, message in enumerate(messages):
+        if index in excluded_positions:
+            continue
+        if message.get(PROMPT_GUARD_TRUST_KEY) is PromptGuardTrust.REFERENCE:
+            content = message["content"]
+            if type(content) is not str:
+                raise ValueError("producer-labelled reference content must be text")
+            total += escaped_bytes(content)
+        elif (parts := evidence.content_parts[index]) is not None:
+            total += sum(escaped_bytes(part.text) for part in parts if part.trust is PromptGuardTrust.REFERENCE)
+    return total
 
 
 class SheddableKind(StrEnum):
@@ -182,8 +200,9 @@ def decide_context_budget(
     included. One measure serves both ceilings. It is what the gateway's body
     cap sees, so ``max_request_bytes`` bounds it directly; and it counts
     everything the model reads (content, tool-call arguments, thinking
-    blocks, tool definitions). Without an anchor only authored bytes get the fallback rate.
-    With an anchor, pay its ENTIRE reported count plus every non-shared byte.
+    blocks, tool definitions). Authored bytes keep the fallback rate even when
+    an anchor exists. The other arm pays the anchor's ENTIRE reported count
+    plus every non-shared byte. Use the smaller of these two upper bounds.
     Shared bytes must belong only to unchanged protected messages/tools;
     no segment saving may overlap them. This deliberately gives no token
     credit for content removed from the anchor. It assumes provider accounting
@@ -226,16 +245,19 @@ def decide_context_budget(
     # When the protected prefix makes the low mark unreachable, shed only
     # to the high mark. If even that is unreachable, exhaust the segments
     # before judging the hard ceilings. Current requests are never segments.
+    def authored_tokens(size: int) -> int:
+        return size - authored_bytes + math.ceil(authored_bytes / policy.fallback_bytes_per_token)
+
     def tokens(size: int) -> int:
         if anchor_tokens is None:
-            return size - authored_bytes + math.ceil(authored_bytes / policy.fallback_bytes_per_token)
-        return min(size, anchor_tokens + size - anchor_shared_bytes)
+            return authored_tokens(size)
+        return min(authored_tokens(size), anchor_tokens + size - anchor_shared_bytes)
 
     def pricing(size: int) -> ContextBudgetPricing:
         mode: Literal["anchored", "conservative", "authored_prefix"] = "conservative"
-        if anchor_tokens is not None and anchor_tokens < anchor_shared_bytes:
+        if anchor_tokens is not None and anchor_tokens + size - anchor_shared_bytes < authored_tokens(size):
             mode = "anchored"
-        elif anchor_tokens is None and authored_bytes:
+        elif authored_bytes:
             mode = "authored_prefix"
         return ContextBudgetPricing(mode, anchor_status, anchor_tokens, anchor_wire_bytes, anchor_shared_bytes, size, authored_bytes)
 

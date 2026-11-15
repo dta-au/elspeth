@@ -813,6 +813,8 @@ files:
   src/elspeth/web/composer/composition_completion.py:
     Mapping[str, Any]: 2
     dict[str, Any]: 4
+  src/elspeth/web/composer/context_budget.py:
+    Mapping[str, object]: 1
   src/elspeth/web/composer/context_budget_apply.py:
     Mapping[str, Any]: 4
     dict[str, Any]: 6
@@ -1110,9 +1112,9 @@ files:
     dict[str, object]: 1
 totals:
   Mapping[str, Any]: 803
-  Mapping[str, object]: 318
+  Mapping[str, object]: 319
   MutableMapping[str, Any]: 8
   boundary: 69
   dict[str, Any]: 1124
   dict[str, object]: 401
-  soft: 2654
+  soft: 2655

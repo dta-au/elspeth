@@ -104,12 +104,10 @@ def _call_anchor(
     old_messages = captured["messages"]
     old_tools = captured["tools"] or []
     wire = len(canonical_json({"messages": old_messages, "tools": old_tools}).encode("utf-8"))
+    # LiteLLM normalizes Anthropic and Bedrock cache reads/creation into
+    # prompt_tokens; OpenAI's cached count is a subset of prompt_tokens.
+    # Adding the separately reported fields would charge those tokens twice.
     count = call.prompt_tokens
-    # Some adapters exclude cache reads/creation from prompt_tokens. Adding
-    # separately reported counters is conservative even when an adapter already
-    # included them. Never subtract cache hits from the input-token charge.
-    if count is not None:
-        count += (call.cached_prompt_tokens or 0) + (call.cache_read_input_tokens or 0) + (call.cache_creation_input_tokens or 0)
     if type(count) is not int or count <= 0 or count > wire or count * 8 < wire:
         return ContextBudgetAnchor(wire_bytes=wire, reason="invalid_prompt_count")
     available = Counter(canonical_json(message) for message in old_messages)

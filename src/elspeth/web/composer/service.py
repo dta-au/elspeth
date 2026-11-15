@@ -104,6 +104,7 @@ from elspeth.web.composer.context_budget import (
     SheddableSegment,
     decide_context_budget,
     escaped_bytes,
+    protected_reference_bytes,
 )
 from elspeth.web.composer.context_budget_apply import (
     CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
@@ -1758,14 +1759,7 @@ class ComposerServiceImpl:
             for position, (_chat_index, kind) in enumerate(frame.history_entries)
             if kind is not None
         } | {index for positions in tool_positions.values() for index in positions}
-        evidence = detach_prompt_guard_evidence(sent_messages)
-        for index, message in enumerate(sent_messages):
-            if index == 0 or index in sheddable_positions:
-                continue
-            if message.get(PROMPT_GUARD_TRUST_KEY) is PromptGuardTrust.REFERENCE:
-                authored_bytes += escaped_bytes(message["content"])
-            elif (parts := evidence.content_parts[index]) is not None:
-                authored_bytes += sum(escaped_bytes(part.text) for part in parts if part.trust is PromptGuardTrust.REFERENCE)
+        authored_bytes += protected_reference_bytes(sent_messages, excluded_positions=frozenset({0, *sheddable_positions}))
         try:
             decision = decide_context_budget(
                 policy=self._context_budget_policy,
@@ -1797,7 +1791,7 @@ class ComposerServiceImpl:
             ) from refusal
         record = ComposerContextBudgetRecord.from_shed_keys(
             policy_hash=decision.policy_hash,
-            bytes_per_token=decision.bytes_per_token,
+            bytes_per_token=(self._context_budget_policy.fallback_bytes_per_token if decision.pricing.mode == "authored_prefix" else 1.0),
             estimated_tokens_before=decision.estimated_tokens_before,
             estimated_tokens_after=decision.estimated_tokens_after,
             # The decision's bound; the caller records the exact size of the request it sends.

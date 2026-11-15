@@ -33,12 +33,14 @@ escape-hatch transcript events, prior user requests. Both ceilings are judged
 on the request as sent (canonical JSON of its messages and tools, so
 tool-call arguments and thinking blocks count; they are never shed). Tokens
 use the newest usable same-model, same-dialect provider count in the exchange:
-`min(wire bytes, anchor tokens + wire bytes - shared protected bytes)`.
-Without an anchor, the shipped skill core, owned tools, catalogue and
-producer-labelled nominal schema references in protected messages use 3 bytes
-per token; other bytes cost one token each. Historical measured ratios are only
-diagnostic. The byte-based release threshold prevents shed/restore
-oscillation but does not prevent additional shedding on every growing turn
+`min(wire bytes - authored bytes + ceil(authored bytes / 3), anchor tokens + wire bytes - shared protected bytes)`
+when an anchor is usable; without one, only the first arm applies. Authored
+bytes include the shipped skill core, owned tools, catalogue and
+producer-labelled nominal schema references in protected messages. Other
+bytes cost one token each. Separately reported cache statistics are already
+included in provider prompt totals and are not added again. Historical
+measured ratios are only diagnostic. The byte-based release threshold prevents
+shed/restore oscillation but does not prevent additional shedding on every growing turn
 when the conservative low mark is unreachable. See the design spec for the
 provider-usage assumptions and the measured tokenizer margin.
 
