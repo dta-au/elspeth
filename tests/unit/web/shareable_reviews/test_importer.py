@@ -9,18 +9,23 @@ session service and the ordinary YAML seeder (the library-fork seam).
 from __future__ import annotations
 
 import asyncio
+import importlib
+import importlib.util
 import json
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi import FastAPI
 from sqlalchemy import select
 from structlog.testing import capture_logs
 
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.payload_store import IntegrityError
 from elspeth.web.auth.middleware import get_current_user
@@ -29,6 +34,7 @@ from elspeth.web.composer.yaml_importer import MAX_RUNTIME_YAML_IMPORT_CHARS
 from elspeth.web.config import WebSettings
 from elspeth.web.plugin_policy.availability import RequestPluginSnapshotFactory
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
+from elspeth.web.sessions.archive_quarantine import ArchiveQuarantineIntegrityError
 from elspeth.web.sessions.composer_app_services import composer_app_services
 from elspeth.web.sessions.models import blobs_table, sessions_table
 from elspeth.web.sessions.protocol import CompositionStateData, SessionNotFoundError
@@ -48,6 +54,25 @@ _DOC_C = b"second document\n"
 _INLINE_PATH = "node:lookup.options.tables.t.reference_content"
 # The import refusal bodies the frontend's tests replay through the client parser.
 _FRONTEND_REFUSAL_FIXTURE = Path(__file__).resolve().parents[4] / "src/elspeth/web/frontend/src/test/fixtures/shared-import-refusals.json"
+
+
+@asynccontextmanager
+async def _assert_no_loop_exception_events() -> AsyncIterator[None]:
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    events: list[dict[str, Any]] = []
+
+    def capture_exception(_loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+        events.append(context)
+
+    loop.set_exception_handler(capture_exception)
+    try:
+        yield
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert events == []
+    finally:
+        loop.set_exception_handler(previous_handler)
 
 
 @dataclass
@@ -685,3 +710,170 @@ def test_import_blank_pipeline_name_uses_fallback_title(client: SyncASGITestClie
     assert response.status_code == 201, response.text
     session = asyncio.run(client.app.state.session_service.get_session(UUID(response.json()["session_id"])))
     assert session.title == "Copy of shared pipeline"
+
+
+@pytest.mark.parametrize("outcome", ["created", "create_failed", "archive_failed"])
+def test_cancelled_import_creation_joins_and_archives(client: SyncASGITestClient, actor: _Actor, outcome: str) -> None:
+    shared = _tom_shares(client, actor)
+    actor.identity_id = _CHRIS
+    session_id = uuid4()
+    create_started = asyncio.Event()
+    finish_create = asyncio.Event()
+    create_failed = asyncio.Event()
+    archived: list[UUID] = []
+    archive_error = AuditIntegrityError("archive failed")
+
+    class BlockedSessionService:
+        async def create_session(self, user_id: str, title: str, auth_provider_type: str) -> Any:
+            create_started.set()
+            await finish_create.wait()
+            if outcome == "create_failed":
+                create_failed.set()
+                raise RuntimeError("create failed")
+            return SimpleNamespace(id=session_id)
+
+        async def archive_session(self, created_id: UUID) -> None:
+            archived.append(created_id)
+            if outcome == "archive_failed":
+                raise archive_error
+
+    client.app.state.session_service = BlockedSessionService()
+
+    async def cancel_mid_create(http_client: Any) -> Any:
+        async with _assert_no_loop_exception_events():
+            request_task = asyncio.create_task(http_client.post(f"/api/sessions/shared/{shared.token}/import"))
+            await create_started.wait()
+            request_task.cancel("import cancelled")
+            finish_create.set()
+            if outcome == "archive_failed":
+                return await request_task
+            try:
+                await request_task
+            except BaseException as error:
+                return error
+            raise AssertionError("cancelled request completed normally")
+
+    error = client.run_in_one_loop(cancel_mid_create)
+    if outcome == "archive_failed":
+        assert error.status_code == 500
+    else:
+        assert isinstance(error, asyncio.CancelledError)
+        assert error.args == ("import cancelled",)
+    assert create_failed.is_set() is (outcome == "create_failed")
+    assert archived == ([] if outcome == "create_failed" else [session_id])
+
+
+def _create_session_with_cancellation_cleanup() -> Any:
+    """Resolve the helper at call time, so this file still collects on a tree without it."""
+    assert importlib.util.find_spec("elspeth.web.sessions.creation") is not None, (
+        "elspeth.web.sessions.creation is missing: nothing archives a session created after its import was cancelled"
+    )
+    return importlib.import_module("elspeth.web.sessions.creation").create_session_with_cancellation_cleanup
+
+
+@pytest.mark.asyncio
+async def test_cancelled_session_creation_preserves_archive_integrity_failure() -> None:
+    session_id = uuid4()
+    create_started = asyncio.Event()
+    finish_create = asyncio.Event()
+    archive_error = AuditIntegrityError("archive failed")
+
+    class BlockedSessionService:
+        async def create_session(self, user_id: str, title: str, auth_provider_type: str) -> Any:
+            create_started.set()
+            await finish_create.wait()
+            return SimpleNamespace(id=session_id)
+
+        async def archive_session(self, created_id: UUID) -> None:
+            assert created_id == session_id
+            raise archive_error
+
+    async with _assert_no_loop_exception_events():
+        task = asyncio.create_task(_create_session_with_cancellation_cleanup()(BlockedSessionService(), _CHRIS, "Copy", "local"))
+        await create_started.wait()
+        task.cancel("import cancelled")
+        finish_create.set()
+        with pytest.raises(AuditIntegrityError) as raised:
+            await task
+        assert raised.value is archive_error
+        assert isinstance(raised.value.__cause__, asyncio.CancelledError)
+        assert raised.value.__cause__.args == ("import cancelled",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing_cause", [False, True])
+async def test_cancelled_session_creation_surfaces_archive_failure_with_cause(existing_cause: bool) -> None:
+    session_id = uuid4()
+    create_started = asyncio.Event()
+    finish_create = asyncio.Event()
+    driver_error = OSError("driver failed")
+    archive_error = ArchiveQuarantineIntegrityError("quarantine failed")
+
+    class BlockedSessionService:
+        async def create_session(self, user_id: str, title: str, auth_provider_type: str) -> Any:
+            create_started.set()
+            await finish_create.wait()
+            return SimpleNamespace(id=session_id)
+
+        async def archive_session(self, created_id: UUID) -> None:
+            assert created_id == session_id
+            if existing_cause:
+                raise archive_error from driver_error
+            raise archive_error
+
+    async with _assert_no_loop_exception_events():
+        task = asyncio.create_task(_create_session_with_cancellation_cleanup()(BlockedSessionService(), _CHRIS, "Copy", "local"))
+        await create_started.wait()
+        task.cancel("import cancelled")
+        finish_create.set()
+        with pytest.raises(ArchiveQuarantineIntegrityError) as raised:
+            await task
+        assert raised.value is archive_error
+        if existing_cause:
+            assert raised.value.__cause__ is driver_error
+            assert isinstance(raised.value.__context__, asyncio.CancelledError)
+            assert raised.value.__context__.args == ("import cancelled",)
+        else:
+            assert isinstance(raised.value.__cause__, asyncio.CancelledError)
+            assert raised.value.__cause__.args == ("import cancelled",)
+
+
+@pytest.mark.asyncio
+async def test_second_cancellation_waits_for_session_archive() -> None:
+    session_id = uuid4()
+    create_started = asyncio.Event()
+    finish_create = asyncio.Event()
+    archive_started = asyncio.Event()
+    finish_archive = asyncio.Event()
+    archive_completed = asyncio.Event()
+    archived: list[UUID] = []
+
+    class BlockedSessionService:
+        async def create_session(self, user_id: str, title: str, auth_provider_type: str) -> Any:
+            create_started.set()
+            await finish_create.wait()
+            return SimpleNamespace(id=session_id)
+
+        async def archive_session(self, created_id: UUID) -> None:
+            archive_started.set()
+            await finish_archive.wait()
+            archived.append(created_id)
+            archive_completed.set()
+
+    async with _assert_no_loop_exception_events():
+        task = asyncio.create_task(_create_session_with_cancellation_cleanup()(BlockedSessionService(), _CHRIS, "Copy", "local"))
+        await create_started.wait()
+        task.cancel("first cancellation")
+        finish_create.set()
+        await archive_started.wait()
+        task.cancel("second cancellation")
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not task.done()
+        assert not archive_completed.is_set()
+        finish_archive.set()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+        assert raised.value.args == ("first cancellation",)
+        assert archive_completed.is_set()
+        assert archived == [session_id]

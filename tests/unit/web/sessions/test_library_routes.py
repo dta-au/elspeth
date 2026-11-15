@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
+from httpx import AsyncClient
 from sqlalchemy import func, insert, select, update
 
 from elspeth.contracts.session_operation import SessionOperationKind
@@ -351,6 +352,52 @@ def test_fork_archives_new_session_if_seed_raises_internal_error(
     with pytest.raises(SessionNotFoundError):
         asyncio.run(client.app.state.session_service.get_session(created[0]))
     assert client.get("/api/sessions").json() == before
+
+
+def test_cancelled_library_fork_creation_archives_completed_session(
+    library_client: tuple[SyncASGITestClient, _Actor, list[str]],
+) -> None:
+    client, actor, _events = library_client
+    _, published = _publish(client)
+    actor.identity_id = "carol"
+    assert client.post(f"/api/library/{published['entry_id']}/accept", json={}).status_code == 200
+    actor.identity_id = "bob"
+    session_id = uuid4()
+    create_started = asyncio.Event()
+    finish_create = asyncio.Event()
+    archived: list[UUID] = []
+
+    class BlockedSessionService:
+        async def create_session(self, user_id: str, title: str, auth_provider_type: str) -> SimpleNamespace:
+            create_started.set()
+            await finish_create.wait()
+            return SimpleNamespace(id=session_id)
+
+        async def archive_session(self, created_id: UUID) -> None:
+            archived.append(created_id)
+
+    client.app.state.session_service = BlockedSessionService()
+
+    async def seed(**kwargs: object) -> SimpleNamespace:
+        raise AssertionError("seed must not run after cancellation")
+
+    client.app.state.library_state_seeder = seed
+
+    async def cancel_mid_create(http_client: AsyncClient) -> None:
+        request_task = asyncio.create_task(http_client.post(f"/api/library/{published['entry_id']}/fork"))
+        try:
+            await asyncio.wait_for(create_started.wait(), timeout=10)
+        except TimeoutError:
+            if request_task.done():
+                await request_task
+            raise
+        request_task.cancel("fork cancelled")
+        finish_create.set()
+        with pytest.raises(asyncio.CancelledError, match="fork cancelled"):
+            await request_task
+
+    client.run_in_one_loop(cancel_mid_create)
+    assert archived == [session_id]
 
 
 def test_recall_committed_before_fork_authorization_refuses(
