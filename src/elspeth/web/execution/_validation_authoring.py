@@ -1037,7 +1037,7 @@ def validate_batch_options(
     state = authored.policy.state
     batch_option_errors: list[tuple[str, str]] = []
     for node in state.nodes:
-        placement_error = _batch_aware_placement_error(node.id, node.node_type, node.plugin, node.output_mode)
+        placement_error = _batch_aware_placement_error(node.id, node.node_type, node.plugin, node.output_mode, node.trigger)
         if placement_error is not None:
             batch_option_errors.append((node.id, placement_error))
         required_error = _batch_aware_required_input_fields_error(node.id, node.plugin, node.options)

@@ -1609,7 +1609,9 @@ def build_set_pipeline_candidate(
             if plugin_error is not None:
                 _record_component_rejection(_plugin_policy_failure(state, plugin_error, rejected_component=node_ref))
                 continue
-            batch_placement_error = _batch_aware_placement_error(node_id, node_type, node_plugin, node.output_mode)
+            batch_placement_error = _batch_aware_placement_error(
+                node_id, node_type, node_plugin, node.output_mode, node.trigger.model_dump() if node.trigger is not None else None
+            )
             if batch_placement_error is not None:
                 _record_component_rejection(
                     _failure_result(state, batch_placement_error, error_code="batch_transform_misplaced", rejected_component=node_ref)

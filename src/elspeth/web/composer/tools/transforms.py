@@ -772,7 +772,13 @@ def _execute_upsert_node(
             return _saved_graph_plugin_policy_failure(state, plugin_error, component=None, rejected_component=node_ref)
         context.catalog.get_schema("transform", plugin)
 
-        batch_placement_error = _batch_aware_placement_error(node_id, node_type, plugin, validated.output_mode)
+        batch_placement_error = _batch_aware_placement_error(
+            node_id,
+            node_type,
+            plugin,
+            validated.output_mode,
+            validated.trigger.model_dump(exclude_unset=True) if validated.trigger is not None else None,
+        )
         if batch_placement_error is not None:
             return _saved_graph_rejection_result(
                 state, batch_placement_error, error_code="batch_transform_misplaced", rejected_component=node_ref
@@ -1893,7 +1899,9 @@ def _execute_patch_node_options(
         # run, in the same order. Without them a required_input_fields patch
         # on a batch-aware node reached plugin construction, whose fail-closed
         # FrameworkBugError escaped the tool and ended the turn as a 500.
-        batch_placement_error = _batch_aware_placement_error(node_id, current.node_type, current.plugin, current.output_mode)
+        batch_placement_error = _batch_aware_placement_error(
+            node_id, current.node_type, current.plugin, current.output_mode, current.trigger
+        )
         if batch_placement_error is not None:
             return _saved_graph_rejection_result(
                 state, batch_placement_error, error_code="batch_transform_misplaced", rejected_component=node_ref
@@ -2175,7 +2183,7 @@ def _prepare_transform_candidate(
     if plugin_error is not None:
         return _saved_graph_plugin_policy_failure(state, plugin_error, component=None, rejected_component=node_ref)
     context.catalog.get_schema("transform", plugin)
-    batch_placement_error = _batch_aware_placement_error(node_id, node_type, plugin, output_mode)
+    batch_placement_error = _batch_aware_placement_error(node_id, node_type, plugin, output_mode, trigger)
     if batch_placement_error is not None:
         return _saved_graph_rejection_result(
             state, batch_placement_error, error_code="batch_transform_misplaced", rejected_component=node_ref
