@@ -221,7 +221,7 @@ class DatabaseSinkConfig(DataPluginConfig):
 
     _plugin_component_type: ClassVar[str | None] = "sink"
 
-    url: str = Field(description="Database connection URL for SQLAlchemy.")
+    url: str = Field(description="Database connection URL for SQLAlchemy.", repr=False)
     table: str = Field(description="Database table name to write rows into.")
     if_exists: Literal["append"] = Field(
         default="append",
@@ -276,7 +276,7 @@ class DatabaseSink(BaseSink, RestagingSinkEffectCapability):
     name = "database"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9c9ef5408017aa9b"
+    source_file_hash: str | None = "sha256:5d5567f4cf51a1b8"
     config_model = DatabaseSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.SQL

@@ -22,12 +22,12 @@ import time
 from collections.abc import Mapping
 from dataclasses import asdict, replace
 from ipaddress import IPv4Network, IPv6Network
-from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 from urllib.parse import parse_qsl, urlsplit
 from xml.sax.saxutils import escape as escape_xml_text
 
 import httpx
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, Field, field_validator, model_validator
 
 from elspeth.contracts import CallType, Determinism
 from elspeth.contracts.audit import Call
@@ -53,6 +53,7 @@ from elspeth.core.security.web import (
     HTTPOrigin,
     SSRFBlockedError,
     SSRFSafeRequest,
+    configured_url_refusal_message,
     parse_http_origin,
     validate_allowed_http_origin,
     validate_archived_ssrf_request,
@@ -253,7 +254,9 @@ class WebScrapeHTTPConfig(BaseModel):
         default="public_only",
         description="SSRF allowlist: 'public_only' (default), 'allow_private', or list of CIDR ranges",
     )
-    allowed_origins: tuple[str, ...] = Field(default=(), description="Exact HTTP(S) origins permitted for initial requests and redirects.")
+    allowed_origins: tuple[str, ...] = Field(
+        default=(), description="Exact HTTP(S) origins permitted for initial requests and redirects.", repr=False
+    )
 
     @field_validator("allowed_origins")
     @classmethod
@@ -296,10 +299,6 @@ class WebScrapeHTTPConfig(BaseModel):
 class WebScrapeConfig(TransformDataConfig):
     """Configuration for web scrape transform."""
 
-    # A nested secret can appear in an outer model's rejected input mapping,
-    # including when validation fails on an unrelated option.
-    model_config: ClassVar[ConfigDict] = ConfigDict(**TransformDataConfig.model_config, hide_input_in_errors=True)
-
     url_field: str | None = Field(
         default=None,
         description=(
@@ -311,7 +310,7 @@ class WebScrapeConfig(TransformDataConfig):
             "value_transform that prepends 'https://' before this transform."
         ),
     )
-    url: str | None = Field(default=None, description="Fixed absolute HTTP(S) URL for every row; exclusive with url_field.")
+    url: str | None = Field(default=None, description="Fixed absolute HTTP(S) URL for every row; exclusive with url_field.", repr=False)
     content_field: str = Field(description="Output field that receives the fetched page content.")
     fingerprint_field: str = Field(description="Output field that receives the page fingerprint.")
     method: Literal["GET", "POST"] = Field(default="GET", description="HTTP method for fetching the row URL.")
@@ -320,9 +319,9 @@ class WebScrapeConfig(TransformDataConfig):
     request_multipart_field: str | None = Field(
         default=None, description="Row field containing ordered multipart text entries or payload-store blob references."
     )
-    query: dict[str, str] = Field(default_factory=dict, description="Static URL query parameters sent with each request.")
+    query: dict[str, str] = Field(default_factory=dict, description="Static URL query parameters sent with each request.", repr=False)
     query_fields: dict[str, str] = Field(default_factory=dict, description="Map URL query parameter names to input row field names.")
-    headers: dict[str, str] = Field(default_factory=dict, description="Validated static public-page request headers.")
+    headers: dict[str, str] = Field(default_factory=dict, description="Validated static public-page request headers.", repr=False)
     header_fields: dict[str, str] = Field(default_factory=dict, description="Map validated request header names to input row fields.")
     format: Literal["markdown", "text", "raw"] = Field(
         default="markdown",
@@ -404,10 +403,10 @@ class WebScrapeConfig(TransformDataConfig):
     def _validate_query_options(self) -> "WebScrapeConfig":
         duplicate_names = self.query.keys() & self.query_fields.keys()
         if duplicate_names:
-            raise ValueError(f"query and query_fields repeat parameter {sorted(duplicate_names)[0]!r}")
+            raise ValueError("query and query_fields repeat a parameter")
         for name in self.query.keys() | self.query_fields.keys():
             if not name or is_sensitive_query_param(name):
-                raise ValueError(f"query parameter {name!r} must be nonempty and must not carry credentials")
+                raise ValueError("query parameter must be nonempty and must not carry credentials")
         for field_name in self.query_fields.values():
             if not field_name:
                 raise ValueError("query_fields row field names must not be empty")
@@ -460,7 +459,7 @@ class WebScrapeConfig(TransformDataConfig):
                 validate_configured_url_for_ssrf(self.url, allowed_ranges=allowed_ranges)
                 validate_allowed_http_origin(self.url, tuple(parse_http_origin(value) for value in self.http.allowed_origins))
             except SSRFBlockedError as exc:
-                raise ValueError(f"url: {exc}") from exc
+                raise ValueError(configured_url_refusal_message(exc.kind)) from None
         if self.auth is not None:
             auth_origin = self.auth.parsed_origin
             allowed_origins = tuple(parse_http_origin(value) for value in self.http.allowed_origins)
@@ -843,7 +842,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:88de403a6a8fcdb5"
+    source_file_hash: str | None = "sha256:fd932846a0bc1577"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True

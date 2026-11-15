@@ -72,7 +72,7 @@ class AzureAuthConfig(BaseModel):
 
     # Option 3: Managed Identity
     use_managed_identity: bool = False
-    account_url: str | None = None
+    account_url: str | None = Field(default=None, repr=False)
 
     # Option 4: Service Principal
     tenant_id: str | None = None

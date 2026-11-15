@@ -112,6 +112,7 @@ class AzureContentUnderstandingConfig(AzureAnalyzeConfig):
     endpoint: str = Field(
         ...,
         description="Azure AI Foundry / AI Services resource endpoint URL (HTTPS, *.services.ai.azure.com or *.cognitiveservices.azure.com).",
+        repr=False,
     )
     api_version: str = Field("2025-11-01", description="REST api-version (GA 2025-11-01).")
     analyzer_id: str = Field(
@@ -243,7 +244,7 @@ class AzureContentUnderstanding(AzureAnalyzeTransform):
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
     # Placeholder must be a sha256: literal so the hash normalizer matches it; recomputed by scripts/cicd/plugin_hash.
-    source_file_hash: str | None = "sha256:317412245440ee01"
+    source_file_hash: str | None = "sha256:d22104c803766847"
     config_model = AzureContentUnderstandingConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED

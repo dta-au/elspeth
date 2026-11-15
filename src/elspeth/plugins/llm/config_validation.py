@@ -253,8 +253,13 @@ def normalize_openrouter_base_url(value: str) -> str:
         raise ValueError("base_url must not contain a fragment")
     try:
         port = parsed.port
-    except ValueError as exc:
-        raise ValueError(f"base_url must have a valid port: {exc}") from exc
+    except ValueError:
+        port = None
+        invalid_port = True
+    else:
+        invalid_port = False
+    if invalid_port:
+        raise ValueError("base_url must have a valid port")
     normalized_host = hostname.lower()
     if normalized_host.endswith("."):
         # elspeth-5653909057: a root-qualified host resolves to the same DNS

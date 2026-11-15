@@ -45,12 +45,14 @@ from elspeth.plugins.infrastructure.clients.http import (
 )
 from elspeth.plugins.infrastructure.clients.llm import (
     CONTEXT_LENGTH_PATTERNS,
-    ContentPolicyError,
+    UNSUPPORTED_TOOL_CALLS_MESSAGE,
     ContextLengthError,
     LLMClientError,
     NetworkError,
     RateLimitError,
     ServerError,
+    UnsupportedResponseError,
+    classify_empty_completion,
     public_llm_error_category,
 )
 from elspeth.plugins.infrastructure.telemetry import emit_resource_cleanup_failed
@@ -184,16 +186,12 @@ def _validate_chat_completion_response(response: httpx.Response) -> tuple[dict[s
         raise LLMClientError(f"Expected string content, got {type(content).__name__}", retryable=False)
 
     if content is None or not content.strip():
-        refusal = message.get("refusal")
-        missing_content = "null content" if content is None else "empty content"
-        if raw_finish_reason == "content_filter" or (isinstance(refusal, str) and refusal.strip()):
-            raise ContentPolicyError(f"LLM returned {missing_content}: provider refused or filtered the response")
-        if raw_finish_reason == "length":
-            raise LLMClientError("LLM exhausted the output token budget before returning content", retryable=False)
         if raw_finish_reason == "tool_calls":
-            raise LLMClientError("LLM returned tool_calls response (not supported by ELSPETH)", retryable=False)
-        # Missing content alone does not establish a content-policy refusal.
-        raise LLMClientError(f"LLM returned {missing_content} without an explicit refusal", retryable=False)
+            raise UnsupportedResponseError(UNSUPPORTED_TOOL_CALLS_MESSAGE)
+        # The shared classification every provider records (#123): missing
+        # content alone does not establish a content-policy refusal.
+        refusal = message.get("refusal")
+        raise classify_empty_completion(raw_finish_reason, refused=isinstance(refusal, str) and bool(refusal.strip()))
 
     raw_usage = data.get("usage")
     if isinstance(raw_usage, dict):
@@ -239,10 +237,11 @@ class OpenRouterConfig(LLMConfig):
     # Override base model to make it required — OpenRouter has no deployment_name fallback
     model: str = Field(..., description="Model identifier (e.g., 'openai/gpt-4o')")
 
-    api_key: str = Field(..., description="OpenRouter API key")
+    api_key: str = Field(..., description="OpenRouter API key", repr=False)
     base_url: str = Field(
         default=OPENROUTER_BASE_URL,
         description="OpenRouter API base URL",
+        repr=False,
     )
     timeout_seconds: float = Field(default=60.0, gt=0, description="Request timeout")
 
@@ -276,6 +275,7 @@ class OpenRouterConfig(LLMConfig):
     tracing: dict[str, Any] | None = Field(
         default=None,
         description="Tier 2 tracing configuration (langfuse only - azure_ai not supported)",
+        repr=False,
     )
 
     # Value-source declaration: ``model`` must appear in the OpenRouter

@@ -114,7 +114,7 @@ class AWSS3SinkConfig(DataPluginConfig):
         description="Normalized, original, or custom output headers",
     )
     region_name: str | None = Field(default=None, description="AWS signing region override")
-    endpoint_url: str | None = Field(default=None, description="CLI/batch-only S3-compatible HTTP endpoint")
+    endpoint_url: str | None = Field(default=None, description="CLI/batch-only S3-compatible HTTP endpoint", repr=False)
     max_object_bytes: int = Field(
         default=256 * 1024 * 1024,
         gt=0,
@@ -728,7 +728,7 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
     name = "aws_s3"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:d3e6874fba82116c"
+    source_file_hash: str | None = "sha256:70e7cc91680f16cc"
     config_model = AWSS3SinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP

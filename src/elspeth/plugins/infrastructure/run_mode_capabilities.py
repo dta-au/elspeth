@@ -86,7 +86,7 @@ _TRANSFORM_CLASSES = {
 class _NoTracingConfig(BaseModel):
     """The only tracing shape a non-live LLM may construct."""
 
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
 
     provider: Literal["none"] = "none"
 
@@ -94,7 +94,7 @@ class _NoTracingConfig(BaseModel):
 class _NonliveLLMOptions(BaseModel):
     """Parse the startup-relevant part of raw LLM options."""
 
-    model_config = ConfigDict(extra="ignore", strict=True)
+    model_config = ConfigDict(extra="ignore", strict=True, hide_input_in_errors=True)
 
     tracing: _NoTracingConfig | None = None
 
@@ -102,7 +102,7 @@ class _NonliveLLMOptions(BaseModel):
 class _RawPluginRef(BaseModel):
     """Owned projection of a plugin entry from untrusted YAML."""
 
-    model_config = ConfigDict(extra="ignore", strict=True)
+    model_config = ConfigDict(extra="ignore", strict=True, hide_input_in_errors=True)
 
     plugin: str
     options: object = Field(default_factory=dict)
@@ -111,7 +111,7 @@ class _RawPluginRef(BaseModel):
 class _RawPluginSections(BaseModel):
     """Parse the five plugin-bearing sections before built-in imports."""
 
-    model_config = ConfigDict(extra="ignore", strict=True)
+    model_config = ConfigDict(extra="ignore", strict=True, hide_input_in_errors=True)
 
     sources: dict[str, _RawPluginRef] = Field(default_factory=dict)
     transforms: list[_RawPluginRef] = Field(default_factory=list)

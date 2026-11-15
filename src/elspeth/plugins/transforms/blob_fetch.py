@@ -27,6 +27,7 @@ from elspeth.core.security.web import (
     HTTPOrigin,
     SSRFBlockedError,
     SSRFSafeRequest,
+    configured_url_refusal_message,
     parse_http_origin,
     validate_allowed_http_origin,
     validate_archived_ssrf_request,
@@ -96,7 +97,9 @@ class BlobFetchHTTPConfig(BaseModel):
         default="public_only",
         description="SSRF allowlist: 'public_only', 'allow_private', or explicit CIDR ranges.",
     )
-    allowed_origins: tuple[str, ...] = Field(default=(), description="Exact HTTP(S) origins permitted for initial requests and redirects.")
+    allowed_origins: tuple[str, ...] = Field(
+        default=(), description="Exact HTTP(S) origins permitted for initial requests and redirects.", repr=False
+    )
 
     @field_validator("allowed_origins")
     @classmethod
@@ -131,7 +134,7 @@ class BlobFetchConfig(TransformDataConfig):
     """Configuration for blob_fetch."""
 
     url_field: str | None = Field(default=None, description="Input row field containing the absolute HTTP(S) URL to fetch.")
-    url: str | None = Field(default=None, description="Fixed absolute HTTP(S) URL for every row; exclusive with url_field.")
+    url: str | None = Field(default=None, description="Fixed absolute HTTP(S) URL for every row; exclusive with url_field.", repr=False)
     blob_ref_field: str = Field(default="blob_ref", description="Output field receiving the payload-store content hash.")
     content_type_field: str = Field(default="blob_content_type", description="Output field receiving the normalized response Content-Type.")
     size_bytes_field: str = Field(default="blob_size_bytes", description="Output field receiving the response body size.")
@@ -205,7 +208,7 @@ class BlobFetchConfig(TransformDataConfig):
                 validate_configured_url_for_ssrf(self.url, allowed_ranges=allowed_ranges)
                 validate_allowed_http_origin(self.url, tuple(parse_http_origin(value) for value in self.http.allowed_origins))
             except SSRFBlockedError as exc:
-                raise ValueError(f"url: {exc}") from exc
+                raise ValueError(configured_url_refusal_message(exc.kind)) from None
         return self
 
     @model_validator(mode="after")
@@ -332,7 +335,7 @@ class BlobFetch(BaseTransform):
     name = "blob_fetch"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9c75f8515498a8a4"
+    source_file_hash: str | None = "sha256:614d8f2b4fadbf51"
     config_model = BlobFetchConfig
     passes_through_input = True
     fetches_http = True

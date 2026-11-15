@@ -118,7 +118,7 @@ class AWSS3SourceConfig(DataPluginConfig):
     field_mapping: NormalizedFieldMappingOption = Field(default=None, description="Overrides for normalized source fields")
     on_validation_failure: str = Field(..., description="Quarantine sink name or explicit discard")
     region_name: str | None = Field(default=None, description="AWS signing region override")
-    endpoint_url: str | None = Field(default=None, description="CLI/batch-only S3-compatible HTTP endpoint")
+    endpoint_url: str | None = Field(default=None, description="CLI/batch-only S3-compatible HTTP endpoint", repr=False)
     max_object_bytes: int = Field(
         default=256 * 1024 * 1024,
         gt=0,
@@ -919,7 +919,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a62a6bf26b5b620b"
+    source_file_hash: str | None = "sha256:988da8638e5b9c87"
     config_model = AWSS3SourceConfig
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 

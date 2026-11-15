@@ -153,7 +153,7 @@ docker run --rm \
 
 #### Error: `content_filtered` in error_json
 
-**Cause:** The LLM provider returned a null content response, typically because the request or response was flagged by the provider's content safety filters.
+**Cause:** The provider reported a `CONTENT_FILTER` finish reason, which can accompany nonblank content. A blank completion with a content-filter finish reason or explicit refusal raises a filtered-completion call error; one with `finish_reason: length` is classified as an exhausted output budget; one without those signals is an unexplained empty completion. A `tool_calls` response is unsupported.
 
 **Solution:**
 
@@ -164,6 +164,13 @@ docker run --rm \
    ```bash
    elspeth explain --run <run_id> --database ./runs/audit.db
    ```
+
+Blank-completion call errors produce a row reason of `llm_call_failed` in single-query transforms and `multi_query_failed` in multi-query transforms. The audited
+LLM call records the empty completion as `ERROR` with its classified error.
+Replay reproduces that error, including the unsupported tool-call verdict.
+Older `SUCCESS` calls with blank content,
+or response-bearing `ContentPolicyError` calls with null content, cannot be
+replayed; run those pipelines live again to create compatible call evidence.
 
 #### Error: `RuntimeError: langfuse ... not installed`
 

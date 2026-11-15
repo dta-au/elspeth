@@ -101,7 +101,7 @@ class ChromaSinkConfig(DataPluginConfig):
     collection: str = Field(description="ChromaDB collection name")
     mode: ChromaConnectionMode = Field(description="Connection mode")
     persist_directory: str | None = Field(default=None, description="Local persistence directory for persistent Chroma mode.")
-    host: str | None = Field(default=None, description="Chroma server host for client mode.")
+    host: str | None = Field(default=None, description="Chroma server host for client mode.", repr=False)
     port: int = Field(default=8000, ge=1, le=65535, description="Chroma server port for client mode.")
     ssl: bool = Field(default=True, description="Whether to use TLS when connecting to a Chroma server.")
     distance_function: Literal["cosine", "l2", "ip"] = Field(
@@ -207,7 +207,7 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
     name = "chroma_sink"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:7c867fa7cf994920"
+    source_file_hash: str | None = "sha256:ab21a3941da131ba"
     config_model = ChromaSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION

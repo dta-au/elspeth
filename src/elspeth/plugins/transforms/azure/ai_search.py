@@ -28,9 +28,9 @@ if TYPE_CHECKING:
 class AzureAISearchConfig(RetrievalOutputConfig):
     """Options for the azure_ai_search transform."""
 
-    endpoint: str = Field(description="Azure AI Search service URL, https://<service>.search.windows.net.")
+    endpoint: str = Field(description="Azure AI Search service URL, https://<service>.search.windows.net.", repr=False)
     index: str = Field(description="Name of the existing index to query.")
-    api_key: str | None = Field(default=None, description="Query key. Mutually exclusive with use_managed_identity.")
+    api_key: str | None = Field(default=None, description="Query key. Mutually exclusive with use_managed_identity.", repr=False)
     use_managed_identity: bool = Field(default=False, description="Authenticate with the host's managed identity.")
     client_id: str | None = Field(default=None, description="Client id of a user-assigned managed identity.")
     api_version: str = Field(default="2024-07-01", description="Azure AI Search REST API version.")
@@ -82,7 +82,7 @@ class AzureAISearchTransform(RetrievalTransformBase):
 
     name = "azure_ai_search"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:aa1e5d1b37f919a6"
+    source_file_hash: str | None = "sha256:9fab6de2edb09652"
     determinism: Determinism = Determinism.EXTERNAL_CALL
     config_model = AzureAISearchConfig
     passes_through_input = True

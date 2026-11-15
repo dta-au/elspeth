@@ -9,6 +9,7 @@ import base64
 import hashlib
 import os
 import socket
+import traceback
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import patch
@@ -2185,8 +2186,25 @@ def test_query_options_reject_sensitive_names_and_duplicate_bindings() -> None:
 
     options["query_fields"] = {"SearchText": "company_query"}
     options["query"] = {"SearchText": "static"}
-    with pytest.raises(PluginConfigError, match="SearchText"):
+    with pytest.raises(PluginConfigError, match="query and query_fields repeat a parameter"):
         WebScrapeTransform(options)
+
+    duplicate_secret = "p5-duplicate-" + "runtime-secret"
+    duplicate_name = f"SearchText_{duplicate_secret}"
+    options["query_fields"] = {duplicate_name: "company_query"}
+    options["query"] = {duplicate_name: "static"}
+    with pytest.raises(PluginConfigError) as duplicate_error:
+        WebScrapeTransform(options)
+    assert "query and query_fields repeat a parameter" in str(duplicate_error.value)
+    assert duplicate_secret not in "".join(traceback.format_exception(duplicate_error.value))
+
+    secret = "p5-query-" + "runtime-secret"
+    options["query_fields"] = {f"api_key_{secret}": "company_query"}
+    options["query"] = {}
+    with pytest.raises(PluginConfigError) as caught:
+        WebScrapeTransform(options)
+    assert "query parameter must be nonempty and must not carry credentials" in str(caught.value)
+    assert secret not in "".join(traceback.format_exception(caught.value))
 
 
 @pytest.mark.parametrize(

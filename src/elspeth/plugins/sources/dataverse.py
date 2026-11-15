@@ -114,6 +114,7 @@ class DataverseSourceConfig(DataPluginConfig):
     environment_url: str = Field(
         ...,
         description="Dataverse environment URL (e.g., https://myorg.crm.dynamics.com)",
+        repr=False,
     )
     auth: DataverseAuthConfig = Field(
         ...,
@@ -302,7 +303,7 @@ class DataverseSource(BaseSource):
     _normalizes_external_names = True
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:d95b4c4ee2aedc4c"
+    source_file_hash: str | None = "sha256:0336007dfd949edf"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 

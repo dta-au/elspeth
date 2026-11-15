@@ -10,10 +10,10 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
-from typing import Any, ClassVar, Self, cast
+from typing import Any, Self, cast
 
 import structlog
-from pydantic import ConfigDict, Field, ValidationInfo, field_validator, model_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 
 from elspeth.contracts import CallType, Determinism, RunMode
 from elspeth.contracts.audit_protocols import PluginAuditWriter
@@ -124,11 +124,6 @@ _warn_telemetry_before_start = make_warn_telemetry_before_start(logger)
 
 class AWSTextractDocumentAnalysisConfig(TransformDataConfig):
     """Validated public configuration for asynchronous S3 document analysis."""
-
-    model_config: ClassVar[ConfigDict] = ConfigDict(
-        **TransformDataConfig.model_config,
-        hide_input_in_errors=True,
-    )
 
     region: str = Field(min_length=1, max_length=64, description="AWS region containing the S3 object and Textract endpoint.")
     auth_mode: AuthMode = Field(
@@ -348,7 +343,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e45dc8dbaf712404"
+    source_file_hash: str | None = "sha256:a5f1d2416cbcdc3d"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
