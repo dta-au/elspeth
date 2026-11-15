@@ -8,6 +8,7 @@ import pytest
 
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.audit_protocols import CallRecorder
+from elspeth.plugins.infrastructure.clients.deadline import DeadlineBoundTransport
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
 from tests.fixtures.mock_audit import mock_audit_authority
 
@@ -529,8 +530,15 @@ class TestAuditedHTTPClient:
 
             client.post("https://api.example.com/v1/process")
 
-        # Verify timeout was passed to Client constructor
-        mock_client_class.assert_called_once_with(timeout=60.0, follow_redirects=False)
+        # The timeout reaches the client, and the client's transport is the
+        # deadline-bound one that makes that timeout the request's total.
+        mock_client_class.assert_called_once()
+        kwargs = mock_client_class.call_args.kwargs
+        assert kwargs["timeout"] == 60.0
+        assert kwargs["follow_redirects"] is False
+        assert isinstance(kwargs["transport"], DeadlineBoundTransport)
+        assert all(mount is None or isinstance(mount, DeadlineBoundTransport) for mount in kwargs["mounts"].values())
+        assert mock_client.post.call_args.kwargs["timeout"] == 60.0
 
     def test_response_headers_recorded(self) -> None:
         """Response headers are recorded in audit trail."""

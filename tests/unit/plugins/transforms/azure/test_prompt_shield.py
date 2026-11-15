@@ -1326,8 +1326,8 @@ class TestPromptShieldInternalProcessing:
         assert result.status == "success"
         assert mock_httpx_client.post.call_count == 2
 
-    def test_connect_output_waits_longer_than_capacity_budget_plus_http_timeout(self) -> None:
-        """Batch waiter timeout must cover row capacity budget plus one HTTP call."""
+    def test_connect_output_waits_longer_than_capacity_limiter_and_http_budgets(self) -> None:
+        """Batch waiter covers row capacity retries, limiter wait and HTTP dispatch."""
         from elspeth.plugins.transforms.azure.base import _AZURE_HTTP_TIMEOUT_SECONDS
         from elspeth.plugins.transforms.azure.prompt_shield import AzurePromptShield
 
@@ -1345,7 +1345,7 @@ class TestPromptShieldInternalProcessing:
         collector = CollectorOutputPort()
         transform.connect_output(collector, max_pending=1)
         try:
-            assert transform._batch_wait_timeout == 1.0 + _AZURE_HTTP_TIMEOUT_SECONDS
+            assert transform._batch_wait_timeout == 1.0 + 2 * _AZURE_HTTP_TIMEOUT_SECONDS
         finally:
             transform.close()
 

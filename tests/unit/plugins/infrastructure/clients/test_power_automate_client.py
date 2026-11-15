@@ -304,8 +304,9 @@ def test_limiter_wait_cannot_send_under_revoked_authority(public_dns, revoke):
     events = []
 
     class Limiter:
-        def acquire(self):
+        def acquire(self, *, timeout=None):
             nonlocal active
+            assert timeout == 90
             events.append("wait")
             active = not revoke
 

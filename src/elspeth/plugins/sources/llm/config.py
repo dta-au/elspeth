@@ -222,7 +222,11 @@ class OpenRouterLLMSourceConfig(LLMSourceConfig):
     model: str = Field(..., description="Model identifier")
     api_key: str = Field(..., description="OpenRouter API key", repr=False)
     base_url: str = Field(default=OPENROUTER_BASE_URL, description="OpenRouter API base URL", repr=False)
-    timeout_seconds: float = Field(default=60.0, gt=0, description="Request timeout")
+    timeout_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        description="Total wall-clock seconds from dispatch for each provider HTTP request, including DNS, connect, TLS, send, headers, body, and every redirect hop. Rate-limiter waits are bounded separately by the same number of seconds.",
+    )
     tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration", repr=False)
 
     @field_validator("base_url")
@@ -316,7 +320,7 @@ class GatewayLLMSourceConfig(LLMSourceConfig):
         default=60.0,
         gt=GATEWAY_TIMEOUT_MIN_EXCLUSIVE,
         le=GATEWAY_TIMEOUT_MAX_SECONDS,
-        description="Request timeout",
+        description="Total wall-clock seconds from dispatch for each provider HTTP request, including DNS, connect, TLS, send, headers, body, and every redirect hop. Rate-limiter waits are bounded separately by the same number of seconds.",
     )
     max_tokens: int | None = Field(
         default=None,

@@ -650,6 +650,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 region=self._region,
                 sdk_client=self._sdk_client,
                 max_response_bytes=self._max_result_bytes,
+                limiter_wait_seconds=self._poll_timeout_seconds,
                 limiter=self._limiter,
                 token_id=token_id,
                 call_mode_session=ctx.call_mode_session,

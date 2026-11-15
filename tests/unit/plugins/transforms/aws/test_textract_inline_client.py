@@ -58,7 +58,7 @@ class FakeLimiter:
 
     def acquire(self, weight: int = 1, timeout: float | None = None) -> None:
         assert weight == 1
-        assert timeout is None
+        assert timeout == 30.0
         self.acquisitions += 1
 
 
@@ -140,6 +140,26 @@ def _analyze(client: TextractInlineClient, **overrides: Any):
     }
     arguments.update(overrides)
     return client.analyze_document(**arguments)
+
+
+def test_limiter_refusal_is_audited_without_analyze_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    sdk = FakeSyncSDK()
+    client, recorder, _events, limiter = _client(sdk)
+    waits: list[float | None] = []
+
+    def refuse(weight: int = 1, timeout: float | None = None) -> None:
+        waits.append(timeout)
+        raise TimeoutError("no permit")
+
+    monkeypatch.setattr(limiter, "acquire", refuse)
+    with pytest.raises(Exception) as caught:
+        _analyze(client)
+    assert type(caught.value).__name__ == "TextractRateLimitTimeout"
+    assert waits == [30.0]
+    assert sdk.analyze_requests == []
+    assert len(recorder.calls) == 1
+    assert recorder.calls[0]["error"].to_dict()["wait_budget_seconds"] == 30.0
+    assert recorder.calls[0]["error"].to_dict()["request_sent"] is False
 
 
 def test_analyze_records_before_telemetry_and_returns_frozen_semantic_response() -> None:

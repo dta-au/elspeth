@@ -91,7 +91,11 @@ class BlobFetchHTTPConfig(BaseModel):
 
     abuse_contact: str = Field(description="Email for abuse reports, sent as an HTTP header.")
     fetch_reason: str = Field(description="Why this pipeline is fetching remote files; recorded in audit and sent as an HTTP header.")
-    timeout: int = Field(default=30, gt=0, description="Request timeout in seconds.")
+    timeout: int = Field(
+        default=30,
+        gt=0,
+        description="Total wall-clock seconds from dispatch for each HTTP request, including DNS, connect, TLS, send, headers, body, and every redirect hop. Rate-limiter waits are bounded separately by the same number of seconds.",
+    )
     max_body_bytes: int = Field(default=10 * 1024 * 1024, gt=0, description="Maximum response body size in bytes.")
     allowed_hosts: Literal["public_only", "allow_private"] | Annotated[list[CidrStr], Field(min_length=1)] = Field(
         default="public_only",

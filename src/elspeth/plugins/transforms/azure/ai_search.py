@@ -38,7 +38,11 @@ class AzureAISearchConfig(RetrievalOutputConfig):
         default="hybrid",
         description="vector and hybrid need an integrated vectorizer on field_vector; semantic needs semantic_config.",
     )
-    request_timeout: float = Field(default=30.0, gt=0, description="Per-request timeout in seconds.")
+    request_timeout: float = Field(
+        default=30.0,
+        gt=0,
+        description="Total wall-clock seconds from dispatch for each search request, including DNS, connect, TLS, send, headers, body, and every redirect hop. Rate-limiter waits are bounded separately by the same number of seconds.",
+    )
     # Index fields are spelled ``field_*``: a ``*_field`` option is, by the base class's
     # convention, the name of a row column this transform reads.
     field_vector: str = Field(default="contentVector", description="Index vector field queried by vector and hybrid modes.")

@@ -167,7 +167,7 @@ class GatewayConfig(LLMConfig):
         default=60.0,
         gt=GATEWAY_TIMEOUT_MIN_EXCLUSIVE,
         le=GATEWAY_TIMEOUT_MAX_SECONDS,
-        description="Request timeout",
+        description="Total wall-clock seconds from dispatch for each provider HTTP request, including DNS, connect, TLS, send, headers, body, and every redirect hop. Rate-limiter waits are bounded separately by the same number of seconds.",
     )
     max_tokens: int | None = Field(
         default=None,

@@ -257,7 +257,7 @@ class TestWebScrapeContract(TransformContractPropertyTestBase):
         landscape = _context_mock(ctx.landscape, "landscape")
         payload_store = _context_mock(ctx.payload_store, "payload_store")
 
-        limiter.acquire.assert_called_once_with()
+        limiter.acquire.assert_called_once_with(timeout=30)
         landscape.allocate_call_index.assert_called_once_with(
             "test-state-001", member_token=ctx.require_member_token(), work_item=ctx.require_work_item()
         )
