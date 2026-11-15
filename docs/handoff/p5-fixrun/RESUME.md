@@ -56,3 +56,4 @@ no pushes to claude/zen-turing-pphown until 0.8.13 lands (integrator's constrain
 - All 8 unlanded lane branches pushed to origin (lane/p4-146-truncate, lane/p5-{batch,web,db-chroma,templates,http-deadline,llm-audit,io-validation}); SHAs match local.
 - Lane state + scratchpad packed (tree copies excluded) onto branch lane/p5-handoff under docs/handoff/p5-fixrun/; restore per its README.
 - On the new host: recreate lane worktrees from the pushed branches (`git worktree add .claude/worktrees/lane-<x> lane/<x>`), then follow "Landing procedure on resume". Re-verify lane-02-p5-batch first.
+- 2026-11-15 integrator (session_01Szt2FzuKZ4Y8WpNigvatoY) is also moving hardware: send per-lane CHANGELOG/COMPAT and HANDOVER to the NEW integrator session the maintainer names (old one may not read). Integration tip still 01f39577; no pushes to #368 until 0.8.13 lands.
