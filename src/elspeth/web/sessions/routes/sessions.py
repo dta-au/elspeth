@@ -583,8 +583,22 @@ def _rewrite_fork_state_blob_custody(
             "Tier 1 audit anomaly: forked validation_errors retains parent blob custody the fork rewriter did not rebase "
             "-- clear the validation errors before forking this session"
         )
-    if not rewritten:
+    # A copied strict verdict covers only the parent's content. Disclosure
+    # re-derivation alone does not change that content; custody rewrites (and
+    # legacy source promotion) do. Compare thawed values, not ``rewritten``.
+    content_changed = (sources, nodes, edges, outputs, metadata) != (
+        deep_thaw(state.sources),
+        deep_thaw(state.nodes),
+        deep_thaw(state.edges),
+        deep_thaw(state.outputs),
+        deep_thaw(state.metadata_),
+    )
+    if not rewritten and not content_changed:
         return None
+    if content_changed:
+        if composer_meta is None:
+            composer_meta = {}
+        composer_meta["validation_lane"] = "authoring_only"
     return CompositionStateData(
         sources=sources,
         nodes=nodes,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
@@ -162,6 +163,95 @@ def _settlement_command(staged, rewritten: CompositionStateData | None) -> Sessi
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["blob", "sink", "unchanged", "disclosure_only"])
+async def test_fork_validation_marker_tracks_content(engine, tmp_path: Path, shape: str, record_property) -> None:
+    service = _service_for(engine)
+    blob_service = BlobServiceImpl(engine, tmp_path / "blobs")
+    parent = await service.create_session("alice", "Parent", "local")
+    sources = {}
+    outputs = []
+    if shape == "blob":
+        blob = await create_blob_under_fence(service, blob_service, parent.id, "cases.csv", b"a,b\n1,2\n", "text/csv")
+        sources = {
+            "data": {
+                "plugin": "csv",
+                "on_success": "rows",
+                "options": {"blob_ref": str(blob.id), "path": blob.storage_path},
+                "on_validation_failure": "quarantine",
+            }
+        }
+    if shape == "sink":
+        outputs = [{"name": "out", "plugin": "csv", "options": {"path": str(tmp_path / "outputs" / str(parent.id) / "out.csv")}}]
+    composer_meta = {"validation_lane": "strict"}
+    if shape == "disclosure_only":
+        composer_meta["implicit_decisions"] = _stale_report([_entry("source.path", "stale")])
+    state = await service.save_composition_state(
+        parent.id,
+        CompositionStateData(
+            sources=sources,
+            nodes=[],
+            edges=[],
+            outputs=outputs,
+            metadata_={"name": "P", "description": None},
+            is_valid=True,
+            composer_meta=composer_meta,
+        ),
+        provenance="session_seed",
+    )
+    message = await service.add_message(
+        parent.id, "user", "fork here", composition_state_id=state.id, writer_principal="route_user_message"
+    )
+    staged, _, rewritten = await _stage_copy_rewrite(
+        service,
+        blob_service,
+        parent_id=parent.id,
+        fork_message_id=message.id,
+        data_dir=tmp_path,
+    )
+    assert (rewritten is None) == (shape == "unchanged")
+    await service.settle_fork_operation_receipt(_settlement_command(staged, rewritten))
+    child = await service.get_current_state(staged.session.id)
+    assert child is not None
+    with engine.begin() as conn:
+        row = conn.execute(select(composition_states_table).where(composition_states_table.c.id == str(child.id))).one()
+    parent_content = [deep_thaw(v) for v in (state.sources, state.nodes, state.edges, state.outputs, state.metadata_)]
+    child_content = [deep_thaw(v) for v in (child.sources, child.nodes, child.edges, child.outputs, child.metadata_)]
+    delta = [
+        name
+        for name, before, after in zip(("sources", "nodes", "edges", "outputs", "metadata"), parent_content, child_content, strict=True)
+        if before != after
+    ]
+    parent_meta, child_meta = deep_thaw(state.composer_meta), deep_thaw(child.composer_meta)
+    record_property(
+        "fork_evidence",
+        json.dumps(
+            {
+                "shape": shape,
+                "version": child.version,
+                "provenance": row.provenance,
+                "is_valid": child.is_valid,
+                "validation_lane": child_meta["validation_lane"],
+                "content_delta": delta,
+                "implicit_decisions_changed": parent_meta.get("implicit_decisions") != child_meta.get("implicit_decisions"),
+                "validation_errors_changed": state.validation_errors != child.validation_errors,
+            }
+        ),
+    )
+    assert child.version == 1
+    assert row.provenance == "session_fork"
+    assert child.is_valid is True
+    baseline = await service.get_last_validated_state(child.session_id, through_version=1, exclude_version=0)
+    if shape in {"blob", "sink"}:
+        assert delta == (["sources"] if shape == "blob" else ["outputs"])
+        assert child_meta["validation_lane"] == "authoring_only"
+        assert baseline is None
+    else:
+        assert delta == []
+        assert child_meta["validation_lane"] == "strict"
+        assert baseline is not None and baseline.id == child.id
+
+
+@pytest.mark.asyncio
 async def test_incident_shaped_fork_settles_and_child_names_only_its_own_blob(engine, tmp_path: Path) -> None:
     """elspeth-f478b01787 on the production chain. The parent's state carries a
     stale ``implicit_decisions`` report naming its blob three ways (bare id,
@@ -236,8 +326,8 @@ async def test_incident_shaped_fork_settles_and_child_names_only_its_own_blob(en
     # A blob_ref-bearing source records its path as the sentinel, never the
     # filesystem value, so the child's raw path must not have entered the report.
     assert child_blob.storage_path not in values, values
-    # Other subsystems' keys ride through the re-derivation untouched.
-    assert deep_thaw(child_state.composer_meta)["validation_lane"] == "strict"
+    # The parent's strict verdict did not validate the child's rewritten source.
+    assert deep_thaw(child_state.composer_meta)["validation_lane"] == "authoring_only"
 
 
 # --- T3: the settlement verifier sees mapping KEYS -----------------------------
@@ -245,7 +335,7 @@ async def test_incident_shaped_fork_settles_and_child_names_only_its_own_blob(en
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("key_shape", ["id", "sentinel", "storage_path"])
-async def test_settlement_rejects_rewritten_state_keyed_by_parent_blob(engine, tmp_path: Path, key_shape: str) -> None:
+async def test_settlement_rejects_rewritten_state_keyed_by_parent_blob(engine, tmp_path: Path, key_shape: str, record_property) -> None:
     """A parent blob id, ``blob:`` sentinel or raw storage path used as a dict
     KEY inside ``composer_meta`` names the parent exactly as a value does
     (red-team B2 on ee1ae108b: it crossed both guards and was served on a 200).
@@ -269,6 +359,8 @@ async def test_settlement_rejects_rewritten_state_keyed_by_parent_blob(engine, t
                 }
             },
             metadata_={"name": "P", "description": None},
+            is_valid=True,
+            composer_meta={"validation_lane": "strict"},
         ),
         provenance="session_seed",
     )
@@ -307,6 +399,28 @@ async def test_settlement_rejects_rewritten_state_keyed_by_parent_blob(engine, t
         await service.settle_fork_operation_receipt(_settlement_command(staged, keyed_state))
 
     assert (await service.get_session(staged.session.id)).archived_at is not None
+    retained = await service.get_current_state(staged.session.id)
+    assert retained == staged.state
+    assert retained.version == 1
+    assert retained.is_valid is True
+    assert retained.composer_meta["validation_lane"] == "strict"
+    assert retained.sources == state.sources
+    with engine.begin() as conn:
+        row = conn.execute(select(composition_states_table).where(composition_states_table.c.id == str(retained.id))).one()
+    assert row.provenance == "session_fork"
+    record_property(
+        "failed_settlement_evidence",
+        json.dumps(
+            {
+                "version": retained.version,
+                "provenance": row.provenance,
+                "is_valid": retained.is_valid,
+                "validation_lane": retained.composer_meta["validation_lane"],
+                "archived": True,
+                "staged_row_unchanged": retained == staged.state,
+            }
+        ),
+    )
 
 
 # --- Child state served without raw storage paths ------------------------------

@@ -542,17 +542,20 @@ composition_states_table = Table(
     # describes *how this state was reached* (distinct from ``metadata_``,
     # which carries the user-facing PipelineMetadata name/description).
     # Surfaced keys: ``repair_turns_used``, and ``validation_lane``
-    # (elspeth-67c6fa691d) — which predicate produced this row's
-    # ``is_valid``: "authoring_only" (mid-turn compose writer: Stage-1
+    # (elspeth-67c6fa691d) — validation evidence for this row's content:
+    # "authoring_only" (mid-turn compose writer: Stage-1
     # ``validate()`` narrowed by pending interpretation-review sites; no
     # plugin config instantiation, no runtime preflight) or "strict"
     # (turn-end writer: authoring + runtime preflight via
     # ``_composer_persisted_validation``). Two writers share the
     # ``is_valid`` column, so rows with byte-identical content can differ
     # in validity across lanes; the marker makes that transition legible
-    # to an auditor. Absence (NULL composer_meta or missing key) is honest
-    # for writer paths that predate the marker or copy an existing row
-    # (revert and fork).
+    # to an auditor. Revert and unchanged-content forks copy the stored
+    # verdict and marker without revalidation. A fork that rewrites content
+    # keeps the parent's ``is_valid`` but marks it "authoring_only" until a
+    # strict save validates the child's content; disclosure-only re-derivation
+    # preserves the marker. Absence (NULL composer_meta or missing key) is
+    # honest for writer paths that predate the marker and copies of those rows.
     Column("composer_meta", JSON, nullable=True),
     Column("creator_operation_id", String, nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
