@@ -1047,7 +1047,11 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # reopen-resume's resumed_full_projection_sha256 moved 1bf3705a... ->
 # b046c184..., measured by the production harness. Captured from this file's
 # parity failure (previous pin 14d69b1c...).
-EXPECTED_CASE_REGISTRY_SHA256 = "18037487924d662c3ec52977e345c452643994f12461e998e4c0dd07a5c4163e"
+# 2026-11-16 quarantine byte-order fix (5e491effa, hash refreshed in
+# 612003d5c): JSONSource's manifest provenance token moved c299bae1329a63c2 ->
+# 34cf4c72a5d26704, the manifest's only changed byte run. Captured from this
+# file's parity failure (previous pin 18037487...).
+EXPECTED_CASE_REGISTRY_SHA256 = "f2af0f14b27f718a6a257760d08f5f26f8e050f2659117a146bbf28763709981"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
