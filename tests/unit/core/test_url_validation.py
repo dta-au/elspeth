@@ -2,9 +2,25 @@
 
 from __future__ import annotations
 
+import traceback
+
 import pytest
 
 from elspeth.core.url_validation import validate_credential_safe_https_url
+
+
+@pytest.mark.parametrize("url", ["https://example.test", "https://example.test/path?q=1#fragment", "HTTPS://example.test:443/"])
+def test_credential_url_retains_existing_https_acceptance(url: str) -> None:
+    assert validate_credential_safe_https_url(url, field_name="endpoint") == url
+
+
+def test_malformed_authority_error_has_no_external_chain() -> None:
+    secret = "p5-core-" + "runtime-password"
+    with pytest.raises(ValueError, match="endpoint must be a valid URL") as caught:
+        validate_credential_safe_https_url(f"https://user:{secret}@exam\uff0fple.test", field_name="endpoint")
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert secret not in "".join(traceback.format_exception(caught.value))
 
 
 @pytest.mark.parametrize(

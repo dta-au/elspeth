@@ -25,6 +25,7 @@ from elspeth.core.security.web import (
     validate_literal_ip_for_ssrf,
     validate_url_for_ssrf,
 )
+from elspeth.core.url_validation import parse_credential_url_components
 from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_headers, fingerprint_url
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
@@ -63,7 +64,7 @@ class AzureSearchProviderConfig(BaseModel):
     # Validation errors never echo the authored input: it carries api_key.
     model_config = {"extra": "forbid", "frozen": True, "hide_input_in_errors": True}
 
-    endpoint: str
+    endpoint: str = Field(repr=False)
     index: str
 
     auth_mode: AzureSearchAuthMode | None = None
@@ -122,19 +123,21 @@ class AzureSearchProviderConfig(BaseModel):
     @field_validator("endpoint")
     @classmethod
     def validate_endpoint(cls, v: str) -> str:
-        parsed = urllib.parse.urlparse(v)
+        parsed, hostname, username, password = parse_credential_url_components(v)
+        if parsed is None:
+            raise ValueError("endpoint must be a valid URL")
         if parsed.scheme != "https":
-            raise ValueError(f"endpoint must use HTTPS scheme, got {parsed.scheme!r}")
-        if not parsed.hostname:
-            raise ValueError(f"endpoint must have a hostname, got {v!r}")
-        if parsed.username or parsed.password:
+            raise ValueError("endpoint must use HTTPS scheme")
+        if not hostname:
+            raise ValueError("endpoint must have a hostname")
+        if username or password:
             raise ValueError("endpoint must not include embedded credentials")
         if parsed.query or parsed.fragment:
             raise ValueError("endpoint must not include query strings or fragments")
         try:
-            validate_literal_ip_for_ssrf(parsed.hostname)
-        except SSRFBlockedError as exc:
-            raise ValueError(f"endpoint literal IP is blocked by SSRF policy: {exc}") from exc
+            validate_literal_ip_for_ssrf(hostname)
+        except SSRFBlockedError:
+            raise ValueError("endpoint literal IP is blocked by SSRF policy") from None
         return v
 
     @field_validator("index")

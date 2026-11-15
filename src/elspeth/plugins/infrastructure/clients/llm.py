@@ -193,9 +193,12 @@ class UnsupportedResponseError(LLMClientError):
         super().__init__(message, retryable=False)
 
 
+# These ELSPETH-owned messages are persisted replay values. Changing their exact
+# text requires a compatibility decision for previously recorded call rows.
 EMPTY_COMPLETION_FILTERED_MESSAGE: Final = "LLM returned empty content: provider refused or filtered the response"
 EMPTY_COMPLETION_LENGTH_MESSAGE: Final = "LLM exhausted the output token budget before returning content"
 EMPTY_COMPLETION_UNEXPLAINED_MESSAGE: Final = "LLM returned empty content without an explicit refusal"
+UNSUPPORTED_TOOL_CALLS_MESSAGE: Final = "LLM returned tool_calls response (not supported by ELSPETH)"
 
 
 def classify_empty_completion(finish_reason: object, *, refused: bool) -> EmptyCompletionError | FilteredCompletionError:
@@ -224,6 +227,14 @@ def _recorded_empty_completion(error_type: str, category: str, message: str) -> 
     ):
         if type(verdict).__name__ == error_type and verdict.category == category and str(verdict) == message:
             return verdict
+    return None
+
+
+def _recorded_tool_calls(error_type: str, category: str, message: str) -> UnsupportedResponseError | None:
+    """Recognize the one ELSPETH-owned replayable response-processing verdict."""
+    verdict = UnsupportedResponseError(UNSUPPORTED_TOOL_CALLS_MESSAGE)
+    if type(verdict).__name__ == error_type and verdict.category == category and str(verdict) == message:
+        return verdict
     return None
 
 
@@ -577,7 +588,7 @@ class AuditedLLMClient(AuditedClientBase):
             if raw_cost_source not in get_args(ComposerLLMProviderCostSource):
                 raise ValueError("Recorded LLM error has invalid provider cost source")
             raw_category = error["category"]
-            if raw_category not in get_args(LLMErrorCategory) or raw_category == "response_processing":
+            if raw_category not in get_args(LLMErrorCategory):
                 raise ValueError("Recorded LLM error has no replayable public classification")
             category = cast(LLMErrorCategory, raw_category)
             if retryable is not (category in {"rate_limit", "server", "network"}):
@@ -591,22 +602,51 @@ class AuditedLLMClient(AuditedClientBase):
                 provider_cost_source=cast(ComposerLLMProviderCostSource, raw_cost_source),
                 category=category,
             )
-            # The only live ERROR branch that retains a typed response payload
-            # AND a replayable classification is the empty completion (null,
-            # empty or whitespace-only content): it records the provider's
-            # response with the classify_empty_completion verdict. Rebuild that
-            # payload so the replay record carries the same evidence as the
-            # source, and refuse every other response-bearing error
-            # (response_processing is already refused above).
+            # Owned blank-completion and tool-call verdicts retain response
+            # evidence. Other response-processing errors cannot be replayed.
             recorded_response: LLMCallResponse | None = None
-            empty_verdict: EmptyCompletionError | FilteredCompletionError | None = None
+            empty_verdict = _recorded_empty_completion(error_type, category, error_message)
+            tool_calls_verdict = _recorded_tool_calls(error_type, category, error_message)
+            if category == "response_processing" and tool_calls_verdict is None:
+                raise ValueError("Recorded LLM response-processing error has no replayable public classification")
+            if (empty_verdict is not None or tool_calls_verdict is not None) and evidence.response_data is None:
+                raise ValueError("Recorded LLM verdict has no response payload")
             if evidence.response_data is not None:
-                empty_verdict = _recorded_empty_completion(error_type, category, error_message)
-                if empty_verdict is None:
-                    raise ValueError("Recorded LLM error with a response payload is not an empty-completion classification")
+                if empty_verdict is None and tool_calls_verdict is None:
+                    raise ValueError("Recorded LLM error with a response payload has no replayable classification")
                 recorded_response = _rebuild_recorded_response(evidence)
                 if recorded_response.content.strip():
                     raise ValueError("Recorded empty-completion LLM response has non-empty content")
+                raw_choices = recorded_response.raw_response["choices"] if "choices" in recorded_response.raw_response else None
+                if (
+                    not isinstance(raw_choices, Sequence)
+                    or isinstance(raw_choices, (str, bytes))
+                    or not raw_choices
+                    or not isinstance(raw_choices[0], Mapping)
+                ):
+                    raise ValueError("Recorded LLM verdict has no valid first choice")
+                first_choice = raw_choices[0]
+                raw_message = first_choice["message"] if "message" in first_choice else None
+                if not isinstance(raw_message, Mapping) or "content" not in raw_message:
+                    raise ValueError("Recorded LLM verdict has no raw message content")
+                raw_content = raw_message["content"]
+                if raw_content is not None and (not isinstance(raw_content, str) or raw_content.strip()):
+                    raise ValueError("Recorded empty-completion LLM response conflicts with raw content")
+                if "finish_reason" not in first_choice:
+                    raise ValueError("Recorded LLM verdict has no finish reason")
+                if tool_calls_verdict is not None:
+                    if first_choice["finish_reason"] != "tool_calls":
+                        raise ValueError("Recorded unsupported LLM response has no tool_calls finish reason")
+                else:
+                    raw_verdict = classify_empty_completion(
+                        first_choice["finish_reason"], refused=_completion_declares_refusal(recorded_response.raw_response)
+                    )
+                    if (
+                        first_choice["finish_reason"] == "tool_calls"
+                        or type(raw_verdict) is not type(empty_verdict)
+                        or str(raw_verdict) != str(empty_verdict)
+                    ):
+                        raise ValueError("Recorded empty-completion verdict conflicts with raw finish or refusal")
             replay_usage = UNKNOWN_TOKEN_USAGE if recorded_response is None else recorded_response.usage
             self._record_image_call(
                 messages=messages,
@@ -632,6 +672,8 @@ class AuditedLLMClient(AuditedClientBase):
             )
             if empty_verdict is not None:
                 raise empty_verdict
+            if tool_calls_verdict is not None:
+                raise tool_calls_verdict
             if category == "rate_limit":
                 raise RateLimitError(error_dto.message)
             if category == "content_policy":
@@ -1194,7 +1236,7 @@ class AuditedLLMClient(AuditedClientBase):
             )
             empty_error: LLMClientError
             if finish_reason == "tool_calls":
-                empty_error = UnsupportedResponseError("LLM returned tool_calls response (not supported by ELSPETH)")
+                empty_error = UnsupportedResponseError(UNSUPPORTED_TOOL_CALLS_MESSAGE)
             else:
                 empty_error = classify_empty_completion(finish_reason, refused=_completion_declares_refusal(raw_response))
             self._record_image_call(

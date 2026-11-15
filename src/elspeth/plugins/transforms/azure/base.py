@@ -91,7 +91,7 @@ class BaseAzureSafetyConfig(TransformDataConfig):
     Subclass to add transform-specific fields (thresholds, analysis_type, etc.).
     """
 
-    endpoint: str = Field(..., description="Azure Content Safety endpoint URL")
+    endpoint: str = Field(..., description="Azure Content Safety endpoint URL", repr=False)
     api_key: str = Field(..., description="Azure Content Safety API key", repr=False)
     fields: str | list[str] = Field(
         ...,

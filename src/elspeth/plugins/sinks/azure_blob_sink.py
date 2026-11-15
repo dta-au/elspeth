@@ -226,6 +226,7 @@ class AzureBlobSinkConfig(DataPluginConfig):
     account_url: str | None = Field(
         default=None,
         description="Azure Storage account URL (e.g., https://mystorageaccount.blob.core.windows.net)",
+        repr=False,
     )
 
     # Auth Option 4: Service Principal
@@ -404,7 +405,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
     name = "azure_blob"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:29732938fa1803b8"
+    source_file_hash: str | None = "sha256:265a70ffa9cb1d46"
     config_model = AzureBlobSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP

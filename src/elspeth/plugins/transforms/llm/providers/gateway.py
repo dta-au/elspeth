@@ -64,6 +64,7 @@ from elspeth.plugins.infrastructure.clients.http import (
     HTTPResponseEncodingLimitError,
 )
 from elspeth.plugins.infrastructure.clients.llm import (
+    UNSUPPORTED_TOOL_CALLS_MESSAGE,
     ContentPolicyError,
     ContextLengthError,
     LLMClientError,
@@ -152,7 +153,7 @@ class GatewayConfig(LLMConfig):
         max_length=GATEWAY_MODEL_MAX_LENGTH,
         description="Logical model alias resolved server-side by the gateway",
     )
-    endpoint: str = Field(..., description="Gateway base URL; must end with the versioned base path '/v1'")
+    endpoint: str = Field(..., description="Gateway base URL; must end with the versioned base path '/v1'", repr=False)
     api_key: str = Field(..., description="Resolved gateway bearer credential", repr=False)
     contract_major: int = Field(
         default=1,
@@ -481,7 +482,7 @@ def _validate_gateway_success_response(
         raise LLMClientError(f"Gateway response content is {type(content).__name__}, expected str", retryable=False)
     if content is None or not content.strip():
         if raw_finish_reason == "tool_calls":
-            raise UnsupportedResponseError("LLM returned tool_calls response (not supported by ELSPETH)")
+            raise UnsupportedResponseError(UNSUPPORTED_TOOL_CALLS_MESSAGE)
         # The shared classification every provider records (#123); the
         # verdict text is owned, finish_reason is never interpolated.
         refusal = message.get("refusal")

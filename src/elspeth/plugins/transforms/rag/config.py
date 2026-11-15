@@ -80,7 +80,9 @@ class RAGRetrievalConfig(RetrievalOutputConfig):
     """Configuration for the rag_retrieval transform plugin."""
 
     provider: RetrievalProviderName = Field(description="Retrieval provider name registered in the RAG provider catalog.")
-    provider_config: dict[str, Any] = Field(description="Provider-specific retrieval configuration passed to the selected provider.")
+    provider_config: dict[str, Any] = Field(
+        description="Provider-specific retrieval configuration passed to the selected provider.", repr=False
+    )
 
     @model_validator(mode="after")
     def validate_provider_config(self) -> Self:

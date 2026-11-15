@@ -93,7 +93,7 @@ class AzureOpenAIConfig(LLMConfig):
     )
 
     deployment_name: str = Field(..., description="Azure deployment name")
-    endpoint: str = Field(..., description="Azure OpenAI endpoint URL")
+    endpoint: str = Field(..., description="Azure OpenAI endpoint URL", repr=False)
     api_key: str = Field(..., description="Azure OpenAI API key", repr=False)
     api_version: str = Field(default="2024-10-21", description="Azure API version")
 

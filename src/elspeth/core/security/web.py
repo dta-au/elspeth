@@ -73,6 +73,33 @@ class SSRFBlockedError(Exception):
         self.kind: SSRFRefusalKind = kind
 
 
+def configured_url_refusal_message(kind: SSRFRefusalKind) -> str:
+    """Explain a fixed URL refusal without displaying any part of the URL."""
+    if kind == "origin_not_allowed":
+        return "url must have a well-formed HTTP(S) origin listed in http.allowed_origins"
+    if kind == "malformed_url":
+        return "url must be a well-formed HTTP(S) address"
+    if kind == "invalid_port":
+        return "url must use a valid numeric port"
+    if kind == "missing_scheme":
+        return "url must include an HTTP or HTTPS scheme"
+    if kind == "credentials_in_url":
+        return "url must not contain embedded credentials"
+    if kind == "forbidden_scheme":
+        return "url must use an HTTP or HTTPS scheme"
+    if kind == "missing_hostname":
+        return "url must include a hostname"
+    if kind == "port_zero":
+        return "url port must be greater than zero"
+    if kind == "unparseable_ip":
+        return "url literal address is invalid; change url"
+    if kind == "always_blocked_range":
+        return "url destination is in a prohibited range; change url"
+    if kind == "blocked_range":
+        return "url destination is blocked; review http.allowed_hosts"
+    return "url must match the archived request; change url"
+
+
 class NetworkError(Exception):
     """Network operation failed (DNS, connection, etc.).
 

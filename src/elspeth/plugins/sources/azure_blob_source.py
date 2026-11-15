@@ -209,6 +209,7 @@ class AzureBlobSourceConfig(DataPluginConfig):
     account_url: str | None = Field(
         default=None,
         description="Azure Storage account URL (e.g., https://mystorageaccount.blob.core.windows.net)",
+        repr=False,
     )
 
     # Auth Option 4: Service Principal
@@ -429,7 +430,7 @@ class AzureBlobSource(BaseSource):
     name = "azure_blob"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9ee9149d808922ab"
+    source_file_hash: str | None = "sha256:fd33f2630f7e2406"
     config_model = AzureBlobSourceConfig
 
     usage_when_to_use: str = (

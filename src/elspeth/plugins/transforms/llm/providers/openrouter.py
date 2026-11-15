@@ -45,6 +45,7 @@ from elspeth.plugins.infrastructure.clients.http import (
 )
 from elspeth.plugins.infrastructure.clients.llm import (
     CONTEXT_LENGTH_PATTERNS,
+    UNSUPPORTED_TOOL_CALLS_MESSAGE,
     ContextLengthError,
     LLMClientError,
     NetworkError,
@@ -186,7 +187,7 @@ def _validate_chat_completion_response(response: httpx.Response) -> tuple[dict[s
 
     if content is None or not content.strip():
         if raw_finish_reason == "tool_calls":
-            raise UnsupportedResponseError("LLM returned tool_calls response (not supported by ELSPETH)")
+            raise UnsupportedResponseError(UNSUPPORTED_TOOL_CALLS_MESSAGE)
         # The shared classification every provider records (#123): missing
         # content alone does not establish a content-policy refusal.
         refusal = message.get("refusal")
@@ -240,6 +241,7 @@ class OpenRouterConfig(LLMConfig):
     base_url: str = Field(
         default=OPENROUTER_BASE_URL,
         description="OpenRouter API base URL",
+        repr=False,
     )
     timeout_seconds: float = Field(default=60.0, gt=0, description="Request timeout")
 

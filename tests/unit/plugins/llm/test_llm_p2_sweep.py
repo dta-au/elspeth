@@ -42,7 +42,7 @@ def _content_filtered_source_call() -> dict[str, Any]:
                 content=None,
                 completion_tokens=0,
                 finish_reason="content_filter",
-                raw_response={"id": "resp_null", "choices": [{"finish_reason": "content_filter"}]},
+                raw_response={"id": "resp_null", "choices": [{"finish_reason": "content_filter", "message": {"content": None}}]},
             )
         ),
     )

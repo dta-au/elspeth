@@ -144,7 +144,7 @@ class LangfuseTracingConfig(TracingConfig):
     provider: str = "langfuse"
     public_key: str | None = None
     secret_key: str | None = field(default=None, repr=False)
-    host: str | None = None
+    host: str | None = field(default=None, repr=False)
     tracing_enabled: bool = True
 
     def __post_init__(self) -> None:
