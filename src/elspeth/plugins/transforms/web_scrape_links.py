@@ -9,6 +9,7 @@ from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
 from elspeth.core.security.web import (
     HTTPOrigin,
     SSRFBlockedError,
+    contains_ascii_control_character,
     validate_allowed_http_origin,
     validate_configured_url_for_ssrf,
 )
@@ -40,7 +41,7 @@ def resolve_discovered_href(
     """
     if not allowed_origins:
         raise ValueError("resolved links require http.allowed_origins")
-    if not href or any(ord(char) < 33 or char == "\\" for char in href):
+    if not href or contains_ascii_control_character(href) or any(char == " " or char == "\\" for char in href):
         raise ValueError("discovered link is not an approved HTTP target")
 
     try:

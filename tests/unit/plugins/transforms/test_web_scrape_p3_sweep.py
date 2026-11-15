@@ -91,7 +91,7 @@ def test_fingerprint_mode_description_matches_compute_fingerprint() -> None:
     description = WebScrapeConfig.model_fields["fingerprint_mode"].description
     assert description is not None
     assert "whitespace" in description.lower()
-    for term in ("status", "final URL", "content type", "raw body"):
+    for term in ("status", "final URL", "content type", "content-decoded body"):
         assert term in description
 
 

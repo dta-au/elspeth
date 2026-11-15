@@ -9,7 +9,8 @@ Two modes:
   content exactly as extracted and, for every fetched page in fetch order,
   the HTTP status, the persisted final URL (the ``fetch_url_final``
   rendering), the raw ``Content-Type`` header (``None`` when absent) and the
-  SHA-256 of the raw response body bytes. Other response headers are not
+  SHA-256 of the content-decoded body (after transfer and content decoding,
+  before text extraction). Other response headers are not
   covered: they carry per-request values (``Date``, ``Age``, cookies) that
   would change the fingerprint on every fetch and defeat change detection.
 """
