@@ -50,7 +50,13 @@ from elspeth.plugins.infrastructure.config_base import (
 )
 from elspeth.plugins.infrastructure.config_content import reject_nonfinite_constant
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
-from elspeth.plugins.infrastructure.text_decoding import BYTE_ESCAPE_ERRORS, contains_escaped_bytes, decoding_codec, escaped_line_to_bytes
+from elspeth.plugins.infrastructure.text_decoding import (
+    BYTE_ESCAPE_ERRORS,
+    contains_escaped_bytes,
+    decoding_codec,
+    escaped_line_to_bytes,
+    line_byte_codec_from_head,
+)
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,
     FieldMappingCollisionError,
@@ -913,7 +919,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:235a36bcefdada6d"
+    source_file_hash: str | None = "sha256:a62a6bf26b5b620b"
     config_model = AWSS3SourceConfig
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 
@@ -1287,6 +1293,9 @@ class AWSS3Source(BaseSource):
         # BYTE_ESCAPE_ERRORS keeps an undecodable code unit on its own line for
         # every codec; surrogateescape cannot for UTF-16/UTF-32, where the
         # decode error aborted the whole read-ahead chunk.
+        head = handle.read(4)
+        handle.seek(0)
+        line_codec = line_byte_codec_from_head(head, decoding_codec(self._json_options.encoding))
         stream = io.TextIOWrapper(
             handle,
             encoding=decoding_codec(self._json_options.encoding),
@@ -1329,7 +1338,7 @@ class AWSS3Source(BaseSource):
                 if not line:
                     continue
                 if contains_escaped_bytes(raw_line):
-                    raw_bytes = escaped_line_to_bytes(raw_line.rstrip("\r\n"), self._json_options.encoding)
+                    raw_bytes = escaped_line_to_bytes(raw_line.rstrip("\r\n"), line_codec, line_number=line_number)
                     yield from self._quarantine_parse_row(
                         ctx,
                         {"__raw_bytes_hex__": raw_bytes.hex(), "__line_number__": line_number},

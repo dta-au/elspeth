@@ -46,7 +46,13 @@ from elspeth.plugins.infrastructure.config_base import (
 )
 from elspeth.plugins.infrastructure.config_content import reject_nonfinite_constant
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
-from elspeth.plugins.infrastructure.text_decoding import BYTE_ESCAPE_ERRORS, contains_escaped_bytes, decoding_codec, escaped_line_to_bytes
+from elspeth.plugins.infrastructure.text_decoding import (
+    BYTE_ESCAPE_ERRORS,
+    contains_escaped_bytes,
+    decoding_codec,
+    escaped_line_to_bytes,
+    line_byte_codec_from_head,
+)
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,
     FieldMappingCollisionError,
@@ -396,7 +402,7 @@ class AzureBlobSource(BaseSource):
     name = "azure_blob"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:5da3ed9923a70982"
+    source_file_hash: str | None = "sha256:1d237672155fd73b"
     config_model = AzureBlobSourceConfig
 
     usage_when_to_use: str = (
@@ -675,6 +681,7 @@ class AzureBlobSource(BaseSource):
         delimiter = self._csv_options.delimiter
         has_header = self._csv_options.has_header
         encoding = self._csv_options.encoding
+        line_codec = line_byte_codec_from_head(blob_data[:4], decoding_codec(encoding))
 
         def _quarantine_undecodable_file(error_msg: str) -> Iterator[SourceRow]:
             raw_row = {
@@ -916,7 +923,8 @@ class AzureBlobSource(BaseSource):
             # raw bytes (mirrors _load_jsonl), and keep reading.
             raw_record = "".join(record_lines)
             if contains_escaped_bytes(raw_record):
-                raw_bytes = escaped_line_to_bytes(raw_record.rstrip("\r\n"), encoding)
+                record_start_line = physical_line - len(record_lines) + 1
+                raw_bytes = escaped_line_to_bytes(raw_record.rstrip("\r\n"), line_codec, line_number=record_start_line)
                 raw_row = {
                     "__raw_bytes_hex__": raw_bytes.hex(),
                     "__line_number__": str(physical_line),
@@ -1053,6 +1061,7 @@ class AzureBlobSource(BaseSource):
         encoding = self._json_options.encoding
 
         non_empty_count = 0
+        line_codec = line_byte_codec_from_head(blob_data[:4], decoding_codec(encoding))
         line_num = 0
         try:
             text_stream = io.TextIOWrapper(
@@ -1069,7 +1078,7 @@ class AzureBlobSource(BaseSource):
                 non_empty_count += 1
 
                 if contains_escaped_bytes(raw_line):
-                    raw_bytes = escaped_line_to_bytes(raw_line.rstrip("\r\n"), encoding)
+                    raw_bytes = escaped_line_to_bytes(raw_line.rstrip("\r\n"), line_codec, line_number=line_num)
                     raw_row = {
                         "__raw_bytes_hex__": raw_bytes.hex(),
                         "__line_number__": line_num,

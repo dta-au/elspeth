@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from elspeth.plugins.infrastructure.results import TransformResult
-from tests.fixtures.factories import make_source_context
+from tests.fixtures.factories import make_operation_context, make_source_context
 from tests.unit.plugins.sources.test_aws_s3_source import _source_for
+from tests.unit.plugins.sources.test_azure_blob_source import PATCH_AUTH, _base_config, _fake_blob_service, _make_source
 
 
 class TestS3CSVBlankLinesBeforeHeader:
@@ -33,6 +35,156 @@ class TestS3CSVBlankLinesBeforeHeader:
 
 def _utf16le(text: str) -> bytes:
     return text.encode("utf-16-le")
+
+
+_BYTE_ORDER_CASES = [
+    pytest.param("utf-16", "utf-16-le", b"\xff\xfe", b"\x00\xd8", id="utf-16-bom-le"),
+    pytest.param("utf-16", "utf-16-be", b"\xfe\xff", b"\xd8\x00", id="utf-16-bom-be"),
+    pytest.param("utf-32", "utf-32-le", b"\xff\xfe\x00\x00", b"\x00\xd8\x00\x00", id="utf-32-bom-le"),
+    pytest.param("utf-32", "utf-32-be", b"\x00\x00\xfe\xff", b"\x00\x00\xd8\x00", id="utf-32-bom-be"),
+]
+
+
+class TestQuarantinedLineBytesKeepTheFileByteOrder:
+    @pytest.mark.parametrize(("encoding", "body_codec", "bom", "bad_unit"), _BYTE_ORDER_CASES)
+    @pytest.mark.parametrize("bad_line", [1, 2])
+    def test_jsonl_quarantined_line_is_the_original_bytes(
+        self, tmp_path: Path, encoding: str, body_codec: str, bom: bytes, bad_unit: bytes, bad_line: int
+    ) -> None:
+        from elspeth.plugins.sources.json_source import JSONSource
+
+        good = '{"id": 1}\n'.encode(body_codec)
+        bad = bad_unit + "\n".encode(body_codec)
+        lines = [good, bad] if bad_line == 2 else [bad, good]
+        path = tmp_path / "data.jsonl"
+        path.write_bytes(bom + b"".join(lines))
+        source = JSONSource(
+            {
+                "path": str(path),
+                "format": "jsonl",
+                "encoding": encoding,
+                "on_validation_failure": "quarantine",
+                "schema": {"mode": "observed"},
+            }
+        )
+        rows = list(source.load(make_source_context(plugin_name="json")))
+        quarantined = [row for row in rows if row.is_quarantined]
+        assert [row.row["__line_number__"] for row in quarantined] == [bad_line]
+        assert quarantined[0].row["__raw_bytes_hex__"] == ((bom + bad) if bad_line == 1 else bad).hex()
+        assert [row.row for row in rows if not row.is_quarantined] == [{"id": 1}]
+
+    @pytest.mark.parametrize(("encoding", "body_codec", "bom", "bad_unit"), _BYTE_ORDER_CASES)
+    @pytest.mark.parametrize("bad_line", [1, 2])
+    def test_text_quarantined_line_is_the_original_bytes(
+        self, tmp_path: Path, encoding: str, body_codec: str, bom: bytes, bad_unit: bytes, bad_line: int
+    ) -> None:
+        from elspeth.plugins.sources.text_source import TextSource
+
+        good = "a\n".encode(body_codec)
+        bad = bad_unit + "c\n".encode(body_codec)
+        lines = [good, bad] if bad_line == 2 else [bad, good]
+        path = tmp_path / "items.txt"
+        path.write_bytes(bom + b"".join(lines))
+        source = TextSource(
+            {
+                "path": str(path),
+                "column": "value",
+                "encoding": encoding,
+                "on_validation_failure": "quarantine",
+                "schema": {"mode": "observed"},
+            }
+        )
+        rows = list(source.load(make_source_context(plugin_name="text")))
+        quarantined = [row for row in rows if row.is_quarantined]
+        assert [row.row["__line_number__"] for row in quarantined] == [bad_line]
+        assert quarantined[0].row["__raw_bytes_hex__"] == ((bom + bad) if bad_line == 1 else bad).hex()
+        assert [row.row for row in rows if not row.is_quarantined] == [{"value": "a"}]
+
+    def test_jsonl_utf8_bom_stays_on_a_quarantined_first_line(self, tmp_path: Path) -> None:
+        from elspeth.plugins.sources.json_source import JSONSource
+
+        bad = b'{"id": \xff}\n'
+        path = tmp_path / "data.jsonl"
+        path.write_bytes(b"\xef\xbb\xbf" + bad + b'{"id": 2}\n')
+        source = JSONSource(
+            {
+                "path": str(path),
+                "format": "jsonl",
+                "encoding": "utf-8",
+                "on_validation_failure": "quarantine",
+                "schema": {"mode": "observed"},
+            }
+        )
+        rows = list(source.load(make_source_context(plugin_name="json")))
+        assert rows[0].row["__raw_bytes_hex__"] == (b"\xef\xbb\xbf" + bad).hex()
+        assert rows[1].row == {"id": 2}
+
+    @pytest.mark.parametrize(
+        ("encoding", "body_codec", "bom", "bad_unit"),
+        [*_BYTE_ORDER_CASES, pytest.param("utf-8-sig", "utf-8", b"\xef\xbb\xbf", b"\xff", id="utf-8-sig")],
+    )
+    @pytest.mark.parametrize("bad_line", [1, 2])
+    @pytest.mark.parametrize("provider", ["s3", "azure"])
+    def test_blob_jsonl_quarantine_preserves_stream_bytes(
+        self, encoding: str, body_codec: str, bom: bytes, bad_unit: bytes, bad_line: int, provider: str
+    ) -> None:
+        good = '{"id": 1}\n'.encode(body_codec)
+        bad = bad_unit + "\n".encode(body_codec)
+        body = bom + (good + bad if bad_line == 2 else bad + good)
+        if provider == "s3":
+            source, _, ctx = _source_for(body, format="jsonl", json_options={"encoding": encoding})
+            rows = list(source.load(ctx))
+        else:
+            source = _make_source(_base_config(format="jsonl", json_options={"encoding": encoding}))
+            azure_ctx = make_operation_context(plugin_name="azure_blob")
+            with patch(PATCH_AUTH, return_value=_fake_blob_service(body)):
+                rows = list(source.load(azure_ctx))
+        quarantined = [row for row in rows if row.is_quarantined]
+        assert len(quarantined) == 1
+        assert quarantined[0].row["__raw_bytes_hex__"] == ((bom + bad_unit) if bad_line == 1 else bad_unit).hex()
+
+    @pytest.mark.parametrize(
+        ("encoding", "body_codec", "bom", "bad_unit"),
+        [*_BYTE_ORDER_CASES, pytest.param("utf-8-sig", "utf-8", b"\xef\xbb\xbf", b"\xff", id="utf-8-sig")],
+    )
+    @pytest.mark.parametrize("bad_line", [1, 2])
+    def test_azure_csv_quarantine_preserves_stream_bytes(
+        self, encoding: str, body_codec: str, bom: bytes, bad_unit: bytes, bad_line: int
+    ) -> None:
+        good = "a\n".encode(body_codec)
+        bad = bad_unit + "\n".encode(body_codec)
+        body = bom + (good + bad if bad_line == 2 else bad + good)
+        source = _make_source(_base_config(format="csv", columns=["value"], csv_options={"has_header": False, "encoding": encoding}))
+        ctx = make_operation_context(plugin_name="azure_blob")
+        with patch(PATCH_AUTH, return_value=_fake_blob_service(body)):
+            rows = list(source.load(ctx))
+        quarantined = [row for row in rows if row.is_quarantined]
+        assert len(quarantined) == 1
+        assert quarantined[0].row["__raw_bytes_hex__"] == ((bom + bad_unit) if bad_line == 1 else bad_unit).hex()
+
+    @pytest.mark.parametrize("provider", ["s3", "azure"])
+    def test_later_chunk_bom_bytes_do_not_reset_stream_codec(self, provider: str) -> None:
+        first = b'{"text":"' + b"a" * 8192 + b'"}\n'
+        second = b"\xef\xbb\xbf\xff\n"
+        body = first + second
+        if provider == "s3":
+            source, _, ctx = _source_for(body, format="jsonl", json_options={"encoding": "utf-8-sig"})
+            rows = list(source.load(ctx))
+        else:
+            source = _make_source(_base_config(format="jsonl", json_options={"encoding": "utf-8-sig"}))
+            azure_ctx = make_operation_context(plugin_name="azure_blob")
+            with patch(PATCH_AUTH, return_value=_fake_blob_service(body)):
+                rows = list(source.load(azure_ctx))
+        assert rows[1].row["__raw_bytes_hex__"] == second.rstrip(b"\n").hex()
+
+    def test_azure_multiline_first_csv_record_keeps_its_bom(self) -> None:
+        bom = b"\xff\xfe"
+        record = '"a\n'.encode("utf-16-le") + b"\x00\xd8" + '"\n'.encode("utf-16-le")
+        source = _make_source(_base_config(format="csv", columns=["value"], csv_options={"has_header": False, "encoding": "utf-16"}))
+        ctx = make_operation_context(plugin_name="azure_blob")
+        with patch(PATCH_AUTH, return_value=_fake_blob_service(bom + record)):
+            rows = list(source.load(ctx))
+        assert rows[0].row["__raw_bytes_hex__"] == (bom + record[:-2]).hex()
 
 
 class TestJSONLUndecodableCodeUnitIsolatedToItsLine:

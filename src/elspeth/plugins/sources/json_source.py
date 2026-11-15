@@ -32,7 +32,13 @@ from elspeth.plugins.infrastructure.config_base import (
 )
 from elspeth.plugins.infrastructure.config_content import reject_nonfinite_constant
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
-from elspeth.plugins.infrastructure.text_decoding import BYTE_ESCAPE_ERRORS, contains_escaped_bytes, decoding_codec, escaped_line_to_bytes
+from elspeth.plugins.infrastructure.text_decoding import (
+    BYTE_ESCAPE_ERRORS,
+    contains_escaped_bytes,
+    decoding_codec,
+    escaped_line_to_bytes,
+    line_byte_codec,
+)
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,
     FieldResolution,
@@ -142,7 +148,7 @@ class JSONSource(BaseSource):
     name = "json"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:47746b3fbe3b15a6"
+    source_file_hash: str | None = "sha256:7a8425cae4ef21bd"
     config_model = JSONSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str
@@ -270,10 +276,11 @@ class JSONSource(BaseSource):
             # (e.g., utf-16 / utf-32) instead of splitting on raw 0x0A bytes.
             # BYTE_ESCAPE_ERRORS keeps an undecodable code unit on its own line
             # for every codec; surrogateescape cannot for UTF-16/UTF-32.
+            line_codec = line_byte_codec(self._path, self._read_encoding)
             with open(self._path, encoding=self._read_encoding, errors=BYTE_ESCAPE_ERRORS, newline="") as f:
                 for line_num, raw_line in enumerate(f, start=1):
                     if contains_escaped_bytes(raw_line):
-                        raw_bytes = escaped_line_to_bytes(raw_line, self._encoding)
+                        raw_bytes = escaped_line_to_bytes(raw_line, line_codec, line_number=line_num)
                         raw_row = {"__raw_bytes_hex__": raw_bytes.hex(), "__line_number__": line_num}
                         error_msg = f"JSON parse error at line {line_num}: invalid {self._encoding} encoding"
                         quarantined = self._record_parse_error(

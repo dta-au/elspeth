@@ -26,7 +26,13 @@ from elspeth.contracts.schema_contract_factory import create_contract_from_confi
 from elspeth.plugins.infrastructure.base import BaseSource
 from elspeth.plugins.infrastructure.config_base import SourceDataConfig, TextEncoding
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
-from elspeth.plugins.infrastructure.text_decoding import BYTE_ESCAPE_ERRORS, contains_escaped_bytes, decoding_codec, escaped_line_to_bytes
+from elspeth.plugins.infrastructure.text_decoding import (
+    BYTE_ESCAPE_ERRORS,
+    contains_escaped_bytes,
+    decoding_codec,
+    escaped_line_to_bytes,
+    line_byte_codec,
+)
 
 
 class TextSourceConfig(SourceDataConfig):
@@ -56,7 +62,7 @@ class TextSource(BaseSource):
     name = "text"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f95c7e1aff517bfa"
+    source_file_hash: str | None = "sha256:8e0ba35f39bd4546"
     config_model = TextSourceConfig
     _on_validation_failure: str
 
@@ -143,10 +149,12 @@ class TextSource(BaseSource):
             # for every codec; surrogateescape cannot for UTF-16/UTF-32, where
             # the decode error aborted the whole read-ahead chunk. A leading
             # UTF-8 BOM is consumed, never emitted as row data.
-            with open(self._path, encoding=decoding_codec(self._encoding), errors=BYTE_ESCAPE_ERRORS, newline="") as f:
+            read_encoding = decoding_codec(self._encoding)
+            line_codec = line_byte_codec(self._path, read_encoding)
+            with open(self._path, encoding=read_encoding, errors=BYTE_ESCAPE_ERRORS, newline="") as f:
                 for line_num, raw_line in enumerate(f, start=1):
                     if contains_escaped_bytes(raw_line):
-                        raw_bytes = escaped_line_to_bytes(raw_line, self._encoding)
+                        raw_bytes = escaped_line_to_bytes(raw_line, line_codec, line_number=line_num)
                         quarantined = self._record_parse_error(
                             ctx=ctx,
                             row={

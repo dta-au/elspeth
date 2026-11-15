@@ -1047,7 +1047,14 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # reopen-resume's resumed_full_projection_sha256 moved 1bf3705a... ->
 # b046c184..., measured by the production harness. Captured from this file's
 # parity failure (previous pin 14d69b1c...).
-EXPECTED_CASE_REGISTRY_SHA256 = "18037487924d662c3ec52977e345c452643994f12461e998e4c0dd07a5c4163e"
+# P5 io-validation (2026-11-16): CSVSource, JSONSink and JSONSource source hashes moved
+# with the shared text-decoding authority and the byte-order port; manifest provenance
+# tokens 4299e6110527265e -> 9ce7cf9e1d01b40a (fifteen lines), 6c9b64bb34350d2c ->
+# 4c5c6d960228d88d (seventeen lines) and 47746b3fbe3b15a6 -> 7a8425cae4ef21bd (one line,
+# json-explode-parent-child). reopen-resume (csv source, json sink) moved its
+# resumed_full_projection_sha256 b046c184... -> 17235100..., measured by the production
+# harness. Captured from this file's parity failure (previous pin 18037487...).
+EXPECTED_CASE_REGISTRY_SHA256 = "0dfb70c221fd36767b286390481ce85247d22c07c9d80076ba762f4e5a48b6f3"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

@@ -16,7 +16,9 @@ Two rules must hold identically in every reader, so they live here:
 from __future__ import annotations
 
 import codecs
+from dataclasses import dataclass
 from itertools import groupby
+from pathlib import Path
 
 
 def decoding_codec(encoding: str) -> str:
@@ -58,16 +60,48 @@ def contains_escaped_bytes(value: str) -> bool:
     return any(0xDC00 <= ord(char) <= 0xDCFF for char in value)
 
 
-def escaped_line_to_bytes(value: str, encoding: str) -> bytes:
+@dataclass(frozen=True, slots=True)
+class LineByteCodec:
+    """Fixed byte order and the BOM consumed from a stream's first line."""
+
+    codec: str
+    first_line_prefix: bytes
+
+
+_BOM_ORDERS: dict[str, tuple[tuple[bytes, str], ...]] = {
+    "utf-16": ((codecs.BOM_UTF16_LE, "utf-16-le"), (codecs.BOM_UTF16_BE, "utf-16-be")),
+    "utf-32": ((codecs.BOM_UTF32_LE, "utf-32-le"), (codecs.BOM_UTF32_BE, "utf-32-be")),
+    "utf-8-sig": ((codecs.BOM_UTF8, "utf-8"),),
+}
+_NO_BOM_FALLBACK = {"utf-16": "utf-16-le", "utf-32": "utf-32-le", "utf-8-sig": "utf-8"}
+
+
+def line_byte_codec_from_head(head: bytes, read_encoding: str) -> LineByteCodec:
+    """Derive a stream's reconstruction codec from only its leading bytes."""
+    name = codecs.lookup(read_encoding).name
+    if name not in _BOM_ORDERS:
+        return LineByteCodec(codec=read_encoding, first_line_prefix=b"")
+    for bom, fixed_codec in _BOM_ORDERS[name]:
+        if head.startswith(bom):
+            return LineByteCodec(codec=fixed_codec, first_line_prefix=bom)
+    return LineByteCodec(codec=_NO_BOM_FALLBACK[name], first_line_prefix=b"")
+
+
+def line_byte_codec(path: Path, read_encoding: str) -> LineByteCodec:
+    """Derive a local file's reconstruction codec from its first bytes."""
+    with path.open("rb") as raw:
+        return line_byte_codec_from_head(raw.read(4), read_encoding)
+
+
+def escaped_line_to_bytes(value: str, line_codec: LineByteCodec, *, line_number: int) -> bytes:
     """Rebuild the raw bytes of a line decoded with ``BYTE_ESCAPE_ERRORS``.
 
     Escaped code points become their original byte; every other run is
-    re-encoded with ``encoding`` (it decoded from that codec, so it encodes
-    back). A BOM-writing codec (``utf-16``, ``utf-32``) prefixes its BOM, as
-    ``str.encode`` would.
+    re-encoded with the stream's fixed byte order. Only line 1 regains the
+    BOM consumed by the decoder.
     """
-    encoder = codecs.getincrementalencoder(encoding)()
-    raw = bytearray()
+    encoder = codecs.getincrementalencoder(line_codec.codec)()
+    raw = bytearray(line_codec.first_line_prefix if line_number == 1 else b"")
     for escaped, run in groupby(value, key=lambda char: 0xDC00 <= ord(char) <= 0xDCFF):
         if escaped:
             raw.extend(ord(char) - 0xDC00 for char in run)
