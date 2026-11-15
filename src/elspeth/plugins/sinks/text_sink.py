@@ -94,7 +94,7 @@ class TextSink(BaseSink):
     name = "text"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a05fe58b8a67b5a3"
+    source_file_hash: str | None = "sha256:5f113ea42926cd69"
     config_model = TextSinkConfig
     supports_resume = True
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
@@ -362,14 +362,16 @@ class TextSink(BaseSink):
                 issue_code=issue_code,
                 summary=(
                     "The text sink writes one LF-delimited record per row, so a value whose line breaks are content "
-                    "cannot go straight into it — every such row is diverted and the file ends up empty. Two remedies: "
+                    "cannot go straight into it — rows containing CR or LF are diverted; single-line rows can still publish. Two remedies: "
                     "put line_explode between the producer and this sink and set field to line_explode's output_field, "
                     "which writes one line per line; or send the value to the document sink instead, which writes one "
-                    "row's whole value to the file byte-for-byte with its line breaks preserved."
+                    "row's whole value to the file byte-for-byte with its line breaks preserved. "
+                    "The document sink accepts a single report row per file, not paginated reports: multiple pages "
+                    "delivered together are diverted without a file; if a first page already published, later pages divert."
                 ),
                 suggested_fixes=(
                     "Insert a line_explode transform before this sink and point the sink's field at its output_field.",
-                    "Replace this sink with the document sink when the value is one whole document, not one record per row.",
+                    "Replace this sink with the document sink only for one whole document row per file; configure report_assemble to flush once at end of source, not paginate.",
                 ),
             )
         if issue_code is None:
@@ -380,7 +382,7 @@ class TextSink(BaseSink):
                 composer_hints=(
                     "Set field to the configured field whose value should become each output line; every accepted value must be a string.",
                     "Text values containing CR or LF are rejected rather than escaped, so one input row always maps to exactly one output record.",
-                    "To write a multiline value — anything an llm generates, or scraped page text — put line_explode in front and set field to its output_field; sending the multiline value straight here diverts every row and writes an empty file.",
+                    "To write multiline values, put line_explode in front and set field to its output_field; values containing CR or LF divert, while single-line values can still publish.",
                     "Choose only utf-8, ascii, latin-1, or cp1252; values not representable in the configured encoding are diverted without leaking their content.",
                     "Use mode: append with collision_policy: append_or_create for append/resume; existing bytes must decode cleanly and end with canonical LF.",
                     "Text is not a generic failure sink because it deliberately writes only one configured field and cannot preserve a rejected row losslessly.",

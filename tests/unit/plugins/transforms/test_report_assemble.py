@@ -400,3 +400,105 @@ class TestReportAssembleDiscovery:
 
         discovered = manager.get_transform_by_name("report_assemble")
         assert discovered is ReportAssemble
+
+
+class TestReportAssembleSemantics:
+    @pytest.mark.parametrize("format_name", ["plain_text", "markdown", "html_fragment"])
+    @pytest.mark.parametrize("title", [None, "", "Report"])
+    @pytest.mark.parametrize(
+        "join_with", [" ", "", "\n", "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029", ", \n", " \r\n"]
+    )
+    def test_declares_only_report_body_with_honest_framing(self, format_name: str, title: str | None, join_with: str) -> None:
+        from elspeth.contracts.plugin_semantics import ContentKind, SemanticValueType, TextFraming
+        from elspeth.plugins.transforms.report_assemble import ReportAssemble
+
+        transform = ReportAssemble(
+            {
+                "schema": DYNAMIC_SCHEMA,
+                "text_field": "line",
+                "output_field": "body",
+                "format": format_name,
+                "title": title,
+                "join_with": join_with,
+            }
+        )
+        facts = transform.output_semantics().fields
+        assert len(facts) == 1
+        fact = facts[0]
+        assert fact.field_name == "body"
+        assert fact.value_type is SemanticValueType.STR
+        assert fact.content_kind is ContentKind.UNKNOWN
+        expected = TextFraming.NEWLINE_FRAMED if title or join_with not in (" ", "") else TextFraming.UNCONSTRAINED
+        assert fact.text_framing is expected
+        assert fact.text_framing is not TextFraming.COMPACT
+        assert fact.fact_code == "report_assemble.output_field.rendered_text"
+        assert fact.configured_by == ("output_field", "title", "join_with", "format")
+
+    @pytest.mark.parametrize("format_name", ["plain_text", "markdown", "html_fragment"])
+    @pytest.mark.parametrize("join_with", ["\n", " "])
+    def test_document_requirement_is_satisfied(self, format_name: str, join_with: str) -> None:
+        from elspeth.contracts.plugin_semantics import SemanticOutcome, compare_semantic
+        from elspeth.plugins.sinks.document_sink import DocumentSink
+        from elspeth.plugins.transforms.report_assemble import ReportAssemble
+
+        transform = ReportAssemble({"schema": DYNAMIC_SCHEMA, "text_field": "line", "format": format_name, "join_with": join_with})
+        sink = DocumentSink({"path": "report.txt", "field": "report_body", "schema": DYNAMIC_SCHEMA})
+        facts = transform.output_semantics().fields
+        fact = facts[0] if facts else None
+        requirement = sink.input_semantic_requirements().fields[0]
+        assert compare_semantic(fact, requirement) is SemanticOutcome.SATISFIED
+
+    @pytest.mark.parametrize("format_name", ["plain_text", "markdown", "html_fragment"])
+    def test_space_join_does_not_reject_embedded_line_breaks(self, format_name: str) -> None:
+        from elspeth.plugins.transforms.report_assemble import ReportAssemble
+
+        transform = ReportAssemble({"schema": DYNAMIC_SCHEMA, "text_field": "line", "format": format_name, "join_with": " "})
+        result = transform.process([_row({"line": "alpha\r\nbeta"})], _ctx(batch_size=1))
+        assert result.status == "success"
+        assert result.row is not None
+        assert "alpha\r\nbeta" in result.row["report_body"]
+
+    def test_document_example_builds_after_report_assemble(self) -> None:
+        import yaml
+
+        from elspeth.cli_helpers import instantiate_plugins_from_config
+        from elspeth.contracts.plugin_semantics import SemanticOutcome, compare_semantic
+        from elspeth.core.config import ElspethSettings
+        from elspeth.core.dag import ExecutionGraph
+        from elspeth.core.dag.models import EdgeContractError
+        from elspeth.plugins.sinks.document_sink import DocumentSink
+        from elspeth.plugins.transforms.report_assemble import ReportAssemble
+
+        config = yaml.safe_load(ReportAssemble.example_use)
+        config.update(yaml.safe_load(DocumentSink.example_use))
+        config["sinks"]["announcement"]["on_write_failure"] = "discard"
+        config["sources"] = {
+            "primary": {
+                "plugin": "text",
+                "on_success": "report_lines",
+                "options": {"path": "input.txt", "column": "line", "schema": DYNAMIC_SCHEMA, "on_validation_failure": "discard"},
+            }
+        }
+        config["aggregations"][0]["on_success"] = "announcement"
+        config["aggregations"][0]["options"]["output_field"] = "announcement_text"
+        plugins = instantiate_plugins_from_config(ElspethSettings.model_validate(config))
+        try:
+            graph = ExecutionGraph.from_plugin_instances(
+                sources=plugins.sources,
+                source_settings_map=plugins.source_settings_map,
+                transforms=plugins.transforms,
+                sinks=plugins.sinks,
+                aggregations=plugins.aggregations,
+            )
+        except EdgeContractError as exc:
+            pytest.fail(f"The document example must accept the report edge: {exc}")
+        graph.validate_edge_compatibility()
+        transform = ReportAssemble(config["aggregations"][0]["options"])
+        sink = DocumentSink(config["sinks"]["announcement"]["options"])
+        facts = transform.output_semantics().fields
+        assert len(facts) == 1
+        assert compare_semantic(facts[0], sink.input_semantic_requirements().fields[0]) is SemanticOutcome.SATISFIED
+        result = transform.process([_row({"line": "first"}), _row({"line": "second"})], _ctx())
+        assert result.row is not None
+        sink.input_schema.model_validate(result.row.to_dict())
+        sink.input_schema.model_validate({"announcement_text": "Standalone announcement"})

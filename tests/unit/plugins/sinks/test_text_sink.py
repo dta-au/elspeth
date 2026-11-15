@@ -208,6 +208,9 @@ class TestTextSinkConflictAssistance:
         assert assistance.issue_code == "text.field.single_line_text"
         assert "line_explode" in assistance.summary
         assert "document" in assistance.summary
+        assert "single report row per file, not paginated reports" in assistance.summary
+        assert "single-line rows can still publish" in assistance.summary
+        assert "later pages divert" in assistance.summary
         assert assistance.suggested_fixes
         assert any("line_explode" in fix for fix in assistance.suggested_fixes)
         assert any("document" in fix for fix in assistance.suggested_fixes)
