@@ -1205,8 +1205,12 @@ async def test_actual_inspection_review_controls_public_and_saved_equivalence_cl
     app.state.settings = app.state.settings.model_copy(update={"composer_prompt_guard_mode": "debug-when-unconfigured"})
     if read_all:
         # Complete inspection of this unchanged long fixture requires more
-        # truthful 4K pages; keep time, provider-call and cost budgets intact.
-        app.state.settings = app.state.settings.model_copy(update={"composer_max_discovery_turns": 40})
+        # truthful 4K pages. Its ten-token usage stub cannot anchor the growing
+        # foreign page transcript. Isolate publication review from context
+        # shedding, keeping time, provider-call and cost budgets intact.
+        app.state.settings = app.state.settings.model_copy(
+            update={"composer_max_discovery_turns": 40, "composer_context_max_prompt_tokens": 400_000}
+        )
     monkeypatch.setattr(
         "elspeth.web.composer.service.compute_availability",
         lambda **kwargs: ComposerAvailability(available=True, model=kwargs["model"], provider="test"),

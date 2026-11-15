@@ -1,6 +1,6 @@
 """Context-budget history derived from a session's stored composer call records.
 
-The budgeter needs two facts from earlier turns: the measured bytes-per-token
+The session retains two facts from earlier turns: the measured bytes-per-token
 ratio of the provider's own prompt accounting, and which history messages an
 earlier call already shed (so the same messages stay shed and the provider
 prefix stays stable). Both live in the public ``llm_call_audit`` envelopes on
@@ -18,23 +18,111 @@ differently shaped request, often on another model, and gives neither fact.
 An absent ``context_budget`` key means the call predates context budgeting and
 is read exactly like a null value: no shedding was recorded and no ratio is
 taken. The first budgeted turn of a session written before the upgrade
-therefore runs on the policy's fallback ratio, which over-estimates tokens:
-the conservative direction. A budgeted record without ``request_wire_bytes``
+therefore has no measured ratio. Admission ignores historical ratios and
+uses live provider anchors or authored-prefix pricing with foreign bytes at one token each.
+Anchors come only from live private request captures, never persisted rows.
+A budgeted record without ``request_wire_bytes``
 (written only by pre-release builds) likewise gives no ratio.
 """
 
 from __future__ import annotations
 
+import json
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, final
 
-from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus, ContextBudgetAnchorStatus, ToolContractDialect
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.prompt_guard import detach_prompt_guard_messages
+from elspeth.core.canonical import canonical_json
 from elspeth.web.composer.context_budget import CONTEXT_BUDGET_MAX_BYTES_PER_TOKEN, CONTEXT_BUDGET_MIN_BYTES_PER_TOKEN
 from elspeth.web.sessions.protocol import ChatMessageRecord
 
 _LLM_CALL_AUDIT_KIND = "llm_call_audit"
+
+
+@dataclass(frozen=True, slots=True)
+class ContextBudgetAnchor:
+    """Content-free pricing evidence; the private request never enters the audit."""
+
+    tokens: int | None = None
+    wire_bytes: int = 0
+    shared_bytes: int = 0
+    reason: ContextBudgetAnchorStatus = "no_previous_call"
+
+
+def request_anchor(
+    *,
+    calls: Sequence[ComposerLLMCall],
+    model: str,
+    dialect: ToolContractDialect | None,
+    messages: Sequence[Mapping[str, Any]],
+    tools: Sequence[Mapping[str, Any]] | None,
+    mutable_positions: frozenset[int],
+) -> ContextBudgetAnchor:
+    """Reuse the newest usable same-model, same-dialect call in this exchange.
+
+    Match entire canonical messages, with multiplicity, and the entire tool
+    block. Mutable messages (including omission-count carriers) never receive
+    credit, even if this particular decision ultimately keeps them. Paying
+    the anchor's full count bounds the shared subset without estimating how
+    its tokens were distributed. Changed dialects/models and missing private
+    capture or usage fail closed. The eight-byte plausibility limit rejects
+    implausibly low counts; rejecting a compressible request is safe.
+    """
+    rejected = ContextBudgetAnchor()
+    for call in reversed(calls):
+        anchor = _call_anchor(call, model=model, dialect=dialect, messages=messages, tools=tools, mutable_positions=mutable_positions)
+        if anchor.tokens is not None:
+            return anchor
+        if rejected.reason == "no_previous_call":
+            rejected = anchor
+    return rejected
+
+
+def _call_anchor(
+    call: ComposerLLMCall,
+    *,
+    model: str,
+    dialect: ToolContractDialect | None,
+    messages: Sequence[Mapping[str, Any]],
+    tools: Sequence[Mapping[str, Any]] | None,
+    mutable_positions: frozenset[int],
+) -> ContextBudgetAnchor:
+    if call.model_requested != model or call.tool_contract_dialect != dialect:
+        return ContextBudgetAnchor(reason="model_or_dialect_changed")
+    if call.status is not ComposerLLMCallStatus.SUCCESS:
+        return ContextBudgetAnchor(reason="previous_call_failed")
+    private = call.private_request
+    if private is None:
+        return ContextBudgetAnchor(reason="request_unavailable")
+    if private.canonical is None:
+        return ContextBudgetAnchor(reason=private.reasons[0])
+    captured = json.loads(private.canonical)
+    old_messages = captured["messages"]
+    old_tools = captured["tools"] or []
+    wire = len(canonical_json({"messages": old_messages, "tools": old_tools}).encode("utf-8"))
+    count = call.prompt_tokens
+    # Some adapters exclude cache reads/creation from prompt_tokens. Adding
+    # separately reported counters is conservative even when an adapter already
+    # included them. Never subtract cache hits from the input-token charge.
+    if count is not None:
+        count += (call.cached_prompt_tokens or 0) + (call.cache_read_input_tokens or 0) + (call.cache_creation_input_tokens or 0)
+    if type(count) is not int or count <= 0 or count > wire or count * 8 < wire:
+        return ContextBudgetAnchor(wire_bytes=wire, reason="invalid_prompt_count")
+    available = Counter(canonical_json(message) for message in old_messages)
+    shared = 0
+    for index, message in enumerate(detach_prompt_guard_messages(messages)[0]):
+        encoded = canonical_json(message)
+        if index not in mutable_positions and available[encoded]:
+            available[encoded] -= 1
+            shared += len(encoded.encode("utf-8"))
+    encoded_tools = canonical_json(list(tools) if tools is not None else [])
+    if encoded_tools == canonical_json(old_tools):
+        shared += len(encoded_tools.encode("utf-8"))
+    return ContextBudgetAnchor(tokens=count, wire_bytes=wire, shared_bytes=shared, reason="anchored")
 
 
 def _history_key(index: int) -> str:
@@ -64,13 +152,24 @@ class ContextBudgetHistory:
         """The ratio for a call to ``model``: its own newest, else the newest of any model, else ``None``.
 
         Tokenizers differ between models, so a ratio measured on the same
-        model is preferred. ``None`` leaves the decision on the policy's
-        fallback ratio.
+        model is preferred. These measurements are diagnostic; admission
+        uses live anchors or the byte bound even when a measurement is available.
         """
         for measured_model, ratio in self.bytes_per_token_by_model:
             if measured_model == model:
                 return ratio
         return self.bytes_per_token
+
+    def shed_history_after(self, calls: Sequence[ComposerLLMCall]) -> frozenset[str]:
+        """History state after the newest budgeted call, including an explicit release.
+
+        Calls without history carry this state forward; they must not union
+        it with an older set that a history-bearing call already released.
+        """
+        for call in reversed(calls):
+            if call.context_budget is not None:
+                return frozenset(_history_key(index) for index in call.context_budget.shed_history_indices)
+        return self.previously_shed_history
 
     @classmethod
     def from_records(cls, records: Sequence[ChatMessageRecord]) -> ContextBudgetHistory:
@@ -155,7 +254,7 @@ def _budgeted_call(call: Mapping[str, Any]) -> _BudgetedCall | None:
             raise AuditIntegrityError("Stored composer call context_budget.request_wire_bytes is not a non-negative integer")
         if status == ComposerLLMCallStatus.SUCCESS.value and prompt_tokens is not None and prompt_tokens > 0 and wire_bytes > 0:
             # Positive integers divide to a finite positive float; the clamp
-            # bounds what provider-reported token counts can do to the estimate.
+            # preserves the historical diagnostic range, not the admission bound.
             ratio = min(max(wire_bytes / prompt_tokens, CONTEXT_BUDGET_MIN_BYTES_PER_TOKEN), CONTEXT_BUDGET_MAX_BYTES_PER_TOKEN)
     return _BudgetedCall(
         model_requested=model,

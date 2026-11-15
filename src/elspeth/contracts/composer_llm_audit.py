@@ -25,6 +25,21 @@ from elspeth.contracts.composer_provider_context import PrivateProviderContext
 from elspeth.contracts.credential_material import CredentialCategory
 from elspeth.contracts.freeze import deep_thaw, freeze_fields, require_int
 
+ContextBudgetAnchorStatus = Literal[
+    "no_previous_call",
+    "model_or_dialect_changed",
+    "previous_call_failed",
+    "request_unavailable",
+    "invalid_prompt_count",
+    "anchored",
+    "bounds",
+    "unsupported",
+    "malformed_json",
+    "duplicate_keys",
+    "credential_field",
+    "recognized_credential",
+]
+
 ComposerLLMProviderCostSource = Literal[
     "not_available",
     "response_usage.cost",
@@ -180,12 +195,12 @@ class ComposerContextBudgetRecord:
     """The context-budget decision made before one composer model call.
 
     Carries integer counts, the policy hash and the identifiers of what was
-    shed; never any content. ``bytes_per_token`` is the ``repr`` of the float
-    the estimate used. ``request_wire_bytes`` is the size of the request this
+    shed; never any content. ``bytes_per_token`` is the legacy ratio (1.0
+    for v2's conservative growth price). ``request_wire_bytes`` is the size of the request this
     call sent: the canonical JSON of its ``{messages, tools}``, which counts
     content, tool-call arguments, thinking blocks and tool definitions. The
     token estimates are on that same measure. ``estimated_tokens_before``
-    is the estimate of the unshed request. ``estimated_tokens_after`` is an
+    is the estimate of the unshed request including re-render allowances. ``estimated_tokens_after`` is an
     UPPER BOUND on the estimate of the request sent, not that estimate: it
     credits each shed segment with a lower bound of what shedding it saves
     and includes the decision's re-render allowance, so it can be larger
@@ -205,6 +220,14 @@ class ComposerContextBudgetRecord:
     shed_history_indices: tuple[int, ...]
     stubbed_tool_call_ids: tuple[str, ...]
     shed_hatch_event_indices: tuple[int, ...]
+    pricing_mode: Literal["anchored", "conservative", "authored_prefix"] | None = None
+    anchor_prompt_tokens: int | None = None
+    anchor_wire_bytes: int = 0
+    anchor_shared_bytes: int = 0
+    decision_wire_bytes: int = 0
+    decision_wire_bytes_after: int = 0
+    anchor_status: ContextBudgetAnchorStatus | None = None
+    authored_bytes: int = 0
 
     def __post_init__(self) -> None:
         _require_non_empty_str(self.policy_hash, "policy_hash")
@@ -212,6 +235,22 @@ class ComposerContextBudgetRecord:
         _require_component_bytes(self.estimated_tokens_before, "estimated_tokens_before")
         _require_component_bytes(self.estimated_tokens_after, "estimated_tokens_after")
         _require_component_bytes(self.request_wire_bytes, "request_wire_bytes")
+        for name, value in (
+            ("authored_bytes", self.authored_bytes),
+            ("anchor_wire_bytes", self.anchor_wire_bytes),
+            ("anchor_shared_bytes", self.anchor_shared_bytes),
+            ("decision_wire_bytes", self.decision_wire_bytes),
+            ("decision_wire_bytes_after", self.decision_wire_bytes_after),
+        ):
+            _require_component_bytes(value, name)
+        if self.pricing_mode is not None and self.pricing_mode not in {"anchored", "conservative", "authored_prefix"}:
+            raise ValueError("invalid pricing_mode")
+        if self.anchor_status is not None:
+            _require_non_empty_str(self.anchor_status, "anchor_status")
+        if self.anchor_prompt_tokens is not None:
+            _require_component_bytes(self.anchor_prompt_tokens, "anchor_prompt_tokens")
+            if self.anchor_prompt_tokens == 0:
+                raise ValueError("anchor_prompt_tokens must be positive")
         _require_index_tuple(self.shed_history_indices, "shed_history_indices")
         _require_index_tuple(self.shed_hatch_event_indices, "shed_hatch_event_indices")
         if type(self.stubbed_tool_call_ids) is not tuple:
@@ -266,7 +305,7 @@ class ComposerContextBudgetRecord:
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-friendly dict for sidecar serialization."""
-        return {
+        result = {
             "policy_hash": self.policy_hash,
             "bytes_per_token": self.bytes_per_token,
             "estimated_tokens_before": self.estimated_tokens_before,
@@ -276,6 +315,18 @@ class ComposerContextBudgetRecord:
             "stubbed_tool_call_ids": list(self.stubbed_tool_call_ids),
             "shed_hatch_event_indices": list(self.shed_hatch_event_indices),
         }
+        if self.pricing_mode is not None:
+            result.update(
+                pricing_mode=self.pricing_mode,
+                anchor_prompt_tokens=self.anchor_prompt_tokens,
+                anchor_wire_bytes=self.anchor_wire_bytes,
+                anchor_shared_bytes=self.anchor_shared_bytes,
+                decision_wire_bytes=self.decision_wire_bytes,
+                decision_wire_bytes_after=self.decision_wire_bytes_after,
+                anchor_status=self.anchor_status,
+                authored_bytes=self.authored_bytes,
+            )
+        return result
 
 
 def _require_non_empty_str(value: object, field_name: str, *, optional: bool = False) -> None:

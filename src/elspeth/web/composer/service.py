@@ -103,6 +103,7 @@ from elspeth.web.composer.context_budget import (
     SheddableKind,
     SheddableSegment,
     decide_context_budget,
+    escaped_bytes,
 )
 from elspeth.web.composer.context_budget_apply import (
     CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
@@ -116,7 +117,7 @@ from elspeth.web.composer.context_budget_apply import (
     stubbed_tool_message,
     tool_result_segments,
 )
-from elspeth.web.composer.context_budget_history import ContextBudgetHistory
+from elspeth.web.composer.context_budget_history import ContextBudgetHistory, request_anchor
 from elspeth.web.composer.control_messages import anti_anchor_control_envelope
 from elspeth.web.composer.discovery_cache import (
     CachedDiscoveryPayload as _CachedDiscoveryPayload,
@@ -141,6 +142,7 @@ from elspeth.web.composer.progress import (
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount, prompt_guard_user_scope
 from elspeth.web.composer.prompt_guard_rendering import JsonPath, json_content_parts
 from elspeth.web.composer.prompts import (
+    SYSTEM_PROMPT,
     build_messages,
     build_run_diagnostics_messages,
     build_state_context_message,
@@ -1629,7 +1631,7 @@ class ComposerServiceImpl:
         budget_record = replace(budget_record, request_wire_bytes=marked_wire_bytes)
         if marked_wire_bytes > self._context_budget_policy.max_request_bytes:
             marked_split = message_wire_split(marked_messages, marked_tools or None)
-            kept_history = len(budget_frame.history_entries) - len(budget_record.shed_history_indices)
+            kept_history = sum(chat_index not in budget_record.shed_history_indices for chat_index, _kind in budget_frame.history_entries)
             raise self._context_budget_refusal(
                 ContextBudgetRefusal(
                     ceiling="bytes",
@@ -1726,15 +1728,59 @@ class ComposerServiceImpl:
             sent_messages, marked_tools = apply_anthropic_cache_markers(sent_messages, tools, mark_history_tail=True)
             sent_tools = marked_tools or None
 
+        mutable_positions = {
+            _CONTEXT_BUDGET_HISTORY_START + position
+            for position, (_chat_index, kind) in enumerate(frame.history_entries)
+            if kind is not None
+        } | {index for positions in tool_positions.values() for index in positions}
+        if frame.history_entries:
+            mutable_positions.add(state_index)
+        # Reply rendering preserves the fixed skill/catalog prefix. Everything
+        # after it may be quoted or re-rendered; only the fixed prefix and an
+        # exactly matching tools block can receive anchor credit.
+        if reply_stage:
+            mutable_positions = set(range(_CONTEXT_BUDGET_HISTORY_START, len(sent_messages)))
+        anchor = request_anchor(
+            calls=recorder.llm_calls,
+            model=self._model,
+            dialect=self._planner_dialect,
+            messages=sent_messages,
+            tools=sent_tools,
+            mutable_positions=frozenset(mutable_positions),
+        )
+        # Authorship comes from the producer's reference labels, never text
+        # inspection. The system message can include an operator overlay, so
+        # only its shipped core qualifies. Sheddable messages must not enter
+        # this fixed allowance: their savings are charged entirely per byte.
+        authored_bytes = escaped_bytes(SYSTEM_PROMPT) + (message_wire_split([], sent_tools).tools_bytes or 0)
+        sheddable_positions = {
+            _CONTEXT_BUDGET_HISTORY_START + position
+            for position, (_chat_index, kind) in enumerate(frame.history_entries)
+            if kind is not None
+        } | {index for positions in tool_positions.values() for index in positions}
+        evidence = detach_prompt_guard_evidence(sent_messages)
+        for index, message in enumerate(sent_messages):
+            if index == 0 or index in sheddable_positions:
+                continue
+            if message.get(PROMPT_GUARD_TRUST_KEY) is PromptGuardTrust.REFERENCE:
+                authored_bytes += escaped_bytes(message["content"])
+            elif (parts := evidence.content_parts[index]) is not None:
+                authored_bytes += sum(escaped_bytes(part.text) for part in parts if part.trust is PromptGuardTrust.REFERENCE)
         try:
             decision = decide_context_budget(
                 policy=self._context_budget_policy,
                 request_bytes=request_wire_bytes(sent_messages, sent_tools) + omission_allowance,
                 segments=segments,
+                anchor_tokens=anchor.tokens,
+                anchor_shared_bytes=anchor.shared_bytes,
+                anchor_wire_bytes=anchor.wire_bytes,
+                anchor_status=anchor.reason,
+                authored_bytes=authored_bytes,
                 # The ratio measured on this model's own budgeted calls, when the session has one.
                 bytes_per_token=frame.history.ratio_for(self._model),
                 previously_shed=previously_shed_keys(frame.history, recorder.llm_calls),
-                held=held_tool_keys(recorder.llm_calls),
+                held=held_tool_keys(recorder.llm_calls)
+                | (frame.history.shed_history_after(recorder.llm_calls) if reply_stage else frozenset()),
             )
         except ContextBudgetRefusal as refusal:
             raise self._context_budget_refusal(
@@ -1756,9 +1802,21 @@ class ComposerServiceImpl:
             estimated_tokens_after=decision.estimated_tokens_after,
             # The decision's bound; the caller records the exact size of the request it sends.
             request_wire_bytes=decision.request_bytes_after,
-            shed_keys=decision.shed_keys,
+            shed_keys=decision.shed_keys
+            + (tuple(sorted(frame.history.shed_history_after(recorder.llm_calls))) if not frame.history_entries else ()),
         )
         shed = frozenset(decision.shed_keys)
+        record = replace(
+            record,
+            pricing_mode=decision.pricing.mode,
+            authored_bytes=decision.pricing.authored_bytes,
+            anchor_status=anchor.reason,
+            anchor_prompt_tokens=anchor.tokens,
+            anchor_wire_bytes=anchor.wire_bytes,
+            anchor_shared_bytes=anchor.shared_bytes,
+            decision_wire_bytes=decision.request_bytes_before,
+            decision_wire_bytes_after=decision.request_bytes_after,
+        )
         if not shed:
             return messages, record, decision.bytes_per_token
 

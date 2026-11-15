@@ -102,9 +102,13 @@ _ANTHROPIC_MODEL = "anthropic/claude-3-5-sonnet-20241022"
 
 
 def _service(max_prompt_tokens: int, **overrides: Any) -> tuple[ComposerServiceImpl, str]:
-    return _composer_service_with_session(
+    service, session_id = _composer_service_with_session(
         catalog=_mock_catalog(), settings=_make_settings(composer_context_max_prompt_tokens=max_prompt_tokens, **overrides)
     )
+    # These boundary tests model a worst-density prefix so wire-byte deltas
+    # map exactly to token deltas. The real shipped-default test lives in CTX-A.
+    service._context_budget_policy = replace(service._context_budget_policy, fallback_bytes_per_token=1.0)
+    return service, session_id
 
 
 async def _compose(
@@ -184,8 +188,8 @@ def _wire_bytes(request: dict[str, Any]) -> int:
 
 
 def _cap_for(base_bytes: int) -> int:
-    """A token cap at which the protected request alone sits at half the cap (fallback 3.0 bytes/token)."""
-    return (2 * base_bytes) // 3
+    """A token cap at which the protected request alone sits at half the cap (one byte/token)."""
+    return 2 * base_bytes
 
 
 def _assert_record_matches_request(call: ComposerLLMCall, request: dict[str, Any]) -> None:
@@ -330,12 +334,13 @@ async def test_three_round_tool_turn_stubs_earlier_results_and_keeps_the_latest_
         (),
         (),
         (),
-        ("call-1", "call-2"),
+        ("call-1",),
     ]
     tool_messages = {m["tool_call_id"]: m for m in provider.requests[3]["messages"] if m["role"] == "tool"}
     assert set(tool_messages) == {"call-1", "call-2", "call-3"}
     assert tool_messages["call-1"]["content"] == CONTEXT_BUDGET_TOOL_RESULT_STUB
-    assert tool_messages["call-2"]["content"] == CONTEXT_BUDGET_TOOL_RESULT_STUB
+    # Protected content is above low; reaching high keeps the newer result.
+    assert big + "2" in tool_messages["call-2"]["content"]
     assert big + "3" in tool_messages["call-3"]["content"]
     # Every tool call still has its result, in the order the provider requires.
     assistant_ids = [call["id"] for m in provider.requests[3]["messages"] if m["role"] == "assistant" for call in m["tool_calls"]]
@@ -562,7 +567,7 @@ async def test_a_dispatched_request_never_exceeds_either_ceiling(model: str) -> 
     history = [user_request, _FIRST_REPLY, _SECOND_REPLY]
     deltas = (-3_000, -400, -10, 0, 10, 100, 400)
     ceilings = [(_GENEROUS_TOKENS, one_shed_wire + delta) for delta in deltas]
-    ceilings += [(-(-(one_shed_wire + delta) // 3), 960 * 1024) for delta in deltas]
+    ceilings += [(one_shed_wire + delta, 960 * 1024) for delta in deltas]
     sent = 0
     for max_prompt_tokens, max_request_bytes in ceilings:
         provider, outcome = await _compose_or_refusal(
@@ -608,7 +613,8 @@ async def test_with_nothing_left_to_shed_a_request_over_the_byte_ceiling_is_refu
 
 
 @pytest.mark.asyncio
-async def test_the_final_byte_guard_refuses_a_request_the_decision_did_not_fit() -> None:
+@pytest.mark.parametrize("carried_indices", [frozenset(), frozenset({"history:1"})])
+async def test_the_final_byte_guard_refuses_a_request_the_decision_did_not_fit(carried_indices: frozenset[str]) -> None:
     """The post-application guard, reached directly.
 
     The decision measures the marked request plus the omission allowance, so
@@ -640,7 +646,13 @@ async def test_the_final_byte_guard_refuses_a_request_the_decision_did_not_fit()
         patch("litellm.acompletion", new_callable=AsyncMock, side_effect=provider.complete),
         pytest.raises(ComposerConvergenceError) as exc_info,
     ):
-        await service.compose("Build a CSV pipeline", [], _empty_state(), session_id=session_id)
+        await service.compose(
+            "Build a CSV pipeline",
+            [],
+            _empty_state(),
+            session_id=session_id,
+            context_budget_history=ContextBudgetHistory(None, carried_indices),
+        )
 
     assert provider.requests == []
     error = exc_info.value
@@ -748,8 +760,8 @@ async def test_the_token_estimate_and_the_recorded_size_are_the_wire_bytes_of_th
     (call,) = result.llm_calls
     (request,) = provider.requests
     assert call.context_budget is not None
-    # Fallback ratio 3.0 over the wire size plus the omission allowance the decision carries.
-    assert call.context_budget.estimated_tokens_before == -(-(wire + CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES) // 3)
+    # One token per wire byte plus the omission allowance the decision carries.
+    assert call.context_budget.estimated_tokens_before == wire + CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES
     # The record carries the exact wire size sent; the content split beside it is unchanged in meaning.
     assert call.context_budget.request_wire_bytes == _wire_bytes(request) == wire
     assert call.request_byte_split is not None and call.request_byte_split.total_bytes == content
@@ -778,7 +790,7 @@ async def test_tool_call_arguments_count_toward_both_ceilings(ceiling: str) -> N
     padding = "a" * 200_000
     # The first request fits with room to spare; the arguments alone carry the second past the ceiling.
     limit_bytes = base_wire + 100_000
-    max_prompt_tokens, max_request_bytes = (limit_bytes // 3, 960 * 1024) if ceiling == "tokens" else (_GENEROUS_TOKENS, limit_bytes)
+    max_prompt_tokens, max_request_bytes = (limit_bytes, 960 * 1024) if ceiling == "tokens" else (_GENEROUS_TOKENS, limit_bytes)
     service, session_id = _service(max_prompt_tokens, composer_model=model, composer_planner_max_request_bytes=max_request_bytes)
     provider = _RecordingProvider(_argument_heavy_turn("call-1", padding), _make_llm_response(content="Done."))
 
@@ -931,7 +943,7 @@ async def test_stubbing_tool_results_alone_sends_no_notice() -> None:
     result = await _compose(service, session_id, [], probe, tool_data=tool_data, progress=probe.sink)
 
     last = result.llm_calls[-1].context_budget
-    assert last is not None and last.stubbed_tool_call_ids == ("call-1", "call-2")
+    assert last is not None and last.stubbed_tool_call_ids == ("call-1",)
     assert probe.notices() == []
 
 
@@ -1028,7 +1040,7 @@ async def test_the_reply_stage_request_stubs_earlier_tool_results_and_keeps_the_
     assert [m["role"] for m in unshed[4:]] == ["assistant", "user", "assistant", "user", "system"]
     assert first in unshed[5]["content"] and second in unshed[7]["content"]
     # The unshed reply request is over the high mark and under the cap.
-    cap = -(-full_content // 3) * 10 // 9
+    cap = full_content * 10 // 9
     service, _ = _service(cap)
     llm_messages = _two_round_turn(service, first, second)
     before = deepcopy(llm_messages)
@@ -1056,7 +1068,7 @@ async def test_a_result_stubbed_on_an_earlier_call_stays_stubbed_in_the_reply_st
     unshed, unshed_tools, _ = await _prepare_reply(generous, _two_round_turn(generous, first, second))
     full_content = message_bytes(unshed, unshed_tools).total_bytes
     # The unshed reply request sits at 70% of the cap: between the marks, so nothing new is shed.
-    service, _ = _service(-(-full_content // 3) * 10 // 7)
+    service, _ = _service(full_content * 10 // 7)
     earlier = build_llm_call_record(
         model_requested="openrouter/openai/gpt-5.5",
         messages=[{"role": "system", "content": "skill"}],
@@ -1098,7 +1110,7 @@ async def test_a_result_stubbed_on_an_earlier_call_stays_stubbed_in_the_reply_st
 
 
 @pytest.mark.asyncio
-async def test_the_compose_loop_uses_the_ratio_measured_on_its_own_model() -> None:
+async def test_the_compose_loop_uses_a_safe_bound_despite_its_measured_ratio() -> None:
     model = "openrouter/openai/gpt-5.5"
     service, session_id = _service(_GENEROUS_TOKENS, composer_model=model)
     provider = _RecordingProvider(_make_llm_response(content="Done."))
@@ -1114,7 +1126,7 @@ async def test_the_compose_loop_uses_the_ratio_measured_on_its_own_model() -> No
     (call,) = result.llm_calls
     assert call.model_requested == model
     assert call.context_budget is not None
-    assert call.context_budget.bytes_per_token == repr(4.25)
+    assert call.context_budget.bytes_per_token == repr(1.0)
     (request,) = provider.requests
     assert call.context_budget.request_wire_bytes == _wire_bytes(request)
-    assert call.context_budget.estimated_tokens_before == -(-_wire_bytes(request) * 100 // 425)
+    assert call.context_budget.estimated_tokens_before == _wire_bytes(request)

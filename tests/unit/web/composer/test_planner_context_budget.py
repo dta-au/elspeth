@@ -73,7 +73,7 @@ from tests.unit.web.composer.test_pipeline_planner import (
 
 _ANTHROPIC = "anthropic/claude-planner"
 _UNMARKED = "openai/gpt-planner"
-_FALLBACK_RATIO = 3.0
+_FALLBACK_RATIO = 1.0
 _ALLOWANCE = CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES
 _TRANSCRIPT_ALLOWANCE = CONTEXT_BUDGET_TRANSCRIPT_GAP_ALLOWANCE_BYTES
 
@@ -384,7 +384,7 @@ async def test_history_shed_on_an_earlier_turn_stays_shed_between_the_marks(tmp_
     full_bytes = _sent_bytes(full_request) + _ALLOWANCE
     ratio = 4.0
     # The full request sits at 70% of the cap: under the high mark, over the low mark.
-    policy = _context_policy(max_prompt_tokens=math.ceil(full_bytes / ratio / 0.7), max_request_bytes=1_000_000)
+    policy = _context_policy(max_prompt_tokens=math.ceil(full_bytes / _FALLBACK_RATIO / 0.7), max_request_bytes=1_000_000)
 
     fresh_request, fresh = await _decline(
         tmp_path,
@@ -403,7 +403,7 @@ async def test_history_shed_on_an_earlier_turn_stays_shed_between_the_marks(tmp_
 
     assert _payload(fresh_request)["conversation_context"] == context.to_dict()
     assert fresh.context_budget is not None and fresh.context_budget.shed_history_indices == ()
-    assert fresh.context_budget.bytes_per_token == repr(ratio)
+    assert fresh.context_budget.bytes_per_token == repr(_FALLBACK_RATIO)
     sticky_context = _payload(sticky_request)["conversation_context"]
     assert "prior_assistant_messages" not in sticky_context and sticky_context["prior_assistant_messages_omitted"] == 1
     assert sticky.context_budget is not None and sticky.context_budget.shed_history_indices == (1,)
@@ -488,8 +488,8 @@ async def test_the_escape_hatch_request_sheds_its_conversation_context_and_keeps
 
 
 @pytest.mark.asyncio
-async def test_each_planner_call_uses_the_ratio_measured_on_its_own_model(tmp_path: Path, tool_context: ToolContext) -> None:
-    """The planner's calls take the planner model's ratio; the escape hatch's call takes the hatch model's."""
+async def test_each_planner_call_uses_a_safe_bound_despite_its_measured_ratio(tmp_path: Path, tool_context: ToolContext) -> None:
+    """Neither a planner nor a hatch prose measurement may lower the admission bound."""
     history = ContextBudgetHistory(
         bytes_per_token=2.5,
         previously_shed_history=frozenset(),
@@ -515,7 +515,7 @@ async def test_each_planner_call_uses_the_ratio_measured_on_its_own_model(tmp_pa
 
     assert [call.model_requested for call in recorder.llm_calls] == [_UNMARKED, _UNMARKED, "test/advisor"]
     ratios = [call.context_budget.bytes_per_token for call in recorder.llm_calls if call.context_budget is not None]
-    assert ratios == [repr(4.25), repr(4.25), repr(3.5)]
+    assert ratios == [repr(1.0), repr(1.0), repr(1.0)]
 
 
 _CONTEXT_REDUCED_HEADLINE = "Earlier conversation is no longer visible to the composer."

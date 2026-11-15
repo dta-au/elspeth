@@ -137,7 +137,7 @@ def test_protected_overflow_refuses_naming_the_ceiling() -> None:
 
 def test_missing_ratio_uses_fallback_and_rounds_tokens_up() -> None:
     d = decide_context_budget(policy=_policy(cap=10**6), request_bytes=10, segments=[], bytes_per_token=None, previously_shed=frozenset())
-    assert d.bytes_per_token == 3.0 and d.estimated_tokens_before == 4
+    assert d.bytes_per_token == 1.0 and d.estimated_tokens_before == 10
 
 
 def test_same_input_same_decision_and_policy_hash_changes_with_each_parameter() -> None:
@@ -202,8 +202,8 @@ def test_sticky_segments_are_shed_before_the_ranked_remainder() -> None:
         policy=_policy(), request_bytes=1000, segments=segs, bytes_per_token=1.0, previously_shed=frozenset({"history:0"})
     )
     # 1000 - 100 (sticky) = 900 is over the high mark, so shedding continues by kind to the low mark.
-    assert d.shed_keys == ("history:0", "tool:a", "history:1")
-    assert d.estimated_tokens_after == 700
+    assert d.shed_keys == ("history:0", "tool:a")
+    assert d.estimated_tokens_after == 800
 
 
 def test_over_is_judged_on_the_size_with_the_sticky_set_already_shed() -> None:
@@ -296,8 +296,9 @@ def test_within_a_turn_tool_stubs_hold_the_band_between_sheds() -> None:
     # Calls 5 and 6 stub nothing new (kept 690, 840); call 7 (kept 990) stubs again.
     assert newly_by_call[4:6] == [(), ()]
     assert after_by_call[4:6] == [690, 840]
-    assert newly_by_call[6] == ("tool:c4", "tool:c5", "tool:c6") and after_by_call[6] == 630
-    assert newly_by_call[7] == ()
+    # The protected prefix is now above low: stop at high, retaining c6.
+    assert newly_by_call[6] == ("tool:c4", "tool:c5") and after_by_call[6] == 750
+    assert newly_by_call[7] == ("tool:c6",) and after_by_call[7] == 780
 
 
 def test_one_measure_serves_both_ceilings_and_a_refusal_reports_it() -> None:
