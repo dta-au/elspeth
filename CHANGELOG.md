@@ -38,6 +38,12 @@ These changes are breaking:
   exposed to `elspeth purge`.** New share data lives in a separate `shares/`
   subtree of the payload store. Never point `elspeth purge --payload-dir` at
   `shares/`. See the Sharing section below.
+- **Library entries published before this release must be republished before
+  they can be forked.** Library payloads now live in their own
+  `<payload base>/library` subtree, with no fallback to the parent store and no
+  migration. Forking an older entry returns 409 `library_payload_unavailable`
+  asking for a republish. Back up `library/` with the payload store, and never
+  point `elspeth purge --payload-dir` at it.
 
 - **Python 3.14 is required** for `elspeth`, `elspeth-lints` and the LLM
   gateway (and the gateway adapter template). Python 3.12 and 3.13 are no
@@ -360,7 +366,9 @@ Sources:
   object raises the existing empty-file error.
 - **JSON source:** an undecodable UTF-16 or UTF-32 JSONL line is quarantined
   on its own, with its true line number and raw bytes, instead of the whole
-  file. This registers a namespaced codec error handler,
+  file. The recorded bytes are the line as the file holds it: in the byte
+  order the file's BOM declares, with the BOM only on line 1. The text source
+  records its quarantined lines the same way. This registers a namespaced codec error handler,
   `elspeth.source_byte_escape`, process-wide on import. UTF-8 input accepts
   a leading byte-order mark; a mid-file U+FEFF is still data.
 - **Text source:** undecodable lines are quarantined one at a time.
@@ -742,6 +750,15 @@ Sinks and retrieval:
   the parent store), but their data stays where it is and remains
   purge-exposed; there is no migration. Never point `purge --payload-dir` at
   `shares/`.
+- **Copying a share link again keeps its original expiry.** A re-minted link
+  is signed with the expiry recorded when the pipeline was shared for review,
+  shortened if the deployment maximum has since been lowered. It used to start
+  a fresh lifetime. Once that expiry has passed, the request returns 409
+  `share_link_expired`; share for review again to create a new link.
+- **Library payloads have their own store**, at `<payload base>/library`, so
+  `elspeth purge` cannot delete a published entry's pipeline. A missing payload
+  is reported as `library_payload_unavailable` (republish); a corrupt one is
+  still an integrity error. See the upgrade note above.
 
 ### Logging
 
