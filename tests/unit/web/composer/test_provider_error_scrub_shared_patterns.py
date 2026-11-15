@@ -15,8 +15,16 @@ from hypothesis import strategies as st
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.credential_material import find_credential_material
-from elspeth.web.composer.llm_response_parsing import _LLM_ERROR_DOTTED_WORDS, _is_ordinary_dotted_name, build_llm_call_record
+from elspeth.web.composer import llm_response_parsing as _parsing
+from elspeth.web.composer.llm_response_parsing import build_llm_call_record
 from elspeth.web.validation import _redact_sensitive_content
+
+
+def _is_ordinary_dotted_name(candidate: str) -> bool:
+    # Looked up at call time so this file still collects on a tree without the
+    # exemption, where its tests must fail on assertions rather than at import.
+    return _parsing._is_ordinary_dotted_name(candidate)
+
 
 _LLM_ERROR_BASE_DOTTED_RE = re.compile(r"\b[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\b")
 
@@ -262,7 +270,7 @@ def test_dotted_exemption_only_accepts_vocabulary_parts(seed: int, length: int) 
                 assert len(segment) <= 4
             else:
                 parts = re.split(r"[_-]", re.sub(r"([a-z])([A-Z])", r"\1_\2", segment).lower())
-                assert all(part in _LLM_ERROR_DOTTED_WORDS for part in parts)
+                assert all(part in _parsing._LLM_ERROR_DOTTED_WORDS for part in parts)
 
 
 @settings(max_examples=100)
