@@ -6552,10 +6552,12 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "RateLimiter.__init__",
         "<non-session-write-connection>",
         "write_connection",
-        "002b7e991cd4aa65",
+        # 2026-11-16 http-deadline: the same rate-limiter-owned SQLite file, now
+        # wrapped in _RollbackSQLiteBucket (rolls back a failed bucket write).
+        "9885e663524766b2",
         1,
         None,
-        line=224,
+        line=258,
         connection_escape=True,
     ),
     WriterIdentity(
