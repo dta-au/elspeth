@@ -32,7 +32,7 @@ import elspeth.plugins.infrastructure.clients.llm as llm_module
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.enums import RunMode
-from elspeth.core.security.web import SSRFBlockedError, SSRFRefusalKind, configured_url_refusal_message
+from elspeth.core.security.web import SSRFBlockedError, SSRFRefusalKind
 from elspeth.plugins.infrastructure.base import BaseSink, BaseSource, BaseTransform
 from elspeth.plugins.infrastructure.clients.llm import AuditedLLMClient, ContentPolicyError, LLMClientError
 from elspeth.plugins.infrastructure.clients.retrieval.azure_search import AzureSearchProviderConfig
@@ -955,6 +955,10 @@ class TestConfigErrorsCarryNoAuthoredInput:
 
     def test_fixed_url_refusal_explains_distinct_operator_options(self) -> None:
         import typing
+
+        # Imported here, not at module level: the base tree has no such helper, and the
+        # rest of this module must still collect there.
+        from elspeth.core.security.web import configured_url_refusal_message
 
         kinds = typing.get_args(SSRFRefusalKind)
         assert len(kinds) == 12
