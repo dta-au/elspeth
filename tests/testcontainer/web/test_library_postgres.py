@@ -105,7 +105,8 @@ def test_concurrent_accept_has_exactly_one_winner(library_engine: Engine, tmp_pa
     _grant_role(library_engine, "alice", "user")
     _grant_role(library_engine, "carol", "curator")
     _grant_role(library_engine, "dave", "curator")
-    authority = RepositoryLibraryAuthority(library_engine, payload_store=FilesystemPayloadStore(tmp_path / "payloads"))
+    parent_store = FilesystemPayloadStore(tmp_path / "payloads")
+    authority = RepositoryLibraryAuthority(library_engine, payload_store=FilesystemPayloadStore(parent_store.base_path / "library"))
     entry = authority.publish(
         session_id=str(uuid4()),
         state=_state(),
@@ -144,7 +145,8 @@ def test_revocation_locked_first_prevents_later_curator_decision(library_engine:
             ensure_test_identity(conn, identity_id=identity_id)
     _grant_role(library_engine, "alice", "user")
     role_id = _grant_role(library_engine, "carol", "curator")
-    authority = RepositoryLibraryAuthority(library_engine, payload_store=FilesystemPayloadStore(tmp_path / "payloads"))
+    parent_store = FilesystemPayloadStore(tmp_path / "payloads")
+    authority = RepositoryLibraryAuthority(library_engine, payload_store=FilesystemPayloadStore(parent_store.base_path / "library"))
     entry = authority.publish(
         session_id=str(uuid4()),
         state=_state(),
@@ -196,7 +198,8 @@ def test_recall_locked_first_refuses_later_fork_authorization(library_engine: En
     _grant_role(library_engine, "alice", "user")
     _grant_role(library_engine, "bob", "user")
     _grant_role(library_engine, "carol", "curator")
-    authority = RepositoryLibraryAuthority(library_engine, payload_store=FilesystemPayloadStore(tmp_path / "payloads"))
+    parent_store = FilesystemPayloadStore(tmp_path / "payloads")
+    authority = RepositoryLibraryAuthority(library_engine, payload_store=FilesystemPayloadStore(parent_store.base_path / "library"))
     entry = authority.publish(
         session_id=str(uuid4()),
         state=_state(),

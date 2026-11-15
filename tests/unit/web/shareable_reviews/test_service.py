@@ -1463,6 +1463,8 @@ async def test_get_shareable_link_remints_with_stable_digest(
     assert r1.payload_digest == marked.payload_digest
     assert r1.payload_digest == r2.payload_digest
     assert r1.token != r2.token
+    assert r1.expires_at == marked.expires_at
+    assert r2.expires_at == marked.expires_at
 
     with session_engine_with_row.connect() as conn:
         rows = conn.execute(
@@ -2693,7 +2695,7 @@ async def test_get_shareable_link_keeps_the_original_lifespan(
         validation=_ok_validation(),
         readiness=_readiness_snapshot(session_record.id),
     )
-    await service.mark_ready_for_review(
+    marked = await service.mark_ready_for_review(
         session_id=session_record.id,
         user_id=session_record.user_id,
         username=_OWNER_USERNAME,
@@ -2701,13 +2703,10 @@ async def test_get_shareable_link_keeps_the_original_lifespan(
         lifetime_seconds=86400,
     )
 
-    before = datetime.now(UTC)
     reminted = await service.get_shareable_link(session_id=session_record.id, user_id=session_record.user_id)
-    after = datetime.now(UTC)
-
-    assert before + timedelta(seconds=86400) <= reminted.expires_at <= after + timedelta(seconds=86400)
+    assert reminted.expires_at == marked.expires_at
     payload = signer.verify(reminted.token)
-    assert payload.expires_at - payload.created_at == timedelta(seconds=86400)
+    assert payload.expires_at == marked.expires_at
 
 
 @pytest.mark.asyncio
@@ -3377,7 +3376,7 @@ async def test_get_shareable_link_clamps_to_a_lowered_maximum(
         readiness=_readiness_snapshot(session_record.id),
         settings=settings,
     )
-    await service.mark_ready_for_review(
+    marked = await service.mark_ready_for_review(
         session_id=session_record.id,
         user_id=session_record.user_id,
         username=_OWNER_USERNAME,
@@ -3386,13 +3385,10 @@ async def test_get_shareable_link_clamps_to_a_lowered_maximum(
     )
     settings.shareable_link_lifetime_seconds = 604800
 
-    before = datetime.now(UTC)
     reminted = await service.get_shareable_link(session_id=session_record.id, user_id=session_record.user_id)
-    after = datetime.now(UTC)
-
-    assert before + timedelta(seconds=604800) <= reminted.expires_at <= after + timedelta(seconds=604800)
+    assert reminted.expires_at == marked.expires_at - timedelta(days=23)
     payload = signer.verify(reminted.token)
-    assert payload.expires_at - payload.created_at == timedelta(seconds=604800)
+    assert payload.expires_at == reminted.expires_at
 
 
 @pytest.mark.asyncio

@@ -20,6 +20,7 @@ import re
 import uuid
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -184,6 +185,54 @@ def test_get_shareable_link_remints_stable_digest(
     assert r2.status_code == 200, r2.text
     assert r1.json()["payload_digest"] == r2.json()["payload_digest"]
     assert r1.json()["token"] != r2.json()["token"]
+    assert r1.json()["expires_at"] == mark_response.json()["expires_at"]
+    assert r2.json()["expires_at"] == mark_response.json()["expires_at"]
+
+
+def test_get_shareable_link_clamps_recorded_expiry_when_maximum_is_lowered(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, session_id = audit_readiness_client_with_state
+    marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review")
+    assert marked.status_code == 200, marked.text
+    service = client.app.state.shareable_review_service
+    event = service._latest_mark_ready_event(
+        session_id=session_id,
+        state_id=service._signer.verify(marked.json()["token"]).state_id,
+        user_id=_TEST_AUTHED_USER_ID,
+    )
+    assert event is not None
+    monkeypatch.setattr(service, "_settings", service._settings.model_copy(update={"shareable_link_lifetime_seconds": 86400}))
+    reminted = client.get(f"/api/sessions/{session_id}/shareable-link")
+    assert reminted.status_code == 200, reminted.text
+    expected = event.created_at.replace(tzinfo=UTC) + timedelta(days=1)
+    assert service._signer.verify(reminted.json()["token"]).expires_at == expected
+
+
+def test_get_shareable_link_expired_mark_returns_409_with_owner_action(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, session_id = audit_readiness_client_with_state
+    marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review")
+    assert marked.status_code == 200, marked.text
+    service = client.app.state.shareable_review_service
+    old_event = service._latest_mark_ready_event
+
+    def expired_event(**kwargs: object) -> SimpleNamespace:
+        event = old_event(**kwargs)
+        assert event is not None
+        return SimpleNamespace(
+            payload_digest=event.payload_digest,
+            created_at=event.created_at - timedelta(days=31),
+            expires_at=event.expires_at - timedelta(days=31),
+        )
+
+    monkeypatch.setattr(service, "_latest_mark_ready_event", expired_event)
+    response = client.get(f"/api/sessions/{session_id}/shareable-link")
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == "This share link has expired. Share for review again to create a new link."
 
 
 def test_get_shareable_link_requires_auth(
@@ -912,7 +961,7 @@ def test_mark_ready_with_lifetime_and_copy_link_keep_one_day(
     reminted = client.get(f"/api/sessions/{session_id}/shareable-link")
     assert reminted.status_code == 200, reminted.text
     reminted_payload = service._signer.verify(reminted.json()["token"])
-    assert reminted_payload.expires_at - reminted_payload.created_at == timedelta(days=1)
+    assert reminted_payload.expires_at == payload.expires_at
 
 
 def test_mark_ready_with_import_freezes_an_uploaded_file(

@@ -409,6 +409,7 @@ export function SaveForReviewDialog(): JSX.Element | null {
                 </time>
                 .
               </p>
+              <p>Copying this link again does not extend its expiry. Share for review again to create a new link.</p>
               <div className="save-for-review-url-row">
                 <label htmlFor="save-for-review-url">Share URL</label>
                 <Input

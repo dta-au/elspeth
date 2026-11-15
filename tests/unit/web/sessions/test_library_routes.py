@@ -93,8 +93,9 @@ def library_client(closed_local_app: SyncASGITestClient, tmp_path: Path) -> tupl
             )
         )
     client.app.state.identity_authority = RepositoryIdentityAuthority(engine, lifecycle_effect=lambda _token, _event: None)
+    parent_store = FilesystemPayloadStore(tmp_path / "payloads")
     client.app.state.library_authority = RepositoryLibraryAuthority(
-        engine, payload_store=FilesystemPayloadStore(tmp_path / "library-payloads")
+        engine, payload_store=FilesystemPayloadStore(parent_store.base_path / "library")
     )
     client.app.include_router(create_library_router())
     return client, actor, events
@@ -105,6 +106,27 @@ def _publish(client: SyncASGITestClient, *, owner: str = "alice") -> tuple[UUID,
     published = client.post(f"/api/sessions/{session_id}/library/publish", json={"title": "shared pipeline"})
     assert published.status_code == 201, published.text
     return session_id, published.json()
+
+
+def test_fork_parent_only_payload_returns_clear_unavailable_conflict(
+    library_client: tuple[SyncASGITestClient, _Actor, list[str]],
+    tmp_path: Path,
+) -> None:
+    client, actor, _events = library_client
+    _session_id, published = _publish(client)
+    actor.identity_id = "carol"
+    accepted = client.post(f"/api/library/{published['entry_id']}/accept", json={})
+    assert accepted.status_code == 200, accepted.text
+    authority = client.app.state.library_authority
+    digest = published["payload_digest"]
+    parent = FilesystemPayloadStore(tmp_path / "payloads")
+    parent.store(authority._payload_store.retrieve(digest))
+    authority._payload_store.delete(digest)
+    actor.identity_id = "bob"
+    response = SyncASGITestClient(client.app, raise_server_exceptions=False).post(f"/api/library/{published['entry_id']}/fork")
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["error_type"] == "library_payload_unavailable"
+    assert "republish" in response.json()["detail"]["detail"]
 
 
 def test_publish_curate_and_browse_hides_source_session(library_client: tuple[SyncASGITestClient, _Actor, list[str]]) -> None:

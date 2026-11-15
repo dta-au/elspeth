@@ -893,8 +893,7 @@ class ShareableReviewService:
         # Stamp expiry now so the same value lands in both the audit row
         # and the signed token envelope. The validity period is set at
         # issue-time; the signer's verify() rejects after this point.
-        # ``get_shareable_link`` re-derives the lifespan from the audit row
-        # (expires_at - created_at), so a re-mint keeps the chosen lifespan.
+        # Re-mints retain this recorded expiry, subject to a lowered cap.
         expires_at = snapshot.created_at + timedelta(seconds=lifetime_seconds)
 
         # Files before the audit row: the row's digest commits to a manifest
@@ -989,6 +988,22 @@ class ShareableReviewService:
                 reason="completion_event_missing",
                 detail="mark this composition ready for review before requesting a shareable link",
             )
+        created_at = datetime.now(UTC)
+        # SQLite returns UTC audit timestamps without tzinfo; PostgreSQL may
+        # return aware values. Normalise both before comparing with mint time.
+        recorded_created_at = event.created_at.replace(tzinfo=UTC) if event.created_at.tzinfo is None else event.created_at.astimezone(UTC)
+        recorded_expires_at = event.expires_at.replace(tzinfo=UTC) if event.expires_at.tzinfo is None else event.expires_at.astimezone(UTC)
+        # The audit event is the expiry authority. A lower current deployment
+        # cap may shorten it, but a re-mint cannot extend an unrecorded grant.
+        expires_at = min(
+            recorded_expires_at,
+            recorded_created_at + timedelta(seconds=self._settings.shareable_link_lifetime_seconds),
+        )
+        if expires_at <= created_at:
+            raise CompositionNotRunnableError(
+                reason="share_link_expired",
+                detail="This share link has expired. Share for review again to create a new link.",
+            )
         payload_digest = str(event.payload_digest)
         digest_hex = payload_digest.removeprefix(_DIGEST_PREFIX)
         try:
@@ -998,16 +1013,6 @@ class ShareableReviewService:
                 reason="not_marked_ready",
                 detail=_NOT_MARKED_READY_DETAIL,
             ) from None
-        # Keep the lifespan the owner chose at mark time: a 1-day link must
-        # not be stretched to the deployment maximum by "copy link again".
-        # Clamped to the CURRENT maximum: if the operator lowered the cap
-        # since the mark, the server still never issues a longer link.
-        lifetime = min(
-            event.expires_at - event.created_at,
-            timedelta(seconds=self._settings.shareable_link_lifetime_seconds),
-        )
-        created_at = datetime.now(UTC)
-        expires_at = created_at + lifetime
         token = self._sign_token(
             session_id=session_id,
             state_id=state_record.id,
