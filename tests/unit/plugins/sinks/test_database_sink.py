@@ -55,20 +55,18 @@ class TestDatabaseSinkEffectCapability:
             validate_sink_effect_capability(sink, "append", SinkEffectInputKind.PIPELINE_MEMBERS)
         assert not target_path.exists()
 
-    def test_effect_capability_rejects_replace_before_target_io(self, tmp_path: Path) -> None:
+    def test_config_refuses_replace_before_target_io(self, tmp_path: Path) -> None:
         target_path = tmp_path / "target.db"
-        sink = DatabaseSink(
-            {
-                "url": f"sqlite:///{target_path}",
-                "table": "output",
-                "schema": STRICT_SCHEMA,
-                "if_exists": "replace",
-                "effect_ledger": EFFECT_LEDGER,
-            }
-        )
-
-        with pytest.raises(SinkEffectCapabilityError, match=r"replace.*not supported"):
-            validate_sink_effect_capability(sink, "replace", SinkEffectInputKind.PIPELINE_MEMBERS)
+        with pytest.raises(PluginConfigError, match="if_exists"):
+            DatabaseSink(
+                {
+                    "url": f"sqlite:///{target_path}",
+                    "table": "output",
+                    "schema": STRICT_SCHEMA,
+                    "if_exists": "replace",
+                    "effect_ledger": EFFECT_LEDGER,
+                }
+            )
         assert not target_path.exists()
 
     def test_effect_capability_rejects_unsupported_dialect_before_target_io(self) -> None:
@@ -148,41 +146,6 @@ class TestDatabaseSink:
 
         sink = inject_write_failure(DatabaseSink({"url": "sqlite:///:memory:", "table": "test", "schema": STRICT_SCHEMA}))
         assert sink.determinism == Determinism.IO_WRITE
-
-
-class TestDatabaseSinkIfExistsReplace:
-    """Regression tests for if_exists='replace' behavior.
-
-    Bug: P2-2026-01-19-databasesink-if-exists-replace-ignored
-    The if_exists config option was stored but never used. Replace mode
-    should drop the existing table on first write, following pandas
-    to_sql semantics.
-    """
-
-    @pytest.fixture
-    def ctx(self) -> PluginContext:
-        """Create a plugin context with real landscape and operation records."""
-        return make_operation_context(
-            node_id="sink",
-            plugin_name="database_sink",
-            node_type="SINK",
-            operation_type="sink_write",
-        )
-
-    @pytest.fixture
-    def db_url(self, tmp_path: Path) -> str:
-        """Create a SQLite database URL."""
-        return f"sqlite:///{tmp_path / 'test.db'}"
-
-    def _get_row_count(self, db_url: str, table_name: str) -> int:
-        """Helper to count rows in a table."""
-        engine = create_engine(db_url)
-        metadata = MetaData()
-        table = Table(table_name, metadata, autoload_with=engine)
-        with engine.connect() as conn:
-            rows = list(conn.execute(select(table)))
-        engine.dispose()
-        return len(rows)
 
 
 class TestDatabaseSinkSecretHandling:

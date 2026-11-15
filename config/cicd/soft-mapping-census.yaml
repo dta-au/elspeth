@@ -425,7 +425,6 @@ files:
     dict[str, object]: 1
   src/elspeth/plugins/sinks/database_sink.py:
     Mapping[str, object]: 4
-    boundary: 1
     dict[str, Any]: 10
     dict[str, object]: 3
   src/elspeth/plugins/sinks/dataverse.py:
@@ -1113,7 +1112,7 @@ totals:
   Mapping[str, Any]: 797
   Mapping[str, object]: 318
   MutableMapping[str, Any]: 8
-  boundary: 70
+  boundary: 69
   dict[str, Any]: 1124
   dict[str, object]: 401
   soft: 2648

@@ -10,7 +10,6 @@ import pytest
 from elspeth.contracts.errors import (
     CommencementGateFailedError,
     DependencyFailedError,
-    DuplicateDocumentError,
     RetrievalNotReadyError,
 )
 
@@ -80,9 +79,3 @@ class TestRetrievalNotReadyError:
     def test_empty_reason_raises(self) -> None:
         with pytest.raises(ValueError, match="reason must not be empty"):
             RetrievalNotReadyError(collection="test", reason="")
-
-
-class TestDuplicateDocumentError:
-    def test_empty_duplicate_ids_raises_value_error(self) -> None:
-        with pytest.raises(ValueError, match="must not be empty"):
-            DuplicateDocumentError(collection="test", duplicate_ids=[])

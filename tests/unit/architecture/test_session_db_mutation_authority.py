@@ -6178,7 +6178,9 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "3e92055687329a54",
         1,
         None,
-        line=493,
+        # p5-db-chroma (2026-11-15): 493 -> 487, POSITION ONLY. The fingerprint is
+        # byte-identical; the -6 is the removed if_exists replace path above it.
+        line=487,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -6189,7 +6191,8 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "cb69520a77f4030e",
         1,
         None,
-        line=921,
+        # p5-db-chroma (2026-11-15): 921 -> 915, POSITION ONLY (same -6 shift).
+        line=915,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -6200,7 +6203,8 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "f259e8651bc82bb6",
         1,
         None,
-        line=941,
+        # p5-db-chroma (2026-11-15): 941 -> 935, POSITION ONLY (same -6 shift).
+        line=935,
         connection_escape=True,
     ),
     # ``with LandscapeDB.from_url(...) as database`` then ``database.engine
