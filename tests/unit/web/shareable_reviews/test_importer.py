@@ -9,6 +9,8 @@ session service and the ordinary YAML seeder (the library-fork seam).
 from __future__ import annotations
 
 import asyncio
+import importlib
+import importlib.util
 import json
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
@@ -34,7 +36,6 @@ from elspeth.web.plugin_policy.availability import RequestPluginSnapshotFactory
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
 from elspeth.web.sessions.archive_quarantine import ArchiveQuarantineIntegrityError
 from elspeth.web.sessions.composer_app_services import composer_app_services
-from elspeth.web.sessions.creation import create_session_with_cancellation_cleanup
 from elspeth.web.sessions.models import blobs_table, sessions_table
 from elspeth.web.sessions.protocol import CompositionStateData, SessionNotFoundError
 from elspeth.web.shareable_reviews import importer as importer_module
@@ -762,6 +763,14 @@ def test_cancelled_import_creation_joins_and_archives(client: SyncASGITestClient
     assert archived == ([] if outcome == "create_failed" else [session_id])
 
 
+def _create_session_with_cancellation_cleanup() -> Any:
+    """Resolve the helper at call time, so this file still collects on a tree without it."""
+    assert importlib.util.find_spec("elspeth.web.sessions.creation") is not None, (
+        "elspeth.web.sessions.creation is missing: nothing archives a session created after its import was cancelled"
+    )
+    return importlib.import_module("elspeth.web.sessions.creation").create_session_with_cancellation_cleanup
+
+
 @pytest.mark.asyncio
 async def test_cancelled_session_creation_preserves_archive_integrity_failure() -> None:
     session_id = uuid4()
@@ -780,7 +789,7 @@ async def test_cancelled_session_creation_preserves_archive_integrity_failure() 
             raise archive_error
 
     async with _assert_no_loop_exception_events():
-        task = asyncio.create_task(create_session_with_cancellation_cleanup(BlockedSessionService(), _CHRIS, "Copy", "local"))
+        task = asyncio.create_task(_create_session_with_cancellation_cleanup()(BlockedSessionService(), _CHRIS, "Copy", "local"))
         await create_started.wait()
         task.cancel("import cancelled")
         finish_create.set()
@@ -813,7 +822,7 @@ async def test_cancelled_session_creation_surfaces_archive_failure_with_cause(ex
             raise archive_error
 
     async with _assert_no_loop_exception_events():
-        task = asyncio.create_task(create_session_with_cancellation_cleanup(BlockedSessionService(), _CHRIS, "Copy", "local"))
+        task = asyncio.create_task(_create_session_with_cancellation_cleanup()(BlockedSessionService(), _CHRIS, "Copy", "local"))
         await create_started.wait()
         task.cancel("import cancelled")
         finish_create.set()
@@ -852,7 +861,7 @@ async def test_second_cancellation_waits_for_session_archive() -> None:
             archive_completed.set()
 
     async with _assert_no_loop_exception_events():
-        task = asyncio.create_task(create_session_with_cancellation_cleanup(BlockedSessionService(), _CHRIS, "Copy", "local"))
+        task = asyncio.create_task(_create_session_with_cancellation_cleanup()(BlockedSessionService(), _CHRIS, "Copy", "local"))
         await create_started.wait()
         task.cancel("first cancellation")
         finish_create.set()
