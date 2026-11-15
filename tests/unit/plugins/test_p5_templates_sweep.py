@@ -11,7 +11,11 @@ opt-in and row-guard tests hold the behaviour that must survive the flip.
 from __future__ import annotations
 
 import inspect
+import pickle
+import traceback
 from typing import Any
+
+import pytest
 
 _SENTINEL = "CONTEXTVALUESENTINEL"
 
@@ -22,6 +26,19 @@ def _failure_text(template: Any, **context: object) -> str:
     except Exception as exc:
         return f"{type(exc).__name__}: {exc}"
     raise AssertionError("the render was expected to fail")
+
+
+def _assert_value_free_failure(render: Any) -> None:
+    with pytest.raises(Exception) as caught:
+        render()
+    error = caught.value
+    assert type(error).__name__ == "TemplateError"
+    assert _SENTINEL not in str(error)
+    assert _SENTINEL not in "".join(traceback.format_exception(error))
+    cause = error.__cause__
+    while cause is not None:
+        assert _SENTINEL not in str(cause)
+        cause = cause.__cause__
 
 
 def test_create_sandboxed_environment_defaults_to_value_free() -> None:
@@ -39,6 +56,26 @@ def test_default_environment_withholds_context_values_without_a_row() -> None:
     text = _failure_text(template, key=_SENTINEL)
     assert _SENTINEL not in text
     assert text.startswith("TemplateError: ")
+
+
+def test_private_worker_defaults_to_value_free() -> None:
+    from elspeth.plugins.infrastructure.templates import _run_template_worker
+
+    payload = pickle.dumps({"key": _SENTINEL}, protocol=5)
+    _assert_value_free_failure(lambda: _run_template_worker("{{ {}[key] }}", payload))
+
+
+def test_private_template_defaults_to_value_free() -> None:
+    from elspeth.plugins.infrastructure.templates import _BoundedTemplate
+
+    _assert_value_free_failure(lambda: _BoundedTemplate("{{ {}[key] }}").render(key=_SENTINEL))
+
+
+def test_private_environment_defaults_to_value_free() -> None:
+    from elspeth.plugins.infrastructure.templates import _BoundedEnvironment
+
+    template = _BoundedEnvironment().from_string("{{ {}[key] }}")
+    _assert_value_free_failure(lambda: template.render(key=_SENTINEL))
 
 
 def test_operator_only_opt_in_keeps_raw_diagnostics() -> None:
@@ -84,4 +121,4 @@ def test_value_free_render_reports_the_output_bound_in_full() -> None:
 
     row = TemplateRow.project(make_pipeline_row({"text": "x"}), ALL_FIELDS)
     text = _failure_text(SandboxedTemplate("{{ row.text * 5000000 }}"), row=row)
-    assert "Rendered template exceeds" in text
+    assert text == "TemplateError: Rendered template exceeds 4194304 UTF-8 bytes"
