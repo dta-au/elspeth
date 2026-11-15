@@ -23,8 +23,10 @@ Landscape audit trail.
 > **Chroma security advisory:** Do not use Chroma with ELSPETH until upstream
 > publishes a fixed release and ELSPETH adopts and verifies it. This includes
 > the `rag_retrieval` transform with `provider: chroma`, the `chroma_sink` sink,
-> and Chroma examples in all connection modes. ChromaDB has unresolved code-execution vulnerabilities;
-> version 1.5.9 is still affected. See the
+> and Chroma examples in all connection modes. ChromaDB has unresolved
+> code-execution vulnerabilities in every release up to and including 1.5.9,
+> the latest at the time of writing, including the 1.5.5 that ELSPETH locks;
+> no fixed release exists. See the
 > [pre-authentication advisory](https://github.com/advisories/GHSA-f4j7-r4q5-qw2c),
 > [collection-update advisory](https://github.com/advisories/GHSA-36p7-vc44-83pf),
 > and [upstream server and client issue](https://github.com/chroma-core/chroma/issues/6717).
