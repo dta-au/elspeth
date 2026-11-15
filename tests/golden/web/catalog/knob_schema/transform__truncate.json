@@ -23,7 +23,7 @@
         "tier": "common"
       },
       {
-        "description": "Mapping of field names to maximum lengths",
+        "description": "Mapping of string field names (as rows carry them, normalized) to maximum lengths",
         "kind": "json-object",
         "label": "Fields",
         "name": "fields",
@@ -37,16 +37,6 @@
         "kind": "text",
         "label": "Suffix",
         "name": "suffix",
-        "nullable": false,
-        "required": false,
-        "tier": "common"
-      },
-      {
-        "default": false,
-        "description": "If True, error when a specified field is missing (default: False)",
-        "kind": "checkbox",
-        "label": "Strict",
-        "name": "strict",
         "nullable": false,
         "required": false,
         "tier": "common"

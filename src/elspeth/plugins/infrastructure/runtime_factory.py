@@ -102,6 +102,7 @@ def instantiate_plugins_from_config(
     to lifecycle/operation methods.
     """
     from elspeth.core.dag.wiring import WiredTransform
+    from elspeth.plugins.infrastructure.base import aggregation_trigger_count_cap_error
     from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
     from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
 
@@ -210,6 +211,15 @@ def instantiate_plugins_from_config(
                 raise ValueError(
                     f"Aggregation '{agg_config.name}' uses '{agg_config.plugin}', which requires an EOF-only trigger; omit trigger or use {{}}"
                 )
+            # A count trigger above the plugin's declared batch cap fails
+            # every full batch at flush; refuse it here, from the class
+            # declaration, so it never reaches a run. The composer's
+            # placement rule reads the same declaration.
+            batch_cap_error = aggregation_trigger_count_cap_error(
+                agg_config.name, agg_config.plugin, transform_cls.max_batch_rows, agg_config.trigger.count
+            )
+            if batch_cap_error is not None:
+                raise ValueError(batch_cap_error)
             transform = transform_cls(dict(agg_config.options))
             transform.on_success = agg_config.on_success
             transform.on_error = agg_config.on_error

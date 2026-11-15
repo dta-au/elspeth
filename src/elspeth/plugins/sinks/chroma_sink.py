@@ -110,9 +110,9 @@ class ChromaSinkConfig(DataPluginConfig):
     )
 
     field_mapping: FieldMappingConfig = Field(description="Maps row fields to ChromaDB document/id/metadata")
-    on_duplicate: Literal["overwrite", "skip", "error"] = Field(
+    on_duplicate: Literal["overwrite"] = Field(
         default="overwrite",
-        description="Behaviour when a document ID already exists",
+        description="Behaviour when a document ID already exists; overwrite is the only policy.",
     )
 
     @model_validator(mode="after")
@@ -207,7 +207,7 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
     name = "chroma_sink"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3d9a95605119bf11"
+    source_file_hash: str | None = "sha256:ab21a3941da131ba"
     config_model = ChromaSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
@@ -269,10 +269,10 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
                 issue_code=None,
                 summary="Writes rows to a ChromaDB collection as embedded documents with metadata.",
                 composer_hints=(
-                    "Set field_mapping.id_field and document_field to row fields holding string values; Chroma requires str ids and documents. A row whose id or document is missing, non-string, or an empty id is diverted per row (to on_write_failure) while its valid siblings are written.",
+                    "Set field_mapping.id_field and document_field to row fields holding string values; Chroma requires str ids and documents. A row whose id or document is missing or non-string, or whose id is empty or whitespace-only, is diverted per row (to on_write_failure) while valid siblings are written.",
                     "metadata_fields may contain only Chroma-compatible scalar values: str, int, float, bool, or None.",
                     "Use mode=persistent with persist_directory for local storage, or mode=client with host/port/ssl for a server.",
-                    "Choose on_duplicate as overwrite, skip, or error before running; the default overwrites document IDs.",
+                    "on_duplicate accepts only overwrite (the default): an existing document ID is overwritten.",
                     "Chroma sink does not support resume, so plan reruns around idempotent document IDs.",
                 ),
             )
@@ -383,11 +383,12 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
             raise ValueError(f"Chroma effect member is missing required field {exc.args[0]!r}") from exc
         if type(raw_id) is not str or type(raw_document) is not str:
             raise ValueError("Chroma effect member id and document fields must be strings")
-        if not raw_id:
+        if not raw_id.strip():
             # Chroma rejects an empty ID at upsert with InvalidArgumentError (a
-            # ChromaError), which would escape commit on every attempt; divert
-            # the member here instead.
-            raise ValueError("Chroma effect member id must not be empty")
+            # ChromaError), which would escape commit on every attempt; a
+            # whitespace-only ID is blank in every meaningful sense and would be
+            # published under an unaddressable key. Divert both here instead.
+            raise ValueError("Chroma effect member id must not be empty or whitespace-only")
         metadata: dict[str, object] = {}
         for field_name in fm.metadata_fields:
             if field_name not in row:
@@ -427,8 +428,8 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
     ) -> tuple[ArtifactDescriptor, str, str, dict[int, tuple[str, str, dict[str, object] | None]], tuple[tuple[int, str], ...]]:
         """Deterministically partition members into extractable payloads and diversions.
 
-        An invalid member (missing/non-string/empty ID or document, unsupported
-        or non-finite metadata, or an ID already used by an earlier member of
+        An invalid member (missing/non-string ID or document, empty or
+        whitespace-only ID, unsupported or non-finite metadata, or an ID already used by an earlier member of
         the group) diverts individually with its exact reason instead
         of aborting the plan and blocking valid siblings (elspeth-32bf1a9b63).
         The descriptor and payload hash cover only the members that will be
@@ -518,11 +519,6 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
         ctx: RestrictedSinkEffectContext,
     ) -> SinkEffectPlan:
         del ctx
-        if self._config.on_duplicate != "overwrite":
-            raise ValueError(
-                "Recoverable Chroma publication requires on_duplicate=overwrite; "
-                "use overwrite or choose a sink with a target-side effect marker"
-            )
         if type(request.effect_input) is not SinkEffectPipelineMembersInput:
             raise TypeError("Chroma effects require pipeline member input")
         descriptor, payload_hash, plan_hash, extracted_by_ordinal, diversions = self._member_effect_material(

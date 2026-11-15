@@ -81,10 +81,10 @@ def test_real_non_blocking_configs_still_get_no_credit() -> None:
 _ROW_SENTINEL = "ROWVALUESENTINEL"
 
 
-def _render_failure_text(source: str, **context: object) -> str:
+def _render_failure_text(source: str, *, value_free: bool = True, **context: object) -> str:
     from elspeth.plugins.infrastructure.templates import create_sandboxed_environment
 
-    template = create_sandboxed_environment().from_string(source)
+    template = create_sandboxed_environment(value_free=value_free).from_string(source)
     try:
         template.render(**context)
     except Exception as exc:
@@ -102,9 +102,9 @@ def test_default_environment_withholds_row_values_from_render_failures() -> None
     assert text.startswith("TemplateError: ")
 
 
-def test_default_environment_keeps_operator_only_render_diagnostics() -> None:
-    """A context with no row (e.g. a blob path over run_id) keeps the detailed message."""
-    text = _render_failure_text("{{ {}[run_id] }}", run_id="OPERATORVALUE")
+def test_operator_only_opt_in_keeps_render_diagnostics() -> None:
+    """A caller that opts out for a context with no row (e.g. a blob path over run_id) keeps the detailed message."""
+    text = _render_failure_text("{{ {}[run_id] }}", value_free=False, run_id="OPERATORVALUE")
     assert "OPERATORVALUE" in text
 
 

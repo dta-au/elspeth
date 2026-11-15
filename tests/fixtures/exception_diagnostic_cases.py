@@ -733,13 +733,6 @@ DIAGNOSTIC_CASES = (
         _exercise_private_context,
     ),
     *_text_cases(errors.RetrievalNotReadyError, {"collection": "fixed-collection", "reason": "fixed-reason"}, "collection", "reason"),
-    *_text_cases(errors.DuplicateDocumentError, {"collection": "fixed-collection", "duplicate_ids": ["fixed-document"]}, "collection"),
-    _message_case(
-        errors.DuplicateDocumentError,
-        {"collection": "fixed-collection"},
-        "duplicate_ids",
-        ((["document-alpha"], "document-alpha"), (["document-omega"], "document-omega")),
-    ),
     DiagnosticCase(
         errors.CapacityError,
         frozenset({"status_code"}),

@@ -405,7 +405,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
     name = "azure_blob"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:265a70ffa9cb1d46"
+    source_file_hash: str | None = "sha256:b49d1d09b8ae71ca"
     config_model = AzureBlobSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP
@@ -498,7 +498,9 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
         # Pre-compile blob path template at init for runtime use.
         # Syntax validation is now handled by AzureBlobSinkConfig.validate_blob_path_template
         # model_validator — from_dict() above already proved the template is valid.
-        env = create_sandboxed_environment()
+        # The path renders only run_id and timestamp (_effect_blob_path), never
+        # row data, so it opts in to raw render diagnostics.
+        env = create_sandboxed_environment(value_free=False)
         self._blob_path_compiled = env.from_string(self._blob_path_template)
 
         # CSV options are already validated Pydantic model

@@ -223,9 +223,9 @@ class DatabaseSinkConfig(DataPluginConfig):
 
     url: str = Field(description="Database connection URL for SQLAlchemy.", repr=False)
     table: str = Field(description="Database table name to write rows into.")
-    if_exists: Literal["append", "replace"] = Field(
+    if_exists: Literal["append"] = Field(
         default="append",
-        description="Whether to append to an existing table or replace it before writing.",
+        description="Write behaviour against the existing table; append is the only mode.",
     )
     effect_ledger: DatabaseEffectLedgerConfig | None = Field(
         default=None,
@@ -245,8 +245,7 @@ class DatabaseSink(BaseSink, RestagingSinkEffectCapability):
 
     Supports SQLite and PostgreSQL only. The target table and the declared
     target-side effect ledger must already exist: the sink performs no DDL and
-    refuses a missing table. Only ``if_exists: append`` is accepted at
-    effect-mode resolution; ``replace`` is refused.
+    refuses a missing table. ``if_exists: append`` is the only write mode.
 
     Uses SQLAlchemy Core for direct SQL control.
 
@@ -261,7 +260,7 @@ class DatabaseSink(BaseSink, RestagingSinkEffectCapability):
         url: Database connection URL (required)
         table: Table name (required)
         schema: Schema configuration (required, via DataPluginConfig)
-        if_exists: "append" (default; "replace" is refused at validation)
+        if_exists: "append" (default and only value)
         effect_ledger: Operator-provisioned exactly-once ledger table (required)
 
     Input validation is always enabled. Incoming rows are validated against
@@ -277,7 +276,7 @@ class DatabaseSink(BaseSink, RestagingSinkEffectCapability):
     name = "database"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9e7fd39c9324d337"
+    source_file_hash: str | None = "sha256:5d5567f4cf51a1b8"
     config_model = DatabaseSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.SQL
@@ -331,10 +330,6 @@ class DatabaseSink(BaseSink, RestagingSinkEffectCapability):
     def _validate_effect_config(cls, cfg: DatabaseSinkConfig) -> None:
         if cfg.effect_ledger is None:
             raise SinkEffectCapabilityError("Database sink recoverable publication requires an operator-declared target-side effect ledger")
-        if cfg.if_exists != "append":
-            raise SinkEffectCapabilityError(
-                "Database sink effect mode 'replace' is not supported; provision a new target table and use if_exists='append'"
-            )
         dialect = make_url(cfg.url).get_backend_name()
         if dialect not in _DATABASE_EFFECT_SUPPORTED_DIALECTS:
             raise SinkEffectCapabilityError(
@@ -356,10 +351,9 @@ class DatabaseSink(BaseSink, RestagingSinkEffectCapability):
     def configure_for_resume(self) -> None:
         """Configure database sink for resume mode.
 
-        Switches from replace mode to append mode so resume operations
-        add to existing table instead of dropping and recreating.
+        Append is the only write mode, so a resumed run already adds to the
+        existing table; there is nothing to switch.
         """
-        self._if_exists = "append"
 
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__(config)
@@ -1191,33 +1185,9 @@ class DatabaseSink(BaseSink, RestagingSinkEffectCapability):
                     "Only SQLite and PostgreSQL URLs are accepted; any other dialect fails validation.",
                     "The target table must already exist with compatible columns: the sink performs no DDL and refuses a missing table. Ask the operator for a provisioned table name.",
                     "effect_ledger is REQUIRED: declare the operator-provisioned ledger (table, schema_version, permissions insert/select) on the same database, or validation fails.",
-                    "if_exists must be 'append' (the default). 'replace' is not supported and fails validation; there is no insert/upsert mode.",
+                    "if_exists accepts only 'append' (the default); there is no insert/upsert mode.",
                     "url is sanitised and audit-recorded — never put credentials inline; use the secrets store.",
                     "on_write_failure routes per-row constraint violations (UNIQUE / NOT NULL / CHECK / foreign-key) — the offending row is diverted and the rest of the batch commits. Batch-integrity failures (connection loss, lock timeout, bad SQL) are not row-attributable and crash the run.",
                 ),
             )
         return None
-
-    @classmethod
-    @trust_boundary(
-        tier=3,
-        source=(
-            "a composer/tool-call config snapshot for this sink — LLM- or operator-authored option values ELSPETH has not yet validated"
-        ),
-        source_param="config_snapshot",
-        suppresses=("R1",),
-        invariant=("returns advisory hint strings only; an absent or non-'replace' if_exists contributes no hint and nothing raises"),
-        non_raising=True,
-    )
-    def get_post_call_hints(
-        cls,
-        *,
-        tool_name: str,
-        config_snapshot: Mapping[str, object],
-    ) -> tuple[str, ...]:
-        hints: list[str] = []
-        if config_snapshot.get("if_exists") == "replace":
-            hints.append(
-                "if_exists: 'replace' is not supported and fails validation. Use if_exists: 'append' against an operator-provisioned table."
-            )
-        return tuple(hints)

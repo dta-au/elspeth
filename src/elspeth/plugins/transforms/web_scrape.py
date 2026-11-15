@@ -15,6 +15,7 @@ Audit Trail:
 - Generates fingerprints for change detection
 """
 
+import hashlib
 import ipaddress
 import math
 import time
@@ -99,7 +100,7 @@ from elspeth.plugins.transforms.web_scrape_extraction import (
     extract_css_records,
     extract_css_records_with_provenance,
 )
-from elspeth.plugins.transforms.web_scrape_fingerprint import compute_fingerprint
+from elspeth.plugins.transforms.web_scrape_fingerprint import FetchResponseContext, compute_fingerprint
 from elspeth.plugins.transforms.web_scrape_json_extraction import JSONRecordsConfig, extract_json_records_with_provenance
 from elspeth.plugins.transforms.web_scrape_links import resolve_discovered_href
 from elspeth.plugins.transforms.web_scrape_pagination import (
@@ -347,8 +348,8 @@ class WebScrapeConfig(TransformDataConfig):
     fingerprint_mode: Literal["content", "full"] = Field(
         default="content",
         description=(
-            "Hash of the extracted content with whitespace collapsed (content) or exactly as extracted (full); "
-            "neither mode covers HTTP status, final URL, headers, or the raw body."
+            "Hash of the extracted content with whitespace collapsed (content), or of the exact content plus each "
+            "fetched page's HTTP status, final URL, content type and raw body hash (full)."
         ),
     )
     strip_elements: list[str] = Field(
@@ -750,6 +751,20 @@ def _build_web_scrape_output_semantics(
     )
 
 
+def _fetch_response_context(response: httpx.Response, final_hostname_url: str) -> FetchResponseContext:
+    """Return the per-page response facts a ``full`` fingerprint covers.
+
+    ``final_url`` is the persisted ``fetch_url_final`` rendering, so the
+    fingerprint never hashes a raw URL secret the row itself does not carry.
+    """
+    return FetchResponseContext(
+        status_code=response.status_code,
+        final_url=fingerprint_url(final_hostname_url),
+        content_type=response.headers["content-type"] if "content-type" in response.headers else None,
+        body_sha256=hashlib.sha256(response.content).hexdigest(),
+    )
+
+
 def _final_response_ip(response: httpx.Response) -> str:
     """Extract the final IP-pinned destination from an SSRF-safe response."""
     try:
@@ -794,7 +809,8 @@ class WebScrapeTransform(BaseTransform):
         fingerprint_field: Field to store content fingerprint
         format: Output format ("markdown", "text", "raw")
         text_separator: Separator between DOM text nodes when format is text
-        fingerprint_mode: Fingerprinting mode ("content", "full")
+        fingerprint_mode: Fingerprinting mode ("content": whitespace-normalized content;
+            "full": exact content plus each page's status, final URL, content type and raw body hash)
         strip_elements: HTML tags to remove (default: ["script", "style"])
         http:
             abuse_contact: Email for abuse reports (required)
@@ -826,7 +842,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:00c3d14b78870b02"
+    source_file_hash: str | None = "sha256:fd932846a0bc1577"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -1337,13 +1353,9 @@ class WebScrapeTransform(BaseTransform):
                 raise FrameworkBugError("web_scrape has no configured URL source")
             if type(url) is not str:
                 raise TypeError("URL field must be a string")
-            # httpx refuses ASCII control characters (C0 and DEL) with
-            # httpx.InvalidURL, which is neither ValueError nor RequestError;
-            # urlsplit silently drops some of them, so the SSRF checks admit
-            # them. Refuse here, whatever allowed_origins says, so a trailing
-            # newline in a row's URL is a row error and not a crash.
-            if any(char.isascii() and not char.isprintable() for char in url):
-                raise SSRFBlockedError("URL contains an ASCII control character", kind="malformed_url")
+            # The shared origin check refuses ASCII control characters (C0 and
+            # DEL, which httpx rejects with httpx.InvalidURL) whatever
+            # allowed_origins says, so a trailing newline is a row error.
             validate_allowed_http_origin(url, self._request_allowed_origins)
             if request_params:
                 try:
@@ -1517,6 +1529,7 @@ class WebScrapeTransform(BaseTransform):
             )
 
         body_size = len(response.content)
+        response_contexts = [_fetch_response_context(response, final_hostname_url)]
         records: list[dict[str, str | list[str] | None]] | None = None
         record_provenance: list[dict[str, dict[str, object]]] | None = None
         if self._records is not None:
@@ -1660,6 +1673,7 @@ class WebScrapeTransform(BaseTransform):
                         {"reason": "content_extraction_failed", "error": str(exc), "error_type": type(exc).__name__}
                     )
                 page_contents.append(next_content)
+                response_contexts.append(_fetch_response_context(response, final_hostname_url))
                 if len(self._aggregate_page_contents(page_contents)) > self._pagination.max_total_content_chars or (
                     page_records is not None and len(page_records) > self._pagination.max_total_records
                 ):
@@ -1681,7 +1695,7 @@ class WebScrapeTransform(BaseTransform):
             final_resolved_ip = _final_response_ip(response)
 
         # Compute fingerprint
-        fingerprint = compute_fingerprint(content, mode=self._fingerprint_mode)
+        fingerprint = compute_fingerprint(content, mode=self._fingerprint_mode, responses=response_contexts)
 
         # Field collision check already done before fetch — no need to re-check here.
 

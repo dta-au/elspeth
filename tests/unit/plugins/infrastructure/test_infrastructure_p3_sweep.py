@@ -367,11 +367,15 @@ def test_truncate_keys_are_config_named_input_columns() -> None:
 
 
 def test_truncate_header_spelling_key_of_a_declared_field_still_constructs() -> None:
-    """Finding #0 caveat: a key whose canonical spelling IS declared is not refused.
+    """Finding #0 caveat: a key whose canonical spelling IS declared is not refused HERE.
 
-    truncate resolves a header-spelled key through the row contract, so
+    The fixed-schema read check compares canonical forms for every plugin, so
     ``{'Value Text': 10}`` / ``{'Notes': 5}`` against fixed ``value_text`` /
-    ``notes`` reach the declared field; only the canonical form is compared.
+    ``notes`` construct. The header spelling is refused by the field-name
+    spelling rule at build instead (truncate's keys are declared string
+    inputs since plugin review #146; pinned in
+    tests/integration/pipeline/test_field_name_spelling_rule.py), so the
+    operator gets the rule's own verdict rather than "forbidden by schema".
     """
     from elspeth.plugins.transforms.truncate import Truncate
 
