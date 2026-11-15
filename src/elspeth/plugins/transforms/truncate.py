@@ -95,8 +95,8 @@ class Truncate(BaseTransform):
 
     name = "truncate"
     determinism = Determinism.DETERMINISTIC
-    plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:4ae16e87917a4322"
+    plugin_version = "2.0.0"
+    source_file_hash: str | None = "sha256:ad81c95b6ead6493"
     config_model = TruncateConfig
     usage_when_to_use: str = (
         "Use for a deterministic character-length cap on selected text fields, optionally reserving "
