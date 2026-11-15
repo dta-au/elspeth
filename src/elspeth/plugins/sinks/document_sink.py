@@ -112,7 +112,7 @@ class DocumentSink(BaseSink):
     name = "document"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a407d8e72f27e85c"
+    source_file_hash: str | None = "sha256:121ff2e7f4e07f78"
     config_model = DocumentSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
@@ -142,6 +142,14 @@ class DocumentSink(BaseSink):
         mode: fixed
         fields:
           - "announcement_text: str"
+          - "report_format: str?"
+          - "report_index: int?"
+          - "line_start: int?"
+          - "line_end: int?"
+          - "line_count: int?"
+          - "lines_seen_total: int?"
+          - "flush_trigger: str?"
+          - "is_end_of_source_report: bool?"
 """
     capability_tags: tuple[str, ...] = ("document", "file", "multiline", "single-value")
 

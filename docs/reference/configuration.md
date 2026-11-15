@@ -148,10 +148,11 @@ contract.
 The web service compiles one operator-owned plugin policy at startup. Its
 required authorization set is:
 
-- sources: `source:csv`, `source:json`, `source:text`
-- transforms: `transform:field_mapper`, `transform:llm`,
-  `transform:web_scrape`
-- sinks: `sink:csv`, `sink:json`, `sink:text`
+- sources: `source:csv`, `source:json`, `source:llm`, `source:text`
+- transforms: `transform:field_mapper`, `transform:file_inject`,
+  `transform:line_explode`, `transform:llm`, `transform:reference_join`,
+  `transform:report_assemble`, `transform:web_scrape`
+- sinks: `sink:csv`, `sink:document`, `sink:json`, `sink:text`
 
 The operator-profiled LLM is request-available only when that principal has at
 least one usable configured profile. Missing LLM or tutorial credentials do

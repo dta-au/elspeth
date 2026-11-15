@@ -214,3 +214,34 @@ class TestReportAssembleAggregationPipeline:
         assert row["lines_seen_total"] == 5
         assert row["flush_trigger"] == "end_of_source"
         assert row["is_end_of_source_report"] is True
+
+    def test_paginated_reports_cannot_share_document_file(self, pipeline_config_count_trigger: Path, output_dir: Path) -> None:
+        from elspeth.cli import app
+
+        config = yaml.safe_load(pipeline_config_count_trigger.read_text())
+        output_file = output_dir / "report.txt"
+        config["sinks"]["output"] = {
+            "plugin": "document",
+            "on_write_failure": "discard",
+            "options": {"path": str(output_file), "field": "report_body", "schema": {"mode": "observed"}},
+        }
+        pipeline_config_count_trigger.write_text(yaml.safe_dump(config))
+        result = runner.invoke(app, ["run", "-s", str(pipeline_config_count_trigger), "--execute"])
+        assert result.exit_code == 2, result.output
+        assert not output_file.exists()
+
+    def test_fixed_document_example_publishes_whole_report(self, pipeline_config_no_trigger: Path, output_dir: Path) -> None:
+        from elspeth.cli import app
+        from elspeth.plugins.sinks.document_sink import DocumentSink
+
+        config = yaml.safe_load(pipeline_config_no_trigger.read_text())
+        sink_config = yaml.safe_load(DocumentSink.example_use)["sinks"]["announcement"]
+        output_file = output_dir / "report.txt"
+        sink_config["options"]["path"] = str(output_file)
+        sink_config["on_write_failure"] = "discard"
+        config["sinks"]["output"] = sink_config
+        config["aggregations"][0]["options"]["output_field"] = "announcement_text"
+        pipeline_config_no_trigger.write_text(yaml.safe_dump(config))
+        result = runner.invoke(app, ["run", "-s", str(pipeline_config_no_trigger), "--execute"])
+        assert result.exit_code == 0, result.output
+        assert output_file.read_text() == "line 1\nline 2\nline 3\nline 4\nline 5"

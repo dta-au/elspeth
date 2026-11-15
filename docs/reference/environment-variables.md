@@ -605,10 +605,11 @@ change to the policy variables, verify the tutorial rows in
 `"transform:passthrough"`) authorizes *optional* plugins on top of the
 required web core, which is always authorized:
 
-- sources: `source:csv`, `source:json`, `source:text`
-- transforms: `transform:field_mapper`, `transform:llm`,
-  `transform:web_scrape`
-- sinks: `sink:csv`, `sink:json`, `sink:text`
+- sources: `source:csv`, `source:json`, `source:llm`, `source:text`
+- transforms: `transform:field_mapper`, `transform:file_inject`,
+  `transform:line_explode`, `transform:llm`, `transform:reference_join`,
+  `transform:report_assemble`, `transform:web_scrape`
+- sinks: `sink:csv`, `sink:document`, `sink:json`, `sink:text`
 
 Consequences:
 
