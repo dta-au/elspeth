@@ -22,6 +22,7 @@ from pydantic.fields import FieldInfo
 
 from elspeth.plugins.infrastructure import config_base
 from elspeth.plugins.infrastructure.discovery import discover_all_plugins
+from tests.fixtures.factories import make_source_context
 
 _OBSERVED: dict[str, Any] = {"mode": "observed"}
 _NON_TEXT_CODECS = ("base64", "rot13", "hex", "zlib")
@@ -252,13 +253,11 @@ def _text_source(path: Any, **overrides: Any) -> Any:
 
 def test_text_source_utf16_bad_code_unit_keeps_every_other_line(tmp_path: Any) -> None:
     """lane-06 suspected TextSource shared json/csv's UTF-16 chunk loss; it must not."""
-    from unittest.mock import MagicMock
-
     lines = [f"line{i}" for i in range(3000)]  # several 8 KiB read-ahead chunks
     path = tmp_path / "in.txt"
     path.write_bytes(_utf16_with_bad_unit(lines, 1500))
 
-    rows = list(_text_source(path, encoding="utf-16").load(MagicMock()))
+    rows = list(_text_source(path, encoding="utf-16").load(make_source_context(plugin_name="text")))
 
     valid = [row.row["line"] for row in rows if not row.is_quarantined]
     assert valid == lines[:1500] + lines[1501:]
@@ -269,12 +268,10 @@ def test_text_source_utf16_bad_code_unit_keeps_every_other_line(tmp_path: Any) -
 
 
 def test_text_source_strips_a_leading_utf8_bom_only(tmp_path: Any) -> None:
-    from unittest.mock import MagicMock
-
     path = tmp_path / "bom.txt"
     path.write_bytes(_BOM + "hello\n\ufeffworld\n".encode())
 
-    rows = list(_text_source(path).load(MagicMock()))
+    rows = list(_text_source(path).load(make_source_context(plugin_name="text")))
 
     assert [row.row["line"] for row in rows] == ["hello", "\ufeffworld"]
 
