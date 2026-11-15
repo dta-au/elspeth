@@ -4,18 +4,40 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
-## 0.8.14 - 2026-11-11
+## 0.8.14 - 2026-11-15
 
-Python 3.14. ELSPETH now requires and runs on Python 3.14 only; this release
-moves the packages, the images and CI to it and corrects the behaviour that
-changed under the new interpreter. The dated entry and package version do not
-establish qualification, a published tag or an image. Not run for this work:
-the PostgreSQL testcontainer suites, a live provider, end-to-end browser tests
-and CI itself on the new single lane.
+Python 3.14, Web Composer remediation and plugin fixes. ELSPETH now requires
+and runs on Python 3.14 only; this release moves the packages, the images and
+CI to it and corrects the behaviour that changed under the new interpreter. It
+also carries the first part of the Web Composer remediation (withheld replies,
+version history, `diff_pipeline`, credential handling, the tutorial, the batch
+plugins and `report_assemble`), a fix that stops `elspeth purge` from deleting a
+live share link's data, and a broad round of plugin fixes. The dated entry and
+package version do not establish qualification, a published tag or an image. Not
+run for this work: the PostgreSQL testcontainer suites, a live provider,
+end-to-end browser tests and CI itself on the new single lane.
 
 ### Upgrade notes
 
 These changes are breaking:
+
+- **Runs admitted before the upgrade refuse to resume in the Web Composer.**
+  Making the three batch plugins available on every install changes the
+  compiled plugin policy hash, so a web run admitted under the previous policy
+  is refused on resume as `POLICY_CHANGED` (`admitted_policy_changed`). Drain
+  in-flight web runs before upgrading.
+- **A Web Composer graph that feeds `report_assemble` straight into a `text`
+  sink is refused at semantic validation.** The text sink diverts rows that
+  contain a line break, so such a graph used to pass validation and then fail
+  at run time. Put `line_explode` between them. CLI YAML and `report_assemble`'s
+  emitted row shapes are unchanged.
+- **Deploy the Web Composer backend and frontend together.** The version
+  history response gains an `is_milestone` field that the new version menu
+  reads. No schema changes and no stored row is rewritten.
+- **Share links minted before this release keep working, but their data stays
+  exposed to `elspeth purge`.** New share data lives in a separate `shares/`
+  subtree of the payload store. Never point `elspeth purge --payload-dir` at
+  `shares/`. See the Sharing section below.
 
 - **Python 3.14 is required** for `elspeth`, `elspeth-lints` and the LLM
   gateway (and the gateway adapter template). Python 3.12 and 3.13 are no
@@ -64,10 +86,6 @@ These changes are breaking:
   - A `web_scrape` `auth` setting, which previously failed every row, and a
     JSON record column without a path.
   - An empty `query_template` or `query_pattern` in retrieval transforms.
-- **`type_coerce` is stricter.** Converting to `bool` no longer turns a blank
-  or whitespace-only string into `False`; it is a `not_boolean_string` row
-  error. Numeric strings with underscores or non-ASCII digits, and integers
-  outside the safe range (`out_of_range`), are refused instead of converted.
   - Multi-query LLM configs whose generated field names collide across
     queries, including the raw, `_usage` and `_model` fields. Uniqueness used
     to be checked only when a query set `structured_output_prefix`; the
@@ -76,6 +94,10 @@ These changes are breaking:
     maximum, or AIMD settings that cannot hold when `pool_size` is above 1).
   - A tracing config that sets other keys while its provider is `none` or
     omitted; those keys were previously ignored.
+- **`type_coerce` is stricter.** Converting to `bool` no longer turns a blank
+  or whitespace-only string into `False`; it is a `not_boolean_string` row
+  error. Numeric strings with underscores or non-ASCII digits, and integers
+  outside the safe range (`out_of_range`), are refused instead of converted.
 - **Single-query LLM `metadata.model` is now the configured model.** The
   model the provider actually served is in `metadata.served_model`
   (`<query>_served_model` for multi-query). Readers that treated
@@ -612,8 +634,86 @@ Sinks and retrieval:
     batch rather than per member; the plan-vs-material integrity check still
     runs for every member (#89).
 
-### Composer
+### Web Composer
 
+- **A reply the completion review withholds is shown as a system notice.** The
+  assistant message is empty and the notice says why (review unavailable,
+  malformed, rejected, out of budget, or not admitted). The withheld text never
+  re-enters the conversation history sent to the model, so it is never treated
+  as the model's own words. The saved-scope facts appear once, in the
+  checkpoint receipt.
+- **Credential-shaped model reasoning no longer fails the turn.** It is dropped
+  and recorded as a value-free withhold, and the turn continues. Where the
+  provider forbids editing or omitting thinking blocks (a tool-call
+  completion), the call is refused with a typed cause instead.
+- **Credential refusals on model output no longer blame the user.** When the
+  guard blocks content the model produced, the message says the model's output
+  was blocked and to retry, and keeps the secret-service remedy for the case
+  where the user supplied the value.
+- **Stored provider-error text is scrubbed with the shared credential
+  patterns.** The scrubber kept its own list, which missed database-URL
+  passwords and over-redacted ordinary request paths. Hyphenated provider keys
+  are never stored in an audit row's `error_message`. New rows may carry the
+  shared marker labels `ssn_like` and `github_token`; existing rows are not
+  rewritten. Redis, AMQP and raw-slash URL passwords are not recognised by the
+  shared detector and remain a gap.
+- **The version menu shows the newest 50 versions and marks validated
+  milestones.** It used to request the oldest 50, so in a long session the
+  baseline `diff_pipeline` names could not be found. Strictly validated
+  versions are labelled without relying on colour and are never hidden by the
+  identical-snapshot filter. If the head keeps moving while the history loads,
+  the menu says so and offers Retry.
+- **A forked session's first version no longer claims a validation that never
+  ran on its bytes.** Fork rewrites blob and sink paths; when that changes the
+  structure, the marker is now `authoring_only` (`is_valid` is kept). An
+  unchanged fork keeps its marker.
+- **`diff_pipeline` compares against the last validated state.** The baseline
+  is the newest strictly validated state other than the working state, reported
+  as `baseline_kind: last_validated`; with none, it is the request-start state
+  (`request_start`). A state checked only by the mid-turn authoring check does
+  not count. The tool description and the composer skill now tell the model to
+  name both version numbers and to say plainly when nothing has changed. The
+  skill text change moves `composer_skill_hash`.
+- **A reviewed interpretation slot that a per-query template bypasses is
+  refused at staging.** A multi-query node whose query supplies its own template
+  never rendered the node-level slot, so the approved value did not reach that
+  prompt. `set_pipeline`, `upsert_node`, `splice_transform` and `patch_node_options`
+  now refuse the shape with the validation code `vague_term_query_override`
+  and a repair message that names the real cause.
+- **Ordinary prose no longer blocks resolving an accepted interpretation.**
+  The guard that refused any template whose text before the placeholder ended
+  in `system:`, `role:` or `instructions:` is removed (for example "Describe
+  the user's role:"). Braces and control characters are still refused.
+- **The end-of-turn advisor review gets the plugin capability record** bound to
+  the same snapshot as the candidate, and a rubric that separates a prose
+  objection (the reply is withheld) from a graph finding. Repair copy says the
+  user has not seen the draft.
+- **The three batch plugins are available on every install.** `batch_stats`,
+  `batch_replicate` and `batch_experiment_compare` no longer depend on an
+  operator allowlist; both AWS terraform mirrors and the docs lists follow. The
+  schema-contract repair text now says `copy_index` is an output field of
+  `batch_replicate` when `include_copy_index` is enabled. The planner request
+  grows by a measured 1,335 bytes.
+- **`report_assemble` declares the text framing it produces**, so the Web
+  Composer rejects a direct link to a `text` sink at validation (see Upgrade
+  notes). The `document` sink example admits the eight report metadata fields as
+  optional, and the `text` and `document` sink guidance states what each
+  writes.
+- **The tutorial's Build step is script-only.** After the brief is sent, the
+  learner can take only the card decisions the script needs: no chat input,
+  upload, suggestion Apply, repair, inline-source edit or use-as-input. The
+  interpretation card has no "Change..." control. Cancel and the
+  interrupted-request retry stay, and a resend control re-sends the scripted
+  brief. The launch check's 409 detail names what differs. The ordinary chat is
+  unchanged.
+- **The escape-hatch boot probe sends the real request.** It used to send three
+  tools; it now sends the full planner palette a production hatch turn sends,
+  so the probe now exercises the request production sends.
+- **A reply that fits is no longer refused by the context budget.** Savings
+  from shed history and stubbed tool results are now counted in wire bytes (and
+  on the quoted records the reply stage sends), where they were counted in
+  content bytes, and a reply-stage refusal's audit components are sized on the
+  request that was measured.
 - **A forked session's copy of a model-written file stays model-written**
   (#365). Forking used to record the copy as VERBATIM, which let a session
   fork turn LLM-generated text into a file the composer would accept as
@@ -621,6 +721,27 @@ Sinks and retrieval:
   `creating_*` provenance fields, anchored to the child session's own
   `session_fork` audit row, so the prompt-surface guard, blob admission and
   share checks treat it as model-written through forks of forks as well.
+
+### Sharing
+
+- **Cancelling a shared-pipeline import or a library fork no longer leaves an
+  empty session.** A client disconnect during creation used to commit a live,
+  empty "Copy of ..." or "Fork of ..." session that nothing archived. The
+  session is now archived on cancellation.
+- **Share tokens are decoded strictly.** A token containing characters outside
+  the URL-safe base64 alphabet is refused; it used to verify with the junk
+  discarded. Every token issued before this release still verifies. The unused
+  `requesting_user_id` parameter of `ShareableReviewService.resolve_token` is
+  removed; the route keeps its authentication and rate limit.
+- **`elspeth purge` can no longer delete a live share's data.** Share snapshots
+  and frozen import files shared the content-addressed payload store with run
+  payloads, so a share whose bytes matched a run's canonical row JSON was
+  deleted with the run and its link returned 404. Shares now have their own
+  store at `<payload base>/shares`, on the same mounted volume with no new
+  setting. Links created before this release keep working (reads fall back to
+  the parent store), but their data stays where it is and remains
+  purge-exposed; there is no migration. Never point `purge --payload-dir` at
+  `shares/`.
 
 ### Logging
 
@@ -688,6 +809,17 @@ Sinks and retrieval:
   already passed.
   The guardrails client also awaits operator re-signing of three tier-model
   allowlist entries for `BedrockGuardrailsClient.apply_guardrail`.
+- `diff_pipeline` moves its baseline to the request-start state as soon as the
+  turn edits, and after a revert it compares with the validated state before
+  the revert.
+- The vague-term bypass refusal does not tell the planner which query bypasses
+  the slot; a slot resolved before an override is added is still accepted; and
+  a stored session with a pending card on such a node is treated as orphaned on
+  the next compose turn.
+- The advisor does not yet receive blocker detail. The handoff override before
+  the pre-scan still drops the masked-red diagnostic.
+- The tutorial's script-only Build step has not had its browser walk: no
+  Chromium was available.
 - Fork copies made before the #365 fix stay VERBATIM; they are not rewritten.
   A fork interrupted mid-copy across the upgrade fails closed on retry with a
   modality mismatch. Pipeline `llm`-node output is still recorded VERBATIM
