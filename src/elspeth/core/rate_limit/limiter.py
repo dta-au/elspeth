@@ -7,6 +7,7 @@ import re
 import sqlite3
 import threading
 import time
+from _thread import RLock as ThreadRLock
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -17,9 +18,10 @@ from pyrate_limiter import (  # type: ignore[attr-defined]  # pyrate-limiter has
     InMemoryBucket,
     Limiter,
     Rate,
-    SQLiteBucket,
+    RateItem,
     SQLiteQueries,
 )
+from pyrate_limiter.buckets.sqlite_bucket import SQLiteBucket
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -130,6 +132,37 @@ def validate_limiter_timeout(timeout: object | None) -> None:
         raise ValueError(f"timeout must be non-negative, got {timeout!r}")
 
 
+class _RollbackSQLiteBucket(SQLiteBucket):
+    """Keep a failed bucket write from retaining the shared connection's lock."""
+
+    def put(self, item: RateItem) -> bool:
+        with self.lock:
+            try:
+                return super().put(item)
+            except BaseException:
+                if self.conn.in_transaction:
+                    self.conn.rollback()
+                raise
+
+    def leak(self, current_timestamp: int | None = None) -> int:
+        with self.lock:
+            try:
+                return super().leak(current_timestamp)
+            except BaseException:
+                if self.conn.in_transaction:
+                    self.conn.rollback()
+                raise
+
+    def flush(self) -> None:
+        with self.lock:
+            try:
+                super().flush()
+            except BaseException:
+                if self.conn.in_transaction:
+                    self.conn.rollback()
+                raise
+
+
 class RateLimiter:
     """Rate limiter for external API calls.
 
@@ -208,6 +241,7 @@ class RateLimiter:
         self._clock = clock
         self._sleep = time.sleep if sleep is None else sleep
         self._conn: sqlite3.Connection | None = None
+        self._sqlite_bucket_lock: ThreadRLock | None
         self._lock = threading.Lock()
         self._closed = False
 
@@ -225,13 +259,17 @@ class RateLimiter:
             table_name = f"ratelimit_{name}"
             self._conn.execute(SQLiteQueries.CREATE_BUCKET_TABLE.format(table=table_name))
             self._conn.commit()
-            self._bucket: InMemoryBucket | SQLiteBucket = SQLiteBucket(
+            self._bucket: InMemoryBucket | SQLiteBucket = _RollbackSQLiteBucket(
                 rates=rates,
                 conn=self._conn,
                 table=table_name,
             )
+            self._sqlite_bucket_lock = self._bucket.lock
+            self._sqlite_busy_timeout_ms: int | None = int(self._conn.execute("PRAGMA busy_timeout").fetchone()[0])
         else:
             self._bucket = InMemoryBucket(rates=rates)
+            self._sqlite_bucket_lock = None
+            self._sqlite_busy_timeout_ms = None
 
         # Single limiter with per-minute rate. The wrapper owns blocking by
         # polling try_acquire(), so configure pyrate-limiter in non-blocking
@@ -276,11 +314,67 @@ class RateLimiter:
         self._validate_weight(weight)
         validate_limiter_timeout(timeout)
 
+        if timeout == 0:
+            if self.try_acquire(weight):
+                return
+            raise TimeoutError(f"Failed to acquire {weight} tokens within {timeout}s timeout")
+
         deadline = None if timeout is None else (self._monotonic() + timeout)
 
         while True:
-            if self.try_acquire(weight):
-                return
+            if deadline is None:
+                if self.try_acquire(weight):
+                    return
+            else:
+                remaining = deadline - self._monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"Failed to acquire {weight} tokens within {timeout}s timeout")
+                if not self._lock.acquire(timeout=remaining):
+                    raise TimeoutError(f"Failed to acquire {weight} tokens within {timeout}s timeout")
+                try:
+                    remaining = deadline - self._monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(f"Failed to acquire {weight} tokens within {timeout}s timeout")
+                    bucket_lock = self._sqlite_bucket_lock
+                    # The bucket's leaker shares this connection. Bound its
+                    # lock wait and restore the normal busy timeout before
+                    # letting the leaker use the connection again.
+                    if bucket_lock is not None and not bucket_lock.acquire(timeout=remaining):
+                        raise TimeoutError(f"Failed to acquire {weight} tokens within {timeout}s timeout")
+                    try:
+                        if self._conn is not None:
+                            remaining = deadline - self._monotonic()
+                            if remaining <= 0:
+                                raise TimeoutError(f"Failed to acquire {weight} tokens within {timeout}s timeout")
+                            self._conn.execute(f"PRAGMA busy_timeout = {max(1, math.ceil(remaining * 1000))}")
+                        acquired = bool(self._limiter.try_acquire(self.name, weight=weight))
+                    except BaseException as exc:
+                        # SQLiteBucket may have inserted before its COMMIT fails.
+                        # Unwind that transaction before the shared connection
+                        # and bucket lock can be used by another caller.
+                        if self._conn is not None and self._conn.in_transaction:
+                            self._conn.rollback()
+                        if (
+                            isinstance(exc, sqlite3.OperationalError)
+                            and self._conn is not None
+                            and exc.sqlite_errorcode == sqlite3.SQLITE_BUSY
+                        ):
+                            acquired = False
+                        else:
+                            raise
+                    finally:
+                        if bucket_lock is not None:
+                            try:
+                                if self._conn is not None and self._sqlite_busy_timeout_ms is not None:
+                                    self._conn.execute(f"PRAGMA busy_timeout = {self._sqlite_busy_timeout_ms}")
+                            finally:
+                                bucket_lock.release()
+                finally:
+                    self._lock.release()
+                if self._monotonic() >= deadline:
+                    raise TimeoutError(f"Failed to acquire {weight} tokens within {timeout}s timeout")
+                if acquired:
+                    return
 
             # Check timeout
             if deadline is not None:

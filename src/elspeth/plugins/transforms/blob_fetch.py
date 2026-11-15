@@ -93,7 +93,7 @@ class BlobFetchHTTPConfig(BaseModel):
     timeout: int = Field(
         default=30,
         gt=0,
-        description="Total wall-clock deadline in seconds for each HTTP request: connect, send, headers and the full response body, with redirect hops sharing it.",
+        description="Total wall-clock seconds from dispatch for each HTTP request, including DNS, connect, TLS, send, headers, body, and every redirect hop. Rate-limiter waits are bounded separately by the same number of seconds.",
     )
     max_body_bytes: int = Field(default=10 * 1024 * 1024, gt=0, description="Maximum response body size in bytes.")
     allowed_hosts: Literal["public_only", "allow_private"] | Annotated[list[CidrStr], Field(min_length=1)] = Field(
@@ -336,7 +336,7 @@ class BlobFetch(BaseTransform):
     name = "blob_fetch"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:d8d0383ba08931bd"
+    source_file_hash: str | None = "sha256:a236e0cda7953790"
     config_model = BlobFetchConfig
     passes_through_input = True
     fetches_http = True

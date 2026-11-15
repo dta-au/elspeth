@@ -226,7 +226,7 @@ class _PowerAutomateOptions(DataPluginConfig):
         gt=0,
         le=110,
         allow_inf_nan=False,
-        description="Absolute HTTP exchange deadline in seconds, including connection and bounded response reading; maximum 110 seconds.",
+        description="Total wall-clock seconds from dispatch for each HTTP exchange, including DNS, connect, TLS, send, headers, body, and every redirect hop; maximum 110 seconds. Rate-limiter waits are bounded separately by the same number of seconds.",
     )
     max_request_body_bytes: PositiveInt = Field(
         default=1048576, description="Maximum UTF-8 byte size of a serialized read, status or write request before dispatch."

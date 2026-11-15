@@ -101,7 +101,7 @@
       },
       {
         "default": 60.0,
-        "description": "Total wall-clock deadline in seconds for each submit or poll HTTP call, including the full response body.",
+        "description": "Total wall-clock seconds from dispatch for each submit or poll HTTP call, including DNS, connect, TLS, send, headers, body, and every redirect hop. Rate-limiter waits are bounded separately by the same number of seconds.",
         "kind": "number-float",
         "label": "Request Timeout Seconds",
         "name": "request_timeout_seconds",

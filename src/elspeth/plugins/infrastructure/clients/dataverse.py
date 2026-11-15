@@ -153,8 +153,9 @@ _THROTTLE_INITIAL_BACKOFF_SECONDS = 1.0
 # Total seconds one request may spend waiting on throttled responses.
 DEFAULT_THROTTLE_WAIT_BUDGET_SECONDS = 300.0
 
-# Total wall-clock deadline for one Dataverse request (connect, send, headers
-# and the full body), not a per-socket-operation timeout.
+# Total wall-clock deadline from dispatch for one Dataverse request (DNS,
+# connect, TLS, send, headers, body). Rate-limiter waits are separately
+# bounded by the same number of seconds. Dataverse refuses redirects.
 DATAVERSE_REQUEST_TIMEOUT_SECONDS = 30.0
 
 
@@ -467,10 +468,13 @@ class DataverseClient:
         # across long multi-page fetches.
         self._auth_retried = False
 
-    def _acquire_rate_limit(self) -> None:
+    def _acquire_rate_limit(self, timeout: float | None = None) -> None:
         """Acquire rate limit before each request."""
         if self._limiter is not None:
-            self._limiter.acquire()
+            if timeout is None:
+                self._limiter.acquire()
+            else:
+                self._limiter.acquire(timeout=timeout)
 
     def get_auth_headers(self) -> dict[str, str]:
         """Get authorization headers with current token.
@@ -733,7 +737,15 @@ class DataverseClient:
             # The hook sees the non-auth headers this request adds, so a
             # VERIFY preflight can rebuild the request exactly as recorded.
             self._before_request(url, extra_headers or {})
-        self._acquire_rate_limit()
+        try:
+            self._acquire_rate_limit(timeout=self._request_timeout_seconds)
+        except TimeoutError as exc:
+            raise DataverseClientError(
+                f"Rate-limiter wait exceeded {self._request_timeout_seconds}s; no request was sent",
+                retryable=True,
+                error_category="timeout",
+                request_url=url,
+            ) from exc
 
         auth_headers = self.get_auth_headers()
         headers = {**auth_headers, **(extra_headers or {})}

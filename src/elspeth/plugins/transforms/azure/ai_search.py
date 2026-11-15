@@ -39,7 +39,9 @@ class AzureAISearchConfig(RetrievalOutputConfig):
         description="vector and hybrid need an integrated vectorizer on field_vector; semantic needs semantic_config.",
     )
     request_timeout: float = Field(
-        default=30.0, gt=0, description="Total wall-clock deadline in seconds for each search request, including the full response body."
+        default=30.0,
+        gt=0,
+        description="Total wall-clock seconds from dispatch for each search request, including DNS, connect, TLS, send, headers, body, and every redirect hop. Rate-limiter waits are bounded separately by the same number of seconds.",
     )
     # Index fields are spelled ``field_*``: a ``*_field`` option is, by the base class's
     # convention, the name of a row column this transform reads.
@@ -84,7 +86,7 @@ class AzureAISearchTransform(RetrievalTransformBase):
 
     name = "azure_ai_search"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:434d9c3dbf1ff981"
+    source_file_hash: str | None = "sha256:f1865abe4b80b729"
     determinism: Determinism = Determinism.EXTERNAL_CALL
     config_model = AzureAISearchConfig
     passes_through_input = True

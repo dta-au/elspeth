@@ -21,6 +21,7 @@ import math
 import select
 import socket
 import ssl
+import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
@@ -37,6 +38,8 @@ import httpx
 from httpx._utils import get_environment_proxies
 
 import elspeth.contracts.errors as contract_errors
+
+_HTTP_DNS_CAPACITY = threading.BoundedSemaphore(8)
 
 
 class HTTPDeadlineExceeded(httpx.HTTPError):
@@ -361,12 +364,33 @@ class _ScopedDeadlineStream(httpcore.NetworkStream):
         self._inner = inner
 
     def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
-        return self._inner.read(max_bytes, timeout=_scoped_timeout(timeout, httpcore.ReadTimeout))
+        data = self._inner.read(max_bytes, timeout=_scoped_timeout(timeout, httpcore.ReadTimeout))
+        _scoped_timeout(None, httpcore.ReadTimeout)
+        return data
 
     def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        # httpcore.SyncStream.write retries short sends with the same timeout
+        # on every retry. Use the public socket exposed by the backend so each
+        # actual send receives the *current* remaining budget.
+        sock = self._inner.get_extra_info("socket")
+        if not isinstance(sock, socket.socket):
+            raise contract_errors.FrameworkBugError("deadline-bound stream has no socket")
         view = memoryview(buffer)
         for offset in range(0, len(view), _WRITE_SLICE_BYTES):
-            self._inner.write(bytes(view[offset : offset + _WRITE_SLICE_BYTES]), timeout=_scoped_timeout(timeout, httpcore.WriteTimeout))
+            chunk = view[offset : offset + _WRITE_SLICE_BYTES]
+            sent_total = 0
+            while sent_total < len(chunk):
+                sock.settimeout(_scoped_timeout(timeout, httpcore.WriteTimeout))
+                try:
+                    sent = sock.send(chunk[sent_total:])
+                except TimeoutError as exc:
+                    raise httpcore.WriteTimeout() from exc
+                except OSError as exc:
+                    raise httpcore.WriteError() from exc
+                if sent <= 0:
+                    raise httpcore.WriteError("socket made no write progress")
+                sent_total += sent
+                _scoped_timeout(None, httpcore.WriteTimeout)
 
     def close(self) -> None:
         self._inner.close()
@@ -377,6 +401,11 @@ class _ScopedDeadlineStream(httpcore.NetworkStream):
         server_hostname: str | None = None,
         timeout: float | None = None,
     ) -> httpcore.NetworkStream:
+        if isinstance(self._inner.get_extra_info("socket"), ssl.SSLSocket):
+            # HTTPS proxy to HTTPS origin: perform the second TLS layer over
+            # this already bounded outer stream. httpcore's TLS-in-TLS stream
+            # otherwise loops over socket reads with one stale timeout.
+            return _NestedDeadlineTLSStream(self, ssl_context, server_hostname)
         upgraded = self._inner.start_tls(
             ssl_context, server_hostname=server_hostname, timeout=_scoped_timeout(timeout, httpcore.ConnectTimeout)
         )
@@ -393,6 +422,77 @@ class _ScopedDeadlineStream(httpcore.NetworkStream):
         return self._inner.get_extra_info(info)
 
 
+class _NestedDeadlineTLSStream(httpcore.NetworkStream):
+    """TLS inside a TLS proxy, with every encrypted I/O through the outer budget."""
+
+    def __init__(self, outer: _ScopedDeadlineStream, context: ssl.SSLContext, hostname: str | None) -> None:
+        self._outer = outer
+        self._incoming = ssl.MemoryBIO()
+        self._outgoing = ssl.MemoryBIO()
+        self._tls = context.wrap_bio(self._incoming, self._outgoing, server_hostname=hostname)
+        try:
+            self._perform(self._tls.do_handshake, httpcore.ConnectTimeout)
+        except BaseException:
+            self.close()
+            raise
+
+    def _perform[T](self, operation: Callable[[], T], expired: type[httpcore.TimeoutException]) -> T:
+        while True:
+            _scoped_timeout(None, expired)
+            want_read = False
+            try:
+                result = operation()
+            except ssl.SSLWantReadError:
+                want_read = True
+            except ssl.SSLWantWriteError:
+                pass
+            else:
+                encrypted = self._outgoing.read()
+                if encrypted:
+                    self._outer.write(encrypted)
+                _scoped_timeout(None, expired)
+                return result
+            encrypted = self._outgoing.read()
+            if encrypted:
+                self._outer.write(encrypted)
+            if want_read:
+                incoming = self._outer.read(_WRITE_SLICE_BYTES)
+                if incoming:
+                    self._incoming.write(incoming)
+                else:
+                    self._incoming.write_eof()
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        _scoped_timeout(timeout, httpcore.ReadTimeout)
+        return self._perform(partial(self._tls.read, max_bytes), httpcore.ReadTimeout)
+
+    def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        view = memoryview(buffer)
+        offset = 0
+        while offset < len(view):
+            _scoped_timeout(timeout, httpcore.WriteTimeout)
+            sent = self._perform(partial(self._tls.write, bytes(view[offset : offset + _WRITE_SLICE_BYTES])), httpcore.WriteTimeout)
+            if sent <= 0:
+                raise httpcore.WriteError("nested TLS made no write progress")
+            offset += sent
+
+    def close(self) -> None:
+        self._outer.close()
+
+    def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> httpcore.NetworkStream:
+        raise httpcore.ConnectError("a third TLS layer is unsupported")
+
+    def get_extra_info(self, info: str) -> object:
+        if info == "ssl_object":
+            return self._tls
+        return self._outer.get_extra_info(info)
+
+
 class _ScopedDeadlineBackend(httpcore.NetworkBackend):
     """Default sync backend with every connect bounded by the scoped deadline."""
 
@@ -407,14 +507,60 @@ class _ScopedDeadlineBackend(httpcore.NetworkBackend):
         local_address: str | None = None,
         socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
     ) -> httpcore.NetworkStream:
-        stream = self._inner.connect_tcp(
-            host,
-            port,
-            timeout=_scoped_timeout(timeout, httpcore.ConnectTimeout),
-            local_address=local_address,
-            socket_options=socket_options,
-        )
-        return _ScopedDeadlineStream(stream)
+        _scoped_timeout(timeout, httpcore.ConnectTimeout)
+        addresses: list[
+            tuple[socket.AddressFamily, socket.SocketKind, int, str, tuple[str, int] | tuple[str, int, int, int] | tuple[int, bytes]]
+        ] = []
+        errors: list[BaseException] = []
+        resolved = threading.Event()
+        if not _HTTP_DNS_CAPACITY.acquire(blocking=False):
+            raise httpcore.ConnectTimeout("HTTP DNS resolver capacity exhausted")
+
+        def resolve() -> None:
+            try:
+                addresses.extend(socket.getaddrinfo(host, port, type=socket.SOCK_STREAM))
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                _HTTP_DNS_CAPACITY.release()
+                resolved.set()
+
+        # The system resolver cannot be cancelled. A daemon worker lets the
+        # caller stop at the deadline without waiting for that resolver.
+        try:
+            threading.Thread(target=resolve, name="elspeth-http-dns", daemon=True).start()
+        except BaseException:
+            _HTTP_DNS_CAPACITY.release()
+            raise
+        if not resolved.wait(_scoped_timeout(timeout, httpcore.ConnectTimeout)):
+            raise httpcore.ConnectTimeout("HTTP request exceeded its total deadline during DNS lookup")
+        if errors:
+            if isinstance(errors[0], OSError):
+                raise httpcore.ConnectError() from errors[0]
+            raise errors[0]
+        _scoped_timeout(None, httpcore.ConnectTimeout)
+        last_error: httpcore.ConnectError | None = None
+        for _family, _kind, _protocol, _name, sockaddr in addresses:
+            try:
+                stream = self._inner.connect_tcp(
+                    str(sockaddr[0]),
+                    port,
+                    timeout=_scoped_timeout(timeout, httpcore.ConnectTimeout),
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except httpcore.ConnectError as exc:
+                last_error = exc
+                continue
+            try:
+                _scoped_timeout(None, httpcore.ConnectTimeout)
+            except httpcore.ConnectTimeout:
+                stream.close()
+                raise
+            return _ScopedDeadlineStream(stream)
+        if last_error is not None:
+            raise last_error
+        raise httpcore.ConnectError("DNS returned no TCP addresses")
 
     def connect_unix_socket(
         self,
@@ -425,10 +571,16 @@ class _ScopedDeadlineBackend(httpcore.NetworkBackend):
         stream = self._inner.connect_unix_socket(
             path, timeout=_scoped_timeout(timeout, httpcore.ConnectTimeout), socket_options=socket_options
         )
+        try:
+            _scoped_timeout(None, httpcore.ConnectTimeout)
+        except httpcore.ConnectTimeout:
+            stream.close()
+            raise
         return _ScopedDeadlineStream(stream)
 
     def sleep(self, seconds: float) -> None:
-        self._inner.sleep(seconds)
+        self._inner.sleep(min(seconds, _scoped_timeout(None, httpcore.ConnectTimeout)))
+        _scoped_timeout(None, httpcore.ConnectTimeout)
 
 
 class DeadlineBoundTransport(httpx.HTTPTransport):

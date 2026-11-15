@@ -750,11 +750,24 @@ class HTTPCallError:
     type: str
     message: str
     status_code: int | None = None
+    refusal_category: str | None = None
+    wait_budget_seconds: float | None = None
+    request_sent: bool | None = None
 
     def __post_init__(self) -> None:
         _require_non_empty_str(self.type, "HTTPCallError.type")
         _require_non_empty_str(self.message, "HTTPCallError.message")
         _require_http_status_code(self.status_code, "status_code", optional=True)
+        if self.request_sent is True and self.refusal_category is None and self.wait_budget_seconds is None:
+            return
+        if (self.refusal_category is not None or self.wait_budget_seconds is not None or self.request_sent is not None) and (
+            self.refusal_category != "rate_limiter"
+            or self.wait_budget_seconds is None
+            or not math.isfinite(self.wait_budget_seconds)
+            or self.wait_budget_seconds <= 0
+            or self.request_sent is not False
+        ):
+            raise ValueError("invalid HTTP limiter refusal evidence")
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to audit-trail dict.
@@ -767,4 +780,10 @@ class HTTPCallError:
         }
         if self.status_code is not None:
             d["status_code"] = self.status_code
+        if self.refusal_category is not None:
+            d["refusal_category"] = self.refusal_category
+            d["wait_budget_seconds"] = self.wait_budget_seconds
+            d["request_sent"] = self.request_sent
+        elif self.request_sent is True:
+            d["request_sent"] = True
         return d

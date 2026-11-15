@@ -205,7 +205,7 @@
       },
       {
         "default": 30.0,
-        "description": "Total wall-clock deadline in seconds for each search request, including the full response body.",
+        "description": "Total wall-clock seconds from dispatch for each search request, including DNS, connect, TLS, send, headers, body, and every redirect hop. Rate-limiter waits are bounded separately by the same number of seconds.",
         "kind": "number-float",
         "label": "Request Timeout",
         "name": "request_timeout",

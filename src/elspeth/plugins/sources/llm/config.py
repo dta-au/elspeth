@@ -225,7 +225,7 @@ class OpenRouterLLMSourceConfig(LLMSourceConfig):
     timeout_seconds: float = Field(
         default=60.0,
         gt=0,
-        description="Total wall-clock deadline in seconds for each provider HTTP request, including the full response body.",
+        description="Total wall-clock seconds from dispatch for each provider HTTP request, including DNS, connect, TLS, send, headers, body, and every redirect hop. Rate-limiter waits are bounded separately by the same number of seconds.",
     )
     tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration")
 
@@ -320,7 +320,7 @@ class GatewayLLMSourceConfig(LLMSourceConfig):
         default=60.0,
         gt=GATEWAY_TIMEOUT_MIN_EXCLUSIVE,
         le=GATEWAY_TIMEOUT_MAX_SECONDS,
-        description="Total wall-clock deadline in seconds for each provider HTTP request, including the full response body.",
+        description="Total wall-clock seconds from dispatch for each provider HTTP request, including DNS, connect, TLS, send, headers, body, and every redirect hop. Rate-limiter waits are bounded separately by the same number of seconds.",
     )
     max_tokens: int | None = Field(
         default=None,

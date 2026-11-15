@@ -348,7 +348,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e45dc8dbaf712404"
+    source_file_hash: str | None = "sha256:7aeec9bde1390777"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -649,6 +649,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 region=self._region,
                 sdk_client=self._sdk_client,
                 max_response_bytes=self._max_result_bytes,
+                limiter_wait_seconds=self._poll_timeout_seconds,
                 limiter=self._limiter,
                 token_id=token_id,
                 call_mode_session=ctx.call_mode_session,

@@ -3,11 +3,53 @@
 from __future__ import annotations
 
 import ast
+import sqlite3
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
+
+
+def _locks_available_from_another_thread(limiter: object) -> tuple[bool, bool]:
+    from elspeth.core.rate_limit import RateLimiter
+
+    assert isinstance(limiter, RateLimiter)
+    bucket_lock = limiter._sqlite_bucket_lock
+    assert bucket_lock is not None
+    acquired: list[bool] = []
+
+    def check_locks() -> None:
+        for lock in (limiter._lock, bucket_lock):
+            available = lock.acquire(timeout=0.1)
+            acquired.append(available)
+            if available:
+                lock.release()
+
+    checker = threading.Thread(target=check_locks, daemon=True)
+    checker.start()
+    checker.join(1)
+    assert not checker.is_alive()
+    return acquired[0], acquired[1]
+
+
+class _FaultConnection(sqlite3.Connection):
+    fail_rollback = False
+    fail_timeout_restore = False
+    timeout_was_set = False
+
+    def rollback(self) -> None:
+        if self.fail_rollback:
+            raise RuntimeError("injected rollback failure")
+        super().rollback()
+
+    def execute(self, sql: str, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+        if sql.startswith("PRAGMA busy_timeout = "):
+            if self.timeout_was_set and self.fail_timeout_restore:
+                raise RuntimeError("injected timeout restoration failure")
+            self.timeout_was_set = True
+        return super().execute(sql, *args, **kwargs)
 
 
 class TestRateLimiterValidation:
@@ -90,6 +132,233 @@ class TestRateLimiterValidation:
 
 class TestRateLimiter:
     """Tests for rate limiting wrapper."""
+
+    def test_acquire_timeout_includes_lock_contention_and_refuses_late_grant(self) -> None:
+        from elspeth.core.rate_limit import RateLimiter
+
+        with RateLimiter(name="contention", requests_per_minute=60) as limiter:
+            held = threading.Event()
+            release = threading.Event()
+
+            def hold_lock() -> None:
+                with limiter._lock:
+                    held.set()
+                    release.wait(1)
+
+            holder = threading.Thread(target=hold_lock)
+            holder.start()
+            assert held.wait(1)
+            started = time.monotonic()
+            try:
+                with pytest.raises(TimeoutError, match=r"within 0\.03s timeout"):
+                    limiter.acquire(timeout=0.03)
+            finally:
+                release.set()
+                holder.join(1)
+            assert time.monotonic() - started < 0.2
+            limiter.acquire(timeout=0.1)
+
+    def test_acquire_refuses_grant_returned_after_deadline(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.core.rate_limit import RateLimiter
+
+        with RateLimiter(name="slow_bucket", requests_per_minute=60) as limiter:
+            original = limiter._limiter.try_acquire
+
+            def slow_grant(name: str, *, weight: int) -> object:
+                time.sleep(0.05)
+                return original(name, weight=weight)
+
+            monkeypatch.setattr(limiter._limiter, "try_acquire", slow_grant)
+            with pytest.raises(TimeoutError, match="within"):
+                limiter.acquire(timeout=0.01)
+
+    @pytest.mark.timing_sensitive
+    def test_persistent_acquire_bounds_sqlite_lock_wait(self, tmp_path: Path) -> None:
+        from elspeth.core.rate_limit import RateLimiter
+
+        db_path = tmp_path / "contended.db"
+        with (
+            RateLimiter(name="sqlite_deadline", requests_per_minute=60, persistence_path=str(db_path)) as limiter,
+            sqlite3.connect(db_path) as blocker,
+        ):
+            blocker.execute("BEGIN EXCLUSIVE")
+            start = time.monotonic()
+            with pytest.raises(TimeoutError, match="within"):
+                limiter.acquire(timeout=0.05)
+            assert time.monotonic() - start < 0.15
+
+    @pytest.mark.timing_sensitive
+    def test_persistent_commit_refusal_releases_write_transaction(self, tmp_path: Path) -> None:
+        from elspeth.core.rate_limit import RateLimiter
+
+        db_path = tmp_path / "commit_contended.db"
+        with (
+            RateLimiter(name="commit_deadline", requests_per_minute=60, persistence_path=str(db_path)) as limiter,
+            sqlite3.connect(db_path) as reader,
+            sqlite3.connect(db_path, timeout=0.1) as writer,
+        ):
+            conn = limiter._conn
+            assert conn is not None
+            original_busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+            bucket_lock = limiter._sqlite_bucket_lock
+            assert bucket_lock is not None
+            with bucket_lock:
+                reader.execute("BEGIN")
+                reader.execute("SELECT COUNT(*) FROM ratelimit_commit_deadline").fetchone()
+                sends = 0
+                started = time.monotonic()
+                try:
+                    with pytest.raises(TimeoutError, match="within"):
+                        limiter.acquire(timeout=0.05)
+                        sends += 1
+                finally:
+                    reader.rollback()
+                assert time.monotonic() - started < 0.2
+                assert sends == 0
+                assert conn.in_transaction is False
+                assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == original_busy_timeout
+                writer.execute("INSERT INTO ratelimit_commit_deadline (name, item_timestamp) VALUES ('other', 0)")
+                writer.commit()
+
+    @pytest.mark.parametrize("error", [RuntimeError, SystemExit, sqlite3.OperationalError])
+    def test_persistent_acquire_exception_unwinds_transaction_and_restores_timeout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: type[BaseException]
+    ) -> None:
+        from elspeth.core.rate_limit import RateLimiter
+
+        db_path = tmp_path / "exception.db"
+        with RateLimiter(name="exception", requests_per_minute=60, persistence_path=str(db_path)) as limiter:
+            conn = limiter._conn
+            assert conn is not None
+            original_busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+
+            def fail_after_insert(*_args: object, **_kwargs: object) -> bool:
+                conn.execute("INSERT INTO ratelimit_exception (name, item_timestamp) VALUES ('partial', 0)")
+                if error is sqlite3.OperationalError:
+                    conn.execute("SELECT * FROM missing_bucket_table")
+                raise error("injected")
+
+            monkeypatch.setattr(limiter._limiter, "try_acquire", fail_after_insert)
+            with pytest.raises(error):
+                limiter.acquire(timeout=0.05)
+            assert conn.in_transaction is False
+            assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == original_busy_timeout
+            assert _locks_available_from_another_thread(limiter) == (True, True)
+
+    @pytest.mark.parametrize("failure", ["rollback", "timeout_restore"])
+    def test_persistent_acquire_cleanup_failure_releases_locks(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str) -> None:
+        from elspeth.core.rate_limit import RateLimiter
+
+        original_connect = sqlite3.connect
+
+        def connect_with_fault(database: str | Path, *, check_same_thread: bool = True) -> _FaultConnection:
+            return original_connect(database, check_same_thread=check_same_thread, factory=_FaultConnection)
+
+        monkeypatch.setattr(sqlite3, "connect", connect_with_fault)
+        with RateLimiter(name="cleanup_fault", requests_per_minute=60, persistence_path=str(tmp_path / "cleanup.db")) as limiter:
+            conn = limiter._conn
+            assert isinstance(conn, _FaultConnection)
+            original_busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+
+            if failure == "rollback":
+
+                def fail_after_insert(*_args: object, **_kwargs: object) -> bool:
+                    conn.execute("INSERT INTO ratelimit_cleanup_fault (name, item_timestamp) VALUES ('partial', 0)")
+                    raise ValueError("injected write failure")
+
+                monkeypatch.setattr(limiter._limiter, "try_acquire", fail_after_insert)
+                conn.fail_rollback = True
+                expected = "injected rollback failure"
+            else:
+                conn.fail_timeout_restore = True
+                expected = "injected timeout restoration failure"
+
+            with pytest.raises(RuntimeError, match=expected):
+                limiter.acquire(timeout=0.05)
+            assert _locks_available_from_another_thread(limiter) == (True, True)
+            if failure == "rollback":
+                if conn.in_transaction:
+                    sqlite3.Connection.rollback(conn)
+            else:
+                assert conn.in_transaction is False
+            current_busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+            if failure == "rollback":
+                assert current_busy_timeout == original_busy_timeout
+            else:
+                assert current_busy_timeout != original_busy_timeout
+
+    def test_persistent_acquire_success_restores_timeout(self, tmp_path: Path) -> None:
+        from elspeth.core.rate_limit import RateLimiter
+
+        with RateLimiter(name="successful", requests_per_minute=60, persistence_path=str(tmp_path / "success.db")) as limiter:
+            conn = limiter._conn
+            assert conn is not None
+            original_busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+            limiter.acquire(timeout=0.05)
+            assert conn.in_transaction is False
+            assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == original_busy_timeout
+
+    @pytest.mark.parametrize("operation", ["try_acquire", "leak", "flush"])
+    def test_other_bucket_write_failures_unwind_transaction(self, tmp_path: Path, operation: str) -> None:
+        from elspeth.core.rate_limit import RateLimiter
+
+        db_path = tmp_path / "bucket_write.db"
+        with (
+            RateLimiter(name="bucket_write", requests_per_minute=60, persistence_path=str(db_path)) as limiter,
+            sqlite3.connect(db_path) as reader,
+            sqlite3.connect(db_path, timeout=0.1) as writer,
+        ):
+            conn = limiter._conn
+            assert conn is not None
+            if operation != "try_acquire":
+                assert limiter.try_acquire()
+            conn.execute("PRAGMA busy_timeout = 25")
+            bucket_lock = limiter._sqlite_bucket_lock
+            assert bucket_lock is not None
+            with bucket_lock:
+                reader.execute("BEGIN")
+                reader.execute("SELECT COUNT(*) FROM ratelimit_bucket_write").fetchone()
+                try:
+                    with pytest.raises(sqlite3.OperationalError) as caught:
+                        if operation == "try_acquire":
+                            limiter.try_acquire()
+                        elif operation == "leak":
+                            limiter._bucket.leak(int(time.time() * 1000) + 100_000)
+                        else:
+                            limiter._bucket.flush()
+                    assert caught.value.sqlite_errorcode == sqlite3.SQLITE_BUSY
+                finally:
+                    reader.rollback()
+            assert conn.in_transaction is False
+            writer.execute("INSERT INTO ratelimit_bucket_write (name, item_timestamp) VALUES ('other', 0)")
+            writer.commit()
+
+    @pytest.mark.parametrize("timeout", [None, 0])
+    def test_special_timeout_waits_for_mutex_then_grants(self, timeout: float | None) -> None:
+        from elspeth.core.rate_limit import RateLimiter
+
+        with RateLimiter(name="special_timeout", requests_per_minute=60) as limiter:
+            held = threading.Event()
+            release = threading.Event()
+
+            def hold_lock() -> None:
+                with limiter._lock:
+                    held.set()
+                    release.wait(1)
+
+            holder = threading.Thread(target=hold_lock)
+            holder.start()
+            assert held.wait(1)
+            timer = threading.Timer(0.05, release.set)
+            timer.start()
+            try:
+                started = time.monotonic()
+                limiter.acquire(timeout=timeout)
+                assert time.monotonic() - started >= 0.04
+            finally:
+                release.set()
+                holder.join(1)
+                timer.join(1)
 
     def test_create_limiter(self) -> None:
         """Can create a rate limiter."""

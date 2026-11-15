@@ -227,7 +227,7 @@ class WebScrapeHTTPConfig(BaseModel):
     timeout: int = Field(
         default=30,
         gt=0,
-        description="Total wall-clock deadline in seconds for each HTTP request: connect, send, headers and the full response body, with redirect hops sharing it.",
+        description="Total wall-clock seconds from dispatch for each HTTP request, including DNS, connect, TLS, send, headers, body, and every redirect hop. Rate-limiter waits are bounded separately by the same number of seconds.",
     )
     max_body_bytes: int = Field(
         default=10 * 1024 * 1024,  # 10 MB
@@ -801,7 +801,9 @@ class WebScrapeTransform(BaseTransform):
         http:
             abuse_contact: Email for abuse reports (required)
             scraping_reason: Why we're scraping (required)
-            timeout: Total wall-clock deadline in seconds per request (default: 30)
+            timeout: Total wall-clock seconds from dispatch per request (default: 30),
+                including DNS, connect, TLS, send, headers, body, and redirects;
+                rate-limiter waits have a separate bound of the same duration.
 
     Error Handling (follows LLM plugin pattern):
         - Retryable errors (5xx, 429, network): Re-raised for engine retry
@@ -828,7 +830,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:93087269252f83e1"
+    source_file_hash: str | None = "sha256:024971a59b662037"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True

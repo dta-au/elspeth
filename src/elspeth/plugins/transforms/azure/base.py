@@ -44,8 +44,9 @@ logger = structlog.get_logger(__name__)
 
 _CAPACITY_RETRY_INITIAL_DELAY_SECONDS = 0.05
 _CAPACITY_RETRY_MAX_DELAY_SECONDS = 1.0
-# Total wall-clock deadline of one Azure HTTP call (AuditedHTTPClient binds it
-# as an absolute deadline), so the batch wait "budget + one call" is a bound.
+# One Azure HTTP call can spend this budget waiting for a limiter permit and
+# another from dispatch through response completion. Account for both when
+# bounding the batch worker's release time.
 _AZURE_HTTP_TIMEOUT_SECONDS = 30.0
 _AZURE_CONTENT_SAFETY_ENDPOINT_SUFFIXES = (
     ".cognitiveservices.azure.com",
@@ -166,7 +167,7 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
         self._batch_wait_timeout_seconds = cfg.batch_wait_timeout_seconds
         self._effective_batch_wait_timeout_seconds = max(
             float(self._batch_wait_timeout_seconds),
-            float(self._max_capacity_retry_seconds) + _AZURE_HTTP_TIMEOUT_SECONDS,
+            float(self._max_capacity_retry_seconds) + 2 * _AZURE_HTTP_TIMEOUT_SECONDS,
         )
 
         schema = create_schema_from_config(cfg.schema_config, schema_name, allow_coercion=False)
