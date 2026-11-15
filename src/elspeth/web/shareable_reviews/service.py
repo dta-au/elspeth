@@ -1019,7 +1019,7 @@ class ShareableReviewService:
             payload_digest=payload_digest,
         )
 
-    async def resolve_token(self, *, token: str, requesting_user_id: str) -> SharedInspectResponse:
+    async def resolve_token(self, *, token: str) -> SharedInspectResponse:
         """Verify the token and return the frozen-at-mark-time snapshot.
 
         The audit_readiness is read directly from the blob — this method

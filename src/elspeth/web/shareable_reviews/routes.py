@@ -241,7 +241,7 @@ def create_shareable_reviews_router() -> APIRouter:
         await rate_limiter.check(user.user_id)
         service: ShareableReviewService = request.app.state.shareable_review_service
         try:
-            result = await service.resolve_token(token=token, requesting_user_id=user.user_id)
+            result = await service.resolve_token(token=token)
         except InvalidToken:
             raise HTTPException(status_code=401, detail="Invalid or expired share token") from None
         except PayloadNotFoundError:
