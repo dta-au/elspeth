@@ -157,11 +157,12 @@ def create_shareable_reviews_router() -> APIRouter:
         # Write bucket: cheap DB write / token mint, not an LLM call.
         rate_limiter: WebRateLimiter = Depends(get_write_rate_limiter),  # noqa: B008
     ) -> JSONResponse:
-        """Re-mint a fresh token for the current (session, state).
+        """Re-mint a token for the current (session, state) until its recorded expiry.
 
         Content-addressing guarantees identical ``payload_digest`` across
         successive calls on an unchanged composition; only the token
-        string differs (different nonce each call).
+        string differs (different nonce each call). An expired recorded grant
+        is a 409 state conflict; the owner must mark ready again.
         """
         await rate_limiter.check(user.user_id)
         await verify_session_ownership(session_id, user, request)
@@ -169,6 +170,8 @@ def create_shareable_reviews_router() -> APIRouter:
         try:
             result = await service.get_shareable_link(session_id=session_id, user_id=user.user_id)
         except CompositionNotRunnableError as exc:
+            # share_link_expired and other state conflicts use the same 409
+            # owner-facing detail contract.
             raise HTTPException(status_code=409, detail=exc.detail or exc.reason) from exc
         return JSONResponse(
             content=result.model_dump(mode="json"),
@@ -241,7 +244,7 @@ def create_shareable_reviews_router() -> APIRouter:
         await rate_limiter.check(user.user_id)
         service: ShareableReviewService = request.app.state.shareable_review_service
         try:
-            result = await service.resolve_token(token=token, requesting_user_id=user.user_id)
+            result = await service.resolve_token(token=token)
         except InvalidToken:
             raise HTTPException(status_code=401, detail="Invalid or expired share token") from None
         except PayloadNotFoundError:

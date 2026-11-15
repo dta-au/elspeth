@@ -2525,13 +2525,13 @@ class TestComposerMultiTurnToolCalls:
         assert primary_call.await_count == 3 and advisor_call.await_count == len(reviews) == 2
         assert reviews[0]["current_graph_hash"] != reviews[1]["current_graph_hash"]
         saved_scope = "Verified checkpoint evidence covers 1 saved draft revisions. There are net authored changes from the starting draft."
-        assert result.message.startswith(saved_scope)
-        assert result.raw_assistant_content == saved_scope
+        assert result.message.count(saved_scope) == 1
+        assert result.raw_assistant_content == ""
         assert (
             len(
                 [
                     segment
-                    for segment in _no_tool_policy_module.visible_message_segments(content=result.message, raw_content=saved_scope)
+                    for segment in _no_tool_policy_module.visible_message_segments(content=result.message, raw_content="")
                     if isinstance(segment, _no_tool_policy_module.TrustedSystemNoticeSegment)
                     and segment.content.startswith("Checkpoint save status: Verified checkpoint evidence covers 1 saved draft revisions.")
                 ]
@@ -2908,23 +2908,23 @@ class TestComposerMultiTurnToolCalls:
         preflight.assert_not_called()
         assert result.state == state
         assert result.tool_invocations == ()
-        saved_scope = (
-            "Verified checkpoint evidence covers 0 saved draft revisions. There is no net authored change from the starting draft."
-        )
-        assert result.raw_assistant_content == saved_scope
+        assert result.raw_assistant_content == ""
         _assert_checkpoint_reply(
             result,
-            saved_scope + _no_tool_policy_module._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX,
-            raw=saved_scope,
+            _no_tool_policy_module.compose_review_reply_withheld_message(
+                _no_tool_policy_module.compose_advisor_signoff_unrendered_unverified_message("", failure_class="unavailable"),
+                reason="unavailable",
+            ),
+            raw="",
             count=0,
         )
         assert "Looks ready." not in result.message
         assert _no_tool_policy_module.visible_message_segments(content=result.message, raw_content=result.raw_assistant_content)[:-1] == (
-            _no_tool_policy_module.AssistantTextSegment(saved_scope),
             # No mutation this turn, so no preflight ran: the absent-shape twin.
             _no_tool_policy_module.TrustedSystemNoticeSegment(
                 _no_tool_policy_module._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_NOTICE
             ),
+            _no_tool_policy_module.TrustedSystemNoticeSegment(_no_tool_policy_module._REVIEW_REPLY_UNREVIEWED_NOTICE),
         )
         assert result.runtime_preflight is not None
         assert result.runtime_preflight.readiness.completion_ready is False
@@ -3180,20 +3180,15 @@ class TestComposerMultiTurnToolCalls:
         else:
             assert saved_revisions() == () and result.state == state
             preflight.assert_not_called()
-        saved_scope = (
-            "Verified checkpoint evidence covers 1 saved draft revisions. There are net authored changes from the starting draft."
+        notice = (
+            _no_tool_policy_module.compose_advisor_signoff_pending_message("", prose_withheld=False)
             if mutate_after_discovery
-            else "Verified checkpoint evidence covers 0 saved draft revisions. There is no net authored change from the starting draft."
-        )
-        suffix = (
-            _no_tool_policy_module._ADVISOR_SIGNOFF_PENDING_PUBLISHED_FINALIZE_SUFFIX
-            if mutate_after_discovery
-            else _no_tool_policy_module._ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
+            else _no_tool_policy_module.compose_advisor_signoff_unverified_message("")
         )
         _assert_checkpoint_reply(
             result,
-            saved_scope + suffix,
-            raw=saved_scope,
+            _no_tool_policy_module.compose_review_reply_withheld_message(notice),
+            raw="",
             count=int(mutate_after_discovery),
             changed=mutate_after_discovery,
         )

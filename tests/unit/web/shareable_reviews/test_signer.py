@@ -10,6 +10,7 @@ boundary (mirrors ``core/payload_store.py:111,163``, ``web/blobs/service.py:759`
 
 from __future__ import annotations
 
+import secrets
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -42,6 +43,47 @@ def test_round_trip() -> None:
     token = signer.sign(payload)
     decoded = signer.verify(token)
     assert decoded == payload
+
+
+@pytest.mark.parametrize("junk", [".", "!", " ", "\n", "+", "/"])
+def test_valid_token_rejects_non_url_safe_character(junk: str) -> None:
+    signer = ShareTokenSigner(b"k" * 32)
+    token = signer.sign(_make_payload())
+    if junk in "+/":
+        original = "-" if junk == "+" else "_"
+        for _ in range(1000):
+            if original in token:
+                break
+            token = signer.sign(_make_payload())
+        assert original in token
+        malformed = token.replace(original, junk, 1)
+    else:
+        midpoint = len(token) // 2
+        malformed = token[:midpoint] + junk + token[midpoint:]
+    with pytest.raises(InvalidToken):
+        signer.verify(malformed)
+
+
+def test_random_signed_payloads_verify_with_url_safe_alphabet_and_padding() -> None:
+    signer = ShareTokenSigner(secrets.token_bytes(32))
+    padding_seen: set[str] = set()
+    for length in range(100):
+        original = _make_payload()
+        payload = ShareTokenPayload(
+            version=original.version,
+            session_id=original.session_id,
+            state_id=original.state_id,
+            created_at=original.created_at,
+            expires_at=original.expires_at,
+            nonce_hex=secrets.token_hex(16),
+            payload_digest="sha256:" + secrets.token_hex(32),
+            created_by_user_id=secrets.token_hex(length),
+        )
+        token = signer.sign(payload)
+        assert all(character.isascii() and (character.isalnum() or character in "-_=") for character in token)
+        padding_seen.add(token[-2:] if token.endswith("==") else token[-1] if token.endswith("=") else "")
+        assert signer.verify(token) == payload
+    assert padding_seen == {"", "=", "=="}
 
 
 def test_tampered_signature_rejected() -> None:

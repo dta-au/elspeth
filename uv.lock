@@ -983,7 +983,7 @@ requires-dist = [
     { name = "botocore", extras = ["crt"], marker = "extra == 'all'", specifier = ">=1.40,<2" },
     { name = "botocore", extras = ["crt"], marker = "extra == 'aws'", specifier = ">=1.40,<2" },
     { name = "certifi", specifier = ">=2026.10.19" },
-    { name = "chromadb", specifier = ">=1.5,<2" },
+    { name = "chromadb", specifier = "==1.5.5" },
     { name = "cryptography", marker = "extra == 'all'", specifier = ">=50,<51" },
     { name = "cryptography", marker = "extra == 'aws'", specifier = ">=50,<51" },
     { name = "deepdiff", specifier = ">=8.6.2,<9" },

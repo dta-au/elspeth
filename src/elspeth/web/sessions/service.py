@@ -460,12 +460,6 @@ _PIPELINE_SETTLEMENT_COUNTER = _PIPELINE_METER.create_counter("composer.pipeline
 
 _INTERPRETATION_IMMUTABLE_TRIGGER_MSG: str = "interpretation_events: resolved rows are immutable"
 
-_STRUCTURAL_DIRECTIVE_PREFIXES: tuple[str, ...] = (
-    "system:",
-    "role:",
-    "instructions:",
-)
-
 
 def _enveloped_state_column(value: Any) -> Any:
     """Wrap one composition_states JSON column through the single envelope rule."""

@@ -1047,8 +1047,10 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # reopen-resume's resumed_full_projection_sha256 moved 1bf3705a... ->
 # b046c184..., measured by the production harness. Captured from this file's
 # parity failure (previous pin 14d69b1c...).
-# P5 io-validation (2026-11-16): CSVSource, JSONSink and JSONSource source hashes moved
-# with the shared text-decoding authority and the byte-order port; manifest provenance
+# P5 io-validation (2026-11-16), which supersedes the release branch's own JSONSource
+# quarantine byte-order fix (5e491effa, token c299bae1 -> 34cf4c72, pin f2af0f14...):
+# both fix the same defect, and the merged JSONSource is io-validation's. CSVSource,
+# JSONSink and JSONSource source hashes moved with the shared text-decoding authority and the byte-order port; manifest provenance
 # tokens 4299e6110527265e -> 9ce7cf9e1d01b40a (fifteen lines), 6c9b64bb34350d2c ->
 # 4c5c6d960228d88d (seventeen lines) and 47746b3fbe3b15a6 -> 7a8425cae4ef21bd (one line,
 # json-explode-parent-child). reopen-resume (csv source, json sink) moved its

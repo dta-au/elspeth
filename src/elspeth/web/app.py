@@ -943,10 +943,8 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
         #     snapshot embedded in the share blob)
         #   * the sessions-DB engine (for authenticated completion-event reads)
         #   * the session-operation authority (for fenced completion-event writes)
-        #   * a ``FilesystemPayloadStore`` (for the content-addressed snapshot
-        #     blob — created here, not shared with ``BlobServiceImpl`` because
-        #     ``BlobServiceImpl`` owns its own internal payload store with a
-        #     different retention semantics)
+        #   * a share-only ``FilesystemPayloadStore`` under the mounted payload
+        #     directory; run purge deletes hashes in the parent store only
         #   * the ``ShareTokenSigner`` primitive (HMAC over WebSettings'
         #     required ``shareable_link_signing_key``)
         if state_mode == "external-postgresql":
@@ -956,7 +954,11 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
             payload_store_path = settings.get_payload_store_path()
         payload_store = FilesystemPayloadStore(payload_store_path)
         app.state.payload_store = payload_store
-        app.state.library_authority = RepositoryLibraryAuthority(app.state.session_engine, payload_store=payload_store)
+        share_payload_store = FilesystemPayloadStore(payload_store.base_path / "shares")
+        app.state.share_payload_store = share_payload_store
+        library_payload_store = FilesystemPayloadStore(payload_store.base_path / "library")
+        app.state.library_payload_store = library_payload_store
+        app.state.library_authority = RepositoryLibraryAuthority(app.state.session_engine, payload_store=library_payload_store)
         # ``shareable_link_signing_key`` is a ``SecretBytes`` (DC-2 FIX-L —
         # masks repr to prevent plaintext leakage in tracebacks/logs).
         # ``.get_secret_value()`` returns the raw bytes the HMAC primitive needs.
@@ -970,7 +972,8 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
             settings=settings,
             sessions_db_engine=app.state.session_engine,
             session_operation_authority=session_service.session_operation_authority,
-            payload_store=payload_store,
+            payload_store=share_payload_store,
+            legacy_payload_store=payload_store,
             # Phase 8 Sub-task 7c — composer.session.completed_total counter.
             # ``app.state.sessions_telemetry`` is set in ``create_app`` (the
             # synchronous factory) BEFORE the lifespan runs, so it is

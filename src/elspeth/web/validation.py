@@ -20,6 +20,7 @@ import re
 import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Literal
 
 from pydantic_core import PydanticCustomError
 
@@ -168,7 +169,7 @@ def reject_credential_shaped_content(value: str) -> None:
         raise ValueError(_CREDENTIAL_REJECTION_MESSAGE)
 
 
-def _redact_sensitive_content(value: str) -> str:
+def _redact_sensitive_content(value: str, *, pii_shapes: Literal["all", "email_ssn"] = "all") -> str:
     """Substitute credential/PII-shaped substrings with fixed sentinels.
 
     This is for egress surfaces that should preserve surrounding diagnostic
@@ -186,9 +187,11 @@ def _redact_sensitive_content(value: str) -> str:
             return "<redacted-sensitive:credit_card>"
         return match.group(0)
 
-    redacted = _CREDIT_CARD_RE.sub(_card_replacement, redacted)
+    if pii_shapes == "all":
+        redacted = _CREDIT_CARD_RE.sub(_card_replacement, redacted)
     for name, pattern in _PII_WARNING_PATTERNS:
-        redacted = pattern.sub(f"<redacted-sensitive:{name}>", redacted)
+        if pii_shapes == "all" or name in {"email", "ssn_like"}:
+            redacted = pattern.sub(f"<redacted-sensitive:{name}>", redacted)
     return redacted
 
 

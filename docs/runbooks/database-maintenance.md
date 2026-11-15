@@ -75,6 +75,16 @@ psql -d elspeth -c "
 Use the maintained `elspeth purge` command for payload retention. Do not delete
 payload files with `find -delete`; the purge command discovers references from
 Landscape and updates reproducibility grades where applicable.
+The web app stores new share snapshots and frozen files under the payload
+store's `shares/` subtree and published library YAML under `library/`. This
+command deletes run hash paths in the parent store and does not reclaim either
+subtree. Pre-change share bytes in the parent
+store remain eligible when their hash is also referenced by an expired run.
+This protection holds only when `--payload-dir` (or `payload_store.base_path`)
+names the parent payload store. Never point `elspeth purge` at the `shares/`
+or `library/` subtree: it would then delete live objects whose hash matches an
+expired run. Pre-change library entries must be republished because their
+parent-store payloads are not read by the library authority.
 
 Dry-run:
 

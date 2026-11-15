@@ -76,6 +76,11 @@ class LibraryEntryNotFound(LibraryAuthorityRefusal):
         super().__init__(f"library entry {entry_id} not found")
 
 
+class LibraryPayloadUnavailable(LibraryAuthorityRefusal):
+    def __init__(self, entry_id: str) -> None:
+        super().__init__(f"library entry {entry_id} is unavailable because its published payload is missing; republish the entry")
+
+
 class LibraryEntryAlreadyCurated(LibraryAuthorityRefusal):
     def __init__(self, current_state: LibraryEntryState) -> None:
         self.current_state = current_state
@@ -331,7 +336,9 @@ class RepositoryLibraryAuthority:
                 raise LibraryEntryNotForkable(entry.state)
             try:
                 payload = self._payload_store.retrieve(entry.payload_digest)
-            except (PayloadNotFoundError, PayloadIntegrityError) as exc:
+            except PayloadNotFoundError as exc:
+                raise LibraryPayloadUnavailable(entry_id) from exc
+            except PayloadIntegrityError as exc:
                 raise AuditIntegrityError(f"library entry {entry_id} has no valid payload under digest {entry.payload_digest}") from exc
             try:
                 payload_yaml = payload.decode("utf-8")

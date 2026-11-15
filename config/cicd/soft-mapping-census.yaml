@@ -373,7 +373,7 @@ files:
   src/elspeth/plugins/infrastructure/manager.py:
     dict[str, Any]: 3
   src/elspeth/plugins/infrastructure/pooling/executor.py:
-    Mapping[str, Any]: 5
+    Mapping[str, Any]: 7
     dict[str, Any]: 1
   src/elspeth/plugins/infrastructure/power_automate.py:
     Mapping[str, object]: 1
@@ -1109,10 +1109,10 @@ files:
   src/elspeth/web/shareable_reviews/service.py:
     dict[str, object]: 1
 totals:
-  Mapping[str, Any]: 797
+  Mapping[str, Any]: 799
   Mapping[str, object]: 318
   MutableMapping[str, Any]: 8
   boundary: 69
   dict[str, Any]: 1124
   dict[str, object]: 401
-  soft: 2648
+  soft: 2650

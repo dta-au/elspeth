@@ -23,8 +23,10 @@ Landscape audit trail.
 > **Chroma security advisory:** Do not use Chroma with ELSPETH until upstream
 > publishes a fixed release and ELSPETH adopts and verifies it. This includes
 > the `rag_retrieval` transform with `provider: chroma`, the `chroma_sink` sink,
-> and Chroma examples in all connection modes. ChromaDB has unresolved code-execution vulnerabilities;
-> version 1.5.9 is still affected. See the
+> and Chroma examples in all connection modes. ChromaDB has unresolved
+> code-execution vulnerabilities in every release up to and including 1.5.9,
+> the latest at the time of writing, including the 1.5.5 that ELSPETH locks;
+> no fixed release exists. See the
 > [pre-authentication advisory](https://github.com/advisories/GHSA-f4j7-r4q5-qw2c),
 > [collection-update advisory](https://github.com/advisories/GHSA-36p7-vc44-83pf),
 > and [upstream server and client issue](https://github.com/chroma-core/chroma/issues/6717).
@@ -120,6 +122,21 @@ a run checkpointed under 3.13 refuses to resume under 3.14 and a web approval
 recorded under 3.13 no longer matches: drain in-flight runs and pending
 approvals before upgrading. CI runs one Python 3.14 lane, so required
 status-check names change and the repository ruleset must be updated to match.
+
+The Web Composer remediation starts in this release. A reply the completion
+review withholds is shown as a system notice and never re-enters the
+conversation as the model's words. The version menu shows the newest 50 versions
+and marks validated milestones, `diff_pipeline` compares against the last
+validated state, and credential-shaped model reasoning is withheld instead of
+failing the turn. `batch_stats`, `batch_replicate` and `batch_experiment_compare`
+are available on every install, which changes the plugin policy hash: web runs
+admitted before the upgrade refuse to resume. A Web Composer graph that feeds
+`report_assemble` straight into a `text` sink is now refused; insert
+`line_explode`. Cancelling a shared-pipeline import or library fork no longer
+leaves an empty session, share tokens are decoded strictly, and `elspeth purge`
+can no longer delete a live share's data: new shares are stored under `shares/`
+in the payload store, links created earlier keep working but remain
+purge-exposed, and `purge --payload-dir` must never point at `shares/`.
 
 Session epoch 78 and Landscape epoch 50 are unchanged from the previous
 release; this release adds no schema-epoch cutover, so existing session and

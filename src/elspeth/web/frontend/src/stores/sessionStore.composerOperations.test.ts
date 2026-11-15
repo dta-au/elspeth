@@ -627,7 +627,38 @@ it("newer same-session version history wins over an older late response", async 
   expect(useSessionStore.getState().stateVersions).toEqual(newRows);
   releaseOld(oldRows); await oldRead;
   expect(useSessionStore.getState().stateVersions).toEqual(newRows);
-  expect(useSessionStore.getState().isLoadingVersions).toBe(false);
+  expect(useSessionStore.getState().historyStatus).toBe("settled");
+});
+
+it("refetches when the composition advances during a history read", async () => {
+  const oldRows = Array.from({ length: 50 }, (_, index) => ({ id: stateId, version: index + 1, created_at: "2026-10-06T00:00:00Z", node_count: 1 }));
+  const freshRows = [...oldRows.slice(2),
+    { ...oldRows[0], version: 51, is_milestone: true },
+    { ...oldRows[0], version: 52 }];
+  let releaseOld!: (rows: typeof oldRows) => void;
+  vi.mocked(api.fetchStateVersions)
+    .mockReturnValueOnce(new Promise((resolve) => { releaseOld = resolve; }))
+    .mockResolvedValueOnce(freshRows);
+  useSessionStore.setState({ compositionState: composition(50) });
+  const loading = useSessionStore.getState().loadStateVersions();
+  useSessionStore.setState({ compositionState: composition(52) });
+  releaseOld(oldRows);
+  await loading;
+  expect(api.fetchStateVersions).toHaveBeenCalledTimes(2);
+  expect(useSessionStore.getState().stateVersions.find((row) => row.version === 51)?.is_milestone).toBe(true);
+  expect(useSessionStore.getState().historyStatus).toBe("settled");
+});
+
+it("marks a moving history unsettled after bounded retries", async () => {
+  const rows = [{ id: stateId, version: 52, created_at: "2026-10-06T00:00:00Z", node_count: 1 }];
+  vi.mocked(api.fetchStateVersions).mockImplementation(async (_sessionId, onMovingHead) => {
+    onMovingHead?.();
+    return rows;
+  });
+  useSessionStore.setState({ compositionState: composition(52) });
+  await useSessionStore.getState().loadStateVersions();
+  expect(useSessionStore.getState().stateVersions).toEqual(rows);
+  expect(useSessionStore.getState().historyStatus).toBe("unsettled");
 });
 
 it("an older failed history read cannot clear a newer read's loading state", async () => {
@@ -640,9 +671,9 @@ it("an older failed history read cannot clear a newer read's loading state", asy
   const oldRead = useSessionStore.getState().loadStateVersions();
   const newRead = useSessionStore.getState().loadStateVersions();
   rejectOld(new Error("old read failed")); await oldRead;
-  expect(useSessionStore.getState().isLoadingVersions).toBe(true);
+  expect(useSessionStore.getState().historyStatus).toBe("loading");
   const rows: Rows = [{ id: stateId, version: 2, created_at: "2026-10-06T00:00:00Z", node_count: 2 }];
   releaseNew(rows); await newRead;
   expect(useSessionStore.getState().stateVersions).toEqual(rows);
-  expect(useSessionStore.getState().isLoadingVersions).toBe(false);
+  expect(useSessionStore.getState().historyStatus).toBe("settled");
 });

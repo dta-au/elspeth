@@ -97,6 +97,7 @@ from elspeth.contracts.blobs import (
 )
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.payload_store import PayloadNotFoundError
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.core.canonical import canonical_json
 from elspeth.core.payload_store import FilesystemPayloadStore
@@ -703,6 +704,7 @@ class ShareableReviewService:
         sessions_db_engine: Engine,
         session_operation_authority: SessionOperationAuthority,
         payload_store: FilesystemPayloadStore,
+        legacy_payload_store: FilesystemPayloadStore | None,
         telemetry: SessionsTelemetry,
         blob_service: BlobServiceProtocol,
     ) -> None:
@@ -714,6 +716,7 @@ class ShareableReviewService:
         self._sessions_db_engine = sessions_db_engine
         self._session_operation_authority = session_operation_authority
         self._payload_store = payload_store
+        self._legacy_payload_store = legacy_payload_store
         # Phase 8 Sub-task 7c — composer.session.completed_total counter.
         # Mirrors the sessions/service.py pattern at line 48/2446 (the
         # cohort b1 interpretation-opt-out emit). The container is owned
@@ -890,8 +893,7 @@ class ShareableReviewService:
         # Stamp expiry now so the same value lands in both the audit row
         # and the signed token envelope. The validity period is set at
         # issue-time; the signer's verify() rejects after this point.
-        # ``get_shareable_link`` re-derives the lifespan from the audit row
-        # (expires_at - created_at), so a re-mint keeps the chosen lifespan.
+        # Re-mints retain this recorded expiry, subject to a lowered cap.
         expires_at = snapshot.created_at + timedelta(seconds=lifetime_seconds)
 
         # Files before the audit row: the row's digest commits to a manifest
@@ -986,23 +988,31 @@ class ShareableReviewService:
                 reason="completion_event_missing",
                 detail="mark this composition ready for review before requesting a shareable link",
             )
+        created_at = datetime.now(UTC)
+        # SQLite returns UTC audit timestamps without tzinfo; PostgreSQL may
+        # return aware values. Normalise both before comparing with mint time.
+        recorded_created_at = event.created_at.replace(tzinfo=UTC) if event.created_at.tzinfo is None else event.created_at.astimezone(UTC)
+        recorded_expires_at = event.expires_at.replace(tzinfo=UTC) if event.expires_at.tzinfo is None else event.expires_at.astimezone(UTC)
+        # The audit event is the expiry authority. A lower current deployment
+        # cap may shorten it, but a re-mint cannot extend an unrecorded grant.
+        expires_at = min(
+            recorded_expires_at,
+            recorded_created_at + timedelta(seconds=self._settings.shareable_link_lifetime_seconds),
+        )
+        if expires_at <= created_at:
+            raise CompositionNotRunnableError(
+                reason="share_link_expired",
+                detail="This share link has expired. Share for review again to create a new link.",
+            )
         payload_digest = str(event.payload_digest)
         digest_hex = payload_digest.removeprefix(_DIGEST_PREFIX)
-        if not self._payload_store.exists(digest_hex):
+        try:
+            await run_sync_in_worker(self.retrieve_share_payload, digest_hex)
+        except PayloadNotFoundError:
             raise CompositionNotRunnableError(
                 reason="not_marked_ready",
                 detail=_NOT_MARKED_READY_DETAIL,
-            )
-        # Keep the lifespan the owner chose at mark time: a 1-day link must
-        # not be stretched to the deployment maximum by "copy link again".
-        # Clamped to the CURRENT maximum: if the operator lowered the cap
-        # since the mark, the server still never issues a longer link.
-        lifetime = min(
-            event.expires_at - event.created_at,
-            timedelta(seconds=self._settings.shareable_link_lifetime_seconds),
-        )
-        created_at = datetime.now(UTC)
-        expires_at = created_at + lifetime
+            ) from None
         token = self._sign_token(
             session_id=session_id,
             state_id=state_record.id,
@@ -1019,7 +1029,7 @@ class ShareableReviewService:
             payload_digest=payload_digest,
         )
 
-    async def resolve_token(self, *, token: str, requesting_user_id: str) -> SharedInspectResponse:
+    async def resolve_token(self, *, token: str) -> SharedInspectResponse:
         """Verify the token and return the frozen-at-mark-time snapshot.
 
         The audit_readiness is read directly from the blob — this method
@@ -1081,11 +1091,25 @@ class ShareableReviewService:
         """
         payload = self._signer.verify(token)
         digest_hex = payload.payload_digest.removeprefix(_DIGEST_PREFIX)
-        blob_bytes = await run_sync_in_worker(self._payload_store.retrieve, digest_hex)
+        blob_bytes = await run_sync_in_worker(self.retrieve_share_payload, digest_hex)
         # The payload store has already verified the digest matches —
         # any tampering on the filesystem path raises IntegrityError
         # before we get here.
         return payload, self._parse_blob(blob_bytes)
+
+    def retrieve_share_payload(self, digest_hex: str) -> bytes:
+        """Read share bytes, including pre-namespace links stored beside run payloads.
+
+        Legacy objects remain purge-exposed; only new writes enter the shares
+        namespace. Corruption in the share store must never be hidden by a
+        healthy legacy copy.
+        """
+        try:
+            return self._payload_store.retrieve(digest_hex)
+        except PayloadNotFoundError:
+            if self._legacy_payload_store is None:
+                raise
+            return self._legacy_payload_store.retrieve(digest_hex)
 
     # ── private helpers ─────────────────────────────────────────────
 

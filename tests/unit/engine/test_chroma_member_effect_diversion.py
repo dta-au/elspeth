@@ -11,6 +11,12 @@ from dataclasses import replace
 from datetime import timedelta
 from typing import Any
 
+import chromadb
+import numpy as np
+from chromadb.api.types import EmbeddingFunction, normalize_insert_record_set, validate_insert_record_set
+from chromadb.config import Settings
+from chromadb.utils.embedding_functions import known_embedding_functions
+
 from elspeth.contracts import NodeType, TerminalOutcome, TerminalPath
 from elspeth.contracts.sink_effects import (
     SinkEffectFinalizationMember,
@@ -25,6 +31,7 @@ from elspeth.core.landscape.execution.sink_effect_identity import (
 from elspeth.engine.executors.sink_effects import SinkEffectCoordinator, SinkEffectExecutionRequest
 from elspeth.plugins.sinks.chroma_sink import ChromaSink
 from tests.fixtures.base_classes import inject_write_failure
+from tests.fixtures.factories import make_context
 from tests.fixtures.landscape import leader_coordination_token, leader_token_for, make_factory, make_landscape_db, register_test_node
 from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_request
 
@@ -32,14 +39,35 @@ from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_req
 class _RecordingCollection:
     def __init__(self) -> None:
         self.documents: dict[str, tuple[str, dict[str, object] | None]] = {}
+        self._client = self
+        self.id = "diverting-members"
+        self.tenant = "default_tenant"
+        self.database = "default_database"
 
-    def upsert(
+    def _validate_and_prepare_upsert_request(self, **kwargs: Any) -> dict[str, Any]:
+        records = normalize_insert_record_set(**kwargs)
+        validate_insert_record_set(records)
+        return {
+            "ids": records["ids"],
+            "documents": records["documents"],
+            "metadatas": records["metadatas"],
+            "embeddings": [np.array([1.0, 0.0], dtype=np.float32)],
+            "uris": records["uris"],
+        }
+
+    def _upsert(
         self,
         *,
+        collection_id: str,
         ids: list[str],
+        embeddings: list[np.ndarray],
         documents: list[str],
         metadatas: list[dict[str, object]] | None,
+        uris: list[str] | None,
+        tenant: str,
+        database: str,
     ) -> None:
+        del collection_id, embeddings, uris, tenant, database
         assert len(ids) == len(documents) == 1
         self.documents[ids[0]] = (documents[0], None if metadatas is None else dict(metadatas[0]))
 
@@ -72,6 +100,27 @@ def _make_sink(collection: _RecordingCollection) -> ChromaSink:
     sink = inject_write_failure(ChromaSink(_chroma_config()))
     sink._collection = collection  # type: ignore[assignment]
     return sink
+
+
+class _RejectingLocalEmbedding(EmbeddingFunction):
+    def __init__(self) -> None:
+        pass
+
+    def __call__(self, input: list[str]) -> list[np.ndarray]:
+        if "REJECT" in input:
+            raise ValueError("document rejected by local embedding policy")
+        return [np.array([1.0, 0.0], dtype=np.float32) for _ in input]
+
+    @staticmethod
+    def name() -> str:
+        return "chroma_member_local_policy"
+
+    def get_config(self) -> dict[str, object]:
+        return {}
+
+    @staticmethod
+    def build_from_config(config: dict[str, object]) -> _RejectingLocalEmbedding:
+        return _RejectingLocalEmbedding()
 
 
 def _build_request(factory, run_id: str, source_id: str, sink_id: str, rows: list[dict[str, Any]]) -> SinkEffectExecutionRequest:
@@ -192,3 +241,39 @@ def test_all_invalid_members_divert_without_wedging_the_batch() -> None:
         assert [member.prepared_disposition for member in members] == ["diverted", "diverted"]
     finally:
         db.close()
+
+
+def test_existing_persistent_collection_embedding_rejection_diverts_sibling(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("ANONYMIZED_TELEMETRY", "False")
+    monkeypatch.setitem(known_embedding_functions, _RejectingLocalEmbedding.name(), _RejectingLocalEmbedding)
+    path = str(tmp_path / "store")
+    client = chromadb.PersistentClient(path=path, settings=Settings(anonymized_telemetry=False))
+    client.create_collection("diverting-members", embedding_function=_RejectingLocalEmbedding(), metadata={"hnsw:space": "cosine"})
+    sink = inject_write_failure(ChromaSink({**_chroma_config(), "persist_directory": path}))
+    sink.on_start(make_context())
+    db = make_landscape_db()
+    try:
+        factory = make_factory(db)
+        run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        source_id = register_test_node(factory.data_flow, run.run_id, "source", node_type=NodeType.SOURCE, plugin_name="source")
+        sink_id = register_test_node(factory.data_flow, run.run_id, "sink", node_type=NodeType.SINK, plugin_name="chroma_sink")
+        request = _build_request(
+            factory,
+            run.run_id,
+            source_id,
+            sink_id,
+            [
+                {"doc_id": "bad", "text": "REJECT"},
+                {"doc_id": "good", "text": "one"},
+            ],
+        )
+        result = SinkEffectCoordinator(factory=factory, worker_id="worker-a", coordination_token=leader_token_for(db, run.run_id)).execute(
+            request, sink
+        )
+        assert result.effect.state is SinkEffectState.FINALIZED
+        assert client.get_collection("diverting-members").get()["ids"] == ["good"]
+        assert [diversion.row_index for diversion in sink._get_diversions()] == [0]
+    finally:
+        db.close()
+        sink.close()
+        client.close()

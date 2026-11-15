@@ -11,12 +11,13 @@ import math
 import urllib.parse
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 import chromadb
 import chromadb.api
 import chromadb.errors
 import structlog
+from chromadb.api.types import Metadata
 from pydantic import BaseModel, Field, model_validator
 
 import elspeth.contracts.errors as contract_errors
@@ -207,7 +208,7 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
     name = "chroma_sink"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9c3987d7801826b8"
+    source_file_hash: str | None = "sha256:8609eab8e69c3992"
     config_model = ChromaSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
@@ -627,20 +628,24 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
         if self._collection is None:
             raise FrameworkBugError("Chroma collection is unavailable — on_start() was not called")
         document_id, document, metadata, descriptor = self._validate_member_effect(plan, member, effect_input)
+        member_metadatas: list[dict[str, Any] | None] | None = None if metadata is None else [metadata]
+        # _extract_effect_member limits metadata to Chroma's scalar value types.
+        # A present list has one non-null member; cast only at the SDK boundary.
+        sdk_metadatas = cast(list[Metadata] | None, member_metadatas)
         try:
-            self._collection.upsert(
+            # Chroma 1.5.5's private preparation performs validation, embedding,
+            # and sparse-metadata enrichment before Collection.upsert dispatches.
+            # A ValueError here is pre-dispatch, so preserve the existing
+            # member-diversion behavior for configured embedding functions too.
+            upsert_request = self._collection._validate_and_prepare_upsert_request(
                 ids=[document_id],
+                embeddings=None,
+                metadatas=sdk_metadatas,
                 documents=[document],
-                metadatas=None if metadata is None else [metadata],  # type: ignore[list-item]
+                images=None,
+                uris=None,
             )
         except ValueError as exc:
-            # The Chroma SDK validates the request before any write and raises
-            # ValueError for a payload it will not accept (e.g. a reserved
-            # metadata key such as "chroma:document"). The try wraps only the
-            # upsert call, so this is the member's data being refused, not a
-            # bug in surrounding code: divert that member, as DataverseSink
-            # does for a row-attributable rejection, instead of failing the
-            # whole effect on every attempt.
             reason = f"Chroma rejected the member payload: {exc}"
             row = deep_thaw(member.row)
             # Live diversion log BEFORE the durable result: fails closed with
@@ -656,7 +661,18 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
                 accepted_ordinals=tuple(item.ordinal for item in effect_input.members if item.ordinal != member.ordinal),
                 diverted_ordinals=(member.ordinal,),
             )
-        member_metadatas: list[dict[str, Any] | None] | None = None if metadata is None else [metadata]
+        # From this point a failure can follow a completed write (including
+        # HTTP response decoding). Propagate it for response-lost reconciliation.
+        self._collection._client._upsert(
+            collection_id=self._collection.id,
+            ids=upsert_request["ids"],
+            embeddings=upsert_request["embeddings"],
+            metadatas=upsert_request["metadatas"],
+            documents=upsert_request["documents"],
+            uris=upsert_request["uris"],
+            tenant=self._collection.tenant,
+            database=self._collection.database,
+        )
         _, payload_size = self._compute_payload_hash([document_id], [document], member_metadatas)
         self._total_written += 1
         self._total_bytes += payload_size
