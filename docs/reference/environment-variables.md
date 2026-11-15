@@ -606,7 +606,8 @@ change to the policy variables, verify the tutorial rows in
 required web core, which is always authorized:
 
 - sources: `source:csv`, `source:json`, `source:llm`, `source:text`
-- transforms: `transform:field_mapper`, `transform:file_inject`,
+- transforms: `transform:batch_experiment_compare`, `transform:batch_replicate`,
+  `transform:batch_stats`, `transform:field_mapper`, `transform:file_inject`,
   `transform:line_explode`, `transform:llm`, `transform:reference_join`,
   `transform:report_assemble`, `transform:web_scrape`
 - sinks: `sink:csv`, `sink:document`, `sink:json`, `sink:text`

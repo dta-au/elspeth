@@ -519,18 +519,18 @@ deployment you will teach on.
    `prompt_shield` and `content_safety` to `required` with Bedrock
    implementations. Slide 20 assumes this. On a deployment with `recommend`
    or no implementation, use the override caveat wording instead.
-2. **Authorised plugins.** A stock web deployment offers roughly nine
-   transforms (`field_mapper`, `llm`, `web_scrape`, `line_explode`,
-   `reference_join`, `report_assemble`, `passthrough`, the two Bedrock
-   controls, plus Textract). Statistical `batch_*` transforms, `json_explode`,
-   `value_transform`, `type_coerce`, `truncate` are **not** web-authorised by
-   default — so Segment 6's pre-built sessions must be built with what your
-   deployment allows (use `line_explode` as the scope opener and LLM nodes as
+2. **Authorised plugins.** Every web deployment authorises the 18-plugin
+   required core, including `batch_stats`, `batch_replicate`, and
+   `batch_experiment_compare`. LLM availability still requires a usable profile;
+   AWS defaults add optional plugins such as Bedrock controls and Textract.
+   Other `batch_*` transforms, `json_explode`, `value_transform`, `type_coerce`,
+   and `truncate` require optional authorisation — so Segment 6's pre-built
+   sessions must be built with what your deployment allows (use `line_explode` as the scope opener and LLM nodes as
    branch arms). `report_assemble` cannot close a scope: it is
    aggregation-only, and validation refuses it as a collector. A collector
    session therefore needs a batch-aware plugin other than `report_assemble`
-   (for example `batch_stats`) authorised on the deployment; a stock
-   deployment authorises none. Check `Plugin catalog`.
+   such as the now-required `batch_stats`. Check `Plugin catalog` for the
+   chosen plugin's supported placement and options.
 3. **Composer coverage.** Build the Segment 6 example sessions against the
    deployment and verify their actual plugin and topology support before class.
 4. **Planner turn time.** Time one advanced build on the deployment. If a turn
