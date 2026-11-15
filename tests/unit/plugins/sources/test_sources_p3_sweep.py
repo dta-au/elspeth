@@ -67,6 +67,107 @@ class TestJSONLUndecodableCodeUnitIsolatedToItsLine:
         assert rows[1].row["__raw_bytes_hex__"] == (bad_unit + _utf16le("\n")).hex()
 
 
+_BYTE_ORDER_CASES = [
+    # (configured encoding, fixed-order codec the file is written in, BOM, an undecodable code unit)
+    pytest.param("utf-16", "utf-16-le", b"\xff\xfe", b"\x00\xd8", id="utf-16-bom-le"),
+    pytest.param("utf-16", "utf-16-be", b"\xfe\xff", b"\xd8\x00", id="utf-16-bom-be"),
+    pytest.param("utf-32", "utf-32-le", b"\xff\xfe\x00\x00", b"\x00\xd8\x00\x00", id="utf-32-bom-le"),
+    pytest.param("utf-32", "utf-32-be", b"\x00\x00\xfe\xff", b"\x00\x00\xd8\x00", id="utf-32-bom-be"),
+]
+
+
+class TestQuarantinedLineBytesKeepTheFileByteOrder:
+    """A quarantined line's __raw_bytes_hex__ is the line exactly as the file holds it.
+
+    A BOM-detecting codec (utf-16, utf-32) takes its byte order from the file's BOM,
+    so rebuilding the line with the configured codec name alone used the host's order
+    and prefixed a BOM to every line.
+    """
+
+    @pytest.mark.parametrize(("encoding", "body_codec", "bom", "bad_unit"), _BYTE_ORDER_CASES)
+    @pytest.mark.parametrize("bad_line", [1, 2], ids=["bad-first-line", "bad-later-line"])
+    def test_jsonl_quarantined_line_is_the_original_bytes(
+        self, tmp_path: Path, encoding: str, body_codec: str, bom: bytes, bad_unit: bytes, bad_line: int
+    ) -> None:
+        from elspeth.plugins.sources.json_source import JSONSource
+
+        good = '{"id": 1}\n'.encode(body_codec)
+        bad = bad_unit + "\n".encode(body_codec)
+        lines = [good, bad] if bad_line == 2 else [bad, good]
+        jsonl_file = tmp_path / "data.jsonl"
+        jsonl_file.write_bytes(bom + b"".join(lines))
+        source = JSONSource(
+            {
+                "path": str(jsonl_file),
+                "format": "jsonl",
+                "encoding": encoding,
+                "on_validation_failure": "quarantine",
+                "schema": {"mode": "observed"},
+            }
+        )
+
+        rows = list(source.load(make_source_context(plugin_name="json")))
+
+        quarantined = [row for row in rows if row.is_quarantined]
+        assert [row.row["__line_number__"] for row in quarantined] == [bad_line]
+        expected = (bom + bad) if bad_line == 1 else bad
+        assert quarantined[0].row["__raw_bytes_hex__"] == expected.hex()
+        assert [row.row for row in rows if not row.is_quarantined] == [{"id": 1}]
+
+    @pytest.mark.parametrize(("encoding", "body_codec", "bom", "bad_unit"), _BYTE_ORDER_CASES)
+    @pytest.mark.parametrize("bad_line", [1, 2], ids=["bad-first-line", "bad-later-line"])
+    def test_text_quarantined_line_is_the_original_bytes(
+        self, tmp_path: Path, encoding: str, body_codec: str, bom: bytes, bad_unit: bytes, bad_line: int
+    ) -> None:
+        from elspeth.plugins.sources.text_source import TextSource
+
+        good = "a\n".encode(body_codec)
+        bad = bad_unit + "c\n".encode(body_codec)
+        lines = [good, bad] if bad_line == 2 else [bad, good]
+        text_file = tmp_path / "items.txt"
+        text_file.write_bytes(bom + b"".join(lines))
+        source = TextSource(
+            {
+                "path": str(text_file),
+                "column": "value",
+                "encoding": encoding,
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "quarantine",
+            }
+        )
+
+        rows = list(source.load(make_source_context(plugin_name="text")))
+
+        quarantined = [row for row in rows if row.is_quarantined]
+        assert [row.row["__line_number__"] for row in quarantined] == [bad_line]
+        expected = (bom + bad) if bad_line == 1 else bad
+        assert quarantined[0].row["__raw_bytes_hex__"] == expected.hex()
+        assert [row.row for row in rows if not row.is_quarantined] == [{"value": "a"}]
+
+    def test_jsonl_utf8_bom_stays_on_a_quarantined_first_line(self, tmp_path: Path) -> None:
+        """The JSON source reads utf-8 as utf-8-sig, which drops the BOM from line 1's text."""
+        from elspeth.plugins.sources.json_source import JSONSource
+
+        bad = b'{"id": \xff}\n'
+        jsonl_file = tmp_path / "data.jsonl"
+        jsonl_file.write_bytes(b"\xef\xbb\xbf" + bad + b'{"id": 2}\n')
+        source = JSONSource(
+            {
+                "path": str(jsonl_file),
+                "format": "jsonl",
+                "encoding": "utf-8",
+                "on_validation_failure": "quarantine",
+                "schema": {"mode": "observed"},
+            }
+        )
+
+        rows = list(source.load(make_source_context(plugin_name="json")))
+
+        assert rows[0].is_quarantined is True
+        assert rows[0].row["__raw_bytes_hex__"] == (b"\xef\xbb\xbf" + bad).hex()
+        assert rows[1].row == {"id": 2}
+
+
 def _json_source(path: Path, **options: object) -> object:
     from elspeth.plugins.sources.json_source import JSONSource
 
