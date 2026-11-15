@@ -182,6 +182,30 @@ def _safe_url_diagnostic(url: str, parsed: urllib.parse.ParseResult) -> str:
     return _safe_url_diagnostic_from_parts(url, scheme=scheme, host=host)
 
 
+def contains_ascii_control_character(value: str) -> bool:
+    """Return whether ``value`` holds an ASCII C0 control character or DEL.
+
+    This is exactly httpx's URL predicate (``char.isascii() and not
+    char.isprintable()``); every URL admission check uses it so none can
+    disagree with what httpx will refuse to send. Non-ASCII is not matched.
+    """
+    return any(char.isascii() and not char.isprintable() for char in value)
+
+
+def _refuse_ascii_control_characters(url: str) -> None:
+    """Refuse ASCII C0 control characters and DEL anywhere in ``url``.
+
+    The predicate is exactly httpx's (see ``contains_ascii_control_character``): httpx raises ``httpx.InvalidURL`` (neither
+    ``ValueError`` nor ``httpx.RequestError``) for these at dispatch, while
+    ``urlsplit`` silently drops ``\\t``/``\\n``/``\\r`` and keeps the rest, so
+    every check below would otherwise admit a URL that cannot be sent, or
+    validate a different URL from the one that is. Non-ASCII (IRI)
+    characters are not affected.
+    """
+    if contains_ascii_control_character(url):
+        raise SSRFBlockedError(f"URL contains an ASCII control character; {_safe_unparsed_url_diagnostic(url)}.", kind="malformed_url")
+
+
 def _parse_url_for_validation(url: str) -> urllib.parse.ParseResult:
     try:
         return urllib.parse.urlparse(url)
@@ -223,6 +247,7 @@ def validate_url_scheme(url: str) -> None:
     """
     if type(url) is not str:
         raise TypeError(f"url must be str, got {type(url).__name__}")
+    _refuse_ascii_control_characters(url)
 
     parsed = _parse_url_for_validation(url)
     scheme = parsed.scheme.lower()
@@ -420,10 +445,17 @@ def parse_http_origin(origin: str) -> HTTPOrigin:
 
 
 def validate_allowed_http_origin(url: str, allowed_origins: Sequence[HTTPOrigin]) -> None:
-    """Refuse an unapproved destination before DNS or replay evidence is read."""
+    """Refuse an unapproved destination before DNS or replay evidence is read.
+
+    A URL containing an ASCII control character is refused even when no
+    origins are configured: it cannot be dispatched, so no caller may admit it.
+    """
+    if type(url) is not str:
+        raise TypeError(f"url must be str, got {type(url).__name__}")
+    _refuse_ascii_control_characters(url)
     if not allowed_origins:
         return
-    if any(ord(char) < 32 or char == "\\" for char in url):
+    if "\\" in url:
         raise SSRFBlockedError("URL contains an ambiguous HTTP origin", kind="origin_not_allowed")
     validate_url_scheme(url)
     parsed = _parse_url_for_validation(url)
