@@ -196,6 +196,8 @@ Fix crashes, inconsistent integrity handling and misleading diagnoses. R3; SG-04
 
 - [ ] **05.20** Distinguish credential-like stored metadata from ordinary inventory failures so a withheld listing gives useful recovery guidance.
 
+- [ ] **05.21** Put long user-supplied text into a file instead of inline YAML. When a user says "use this as the prompt" and pastes something long, the composer currently writes the whole text into the pipeline YAML, which makes the YAML enormous and runs into the runtime-YAML import cap (`MAX_RUNTIME_YAML_IMPORT_CHARS`, 262,144 characters, deliberately unchanged in 0.8.14). The composer should store long strings (prompts, system prompts, per-query templates) as a session file and wire that file into the option, then import it, so the YAML stays small and the text keeps its own custody and hash. The planner must still choose and author this (no server-side rewriting of the planner's structure; composer invariant 1), and the prompt review must still show and attest the full text. Raised by the maintainer, 16 November 2026, after staging users hit the size cap.
+
 # 6 Plugin catalogs schemas and model discovery
 
 Make discovery authoritative enough to guide a successful edit. R2; SG-05; XC-11/18/19/24.
@@ -723,3 +725,5 @@ Resolve these before their dependent fixes. Record the chosen behavior and date 
 # Activity log
 
 - 9 November 2026 — Created the grouped tracker, reconciled the live inventory (01.01), recorded the user’s D1 ruling, and integrated the first three fixes (02.03, 12.07, 13.16) on fix/composer-tool-remediation at 5e192342c. Sol 6.1 high implemented; Astra high approved all three. Final frozen-tree regression: 783 passed. Keyless all-rule lint scan exits 1 both before and after with the same 5,424 findings after checkout-path normalization; all 12 changed fingerprints match inserted line offsets. Scoped Ruff, mypy and contracts pass. Full Python and PostgreSQL suites were not run for this bounded tranche; D1 implementation remains open and will require them. Audit source documents remain preserved locally.
+
+- 16 November 2026 — Added 05.21 (long user-supplied prompts go to a file, not inline YAML) at the maintainer's request; the YAML import cap stays at 262,144 characters.
