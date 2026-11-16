@@ -128,7 +128,8 @@ above).
   16.5% were inside sqlite3 `execute` or `commit`.
 - **Statement volume per source row is high.** The gate workload issues
   about 81 SQL executes and 10 commits per source row; fork/coalesce about
-  390 and 53.
+  390 and 53. These are older-tree workloads with shapes different from the
+  current fixed/per-row pins; see [the remediation plan](executor-hot-path-remediation.md#status-as-of-2026-11-17).
 - **Ingest is as heavy as node execution.** By py-spy phase: ingest plus
   initial claim (`core/landscape/scheduler/queue.py:353`) 40.9%, node
   execution 36.9%, sink flush 19.8%. Static reading puts ingest at 28
@@ -150,18 +151,20 @@ above).
 
 - **Quadratic sink reservation.**
   `core/landscape/execution/sink_effect_reservation.py:358` and `:370`
-  rebuild a tuple of every row locked so far inside the per-member loop. The
+  rebuilt a tuple of every row locked so far inside the per-member loop. The
   profiler counted 44 iterations at 10 rows, 10,300 at 200 and 1,003,049 at
-  2,000. It is about 1% of time at 2,000 rows and grows with rows pending per
-  sink.
+  2,000. This older-tree cost was removed by L3-1; PostgreSQL also went from
+  three pid reads per one-member reservation to one. See [the remediation
+  plan](executor-hot-path-remediation.md#l3-1--stop-rebuilding-the-locked-id-tuple-on-every-lock).
 - **The DB-write micro-benchmarks do not run.** The four throughput tests in
   `tests/performance/benchmarks/test_db_write.py` fail with
   `TypeError: DataFlowRepository.register_node() got an unexpected keyword argument 'run_id'`,
   so the dominant cost bucket has no working micro-benchmark. The `performance`
   marker is deselected by default, which is how this went unnoticed.
-- **Existing perf tests do not cover the dominant costs.** They use an
-  in-memory database and a mock payload store, and none measures commits per
-  row, `complete_node_state`, ingest, checkpoints or the sink path.
+- **Existing perf tests did not cover the dominant costs at the time of this
+  recon.** They used an in-memory database and a mock payload store, and none
+  then measured commits per row, `complete_node_state`, ingest, checkpoints or
+  the sink path; see the [remediation plan's status](executor-hot-path-remediation.md#status-as-of-2026-11-17).
 - **Payload store directory validation** runs 8 times per row, about 129
   `lstat` calls per row.
 
@@ -270,7 +273,7 @@ timers, and progress-event persistence.
 | Claim | Status |
 |---|---|
 | Executor bucket split, per-row statement, commit and hash counts | Measured (Appendix F) |
-| Quadratic tuple rebuild in sink reservation | Measured, and the loop was re-read at `1a7ff0e6` |
+| Quadratic tuple rebuild in sink reservation | Measured on the older tree; removed by L3-1 (see the remediation plan) |
 | Web-run governance rescans all LLM calls per call | Static; the function and its caller were re-read at `1a7ff0e6` |
 | `test_db_write.py` benchmark failure | Measured (two runs, exit 1) |
 | All composer and web-tier counts | Static, one reader each, not cross-checked |
@@ -1071,7 +1074,7 @@ contention, PostgreSQL round trips, or payload fsyncs.
 | `scalability/` (`test_deep_dag`, `test_large_datasets`, `test_many_sinks`, `test_wide_rows`) | 10/20/50-transform DAGs, 1k/10k rows, 10/50/100 sinks, 100/500/1000-field rows | correctness only, except 1000-field rows < 120 s (`test_wide_rows.py:101`) |
 | `stress/test_call_index_concurrency.py` | 8 threads x 500 `allocate_call_index` calls | uniqueness, no timing |
 
-Gaps: nothing measures commits or statements per row, `complete_node_state`,
+Gaps at the time of this recon: nothing measured commits or statements per row, `complete_node_state`,
 `ingest_row_with_initial_claim`, the scheduler disposition verbs, `create_checkpoint`, the
 payload store, or the sink-effect path; the `test_db_write.py` thresholds
 (500-1000 ops/s on an in-memory DB) are loose enough that a doubling of per-write statements

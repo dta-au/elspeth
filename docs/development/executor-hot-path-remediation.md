@@ -1,14 +1,26 @@
 # Executor hot-path remediation — plan
 
-Status: **plan only — nothing here has landed.** It covers every finding in
+Status: **working plan.** It covers every finding in
 [hot-path-recon.md](hot-path-recon.md) that lies outside `src/elspeth/web/`:
 the engine, the Landscape, canonical hashing, the payload store,
 checkpointing, the sink phase, plugins and the performance test harness.
 Mechanisms were re-verified, and most were measured, at `1a7ff0e6`
 (measurement runs on docs-only commits on top of it), SQLite, one process.
-This is a working document: update the status column as items land, and
-delete it when it stops being useful. Line numbers are valid for that commit
-only.
+This is a working document: update item status as fixes land, and delete it
+when it stops being useful. File:line references predate 0.8.14 and must be
+re-derived on the current tree before each item is implemented.
+
+## Status as of 2026-11-17
+
+L4-8 and the statement-budget part of L1-2 have landed in
+`tests/unit/engine/test_hot_path_row_cost.py`: exact fixed and per-row SQL
+statements, commits, four hash/JSON counters and verb/table buckets are pinned
+on SQLite and PostgreSQL, with a Python-call linearity oracle. L1-2's
+statement-identity and bind-equivalence guards remain open. L3-1 has landed;
+the reservation seams now receive a count and one id, with one backend-pid
+read per reservation. E-6a is integrated: `version_hash()` has an instance
+memo and an exact-tuple guard. E-11 is parked pending a maintainer ruling,
+targeted for 0.8.16 unless ruled otherwise.
 
 Web-tier findings (web-run LLM governance, the run-progress websocket poll,
 per-request auth, the web validation trunk) are out of scope here, as is the
@@ -21,13 +33,14 @@ The summary sections are the working plan: the fix list, the confirmations
 and rulings it needs, and the order. Appendices L1–L6 hold the full design of
 each item in one format (finding, verified mechanism, evidence, change, what
 must not change, risk, ruling, verification, expected saving). Each appendix
-is one investigator's report, reproduced with only heading levels changed,
-and each ends with its own list of what was not verified.
+retains the investigator's evidence and design record, updated where later
+implementation or review changed its conclusions. Each ends with what was
+not verified.
 
 **Where the summary and an appendix disagree, the summary governs.** The
-summary was revised after an independent review (see "Review" below); the
-appendices were not. The section "Where this summary overrides an appendix"
-lists each difference.
+summary was revised after an independent review (see "Review" below); some
+appendix proposals retain their original scope. The section "Where this
+summary overrides an appendix" lists those differences.
 
 The appendices cite scripts, traces and logs under `.claude/lanes/`. That
 directory is gitignored and does not survive the session that produced it;
@@ -75,7 +88,7 @@ edited from here.
 | E-1a and E-1b are ready with no ruling | Earlier review | The clock-authority source gate rejects a prebuilt leader fence, leader renewal, both clock helpers, and any prebuilt statement executed with a time value in its bind mapping. Only the membership fence and by-key selects pass as-is (L1, L1-4) |
 | Prebuilding "changes no SQL text" | Earlier review | True on SQLite; on PostgreSQL the placeholder names change (L1) |
 | R-13 (node-state timestamps on the process clock) may be a defect | Earlier review | Not a defect: ADR-047 explicitly leaves `node_states` timestamps on the process clock (L1) |
-| E-11 may need an index | Earlier review | The index exists; SQLite picks a bad join order and a query rewrite fixes it with no schema change (L4) |
+| E-11 may need an index | Earlier review | No index leads with `run_id` and `parent_token_id`; the proposed rewrite fails on permitted shapes. The index variant also fails with stale statistics and has upgrade blockers (L4) |
 | The external-call path adds nothing above the measured floor | Earlier review, Limits | An Azure LLM row adds 16 statements, 3 commits and 2 payload files; an OpenRouter row adds 31, 6 and 4, because HTTP-transport providers record two calls per query (L5, L6) |
 | Canonical JSON and hashing is 11.5–16.2% of per-row time | Recon § 1 | A cProfile bucket that over-weights small Python calls. Removing about half of those calls changed CPU by −4.6% (gate) and −0.3% (transform) on narrow rows; it reaches −17% at 100 columns (L2) |
 | Three `to_dict()` thaws per token × transform | Recon Appendix A | Seven in engine code plus one or two in the plugin (L2) |
@@ -143,9 +156,10 @@ Three constraints bound every item:
 
 ## Master fix list
 
-Status is `open` for every row. Savings are per-item estimates on SQLite and
+Items below record completed work as well as open proposals. Savings are per-item estimates on SQLite and
 overlap heavily — removing a statement also removes its construction cost —
-so they do not add up. Unless a row says "measured end to end", a CPU
+so they do not add up. Older-baseline savings are estimated against the older
+baseline; re-measure against the pins. Unless a row says "measured end to end", a CPU
 percentage is a per-row count multiplied by a micro-benchmark delta taken on
 a loaded shared box. "TC" marks items that owe the PostgreSQL testcontainer
 suite as well as the default one.
@@ -157,8 +171,8 @@ any of them.
 
 | ID | Item | Risk | Appendix |
 |---|---|---|---|
-| L4-8 | Pin exact per-row counts (SQL statements, commits, canonical-JSON and hash calls) on a small linear and a small fork pipeline through the production entry, plus a linearity oracle that names any function whose call count grows faster than rows. Prototyped: 68 statements / 8 commits per row linear, 381 / 51 fork; a mutant goes red. Build the PostgreSQL-parametrised variant at the same time | Low | L4 |
-| L1-2 | Statement-identity, per-row statement-budget and bind-equivalence guards for the Landscape verbs. Overlaps L4-8's statement pins; build as one instrument | Low | L1 |
+| L4-8 — done | Exact fixed/per-row pins for statements, commits, four hash/JSON counters and verb/table buckets on linear and fork pipelines, SQLite and PostgreSQL; Python-call linearity oracle. Current pins: SQLite linear 97 statements / 13 commits per row, fork 338 / 45; PostgreSQL linear 79 / 13, fork 263 / 45. The older 68 / 8 and 381 / 51 figures used different tree and pipeline shapes | Low | L4 |
+| L1-2 — partial | Statement-budget pins are done through L4-8. Statement-identity and bind-equivalence guards remain open | Low | L1 |
 | M-1 | Take the PostgreSQL baseline (and one with a follower worker) **before** any SQL item lands. Needs a Docker host; none of the lanes had one | Low | L1, L4 |
 | L4-6 | Rewrite the stale benchmarks and stress fixtures against the current repository API | Low | L4 |
 | H-1, H-2 | Commit the measurement harness, the workload generator and the scripts each ready item names as its before/after instrument. Use `scripts/perf/`; the earlier review's `notes/` destination is gitignored | Low | L4 |
@@ -168,9 +182,8 @@ any of them.
 
 | ID | Fix | Risk | Expected saving | TC | Appendix |
 |---|---|---|---|---|---|
-| L3-1 | Stop rebuilding the locked-id tuple on every lock in sink reservation; stop evaluating the backend pid per iteration | Low | Removes a quadratic term: about 1.3 s per 2,000-member sink, projected minutes at 100k | TC | L3 |
-| E-11 | Rewrite the run-end orphan sweep to drive from `token_parents`. The review checked the rewrite is logically identical, including NULL handling | Low | 225 → 2 ms at 800 fork rows; removes a rows² term | TC | L4 |
-| E-6a | Memoise `SchemaContract.version_hash()` on the frozen instance. Editing this code changes the runtime VAL manifest, so a run interrupted before the upgrade is refused on resume after it — the existing refuse contract, stated here so it is not a surprise | Low | Linear in field count: 0.3–0.6 ms/row narrow, 5–12 ms/row at 100 columns | — | L2 |
+| L3-1 — done | Reservation seams receive `(pid, locked_count, id)`; backend pid is read once per reservation | Low | Quadratic tuple rebuild removed; PostgreSQL statements per row moved 81 → 79 linear and 265 → 263 fork. Older CPU saving estimate needs remeasurement against the pins | TC | L3 |
+| E-6a — done | Per-instance `SchemaContract.version_hash()` memo with exact-tuple guard. The runtime VAL manifest changed; a pre-upgrade interrupted run is refused on resume | Low | `contracts.hashing.canonical_json` per row moved 59 → 55 linear and 99 → 87 fork on both dialects; older CPU estimate needs remeasurement against the pins | — | L2 |
 | E-6b | Share the version hash across equal contracts on the engine side (value interning in the engine; no plugin edit). This is Appendix L2's design. The plugin-side interning in Appendix L5 is tracked separately as L5-11 | Low | Remaining contract hashes per transform row → 0 | — | L2 |
 | E-1a part 1 | Prebuild the membership fence statement | Low | ≈1.6% gate, ≈2.5% transform | TC | L1 |
 | L1-1 | Stop recompiling the two dialect-specific inserts on every row. After the change the SQLite arm no longer exercises `ON CONFLICT`, so add a testcontainer replay test for the conflict path | Low to Low–Med | ≈0.5–1% | TC | L1 |
@@ -229,6 +242,7 @@ readings.
 
 | ID | Decision | Touches | Why it is a decision | Saving if approved | Appendix |
 |---|---|---|---|---|---|
+| E-11 — parked | Choose a snapshot-safe two-step read, repair the index variant, or leave the query | Run-end audit integrity and external-store admission | Every tested single-statement form fails on a permitted planner-statistics state; neither candidate is ready | Re-measure after a ruling; target 0.8.16 unless ruled | L4 |
 | L2-6 | Refuse a `set` in row data, and at which seam | Canonical-JSON policy | Defect: recorded hash is not reproducible | None | L2 |
 | L3-8 | Group sink writes by (outcome, path) and carry the error hash per member | ADR-019 | Changes the number and ids of effects for runs with several error hashes per sink; today such a run can fail | Run completes; removes an O(K²) rebuild | L3 |
 | R-2a | Let a leader `_on` verb discharge its fence by proving the outer transaction already took it | ADR-047, ADR-030 D4 | ADR-047 gives raw-connection callers an explicit renewal obligation | 6 statements per source row (prototyped: ingest 30 → 24) | L1 |
@@ -305,15 +319,15 @@ own complete list.
 
 ## Order
 
-1. **Instruments and baselines** — L4-8 with L1-2 (including the PostgreSQL
-   variant), M-1, L4-6, H-1 and H-2, and the full source-gate run against a
+1. **Instruments and baselines** — L4-8 and L1-2's budget pins are done.
+   Complete L1-2's remaining guards, M-1, L4-6, H-1 and H-2, and the full source-gate run against a
    private copy of the E-3 / E-10 / L1-1 changes.
 2. **Raise the two defect rulings** — L2-6 and L3-8 — so they are not queued
    behind performance work. Raise the C1 confirmations at the same time;
    they are cheap to answer and several ready items wait on them.
-3. **Super-linear terms** — L3-1, then E-11. Both owe the testcontainer
-   suite.
-4. **Contract hashing** — E-6a, E-6b, then E-5 once confirmed.
+3. **Super-linear terms** — L3-1 is done. E-11 is parked for a ruling,
+   targeted at 0.8.16 unless ruled otherwise.
+4. **Contract hashing** — E-6a is done; E-6b, then E-5 once confirmed.
 5. **Local changes** — L2-3, L2-10, E-9a, L4-1; L2-2 and L2-1 (TC, because
    they sit on a path that takes a row lock); the plugin group L5-2, L5-4,
    L5-7, E-9b, L5-11, L5-5, and L5-1 once confirmed; the startup pair E-8a
@@ -347,7 +361,16 @@ that none of options A–D covers a fork, coalesce or barrier transaction.
 If L1-4 is ruled in early, E-1b part 2 should follow E-3 directly and be
 measured then.
 
+Each fix lane re-pins the shared count pins, so cut lanes from the integration
+tip and land them serially. Sequence items in `engine/executors/transform.py`,
+`state_guard.py` and the plugin client/LLM files after the other in-flight
+0.8.15 work in those files.
+
 ## Working rules for every fix
+
+For SQL items, define the performance contract and adversarial shapes before
+choosing a query form: multi-parent children with repeated outcomes, dense
+graphs, other runs in the same database, and no, fresh and stale statistics.
 
 - One fix per commit series. Run `scripts/branch-safety-check.sh` before
   each commit and push.
@@ -401,7 +424,8 @@ it and the summary rows drawn from it have not been independently reviewed,
 and none of its items was prototyped.
 
 The review also confirmed, by reading or experiment: the E-11 rewrite's
-equivalence; the L3-1 mechanism and its test-seam consumers; the L1-1
+logical equivalence on the cases reviewed, though later performance probes
+rejected it; the L3-1 mechanism and its test-seam consumers; the L1-1
 caching claim; that the E-5 fold is a monotone join, so a skipped re-fold is
 sound; the L2-1 hash equivalence; the L2-6 defect; the L3-8 cap; and that no
 design needs a suppression or a new dynamic-attribute site.
@@ -1062,10 +1086,10 @@ two-transform pipeline:
    are an explicit set keyed by call site, so the test can land first and
    ratchet down; the set is empty only once E-1b part 2 has landed, and until
    L1-4 is ruled it names every timestamp-carrying write.
-2. *Budget.* Assert exact statements, commits and compiles per row for each
-   pipeline, pinned from the fixture's own measurement (the CLI workloads give
-   81 / 10 / 2 and 90 / 13 / 1; an in-memory fixture will differ). Any change
-   to a count fails and must be re-pinned in the same commit, with the reason.
+2. *Budget — done in L4-8.* The production-entry test pins exact fixed and
+   per-row statement and commit counts on both dialects, plus four hash/JSON
+   counters and verb/table buckets. Any change must be re-pinned with its
+   reason. The older CLI workloads and the pinned pipeline shapes differ.
 3. *Equivalence.* For every statement in the `prebuilt` registry, on the SQLite
    and PostgreSQL dialects: no bind has `NullType`; each bind's type is the
    type of the column it is compared with or assigned to; and for the
@@ -1089,8 +1113,9 @@ statement; that is its purpose.
 
 **Ruling needed.** No.
 
-**Verification.** The three negative controls above. No testcontainer run owed
-for the tests themselves.
+**Verification.** The statement-budget pin and a synthetic quadratic-function
+control are in `test_hot_path_row_cost.py`. Identity and bind-equivalence
+negative controls remain to be built.
 
 **Expected saving.** None directly; it holds the savings of E-1 and E-3.
 
@@ -1753,8 +1778,8 @@ folded in between (`merge_for_node_evolution`, `contracts/schema_contract.py:571
 union of fields, `nullable` is OR, a type conflict raises). I read the merge's
 contract, not its implementation; the property test below is the proof.
 
-It still costs one `version_hash()` per row until the prior review's E-6a/E-6b
-land (another lane).
+E-6a's instance memo has landed; E-6b's cross-instance sharing remains open,
+so rebuilt contracts can still require a `version_hash()` computation per row.
 
 Rejected: caching the parsed stored contract and keeping the transaction
 (saves the parse, keeps the commit). Rejected: a memo keyed on contract object
@@ -1900,7 +1925,7 @@ item (the prior review's M-2).
 | E-1b part 2 | Prebuild every write that binds a timestamp | Medium | **Yes**, via L1-4 (ADR-047) | E-1b | Unknown until measured; estimate 8–12% |
 | L1-4 | Teach the clock-authority gate to resolve a prebuilt statement and its bind mapping | Medium–High | **Yes** (ADR-047) | new | Unlocks E-1a part 2 and E-1b part 2 |
 | L1-1 | Stop recompiling the two dialect-specific inserts | Low / Low–Medium | No | new | ≈ 0.5–1% |
-| L1-2 | Guard tests: statement identity, budget, bind equivalence | Low | No | new | Holds E-1 and E-3 |
+| L1-2 — partial | Statement budget done; identity and bind equivalence open | Low | No | new | Holds E-1 and E-3 |
 | R-2a | Stop re-taking the leader fence inside a fenced transaction | Medium | **Yes** (ADR-047, ADR-030 D4) | R-2a | 6 statements per source row (prototyped: 30 → 24 at ingest) |
 | R-2b | Issue the leader deadline once, at completion | Medium–High | **Yes** (ADR-047) | R-2b (different design) | 2 statements per leader transaction |
 | R-12 | Decide the lock form of the fences | High | **Yes** (ADR-030 D7, ADR-047) | R-12 | 1 WAL frame per member transaction on SQLite; PostgreSQL unknown |
@@ -1914,8 +1939,8 @@ item (the prior review's M-2).
 
 #### 2. Recommended order
 
-1. **L1-2** (identity and budget tests, with the exemption set full) — first, so
-   every later item moves a pinned number.
+1. **L1-2** statement-budget pins have landed with L4-8; build identity and
+   bind-equivalence guards before the matching prebuild work.
 2. **E-5**, **E-1a part 1**, **L1-1 (routing arm)** — independent, no ruling,
    no dependency on each other.
 3. **E-3a**, then **E-3b** with **L1-1 (work-item arm)** — E-3b needs the
@@ -2236,7 +2261,7 @@ L2-4. No full suite and no testcontainer suite was run.
 and Appendix B top-10 item 9. New here: the cost is linear in field count and
 this is the dominant hashing cost on the row path.
 
-**Mechanism (verified at 1a7ff0e6).** `version_hash()`
+**Mechanism (verified at 1a7ff0e6, before the fix).** `version_hash()`
 (`contracts/schema_contract.py:394-433`) sorts the fields, builds a six-key
 dict per field, runs `canonical_json` and SHA-256 on every call; nothing is
 cached. `SchemaContract` is `@dataclass(frozen=True, slots=True)` (`:149`)
@@ -2255,7 +2280,7 @@ value); 11.00 per row on transform (3,417 calls, 1,239 instances, 5 values).
 112.5 µs per call at 10 fields, 1,077.7 µs at 100. Prototype: computations
 5 → 0 and 11 → 0 per row (with E-6b), recorded values identical.
 
-**Change.** Add a non-compared, non-init slot and fill it on first use:
+**Change — done.** A non-compared, non-init slot is filled on first use:
 
     _version_hash_memo: str | None = field(default=None, init=False, repr=False, compare=False, hash=False)
 
@@ -2268,10 +2293,9 @@ value); 11.00 per row on transform (3,417 calls, 1,239 instances, 5 values).
 
 `dataclasses.replace` re-initialises an `init=False` field, so `with_field`,
 `with_locked` and every other derived contract start with an empty memo.
-Soundness rests on `fields` being a tuple of frozen `FieldContract`; nothing
-in `__post_init__` (`:172-195`) checks that. Add
-`if type(self.fields) is not tuple: raise TypeError(...)` there and run the
-contract suites; if a caller passes a list, fix the caller. Rejected: a
+Soundness rests on `fields` being an exact tuple of frozen `FieldContract`.
+`__post_init__` now rejects a list or tuple subclass with `TypeError` before
+building the indices. Rejected: a
 module-level `functools.lru_cache` keyed on the contract value — Runtime-VAL
 refuses it at run start (measured, § 0 point 6); caching the
 `to_checkpoint_format()` dict — it is mutable and callers own it.
@@ -2285,21 +2309,20 @@ it does because a fresh instance has no memo.
 
 **Ruling needed.** No.
 
-**Verification.** `tests/unit/contracts/test_schema_contract.py`,
-`tests/unit/contracts/test_pipeline_row.py`,
-`tests/unit/contracts/test_contract_records.py`,
-`tests/unit/contracts/test_union_merge.py`, `tests/unit/core/checkpoint/`.
-New test: 100 calls on one instance run `canonical_json` once (count through
-`monkeypatch` on `elspeth.contracts.hashing.canonical_json`); negative control
-— `with_field(...)` on a memoised contract returns a different hash and
-computes again. New test that a contract built with a list for `fields`
-raises. Testcontainer not owed. Before/after: `L2/callers.py` rows for
-`version_hash` and `_compute_version_hash`.
+**Verification.** The contract tests pin one computation per instance,
+recomputation on a derived contract, and refusal of list-valued `fields`.
+The row-cost pins record the canonical-JSON count changes on both dialects.
+The tuple guard also refuses tuple subclasses. Testcontainer is not owed.
 
 **Expected saving.** About 11 µs × fields × calls per row: 0.3–0.6 ms per row
 on the five-to-seven-column workloads, 5.4 ms (gate) to 11.9 ms (two
 transforms) per row at 100 columns. Alone, without E-6b, transform pipelines
 keep 4 computations per row (1,239 instances over 310 rows).
+These CPU figures are estimated against the older baseline; re-measure against
+the pins. The landed change reduced `contracts.hashing.canonical_json` per row
+from 59 to 55 (linear) and 99 to 87 (fork) on SQLite and PostgreSQL; SQL and
+commit pins did not move. The runtime manifest changed, so a run interrupted
+before this upgrade is refused on resume.
 
 #### E-6b — Share the version hash across equal contracts rebuilt per row
 
@@ -2862,7 +2885,7 @@ the cProfile figure); more with wide contracts.
 
 | ID | Title | Risk | Ruling | Prior-review ID | Expected saving |
 |---|---|---|---|---|---|
-| E-6a | Memoise `version_hash()` on the instance | Low | No | E-6a | ~11 µs × fields × 5–11 calls per row; 0.3–0.6 ms narrow, 5–12 ms at 100 columns |
+| E-6a — done | Per-instance `version_hash()` memo and exact-tuple guard | Low | No | E-6a | Canonical JSON per row −4 linear, −12 fork on both dialects; older CPU estimate needs remeasurement against the pins |
 | E-6b | Share the hash across equal contracts (engine-side value interning) | Low | No | E-6b | Remaining 4 computations per row on transform pipelines → 0 |
 | L2-1 | Serialise once where an object is hashed and stored | Low | No | — | 1 canonicalisation per source row; 2 per external call |
 | L2-2 | Hash the source row once for its source state | Low | No | — | 1 per source row |
@@ -2880,7 +2903,7 @@ on 1,000 narrow transform rows, −17% on 310 rows of 100 columns.
 
 #### (2) Recommended order
 
-1. **E-6a**, then **E-6b**. Independent of everything else; most of the
+1. **E-6a** has landed; then **E-6b**. Independent of everything else; most of the
    measurable gain. E-6b should land with or before prior **E-5** so E-5's
    skip can key on the contract value.
 2. **L2-3**, **L2-2**, **L2-1**, **L2-10**. Independent, local, no ruling.
@@ -3070,7 +3093,7 @@ What the hooks are: `:994-1001`, three empty methods documented "Deterministic c
 - `_after_state_lock` — no consumer anywhere in `tests/`, `src/` or `elspeth-lints/` (grep for the name returns the definition and the call only).
 - `_after_witness_locks` — four consumers (`:179`, `:181`, `:490-491`, `:601`); called once per reservation at `:382` with tuples that already exist. Not part of the quadratic term.
 
-Second cost on the same lines, missed by the recon: the first argument is `self._backend_pid(conn)` (`:988-992`), which on PostgreSQL executes `SELECT pg_backend_pid()`. It is evaluated on every iteration whether or not a seam is installed, so on PostgreSQL the loop costs 4n round trips (lock, pid, lock, pid), not 2n. Static only; SQLite returns 0 without a query.
+Second cost on the same lines, missed by the recon: the first argument was `self._backend_pid(conn)` (`:988-992`), which on PostgreSQL executes `SELECT pg_backend_pid()`. One member reservation made three pid reads (before the loops and once after each of its two locks); the fix makes one. The PostgreSQL per-row statement pins moved 81 → 79 linear and 265 → 263 fork. SQLite issued no pid SQL.
 
 **Evidence.** Three ways, all agree.
 
@@ -3097,7 +3120,7 @@ Where it dominates. Per-row CPU for everything else on the gate workload is abou
 
 The shipped `large_scale_test` (10,000 rows, about 5,000 per sink) already pays about 2 × 8.4 s = 17 s, roughly 7% of the prior review's 246 s baseline, inside what that review reported as "sink flush 16%".
 
-**Change.** In `SinkEffectReservation._lock_and_validate_pipeline_witness`:
+**Change — done.** In `SinkEffectReservation._lock_and_validate_pipeline_witness`:
 
 - Read the backend pid once before the loops (`pid = self._backend_pid(conn)`); it cannot change on one connection inside one transaction.
 - Change the two per-item seams to carry a count and the id just locked, not the whole prefix:
@@ -3108,7 +3131,7 @@ The shipped `large_scale_test` (10,000 rows, about 5,000 per sink) already pays 
   ```
 
   and update the single consumer (`pause_after_first_token`: `len(token_ids) == 1` becomes `locked_count == 1`). `locked_tokens` is then unused and goes; `locked_states` stays (its rows are validated at `:376-381`).
-- If L3-2 lands at the same time the per-item seams become per-chunk seams instead; see there. L3-1 alone is the smallest change that removes the quadratic term and can ship first.
+- L3-2 remains open and can replace these per-item seams with per-chunk seams; see there. L3-1 removed the quadratic term independently.
 
 Rejected: calling the hook only when one is installed (the tests patch the instance, so detection needs a `getattr`/`__func__` identity probe, which the house rules and the dynamic-attribute gate forbid); passing the growing list itself (hands a mutable internal to a seam; the count is all the consumer needs); deleting `_after_state_lock` outright (harmless, but it removes a seam the lock-order suite may want; keep it cheap instead).
 
@@ -3118,9 +3141,9 @@ Rejected: calling the hook only when one is installed (the tests patch the insta
 
 **Ruling needed.** No.
 
-**Verification.** `tests/unit/core/landscape/test_sink_effect_reservation.py`, `tests/unit/core/landscape/test_sink_effect_reservation_integrity.py`; `tests/testcontainer/core/test_sink_effect_lock_order_postgres.py` (owed: the seam is consumed only there, so `pytest tests/ -m testcontainer -n 0`). New test: reserve 3,000 members with a counting seam and assert total items handed to the seams is O(n) (exactly n calls, each constant-size); negative control: the same assertion run against the current code must fail (it reports 4,501,500). Add a PostgreSQL assertion that a reservation issues at most one `pg_backend_pid` statement. Before/after: `run.sh gate_4000`, region `reserve_lock_loop`.
+**Verification.** `tests/unit/core/landscape/test_sink_effect_reservation.py` reserves 12 members and asserts 12 ordered, constant-size calls to each seam and one pid call. The PostgreSQL lock-order suite exercises the updated seam consumer. The row-cost pins record two fewer PostgreSQL pid statements per one-member reservation on both pipeline shapes. The Python-call linearity oracle's old known-superlinear list fails after the fix; its emptied list passes. The old 3,000-member assertion and large-reservation CPU remeasurement were not run.
 
-**Expected saving.** Measured term, removed entirely: 3.3e-7 × n² s per reservation — about 1.3 s per 2,000-member sink, 17 s on the 10,000-row shipped example, hours above 100,000 members per sink. On PostgreSQL also 2n round trips per reservation (static).
+**Measured effect.** The quadratic Python call growth is gone; the earlier 1.3 s per 2,000-member CPU estimate was not re-measured and needs remeasurement against the pins. PostgreSQL removed two pid statements per one-member reservation, as the per-row pins show; lock reads and commits did not move.
 
 ---
 
@@ -3132,7 +3155,7 @@ Rejected: calling the hook only when one is installed (the tests patch the insta
 
 The repository already has the batched, ordered form of exactly this lock, used by finalization on the same tokens: `core/landscape/data_flow/outcomes.py:138-164` (`lock_token_outcome_dependencies`): `SELECT token_id … WHERE token_id IN (chunk) ORDER BY token_id FOR UPDATE OF tokens`, ascending chunks, skipped on non-PostgreSQL dialects. `core/landscape/bind_budget.py:1-37` states the rule for it: a read over a caller-supplied collection runs in ascending `bind_budget_chunks` (900 binds) "on the caller's one connection and transaction … ascending order keeps a locking read in the global primary-key lock order".
 
-**Evidence.** `tag_sql["reserve_lock_loop"]` = 406 / 2,008 / 4,012 / 8,020 statements at 200 / 1,000 / 2,000 / 4,000 rows: 2.0 per row plus 3 per reservation. Linear part of the loop's CPU about 0.3 ms per member (fit of the table above after removing the L3-1 term). PostgreSQL round-trip cost not measured.
+**Evidence (older baseline, before L3-1).** `tag_sql["reserve_lock_loop"]` = 406 / 2,008 / 4,012 / 8,020 statements at 200 / 1,000 / 2,000 / 4,000 rows: 2.0 per row plus 3 per reservation. The loop's CPU estimate of about 0.3 ms per member needs remeasurement after L3-1. PostgreSQL round-trip cost was not measured.
 
 **Change.** Replace the two loops with chunked ordered locking reads:
 
@@ -3169,7 +3192,7 @@ Rejected: reusing `lock_token_outcome_dependencies` directly (it returns nothing
 
 **Verification.** Default suite files as L3-1 plus `tests/integration/pipeline/test_landscape_bind_budget.py`. Testcontainer owed: `tests/testcontainer/core/test_sink_effect_lock_order_postgres.py`, `tests/testcontainer/core/test_landscape_bind_budget_postgres.py`. New tests: (a) PostgreSQL, 2,000 members with the shared budget lowered to 100: record the statement sequence and assert the `FOR UPDATE` statements are 20 token statements in ascending id ranges followed by 20 state statements; negative control: reverse the chunk iteration in a test double and show the assertion fails. (b) two overlapping reservations plus a finalizer on interleaved member sets complete without `DeadlockDetected` (the existing `:490-491` test extended to more than one chunk). (c) a member token deleted between witness and lock still raises the "disappeared" error. Before/after: `tag_sql["reserve_lock_loop"]` falls from 2n+3 to 2·ceil(n/900)+3 on PostgreSQL and ceil(n/900)+3 on SQLite.
 
-**Expected saving.** 2 statements per sink row on SQLite (4,012 → 9 at 2,000 rows), about 0.3 ms CPU per row (about 1% of gate CPU). On PostgreSQL 4 round trips per sink row become a handful per reservation; value unknown until M-1 measures it.
+**Expected saving.** These figures are estimates against the older baseline, taken before L3-1 landed, and must be re-measured against the row-cost pins. On that baseline: 2 statements per sink row on SQLite (4,012 → 9 at 2,000 rows) and about 0.3 ms CPU per row (about 1% of gate CPU). On PostgreSQL the baseline counted 4 round trips per sink row; L3-1 removed the two per-member pid reads, so 2 per-member lock reads remain for this item to batch into a handful per reservation. The value is unknown until M-1 measures it.
 
 ---
 
@@ -3248,11 +3271,14 @@ Projection for this narrow row (about 75 bytes of data; real rows with LLM outpu
 | 100,000 | about 80 MB | 0.54–0.80 GB | 0.9–1.2 GB |
 | 1,000,000 | about 0.8 GB | 5.4–8.0 GB | 5.8–8.4 GB |
 
-Time bites before memory does: at 100,000 rows in one sink group the L3-1 term alone is about 55 minutes, and a local-file effect is refused above 1 GiB or 10,000,000 rows (`_local_file_effects.py:42-43`).
+The older baseline estimated about 55 minutes of L3-1 tuple-rebuild CPU at
+100,000 rows in one sink group; that work is gone and its replacement cost has
+not been measured. A local-file effect is refused above 1 GiB or 10,000,000
+rows (`_local_file_effects.py:42-43`).
 
 **Change.** No code change is proposed without the ruling. Options to put to the maintainer:
 
-- A. Keep the single end-of-run flush; fix what makes it expensive (L3-1, L3-2, E-4, L3-4, L3-8) and bound the transient memory by building `canonical_rows`/candidates/finalization members as one pass instead of five parallel lists. Recorded shape unchanged. This is my recommendation for now: after those fixes the flush is linear and its memory is the remaining issue, at about 1 GB per 100,000 narrow rows.
+- A. Keep the single end-of-run flush; build `canonical_rows`/candidates/finalization members as one pass instead of five parallel lists. L3-1 has removed the quadratic tuple rebuild; L3-2, E-4, L3-4 and L3-8 remain proposals. Recorded shape unchanged. The projected memory cost is about 1 GB per 100,000 narrow rows; the remaining flush time needs remeasurement before choosing this option.
 - B. Flush per sink when its pending count reaches a configured threshold, inside the source loop. Needs: an ADR under ADR-030 D2; a threshold floor of N/257 or removal of the chain cap; an incremental continuation for file sinks that does not re-serialise predecessors (which is its own audit question: today a replace-mode successor's content hash covers a full rebuild from durable members); a decision on output row order; a new public config key.
 - C. Keep one effect per group but stream its members from the journal in chunks rather than holding `TokenInfo` objects (memory only; effect identity unchanged). Removes the 0.8 kB per token but not the flush-time materialisation.
 
@@ -3484,8 +3510,8 @@ The round trip at `:810` is not waste: it normalises pipeline values (numpy, pan
 
 | ID | Title | Risk | Ruling | Prior-review ID | Expected saving |
 |---|---|---|---|---|---|
-| L3-1 | Stop rebuilding the locked-id tuple on every lock | Low | No | — | Removes 3.3e-7·n² s per reservation: 1.3 s per 2,000-member sink, about 17 s on the 10,000-row example, about 55 min at 100,000 members; 2n PostgreSQL round trips |
-| L3-2 | Take the reservation witness locks in ordered chunks | Medium | No | — | 2 statements per sink row on SQLite, 4 round trips per sink row on PostgreSQL; about 1% CPU on SQLite |
+| L3-1 — done | Constant-size lock seams and one pid read per reservation | Low | No | — | Quadratic call growth gone; PostgreSQL −2 statements per row on both pinned shapes. Older CPU estimate needs remeasurement against the pins |
+| L3-2 | Take the reservation witness locks in ordered chunks | Medium | No | — | Older-baseline estimate: 2 statements per sink row on SQLite, 4 round trips per sink row on PostgreSQL and about 1% CPU on SQLite; re-measure after L3-1 |
 | E-4 | Batch the sink-flush lineage loads | Low–medium | No | E-4 | 16 statements and 4 transactions per sink token; about 6% of gate CPU |
 | L3-3 | Decide whether sinks stay deferred to end of run | High (if changed) | Yes | — | Memory: about 7 kB of peak RSS per narrow row today; saving unknown until measured |
 | L3-4 | One progress checkpoint per durable sink write | Medium | Yes | — | 9 statements and 1 commit per sink token at the default cadence; about 7.8% of CPU |
@@ -3499,15 +3525,16 @@ The round trip at `:810` is not waste: it normalises pipeline values (numpy, pan
 
 ### 2. Recommended order and dependencies
 
-1. **L3-1** — independent, smallest, removes the only super-linear term on the common path.
-2. **E-4** — independent of everything in this lane; largest statement reduction in the sink phase.
-3. **E-9a** — independent; skip it if L3-4 is approved first, since it then saves almost nothing.
-4. **L3-2** — after L3-1 (same function; L3-2 replaces the per-item seams L3-1 retyped). Owes the testcontainer suite; batch it with E-4's testcontainer run.
-5. **L3-6** — independent; coordinate with whichever lane owns the ingest transaction and the fences (R-2a touches the same verb).
-6. Rulings, raised together because they interact: **L3-8** first (it is a failure, not only a cost, and its answer decides whether item 6 of the brief needs any further work), then **L3-4**, **L3-5**, **L3-3**. L3-3 should be decided after L3-1, L3-2, E-4, L3-4 and L3-8 are in and re-measured, because they remove most of what makes the single flush expensive.
-7. **L3-9** — only alongside L2's row-hashing change.
+L3-1 has landed. The remaining order is:
 
-Re-measure with `run.sh gate_2000`, `run.sh gate_4000` and `run.sh gateER_2000` after steps 1–4; the acceptance figures are `reserve_lock_loop` CPU linear in rows, `resolve_members` statements about 12 per call, and identical sink output digests.
+1. **E-4** — independent of everything in this lane; largest statement reduction in the sink phase.
+2. **E-9a** — independent; skip it if L3-4 is approved first, since it then saves almost nothing.
+3. **L3-2** — after L3-1 (same function; L3-2 replaces the per-item seams L3-1 retyped). Owes the testcontainer suite; batch it with E-4's testcontainer run.
+4. **L3-6** — independent; coordinate with whichever lane owns the ingest transaction and the fences (R-2a touches the same verb).
+5. Rulings, raised together because they interact: **L3-8** first (it is a failure, not only a cost, and its answer decides whether item 6 of the brief needs any further work), then **L3-4**, **L3-5**, **L3-3**. L3-3 should be decided after L3-2, E-4, L3-4 and L3-8 are in and re-measured, because they remove most of what makes the single flush expensive.
+6. **L3-9** — only alongside L2's row-hashing change.
+
+Re-measure with `run.sh gate_2000`, `run.sh gate_4000` and `run.sh gateER_2000` after the first four remaining steps; the acceptance figures are `reserve_lock_loop` CPU linear in rows, `resolve_members` statements about 12 per call, and identical sink output digests.
 
 ### 3. Examined and recommended NOT fixing
 
@@ -3520,7 +3547,7 @@ Re-measure with `run.sh gate_2000`, `run.sh gate_4000` and `run.sh gateER_2000` 
 
 ### 4. Not verified
 
-- PostgreSQL behaviour of everything here. Lock-order reasoning for L3-2 and the 2n `pg_backend_pid` queries in L3-1 are static; no testcontainer run was made (Docker not attempted in this lane).
+- PostgreSQL behaviour of the remaining proposals. L3-1's two-statement reduction per pinned row was measured on PostgreSQL; its older large-reservation CPU estimate was not re-measured.
 - 10,000 rows (brief asked "if it fits in about 3 minutes"; 4,000 took 190 s wall under contention). The 100k and 1M projections are extrapolations from 200–4,000 rows and from the isolated micro-benchmark up to 20,000 members.
 - Whether real LLM provider error text varies per row after `scrub_text_for_audit`; L3-8's many-group runs use a harness that makes error reasons distinct. The chain-cap failure itself is real code reached by a real run.
 - fsync latency and therefore the lock-hold time in L3-6 on production storage.
@@ -3571,9 +3598,11 @@ internals.
    quite right.** One statement is quadratic: the run-end ADR-019 I1a sweep
    (prior E-11). It is located and root-caused below. It is 0.2% of an 800-row
    fork run, so it explains none of item 1, but it grows as rows².
-3. **E-11 is not a missing index.** `ix_token_parents_parent` exists. SQLite
-   picks a join order that scans every outcome of the run for each fork
-   parent. A query rewrite fixes it with no schema change.
+3. **E-11 lacks a run-leading parent-edge index.**
+   `ix_token_parents_parent` exists, but no index starts with `run_id` and
+   `parent_token_id`. The original query is quadratic without statistics;
+   later probes rejected the rewrite on other permitted shapes. The index
+   variant also fails with stale statistics; E-11 is parked for a ruling.
 4. **The stale benchmark is wider than `register_node(run_id=…)`.** mypy
    reports 16 errors in `test_db_write.py` against six changed verbs, and the
    whole `stress` tier is broken the same way (23 of 30 tests), which neither
@@ -3637,102 +3666,68 @@ Reading:
   (`src/elspeth/engine/coalesce_executor.py:553`, `:790-796`), and the
   per-pass key sets in `run_intake_pass` are graph-sized.
 
-#### E-11 — Rewrite the run-end I1a orphan sweep so it drives from `token_parents`
+#### E-11 — Run-end I1a orphan sweep: parked pending a ruling
 
-**Finding.** Prior review E-11: one run-end query took 0.58 s at 1,000 fork
-rows and its site was not located. Recon § 1 reports fork/coalesce as
-super-linear. This query is the only super-linear SQL in the workload.
+**Finding.** The orphan sweep can be quadratic on an ordinary fork run without
+planner statistics. In the current round-eight probe, 60 → 120 forks cost
+12,769 → 47,089 SQLite VM steps. The older 225 ms observation at 800 fork
+rows describes a different tree and workload; its saving estimate must be
+re-measured against the pins.
 
-**Mechanism (verified at 1a7ff0e6).**
-`OutcomeRepository.find_orphaned_transient_parents`
-(`src/elspeth/core/landscape/data_flow/outcomes.py:762-790`) is called by
-`sweep_deferred_invariants_or_crash` (`:810-812`), reached once per run from
-`src/elspeth/engine/orchestrator/leader_drain.py:383` (and from
-`resume.py:1048`, `:1419`). The correlated `NOT EXISTS` joins `token_parents`
-to an aliased `token_outcomes` with `child_outcomes.run_id == run_id` in the
-`ON` clause. `EXPLAIN QUERY PLAN` on the produced DB:
+**Mechanism.** `OutcomeRepository.find_orphaned_transient_parents` tests each
+transient fork or expand parent for a child outcome. Without statistics,
+SQLite may search all outcomes for each parent. The existing parent index
+starts with `parent_token_id`; no index on `token_parents` leads with both
+`run_id` and `parent_token_id`. A run filter in SQL does not by itself make
+the access cost independent of other runs.
 
-```
-SEARCH token_outcomes USING INDEX ix_token_outcomes_run_token (run_id=?)
-CORRELATED SCALAR SUBQUERY 1
-  SEARCH child_outcomes USING INDEX ix_token_outcomes_run_token (run_id=?)
-  SEARCH token_parents USING INDEX sqlite_autoindex_token_parents_1 (token_id=? AND parent_token_id=?)
-```
+**Forms examined.** The figures below are SQLite VM steps on permitted audit
+shapes, not elapsed time or PostgreSQL measurements.
 
-For each fork-parent outcome, SQLite walks **every** outcome of the run and
-probes `token_parents` by primary key. With P parents and N outcomes that is
-P × N probes. The index that would serve the intended order,
-`ix_token_parents_parent (parent_token_id)`, exists and is not chosen: the
-database has no `sqlite_stat1`, so the planner rates `run_id = ?` as selective,
-and in a one-run audit DB it selects every row.
+| Form | No statistics | Fresh statistics | Stale statistics | Limitation |
+|---|---|---|---|---|
+| Original correlated join | 60 → 120 forks: 12,769 → 47,089 steps | Same fork shape: 2,145 → 4,245 | Same fork shape: 24,326 → 91,766 | Quadratic without statistics and with stale statistics |
+| Nested correlated `EXISTS` | One parent with 20,000 children and one late outcome: 280,057 steps versus original's 70 | Skewed shapes also regress | Not established as a general fix | Forces edge-first work on sparse children |
+| Uncorrelated witness join with `NOT IN` | Shared child with repeated outcomes: 1,003 → 2,003 stored rows cost 506,783 → 2,013,533 steps | Same shape after ANALYZE: 321,033 → 1,267,033 steps | Not established as a general fix | Repeated outcomes multiply witness rows quadratically in stored data; PostgreSQL `NOT IN` can use a non-spillable SubPlan |
+| New `(run_id, parent_token_id)` index with anti-join | 500 → 1,000 forks: 25,567 → 51,067 | Same: 25,562 → 51,062 | Same: 3,157,355 → 12,564,605 | The index alone does not prevent quadratic planning |
+| Two-step candidate and witness read on existing indexes | 500 → 1,000 forks: 23,582 → 47,130 | Same: 23,578 → 47,126 | Same: 23,123 → 53,174 | The prototype reads separate snapshots and moves the integrity predicate into Python |
 
-**Evidence.** `python sqlcount.py … -- run --settings work/fork_<n>/settings.yaml --execute`:
-2.8 / 16.8 / 49.6 / 224.7 ms at 100 / 200 / 400 / 800 rows, about
-0.35 µs × rows². `explain.py` prints the plan above at 100 and 400 rows.
-`whatif_sweep.py` runs the as-issued and rewritten forms on an in-memory copy
-of each produced DB:
+The dense 100 × 100 case costs 82,832 steps versus the original's 3,331,
+but is linear in its 10,000 stored edges. It disproves the earlier
+slowdown-ratio target, not linearity in stored data.
 
-| Fork rows | As issued | Rewritten | Result sets equal | Injected orphan reported by both |
-|---:|---:|---:|---|---|
-| 100 | 2.47 ms | 0.16 ms | yes | yes |
-| 400 | 46.50 ms | 0.80 ms | yes | yes |
-| 800 | 214.73 ms | 2.35 ms | yes | yes |
+**Decision.** The original no-new-index constraint was based on the mistaken
+claim that the needed index already existed. The maintainer approved an index
+on 2026-11-17; review then showed that the index alone is insufficient. The
+index variant has three blockers: an existing external-PostgreSQL web store
+without the new index would be refused at startup before it could be repaired;
+stale `sqlite_stat1` still gives quadratic work; and whole-module source
+bindings in the mutation-fencing gate must be reviewed and re-pinned. Its
+PostgreSQL performance has not been measured. One EXPLAIN run of the index
+variant, with nested loops disabled, showed an anti/semi-join plan is
+available. It did not show that PostgreSQL chooses that plan under normal
+settings, nor measure runtime scaling or actual spill.
 
-Rewritten plan: `SEARCH token_parents USING INDEX ix_token_parents_parent
-(parent_token_id=?)`, then `SEARCH child_outcomes EXISTS USING COVERING INDEX
-ix_token_outcomes_run_token (run_id=? AND token_id=?)`.
+The two-step alternative is linear in every measured SQLite cell with the
+existing indexes. It needs one snapshot across the candidate and witness
+reads, including `REPEATABLE READ` on PostgreSQL, plus a concurrent-writer
+proof. It also reverses this item's earlier rejection of joining in Python,
+which moved the integrity predicate out of SQL. The three choices are a
+snapshot-safe two-step read, a repaired index variant, or leaving the query.
+No choice has been made. Target 0.8.16 unless ruled otherwise.
 
-**Change.** In `find_orphaned_transient_parents` only, replace the join inside
-the subquery with a nested `EXISTS`, which leaves the planner one table per
-level:
+**Must not change.** A `fork_parent` or `expand_parent` `TRANSIENT` outcome is
+an orphan iff no parent edge in its run has a child with any outcome in that
+run. Preserve bag multiplicity, audit refusal, read-only operation and the
+sweep's run-end position.
 
-```python
-child_outcomes = token_outcomes_table.alias("child_outcomes")
-child_has_outcome = (
-    select(literal(1))
-    .where(child_outcomes.c.token_id == token_parents_table.c.token_id)
-    .where(child_outcomes.c.run_id == run_id)
-    .exists()
-)
-child_witness = (
-    select(literal(1))
-    .select_from(token_parents_table)
-    .where(token_parents_table.c.parent_token_id == token_outcomes_table.c.token_id)
-    .where(token_parents_table.c.run_id == run_id)
-    .where(child_has_outcome)
-)
-```
-
-The outer query is unchanged. Rejected: a new index (none is missing, and it
-would be a schema change: migration, testcontainer, compatibility); `ANALYZE`
-at run end (writes planner tables into the audit DB and still depends on the
-planner); `CROSS JOIN` / `INDEXED BY` (SQLite-only syntax); loading both tables
-and joining in Python (moves an integrity predicate out of SQL).
-
-**Must not change.** The predicate: a `fork_parent` / `expand_parent`
-`TRANSIENT` outcome is an orphan iff no `token_parents` row for it in this run
-has a child with any `token_outcomes` row in this run. Same rows, same
-`AuditIntegrityError` text, still read-only, still run at the same point.
-
-**Risk.** Low. One read-only query; logically equivalent form.
-
-**Ruling needed.** No.
-
-**Verification.** Existing: `tests/integration/test_adr_019_cross_table_invariants.py`,
-`tests/integration/test_adr_019_sweep_durability.py`,
-`tests/unit/core/landscape/test_data_flow_repository.py`,
-`tests/integration/pipeline/test_unsettled_group_end_of_run_backstop.py`. New:
-a scaling test that builds fork-shaped rows at two sizes and counts SQLite VM
-steps for this query through `sqlite3.Connection.set_progress_handler`; the
-ratio for 2× rows must stay under 2.5 (today it is about 4). Negative control:
-the same test run against the current query text must fail. The PostgreSQL
-testcontainer suite is owed (Landscape SQL shape changed, and the query also
-runs there).
-
-**Expected saving.** 225 ms → about 2 ms at 800 fork rows (measured on a
-copy). Extrapolated from the quadratic fit, not measured: about 35 s at
-10,000 fork rows and about an hour at 100,000. Zero for pipelines with no
-fork or expand parents.
+**Acceptance.** The chosen implementation must scale linearly in the run's
+stored rows on every permitted shape with no, fresh and stale statistics;
+its cost must be independent of other runs. PostgreSQL needs a spillable
+anti/semi-join plan or an equivalently bounded snapshot-safe approach.
+Measure multi-parent children with repeated outcomes, dense graphs and other
+runs in the same database. Run the PostgreSQL testcontainer and concurrency
+proofs before claiming completion.
 
 ---
 
@@ -4463,10 +4458,11 @@ through `build_production_graph` (which calls
 `ExecutionGraph.from_plugin_instances`), the real `Orchestrator`, and
 `LandscapeDB.from_url("sqlite:///<tmp>/audit.db")`.
 
-**Evidence.** Measured at this commit, sizes 16 / 32 / 48 after a discarded
-4-row warm-up, main thread only:
+**Evidence.** The older prototype measured sizes 16 / 32 / 48 after a
+discarded 4-row warm-up, main thread only. It used an older tree and pipeline
+shapes that differ from the pinned test:
 
-| Per source row | Linear | Fork/coalesce |
+| Per source row | Older linear | Older fork/coalesce |
 |---|---:|---:|
 | SQL statements (`after_cursor_execute`) | 68 | 381 |
 | Commits | 8 | 51 |
@@ -4474,6 +4470,13 @@ through `build_production_graph` (which calls
 | `rfc8785.dumps` (every canonical serialisation) | 46 | 108 |
 | `core.canonical.canonical_json` | 12 | 42 |
 | `core.canonical.stable_hash` | 9 | 28 |
+
+The landed `test_hot_path_row_cost.py` uses sizes 2 / 4 / 6, the production
+orchestrator, an every-row checkpoint and dialect-specific exact fixed/per-row
+pins. Current SQLite statement/commit pairs are linear `(586, 97)` / `(67,
+13)` and fork `(620, 338)` / `(70, 45)`; PostgreSQL pairs are linear `(500,
+79)` / `(67, 13)` and fork `(526, 263)` / `(70, 45)`. It also pins four
+hash/JSON counters and each SQL verb/table bucket on both dialects.
 
 All second differences are zero. Negative control: a mutant that issues one
 extra `SELECT 1` inside `begin_node_state` moves statements per row from 68
@@ -4484,7 +4487,7 @@ shapes, `sink_effect_reservation.py:358` and `:370` `<genexpr>` with
 second difference 256 = 16² (`proto/v3-nonlinear-_linear.txt`,
 `…-_fork.txt`) — the known quadratic.
 
-Things the prototype had to handle, which the real test must keep:
+Things the older prototype had to handle, considered in the landed test:
 
 - Sizes stay below 64 rows: scheduler maintenance and the sink-terminal batch
   fire every 64 drains (32 → 64 showed 68.375 statements per row).
@@ -4497,20 +4500,13 @@ Things the prototype had to handle, which the real test must keep:
   prototype measured 0). Count at the chokepoints instead: `rfc8785.dumps`
   and `core.canonical._primitive_canonical_json` / `_primitive_stable_hash`.
 
-**Change.** Add `tests/unit/engine/test_hot_path_row_cost.py` (default
-suite; about 30 s serial for the pins, about 75 s more for the profiled
-oracle, so put the oracle behind the `slow` marker or run it at two shapes ×
-three small sizes only):
-
-1. `test_per_row_counts_are_pinned[linear|fork]` — asserts the six integers
-   above exactly, and that each second difference is zero.
-2. `test_extra_statement_is_detected` — the negative control above, kept in
-   the suite.
-3. `test_no_engine_function_is_superlinear[linear|fork]` — the second
-   difference oracle over `elspeth/` functions with an explicit allowlist that
-   today holds the two reservation generator expressions; the sink lane's fix
-   deletes the allowlist entries, and a stale entry must fail the test.
-4. `test_i1a_sweep_is_linear` from E-11.
+**Change — done.** `tests/unit/engine/test_hot_path_row_cost.py` runs the
+linear and fork shapes through the production orchestrator on SQLite and
+PostgreSQL. SQLAlchemy events count statements, commits and verb/table
+buckets; a profiler counts four hash/JSON functions and checks that no engine
+function's call count grows super-linearly. The synthetic quadratic-function
+control names its offender. L3-1 emptied the oracle's known-superlinear list.
+The E-11 SQL query plan is outside this Python-call oracle and remains parked.
 
 Pin policy, in the test's docstring as in
 `tests/unit/web/composer/test_schema_contract_walk_cost.py`: pins are exact,
@@ -4533,11 +4529,11 @@ which is the point; SQLAlchemy upgrades do not change statement counts.
 
 **Ruling needed.** No.
 
-**Verification.** The prototype is the evidence that it is feasible and that
-each oracle goes red (mutant +2 statements; known quadratic reported).
-PostgreSQL: not owed for the test itself; a parametrised testcontainer
-variant of test 1 would give M-1 its statement counts for free and is
-recommended as a follow-up.
+**Verification.** The exact statement pins were controlled with an injected
+statement, and the synthetic quadratic helper makes the call-count oracle
+fail with its function name. Both dialects have pinned cases; the PostgreSQL
+cases run under the testcontainer marker. The older prototype's mutant and
+counts are historical evidence only.
 
 **Expected saving.** None directly. It is the before/after instrument for
 every other lane's fix: each prebuilt statement, removed read-back or folded
@@ -4615,7 +4611,7 @@ the stated noise on a quiet box.
 
 | ID | Title | Risk | Ruling | Prior-review ID | Expected saving |
 |---|---|---|---|---|---|
-| E-11 | Rewrite the run-end I1a sweep to drive from `token_parents` | Low | No | E-11 | 225 → 2 ms at 800 fork rows; quadratic term removed (about 35 s at 10k rows, extrapolated) |
+| E-11 — parked | Resolve the run-end I1a sweep after a maintainer ruling | Open | Yes | E-11 | Older 225 → 2 ms estimate is invalid as a general fix; re-measure against the pins |
 | E-9c | Skip intake reads when the leader produced nothing to adopt | Medium | Yes (ADR-029 § E.2) | E-9c | About 2.5% of fork CPU; 6 of 8 reads per row |
 | L4-1 | No Landscape probe for a coalesce group held open in memory | Low | No | — | 2 probes (10 round trips) per fork row; CPU unknown until measured |
 | L4-2 | Retry wrapper | — | No | — | Under 0.1%; recommend not fixing |
@@ -4627,16 +4623,17 @@ the stated noise on a quiet box.
 | L4-5 | Cross-row concurrency at external calls | B Medium, C High | Yes (ADR-001, ADR-030) | — | Up to W× wall on external-call pipelines |
 | L4-6 | Rewrite stale benchmarks and stress fixtures | Low | No | — | Restores measurement |
 | L4-7 | Call-shape type check and tiny-N smoke for perf tests | Low | No | — | Prevents rot |
-| L4-8 | Exact per-row count pins and linearity oracle | Low | No | — | The instrument for all other fixes |
+| L4-8 — done | Exact per-row count pins and linearity oracle, SQLite and PostgreSQL | Low | No | — | The instrument for all other fixes |
 | H-1, H-2, M-1, M-2, M-3 | Committed, reproducible measurement procedure | Low | No | H-1, H-2, M-1, M-2, M-3 | Makes savings checkable |
 
 #### 2. Recommended order
 
-1. **L4-8** first. Every later fix is proved by a pin change, and the pins
-   exist today (68 / 8 and 381 / 51 / 8).
+1. **L4-8** has landed. Every later fix re-pins its exact count changes;
+   current SQLite per-row statements/commits are 97 / 13 linear and 338 / 45
+   fork; PostgreSQL is 79 / 13 and 263 / 45.
 2. **L4-6**, then **L4-7** (the guard is only meaningful once the tests pass).
 3. **H-1 / H-2** alongside, so M-2 can be run by anyone.
-4. **E-11** (independent; owes testcontainer).
+4. **E-11** is parked pending a maintainer ruling, targeted at 0.8.16 unless ruled.
 5. **E-8a**, then **L4-4** (independent of each other; E-8a first because it
    is the larger and makes R-8 moot).
 6. **L4-1** (independent; moves the fork pin by 2 probes).
@@ -4648,7 +4645,8 @@ the stated noise on a quiet box.
 #### 3. Examined and recommended not to fix
 
 - **Fork/coalesce "super-linearity"** — not reproduced; nothing to fix beyond
-  E-11 and the sink lane's reservation loop.
+  E-11. The sink lane's reservation loop was the other super-linear site and
+  L3-1 has fixed it.
 - **Retry wrapper (L4-2)** — 11.65 µs per token×node.
 - **Per-node loop (L4-3)** — under 0.4% of profiled time in total.
 - **VAL manifest cache (E-8b)** — the cache key would be the manifest.
@@ -4675,7 +4673,7 @@ the stated noise on a quiet box.
   call sites and the restore paths were counted, not each read.
 - `row_union_executor.py` and the collector executor were not read for an
   equivalent of the L4-1 probe.
-- PostgreSQL behaviour of the E-11 rewrite (no testcontainer run here), and
+- PostgreSQL performance of the E-11 alternatives, and
   everything in M-1.
 - The 0.05 s digest prototype was checked on litellm 1.102.2 only.
 - Budget-assertion results in `perf/performance-all.log` were taken while
@@ -5127,7 +5125,7 @@ Every `*.from_dict(...)`, `create_schema_from_config(...)` and `re.compile(...)`
 - `plugins/infrastructure/base.py:1214-1218`: the stamped contract.
 - `plugins/infrastructure/base.py:942-946`: the aligned contract, when mode or lock differ from the declaration.
 
-`SchemaContract` and `FieldContract` are frozen, slotted dataclasses (`contracts/schema_contract.py:68,149`), so equal contracts are interchangeable, but each row gets new objects. That defeats any per-instance memo (E-6a) and makes the engine's identity test at `engine/executors/transform.py:800` true on every row.
+`SchemaContract` and `FieldContract` are frozen, slotted dataclasses (`contracts/schema_contract.py:68,149`), so equal contracts are interchangeable, but each row gets new objects. That limits the landed per-instance memo (E-6a) and makes the engine's identity test at `engine/executors/transform.py:800` true on every row.
 
 **Evidence.** Counts on the LLM run: 6.00 `SchemaContract.__init__` per row, of which three are the plugin-side sites above (`contract_propagation.py:51`, `base.py:1214`, `base.py:942`) and three are engine or Landscape sites. Construction itself is cheap: 2.5 µs for 8 fields.
 
@@ -5293,7 +5291,7 @@ Savings overlap and are not additive.
 
 1. **L5-2**, then **L5-1**. L5-2 is the smaller edit to the same constructor and makes `self._client` optional, which L5-1's `transport_client` parameter builds on. Together they remove every per-row TLS context outside the SSRF path.
 2. **L5-4** and **L5-5**. Independent of everything else; each is a few lines plus the equality test that proves it.
-3. **L5-7**, then **E-9b**, then **E-6b**. L5-7 makes the stamp table read-only and cached; E-9b removes what is left of the `ValueTransform` recomputation; E-6b gives lane L2's E-6a a stable object to memoise on, so land it with or just before E-6a.
+3. **L5-7**, then **E-9b**, then **E-6b**. L5-7 makes the stamp table read-only and cached; E-9b removes what is left of the `ValueTransform` recomputation; E-6b gives the landed E-6a memo a stable object to memoise on.
 4. **L5-3** only after its ruling.
 5. **L5-6** only after its ruling, and only if the maintainer wants the audit shape changed for its own sake.
 
@@ -5899,7 +5897,7 @@ Rejected: deleting the check and relying on the foreign key (changes the error a
 | `lock_worker_membership_row` after the membership fence in `claim_ready` (`scheduler/leases.py:87`, `:211`) | 3 | The fence `UPDATE` on the same `run_workers` row, first in the same transaction, already holds a stronger lock on PostgreSQL, and SQLite ignores `FOR SHARE` (`leases.py:83-85`). Removing it is a lock-shape change in the eviction serialisation fix (`elspeth-6903f82511`) for 3 statements per fork row and 0 per linear row. Not recommended without M-1 |
 | `validate_work_item_references` token and row selects outside ingest (`work_items.py:194-219`) | 8 | They are the cross-check that keeps L6-7 honest, and the rows were written by an earlier transaction, so there is no in-transaction witness. Only an R-7-style fold could remove them |
 | `finalize_coalesce_effect`: lock, before-image and after-image selects of the parent states around one `UPDATE` (`execution/node_states.py:808`, `:832`, `:862`, `data_flow/tokens.py:1233`) | 3–4 | E-3a's `RETURNING` pattern applies to `_complete_node_states_many`, but that function is not in E-3a's site list (`plan:1238-1244`). Add it there rather than as a new item |
-| Run-end group settlement: three selects per lineage group (`core/checkpoint/recovery.py:356`, `:372`, `:391`), reached from `assert_bound_groups_settled_from_audit` (`run_status.py:65`) | 6 | Linear in groups and run once at finalize, so not a hot-path term; it is the same per-group point-select shape E-11 replaced with a set query for the orphan sweep. Counted here, not read |
+| Run-end group settlement: three selects per lineage group (`core/checkpoint/recovery.py:356`, `:372`, `:391`), reached from `assert_bound_groups_settled_from_audit` (`run_status.py:65`) | 6 | Linear in groups and run once at finalize, so not a hot-path term; E-11's orphan sweep remains parked. Counted here, not read |
 | `is_release_group` read transaction (`engine/tokens.py:231`) | 4 | One immutable `group_records.kind` read per row; 2 statements after E-10. Could be memoised per group; too small to design |
 | Expand and aggregation verbs | — | Not traced. `fork_coalesce` has no expand and no batch. L6-7 and L6-8 apply to `expand_token` by reading (`data_flow/tokens.py:1505-1506`) |
 
@@ -5926,9 +5924,9 @@ Savings overlap with each other and with E-10, E-3a and E-1a; do not add them.
 1. **L6-6** — no dependency, no gate change, about 1% of every row. It can go in
    the plan's step 4 ("independent, local"). Land it before E-3a so E-3a's
    `RETURNING` uses the constant.
-2. **L6-4** — independent of everything; add its count pin to L4-8 first so the
+2. **L6-4** — independent of everything; extend the landed L4-8 count pins so the
    7 → 1 is a pinned number moving.
-3. **L6-7**, then **L6-8**, then **L6-9** — after L4-8's fork pin exists, in one
+3. **L6-7**, then **L6-8**, then **L6-9** — using L4-8's landed fork pin, in one
    testcontainer batch with the plan's step 5. L6-8 before E-10 gives the
    larger measured delta; after E-10 it is still 6 transactions. L6-9 after
    E-3b, which removes the ingest occurrence.
