@@ -20,7 +20,7 @@ import structlog
 
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.batch_runtime import BatchTransformRuntime
-from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.errors import FrameworkBugError, SchedulerLeaseLostError
 from elspeth.plugins.infrastructure.batching.ports import OutputPort
 from elspeth.plugins.infrastructure.batching.row_reorder_buffer import (
     RowReorderBuffer,
@@ -35,6 +35,9 @@ if TYPE_CHECKING:
     from elspeth.contracts.contexts import TransformContext
     from elspeth.contracts.identity import TokenInfo
     from elspeth.contracts.schema_contract import PipelineRow
+
+# Engine wait for one row's result when a transform states no larger bound.
+DEFAULT_BATCH_WAIT_TIMEOUT_SECONDS: float = 3600.0
 
 _logger = structlog.get_logger(__name__)
 
@@ -145,7 +148,7 @@ class BatchTransformMixin(BatchTransformRuntime):
         output: OutputPort,
         name: str | None = None,
         max_workers: int | None = None,
-        batch_wait_timeout: float = 3600.0,
+        batch_wait_timeout: float = DEFAULT_BATCH_WAIT_TIMEOUT_SECONDS,
     ) -> None:
         """Initialize batch processing infrastructure.
 
@@ -375,6 +378,18 @@ class BatchTransformMixin(BatchTransformRuntime):
             from elspeth.contracts import ExceptionResult
 
             if isinstance(result, ExceptionResult):
+                if isinstance(result.exception, SchedulerLeaseLostError):
+                    # The evicted attempt's own lease is gone; its row is
+                    # already recorded as timed out, so this loss belongs to
+                    # no live row and is not a run-level fence failure
+                    # (staging 0.8.12, 2026-11-16).
+                    _logger.debug(
+                        "late_result_discarded",
+                        token_id=token.token_id,
+                        state_id=state_id,
+                        reason="lease_lost_after_eviction",
+                    )
+                    return
                 self._raise_orphaned_late_failure(result.exception, token, state_id)
             _logger.debug(
                 "late_result_discarded",

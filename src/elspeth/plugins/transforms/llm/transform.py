@@ -48,6 +48,7 @@ from elspeth.core.llm_profiles import require_lowered_llm_profile_alias
 from elspeth.core.llm_provider_validation import LLM_PROVIDER_NAMES
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputPort
+from elspeth.plugins.infrastructure.batching.mixin import DEFAULT_BATCH_WAIT_TIMEOUT_SECONDS
 from elspeth.plugins.infrastructure.clients.llm import ContextLengthError, LLMClientError
 from elspeth.plugins.infrastructure.pooling import PooledExecutor, RowContext
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
@@ -1274,7 +1275,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f3e9f297b64e5bdf"
+    source_file_hash: str | None = "sha256:a6d5802b42ad44f0"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1869,9 +1870,14 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         query plus headroom.
         """
         query_count = len(self._strategy.query_specs) if isinstance(self._strategy, MultiQueryStrategy) else 1
-        return (
+        retry_bound = (
             float(self._max_capacity_retry_seconds) + query_count * self._provider_request_timeout_seconds() + _BATCH_WAIT_HEADROOM_SECONDS
         )
+        # The query pool runs one row's batch at a time, so a pooled row also
+        # queues behind earlier rows; that time is outside the retry bound.
+        # Keep the one-hour batch-wait default as a floor, as the other batch
+        # transforms do (staging 0.8.12, 2026-11-16).
+        return max(DEFAULT_BATCH_WAIT_TIMEOUT_SECONDS, retry_bound)
 
     def created_output_fields(self) -> tuple[FieldDefinition, ...]:
         """Every field this transform creates, typed by the code that writes it (ADR-050).
