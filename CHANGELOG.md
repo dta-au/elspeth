@@ -6,6 +6,19 @@ All notable changes to ELSPETH are documented here.
 
 ## Unreleased (0.8.15)
 
+### Upgrade notes
+
+- A run interrupted before upgrading cannot be resumed after it: the
+  schema-contract module changed, so the runtime manifest recorded at run start
+  no longer matches and resume refuses (no data is changed; re-run or finish
+  interrupted runs before upgrading).
+
+### Engine and runtime
+
+- `SchemaContract.version_hash()` is computed once per contract instance.
+  Constructing a `SchemaContract` with `fields` that is not a plain tuple now
+  raises `TypeError`.
+
 ### Web Composer
 
 - The pipeline graph no longer blanks and redraws its connectors when the view
