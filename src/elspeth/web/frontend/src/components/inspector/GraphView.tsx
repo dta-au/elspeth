@@ -959,7 +959,6 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
     [],
   );
 
-  // Node click handler — toggle selection
   // Only the measured sizes React Flow reports are kept: the graph is
   // display-only, so position and selection changes stay owned by the stores.
   const [measuredNodeSizes, setMeasuredNodeSizes] = useState<
@@ -980,6 +979,7 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
     });
   }, []);
 
+  // Node click handler — toggle selection
   const onNodeClick: NodeMouseHandler = useCallback(
     (_event, node) => {
       setActiveEdgeId(null);
