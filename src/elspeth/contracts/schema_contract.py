@@ -168,6 +168,7 @@ class SchemaContract:
     # Computed indices - populated in __post_init__
     _by_normalized: Mapping[str, FieldContract] = field(default_factory=dict, repr=False, compare=False, hash=False)
     _by_original: Mapping[str, str] = field(default_factory=dict, repr=False, compare=False, hash=False)
+    _version_hash_memo: str | None = field(default=None, init=False, repr=False, compare=False, hash=False)
 
     def __post_init__(self) -> None:
         """Build O(1) lookup indices after initialization.
@@ -175,6 +176,8 @@ class SchemaContract:
         Raises:
             ValueError: If duplicate normalized_name found in fields
         """
+        if type(self.fields) is not tuple:
+            raise TypeError("SchemaContract fields must be a tuple")
         # Defense-in-depth: validate uniqueness before building indices
         # (with_field() also checks, but direct construction must be safe)
         normalized_names = [fc.normalized_name for fc in self.fields]
@@ -410,6 +413,14 @@ class SchemaContract:
         Returns:
             32-character hex hash string
         """
+        memo = self._version_hash_memo
+        if memo is None:
+            memo = self._compute_version_hash()
+            object.__setattr__(self, "_version_hash_memo", memo)
+        return memo
+
+    def _compute_version_hash(self) -> str:
+        """Compute the checkpoint hash from the immutable serialized fields."""
         from elspeth.contracts.hashing import canonical_json
 
         field_defs = [
