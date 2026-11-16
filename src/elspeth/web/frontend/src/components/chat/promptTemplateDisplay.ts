@@ -133,7 +133,8 @@ interface SurfaceQuery {
 }
 
 interface MultiQuerySurface {
-  nodePromptTemplate: string;
+  /** The optional shared template; null when omitted or null in the options. */
+  nodePromptTemplate: string | null;
   systemPrompt: string | null;
   queries: SurfaceQuery[];
 }
@@ -177,18 +178,20 @@ function wellFormedQueryEntries(
 
 /**
  * The multi-query prompt surface, mirroring interpretation_state.py
- * `multi_query_prompt_surface_from_options`: null unless a string
- * `prompt_template` sits beside a `queries` value with at least one
- * well-formed entry (every other shape is a single-prompt node there too).
+ * `multi_query_prompt_surface_from_options`: null unless a `queries` value
+ * with at least one well-formed entry sits beside a string, omitted or null
+ * `prompt_template` (every other shape is a single-prompt node there too).
+ * The shared template is optional: every query may supply its own.
  */
 function multiQuerySurfaceFromOptions(
   options: Record<string, unknown>,
 ): MultiQuerySurface | null {
   const rawQueries = options.queries;
   const promptTemplate = options.prompt_template;
+  if (rawQueries === undefined || rawQueries === null) return null;
   if (
-    rawQueries === undefined ||
-    rawQueries === null ||
+    promptTemplate !== undefined &&
+    promptTemplate !== null &&
     typeof promptTemplate !== "string"
   ) {
     return null;
@@ -207,7 +210,7 @@ function multiQuerySurfaceFromOptions(
   });
   const systemPrompt = options.system_prompt;
   return {
-    nodePromptTemplate: promptTemplate,
+    nodePromptTemplate: typeof promptTemplate === "string" ? promptTemplate : null,
     systemPrompt: typeof systemPrompt === "string" ? systemPrompt : null,
     queries,
   };
@@ -267,6 +270,20 @@ function segmentsFromSurface(
     lines.push(
       "Node-level prompt_template: not used (every query supplies its own template).",
     );
+  }
+
+  if (surface.nodePromptTemplate === null) {
+    // No shared template: the per-query templates are the whole surface, as
+    // in the backend draft. A query that falls back to the missing template
+    // has no prompt to show, so the card must not offer approval.
+    if (users.length > 0) {
+      lines.push("(no node-level prompt_template is set)");
+    }
+    return {
+      segments: [{ kind: "text", text: lines.join("\n") }],
+      usedFallback: false,
+      reviewAvailable: users.length === 0,
+    };
   }
 
   const requirements = parseRequirements(options.interpretation_requirements);
