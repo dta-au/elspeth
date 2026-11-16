@@ -20,12 +20,14 @@ import {
   Handle,
   MarkerType,
   Position,
+  useUpdateNodeInternals,
   type Node,
   type Edge,
   type EdgeProps,
   type EdgeTypes,
   type NodeProps,
   type NodeTypes,
+  type NodeChange,
   type NodeMouseHandler,
   type OnInit,
   type ReactFlowInstance,
@@ -331,8 +333,25 @@ function parallelLanePath(
 }
 
 function PipelineGraphNode({
+  id,
   data,
 }: NodeProps<PipelineGraphNodeModel>): JSX.Element {
+  // Measured sizes are carried across node rebuilds (see measuredNodeSizes), so
+  // React Flow keeps this node's handle bounds. A route change can add, drop or
+  // move a parallel handle without resizing the node, so re-read the handles
+  // whenever their set or placement changes. React Flow measures a node itself
+  // when it mounts, so only a later change needs the explicit re-read.
+  const updateNodeInternals = useUpdateNodeInternals();
+  const handleLayout = [
+    ...(data.parallelTargetHandles ?? []).map((handle) => `t:${handle.id}@${handle.offsetPercent}`),
+    ...(data.parallelSourceHandles ?? []).map((handle) => `s:${handle.id}@${handle.offsetPercent}`),
+  ].join("|");
+  const readHandleLayout = useRef(handleLayout);
+  useEffect(() => {
+    if (readHandleLayout.current === handleLayout) return;
+    readHandleLayout.current = handleLayout;
+    updateNodeInternals(id);
+  }, [id, handleLayout, updateNodeInternals]);
   return (
     <>
       <Handle
@@ -941,6 +960,26 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
   );
 
   // Node click handler — toggle selection
+  // Only the measured sizes React Flow reports are kept: the graph is
+  // display-only, so position and selection changes stay owned by the stores.
+  const [measuredNodeSizes, setMeasuredNodeSizes] = useState<
+    ReadonlyMap<string, { width: number; height: number }>
+  >(() => new Map());
+  const onNodesChange = useCallback((changes: NodeChange[]) => {
+    setMeasuredNodeSizes((previous) => {
+      let next: Map<string, { width: number; height: number }> | null = null;
+      for (const change of changes) {
+        if (change.type !== "dimensions" || change.dimensions === undefined) continue;
+        const { width, height } = change.dimensions;
+        const current = (next ?? previous).get(change.id);
+        if (current?.width === width && current.height === height) continue;
+        next ??= new Map(previous);
+        next.set(change.id, { width, height });
+      }
+      return next ?? previous;
+    });
+  }, []);
+
   const onNodeClick: NodeMouseHandler = useCallback(
     (_event, node) => {
       setActiveEdgeId(null);
@@ -2077,9 +2116,18 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
   }));
   // ARGOnite: a selected route's endpoints take the same gap ring as a
   // selected node, over the card shadow.
-  const renderedNodes = visibleGraph.nodes.map((node) => activeEdge && (node.id === activeEdge.source || node.id === activeEdge.target)
-    ? { ...node, className: "graph-node--selected", style: { ...node.style, boxShadow: `${SELECTED_NODE_RING}, var(--shadow-card)` } }
-    : node);
+  // Every node object is rebuilt on each validation result, selection or route
+  // toggle. React Flow treats a controlled node that arrives without `measured`
+  // as unmeasured: it drops its size and handle bounds and hides its edges until
+  // it re-measures, so the whole edge layer blanked and redrew. Carry the last
+  // measured size forward instead.
+  const renderedNodes = visibleGraph.nodes.map((node) => {
+    const measured = measuredNodeSizes.get(node.id);
+    const sized = measured ? { ...node, measured } : node;
+    return activeEdge && (node.id === activeEdge.source || node.id === activeEdge.target)
+      ? { ...sized, className: "graph-node--selected", style: { ...sized.style, boxShadow: `${SELECTED_NODE_RING}, var(--shadow-card)` } }
+      : sized;
+  });
 
   // Accessible, keyboard-operable equivalent of the visual DAG. The React Flow
   // diagram is a visual image (role="img", scoped to the diagram element
@@ -2303,6 +2351,7 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
               nodesFocusable={false}
               edgesFocusable={false}
               elementsSelectable={true}
+              onNodesChange={onNodesChange}
               onNodeClick={onNodeClick}
               onEdgeClick={(_event, edge) => setActiveEdgeId(edge.id)}
               onPaneClick={onPaneClick}
