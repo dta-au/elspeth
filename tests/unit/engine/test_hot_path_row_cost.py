@@ -244,7 +244,7 @@ UPDATE token_work_items 1 11
     "postgres": {
         "linear": {
             "counters": {
-                "statements": (500, 81),
+                "statements": (500, 79),
                 "commits": (67, 13),
                 "core.canonical.canonical_json": (20, 14),
                 "core.canonical.stable_hash": (16, 20),
@@ -275,7 +275,7 @@ UPDATE token_work_items 1 11
                 "INSERT token_outcomes": (1, 0),
                 "INSERT token_work_items": (0, 1),
                 "INSERT tokens": (0, 1),
-                "SELECT <expression>": (148, 14),
+                "SELECT <expression>": (148, 12),
                 "SELECT artifacts": (1, 0),
                 "SELECT calls": (3, 0),
                 "SELECT checkpoints": (1, 1),
@@ -314,7 +314,7 @@ UPDATE token_work_items 1 11
         },
         "fork": {
             "counters": {
-                "statements": (526, 265),
+                "statements": (526, 263),
                 "commits": (70, 45),
                 "core.canonical.canonical_json": (24, 36),
                 "core.canonical.stable_hash": (20, 29),
@@ -350,7 +350,7 @@ UPDATE token_work_items 1 11
                 "INSERT token_parents": (0, 2),
                 "INSERT token_work_items": (0, 3),
                 "INSERT tokens": (0, 3),
-                "SELECT <expression>": (157, 43),
+                "SELECT <expression>": (157, 41),
                 "SELECT artifacts": (1, 0),
                 "SELECT calls": (3, 0),
                 "SELECT checkpoints": (1, 1),
@@ -395,15 +395,9 @@ UPDATE token_work_items 1 11
     },
 }
 
-# L3-1: the two growing-prefix comprehensions in sink reservation are already
-# quadratic in sink members. E-11 is a quadratic SQL query plan, not a
-# quadratic Python call count, so this call-count oracle cannot exempt it.
-_KNOWN_SUPERLINEAR = frozenset(
-    {
-        "core/landscape/execution/sink_effect_reservation.py:358:<genexpr>",
-        "core/landscape/execution/sink_effect_reservation.py:370:<genexpr>",
-    }
-)
+# No known super-linear Python call sites remain. E-11 is a quadratic SQL
+# query plan, which this call-count oracle cannot detect.
+_KNOWN_SUPERLINEAR = frozenset()
 
 
 def _sql_bucket(statement: str) -> str:

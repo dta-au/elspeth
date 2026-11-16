@@ -135,6 +135,45 @@ def test_pipeline_reservation_is_idempotent_under_reverse_arrival(db_factory: tu
         assert conn.scalar(select(func.count()).select_from(operations_table)) == 1
 
 
+def test_reservation_lock_seams_receive_constant_size_values_in_order(
+    db_factory: tuple[LandscapeDB, RecorderFactory], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db, factory = db_factory
+    run_id, sink_id, members = _pipeline_members(factory, 12)
+    request = _pipeline_request(run_id, sink_id, members)
+    token_ids = tuple(sorted(member.token_id for member in members))
+    with db.read_only_connection() as conn:
+        state_ids = tuple(
+            sorted(conn.execute(select(node_states_table.c.state_id).where(node_states_table.c.token_id.in_(token_ids))).scalars())
+        )
+    token_calls: list[tuple[int, int, str]] = []
+    state_calls: list[tuple[int, int, str]] = []
+    pid_calls: list[Connection] = []
+    reservation = factory.execution.sink_effects._reservation
+
+    def record_backend_pid(conn: Connection) -> int:
+        pid_calls.append(conn)
+        return 0
+
+    def record_token_lock(pid: int, locked_count: int, token_id: str) -> None:
+        token_calls.append((pid, locked_count, token_id))
+
+    def record_state_lock(pid: int, locked_count: int, state_id: str) -> None:
+        state_calls.append((pid, locked_count, state_id))
+
+    monkeypatch.setattr(reservation, "_backend_pid", record_backend_pid)
+    monkeypatch.setattr(reservation, "_after_token_lock", record_token_lock)
+    monkeypatch.setattr(reservation, "_after_state_lock", record_state_lock)
+
+    factory.execution.sink_effects.reserve(request, coordination_token=leader_coordination_token(factory, run_id))
+
+    assert token_calls == [(0, index, token_id) for index, token_id in enumerate(token_ids, start=1)]
+    assert state_calls == [(0, index, state_id) for index, state_id in enumerate(state_ids, start=1)]
+    assert len(token_calls) == len(token_ids) == 12
+    assert len(state_calls) == len(state_ids) == 12
+    assert len(pid_calls) == 1
+
+
 def test_pipeline_reservation_refuses_terminal_run_before_effect_mutation(
     db_factory: tuple[LandscapeDB, RecorderFactory],
 ) -> None:

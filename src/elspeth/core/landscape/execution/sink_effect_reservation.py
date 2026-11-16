@@ -348,26 +348,25 @@ class SinkEffectReservation:
         if run_status != RunStatus.RUNNING.value:
             raise ValueError(f"cannot reserve a pipeline sink effect for terminal run status {run_status!r}")
 
+        pid = self._backend_pid(conn)
         token_ids = tuple(sorted(member.token_id for member in request.members))
-        locked_tokens: list[Row[Any]] = []
-        for token_id in token_ids:
+        for locked_count, token_id in enumerate(token_ids, start=1):
             row = conn.execute(select(tokens_table).where(tokens_table.c.token_id == token_id).with_for_update()).fetchone()
             if row is None:
                 raise ValueError(f"sink effect member token {token_id!r} disappeared")
-            locked_tokens.append(row)
-            self._after_token_lock(self._backend_pid(conn), tuple(item.token_id for item in locked_tokens))
+            self._after_token_lock(pid, locked_count, row.token_id)
 
         token_rows = self._token_rows_with_ingest_sequence(conn, token_ids)
         self._validate_token_rows(request, token_rows)
 
         state_ids = tuple(sorted(set(witness.state_ids_by_token.values())))
         locked_states: list[Row[Any]] = []
-        for state_id in state_ids:
+        for locked_count, state_id in enumerate(state_ids, start=1):
             row = conn.execute(select(node_states_table).where(node_states_table.c.state_id == state_id).with_for_update()).fetchone()
             if row is None:
                 raise ValueError(f"sink effect current state {state_id!r} disappeared")
             locked_states.append(row)
-            self._after_state_lock(self._backend_pid(conn), tuple(item.state_id for item in locked_states))
+            self._after_state_lock(pid, locked_count, row.state_id)
 
         current = self._current_state_ids(conn, request, token_ids)
         if current != witness.state_ids_by_token:
@@ -379,7 +378,7 @@ class SinkEffectReservation:
             member = member_by_token[row.token_id]
             if row.run_id != request.run_id or row.node_id != request.sink_node_id or row.input_hash != member.payload_hash:
                 raise ValueError("sink effect current-state witness is divergent")
-        self._after_witness_locks(self._backend_pid(conn), token_ids, state_ids)
+        self._after_witness_locks(pid, token_ids, state_ids)
 
     @staticmethod
     def _token_rows_with_ingest_sequence(conn: Connection, token_ids: Sequence[str]) -> list[Row[Any]]:
@@ -991,10 +990,10 @@ class SinkEffectReservation:
             return int(conn.exec_driver_sql("SELECT pg_backend_pid()").scalar_one())
         return 0
 
-    def _after_token_lock(self, _pid: int, _token_ids: tuple[str, ...]) -> None:
+    def _after_token_lock(self, _pid: int, _locked_count: int, _token_id: str) -> None:
         """Deterministic contention seam; production implementation is inert."""
 
-    def _after_state_lock(self, _pid: int, _state_ids: tuple[str, ...]) -> None:
+    def _after_state_lock(self, _pid: int, _locked_count: int, _state_id: str) -> None:
         """Deterministic contention seam; production implementation is inert."""
 
     def _after_witness_locks(self, _pid: int, _token_ids: tuple[str, ...], _state_ids: tuple[str, ...]) -> None:
