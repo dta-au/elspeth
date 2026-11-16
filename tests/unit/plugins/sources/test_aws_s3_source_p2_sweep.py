@@ -66,6 +66,24 @@ class TestJSONMidDocumentFailure:
 class TestRecordsAfterUnreadableRecord:
     """Sweep finding #10: records after an oversized/unparseable record must not vanish silently."""
 
+    @pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be"])
+    @pytest.mark.parametrize("newline_before_stray", [False, True])
+    def test_jsonl_drain_quarantines_truncated_utf16_after_oversized_line(self, encoding: str, newline_before_stray: bool) -> None:
+        oversized = '{"id":"' + "x" * 10_000 + '"}'
+        payload = (oversized + ("\n" if newline_before_stray else "")).encode(encoding) + b"\x00"
+        source, _, ctx = _source_for(payload, format="jsonl", max_record_chars=100, json_options={"encoding": encoding})
+
+        rows = list(source.load(ctx))
+
+        expected = [(0, "JSONL record exceeds configured character limit", {"__line_number__": 1})]
+        if newline_before_stray:
+            expected.append(
+                (1, f"JSON parse error at line 2: invalid {encoding} encoding", {"__raw_bytes_hex__": "00", "__line_number__": 2})
+            )
+        assert [(row.source_row_index, row.quarantine_error, row.row) for row in rows] == expected
+        assert all(row.is_quarantined for row in rows)
+        assert [(error["error"], error["row"]) for error in ctx.validation_errors] == [(message, row) for _, message, row in expected]
+
     def test_jsonl_resumes_after_oversized_line(self) -> None:
         payload = b'{"id":1}\n{"id":"' + b"x" * 50 + b'"}\n{"id":3}\n{"id":4}\n'
         source, _, ctx = _source_for(payload, format="jsonl", max_record_chars=20)
