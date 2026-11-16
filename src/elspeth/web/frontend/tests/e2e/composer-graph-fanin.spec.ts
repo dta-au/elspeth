@@ -47,9 +47,17 @@ for (const { count, secondSink } of [{ count: 1, secondSink: false }, { count: 3
         expect(await readZoom()).toBeGreaterThanOrEqual(0.15);
       }
       const paths = page.locator('.react-flow__edge[data-testid]');
-      const before = await paths.count();
-      expect(before).toBeGreaterThan(count);
-      const topology = await paths.evaluateAll((elements) => elements.map((element) => element.getAttribute("data-testid")).sort());
+      const readEdges = () => paths.evaluateAll((elements) => elements.map((element) => element.getAttribute("data-testid")).sort());
+      // Edges render after the nodes and the edge layer can empty and redraw while the initial
+      // validation lands, so record the topology only once the network is idle and two reads agree.
+      await page.waitForLoadState("networkidle");
+      let topology = await readEdges();
+      await expect.poll(async () => {
+        const next = await readEdges();
+        const settled = next.length > count && JSON.stringify(next) === JSON.stringify(topology);
+        topology = next;
+        return settled;
+      }, { intervals: [250] }).toBe(true);
       await page.getByText(/^Wiring \(/).click();
       const routes = page.getByRole("list", { name: "Inspect pipeline routes" });
       const arrivals = routes.getByRole("button").filter({ hasText: /→ shared_(sink|other):/ });
@@ -130,7 +138,7 @@ for (const { count, secondSink } of [{ count: 1, secondSink: false }, { count: 3
         await expect(quarantine).toBeVisible();
         await expect.poll(retainedGeometry).toEqual(originalGeometry);
         expect(await viewport.evaluate((element) => getComputedStyle(element).transform)).toBe(originalViewport);
-        expect(await paths.evaluateAll((elements) => elements.map((element) => element.getAttribute("data-testid")).sort())).toEqual(topology);
+        await expect.poll(readEdges).toEqual(topology);
       }
       if (count === 15 && !secondSink) {
         const zoomOut = page.locator(".react-flow__controls-zoomout");
@@ -146,8 +154,9 @@ for (const { count, secondSink } of [{ count: 1, secondSink: false }, { count: 3
       await page.reload();
       await composer.waitForChatReady();
       await expect(sink).toBeVisible();
-      await expect(paths).toHaveCount(before);
-      expect(await paths.evaluateAll((elements) => elements.map((element) => element.getAttribute("data-testid")).sort())).toEqual(topology);
+      // After a reload the edge layer can empty and redraw again, so poll until the rendered
+      // edge identities equal the pre-reload topology.
+      await expect.poll(readEdges).toEqual(topology);
     } finally {
       await deleteSession(ctx, session.id);
       await ctx.dispose();
