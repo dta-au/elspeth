@@ -90,7 +90,7 @@ _PINS: dict[str, dict[str, dict[str, object]]] = {
                 "commits": (67, 13),
                 "core.canonical.canonical_json": (20, 14),
                 "core.canonical.stable_hash": (16, 20),
-                "contracts.hashing.canonical_json": (104, 59),
+                "contracts.hashing.canonical_json": (97, 55),
                 "contracts.hashing.stable_hash": (29, 21),
             },
             "sql_buckets": _bucket_pins("""
@@ -163,7 +163,7 @@ UPDATE token_work_items 1 2
                 "commits": (70, 45),
                 "core.canonical.canonical_json": (24, 36),
                 "core.canonical.stable_hash": (20, 29),
-                "contracts.hashing.canonical_json": (112, 99),
+                "contracts.hashing.canonical_json": (105, 87),
                 "contracts.hashing.stable_hash": (33, 30),
             },
             "sql_buckets": _bucket_pins("""
@@ -248,7 +248,7 @@ UPDATE token_work_items 1 11
                 "commits": (67, 13),
                 "core.canonical.canonical_json": (20, 14),
                 "core.canonical.stable_hash": (16, 20),
-                "contracts.hashing.canonical_json": (104, 59),
+                "contracts.hashing.canonical_json": (97, 55),
                 "contracts.hashing.stable_hash": (29, 21),
             },
             "sql_buckets": {
@@ -318,7 +318,7 @@ UPDATE token_work_items 1 11
                 "commits": (70, 45),
                 "core.canonical.canonical_json": (24, 36),
                 "core.canonical.stable_hash": (20, 29),
-                "contracts.hashing.canonical_json": (112, 99),
+                "contracts.hashing.canonical_json": (105, 87),
                 "contracts.hashing.stable_hash": (33, 30),
             },
             "sql_buckets": {
