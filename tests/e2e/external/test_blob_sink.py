@@ -177,7 +177,7 @@ class TestBlobSink:
         result = _publish_effect(sink, [{"id": 1, "name": "Ada"}], operation_id="jsonl-write")
 
         assert result.descriptor.path_or_uri == f"azure://devstoreaccount1/{azurite_blob_container['container']}/{blob_path}"
-        assert _read_blob(azurite_blob_container, blob_path).decode("utf-8") == '{"id": 1, "name": "Ada"}'
+        assert _read_blob(azurite_blob_container, blob_path).decode("utf-8") == '{"id": 1, "name": "Ada"}\n'
 
     def test_blob_sink_reaffirms_identical_content_and_rejects_true_collision_without_overwrite(
         self, azurite_blob_container: dict[str, str]
@@ -202,11 +202,11 @@ class TestBlobSink:
         assert reaffirmed_plan.safe_evidence["publication_kind"] == "reaffirmed"
         assert reaffirmed_plan.expected_descriptor == primary_result.descriptor
         # Content on the blob is unchanged — no second upload was ever issued.
-        assert _read_blob(azurite_blob_container, blob_path).decode("utf-8") == '{"id": 1, "name": "Ada"}'
+        assert _read_blob(azurite_blob_container, blob_path).decode("utf-8") == '{"id": 1, "name": "Ada"}\n'
 
         colliding = inject_write_failure(
             AzureBlobSink(_sink_config(azurite_blob_container, blob_path=blob_path, format_="jsonl", overwrite=False))
         )
         with pytest.raises(RemoteObjectCollisionError):
             _prepare_effect(colliding, [{"id": 2, "name": "Grace"}], operation_id="idempotent-collision")
-        assert _read_blob(azurite_blob_container, blob_path).decode("utf-8") == '{"id": 1, "name": "Ada"}'
+        assert _read_blob(azurite_blob_container, blob_path).decode("utf-8") == '{"id": 1, "name": "Ada"}\n'

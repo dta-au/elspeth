@@ -26,6 +26,22 @@ class TestPipelineRowAccess:
         data = {"amount_usd": 100, "customer_id": "C123"}
         return make_row(data, contract=contract)
 
+    def test_carried_value_reads_the_literal_key_frozen(self) -> None:
+        """carried_value reads a carried key only: no alias resolution, no thaw."""
+        field = make_field("tags", object, original_name="Tags", required=True, source="declared")
+        contract = SchemaContract(mode="FIXED", fields=(field,), locked=True)
+        row = make_row({"tags": ["a", "b"]}, contract=contract)
+
+        assert row.carries("tags")
+        assert not row.carries("Tags")
+        assert "Tags" in row  # the alias-resolving check differs, which is why carries exists
+        assert row.carried_value("tags") == ("a", "b")
+        assert type(row.carried_value("tags")) is type(row["tags"])
+        with pytest.raises(KeyError):
+            row.carried_value("Tags")
+        with pytest.raises(KeyError):
+            row.carried_value("missing")
+
     def test_getitem_normalized_name(self, sample_row: PipelineRow) -> None:
         """Access by normalized name via bracket notation."""
         assert sample_row["amount_usd"] == 100

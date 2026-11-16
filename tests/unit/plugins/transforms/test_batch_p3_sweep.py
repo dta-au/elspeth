@@ -48,8 +48,8 @@ def ctx() -> PluginContext:
 class TestFinding20BatchRowCapIsAdvertised:
     """#20: the 4096-row flush cap must reach the composer/operator before a run.
 
-    Each capped plugin refuses a flush above ``_MAX_BATCH_ROWS`` at run time.
-    Its composer hints must name that same cap, read from the module constant,
+    Each capped plugin refuses a flush above its ``max_batch_rows`` at run time.
+    Its composer hints must name that same cap, read from the class declaration,
     and tie it to the aggregation trigger, so a planner does not configure a
     trigger (or an end-of-source flush) that fails every batch.
     """
@@ -65,7 +65,7 @@ class TestFinding20BatchRowCapIsAdvertised:
     )
     def test_composer_hints_name_the_flush_cap(self, module: ModuleType, plugin_cls_name: str) -> None:
         plugin_cls = vars(module)[plugin_cls_name]
-        cap = vars(module)["_MAX_BATCH_ROWS"]
+        cap = plugin_cls.max_batch_rows
         assistance = plugin_cls.get_agent_assistance()
         assert assistance is not None
         cap_hints = [hint for hint in assistance.composer_hints if str(cap) in hint and "trigger" in hint]

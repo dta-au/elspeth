@@ -389,23 +389,15 @@ def test_the_field_arm_consumes_its_text_column_instead_of_copying_the_document(
     assert emitted["run_label"] == "batch-7"
 
 
-def test_the_field_arm_consumes_a_text_column_named_by_its_original_header() -> None:
-    """The consumed column must go even when config names the ORIGINAL header.
-
-    ``row.to_dict()`` is keyed by NORMALIZED names, while ``text_field`` may be
-    the header a source saw (``"Content Body"`` -> ``content_body``). Removing
-    by the literal with a defaulted ``pop`` matched nothing and silently left
-    the whole document on every emitted row — the same defect blob_csv_expand
-    had. The read side already resolves through the contract; the removal
-    side must resolve the same way.
-    """
+def test_the_field_arm_consumes_the_literal_payload_key() -> None:
+    """The configured text field names the carried key that is consumed."""
     document = json.dumps({"documents": [{"document_id": "d1", "title": "First", "sections": ["a"]}]})
     transform = BlobJSONExpand(
         {
             "schema": {"mode": "observed"},
             "source": "field",
             "format": "json",
-            "text_field": "Content Body",
+            "text_field": "content_body",
             "data_key": "documents",
             "fields": list(DOCUMENT_FIELDS),
         }
@@ -420,8 +412,8 @@ def test_the_field_arm_consumes_a_text_column_named_by_its_original_header() -> 
     )
     row = PipelineRow({"url": "https://example.test/a.json", "content_body": document}, contract)
 
-    assert transform.forwards_input_fields is False
-    assert transform.removed_input_fields == frozenset()
+    assert transform.forwards_input_fields is True
+    assert transform.removed_input_fields == frozenset({"content_body"})
     assert transform.preserves_input_values is True
 
     result = transform.process(row, make_context())

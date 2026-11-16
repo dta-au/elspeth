@@ -27,6 +27,7 @@ from elspeth.core.security.web import (
     HTTPOrigin,
     SSRFBlockedError,
     SSRFSafeRequest,
+    configured_url_refusal_message,
     parse_http_origin,
     validate_allowed_http_origin,
     validate_archived_ssrf_request,
@@ -90,13 +91,19 @@ class BlobFetchHTTPConfig(BaseModel):
 
     abuse_contact: str = Field(description="Email for abuse reports, sent as an HTTP header.")
     fetch_reason: str = Field(description="Why this pipeline is fetching remote files; recorded in audit and sent as an HTTP header.")
-    timeout: int = Field(default=30, gt=0, description="Request timeout in seconds.")
+    timeout: int = Field(
+        default=30,
+        gt=0,
+        description="Total wall-clock seconds from dispatch for each HTTP request, including DNS, connect, TLS, send, headers, body, and every redirect hop. Rate-limiter waits are bounded separately by the same number of seconds.",
+    )
     max_body_bytes: int = Field(default=10 * 1024 * 1024, gt=0, description="Maximum response body size in bytes.")
     allowed_hosts: Literal["public_only", "allow_private"] | Annotated[list[CidrStr], Field(min_length=1)] = Field(
         default="public_only",
         description="SSRF allowlist: 'public_only', 'allow_private', or explicit CIDR ranges.",
     )
-    allowed_origins: tuple[str, ...] = Field(default=(), description="Exact HTTP(S) origins permitted for initial requests and redirects.")
+    allowed_origins: tuple[str, ...] = Field(
+        default=(), description="Exact HTTP(S) origins permitted for initial requests and redirects.", repr=False
+    )
 
     @field_validator("allowed_origins")
     @classmethod
@@ -131,7 +138,7 @@ class BlobFetchConfig(TransformDataConfig):
     """Configuration for blob_fetch."""
 
     url_field: str | None = Field(default=None, description="Input row field containing the absolute HTTP(S) URL to fetch.")
-    url: str | None = Field(default=None, description="Fixed absolute HTTP(S) URL for every row; exclusive with url_field.")
+    url: str | None = Field(default=None, description="Fixed absolute HTTP(S) URL for every row; exclusive with url_field.", repr=False)
     blob_ref_field: str = Field(default="blob_ref", description="Output field receiving the payload-store content hash.")
     content_type_field: str = Field(default="blob_content_type", description="Output field receiving the normalized response Content-Type.")
     size_bytes_field: str = Field(default="blob_size_bytes", description="Output field receiving the response body size.")
@@ -205,7 +212,7 @@ class BlobFetchConfig(TransformDataConfig):
                 validate_configured_url_for_ssrf(self.url, allowed_ranges=allowed_ranges)
                 validate_allowed_http_origin(self.url, tuple(parse_http_origin(value) for value in self.http.allowed_origins))
             except SSRFBlockedError as exc:
-                raise ValueError(f"url: {exc}") from exc
+                raise ValueError(configured_url_refusal_message(exc.kind)) from None
         return self
 
     @model_validator(mode="after")
@@ -331,8 +338,8 @@ class BlobFetch(BaseTransform):
     )
     name = "blob_fetch"
     determinism = Determinism.EXTERNAL_CALL
-    plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9c75f8515498a8a4"
+    plugin_version = "2.0.0"
+    source_file_hash: str | None = "sha256:9a34b36970aa9a49"
     config_model = BlobFetchConfig
     passes_through_input = True
     fetches_http = True
@@ -380,6 +387,7 @@ class BlobFetch(BaseTransform):
         self._initialize_declared_input_fields(cfg)
 
         self._url_field = cfg.url_field
+        self.declared_string_input_fields = frozenset({cfg.url_field}) if cfg.url_field is not None else frozenset()
         self._url = cfg.url
         self._blob_ref_field = cfg.blob_ref_field
         self._content_type_field = cfg.content_type_field
@@ -531,7 +539,7 @@ class BlobFetch(BaseTransform):
             if self._url is not None:
                 url = self._url
             elif self._url_field is not None:
-                url = row[self._url_field]
+                url = row.carried_value(self._url_field)
             else:
                 raise FrameworkBugError("blob_fetch has no configured URL source")
             if type(url) is not str:

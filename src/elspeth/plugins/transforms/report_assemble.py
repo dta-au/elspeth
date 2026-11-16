@@ -102,8 +102,8 @@ class ReportAssemble(BaseTransform):
     output_naming_config_keys = frozenset({"output_field"})
     name = "report_assemble"
     determinism = Determinism.DETERMINISTIC
-    plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:5d589c597beb8b32"
+    plugin_version = "2.0.0"
+    source_file_hash: str | None = "sha256:73993d5a79b0013b"
     config_model = ReportAssembleConfig
     usage_when_to_use: str = (
         "Use in an aggregations node to assemble each flushed batch into a page or section of a "
@@ -168,6 +168,7 @@ class ReportAssemble(BaseTransform):
         super().__init__(config)
         cfg = ReportAssembleConfig.from_dict(config, plugin_name=self.name)
         self._initialize_declared_input_fields(cfg)
+        self.declared_string_input_fields = frozenset({cfg.text_field})
         self._text_field = cfg.text_field
         self._output_field = cfg.output_field
         self._format = cfg.format

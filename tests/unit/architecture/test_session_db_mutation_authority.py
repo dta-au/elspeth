@@ -2812,7 +2812,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="c4c60b6243740912",
         ordinal=1,
         authority="LibraryAuthority",
-        line=404,
+        line=411,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -2823,7 +2823,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="63f7e34f83c9ffcf",
         ordinal=1,
         authority="LibraryAuthority",
-        line=416,
+        line=423,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -2834,7 +2834,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="71688a4b4a19098c",
         ordinal=1,
         authority="LibraryAuthority",
-        line=476,
+        line=483,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -2845,7 +2845,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="c558171359798dcd",
         ordinal=1,
         authority="LibraryAuthority",
-        line=488,
+        line=495,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -2856,7 +2856,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="af51bf4ee299ba3a",
         ordinal=1,
         authority="LibraryAuthority",
-        line=367,
+        line=374,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -2867,7 +2867,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="52549f3f8509d8af",
         ordinal=1,
         authority="LibraryAuthority",
-        line=378,
+        line=385,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -2878,7 +2878,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="3d11236ebd84f79c",
         ordinal=1,
         authority="LibraryAuthority",
-        line=517,
+        line=524,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -2889,7 +2889,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="dd0f0638fced233b",
         ordinal=1,
         authority="LibraryAuthority",
-        line=529,
+        line=536,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -2900,7 +2900,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="63c53d6e378cca97",
         ordinal=1,
         authority="LibraryAuthority",
-        line=440,
+        line=447,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -2911,7 +2911,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="0884f0f1ab16471a",
         ordinal=1,
         authority="LibraryAuthority",
-        line=452,
+        line=459,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5413,10 +5413,10 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         symbol="RepositoryLibraryAuthority.authorize_fork_source",
         table="<sessions-write-connection>",
         operation="write_connection",
-        fingerprint="717c07870e2d92c7",
+        fingerprint="d89f2e7d98c8d01d",
         ordinal=1,
         authority=None,
-        line=320,
+        line=325,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5427,7 +5427,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="5c3986019be8744b",
         ordinal=1,
         authority=None,
-        line=293,
+        line=298,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5438,7 +5438,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="3fb165f849a020a3",
         ordinal=1,
         authority=None,
-        line=300,
+        line=305,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5449,7 +5449,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="5df578dd6aecec07",
         ordinal=1,
         authority=None,
-        line=311,
+        line=316,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5460,7 +5460,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="77be48d4595cea35",
         ordinal=1,
         authority=None,
-        line=286,
+        line=291,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -6178,7 +6178,9 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "3e92055687329a54",
         1,
         None,
-        line=493,
+        # p5-db-chroma (2026-11-15): 493 -> 487, POSITION ONLY. The fingerprint is
+        # byte-identical; the -6 is the removed if_exists replace path above it.
+        line=487,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -6189,7 +6191,8 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "cb69520a77f4030e",
         1,
         None,
-        line=921,
+        # p5-db-chroma (2026-11-15): 921 -> 915, POSITION ONLY (same -6 shift).
+        line=915,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -6200,7 +6203,8 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "f259e8651bc82bb6",
         1,
         None,
-        line=941,
+        # p5-db-chroma (2026-11-15): 941 -> 935, POSITION ONLY (same -6 shift).
+        line=935,
         connection_escape=True,
     ),
     # ``with LandscapeDB.from_url(...) as database`` then ``database.engine
@@ -6552,10 +6556,12 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "RateLimiter.__init__",
         "<non-session-write-connection>",
         "write_connection",
-        "002b7e991cd4aa65",
+        # 2026-11-16 http-deadline: the same rate-limiter-owned SQLite file, now
+        # wrapped in _RollbackSQLiteBucket (rolls back a failed bucket write).
+        "9885e663524766b2",
         1,
         None,
-        line=224,
+        line=258,
         connection_escape=True,
     ),
     WriterIdentity(

@@ -69,5 +69,6 @@ def test_help_does_not_import_harness_before_argument_parsing(tmp_path: Path) ->
     )
 
     assert result.returncode == 0
-    assert "usage: python -m scripts.skill_rgr.run" in result.stdout
+    # Python 3.14 argparse names the interpreter by its basename (CI runs .venv/bin/python3).
+    assert f"usage: {Path(sys.executable).name} -m scripts.skill_rgr.run" in result.stdout
     assert "harness imported before args parsed" not in result.stderr

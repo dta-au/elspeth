@@ -386,6 +386,7 @@ describe("SaveForReviewDialog", () => {
         sessionIdForResponse: "sess-1",
       } as never);
       render(<SaveForReviewDialog />);
+      expect(screen.getByText(/Copying this link again does not extend its expiry/)).toBeInTheDocument();
       const link = screen.getByTestId("save-for-review-open-link");
       expect(link.tagName).toBe("A");
       expect(link).toHaveAttribute("target", "_blank");

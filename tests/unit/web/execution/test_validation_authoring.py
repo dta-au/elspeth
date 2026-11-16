@@ -735,6 +735,41 @@ def test_batch_phase_returns_typed_failure_with_semantic_evidence() -> None:
     assert result.semantic_contracts == (contract,)
 
 
+@pytest.mark.parametrize("count", [4096, 4097])
+def test_batch_phase_checks_the_authored_trigger_count_against_the_plugin_cap(count: int) -> None:
+    """The execution phase forwards the node's trigger, so the 4096-row cap applies here too."""
+    import dataclasses
+
+    from elspeth.plugins.transforms.batch_rank import BatchRank
+
+    node = dataclasses.replace(
+        _node(node_id="agg", plugin="batch_rank", node_type="aggregation", input_name="agg", options=BatchRank.probe_config()),
+        trigger={"count": count},
+        output_mode="transform",
+    )
+    state = _state(source=_source(on_success="agg"), nodes=(node,), outputs=(_output(),))
+
+    result = validate_batch_options(_authored(state, contracts=(_contract(),)))
+
+    if count == 4097:
+        assert isinstance(result, PhaseFailure)
+        assert result.failed_check.name == "batch_transform_options"
+        assert result.errors[0].component_id == "agg"
+        assert "4097" in result.errors[0].message
+        assert "4096" in result.errors[0].message
+    else:
+        assert not isinstance(result, PhaseFailure)
+
+
+def test_batch_placement_guard_requires_the_trigger_argument() -> None:
+    """No default: a caller that omits the trigger fails to type-check instead of silently skipping the cap."""
+    import inspect
+
+    from elspeth.web.composer.state import _batch_aware_placement_error
+
+    assert inspect.signature(_batch_aware_placement_error).parameters["trigger"].default is inspect.Parameter.empty
+
+
 def test_interpretation_phase_preserves_pending_readiness_axes_and_semantics() -> None:
     state = _state(
         nodes=(

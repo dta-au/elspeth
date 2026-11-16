@@ -350,16 +350,6 @@ _BATCH_GA_CATALOG_CANONICAL_BYTES = 1335
 # the prior 7 B headroom and the exact-boundary / +1-byte overflow control are
 # preserved.
 _CONTENT_UNDERSTANDING_CATALOG_CANONICAL_BYTES = 595
-# batch_drift_compare chi-square disclosure (2026-11-14, plugin review #102),
-# priced under the 2026-11-10 operator ruling (no obvious cut -> the measured
-# increase is authorised): usage_when_not_to_use gains the sentence
-# "chi_square_statistic omits categories absent from the baseline." so the
-# planner's discovery digest carries the caveat (composer hints are not in this
-# scaffold). Measured on the same live request: 141,061 B without the sentence,
-# 141,125 B with it: +64 B, in both the live and small catalog cases. Nothing
-# else in the scaffold changes. Price only this measured growth: the prior 9 B
-# headroom and the exact-boundary / +1-byte overflow control are preserved.
-_DRIFT_COMPARE_CHI_SQUARE_DISCLOSURE_CANONICAL_BYTES = 64
 # CDA-24 (2026-11-15): diff description measured by AST, 1377 -> 1358 UTF-8 bytes.
 _CDA24_MILESTONE_GUIDANCE_CANONICAL_BYTES = -19
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
@@ -380,7 +370,6 @@ _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     + _CDA02B_DIFF_GUIDANCE_CANONICAL_BYTES
     + _BATCH_GA_CATALOG_CANONICAL_BYTES
     + _CONTENT_UNDERSTANDING_CATALOG_CANONICAL_BYTES
-    + _DRIFT_COMPARE_CHI_SQUARE_DISCLOSURE_CANONICAL_BYTES
     + _CDA24_MILESTONE_GUIDANCE_CANONICAL_BYTES
 )
 

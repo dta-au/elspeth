@@ -9,15 +9,11 @@ NOTE: Non-standard JSON constants (NaN, Infinity, -Infinity) are rejected
 at parse time per canonical JSON policy. Use null for missing values.
 """
 
-import codecs
 import json
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
-from itertools import groupby
-from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import Field, JsonValue, ValidationError, field_validator, model_validator
+from pydantic import Field, JsonValue, ValidationError, model_validator
 
 from elspeth.contracts import Determinism, PluginSchema, SourceRow
 from elspeth.contracts.contexts import SourceContext
@@ -31,10 +27,18 @@ from elspeth.plugins.infrastructure.base import BaseSource
 from elspeth.plugins.infrastructure.config_base import (
     NormalizedFieldMappingOption,
     SourceDataConfig,
+    TextEncoding,
     declared_source_schema_field_names,
 )
 from elspeth.plugins.infrastructure.config_content import reject_nonfinite_constant
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+from elspeth.plugins.infrastructure.text_decoding import (
+    BYTE_ESCAPE_ERRORS,
+    contains_escaped_bytes,
+    decoding_codec,
+    escaped_line_to_bytes,
+    line_byte_codec,
+)
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,
     FieldResolution,
@@ -43,116 +47,6 @@ from elspeth.plugins.sources.field_normalization import (
     normalize_field_name,
     resolve_field_names,
 )
-
-
-def _contains_surrogateescape_chars(value: str) -> bool:
-    """Return True when value contains surrogateescape-decoded bytes."""
-    return any(0xDC80 <= ord(char) <= 0xDCFF for char in value)
-
-
-def _surrogateescape_line_to_bytes(value: str, encoding: str) -> bytes:
-    """Encode a surrogateescape-decoded line back to bytes for quarantine.
-
-    UTF-16/UTF-32 codecs reject low-surrogate code points on encode, even when
-    ``errors="surrogateescape"`` is requested. Fall back to UTF-8 with
-    surrogateescape to preserve raw undecodable byte values without crashing.
-    """
-    try:
-        return value.encode(encoding, errors="surrogateescape")
-    except UnicodeEncodeError:
-        return value.encode("utf-8", errors="surrogateescape")
-
-
-BYTE_ESCAPE_ERRORS = "elspeth.source_byte_escape"
-"""Codec error-handler name that escapes every undecodable byte (see below)."""
-
-
-def _escape_undecodable_bytes(exc: UnicodeError) -> tuple[str, int]:
-    """Decode error handler: replace each undecodable byte ``b`` with U+DC00+b.
-
-    ``surrogateescape`` only escapes bytes >= 0x80 and re-raises otherwise, so
-    for UTF-16/UTF-32 an illegal code unit such as a lone surrogate
-    (``b"\\x00\\xd8"``) escapes nothing and TextIOWrapper raises for its whole
-    read-ahead chunk, dropping valid lines on both sides of the bad bytes.
-    Escaping every byte keeps the decode going, so the bad bytes stay on the
-    line that carried them. A strict decode never yields U+DC00..U+DCFF
-    (lone surrogates are invalid in every Unicode encoding), so these code
-    points mark the escaped bytes unambiguously.
-    """
-    if not isinstance(exc, UnicodeDecodeError):
-        raise exc
-    undecodable = exc.object[exc.start : exc.end]
-    return "".join(chr(0xDC00 + byte) for byte in undecodable), exc.end
-
-
-codecs.register_error(BYTE_ESCAPE_ERRORS, _escape_undecodable_bytes)
-
-
-def contains_escaped_bytes(value: str) -> bool:
-    """Return True when value carries bytes escaped by ``BYTE_ESCAPE_ERRORS``."""
-    return any(0xDC00 <= ord(char) <= 0xDCFF for char in value)
-
-
-@dataclass(frozen=True, slots=True)
-class LineByteCodec:
-    """How to turn a decoded line back into the bytes the file holds.
-
-    ``codec`` has a fixed byte order and writes no BOM. ``first_line_prefix``
-    is the BOM the decoder consumed from the start of the stream; it belongs
-    to line 1 only.
-    """
-
-    codec: str
-    first_line_prefix: bytes
-
-
-_BOM_ORDERS: dict[str, tuple[tuple[bytes, str], ...]] = {
-    "utf-16": ((codecs.BOM_UTF16_LE, "utf-16-le"), (codecs.BOM_UTF16_BE, "utf-16-be")),
-    "utf-32": ((codecs.BOM_UTF32_LE, "utf-32-le"), (codecs.BOM_UTF32_BE, "utf-32-be")),
-    "utf-8-sig": ((codecs.BOM_UTF8, "utf-8"),),
-}
-_NO_BOM_FALLBACK = {"utf-16": "utf-16-le", "utf-32": "utf-32-le", "utf-8-sig": "utf-8"}
-
-
-def line_byte_codec(path: Path, read_encoding: str) -> LineByteCodec:
-    """Return how lines of ``path`` decoded with ``read_encoding`` map back to bytes.
-
-    ``utf-16``, ``utf-32`` and ``utf-8-sig`` take the byte order (or the BOM's
-    presence) from the stream and drop the BOM from the decoded text, so the
-    codec name alone cannot rebuild a line: re-encoding with it uses the host's
-    byte order and prefixes a BOM to every line. Every other codec rebuilds
-    with itself and has no prefix.
-    """
-    name = codecs.lookup(read_encoding).name
-    if name not in _BOM_ORDERS:
-        return LineByteCodec(codec=read_encoding, first_line_prefix=b"")
-    with path.open("rb") as raw:
-        head = raw.read(4)
-    for bom, fixed_codec in _BOM_ORDERS[name]:
-        if head.startswith(bom):
-            return LineByteCodec(codec=fixed_codec, first_line_prefix=bom)
-    # No BOM: utf-8-sig decodes as plain utf-8; utf-16 and utf-32 refuse the
-    # stream at its first read, before any line exists to rebuild.
-    return LineByteCodec(codec=_NO_BOM_FALLBACK[name], first_line_prefix=b"")
-
-
-def escaped_line_to_bytes(value: str, line_codec: LineByteCodec, *, line_number: int) -> bytes:
-    """Rebuild the raw bytes of a line decoded with ``BYTE_ESCAPE_ERRORS``.
-
-    Escaped code points become their original byte; every other run is
-    re-encoded with ``line_codec.codec`` (the fixed-order codec the stream was
-    decoded as, so it encodes back to the same bytes). Line 1 regains the BOM
-    the decoder consumed.
-    """
-    encoder = codecs.getincrementalencoder(line_codec.codec)()
-    raw = bytearray(line_codec.first_line_prefix if line_number == 1 else b"")
-    for escaped, run in groupby(value, key=lambda char: 0xDC00 <= ord(char) <= 0xDCFF):
-        if escaped:
-            raw.extend(ord(char) - 0xDC00 for char in run)
-        else:
-            raw.extend(encoder.encode("".join(run)))
-    raw.extend(encoder.encode("", final=True))
-    return bytes(raw)
 
 
 class JSONSourceConfig(SourceDataConfig):
@@ -177,20 +71,11 @@ class JSONSourceConfig(SourceDataConfig):
         default=None,
         description="Optional top-level object key containing the array of records to read from a JSON document.",
     )
-    encoding: str = Field(default="utf-8", description="Text encoding used to decode the JSON or JSONL file.")
+    encoding: TextEncoding = Field(default="utf-8", description="Text encoding used to decode the JSON or JSONL file.")
     field_mapping: NormalizedFieldMappingOption = Field(
         default=None,
         description="Optional mapping from observed JSON object keys to normalized pipeline field names.",
     )
-
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, v: str) -> str:
-        try:
-            codecs.lookup(v)
-        except LookupError as exc:
-            raise ValueError(f"unknown encoding: {v!r}") from exc
-        return v
 
     @model_validator(mode="after")
     def _reject_data_key_with_jsonl(self) -> "JSONSourceConfig":
@@ -263,7 +148,7 @@ class JSONSource(BaseSource):
     name = "json"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:34cf4c72a5d26704"
+    source_file_hash: str | None = "sha256:7a8425cae4ef21bd"
     config_model = JSONSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str
@@ -295,10 +180,8 @@ class JSONSource(BaseSource):
         self._path = cfg.resolved_path()
         self._encoding = cfg.encoding
         # Windows tooling commonly writes UTF-8 with a leading BOM, which
-        # json.loads rejects ('Unexpected UTF-8 BOM'). Read UTF-8 input as
-        # utf-8-sig so only a BOM at the start of the file is stripped, as
-        # the CSV source's header normalization does.
-        self._read_encoding = "utf-8-sig" if codecs.lookup(cfg.encoding).name == "utf-8" else cfg.encoding
+        # json.loads rejects ('Unexpected UTF-8 BOM').
+        self._read_encoding = decoding_codec(cfg.encoding)
         self._data_key = cfg.data_key
 
         # Auto-detect format from extension if not specified

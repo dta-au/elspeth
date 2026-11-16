@@ -1200,7 +1200,8 @@ class TestRateLimiter:
         acquire_calls = []
 
         class FakeLimiter:
-            def acquire(self) -> None:
+            def acquire(self, *, timeout: float | None = None) -> None:
+                assert timeout == 30.0
                 acquire_calls.append(True)
 
         c = DataverseClient(
@@ -1215,6 +1216,21 @@ class TestRateLimiter:
         c.get_page(f"{ENV_URL}/api/data/v9.2/accounts")
 
         assert len(acquire_calls) == 1
+
+    def test_limiter_timeout_refuses_before_request(self, transport: MockTransport) -> None:
+        class RefusingLimiter:
+            def acquire(self, *, timeout: float | None = None) -> None:
+                assert timeout == 30.0
+                raise TimeoutError("no permit")
+
+        client = DataverseClient(environment_url=ENV_URL, credential=FakeCredential(), limiter=RefusingLimiter())
+        client._client.close()
+        client._client = httpx.Client(transport=transport, timeout=30.0)
+        with pytest.raises(DataverseClientError, match=r"Rate-limiter wait exceeded 30\.0s; no request was sent") as raised:
+            client.get_page(f"{ENV_URL}/api/data/v9.2/accounts")
+        assert raised.value.error_category == "timeout"
+        assert raised.value.retryable
+        assert transport.requests == []
 
     def test_no_rate_limiter(self, client: DataverseClient, transport: MockTransport) -> None:
         """No limiter configured — should not raise."""

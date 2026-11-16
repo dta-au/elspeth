@@ -15,7 +15,7 @@ from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, model_validator
 
 from elspeth.contracts import CallType, Determinism, PluginSchema
 from elspeth.contracts.diversion import SinkWriteResult
@@ -45,7 +45,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.sink import OutputValidationResult
 from elspeth.contracts.contexts import SinkContext
 from elspeth.plugins.infrastructure.base import BaseSink
-from elspeth.plugins.infrastructure.config_base import OutputCollisionPolicy, SinkPathConfig
+from elspeth.plugins.infrastructure.config_base import CSVDelimiter, OutputCollisionPolicy, SinkPathConfig, TextEncoding
 from elspeth.plugins.infrastructure.display_headers import (
     display_name_for,
     get_effective_display_headers,
@@ -104,8 +104,8 @@ class CSVSinkConfig(SinkPathConfig):
     - Header output mode (headers: normalized | original | {mapping})
     """
 
-    delimiter: str = Field(default=",", description="Single-character delimiter used when writing CSV fields.")
-    encoding: str = Field(default="utf-8", description="Text encoding used when writing the CSV file.")
+    delimiter: CSVDelimiter = Field(default=",", description="Single-character delimiter used when writing CSV fields.")
+    encoding: TextEncoding = Field(default="utf-8", description="Text encoding used when writing the CSV file.")
     mode: Literal["write", "append"] = Field(default="write", description="Whether to create/replace the CSV file or append rows.")
     require_all_rows: bool = Field(
         default=False,
@@ -156,34 +156,6 @@ class CSVSinkConfig(SinkPathConfig):
             "names are not rewritten. The written cells then differ from the audited row values; false writes verbatim."
         ),
     )
-
-    @field_validator("delimiter")
-    @classmethod
-    def _validate_delimiter(cls, v: str) -> str:
-        if len(v) != 1:
-            raise ValueError(f"delimiter must be a single character, got {v!r}")
-        # csv.writer also refuses the quotechar and line terminators; reject
-        # them here so the error is a config error, not a publication crash.
-        try:
-            csv.writer(io.StringIO(), delimiter=v)
-        except ValueError as exc:
-            raise ValueError(f"delimiter {v!r} is not usable by the CSV writer: {exc}") from exc
-        return v
-
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, v: str) -> str:
-        try:
-            codecs.lookup(v)
-        except LookupError as exc:
-            raise ValueError(f"unknown encoding: {v!r}") from exc
-        # codecs.lookup() also resolves bytes-to-bytes and str-to-str codecs
-        # (base64, hex, zlib, rot13); str.encode() refuses them as non-text.
-        try:
-            "".encode(v)
-        except LookupError as exc:
-            raise ValueError(f"encoding {v!r} is not a text encoding") from exc
-        return v
 
     @model_validator(mode="after")
     def _validate_collision_policy_mode(self) -> CSVSinkConfig:
@@ -246,7 +218,7 @@ class CSVSink(BaseSink, SinkEffectAuditContextCapability):
     name = "csv"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:70e091ae2823f6ca"
+    source_file_hash: str | None = "sha256:c3acfd7dc4a8fc84"
     config_model = CSVSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM

@@ -64,12 +64,15 @@ from elspeth.plugins.infrastructure.clients.http import (
     HTTPResponseEncodingLimitError,
 )
 from elspeth.plugins.infrastructure.clients.llm import (
+    UNSUPPORTED_TOOL_CALLS_MESSAGE,
     ContentPolicyError,
     ContextLengthError,
     LLMClientError,
     NetworkError,
     RateLimitError,
     ServerError,
+    UnsupportedResponseError,
+    classify_empty_completion,
     public_llm_error_category,
 )
 from elspeth.plugins.infrastructure.telemetry import emit_resource_cleanup_failed
@@ -150,8 +153,8 @@ class GatewayConfig(LLMConfig):
         max_length=GATEWAY_MODEL_MAX_LENGTH,
         description="Logical model alias resolved server-side by the gateway",
     )
-    endpoint: str = Field(..., description="Gateway base URL; must end with the versioned base path '/v1'")
-    api_key: str = Field(..., description="Resolved gateway bearer credential")
+    endpoint: str = Field(..., description="Gateway base URL; must end with the versioned base path '/v1'", repr=False)
+    api_key: str = Field(..., description="Resolved gateway bearer credential", repr=False)
     contract_major: int = Field(
         default=1,
         description="Gateway contract major version this configuration expects",
@@ -164,7 +167,7 @@ class GatewayConfig(LLMConfig):
         default=60.0,
         gt=GATEWAY_TIMEOUT_MIN_EXCLUSIVE,
         le=GATEWAY_TIMEOUT_MAX_SECONDS,
-        description="Request timeout",
+        description="Total wall-clock seconds from dispatch for each provider HTTP request, including DNS, connect, TLS, send, headers, body, and every redirect hop. Rate-limiter waits are bounded separately by the same number of seconds.",
     )
     max_tokens: int | None = Field(
         default=None,
@@ -172,7 +175,7 @@ class GatewayConfig(LLMConfig):
         le=GATEWAY_MAX_TOKENS_LIMIT,
         description="Maximum tokens in response",
     )
-    tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration")
+    tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration", repr=False)
 
     @field_validator("endpoint")
     @classmethod
@@ -475,15 +478,15 @@ def _validate_gateway_success_response(
     content = message["content"]
     raw_finish_reason = first_choice.get("finish_reason")
 
-    if content is None:
-        raise ContentPolicyError("Gateway returned null content (likely content-filtered upstream)")
-    if not isinstance(content, str):
+    if content is not None and not isinstance(content, str):
         raise LLMClientError(f"Gateway response content is {type(content).__name__}, expected str", retryable=False)
-    if not content.strip():
+    if content is None or not content.strip():
         if raw_finish_reason == "tool_calls":
-            raise LLMClientError("Gateway returned a tool_calls response (not supported by ELSPETH)", retryable=False)
-        # finish_reason is agency-controlled data — never interpolated.
-        raise ContentPolicyError("Gateway returned empty content")
+            raise UnsupportedResponseError(UNSUPPORTED_TOOL_CALLS_MESSAGE)
+        # The shared classification every provider records (#123); the
+        # verdict text is owned, finish_reason is never interpolated.
+        refusal = message.get("refusal")
+        raise classify_empty_completion(raw_finish_reason, refused=isinstance(refusal, str) and bool(refusal.strip()))
 
     raw_usage = data.get("usage")
     if usage_required and raw_usage is None:

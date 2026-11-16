@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any, Literal, Self
 import chromadb
 import chromadb.api
 import httpx
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.call_mode import CallModeSession
@@ -52,14 +52,14 @@ if TYPE_CHECKING:
 class ChromaSearchProviderConfig(BaseModel):
     """Configuration for ChromaDB provider."""
 
-    model_config = {"extra": "forbid", "frozen": True}
+    model_config = {"extra": "forbid", "frozen": True, "hide_input_in_errors": True}
 
     collection: str
     mode: ChromaSearchMode = "ephemeral"
 
     persist_directory: str | None = None
 
-    host: str | None = None
+    host: str | None = Field(default=None, repr=False)
     port: int = 8000
     ssl: bool = True
 

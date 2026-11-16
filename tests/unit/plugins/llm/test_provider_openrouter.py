@@ -27,6 +27,8 @@ from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.plugins.infrastructure.clients.llm import (
     ContentPolicyError,
     ContextLengthError,
+    EmptyCompletionError,
+    FilteredCompletionError,
     LLMClientError,
     NetworkError,
     RateLimitError,
@@ -700,7 +702,7 @@ class TestExecuteQuery:
             request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"),
         )
         http_client = FakeHTTPClient(response=resp)
-        with _provider_http_client(provider, http_client), pytest.raises(LLMClientError, match="null content"):
+        with _provider_http_client(provider, http_client), pytest.raises(EmptyCompletionError, match="without an explicit refusal"):
             provider.execute_query(
                 messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
@@ -1274,10 +1276,10 @@ class TestRuntimePreflight:
     @pytest.mark.parametrize(
         ("finish_reason", "refusal", "expected_type", "diagnostic"),
         [
-            ("length", None, LLMClientError, "output token budget"),
-            ("stop", None, LLMClientError, "without an explicit refusal"),
-            ("content_filter", None, ContentPolicyError, "provider refused or filtered"),
-            ("stop", "private refusal detail", ContentPolicyError, "provider refused or filtered"),
+            ("length", None, EmptyCompletionError, "output token budget"),
+            ("stop", None, EmptyCompletionError, "without an explicit refusal"),
+            ("content_filter", None, FilteredCompletionError, "provider refused or filtered"),
+            ("stop", "private refusal detail", FilteredCompletionError, "provider refused or filtered"),
         ],
     )
     def test_preflight_missing_content_classification(

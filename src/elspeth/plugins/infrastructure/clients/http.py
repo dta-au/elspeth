@@ -15,6 +15,7 @@ import time
 import zlib
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
+from functools import partial
 from ipaddress import IPv4Network, IPv6Network
 from threading import Lock
 from types import MappingProxyType
@@ -50,7 +51,10 @@ from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.security.web import (
     HTTPOrigin,
+    NetworkError,
+    SSRFBlockedError,
     SSRFSafeRequest,
+    contains_ascii_control_character,
     validate_allowed_http_origin,
     validate_url_for_ssrf,
 )
@@ -59,6 +63,8 @@ from elspeth.plugins.infrastructure.clients.deadline import (
     DeadlineHTTPTransport,
     HTTPDeadline,
     HTTPDeadlineExceeded,
+    deadline_bound_client,
+    http_deadline_scope,
 )
 from elspeth.plugins.infrastructure.clients.fingerprinting import (
     filter_response_headers as _filter_response_headers,
@@ -80,6 +86,14 @@ logger = structlog.get_logger(__name__)
 
 _HTTP_URL_IN_TEXT = re.compile(r"https?://\S+", re.IGNORECASE)
 _FINGERPRINTED_AUTH = re.compile(r"<fingerprint:[0-9a-f]{64}>\Z")
+
+
+def _admit_raw_redirect_location(response: httpx.Response, *, manual_follow: bool) -> None:
+    """Refuse raw control bytes before httpx builds a redirect request."""
+    if (
+        response.has_redirect_location or (manual_follow and response.is_redirect and "location" in response.headers)
+    ) and contains_ascii_control_character(response.headers["location"]):
+        raise SSRFBlockedError("Redirect Location contains an ASCII control character", kind="malformed_url")
 
 
 def _sanitize_http_error_message(message: str) -> str:
@@ -137,6 +151,19 @@ def _recorded_transport_failure(
     if evidence.status is not CallStatus.ERROR or evidence.response_data is not None or evidence.error_data is None:
         return None
     error = evidence.error_data
+    if set(error) == {"type", "message", "refusal_category", "wait_budget_seconds", "request_sent"}:
+        budget = error["wait_budget_seconds"]
+        if (
+            error["type"] == "HTTPLimiterRefusal"
+            and error["refusal_category"] == "rate_limiter"
+            and type(budget) in (int, float)
+            and math.isfinite(budget)
+            and budget > 0
+            and error["request_sent"] is False
+            and type(error["message"]) is str
+        ):
+            return HTTPLimiterRefusal(float(budget), request=request), RawCallPayload(error)
+        return None
     if set(error) != {"type", "message"}:
         return None
     error_type = error["type"]
@@ -203,12 +230,42 @@ class HTTPResponseAuditRejectedError(httpx.HTTPError):
 class HTTPPolicyError(httpx.HTTPError):
     """A value-free external failure with separately retained body evidence."""
 
-    def __init__(self, code: HTTPFailureCode, *, response_payload: HTTPCallResponse | None = None) -> None:
+    def __init__(
+        self,
+        code: HTTPFailureCode,
+        *,
+        response_payload: HTTPCallResponse | None = None,
+        wait_budget_seconds: float | None = None,
+    ) -> None:
         if code not in HTTP_FAILURE_CODES:
             raise ValueError("HTTP policy error requires a closed failure code")
         super().__init__(code)
         self.code = code
         self.response_payload = response_payload
+        self.refusal_category = "rate_limiter" if wait_budget_seconds is not None else None
+        self.wait_budget_seconds = wait_budget_seconds
+        self.request_sent = False if wait_budget_seconds is not None else None
+
+
+class HTTPLimiterRefusal(httpx.ConnectTimeout):
+    """A permit was refused before an HTTP request reached the transport."""
+
+    def __init__(self, wait_budget_seconds: float, *, request: httpx.Request | None = None) -> None:
+        super().__init__(f"Rate-limiter wait exceeded {wait_budget_seconds}s; no request was sent", request=request)
+        self.refusal_category = "rate_limiter"
+        self.wait_budget_seconds = wait_budget_seconds
+        self.request_sent = False
+
+
+def _http_error_evidence(error: Exception, *, policy_code: HTTPFailureCode | None = None) -> HTTPCallError:
+    refusal = error if isinstance(error, HTTPLimiterRefusal) else None
+    return HTTPCallError(
+        type="HTTPPolicyError" if policy_code is not None else type(error).__name__,
+        message=policy_code if policy_code is not None else _sanitize_http_error_message(str(error)),
+        refusal_category=None if refusal is None else refusal.refusal_category,
+        wait_budget_seconds=None if refusal is None else refusal.wait_budget_seconds,
+        request_sent=None if refusal is None else refusal.request_sent,
+    )
 
 
 def _policy_failure_code(error: Exception) -> HTTPFailureCode:
@@ -317,7 +374,10 @@ class AuditedHTTPClient(AuditedClientBase):
             state_id: Node state ID to associate calls with
             run_id: Pipeline run ID for telemetry correlation
             telemetry_emit: Callback to emit telemetry events
-            timeout: Request timeout in seconds (default: 30.0)
+            timeout: Total wall-clock seconds from dispatch for one request
+                (default: 30.0), including DNS, connect, TLS, send, headers,
+                body, and every redirect hop. Rate-limiter waits are bounded
+                separately by the same number of seconds.
             base_url: Optional base URL to prepend to all requests
             headers: Default headers for all requests
             limiter: Optional rate limiter for throttling requests
@@ -365,7 +425,8 @@ class AuditedHTTPClient(AuditedClientBase):
         self._semantic_managed_identity_verify = semantic_managed_identity_verify
         # Shared httpx.Client for connection pooling and TCP reuse.
         # httpx.Client is thread-safe; the internal pool handles concurrency.
-        # Per-request timeouts override the default via timeout= kwarg.
+        # Per-request timeouts override the default via timeout= kwarg; every
+        # request runs inside http_deadline_scope so the timeout is a total.
         # follow_redirects=False: SSRF-safe methods manage redirects manually.
         # VERIFY waits until the first request has passed source-call admission.
         self._client_init_lock = Lock()
@@ -373,7 +434,7 @@ class AuditedHTTPClient(AuditedClientBase):
             None
             if audit_policy is HTTPAuditPolicy.POWER_AUTOMATE_V1
             or (call_mode_session is not None and call_mode_session.mode in (RunMode.REPLAY, RunMode.VERIFY))
-            else httpx.Client(timeout=self._timeout, follow_redirects=False)
+            else deadline_bound_client(timeout=self._timeout)
         )
 
     # Delegate to shared module functions. Instance methods preserved for
@@ -412,6 +473,9 @@ class AuditedHTTPClient(AuditedClientBase):
                 type=error.type,
                 message=_sanitize_http_error_message(error.message),
                 status_code=error.status_code,
+                refusal_category=error.refusal_category,
+                wait_budget_seconds=error.wait_budget_seconds,
+                request_sent=error.request_sent,
             )
         return super()._record_call(
             call_index=call_index,
@@ -538,6 +602,9 @@ class AuditedHTTPClient(AuditedClientBase):
                 type=error_data.type,
                 message=_sanitize_http_error_message(error_data.message),
                 status_code=error_data.status_code,
+                refusal_category=error_data.refusal_category,
+                wait_budget_seconds=error_data.wait_budget_seconds,
+                request_sent=error_data.request_sent,
             )
         call = self._record_call(
             call_index=call_index,
@@ -1540,7 +1607,7 @@ class AuditedHTTPClient(AuditedClientBase):
             method: HTTP method ("POST" or "GET")
             url: URL path (appended to base_url if configured)
             headers: Additional headers for this request
-            timeout: Request timeout override (uses client default if None)
+            timeout: Total-deadline override in seconds (uses client default if None)
             json: JSON body (POST only)
             params: Query parameters (GET only)
             audit_request_metadata: Audit-only metadata to include in the
@@ -1564,8 +1631,6 @@ class AuditedHTTPClient(AuditedClientBase):
             raise contract_errors.FrameworkBugError("Power Automate HTTP policy requires IP-pinned requests")
         if self._semantic_managed_identity_verify:
             raise AuditIntegrityError("Managed identity verify requires the SSRF-safe request path")
-        if self._call_mode_session is None or self._call_mode_session.mode is not RunMode.REPLAY:
-            self._acquire_rate_limit()
         call_index = self._next_call_index()
 
         full_url = self._resolve_url(url)
@@ -1603,30 +1668,37 @@ class AuditedHTTPClient(AuditedClientBase):
         response: httpx.Response | None = None
 
         try:
+            if self._call_mode_session is None or self._call_mode_session.mode is not RunMode.REPLAY:
+                try:
+                    self._acquire_rate_limit(timeout=effective_timeout)
+                except TimeoutError as exc:
+                    raise HTTPLimiterRefusal(effective_timeout) from exc
             if self._client is None:
                 with self._client_init_lock:
                     if self._client is None:
                         if self._call_mode_session is None or self._call_mode_session.mode is not RunMode.VERIFY:
                             raise AuditIntegrityError("HTTP client absent outside admitted verify mode")
-                        self._client = httpx.Client(timeout=self._timeout, follow_redirects=False)
+                        self._client = deadline_bound_client(timeout=self._timeout)
             client = self._client
             if client is None:
                 raise AuditIntegrityError("HTTP client absent after verify admission")
-            # Dispatch to the correct httpx method
-            response = self._request_with_optional_body_cap(
-                client,
-                method,
-                full_url,
-                json=json,
-                params=params,
-                headers=merged_headers,
-                timeout=effective_timeout,
-            )
+            # Dispatch to the correct httpx method. The scope makes the
+            # timeout the request's total wall time, body read included.
+            with http_deadline_scope(effective_timeout):
+                response = self._request_with_optional_body_cap(
+                    client,
+                    method,
+                    full_url,
+                    json=json,
+                    params=params,
+                    headers=merged_headers,
+                    timeout=effective_timeout,
+                )
         except Exception as e:
             latency_ms = (time.perf_counter() - start) * 1000
             response_payload: HTTPCallResponse | None = None
             response_data: Mapping[str, Any] | None = None
-            error_payload = HTTPCallError(type=type(e).__name__, message=str(e))
+            error_payload = _http_error_evidence(e)
             error_refusal: HTTPResponseAuditRejectedError | None = None
             if isinstance(e, (HTTPResponseBodyTooLargeError, HTTPResponseEncodingLimitError)):
                 response_payload = e.response_payload
@@ -1718,7 +1790,7 @@ class AuditedHTTPClient(AuditedClientBase):
             url: URL path (appended to base_url if configured)
             json: JSON body to send (optional)
             headers: Additional headers for this request
-            timeout: Request timeout in seconds (uses client default if None)
+            timeout: Total wall-clock deadline in seconds for this request (uses client default if None)
             audit_request_metadata: Audit-only metadata to include in the
                 recorded request payload without sending it to the remote
                 service.
@@ -1762,7 +1834,7 @@ class AuditedHTTPClient(AuditedClientBase):
             url: URL path (appended to base_url if configured)
             headers: Additional headers for this request
             params: Query parameters to append to URL
-            timeout: Request timeout in seconds (uses client default if None)
+            timeout: Total wall-clock deadline in seconds for this request (uses client default if None)
             token_id: Per-call token_id for telemetry (overrides client default).
                 Used by batch transforms where one client serves multiple tokens.
 
@@ -1810,16 +1882,22 @@ class AuditedHTTPClient(AuditedClientBase):
         form: tuple[tuple[str, str], ...] | None,
         multipart_body: bytes | None,
         params: dict[str, str | int | float] | None,
+        deadline: HTTPDeadline,
+        follow_redirects: bool,
         before_send: Callable[[], None] | None = None,
     ) -> httpx.Response:
-        """Send one IP-pinned request with method-specific httpx handling."""
+        """Send one IP-pinned request with method-specific httpx handling.
+
+        ``deadline`` is the request's scoped total deadline; the Power
+        Automate policy's literal-IP transport is bound to the same one.
+        """
         if self._audit_policy is HTTPAuditPolicy.POWER_AUTOMATE_V1:
-            deadline = HTTPDeadline(time.monotonic() + self._timeout, clock=time.monotonic)
             with httpx.Client(
                 timeout=self._timeout,
                 follow_redirects=False,
                 trust_env=False,
                 transport=DeadlineHTTPTransport(deadline),
+                event_hooks={"response": [partial(_admit_raw_redirect_location, manual_follow=follow_redirects)]},
             ) as deadline_client:
                 self._run_before_send(before_send)
                 return self._request_with_optional_body_cap(
@@ -1934,9 +2012,6 @@ class AuditedHTTPClient(AuditedClientBase):
                 raise AuditIntegrityError("Managed identity verify does not support redirect following")
         elif verify_source_call_id is not None:
             raise AuditIntegrityError("Verify source call identity requires managed identity verify mode")
-        if self._call_mode_session is None or self._call_mode_session.mode is not RunMode.REPLAY:
-            self._acquire_rate_limit()
-
         call_index = self._next_call_index()
 
         merged_headers = {
@@ -2010,47 +2085,59 @@ class AuditedHTTPClient(AuditedClientBase):
         replay_hops: list[HTTPRedirectReplayHop] = []
         policy_failure: HTTPFailureCode | None = None
         policy_response: HTTPCallResponse | None = None
+        policy_wait_budget: float | None = None
 
         try:
+            if self._call_mode_session is None or self._call_mode_session.mode is not RunMode.REPLAY:
+                try:
+                    self._acquire_rate_limit(timeout=effective_timeout)
+                except TimeoutError as exc:
+                    raise HTTPLimiterRefusal(effective_timeout) from exc
             # Ephemeral client for SSRF-safe requests: connection_url uses the
             # resolved IP (e.g. https://1.2.3.4:443/path), so all hostnames sharing
             # an IP would map to the same pool key. A shared client would reuse a
             # TLS connection established for hostname-A when requesting hostname-B,
             # silently skipping SNI negotiation and certificate verification.
-            with httpx.Client(
-                timeout=effective_timeout,
-                follow_redirects=False,
-                trust_env=self._audit_policy is HTTPAuditPolicy.GENERIC,
-            ) as ssrf_client:
-                response = self._send_ssrf_safe_request(
-                    ssrf_client,
-                    method_upper,
-                    connection_url,
-                    headers=merged_headers,
-                    extensions=extensions if extensions else None,
-                    json=json,
-                    form=form,
-                    multipart_body=multipart_body,
-                    params=params,
-                    before_send=before_send,
-                )
+            # One deadline scope covers the request and every redirect hop, so
+            # the configured timeout is the logical request's total wall time.
+            with http_deadline_scope(effective_timeout) as deadline:
+                with deadline_bound_client(
+                    timeout=effective_timeout,
+                    trust_env=self._audit_policy is HTTPAuditPolicy.GENERIC,
+                    event_hooks={"response": [partial(_admit_raw_redirect_location, manual_follow=follow_redirects)]},
+                ) as ssrf_client:
+                    response = self._send_ssrf_safe_request(
+                        ssrf_client,
+                        method_upper,
+                        connection_url,
+                        headers=merged_headers,
+                        extensions=extensions if extensions else None,
+                        json=json,
+                        form=form,
+                        multipart_body=multipart_body,
+                        params=params,
+                        deadline=deadline,
+                        follow_redirects=follow_redirects,
+                        before_send=before_send,
+                    )
 
-            # Handle redirects with SSRF validation at each hop
-            redirect_count = 0
-            final_hostname_url = logical_request_url
-            if follow_redirects:
-                response, redirect_count, final_hostname_url = self._follow_redirects_safe(
-                    response,
-                    max_redirects,
-                    effective_timeout,
-                    merged_headers,
-                    original_url=logical_request_url,
-                    allowed_ranges=allowed_ranges,
-                    allowed_origins=allowed_origins,
-                    bound_header_origin=bound_header_origin,
-                    fingerprinted_header_names=fingerprinted_header_names,
-                    replay_hops=replay_hops,
-                )
+                # Handle redirects with SSRF validation at each hop
+                redirect_count = 0
+                final_hostname_url = logical_request_url
+                if follow_redirects:
+                    response, redirect_count, final_hostname_url = self._follow_redirects_safe(
+                        response,
+                        max_redirects,
+                        effective_timeout,
+                        merged_headers,
+                        original_url=logical_request_url,
+                        deadline=deadline,
+                        allowed_ranges=allowed_ranges,
+                        allowed_origins=allowed_origins,
+                        bound_header_origin=bound_header_origin,
+                        fingerprinted_header_names=fingerprinted_header_names,
+                        replay_hops=replay_hops,
+                    )
 
             latency_ms = (time.perf_counter() - start) * 1000
 
@@ -2101,11 +2188,23 @@ class AuditedHTTPClient(AuditedClientBase):
                 error_response_data = response_payload.to_dict()
 
             safe_code = _policy_failure_code(e) if self._audit_policy is HTTPAuditPolicy.POWER_AUTOMATE_V1 else None
-            error_payload = HTTPCallError(
-                type="HTTPPolicyError" if safe_code is not None else type(e).__name__,
-                message=safe_code if safe_code is not None else _sanitize_http_error_message(str(e)),
-                status_code=response_payload.status_code if safe_code is not None and response_payload is not None else None,
-            )
+            error_payload = _http_error_evidence(e, policy_code=safe_code)
+            if isinstance(e, HTTPLimiterRefusal) and response is not None:
+                error_payload = HTTPCallError(
+                    type=error_payload.type,
+                    message=f"Redirect hop refused: {e.wait_budget_seconds}s rate-limiter wait exceeded; initial request was sent",
+                    status_code=response.status_code,
+                    request_sent=True,
+                )
+            if safe_code is not None and response_payload is not None:
+                error_payload = HTTPCallError(
+                    type=error_payload.type,
+                    message=error_payload.message,
+                    status_code=response_payload.status_code,
+                    refusal_category=error_payload.refusal_category,
+                    wait_budget_seconds=error_payload.wait_budget_seconds,
+                    request_sent=error_payload.request_sent,
+                )
             failed_call = self._record_call(
                 call_index=call_index,
                 call_type=CallType.HTTP,
@@ -2146,11 +2245,12 @@ class AuditedHTTPClient(AuditedClientBase):
                 raise
             policy_failure = safe_code
             policy_response = response_payload
+            policy_wait_budget = e.wait_budget_seconds if isinstance(e, HTTPLimiterRefusal) else None
 
         if policy_failure is not None:
             # Raise after the exception handler so external context is absent,
             # including when callers inspect chains rather than rendering them.
-            raise HTTPPolicyError(policy_failure, response_payload=policy_response)
+            raise HTTPPolicyError(policy_failure, response_payload=policy_response, wait_budget_seconds=policy_wait_budget)
 
         if response is None:
             raise contract_errors.FrameworkBugError("HTTP dispatch completed without a response")
@@ -2237,6 +2337,7 @@ class AuditedHTTPClient(AuditedClientBase):
         original_headers: dict[str, str],
         original_url: str,
         *,
+        deadline: HTTPDeadline | None = None,
         allowed_ranges: Sequence[IPv4Network | IPv6Network] = (),
         allowed_origins: Sequence[HTTPOrigin] = (),
         fingerprinted_header_names: frozenset[str] = frozenset(),
@@ -2252,7 +2353,8 @@ class AuditedHTTPClient(AuditedClientBase):
         Args:
             response: Initial response (may be a redirect)
             max_redirects: Maximum number of redirect hops
-            timeout: Request timeout for each hop
+            timeout: Per-phase timeout ceiling for each hop; the caller's
+                ``http_deadline_scope`` bounds all hops together
             original_headers: Headers from original request (minus Host, which is set per-hop)
             original_url: Hostname-based URL for resolving relative redirects.
                 response.url is IP-based (from connection_url rewrite), so relative
@@ -2323,10 +2425,18 @@ class AuditedHTTPClient(AuditedClientBase):
                 validate_allowed_http_origin(redirect_url, allowed_origins)
                 if bound_header_origin is not None:
                     validate_allowed_http_origin(redirect_url, (bound_header_origin,))
-                redirect_request = validate_url_for_ssrf(redirect_url, allowed_ranges=allowed_ranges)
+                validation_budget = deadline.remaining() if deadline is not None else timeout
+                redirect_request = validate_url_for_ssrf(redirect_url, allowed_ranges=allowed_ranges, timeout=validation_budget)
+                if deadline is not None:
+                    deadline.remaining()
             except contract_errors.TIER_1_ERRORS:
                 raise
             except Exception as redirect_err:
+                if self._audit_policy is HTTPAuditPolicy.GENERIC and (
+                    isinstance(redirect_err, HTTPDeadlineExceeded)
+                    or (isinstance(redirect_err, NetworkError) and redirect_err.kind == "dns_timeout")
+                ):
+                    redirect_err = httpx.ConnectTimeout("HTTP redirect validation exceeded the remaining deadline")
                 self._admit_verify_call(
                     call_type=CallType.HTTP_REDIRECT,
                     request_data=blocked_hop_request_dto.to_dict(),
@@ -2352,7 +2462,7 @@ class AuditedHTTPClient(AuditedClientBase):
                     status=CallStatus.ERROR,
                     error_data=error_data,
                 )
-                raise
+                raise redirect_err
 
             # Update hostname_url to the redirect target for the next iteration.
             # If this was an absolute redirect to a different host, hostname_url
@@ -2367,11 +2477,6 @@ class AuditedHTTPClient(AuditedClientBase):
             extensions: dict[str, str] = {}
             if redirect_request.scheme == "https":
                 extensions["sni_hostname"] = redirect_request.sni_hostname
-
-            # Acquire rate limit for each redirect hop — each hop is a separate
-            # outbound network request that must be throttled independently.
-            # Bug fix: redirect hops were bypassing the rate limiter.
-            self._acquire_rate_limit()
 
             # Pre-allocate call index and request data BEFORE the hop so that
             # both success and failure paths can record the hop in the audit trail.
@@ -2390,9 +2495,18 @@ class AuditedHTTPClient(AuditedClientBase):
             # as the initial SSRF-safe request — IP-based connection_url would
             # cause the pool to reuse connections across different hostnames.
             try:
-                with httpx.Client(
+                try:
+                    wait_budget = deadline.remaining() if deadline is not None else timeout
+                    self._acquire_rate_limit(timeout=wait_budget)
+                except TimeoutError as exc:
+                    raise HTTPLimiterRefusal(wait_budget) from exc
+                except HTTPDeadlineExceeded as exc:
+                    if self._audit_policy is HTTPAuditPolicy.GENERIC:
+                        raise httpx.ConnectTimeout("HTTP redirect exceeded its remaining deadline") from exc
+                    raise
+                with deadline_bound_client(
                     timeout=timeout,
-                    follow_redirects=False,
+                    event_hooks={"response": [partial(_admit_raw_redirect_location, manual_follow=True)]},
                 ) as hop_client:
                     response = self._request_with_optional_body_cap(
                         hop_client,
@@ -2409,10 +2523,7 @@ class AuditedHTTPClient(AuditedClientBase):
                     else None
                 )
                 # Record the failed hop in the audit trail so lineage is complete
-                error_data = HTTPCallError(
-                    type=type(hop_err).__name__,
-                    message=_sanitize_http_error_message(str(hop_err)),
-                )
+                error_data = _http_error_evidence(hop_err)
                 failed_hop_call = self._record_call(
                     call_index=hop_call_index,
                     call_type=CallType.HTTP_REDIRECT,

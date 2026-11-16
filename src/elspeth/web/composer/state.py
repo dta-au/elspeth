@@ -85,6 +85,7 @@ from elspeth.core.dag.guarantees import ResolutionMode
 from elspeth.core.dag.models import GraphValidationError
 from elspeth.core.expression_types import UNRESOLVED, ResultKinds, SchemaFieldType, expression_kinds, input_kinds
 from elspeth.core.templates import extract_jinja2_field_usage
+from elspeth.plugins.infrastructure.base import aggregation_trigger_count_cap_error
 from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment, find_runtime_unbound_variables
 from elspeth.plugins.sources.field_normalization import (
     describe_undeclared_row_fields,
@@ -1763,6 +1764,13 @@ def _known_transform_plugins_requiring_complete_source_batch() -> frozenset[str]
     return frozenset(cls.name for cls in get_shared_plugin_manager().get_transforms() if cls.requires_complete_source_batch)
 
 
+def _known_transform_plugin_batch_caps() -> Mapping[str, int]:
+    """Return each capped transform's declared ``max_batch_rows`` (runtime_factory reads the same)."""
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+    return {cls.name: cls.max_batch_rows for cls in get_shared_plugin_manager().get_transforms() if cls.max_batch_rows is not None}
+
+
 def _declared_input_fields_option(options: Mapping[str, Any]) -> object:
     """Return the raw declared-input-field option, including wrapper-shaped aggregations."""
     if _DECLARED_INPUT_FIELDS_OPTION in options:
@@ -1803,7 +1811,7 @@ def _batch_aware_placement_error(
     node_type: str,
     plugin_name: str | None,
     output_mode: str | None,
-    trigger: Mapping[str, Any] | None = None,
+    trigger: Mapping[str, Any] | None,
 ) -> str | None:
     """Reject a batch-aware transform from a node kind it cannot run in.
 
@@ -1811,8 +1819,9 @@ def _batch_aware_placement_error(
     declarations: a batch-only plugin as a row transform, a plugin that reads
     the aggregation flush window as a collector, and a plugin whose flush does
     not emit exactly one row per buffered row as an aggregation under
-    ``output_mode: passthrough``. An absent ``output_mode`` is the runtime
-    default, ``transform``.
+    ``output_mode: passthrough``, and an aggregation whose trigger count
+    exceeds the plugin's declared ``max_batch_rows``. An absent
+    ``output_mode`` is the runtime default, ``transform``.
     """
     if plugin_name is None:
         return None
@@ -1824,6 +1833,16 @@ def _batch_aware_placement_error(
         assert parsed is not None
         if parsed.has_count or parsed.has_timeout or parsed.has_condition:
             return f"Node '{node_id}' uses '{plugin_name}', which requires an EOF-only trigger; omit trigger or use {{}}"
+
+    batch_caps = _known_transform_plugin_batch_caps() if node_type == "aggregation" else {}
+    if plugin_name in batch_caps:
+        parsed, error = _parse_aggregation_trigger(node_id, trigger or {})
+        if error is not None:
+            return error.message
+        assert parsed is not None
+        cap_error = aggregation_trigger_count_cap_error(node_id, plugin_name, batch_caps[plugin_name], parsed.count)
+        if cap_error is not None:
+            return cap_error
 
     if node_type == "collector" and plugin_name in _known_transform_plugins_requiring_aggregation_batch_context():
         return (

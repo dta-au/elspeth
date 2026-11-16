@@ -49,15 +49,14 @@ def _is_loopback_host(host: str) -> bool:
 
 
 def _host_url(host: str, port: int, *, ssl: bool) -> str:
-    if "://" in host or "/" in host or "?" in host or "#" in host:
-        raise ValueError(f"host must be a bare hostname or IP address, got {host!r}")
+    if "://" in host or "/" in host or "?" in host or "#" in host or "@" in host or "\\" in host:
+        raise ValueError("host must be a bare hostname or IP address")
+    scheme = "https" if ssl else "http"
     try:
         parsed_ip = ipaddress.ip_address(host.strip("[]"))
     except ValueError:
-        url_host = host
-    else:
-        url_host = f"[{parsed_ip}]" if parsed_ip.version == 6 else str(parsed_ip)
-    scheme = "https" if ssl else "http"
+        return f"{scheme}://{host}:{port}/"
+    url_host = f"[{parsed_ip}]" if parsed_ip.version == 6 else str(parsed_ip)
     return f"{scheme}://{url_host}:{port}/"
 
 
@@ -71,10 +70,10 @@ def _validate_chroma_http_target(host: str, port: int, *, ssl: bool) -> SSRFSafe
     allowed_ranges = _LOOPBACK_ALLOWED_RANGES if _is_loopback_host(host) else ()
     try:
         safe_target = validate_url_for_ssrf(_host_url(host, port, ssl=ssl), allowed_ranges=allowed_ranges)
-    except (SSRFBlockedError, NetworkError) as exc:
-        raise ValueError(f"ChromaDB host {host!r} is blocked by the SSRF policy: {exc}") from exc
+    except (SSRFBlockedError, NetworkError):
+        raise ValueError("ChromaDB host is blocked by the SSRF policy") from None
     if _is_loopback_host(host) and not ipaddress.ip_address(safe_target.resolved_ip).is_loopback:
-        raise ValueError(f"ChromaDB loopback host {host!r} resolved outside the loopback ranges")
+        raise ValueError("ChromaDB loopback host resolved outside the loopback ranges")
     return safe_target
 
 
@@ -108,7 +107,7 @@ def _validated_chroma_http_client_args(host: str, port: int, *, ssl: bool) -> _C
 class ChromaConnectionConfig(BaseModel):
     """Shared ChromaDB connection fields with cross-field validation."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
 
     collection: str = Field(description="ChromaDB collection name")
 
@@ -140,6 +139,7 @@ class ChromaConnectionConfig(BaseModel):
     host: str | None = Field(
         default=None,
         description="ChromaDB server hostname (client mode only)",
+        repr=False,
     )
     port: int = Field(default=8000, ge=1, le=65535, description="ChromaDB server port")
     ssl: bool = Field(default=True, description="Use HTTPS for client connections")
@@ -162,9 +162,7 @@ class ChromaConnectionConfig(BaseModel):
                 raise ValueError("persist_directory must not be set when mode='client'")
             if not self.ssl and not _is_loopback_host(self.host):
                 raise ValueError(
-                    f"HTTPS (ssl=True) is required for remote ChromaDB hosts, "
-                    f"got host={self.host!r} with ssl=False. "
-                    f"Non-SSL connections are only permitted for localhost."
+                    "HTTPS (ssl=True) is required for remote ChromaDB hosts. Non-SSL connections are only permitted for localhost."
                 )
             # Config parsing also runs during replay admission. Keep it local:
             # reject literal private targets now, then resolve and pin named
@@ -173,6 +171,6 @@ class ChromaConnectionConfig(BaseModel):
             allowed_ranges = _LOOPBACK_ALLOWED_RANGES if _is_loopback_host(self.host) else ()
             try:
                 validate_literal_ip_for_ssrf(self.host.strip("[]"), allowed_ranges=allowed_ranges)
-            except SSRFBlockedError as exc:
-                raise ValueError(f"ChromaDB host {self.host!r} is blocked by the SSRF policy: {exc}") from exc
+            except SSRFBlockedError:
+                raise ValueError("ChromaDB host is blocked by the SSRF policy") from None
         return self

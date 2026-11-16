@@ -28,7 +28,6 @@ clauses below are the whole trust-boundary convention here: like
 
 from __future__ import annotations
 
-import codecs
 import copy
 import json
 from collections.abc import Mapping
@@ -49,9 +48,10 @@ from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.contracts.source_read_verification import MAX_JSON_DEPTH
 from elspeth.plugins.infrastructure.base import BaseTransform
-from elspeth.plugins.infrastructure.config_base import NormalizedFieldMappingOption, TransformDataConfig
+from elspeth.plugins.infrastructure.config_base import NormalizedFieldMappingOption, TextEncoding, TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+from elspeth.plugins.infrastructure.text_decoding import decoding_codec
 from elspeth.plugins.sources.field_normalization import ExternalHeaderError, is_normalized_field_name, normalize_field_name
 from elspeth.plugins.transforms.blob_expand_contract import (
     BLOB_CONTENT_TYPE_FIELD_DESCRIPTION,
@@ -122,7 +122,7 @@ class BlobJSONExpandConfig(TransformDataConfig):
     field_mapping: NormalizedFieldMappingOption = Field(
         default=None, description="Optional mapping from normalized JSON record keys to final pipeline field names."
     )
-    encoding: str = Field(default="utf-8", description="Encoding used to decode the JSON blob.")
+    encoding: TextEncoding = Field(default="utf-8", description="Encoding used to decode the JSON blob.")
     include_record_index: bool = Field(default=True, description="Whether to emit the record index within the parsed JSON document.")
     record_index_field: str = Field(default="json_record_index", description="Output field receiving the zero-based JSON record index.")
     max_output_rows: int = Field(default=DEFAULT_MAX_OUTPUT_ROWS, gt=0, description="Maximum rows emitted for one input document.")
@@ -144,15 +144,6 @@ class BlobJSONExpandConfig(TransformDataConfig):
         if not stripped:
             raise ValueError(f"{info.field_name} must not be empty")
         return stripped
-
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, value: str) -> str:
-        try:
-            codecs.lookup(value)
-        except LookupError as exc:
-            raise ValueError(f"unknown encoding: {value!r}") from exc
-        return value
 
     @field_validator("fields")
     @classmethod
@@ -405,8 +396,8 @@ class BlobJSONExpand(BaseTransform):
     output_naming_config_keys = frozenset({"record_index_field", "fields"})
     name = "blob_json_expand"
     determinism = Determinism.IO_READ
-    plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e2b9ae839814a457"
+    plugin_version = "2.0.0"
+    source_file_hash: str | None = "sha256:7cf76c4cf5b55de5"
     config_model = BlobJSONExpandConfig
     usage_when_to_use: str = (
         "Use when a row carries a JSON document — either a payload-store reference from blob_fetch or JSON text in a "
@@ -458,6 +449,12 @@ class BlobJSONExpand(BaseTransform):
         super().__init__(options)
         cfg = BlobJSONExpandConfig.from_dict(options, plugin_name=self.name)
         self._initialize_declared_input_fields(cfg)
+        if cfg.source == "field":
+            self.declared_string_input_fields = frozenset({cfg.read_text_field})
+        elif cfg.format is None:
+            self.declared_string_input_fields = frozenset({cfg.read_blob_ref_field, cfg.read_content_type_field})
+        else:
+            self.declared_string_input_fields = frozenset({cfg.read_blob_ref_field})
 
         self._source = cfg.source
         self._blob_ref_field = cfg.read_blob_ref_field
@@ -622,18 +619,10 @@ class BlobJSONExpand(BaseTransform):
         # document, but a record key colliding with the text column is still a
         # genuine collision on the row that arrived. Only the inline arm
         # removes anything; this runtime removal stays separate from the
-        # static declaration, which may abstain for an original-header name.
-        # `base` carries NORMALIZED keys while the configured name may be the
-        # original header, so resolve it through the contract exactly as
-        # line_explode/json_explode and blob_csv_expand do. `_load_field_text`
-        # already read the column through the same resolution, so on this
-        # path the key exists — a `pop(..., None)` here silently left the
-        # whole document on every output row whenever the two spellings
-        # differed.
+        # static declaration. The configured name is the carried payload key.
         runtime_removed_fields = (self._text_field,) if self._source == "field" else ()
         for removed in runtime_removed_fields:
-            normalized_removed = removed if removed in base else row.contract.resolve_name(removed)
-            del base[normalized_removed]
+            del base[removed]
 
         output_rows: list[dict[str, Any]] = []
         for record_index, record in enumerate(parsed.records):
@@ -692,7 +681,9 @@ class BlobJSONExpand(BaseTransform):
 
     def _load_field_text(self, row: PipelineRow) -> tuple[str, str, dict[str, str]]:
         """Read JSON text straight from a row field. No payload store involved."""
-        text = row[self._text_field]
+        if not row.carries(self._text_field):
+            raise _BlobJSONParseError(_json_error_reason("missing_field", field=self._text_field))
+        text = row.carried_value(self._text_field)
         if type(text) is not str:
             raise _BlobJSONParseError(
                 _json_error_reason(
@@ -712,7 +703,9 @@ class BlobJSONExpand(BaseTransform):
 
     def _load_blob_text(self, row: PipelineRow) -> tuple[str, str, dict[str, str]]:
         """Read bytes from the payload store and decode them."""
-        blob_ref = row[self._blob_ref_field]
+        if not row.carries(self._blob_ref_field):
+            raise _BlobJSONParseError(_json_error_reason("missing_field", field=self._blob_ref_field))
+        blob_ref = row.carried_value(self._blob_ref_field)
         if type(blob_ref) is not str:
             # Routed, not raised: a wrong-typed ref is a fact about THIS row,
             # the same kind as the malformed-hash rejection directly below.
@@ -778,7 +771,7 @@ class BlobJSONExpand(BaseTransform):
             )
 
         try:
-            text = body.decode(self._encoding)
+            text = body.decode(decoding_codec(self._encoding))
         except UnicodeDecodeError as exc:
             raise _BlobJSONParseError(
                 _json_error_reason("decode_failed", field=self._blob_ref_field, blob_ref=blob_ref, encoding=self._encoding, error=str(exc))
@@ -795,7 +788,7 @@ class BlobJSONExpand(BaseTransform):
         # omitted, so a pipeline that cannot guarantee the column is rejected at
         # build time. A row that still arrives without it is refused here rather
         # than guessed at.
-        if self._content_type_field not in row:
+        if not row.carries(self._content_type_field):
             raise _BlobJSONParseError(
                 _json_error_reason(
                     "unsupported_content_type",
@@ -803,7 +796,7 @@ class BlobJSONExpand(BaseTransform):
                     error=f"no content type on the row to infer the parse format from — set the 'format' option on {self.name}",
                 )
             )
-        content_type = row[self._content_type_field]
+        content_type = row.carried_value(self._content_type_field)
         if type(content_type) is not str:
             raise _BlobJSONParseError(
                 _json_error_reason(

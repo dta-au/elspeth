@@ -404,9 +404,9 @@ def test_the_shared_batch_placement_code_teaches_every_arm_that_emits_it() -> No
     from elspeth.web.composer.state import _batch_aware_placement_error
 
     arms = {
-        "transform": _batch_aware_placement_error("n", "transform", "batch_stats", None),
-        "collector": _batch_aware_placement_error("n", "collector", "report_assemble", None),
-        "replicate": _batch_aware_placement_error("n", "aggregation", "batch_replicate", "passthrough"),
+        "transform": _batch_aware_placement_error("n", "transform", "batch_stats", None, None),
+        "collector": _batch_aware_placement_error("n", "collector", "report_assemble", None, None),
+        "replicate": _batch_aware_placement_error("n", "aggregation", "batch_replicate", "passthrough", None),
     }
     assert all(message is not None for message in arms.values()), arms
     explanation, fix = generation.explain_validation_code("batch_transform_misplaced") or ("", "")

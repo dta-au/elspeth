@@ -8,6 +8,8 @@ Verifies that:
 """
 
 import base64
+import socket
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -20,6 +22,7 @@ from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.call_data import HTTPCallResponse
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.core.security import web as web_security
 from elspeth.core.security.web import SSRFSafeRequest
 from elspeth.plugins.infrastructure.clients import http as http_client_module
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient, HTTPResponseBodyTooLargeError
@@ -87,7 +90,7 @@ class FakeSSRFValidator:
     def queue(self, *results: SSRFSafeRequest | BaseException) -> None:
         self.results.extend(results)
 
-    def __call__(self, url: str, *, allowed_ranges: Sequence[Any] = ()) -> SSRFSafeRequest:
+    def __call__(self, url: str, *, allowed_ranges: Sequence[Any] = (), timeout: float = 5.0) -> SSRFSafeRequest:
         self.calls.append(ValidationCall(url=url, allowed_ranges=tuple(allowed_ranges)))
         if not self.results:
             raise AssertionError(f"No queued fake SSRF validation result for {url}")
@@ -203,6 +206,73 @@ def test_successful_redirect_archives_complete_hop_for_replay(ssrf_validator, ht
     assert len(archive["redirect_hops"]) == 1
     assert archive["redirect_hops"][0]["request"]["url"] == "https://example.com/end"
     assert archive["redirect_hops"][0]["response"]["transport"]["body_b64"] == archive["body_b64"]
+
+
+@pytest.mark.timing_sensitive
+def test_redirect_limiter_wait_uses_remaining_deadline_and_records_refusal(ssrf_validator, http_client, monkeypatch):
+    http_client._timeout = 0.2
+    ssrf_validator.queue(_make_ssrf_request("https://example.com/end"))
+    http_client._test_ephemeral_client.queue_get(_make_final_response())
+    waits: list[float | None] = []
+    initial_dispatches: list[str] = []
+
+    def refuse(*, timeout: float | None = None) -> None:
+        waits.append(timeout)
+        if len(waits) == 2:
+            raise TimeoutError("no permit")
+
+    def first_response(*_args: Any, **_kwargs: Any) -> httpx.Response:
+        import time
+
+        initial_dispatches.append("start")
+        time.sleep(0.05)
+        return _make_redirect_response("/end")
+
+    monkeypatch.setattr(http_client, "_acquire_rate_limit", refuse)
+    monkeypatch.setattr(http_client, "_send_ssrf_safe_request", first_response)
+    with pytest.raises(Exception) as caught:
+        http_client.request_ssrf_safe("GET", _make_ssrf_request("https://example.com/start"), follow_redirects=True)
+    assert isinstance(caught.value, httpx.ConnectTimeout), type(caught.value).__name__
+    assert waits[0] == 0.2
+    assert initial_dispatches == ["start"]
+    assert waits[1] is not None and 0 < waits[1] < 0.18
+    assert http_client._test_ephemeral_client.get_calls == []
+    redirects = [call for call in http_client._execution.calls if call["call_type"] is CallType.HTTP_REDIRECT]
+    assert len(redirects) == 1
+    recorded = redirects[0]
+    assert recorded["call_type"] is CallType.HTTP_REDIRECT
+    assert recorded["status"] is CallStatus.ERROR
+    assert recorded["error"].type == "HTTPLimiterRefusal"
+    assert recorded["error"].to_dict()["wait_budget_seconds"] == waits[1]
+    assert recorded["error"].to_dict()["request_sent"] is False
+    parents = [call for call in http_client._execution.calls if call["call_type"] is CallType.HTTP]
+    assert len(parents) == 1
+    parent = parents[0]
+    assert parent["status"] is CallStatus.ERROR
+    assert parent["response_data"].status_code == 301
+    assert parent["error"].status_code == 301
+    assert parent["error"].to_dict()["request_sent"] is True
+    assert "Redirect hop refused" in parent["error"].message
+
+
+@pytest.mark.timing_sensitive
+def test_redirect_dns_uses_remaining_request_budget_and_records_one_refusal(http_client, monkeypatch):
+    http_client._timeout = 0.05
+    http_client._test_ephemeral_client.queue_get(_make_redirect_response("/end"), _make_final_response())
+    monkeypatch.setattr(http_client_module, "validate_url_for_ssrf", web_security.validate_url_for_ssrf)
+
+    def slow_resolver(*_args: Any, **_kwargs: Any) -> list[tuple[int, int, int, str, tuple[str, int]]]:
+        time.sleep(0.3)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", slow_resolver)
+    started = time.monotonic()
+    with pytest.raises(httpx.ConnectTimeout):
+        http_client.request_ssrf_safe("GET", _make_ssrf_request("https://example.com/start"), follow_redirects=True)
+    assert time.monotonic() - started < 0.2
+    redirects = [call for call in http_client._execution.calls if call["call_type"] is CallType.HTTP_REDIRECT]
+    assert len(redirects) == 1
+    assert redirects[0]["status"] is CallStatus.ERROR
 
 
 class TestRelativeRedirectResolution:

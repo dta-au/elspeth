@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import codecs
 import copy
 import csv
 import io
@@ -23,13 +22,15 @@ from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import (
+    CSVDelimiter,
     NormalizedColumnsOption,
     NormalizedFieldMappingOption,
+    TextEncoding,
     TransformDataConfig,
-    validate_csv_delimiter,
 )
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+from elspeth.plugins.infrastructure.text_decoding import decoding_codec
 from elspeth.plugins.sources.field_normalization import ExternalHeaderError, is_normalized_field_name, resolve_field_names
 from elspeth.plugins.transforms.blob_expand_contract import (
     BLOB_REF_FIELD_DESCRIPTION,
@@ -75,8 +76,8 @@ class BlobCSVExpandConfig(TransformDataConfig):
     # for missing the field the transform exists to create (elspeth-d6eeb3a71d), from
     # a config that never mentions ``source``. None names no column, so nothing leaks.
     text_field: str | None = Field(default=None, description=f"{TEXT_FIELD_DESCRIPTION} Defaults to {DEFAULT_TEXT_FIELD!r}.")
-    delimiter: str = Field(default=",", description="Single-character delimiter used to split CSV fields.")
-    encoding: str = Field(default="utf-8", description="Encoding used to decode the CSV blob. Applies to source: blob only.")
+    delimiter: CSVDelimiter = Field(default=",", description="Single-character delimiter used to split CSV fields.")
+    encoding: TextEncoding = Field(default="utf-8", description="Encoding used to decode the CSV blob. Applies to source: blob only.")
     skip_rows: int = Field(default=0, ge=0, description="Number of leading CSV records to skip before reading headers or data.")
     columns: NormalizedColumnsOption = Field(default=None, description="Explicit normalized column names for headerless CSV blobs.")
     field_mapping: NormalizedFieldMappingOption = Field(
@@ -106,20 +107,6 @@ class BlobCSVExpandConfig(TransformDataConfig):
         if not value.strip():
             raise ValueError("text_field must not be empty")
         return value.strip()
-
-    @field_validator("delimiter")
-    @classmethod
-    def _validate_delimiter(cls, value: str) -> str:
-        return validate_csv_delimiter(value)
-
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, value: str) -> str:
-        try:
-            codecs.lookup(value)
-        except LookupError as exc:
-            raise ValueError(f"unknown encoding: {value!r}") from exc
-        return value
 
     @field_validator("row_index_field")
     @classmethod
@@ -305,8 +292,8 @@ class BlobCSVExpand(BaseTransform):
     output_naming_config_keys = frozenset({"row_index_field"})
     name = "blob_csv_expand"
     determinism = Determinism.IO_READ
-    plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:64de4207fc6d2406"
+    plugin_version = "2.0.0"
+    source_file_hash: str | None = "sha256:92ce0032bdc9635e"
     config_model = BlobCSVExpandConfig
     usage_when_to_use: str = (
         "Use when each input row carries a payload-store reference to a CSV blob and you need to "
@@ -343,6 +330,7 @@ class BlobCSVExpand(BaseTransform):
         super().__init__(options)
         cfg = BlobCSVExpandConfig.from_dict(options, plugin_name=self.name)
         self._initialize_declared_input_fields(cfg)
+        self.declared_string_input_fields = frozenset({cfg.active_input_field})
 
         self._blob_ref_field = cfg.read_blob_ref_field
         self._source = cfg.source
@@ -498,15 +486,10 @@ class BlobCSVExpand(BaseTransform):
         # document, but a CSV header colliding with the text column is still a
         # genuine collision on the row that arrived. Only the inline arm
         # removes anything; this runtime removal stays separate from the
-        # static declaration, which may abstain for an original-header name.
-        # `base` carries NORMALIZED keys while the configured name may be the
-        # original header, so resolve it through the contract exactly as
-        # line_explode/json_explode do. `_load_field_text` already routed a row
-        # on which the name does not resolve, so on this path the key exists.
+        # static declaration. The configured name is the carried payload key.
         runtime_removed_fields = (self._text_field,) if self._source == "field" else ()
         for removed in runtime_removed_fields:
-            normalized_removed = removed if removed in base else row.contract.resolve_name(removed)
-            del base[normalized_removed]
+            del base[removed]
 
         output_rows: list[dict[str, Any]] = []
         for row_index, csv_row in enumerate(parsed.rows):
@@ -581,7 +564,9 @@ class BlobCSVExpand(BaseTransform):
         return self._load_blob_text(row)
 
     def _load_blob_text(self, row: PipelineRow) -> _CSVSourceText:
-        blob_ref = row[self._blob_ref_field]
+        if not row.carries(self._blob_ref_field):
+            raise _BlobCSVParseError(_csv_error_reason("invalid_input", field=self._blob_ref_field, error_type="missing_blob_ref_field"))
+        blob_ref = row.carried_value(self._blob_ref_field)
         if type(blob_ref) is not str:
             # Routed, not raised: a wrong-typed ref is a fact about THIS row,
             # the same kind as the malformed-hash rejection directly below.
@@ -653,7 +638,7 @@ class BlobCSVExpand(BaseTransform):
             )
 
         try:
-            text = body.decode(self._encoding)
+            text = body.decode(decoding_codec(self._encoding))
         except UnicodeDecodeError as exc:
             raise _BlobCSVParseError(
                 _csv_error_reason(
@@ -668,11 +653,9 @@ class BlobCSVExpand(BaseTransform):
         return _CSVSourceText(text=text, field=self._blob_ref_field, blob_ref=blob_ref)
 
     def _load_field_text(self, row: PipelineRow) -> _CSVSourceText:
-        # Read through ``row`` rather than the ``to_dict()`` copy: __getitem__
-        # resolves an original header name to its normalized key via the
-        # contract, which a raw dict lookup would silently miss.
+        # The configured name is the payload key as carried by the row.
         try:
-            value = row[self._text_field]
+            value = row.carried_value(self._text_field)
         except KeyError as exc:
             raise _BlobCSVParseError(
                 _csv_error_reason(

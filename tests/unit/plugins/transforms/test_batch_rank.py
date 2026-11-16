@@ -160,7 +160,7 @@ class TestShape:
         assert result.reason == {"reason": "empty_batch"}
 
     def test_excessive_batch_is_refused(self, ctx: PluginContext, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("elspeth.plugins.transforms.batch_rank._MAX_BATCH_ROWS", 2)
+        monkeypatch.setattr(BatchRank, "max_batch_rows", 2)
         rows = [_make_row({"score": value}) for value in (1, 2, 3)]
         result = BatchRank({"schema": OBSERVED, "value_field": "score"}).process(rows, ctx)
         assert result.status == "error"
@@ -169,7 +169,7 @@ class TestShape:
         assert result.reason["batch_size"] == 3
 
     def test_batch_of_exactly_the_cap_is_ranked(self, ctx: PluginContext, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("elspeth.plugins.transforms.batch_rank._MAX_BATCH_ROWS", 2)
+        monkeypatch.setattr(BatchRank, "max_batch_rows", 2)
         rows = [_make_row({"score": value}) for value in (1, 2)]
         result = BatchRank({"schema": OBSERVED, "value_field": "score"}).process(rows, ctx)
         assert _column(result, "rank_rank") == [2, 1]

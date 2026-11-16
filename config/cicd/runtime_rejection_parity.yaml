@@ -3519,16 +3519,17 @@ sites:
   note: declared_required_fields is written only at builder.py:331 (sink path), or derived inside add_node
     under an explicit `node_type == NodeType.SINK` guard (graph.py:224-225). The non-SINK case is unconstructible
     from pipeline input.
-- key: 45df09e60fd82cca
+- key: 20ad384d2bb4a828
   path: src/elspeth/core/dag/models.py
   qualname: NodeInfo.__post_init__
   exception: GraphValidationError
-  message: NodeInfo.declared_string_input_fields is only meaningful for TRANSFORM nodes; node {} has type
-    {} with declared_string_input_fields={}.
+  message: NodeInfo.declared_string_input_fields is only meaningful for TRANSFORM or AGGREGATION nodes;
+    node {} has type {} with declared_string_input_fields={}.
   ordinal: 0
   disposition: structural
-  note: declared_string_input_fields is written only at builder.py:405 (transform path); add_node defaults
-    it to frozenset() (graph.py:140).
+  note: declared_string_input_fields is written only at builder.py:563 (transform path) and builder.py:626
+    (aggregation path); add_node defaults it to frozenset() (graph.py:174). Re-adjudicated 2026-11-16
+    after aggregations gained the declaration.
 - key: 3adcd9c6561d868d
   path: src/elspeth/core/dag/models.py
   qualname: NodeInfo.__post_init__
@@ -3943,19 +3944,19 @@ sites:
   disposition: mirrored
   counterpart:
   - transform_contract_violation
-- key: 864bb0595539ade6
+- key: 0309ef6e944af207
   path: src/elspeth/core/dag/schema_validation.py
   qualname: validate_transform_string_typed_input_fields
   exception: GraphValidationError
-  message: 'Transform ''{}'' (node ''{}'') scans input fields that must be text, but its upstream ''{}''
-    declares them non-string: {}. The transform fails closed on any non-strin'
+  message: '{} ''{}'' (node ''{}'') scans input fields that must be text, but its upstream ''{}'' declares
+    them non-string: {}. The transform fails closed on any non-string value'
   ordinal: 0
   disposition: abstains
   counterpart:
   - transform_string_input_field_type_incompatible
   note: Mirrored for typed-SOURCE producers via _string_input_field_type_conflict; transform/gate/coalesce
     producers abstain (their runtime output schema may be computed, not the raw schema block) - the same
-    gate as _edge_field_type_conflict. Census 2026-08-17.
+    gate as _edge_field_type_conflict. Census 2026-08-17; message gained the plugin kind 2026-11-16.
 - key: 1cef4a504ba4febf
   path: src/elspeth/core/dag/wiring.py
   qualname: WiredTransform.__post_init__

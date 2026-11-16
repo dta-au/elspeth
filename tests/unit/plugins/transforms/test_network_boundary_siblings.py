@@ -61,7 +61,8 @@ def _transport(monkeypatch: pytest.MonkeyPatch, response: httpx.Response | tuple
         return response[len(requests) - 1] if isinstance(response, tuple) else response
 
     def client(*args, **kwargs):
-        return original_client(*args, **kwargs, transport=httpx.MockTransport(handle))
+        kwargs["transport"] = httpx.MockTransport(handle)
+        return original_client(*args, **kwargs)
 
     monkeypatch.setattr(httpx, "Client", client)
     return requests

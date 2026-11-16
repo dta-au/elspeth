@@ -49,8 +49,10 @@ from elspeth.contracts.wire_visible_identity import reject_operator_required_pla
 from elspeth.plugins.infrastructure.azure_auth import AzureAuthConfig, AzureAuthMethod
 from elspeth.plugins.infrastructure.base import BaseSink
 from elspeth.plugins.infrastructure.config_base import (
+    CSVDelimiter,
     DataPluginConfig,
     HeaderModeOption,
+    TextEncoding,
     validate_headers_value,
 )
 from elspeth.plugins.infrastructure.display_headers import (
@@ -131,27 +133,9 @@ class CSVWriteOptions(BaseModel):
 
     model_config = {"extra": "forbid"}
 
-    delimiter: str = ","
-    encoding: str = "utf-8"
+    delimiter: CSVDelimiter = ","
+    encoding: TextEncoding = "utf-8"
     include_header: bool = True
-
-    @field_validator("delimiter")
-    @classmethod
-    def _validate_delimiter(cls, v: str) -> str:
-        if len(v) != 1:
-            raise ValueError(f"delimiter must be a single character, got {v!r}")
-        return v
-
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, v: str) -> str:
-        import codecs
-
-        try:
-            codecs.lookup(v)
-        except LookupError as exc:
-            raise ValueError(f"unknown encoding: {v!r}") from exc
-        return v
 
 
 class AzureBlobSinkConfig(DataPluginConfig):
@@ -208,12 +192,14 @@ class AzureBlobSinkConfig(DataPluginConfig):
     connection_string: str | None = Field(
         default=None,
         description="Azure Storage connection string",
+        repr=False,
     )
 
     # Auth Option 2: SAS token
     sas_token: str | None = Field(
         default=None,
         description="Azure Storage SAS token (with or without leading '?')",
+        repr=False,
     )
 
     # Auth Option 3: Managed Identity
@@ -224,6 +210,7 @@ class AzureBlobSinkConfig(DataPluginConfig):
     account_url: str | None = Field(
         default=None,
         description="Azure Storage account URL (e.g., https://mystorageaccount.blob.core.windows.net)",
+        repr=False,
     )
 
     # Auth Option 4: Service Principal
@@ -238,6 +225,7 @@ class AzureBlobSinkConfig(DataPluginConfig):
     client_secret: str | None = Field(
         default=None,
         description="Azure AD client secret for Service Principal auth",
+        repr=False,
     )
 
     # Blob location (required for all auth methods)
@@ -401,7 +389,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
     name = "azure_blob"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8c5310c3821b716f"
+    source_file_hash: str | None = "sha256:999e63c5bd95a2b5"
     config_model = AzureBlobSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP
@@ -494,7 +482,9 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
         # Pre-compile blob path template at init for runtime use.
         # Syntax validation is now handled by AzureBlobSinkConfig.validate_blob_path_template
         # model_validator — from_dict() above already proved the template is valid.
-        env = create_sandboxed_environment()
+        # The path renders only run_id and timestamp (_effect_blob_path), never
+        # row data, so it opts in to raw render diagnostics.
+        env = create_sandboxed_environment(value_free=False)
         self._blob_path_compiled = env.from_string(self._blob_path_template)
 
         # CSV options are already validated Pydantic model

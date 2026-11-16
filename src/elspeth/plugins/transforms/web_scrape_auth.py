@@ -51,7 +51,7 @@ class WebScrapeAuthConfig(BaseModel):
     model_config = {"extra": "forbid", "hide_input_in_errors": True}
 
     scheme: Literal["basic", "bearer", "api_key"]
-    origin: str = Field(description="Exact HTTPS origin receiving the credential.")
+    origin: str = Field(description="Exact HTTPS origin receiving the credential.", repr=False)
     credential: SecretStr = Field(repr=False, description="Resolved secret; author as a secret reference.")
     header_name: str | None = Field(default=None, description="API-key header name; defaults to X-API-Key.")
 

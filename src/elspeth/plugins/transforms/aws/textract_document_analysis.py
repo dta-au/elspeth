@@ -10,10 +10,10 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
-from typing import Any, ClassVar, Self, cast
+from typing import Any, Self, cast
 
 import structlog
-from pydantic import ConfigDict, Field, ValidationInfo, field_validator, model_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 
 from elspeth.contracts import CallType, Determinism, RunMode
 from elspeth.contracts.audit_protocols import PluginAuditWriter
@@ -124,11 +124,6 @@ _warn_telemetry_before_start = make_warn_telemetry_before_start(logger)
 
 class AWSTextractDocumentAnalysisConfig(TransformDataConfig):
     """Validated public configuration for asynchronous S3 document analysis."""
-
-    model_config: ClassVar[ConfigDict] = ConfigDict(
-        **TransformDataConfig.model_config,
-        hide_input_in_errors=True,
-    )
 
     region: str = Field(min_length=1, max_length=64, description="AWS region containing the S3 object and Textract endpoint.")
     auth_mode: AuthMode = Field(
@@ -347,8 +342,8 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     output_naming_config_keys = frozenset({"text_field", "page_count_field", "metadata_field", "result_field"})
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
-    plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e45dc8dbaf712404"
+    plugin_version = "2.0.0"
+    source_file_hash: str | None = "sha256:ebab9a51a1e26b35"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -396,6 +391,12 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         super().__init__(config)
         cfg = AWSTextractDocumentAnalysisConfig.from_dict(config, plugin_name=self.name)
         self._initialize_declared_input_fields(cfg)
+        string_fields = {cfg.key_field}
+        if cfg.bucket_field is not None and cfg.bucket is None:
+            string_fields.add(cfg.bucket_field)
+        if cfg.version_field is not None:
+            string_fields.add(cfg.version_field)
+        self.declared_string_input_fields = frozenset(string_fields)
         self._cfg = cfg
 
         self._region = cfg.region
@@ -649,6 +650,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 region=self._region,
                 sdk_client=self._sdk_client,
                 max_response_bytes=self._max_result_bytes,
+                limiter_wait_seconds=self._poll_timeout_seconds,
                 limiter=self._limiter,
                 token_id=token_id,
                 call_mode_session=ctx.call_mode_session,

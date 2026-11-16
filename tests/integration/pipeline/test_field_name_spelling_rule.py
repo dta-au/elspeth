@@ -395,6 +395,38 @@ class TestStringScanFields:
         assert _terminal_outcomes(tmp_path) == {"success/default_flow": 2}
 
 
+class TestTruncateFields:
+    """truncate's ``fields`` keys (plugin review #146): ``declared_string_input_fields``, like keyword_filter's.
+
+    truncate used to resolve a header-spelled key through the row contract and
+    rewrite the normalized field: unlike the named text-scanning siblings, it
+    keys are now read declarations; a header spelling is refused like any other.
+    """
+
+    def _truncate(self, field: str) -> dict[str, Any]:
+        return _transform("truncate", {"fields": {field: 3}, "schema": _OBSERVED})
+
+    def test_a_header_spelled_field_is_refused_at_build_behind_a_closed_upstream(self, tmp_path: Path) -> None:
+        output = _refused_at_build(
+            _settings(tmp_path, source=_csv_source(tmp_path, schema=_FIXED_ID_NAME), transforms=[self._truncate("Name")])
+        )
+
+        assert "'Name' is a header spelling of 'name'" in output
+        assert "Declare 'name'" in output
+
+    def test_a_header_spelled_field_behind_an_observed_upstream_routes(self, tmp_path: Path) -> None:
+        """Before: the lookup resolved ``Name`` and truncated ``name`` on every row; now routed, one value-free reason."""
+        result = _run(_settings(tmp_path, source=_csv_source(tmp_path), transforms=[self._truncate("Name")]))
+
+        _assert_routed(tmp_path, result, reason=_READ, literal="Name", canonical="name")
+
+    def test_the_canonical_field_delivers(self, tmp_path: Path) -> None:
+        result = _run(_settings(tmp_path, source=_csv_source(tmp_path), transforms=[self._truncate("name")]))
+
+        assert result.exit_code == 0, result.output
+        assert _terminal_outcomes(tmp_path) == {"success/default_flow": 2}
+
+
 class TestTypeCoerceConversionField:
     """S7(b): a conversion reads its declared input and writes a published output."""
 
@@ -660,6 +692,7 @@ def _mapped_surfaces(*, runtime: bool) -> list[Any]:
             _READ,
             id="keyword_filter-scan-field",
         ),
+        pytest.param(_transform("truncate", {"fields": {"Name": 3}, "schema": _OBSERVED}), _READ, id="truncate-field"),
         pytest.param(
             _transform("type_coerce", {"conversions": [{"field": "Name", "to": "int"}], "schema": _OBSERVED}),
             _CREATE,

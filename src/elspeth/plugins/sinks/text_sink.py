@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import codecs
 import keyword
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -67,17 +66,6 @@ class TextSinkConfig(LocalFileSinkConfig):
             raise ValueError(f"field {value!r} must be a non-keyword Python identifier")
         return value
 
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, value: str) -> str:
-        try:
-            canonical = codecs.lookup(value).name
-        except LookupError as exc:
-            raise ValueError(f"unknown encoding: {value!r}") from exc
-        if canonical not in {"utf-8", "ascii", "iso8859-1", "cp1252"}:
-            raise ValueError("encoding must be one of utf-8, ascii, latin-1, or cp1252")
-        return value
-
     @model_validator(mode="after")
     def _validate_collision_mode(self) -> TextSinkConfig:
         validate_output_collision_policy_mode(
@@ -94,7 +82,7 @@ class TextSink(BaseSink):
     name = "text"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:5f113ea42926cd69"
+    source_file_hash: str | None = "sha256:e1f45b3dd430936a"
     config_model = TextSinkConfig
     supports_resume = True
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION

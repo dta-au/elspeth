@@ -28,9 +28,9 @@ if TYPE_CHECKING:
 class AzureAISearchConfig(RetrievalOutputConfig):
     """Options for the azure_ai_search transform."""
 
-    endpoint: str = Field(description="Azure AI Search service URL, https://<service>.search.windows.net.")
+    endpoint: str = Field(description="Azure AI Search service URL, https://<service>.search.windows.net.", repr=False)
     index: str = Field(description="Name of the existing index to query.")
-    api_key: str | None = Field(default=None, description="Query key. Mutually exclusive with use_managed_identity.")
+    api_key: str | None = Field(default=None, description="Query key. Mutually exclusive with use_managed_identity.", repr=False)
     use_managed_identity: bool = Field(default=False, description="Authenticate with the host's managed identity.")
     client_id: str | None = Field(default=None, description="Client id of a user-assigned managed identity.")
     api_version: str = Field(default="2024-07-01", description="Azure AI Search REST API version.")
@@ -38,7 +38,11 @@ class AzureAISearchConfig(RetrievalOutputConfig):
         default="hybrid",
         description="vector and hybrid need an integrated vectorizer on field_vector; semantic needs semantic_config.",
     )
-    request_timeout: float = Field(default=30.0, gt=0, description="Per-request timeout in seconds.")
+    request_timeout: float = Field(
+        default=30.0,
+        gt=0,
+        description="Total wall-clock seconds from dispatch for each search request, including DNS, connect, TLS, send, headers, body, and every redirect hop. Rate-limiter waits are bounded separately by the same number of seconds.",
+    )
     # Index fields are spelled ``field_*``: a ``*_field`` option is, by the base class's
     # convention, the name of a row column this transform reads.
     field_vector: str = Field(default="contentVector", description="Index vector field queried by vector and hybrid modes.")
@@ -81,8 +85,8 @@ class AzureAISearchTransform(RetrievalTransformBase):
     """RAG retrieval against an existing Azure AI Search index."""
 
     name = "azure_ai_search"
-    plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:aa1e5d1b37f919a6"
+    plugin_version = "2.0.0"
+    source_file_hash: str | None = "sha256:8ac0b39fc578d333"
     determinism: Determinism = Determinism.EXTERNAL_CALL
     config_model = AzureAISearchConfig
     passes_through_input = True

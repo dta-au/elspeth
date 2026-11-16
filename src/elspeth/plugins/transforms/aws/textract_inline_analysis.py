@@ -16,10 +16,10 @@ import re
 import threading
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
-from typing import Any, ClassVar, Self, cast
+from typing import Any, Self, cast
 
 import structlog
-from pydantic import ConfigDict, Field, ValidationInfo, field_validator, model_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 
 from elspeth.contracts import Determinism, RunMode
 from elspeth.contracts.audit_protocols import PluginAuditWriter
@@ -102,11 +102,6 @@ class TextractInlineQueryConfig(TextractQueryConfig):
 
 class AWSTextractInlineAnalysisConfig(TransformDataConfig):
     """Validated public configuration for synchronous inline document analysis."""
-
-    model_config: ClassVar[ConfigDict] = ConfigDict(
-        **TransformDataConfig.model_config,
-        hide_input_in_errors=True,
-    )
 
     region: str = Field(min_length=1, max_length=64, description="AWS region providing the Amazon Textract endpoint.")
     auth_mode: AuthMode = Field(
@@ -282,8 +277,8 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
     output_naming_config_keys = frozenset({"text_field", "page_count_field", "metadata_field", "result_field"})
     name = "aws_textract_inline_analysis"
     determinism = Determinism.EXTERNAL_CALL
-    plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8fbbdb2d684a9029"
+    plugin_version = "2.0.0"
+    source_file_hash: str | None = "sha256:e10303cba8d646d7"
     config_model = AWSTextractInlineAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -330,6 +325,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         super().__init__(config)
         cfg = AWSTextractInlineAnalysisConfig.from_dict(config, plugin_name=self.name)
         self._initialize_declared_input_fields(cfg)
+        self.declared_string_input_fields = frozenset({cfg.blob_ref_field})
         self._cfg = cfg
 
         self._region = cfg.region
@@ -490,6 +486,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
                 region=self._region,
                 sdk_client=self._sdk_client,
                 max_response_bytes=self._max_result_bytes,
+                limiter_wait_seconds=self._request_timeout_seconds,
                 limiter=self._limiter,
                 token_id=token_id,
                 call_mode_session=ctx.call_mode_session,

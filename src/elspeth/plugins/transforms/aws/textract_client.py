@@ -98,6 +98,15 @@ class TextractServiceError(RuntimeError):
         self.retryable = retryable
 
 
+class TextractRateLimitTimeout(TextractServiceError):
+    """No Textract SDK request was sent because its permit wait expired."""
+
+    def __init__(self, wait_budget_seconds: float) -> None:
+        super().__init__(code="RateLimitTimeout", retryable=True)
+        self.wait_budget_seconds = wait_budget_seconds
+        self.request_sent = False
+
+
 class TextractIdempotencyInvariantError(RuntimeError):
     """Raised when AWS reports reuse of a token with different parameters."""
 
@@ -142,6 +151,16 @@ def _replay_error(evidence: ReplayCallEvidence, *, operation: str, inline: bool 
         retryable = error["retryable"]
         if type(code) is str and 1 <= len(code) <= _MAX_ERROR_CODE_LENGTH and type(retryable) is bool:
             return TextractServiceError(code=code, retryable=retryable)
+    if status == "rate_limiter_refusal" and error["retryable"] is True:
+        budget = error["wait_budget_seconds"] if "wait_budget_seconds" in error else None
+        if (
+            isinstance(budget, (int, float))
+            and not isinstance(budget, bool)
+            and budget > 0
+            and "request_sent" in error
+            and error["request_sent"] is False
+        ):
+            return TextractRateLimitTimeout(float(budget))
     raise AuditIntegrityError(f"Textract replay call {evidence.source_call_id} has incomplete error evidence")
 
 
@@ -400,6 +419,7 @@ class _TextractAuditedClient(AuditedClientBase):
         *,
         region: str,
         max_response_bytes: int,
+        limiter_wait_seconds: float = 30.0,
         limiter: LimiterProtocol | None = None,
         token_id: str | None = None,
         member_token: WorkerMembershipToken,
@@ -413,6 +433,9 @@ class _TextractAuditedClient(AuditedClientBase):
             raise ValueError("max_response_bytes must be positive")
         self._region = region
         self._max_response_bytes = max_response_bytes
+        if limiter_wait_seconds <= 0:
+            raise ValueError("limiter_wait_seconds must be positive")
+        self._limiter_wait_seconds = limiter_wait_seconds
         self._call_mode_session = call_mode_session
 
     def _replay_evidence(
@@ -607,6 +630,7 @@ class TextractClient(_TextractAuditedClient):
         region: str,
         sdk_client: TextractSDKClient,
         max_response_bytes: int,
+        limiter_wait_seconds: float = 30.0,
         limiter: LimiterProtocol | None = None,
         token_id: str | None = None,
         member_token: WorkerMembershipToken,
@@ -620,6 +644,7 @@ class TextractClient(_TextractAuditedClient):
             telemetry_emit,
             region=region,
             max_response_bytes=max_response_bytes,
+            limiter_wait_seconds=limiter_wait_seconds,
             limiter=limiter,
             token_id=token_id,
             member_token=member_token,
@@ -743,7 +768,7 @@ class TextractClient(_TextractAuditedClient):
         terminal_error: Exception | None = None
         attempts = 1
         try:
-            self._acquire_rate_limit()
+            self._acquire_rate_limit(timeout=self._limiter_wait_seconds)
             _reset_send_attempts()
             raw_response = self._sdk_client.start_document_analysis(**sdk_request)
             response = _mapping(raw_response)
@@ -763,6 +788,21 @@ class TextractClient(_TextractAuditedClient):
             )
             call_status = CallStatus.SUCCESS
             error_payload = None
+        except TimeoutError:
+            terminal_error = TextractRateLimitTimeout(self._limiter_wait_seconds)
+            receipt = None
+            response_payload = RawCallPayload(
+                {"operation": "start_document_analysis", "status": "rate_limiter_refusal", "attempts": attempts}
+            )
+            call_status = CallStatus.ERROR
+            error_payload = RawCallPayload(
+                {
+                    "type": "rate_limiter_refusal",
+                    "retryable": True,
+                    "wait_budget_seconds": self._limiter_wait_seconds,
+                    "request_sent": False,
+                }
+            )
         except TextractResponseError as error:
             terminal_error = error
             receipt = None
@@ -958,7 +998,7 @@ class TextractClient(_TextractAuditedClient):
         terminal_error: Exception | None = None
         attempts = 1
         try:
-            self._acquire_rate_limit()
+            self._acquire_rate_limit(timeout=self._limiter_wait_seconds)
             _reset_send_attempts()
             raw_response = self._sdk_client.get_document_analysis(**sdk_request)
             response = _mapping(raw_response)
@@ -988,6 +1028,22 @@ class TextractClient(_TextractAuditedClient):
             )
             call_status = CallStatus.SUCCESS
             error_payload = None
+        except TimeoutError:
+            terminal_error = TextractRateLimitTimeout(self._limiter_wait_seconds)
+            result_page = None
+            returned_next_token = None
+            response_payload = RawCallPayload(
+                {"operation": "get_document_analysis", "status": "rate_limiter_refusal", "attempts": attempts}
+            )
+            call_status = CallStatus.ERROR
+            error_payload = RawCallPayload(
+                {
+                    "type": "rate_limiter_refusal",
+                    "retryable": True,
+                    "wait_budget_seconds": self._limiter_wait_seconds,
+                    "request_sent": False,
+                }
+            )
         except TextractResponseError as error:
             terminal_error = error
             result_page = None
@@ -1060,6 +1116,7 @@ class TextractInlineClient(_TextractAuditedClient):
         region: str,
         sdk_client: TextractSyncSDKClient,
         max_response_bytes: int,
+        limiter_wait_seconds: float = 30.0,
         limiter: LimiterProtocol | None = None,
         token_id: str | None = None,
         member_token: WorkerMembershipToken,
@@ -1073,6 +1130,7 @@ class TextractInlineClient(_TextractAuditedClient):
             telemetry_emit,
             region=region,
             max_response_bytes=max_response_bytes,
+            limiter_wait_seconds=limiter_wait_seconds,
             limiter=limiter,
             token_id=token_id,
             member_token=member_token,
@@ -1169,7 +1227,7 @@ class TextractInlineClient(_TextractAuditedClient):
         terminal_error: Exception | None = None
         attempts = 1
         try:
-            self._acquire_rate_limit()
+            self._acquire_rate_limit(timeout=self._limiter_wait_seconds)
             _reset_send_attempts()
             raw_response = self._sdk_client.analyze_document(**sdk_request)
             response = _mapping(raw_response)
@@ -1193,6 +1251,19 @@ class TextractInlineClient(_TextractAuditedClient):
             )
             call_status = CallStatus.SUCCESS
             error_payload = None
+        except TimeoutError:
+            terminal_error = TextractRateLimitTimeout(self._limiter_wait_seconds)
+            result = None
+            response_payload = RawCallPayload({"operation": "analyze_document", "status": "rate_limiter_refusal", "attempts": attempts})
+            call_status = CallStatus.ERROR
+            error_payload = RawCallPayload(
+                {
+                    "type": "rate_limiter_refusal",
+                    "retryable": True,
+                    "wait_budget_seconds": self._limiter_wait_seconds,
+                    "request_sent": False,
+                }
+            )
         except TextractResponseError as error:
             terminal_error = error
             result = None

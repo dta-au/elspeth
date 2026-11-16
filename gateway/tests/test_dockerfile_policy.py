@@ -74,6 +74,15 @@ def test_dockerfile_final_stage_has_no_pip_install():
     assert "pip install" not in _final_stage_text()
 
 
+def test_dockerfile_final_stage_removes_the_base_image_pip_before_dropping_root():
+    """The base image's pip vendors urllib3/msgpack/pkg_resources that image scans flag."""
+    final = _final_stage_text()
+    removal = final.find("/usr/local/lib/python3.14/site-packages/pip ")
+    assert removal != -1, "final stage must remove the base image's system pip"
+    assert "pip-*.dist-info" in final
+    assert removal < final.find("USER 65532:65532")
+
+
 def test_dockerfile_has_no_dependency_resolving_pip_install_in_any_stage():
     text = _dockerfile_text()
 

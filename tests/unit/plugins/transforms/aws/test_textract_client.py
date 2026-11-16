@@ -48,7 +48,7 @@ class FakeLimiter:
 
     def acquire(self, weight: int = 1, timeout: float | None = None) -> None:
         assert weight == 1
-        assert timeout is None
+        assert timeout == 30.0
         self.acquisitions += 1
 
 
@@ -119,6 +119,30 @@ def _start(client: TextractClient):
         queries=(),
         client_request_token="a" * 64,
     )
+
+
+@pytest.mark.parametrize("operation", ["start", "poll"])
+def test_limiter_refusal_is_audited_without_sdk_send(operation: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    sdk = FakeSDK()
+    client, recorder, _events, limiter = _client(sdk)
+    waits: list[float | None] = []
+
+    def refuse(weight: int = 1, timeout: float | None = None) -> None:
+        waits.append(timeout)
+        raise TimeoutError("no permit")
+
+    monkeypatch.setattr(limiter, "acquire", refuse)
+    with pytest.raises(Exception) as caught:
+        if operation == "start":
+            _start(client)
+        else:
+            client.get_document_analysis(job_id="job-1", next_token=None)
+    assert type(caught.value).__name__ == "TextractRateLimitTimeout"
+    assert waits == [30.0]
+    assert sdk.start_requests == [] and sdk.get_requests == []
+    assert len(recorder.calls) == 1
+    assert recorder.calls[0]["error"].to_dict()["wait_budget_seconds"] == 30.0
+    assert recorder.calls[0]["error"].to_dict()["request_sent"] is False
 
 
 def test_start_records_before_telemetry_and_returns_job_id() -> None:

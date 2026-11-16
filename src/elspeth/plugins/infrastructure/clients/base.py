@@ -228,17 +228,20 @@ class AuditedClientBase:
             self._llm_call_governance.after_call(llm_call_attempt, call.call_id)
         return call
 
-    def _acquire_rate_limit(self) -> None:
+    def _acquire_rate_limit(self, timeout: float | None = None) -> None:
         """Acquire rate limit permission before making external call.
 
-        Blocks until the rate limiter allows the request. If no limiter
-        is configured, returns immediately (no throttling).
+        Waits at most ``timeout`` seconds for permission. If no limiter is
+        configured, returns immediately (no throttling).
 
         Subclasses should call this at the start of their external call
         methods (e.g., chat_completion, post) before making the actual request.
         """
         if self._limiter is not None:
-            self._limiter.acquire()
+            if timeout is None:
+                self._limiter.acquire()
+            else:
+                self._limiter.acquire(timeout=timeout)
 
     def update_call_context(
         self, state_id: str, token_id: str | None = None, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem

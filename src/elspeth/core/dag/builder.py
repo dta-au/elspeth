@@ -623,6 +623,7 @@ def build_execution_graph(
             output_schema_config=agg_output_schema_config,
             # The runtime factory admits only batch-aware plugins as aggregations.
             batch_required_input_fields=cast("BatchTransformProtocol", transform).schema_required_input_fields(),
+            declared_string_input_fields=transform.declared_string_input_fields,
             declared_read_fields=transform.declared_read_fields,
             passes_through_input=transform.passes_through_input,
             forwards_input_fields=transform.forwards_input_fields,

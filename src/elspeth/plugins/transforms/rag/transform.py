@@ -39,8 +39,8 @@ class RAGRetrievalTransform(RetrievalTransformBase):
     """
 
     name = "rag_retrieval"
-    plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:039e7274158b655c"
+    plugin_version = "2.0.0"
+    source_file_hash: str | None = "sha256:d73c99174e6c6002"
     determinism: Determinism = Determinism.EXTERNAL_CALL
     config_model = RAGRetrievalConfig
     passes_through_input = True

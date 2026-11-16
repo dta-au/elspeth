@@ -466,8 +466,8 @@ class PDFRasterize(BaseTransform):
     )
     name = "pdf_rasterize"
     determinism = Determinism.IO_READ
-    plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:334c2c2d700d33c5"
+    plugin_version = "2.0.0"
+    source_file_hash: str | None = "sha256:0929c5cd08e9d2dc"
     config_model = PDFRasterizeConfig
     usage_when_to_use: str = (
         "Use when each row carries a payload-store content hash for a PDF (from the blob_rows source or blob_fetch) "
@@ -500,6 +500,7 @@ class PDFRasterize(BaseTransform):
         super().__init__(options)
         cfg = PDFRasterizeConfig.from_dict(options, plugin_name=self.name)
         self._initialize_declared_input_fields(cfg)
+        self.declared_string_input_fields = frozenset({cfg.blob_ref_field})
 
         self._blob_ref_field = cfg.blob_ref_field
         self._page_blob_ref_field = cfg.page_blob_ref_field

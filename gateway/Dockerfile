@@ -75,6 +75,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 COPY --from=builder /venv /venv
 
+# The runtime runs only /venv. The base image's system pip is never used, and
+# it vendors its own urllib3, msgpack and pkg_resources, which image scans
+# report as the base image's vulnerable copies; remove it while still root.
+RUN rm -rf /usr/local/lib/python3.14/site-packages/pip \
+      /usr/local/lib/python3.14/site-packages/pip-*.dist-info \
+      /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.14
+
 # Fixed, non-root, non-allocatable UID/GID (distroless convention) -- never
 # root, and never a UID that could collide with a container-host account.
 USER 65532:65532

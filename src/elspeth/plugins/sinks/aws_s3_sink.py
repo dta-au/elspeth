@@ -7,6 +7,7 @@ import binascii
 import codecs
 import csv
 import hashlib
+import io
 import json
 import math
 import re
@@ -45,8 +46,10 @@ from elspeth.contracts.wire_visible_identity import reject_operator_required_pla
 from elspeth.plugins.aws_s3_common import build_s3_client
 from elspeth.plugins.infrastructure.base import BaseSink
 from elspeth.plugins.infrastructure.config_base import (
+    CSVDelimiter,
     DataPluginConfig,
     HeaderModeOption,
+    TextEncoding,
     validate_headers_value,
 )
 from elspeth.plugins.infrastructure.display_headers import (
@@ -92,32 +95,9 @@ class CSVWriteOptions(BaseModel):
 
     model_config = {"extra": "forbid", "frozen": True}
 
-    delimiter: str = Field(default=",", description="Single-character CSV field delimiter")
-    encoding: str = Field(default="utf-8", description="Character encoding for CSV output")
+    delimiter: CSVDelimiter = Field(default=",", description="Single-character CSV field delimiter")
+    encoding: TextEncoding = Field(default="utf-8", description="Character encoding for CSV output")
     include_header: bool = Field(default=True, description="Write the CSV header record")
-
-    @field_validator("delimiter")
-    @classmethod
-    def _validate_delimiter(cls, value: str) -> str:
-        if len(value) != 1:
-            raise ValueError("delimiter must be a single character")
-        return value
-
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, value: str) -> str:
-        try:
-            codecs.lookup(value)
-        except LookupError as exc:
-            raise ValueError("unknown CSV encoding") from exc
-        try:
-            encoded: object = codecs.getincrementalencoder(value)(errors="strict").encode("", final=True)
-        except (LookupError, TypeError, UnicodeError, ValueError):
-            raise ValueError("CSV encoding must encode text to bytes") from None
-        # Text-to-text codecs such as rot13 look up cleanly but never yield bytes.
-        if type(encoded) is not bytes:
-            raise ValueError("CSV encoding must encode text to bytes")
-        return value
 
 
 class AWSS3SinkConfig(DataPluginConfig):
@@ -135,7 +115,7 @@ class AWSS3SinkConfig(DataPluginConfig):
         description="Normalized, original, or custom output headers",
     )
     region_name: str | None = Field(default=None, description="AWS signing region override")
-    endpoint_url: str | None = Field(default=None, description="CLI/batch-only S3-compatible HTTP endpoint")
+    endpoint_url: str | None = Field(default=None, description="CLI/batch-only S3-compatible HTTP endpoint", repr=False)
     max_object_bytes: int = Field(
         default=256 * 1024 * 1024,
         gt=0,
@@ -524,13 +504,9 @@ def _csv_scalar_text(value: Any) -> str:
 
 
 def _csv_record_chars(values: Sequence[str], delimiter: str) -> int:
-    total = max(0, len(values) - 1) + 2
-    for value in values:
-        if delimiter in value or '"' in value or "\r" in value or "\n" in value:
-            total += len(value) + value.count('"') + 2
-        else:
-            total += len(value)
-    return total
+    buffer = io.StringIO(newline="")
+    csv.writer(buffer, delimiter=delimiter, lineterminator="\r\n").writerow(values)
+    return len(buffer.getvalue()) - 2
 
 
 def _serialize_rows_to_spool(
@@ -749,7 +725,7 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
     name = "aws_s3"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3d90ff2251470de9"
+    source_file_hash: str | None = "sha256:ef42f750a3679d1f"
     config_model = AWSS3SinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP
