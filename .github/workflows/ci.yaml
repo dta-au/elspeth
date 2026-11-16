@@ -1265,7 +1265,9 @@ jobs:
           # provider and no /api/v2 route. An operator who points HttpClient at a
           # Chroma server they host owns that server's exposure; this ignore does
           # not extend to it. Remove all four chromadb ignores and bump the pin
-          # once upstream ships a fix.
+          # once upstream ships a fix. The image scans in build-push.yaml take
+          # the same four as version-scoped, expiring exceptions in
+          # .trivyignore.yaml; keep the two lists in step.
           uv run --frozen --all-extras --group audit pip-audit \
             --strict \
             --timeout 60 \

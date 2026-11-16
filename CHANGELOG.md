@@ -938,6 +938,14 @@ Sinks and retrieval:
   one for the batch transform mixin, four for the S3 sink, and the signed
   `http.py` entries after the client changes.
 - In pooled LLM mode, time a row spends queueing is still unbounded.
+- `chromadb` 1.5.5 carries four advisories with no fixed release
+  (CVE-2026-45829, CVE-2026-45830, CVE-2026-45831, CVE-2026-45833). All four
+  are in the Chroma server, which the image never runs, so the image scan
+  takes them as version-scoped, expiring exceptions (`.trivyignore.yaml`), as
+  the dependency audit already did. A separate limitation: in Chroma
+  `mode: client`, ELSPETH does not pass its own embedding function, so
+  `chromadb` builds the one named in the remote collection's stored
+  configuration. Point client mode only at Chroma servers you trust.
 - The plugin source-hash lint now checks the AWS transforms, which it had
   skipped: it did not scan `plugins/transforms/aws` or recognise the Bedrock
   guardrail base. The stale `aws_bedrock_prompt_shield` hash it then found is
