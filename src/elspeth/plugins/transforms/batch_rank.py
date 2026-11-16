@@ -48,7 +48,7 @@ from elspeth.contracts.union_merge import join_batch_contracts
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import PluginConfigError, TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
-from elspeth.plugins.transforms._batch_row_types import BatchRowFieldCollisionError, BatchRowTypeError
+from elspeth.plugins.transforms._batch_row_types import MAX_BATCH_ROWS, BatchRowFieldCollisionError, BatchRowTypeError
 
 type RankOrder = Literal["descending", "ascending"]
 type RankTies = Literal["competition", "dense"]
@@ -64,7 +64,6 @@ _RANK_CREATED_SUFFIXES: tuple[FieldDefinition, ...] = (
     FieldDefinition("batch_size", "int"),
 )
 _RANK_FIELD_SUFFIXES = tuple(field.name for field in _RANK_CREATED_SUFFIXES)
-_MAX_BATCH_ROWS = 4096
 
 
 def _rank_fields(output_prefix: str) -> frozenset[str]:
@@ -127,9 +126,10 @@ class BatchRank(BaseTransform):
     name = "batch_rank"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:bfcb04174bb43be1"
+    source_file_hash: str | None = "sha256:9ed1e4527e591e4e"
     config_model = BatchRankConfig
     is_batch_aware = True
+    max_batch_rows: int = MAX_BATCH_ROWS
     # Passthrough-capable: every successful flush is a success_multi of exactly
     # one row per buffered row, in buffered order (an unranked row is emitted
     # with null rank), with no quarantined_indices.
@@ -180,6 +180,9 @@ class BatchRank(BaseTransform):
                     "it emits exactly one row per buffered row, in order, so the same tokens continue downstream.",
                     "It also runs under output_mode: transform, where each emitted row becomes a new child token.",
                     "Ranks restart in every batch: pick the trigger (count, timeout or condition) so a batch is the group to rank.",
+                    f"An aggregation trigger count above {MAX_BATCH_ROWS} is refused before the run; a flush over "
+                    f"{MAX_BATCH_ROWS} buffered rows fails the whole batch (batch_too_large), so do not rely on an "
+                    "end-of-source flush (omitted trigger) when the input can exceed it.",
                     "A null, absent or non-finite value keeps its row with null rank and percentile; "
                     "a present text or boolean value fails the whole batch.",
                     "order: descending ranks the highest value 1; ties: competition gives 1, 2, 2, 4 and dense gives 1, 2, 2, 3.",
@@ -355,12 +358,12 @@ class BatchRank(BaseTransform):
         return self._align_output_contract(self._apply_declared_output_field_contracts(output_contract))
 
     @staticmethod
-    def _error_for_batch_too_large(*, batch_size: int) -> TransformResult:
+    def _error_for_batch_too_large(*, batch_size: int, max_batch_rows: int) -> TransformResult:
         reason: TransformErrorReason = {
             "reason": "validation_failed",
             "cause": "batch_too_large",
             "batch_size": batch_size,
-            "expected": f"at most {_MAX_BATCH_ROWS} rows",
+            "expected": f"at most {max_batch_rows} rows",
         }
         return TransformResult.error(reason, retryable=False)
 
@@ -370,8 +373,8 @@ class BatchRank(BaseTransform):
         """Emit every buffered row, in order, with its rank annotations (always a success_multi)."""
         if not rows:
             return TransformResult.error({"reason": "empty_batch"}, retryable=False)
-        if len(rows) > _MAX_BATCH_ROWS:
-            return self._error_for_batch_too_large(batch_size=len(rows))
+        if len(rows) > self.max_batch_rows:
+            return self._error_for_batch_too_large(batch_size=len(rows), max_batch_rows=self.max_batch_rows)
 
         try:
             self._reject_runtime_output_field_collision(rows)

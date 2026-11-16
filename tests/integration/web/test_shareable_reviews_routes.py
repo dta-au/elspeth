@@ -20,6 +20,7 @@ import re
 import uuid
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -184,6 +185,54 @@ def test_get_shareable_link_remints_stable_digest(
     assert r2.status_code == 200, r2.text
     assert r1.json()["payload_digest"] == r2.json()["payload_digest"]
     assert r1.json()["token"] != r2.json()["token"]
+    assert r1.json()["expires_at"] == mark_response.json()["expires_at"]
+    assert r2.json()["expires_at"] == mark_response.json()["expires_at"]
+
+
+def test_get_shareable_link_clamps_recorded_expiry_when_maximum_is_lowered(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, session_id = audit_readiness_client_with_state
+    marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review")
+    assert marked.status_code == 200, marked.text
+    service = client.app.state.shareable_review_service
+    event = service._latest_mark_ready_event(
+        session_id=session_id,
+        state_id=service._signer.verify(marked.json()["token"]).state_id,
+        user_id=_TEST_AUTHED_USER_ID,
+    )
+    assert event is not None
+    monkeypatch.setattr(service, "_settings", service._settings.model_copy(update={"shareable_link_lifetime_seconds": 86400}))
+    reminted = client.get(f"/api/sessions/{session_id}/shareable-link")
+    assert reminted.status_code == 200, reminted.text
+    expected = event.created_at.replace(tzinfo=UTC) + timedelta(days=1)
+    assert service._signer.verify(reminted.json()["token"]).expires_at == expected
+
+
+def test_get_shareable_link_expired_mark_returns_409_with_owner_action(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, session_id = audit_readiness_client_with_state
+    marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review")
+    assert marked.status_code == 200, marked.text
+    service = client.app.state.shareable_review_service
+    old_event = service._latest_mark_ready_event
+
+    def expired_event(**kwargs: object) -> SimpleNamespace:
+        event = old_event(**kwargs)
+        assert event is not None
+        return SimpleNamespace(
+            payload_digest=event.payload_digest,
+            created_at=event.created_at - timedelta(days=31),
+            expires_at=event.expires_at - timedelta(days=31),
+        )
+
+    monkeypatch.setattr(service, "_latest_mark_ready_event", expired_event)
+    response = client.get(f"/api/sessions/{session_id}/shareable-link")
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == "This share link has expired. Share for review again to create a new link."
 
 
 def test_get_shareable_link_requires_auth(
@@ -347,7 +396,7 @@ def test_shared_route_and_persistence_expose_only_public_projection(
     resolved_body = resolved.json()
 
     digest_hex = marked_body["payload_digest"].removeprefix("sha256:")
-    stored_bytes = client.app.state.payload_store.retrieve(digest_hex)
+    stored_bytes = client.app.state.share_payload_store.retrieve(digest_hex)
     stored_body = json.loads(stored_bytes)
     with client.app.state.session_engine.connect() as conn:
         audit_row = conn.execute(
@@ -377,7 +426,7 @@ def test_shared_route_projects_signed_blob_without_rewriting_evidence(
     marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review")
     assert marked.status_code == 200, marked.text
     service = client.app.state.shareable_review_service
-    payload_store = client.app.state.payload_store
+    payload_store = client.app.state.share_payload_store
     signed_payload = service._signer.verify(marked.json()["token"])
     stored = json.loads(payload_store.retrieve(signed_payload.payload_digest.removeprefix("sha256:")))
 
@@ -546,10 +595,26 @@ def test_get_shared_inspect_blob_expired_returns_404(
     token = body["token"]
     digest_hex = body["payload_digest"].removeprefix("sha256:")
     # Reach into the wired payload store and delete the blob.
-    payload_store = client.app.state.payload_store
+    payload_store = client.app.state.share_payload_store
     assert payload_store.delete(digest_hex), "blob should exist before deletion"
     response = client.get(f"/api/sessions/shared/{token}")
     assert response.status_code == 404
+
+
+def test_new_view_only_share_survives_main_store_purge(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+) -> None:
+    client, session_id = audit_readiness_client_with_state
+    marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review")
+    assert marked.status_code == 200, marked.text
+    digest = marked.json()["payload_digest"].removeprefix("sha256:")
+    main_store = client.app.state.payload_store
+    main_store.delete(digest)  # Simulate purge of a run with identical bytes.
+
+    inspected = client.get(f"/api/sessions/shared/{marked.json()['token']}")
+    assert inspected.status_code == 200, inspected.text
+    reminted = client.get(f"/api/sessions/{session_id}/shareable-link")
+    assert reminted.status_code == 200, reminted.text
 
 
 def _seed_uploaded_file_source(client: TestClient, session_id: UUID, content: bytes) -> dict[str, str]:
@@ -762,7 +827,7 @@ def test_mark_ready_for_review_audit_write_failure_returns_no_token(
     client, session_id = audit_readiness_client_with_state
 
     # Track payload_store.store calls so we can prove no blob was written.
-    payload_store = client.app.state.payload_store
+    payload_store = client.app.state.share_payload_store
     original_store = payload_store.store
     store_calls: list[bytes] = []
 
@@ -806,7 +871,7 @@ def test_mark_ready_accepts_absent_body(
     payload = service._signer.verify(response.json()["token"])
     lifetime = client.app.state.settings.shareable_link_lifetime_seconds
     assert payload.expires_at - payload.created_at == timedelta(seconds=lifetime)
-    stored = json.loads(client.app.state.payload_store.retrieve(payload.payload_digest.removeprefix("sha256:")))
+    stored = json.loads(client.app.state.share_payload_store.retrieve(payload.payload_digest.removeprefix("sha256:")))
     assert stored["import_allowed"] is False
     assert stored["files"] == []
 
@@ -826,7 +891,7 @@ def test_mark_ready_refuses_files_that_changed_since_the_preview(
     detail = refused.json()["detail"]
     assert detail["error_type"] == "share_files_changed"
     assert detail["detail"] == "the files this pipeline uses changed since you reviewed them; review the list and create the link again"
-    assert not client.app.state.payload_store.exists(swapped["content_hash"])
+    assert not client.app.state.share_payload_store.exists(swapped["content_hash"])
     with client.app.state.session_engine.connect() as conn:
         rows = conn.execute(
             select(composer_completion_events_table).where(composer_completion_events_table.c.session_id == str(session_id))
@@ -835,7 +900,7 @@ def test_mark_ready_refuses_files_that_changed_since_the_preview(
 
     confirmed = client.post(f"/api/sessions/{session_id}/mark-ready-for-review", json=_import_share_body(client, session_id))
     assert confirmed.status_code == 200, confirmed.text
-    assert client.app.state.payload_store.exists(swapped["content_hash"])
+    assert client.app.state.share_payload_store.exists(swapped["content_hash"])
 
 
 @pytest.mark.parametrize(
@@ -896,7 +961,7 @@ def test_mark_ready_with_lifetime_and_copy_link_keep_one_day(
     reminted = client.get(f"/api/sessions/{session_id}/shareable-link")
     assert reminted.status_code == 200, reminted.text
     reminted_payload = service._signer.verify(reminted.json()["token"])
-    assert reminted_payload.expires_at - reminted_payload.created_at == timedelta(days=1)
+    assert reminted_payload.expires_at == payload.expires_at
 
 
 def test_mark_ready_with_import_freezes_an_uploaded_file(
@@ -937,7 +1002,7 @@ def test_mark_ready_with_import_freezes_an_uploaded_file(
     marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review", json=_import_share_body(client, session_id))
 
     assert marked.status_code == 200, marked.text
-    payload_store = client.app.state.payload_store
+    payload_store = client.app.state.share_payload_store
     assert payload_store.retrieve(blob["content_hash"]) == content
     stored = json.loads(payload_store.retrieve(marked.json()["payload_digest"].removeprefix("sha256:")))
     assert stored["import_allowed"] is True

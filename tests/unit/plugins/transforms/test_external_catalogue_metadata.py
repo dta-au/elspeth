@@ -44,6 +44,7 @@ EXPECTED_EXTERNAL_TAGS = {
     "aws_textract_inline_analysis": ("aws", "textract", "ocr", "inline", "blob", "enrichment"),
     "azure_ai_search": ("rag", "retrieval", "vector-search", "azure"),
     "azure_content_safety": ("azure", "content-safety", "moderation"),
+    "azure_content_understanding": ("azure", "document", "multimodal", "extraction", "http"),
     "azure_document_intelligence": ("azure", "document", "ocr", "enrichment", "http"),
     "azure_prompt_shield": ("azure", "prompt-shield", "security"),
     "blob_fetch": ("http", "network", "blob"),
@@ -110,6 +111,10 @@ _REQUIRED_GUIDANCE = {
     "azure_document_intelligence": (
         ("url", "base64", "request audit", "encoded body", "untrusted before llm"),
         ("credential", "data-retention"),
+    ),
+    "azure_content_understanding": (
+        ("url", "base64", "audio", "video", "request audit", "encoded body", "untrusted before llm"),
+        ("credential", "data-retention", "model deployments"),
     ),
 }
 
@@ -381,6 +386,27 @@ def test_azure_document_intelligence_example_uses_a_supported_secret_ref_marker(
 
     assert options["api_key"] == {"secret_ref": "AZURE_DOCUMENT_INTELLIGENCE_KEY"}
     assert "${" not in example
+
+
+def test_azure_content_understanding_example_uses_a_supported_secret_ref_marker() -> None:
+    reference = EXTERNAL_BY_NAME["azure_content_understanding"]
+    options = _options(reference)
+    example = cast(str, reference.plugin_cls.example_use)
+
+    assert options["api_key"] == {"secret_ref": "AZURE_CONTENT_UNDERSTANDING_KEY"}
+    assert "${" not in example
+
+
+def test_azure_content_understanding_example_constructs_and_targets_the_analyzer() -> None:
+    reference = EXTERNAL_BY_NAME["azure_content_understanding"]
+    options = _runtime_options(reference)
+
+    with plugin_preflight_mode(True):
+        transform = reference.plugin_cls(options)
+    try:
+        assert "/contentunderstanding/analyzers/prebuilt-invoice:analyze?api-version=2025-11-01" in transform._analyze_url()
+    finally:
+        transform.close()
 
 
 def test_azure_ai_search_example_names_its_options_at_the_top_level() -> None:

@@ -172,7 +172,7 @@
             },
             {
               "default": null,
-              "description": "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. Any non-null override requires unique final generated names across all queries.",
+              "description": "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. Final generated names, including raw/usage/model fields, must be unique across all queries.",
               "kind": "text",
               "label": "structured_output_prefix",
               "name": "structured_output_prefix",
@@ -780,7 +780,7 @@
             },
             {
               "default": null,
-              "description": "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. Any non-null override requires unique final generated names across all queries.",
+              "description": "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. Final generated names, including raw/usage/model fields, must be unique across all queries.",
               "kind": "text",
               "label": "structured_output_prefix",
               "name": "structured_output_prefix",
@@ -1194,7 +1194,7 @@
       },
       {
         "default": 60.0,
-        "description": "Request timeout",
+        "description": "Total wall-clock seconds from dispatch for each provider HTTP request, including DNS, connect, TLS, send, headers, body, and every redirect hop. Rate-limiter waits are bounded separately by the same number of seconds.",
         "kind": "number-float",
         "label": "Timeout Seconds",
         "name": "timeout_seconds",
@@ -1376,7 +1376,7 @@
             },
             {
               "default": null,
-              "description": "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. Any non-null override requires unique final generated names across all queries.",
+              "description": "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. Final generated names, including raw/usage/model fields, must be unique across all queries.",
               "kind": "text",
               "label": "structured_output_prefix",
               "name": "structured_output_prefix",
@@ -2001,7 +2001,7 @@
             },
             {
               "default": null,
-              "description": "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. Any non-null override requires unique final generated names across all queries.",
+              "description": "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. Final generated names, including raw/usage/model fields, must be unique across all queries.",
               "kind": "text",
               "label": "structured_output_prefix",
               "name": "structured_output_prefix",
@@ -2442,7 +2442,7 @@
       },
       {
         "default": 60.0,
-        "description": "Request timeout",
+        "description": "Total wall-clock seconds from dispatch for each provider HTTP request, including DNS, connect, TLS, send, headers, body, and every redirect hop. Rate-limiter waits are bounded separately by the same number of seconds.",
         "kind": "number-float",
         "label": "Timeout Seconds",
         "name": "timeout_seconds",

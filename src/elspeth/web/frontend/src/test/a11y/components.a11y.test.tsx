@@ -354,7 +354,7 @@ function resetAllStores() {
     // GraphMiniView a11y audit down to auditing a bare <span>.
     compositionStateLoaded: true,
     stateVersions: [],
-    isLoadingVersions: false,
+    historyStatus: "idle",
   } as never);
   useExecutionStore.setState({
     validationResult: null,
@@ -609,7 +609,7 @@ describe("HeaderVersionSelector", () => {
         outputs: [],
       } as never,
       stateVersions: makeVersionHistory(),
-      isLoadingVersions: false,
+      historyStatus: "idle",
     } as never);
     const { container } = render(<HeaderVersionSelector />);
     await userEvent.click(

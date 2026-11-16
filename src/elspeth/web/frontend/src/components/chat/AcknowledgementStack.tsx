@@ -50,6 +50,8 @@ export function isPendingAcknowledgement(event: InterpretationEvent): boolean {
 
 export interface AcknowledgementStackProps {
   sessionId: string;
+  /** Whether amendable decisions offer the Change control. */
+  allowAmend?: boolean;
   /** Restore focus to a stable parent control after the final decision. */
   onFocusFallback?: () => void;
   /**
@@ -103,6 +105,7 @@ export function usePendingAcknowledgements(
 
 export function AcknowledgementStack({
   sessionId,
+  allowAmend = true,
   onResolved,
   onFocusFallback,
 }: AcknowledgementStackProps): JSX.Element | null {
@@ -195,7 +198,7 @@ export function AcknowledgementStack({
               // (elspeth-990f5ea562): refreshed on every sibling resolve, so an
               // open prompt card re-renders with fresh substitutions.
               compositionState={compositionState}
-              showAmend={supportsAmendment(event.kind)}
+              showAmend={allowAmend && supportsAmendment(event.kind)}
               acceptButtonRef={(el) => {
                 if (el != null) acceptRefs.current.set(event.id, el);
                 else acceptRefs.current.delete(event.id);

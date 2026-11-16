@@ -8,7 +8,7 @@ import urllib.parse
 from typing import TYPE_CHECKING, Any, Literal, Protocol, Self, cast
 
 import httpx
-from pydantic import BaseModel, ValidationInfo, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
 from elspeth.contracts.call_data import HTTPCallRequest, RawCallPayload
 from elspeth.contracts.call_mode import CallModeSession, ReplaySSRFRequest
@@ -25,6 +25,7 @@ from elspeth.core.security.web import (
     validate_literal_ip_for_ssrf,
     validate_url_for_ssrf,
 )
+from elspeth.core.url_validation import parse_credential_url_components
 from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_headers, fingerprint_url
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
@@ -60,13 +61,14 @@ def _is_azure_search_managed_identity_hostname(hostname: str) -> bool:
 class AzureSearchProviderConfig(BaseModel):
     """Configuration for Azure AI Search provider."""
 
-    model_config = {"extra": "forbid", "frozen": True}
+    # Validation errors never echo the authored input: it carries api_key.
+    model_config = {"extra": "forbid", "frozen": True, "hide_input_in_errors": True}
 
-    endpoint: str
+    endpoint: str = Field(repr=False)
     index: str
 
     auth_mode: AzureSearchAuthMode | None = None
-    api_key: str | None = None
+    api_key: str | None = Field(default=None, repr=False)
     use_managed_identity: bool = False
     api_version: str = "2024-07-01"
 
@@ -121,19 +123,21 @@ class AzureSearchProviderConfig(BaseModel):
     @field_validator("endpoint")
     @classmethod
     def validate_endpoint(cls, v: str) -> str:
-        parsed = urllib.parse.urlparse(v)
+        parsed, hostname, username, password = parse_credential_url_components(v)
+        if parsed is None:
+            raise ValueError("endpoint must be a valid URL")
         if parsed.scheme != "https":
-            raise ValueError(f"endpoint must use HTTPS scheme, got {parsed.scheme!r}")
-        if not parsed.hostname:
-            raise ValueError(f"endpoint must have a hostname, got {v!r}")
-        if parsed.username or parsed.password:
+            raise ValueError("endpoint must use HTTPS scheme")
+        if not hostname:
+            raise ValueError("endpoint must have a hostname")
+        if username or password:
             raise ValueError("endpoint must not include embedded credentials")
         if parsed.query or parsed.fragment:
             raise ValueError("endpoint must not include query strings or fragments")
         try:
-            validate_literal_ip_for_ssrf(parsed.hostname)
-        except SSRFBlockedError as exc:
-            raise ValueError(f"endpoint literal IP is blocked by SSRF policy: {exc}") from exc
+            validate_literal_ip_for_ssrf(hostname)
+        except SSRFBlockedError:
+            raise ValueError("endpoint literal IP is blocked by SSRF policy") from None
         return v
 
     @field_validator("index")
@@ -604,10 +608,13 @@ class AzureSearchProvider:
                 skipped_items.append({"reason": "missing_id", "keys": list(item.keys())})
                 continue
 
+            # The embedding (vector_field) and Azure's @search.* annotations are
+            # retrieval internals, not document metadata: copying them would put
+            # a full embedding into every chunk and the row's sources output.
             metadata: dict[str, Any] = {
                 k: str(v) if not isinstance(v, (str, int, float, bool, type(None), list, dict)) else v
                 for k, v in item.items()
-                if k not in (self._score_key, content_field, id_field)
+                if k not in (self._score_key, content_field, id_field, self._config.vector_field) and not k.startswith("@search.")
             }
             # Citation fields under provider-neutral names. A missing or
             # non-string value is omitted, never fabricated.

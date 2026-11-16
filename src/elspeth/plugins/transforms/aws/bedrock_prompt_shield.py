@@ -31,7 +31,7 @@ class AWSBedrockPromptShield(BedrockGuardrailTransformBase):
         }
     )
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:99c73100f803b8f0"
+    source_file_hash: str | None = "sha256:b391e6dc564071b9"
     config_model = AWSBedrockPromptShieldConfig
     _required_filters = PROMPT_ATTACK_FILTERS
     _detected_reason = "prompt_injection_detected"

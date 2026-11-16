@@ -1,12 +1,12 @@
 import { readFileSync } from "node:fs";
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { HeaderVersionSelector } from "./HeaderVersionSelector";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
-import { makeVersionHistory } from "@/test/composerFixtures";
+import { makeComposition, makeVersionHistory } from "@/test/composerFixtures";
 import { resetStore } from "@/test/store-helpers";
 import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 import type { ChatMessage, CompositionStateVersion, NodeSpec } from "@/types/index";
@@ -74,7 +74,7 @@ describe("HeaderVersionSelector", () => {
       } as never,
       messages: [],
       stateVersions: [],
-      isLoadingVersions: false,
+      historyStatus: "idle",
       loadStateVersions: vi.fn(),
       revertToVersion: vi.fn(),
     } as never);
@@ -108,6 +108,79 @@ describe("HeaderVersionSelector", () => {
     );
 
     expect(loadStateVersions).toHaveBeenCalled();
+  });
+
+  it("checks an open menu again when the current version advances", async () => {
+    const loadStateVersions = vi.fn();
+    useSessionStore.setState({ loadStateVersions, stateVersions: defaultVersions } as never);
+    render(<HeaderVersionSelector />);
+    fireEvent.click(screen.getByRole("button", { name: /composition history/i }));
+    expect(loadStateVersions).toHaveBeenCalledTimes(1);
+    useSessionStore.setState({ compositionState: makeComposition(4) });
+    await waitFor(() => expect(loadStateVersions).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole("treeitem", { name: /Version 4 \(current\) — Checking saved version/ })).toBeInTheDocument();
+  });
+
+  it("marks a published page as refreshing while the head is moving", () => {
+    useSessionStore.setState({ stateVersions: defaultVersions, historyStatus: "loading" });
+    render(<HeaderVersionSelector />);
+    fireEvent.click(screen.getByRole("button", { name: /composition history/i }));
+    expect(screen.getByRole("status")).toHaveTextContent("Refreshing versions...");
+  });
+
+  it("shows a retryable failed history in one status region", () => {
+    const loadStateVersions = vi.fn();
+    useSessionStore.setState({ stateVersions: defaultVersions, historyStatus: "failed", loadStateVersions });
+    render(<HeaderVersionSelector />);
+    fireEvent.click(screen.getByRole("button", { name: /composition history/i }));
+    expect(screen.getAllByRole("status")).toHaveLength(1);
+    expect(screen.getByRole("status")).toHaveTextContent("Could not load versions.");
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(loadStateVersions).toHaveBeenCalledTimes(2);
+  });
+
+  it("describes a current version outside a settled window", () => {
+    useSessionStore.setState({ compositionState: makeComposition(2), stateVersions: [makeVersion({ id: "st-70", version: 70 })], historyStatus: "settled" });
+    render(<HeaderVersionSelector />);
+    fireEvent.click(screen.getByRole("button", { name: /composition history/i }));
+    expect(screen.getByRole("treeitem", { name: /Version 2 \(current\) — Not in the 50 most recent versions/ })).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Version 2 is not in the 50 most recent versions.");
+  });
+
+  it("refreshes a different session with the same current version", async () => {
+    const loadStateVersions = vi.fn();
+    useSessionStore.setState({ stateVersions: defaultVersions, loadStateVersions });
+    render(<HeaderVersionSelector />);
+    fireEvent.click(screen.getByRole("button", { name: /composition history/i }));
+    useSessionStore.setState({ activeSessionId: "sess-2", stateVersions: [] });
+    await waitFor(() => expect(loadStateVersions).toHaveBeenCalledTimes(2));
+  });
+
+  it("offers a retry for unsettled history and cancels its follow-up on close", async () => {
+    vi.useFakeTimers();
+    try {
+      const loadStateVersions = vi.fn();
+      useSessionStore.setState({ stateVersions: defaultVersions, historyStatus: "unsettled", loadStateVersions });
+      render(<HeaderVersionSelector />);
+      fireEvent.click(screen.getByRole("button", { name: /composition history/i }));
+      expect(screen.getAllByRole("status")).toHaveLength(1);
+      expect(screen.getByRole("status")).toHaveTextContent("Versions changed while loading.");
+      expect(vi.getTimerCount()).toBeGreaterThan(0);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(loadStateVersions).toHaveBeenCalledTimes(2);
+      fireEvent.click(screen.getByRole("button", { name: /composition history/i }));
+      await vi.advanceTimersByTimeAsync(10000);
+      expect(loadStateVersions).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not call a missing strict version 51 Edited after a one-write race", () => {
+    useSessionStore.setState({ compositionState: makeComposition(51), stateVersions: [makeVersion({ id: "st-50", version: 50 })] });
+    render(<HeaderVersionSelector />);
+    fireEvent.click(screen.getByRole("button", { name: /composition history/i }));
+    expect(screen.getByRole("treeitem", { name: "Version 51 (current) — Checking saved version" })).toBeInTheDocument();
   });
 
   it("confirms and calls revertToVersion when the user picks an older version", () => {
@@ -218,6 +291,37 @@ describe("HeaderVersionSelector", () => {
   // change"), so they are hidden from the history list entirely. Version
   // numbers stay REAL — they must keep agreeing with the chat revert
   // message and the audit trail — so the list shows honest gaps.
+  it("keeps a validated twin visible and marked beside its non-milestone predecessor", () => {
+    const v2 = makeVersion({ id: "st-2", version: 2 });
+    const v3 = { ...v2, id: "st-3", version: 3, is_milestone: true };
+    useSessionStore.setState({
+      compositionState: makeComposition(4),
+      stateVersions: [defaultVersions[0], v2, v3, makeVersion({ id: "st-4", version: 4 })],
+      messages: [{
+        id: "msg-1", session_id: "sess-1", role: "assistant", content: "", created_at: "2026-05-15T10:10:00Z",
+        tool_calls: [{ id: "call-1", type: "function", function: { name: "upsert_edge", arguments: "{}" }, outcome: "applied", applied_state_version: 2 }],
+      }],
+    });
+    render(<HeaderVersionSelector />);
+    fireEvent.click(screen.getByRole("button", { name: /composition history/i }));
+    const milestone = screen.getByRole("treeitem", {
+      name: "Version 3 — Validated version — passed validation when saved; no visible change since the previous version",
+    });
+    expect(within(milestone).getByText(/passed validation when saved/)).toBeVisible();
+    expect(screen.getByRole("treeitem", { name: /^Version 2 — Applied:/ })).toBeVisible();
+  });
+
+  it("keeps a milestone inside an edited run standing alone", () => {
+    const versions = [1, 2, 3, 4, 5, 6].map((version) => makeVersion({
+      id: `st-${version}`, version, is_milestone: version === 3,
+    }));
+    useSessionStore.setState({ stateVersions: versions, compositionState: makeComposition(6) });
+    render(<HeaderVersionSelector />);
+    fireEvent.click(screen.getByRole("button", { name: /composition history/i }));
+    expect(screen.getByRole("treeitem", { name: "Version 3 — Validated version — passed validation when saved" })).toBeVisible();
+    expect(screen.getByRole("treeitem", { name: /Versions 4 to 5/ })).toBeVisible();
+  });
+
   it("hides snapshot-only rows from the history list", () => {
     // v2 content-identical to v1 — a bookkeeping snapshot; v3 differs.
     const v1 = makeVersion({ id: "st-1", version: 1, nodes: [makeNode("a")] });

@@ -460,12 +460,6 @@ _PIPELINE_SETTLEMENT_COUNTER = _PIPELINE_METER.create_counter("composer.pipeline
 
 _INTERPRETATION_IMMUTABLE_TRIGGER_MSG: str = "interpretation_events: resolved rows are immutable"
 
-_STRUCTURAL_DIRECTIVE_PREFIXES: tuple[str, ...] = (
-    "system:",
-    "role:",
-    "instructions:",
-)
-
 
 def _enveloped_state_column(value: Any) -> Any:
     """Wrap one composition_states JSON column through the single envelope rule."""
@@ -6974,6 +6968,39 @@ class SessionServiceImpl:
             return None
 
         return row
+
+    async def get_last_validated_state(
+        self, session_id: UUID, *, through_version: int, exclude_version: int
+    ) -> CompositionStateRecord | None:
+        """Page valid rows newest-first; unknown lane markers fail closed."""
+        # _row_to_state_record admits both legacy unwrapped and enveloped JSON.
+        page_size = 100
+        before_version = through_version + 1
+
+        def _sync(page_before_version: int) -> Any:
+            with self._engine.begin() as conn:
+                return conn.execute(
+                    select(composition_states_table)
+                    .where(
+                        composition_states_table.c.session_id == str(session_id),
+                        composition_states_table.c.is_valid.is_(True),
+                        composition_states_table.c.version < page_before_version,
+                        composition_states_table.c.version != exclude_version,
+                    )
+                    .order_by(composition_states_table.c.version.desc())
+                    .limit(page_size)
+                ).fetchall()
+
+        while True:
+            rows = await self._run_sync(lambda page_before_version=before_version: _sync(page_before_version))
+            for row in rows:
+                record = self._row_to_state_record(row)
+                meta = record.composer_meta
+                if meta is None or "validation_lane" not in meta or meta["validation_lane"] == "strict":
+                    return record
+            if len(rows) < page_size:
+                return None
+            before_version = rows[-1].version
 
     async def get_state_versions(
         self,

@@ -441,20 +441,20 @@ class AttachmentContentPayload(TypedDict):
     values that guard has already narrowed.
 
     Read them as a PAIR.  ``creation_modality`` alone is not an authorship
-    statement: four unrelated paths write ``verbatim`` — the composer, for
+    statement: three unrelated paths write ``verbatim`` — the composer, for
     content copied out of the user's own message; ``create_blob`` behind the
-    upload route; the authority facet's ``reserve_pending_output_blob`` for
-    pipeline output; and ``copy_blobs_for_fork``.  ``created_by`` is what
-    separates them.
+    upload route; and the authority facet's ``reserve_pending_output_blob``
+    for pipeline output.  ``created_by`` is what separates them.
+    ``copy_blobs_for_fork`` preserves both fields and the five ``creating_*``
+    columns of its source.
 
     Both fields report what the row RECORDS, which is not always what
-    happened: fork copy preserves ``created_by`` but resets the modality to
-    ``verbatim`` and nulls the five ``creating_*`` columns, so an
-    LLM-generated blob carried across a session fork records as verbatim.
-    That is a defect in the fork writer, not something this read path can
-    detect — and it is the reason no derived "the assistant authored this"
-    flag is offered here: such a flag would confidently deny authorship of
-    content the assistant really did invent.
+    happened: until dta-au/elspeth#365 the fork writer reset the modality to
+    ``verbatim`` and nulled the ``creating_*`` columns, so a fork copy made
+    before that fix of an LLM-generated blob still records as verbatim.
+    This read path cannot detect such a row — and it is the reason no derived
+    "the assistant authored this" flag is offered here: such a flag would
+    confidently deny authorship of content the assistant really did invent.
     """
 
     blob_id: str

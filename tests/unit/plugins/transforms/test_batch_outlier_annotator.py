@@ -328,10 +328,9 @@ class TestBatchOutlierAnnotator:
         assert not result.retryable
 
     def test_excessive_batch_size_is_rejected_before_outlier_work(self, ctx: PluginContext, monkeypatch: pytest.MonkeyPatch) -> None:
-        import elspeth.plugins.transforms.batch_outlier_annotator as module
         from elspeth.plugins.transforms.batch_outlier_annotator import BatchOutlierAnnotator
 
-        monkeypatch.setattr(module, "_MAX_BATCH_ROWS", 3, raising=False)
+        monkeypatch.setattr(BatchOutlierAnnotator, "max_batch_rows", 3)
         transform = BatchOutlierAnnotator({"schema": DYNAMIC_SCHEMA, "value_field": "score"})
         rows = [_make_row({"id": index, "score": float(index)}) for index in range(4)]
 

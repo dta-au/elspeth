@@ -25,6 +25,7 @@ PLUGIN_DIRS = (
     "plugins/sources/llm",
     "plugins/sinks",
     "plugins/transforms",
+    "plugins/transforms/aws",
     "plugins/transforms/azure",
     "plugins/transforms/llm",
     "plugins/transforms/rag",
@@ -43,7 +44,7 @@ EXCLUDED_FILES = frozenset(
         "provider.py",
     }
 )
-EXPECTED_PLUGIN_COUNT = 45
+EXPECTED_PLUGIN_COUNT = 62
 _HASH_LINE_PATTERN = re.compile(rb'(\s*source_file_hash\s*(?::[^=]+=\s*|=\s*))"sha256:[^"]+"')
 _NORMALIZED_HASH_VALUE = b'"sha256:0000000000000000"'
 _PLUGIN_BASE_CLASS_NAMES = frozenset(
@@ -54,8 +55,14 @@ _PLUGIN_BASE_CLASS_NAMES = frozenset(
         # Azure safety plugins share an abstract project base that inherits
         # BaseTransform; runtime discovery accepts those concrete subclasses.
         "BaseAzureSafetyTransform",
+        # The Azure analyze transforms (Document Intelligence, Content
+        # Understanding) share an abstract submit/poll core the same way.
+        "AzureAnalyzeTransform",
         # The retrieval transforms share an abstract core the same way.
         "RetrievalTransformBase",
+        # The AWS Bedrock guardrail transforms (content safety, prompt
+        # shield) share an abstract guardrail core the same way.
+        "BedrockGuardrailTransformBase",
     }
 )
 

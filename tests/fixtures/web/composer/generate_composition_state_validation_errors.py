@@ -17,6 +17,7 @@ from pydantic import JsonValue
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.sessions.protocol import CompositionStateRecord, CompositionValidationError
 from elspeth.web.sessions.routes._helpers import _state_response
+from elspeth.web.sessions.routes.composer.state import _state_version_response
 
 
 class CompositionStateValidationFixture(TypedDict):
@@ -70,6 +71,7 @@ def composition_state_validation_error_cases() -> CompositionStateValidationFixt
         ),
     }
     result = {}
+    versions = []
     for name, values in errors.items():
         record = CompositionStateRecord(
             id=UUID("00000000-0000-4000-8000-000000000001"),
@@ -86,7 +88,8 @@ def composition_state_validation_error_cases() -> CompositionStateValidationFixt
             derived_from_state_id=None,
         )
         result[name] = _state_response(record).model_dump(mode="json")
-    return {"states": result, "versions": list(result.values())}
+        versions.append(_state_version_response(record).model_dump(mode="json"))
+    return {"states": result, "versions": versions}
 
 
 def main() -> None:

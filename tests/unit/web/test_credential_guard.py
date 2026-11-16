@@ -327,6 +327,68 @@ def test_structured_refusal_contains_only_closed_evidence() -> None:
     assert candidate not in repr(payload)
 
 
+@pytest.mark.parametrize(
+    "surface",
+    [
+        "composer_provider_response",
+        "composer_planner_response",
+        "composer_advisor_response",
+        "composer_provider_thinking",
+        "composer_tool_batch",
+        "composer_tool_wire",
+        "composer_recovery_reply",
+    ],
+)
+def test_model_output_refusal_identifies_model_and_keeps_evidence_closed(surface: str) -> None:
+    candidate = "sk-" + "a" * 24
+
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        require_no_credential_material({"ordinary": candidate}, surface=surface)
+
+    detail = (
+        "The model's output appears to contain a credential, so it was blocked. "
+        "If you gave the Composer a credential, store it through the secret service and use a secret reference instead. "
+        "Otherwise, retry your request."
+    )
+    assert str(caught.value) == detail
+    assert caught.value.to_payload() == {
+        "error_type": "credential_material_rejected",
+        "failure_code": "credential_material_rejected",
+        "detail": detail,
+        "category": "token_shape",
+        "surface": surface,
+        "detector_version": "1",
+    }
+    assert candidate not in repr(caught.value)
+    assert candidate not in repr(caught.value.to_payload())
+
+
+@pytest.mark.parametrize(
+    "surface",
+    [
+        "composer_provider_request",
+        "composer_state_before_provider",
+        "composer_yaml_import",
+        "web_message_ingress",
+        "web_fork_message_ingress",
+        "session_title",
+        "blob_filename",
+        "composer_tool_arguments",
+        "composer_advisor_complete_content",
+        "composer_mcp_tool_arguments",
+        "composer_prompt_guard_request",
+        "composer_unknown_response",
+    ],
+)
+def test_non_model_output_surfaces_keep_original_refusal_copy(surface: str) -> None:
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        require_no_credential_material("sk-" + "a" * 24, surface=surface)
+
+    detail = "This control content appears to contain a credential. Store the value through the secret service and use a secret reference."
+    assert str(caught.value) == detail
+    assert caught.value.to_payload()["detail"] == detail
+
+
 def test_structured_refusal_never_returns_a_user_controlled_mapping_key() -> None:
     candidate_key = "sk-" + "b" * 24
 
@@ -518,7 +580,7 @@ async def test_provider_response_is_refused_before_release(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
-async def test_provider_reasoning_is_refused_before_release(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_provider_reasoning_is_withheld_before_release(monkeypatch: pytest.MonkeyPatch) -> None:
     candidate = "sk-" + "a" * 24
     response = _make_llm_response(content="ordinary")
     response.choices[0].message.__dict__["reasoning_content"] = candidate
@@ -534,15 +596,14 @@ async def test_provider_reasoning_is_refused_before_release(monkeypatch: pytest.
         endpoint_api_key=None,
     )
 
-    with pytest.raises(CredentialMaterialRefused) as caught:
-        await gateway._call_llm([{"role": "user", "content": "ordinary"}], [])
-
-    assert caught.value.surface == "composer_provider_response"
-    assert candidate not in repr(caught.value.to_payload())
+    admitted = await gateway._call_llm([{"role": "user", "content": "ordinary"}], [])
+    assert admitted.provider_metadata.reasoning_content is None
+    assert admitted.provider_metadata.reasoning_withholds[0].surface == "composer_provider_response"
+    assert candidate not in repr(admitted)
 
 
 @pytest.mark.asyncio
-async def test_text_provider_reasoning_is_refused_before_release(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_text_provider_reasoning_keeps_visible_reply(monkeypatch: pytest.MonkeyPatch) -> None:
     candidate = "sk-" + "a" * 24
     response = _make_llm_response(content="ordinary")
     response.choices[0].message.__dict__["reasoning_content"] = candidate
@@ -558,11 +619,8 @@ async def test_text_provider_reasoning_is_refused_before_release(monkeypatch: py
         endpoint_api_key=None,
     )
 
-    with pytest.raises(CredentialMaterialRefused) as caught:
-        await gateway._call_text_llm([{"role": "user", "content": "ordinary"}])
-
-    assert caught.value.surface == "composer_provider_response"
-    assert candidate not in repr(caught.value.to_payload())
+    admitted = await gateway._call_text_llm([{"role": "user", "content": "ordinary"}])
+    assert admitted.choices[0].message.content == "ordinary"
 
 
 def test_pipeline_data_and_sink_modules_do_not_import_control_plane_guard() -> None:

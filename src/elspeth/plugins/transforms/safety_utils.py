@@ -6,6 +6,9 @@ all security-oriented transforms.
 
 from __future__ import annotations
 
+from types import MappingProxyType
+
+from elspeth.contracts.freeze import FrozenJsonArray
 from elspeth.contracts.schema_contract import PipelineRow
 
 
@@ -26,6 +29,46 @@ def get_fields_to_scan(fields_config: str | list[str], row: PipelineRow) -> list
         return [fields_config]
     else:
         return fields_config
+
+
+def unscanned_field_warnings(fields_config: str | list[str], row: PipelineRow) -> list[str]:
+    """Name every field that ``fields: all`` leaves unscanned, for the audit trail.
+
+    'all' mode scans only top-level string values, so a field holding a
+    dict, list or other non-string value — including text nested inside
+    a container — is never scanned. A security transform reporting success
+    must say so, or the audit record reads as though the whole row was
+    checked. Each warning carries the field name and value type only, never
+    the value. Explicitly named fields fail closed instead, so they produce
+    no warnings here.
+    """
+    if fields_config != "all":
+        return []
+    scanned = frozenset(get_fields_to_scan(fields_config, row))
+    return [
+        f"field {field_name!r} not scanned: fields='all' scans only top-level string values "
+        f"(actual_type={_row_value_type_name(row[field_name])})"
+        for field_name in row
+        if field_name not in scanned
+    ]
+
+
+# deep_freeze (contracts/freeze.py) turns an authored dict into a
+# MappingProxyType and an authored list into a tuple or FrozenJsonArray;
+# the warning names the authored shape, not the freeze wrapper.
+_AUTHORED_TYPE_NAMES: dict[type, str] = {
+    MappingProxyType: "dict",
+    tuple: "list",
+    FrozenJsonArray: "list",
+}
+
+
+def _row_value_type_name(value: object) -> str:
+    """Name a row value's type as the row's author wrote it."""
+    value_type = type(value)
+    if value_type in _AUTHORED_TYPE_NAMES:
+        return _AUTHORED_TYPE_NAMES[value_type]
+    return value_type.__name__
 
 
 def validate_fields_not_empty(v: str | list[str]) -> str | list[str]:

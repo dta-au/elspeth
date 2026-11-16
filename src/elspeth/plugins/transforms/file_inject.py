@@ -41,7 +41,7 @@ from elspeth.contracts.schema import FieldDefinition, SchemaConfig, declare_miss
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.core.canonical import is_non_canonical_number
 from elspeth.plugins.infrastructure.base import BaseTransform
-from elspeth.plugins.infrastructure.config_base import TransformDataConfig
+from elspeth.plugins.infrastructure.config_base import CSVDelimiter, TransformDataConfig, validate_csv_delimiter
 from elspeth.plugins.infrastructure.config_content import (
     CanonicalSizeLimitExceededError,
     NonCanonicalValueTypeError,
@@ -184,8 +184,7 @@ def _load_json(text: str) -> object:
 
 def _parse_csv(text: str, *, delimiter: str) -> list[dict[str, str]]:
     """Parse CSV text into one dict per data row, keyed by the header verbatim."""
-    if len(delimiter) != 1 or delimiter in '\r\n"':
-        raise ValueError(f"delimiter must be exactly one character, and not a quote or a line break; got {delimiter!r}")
+    validate_csv_delimiter(delimiter)
     # newline=None reads \n, \r\n and \r alike and hands the reader \n, so no
     # carriage return survives in a header name or a last cell.
     stream = io.StringIO(text, newline=None)
@@ -314,7 +313,7 @@ class FileInjectEntryConfig(BaseModel):
     data_key: str | None = Field(
         default=None, description="json only: write this member of a top-level JSON object instead of the whole value."
     )
-    delimiter: str = Field(default=",", description="csv only: the single character that separates cells.")
+    delimiter: CSVDelimiter = Field(default=",", description="csv only: the single character that separates cells.")
     output_field: str | None = Field(
         default=None,
         description="mode 'all' only, and required there: the row field this entry's value is written to.",
@@ -658,7 +657,7 @@ class FileInject(BaseTransform):
     name = "file_inject"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3cf2db3f01fd35fd"
+    source_file_hash: str | None = "sha256:984f1065b34bb6cc"
     config_model = FileInjectConfig
     passes_through_input = True
     usage_when_to_use: str = (

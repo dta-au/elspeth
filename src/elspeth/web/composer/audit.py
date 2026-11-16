@@ -445,6 +445,7 @@ _LLM_CALL_PUBLIC_AUDIT_FIELDS: Final[tuple[str, ...]] = (
     "cache_creation_input_tokens",
     "cache_read_input_tokens",
     "reasoning_tokens",
+    "reasoning_withholds",
     "latency_ms",
     "provider_request_id",
     "messages_hash",

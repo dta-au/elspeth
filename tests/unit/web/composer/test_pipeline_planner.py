@@ -322,6 +322,36 @@ _SKILL_REWORK_0812_CANONICAL_BYTES = 3878
 # growth: the baseline, 10% band and prior headroom (zero before this change)
 # are preserved, with the exact-boundary / +1-byte overflow control.
 _FILE_INJECT_CATALOG_CANONICAL_BYTES = 867
+# 2026-11-13: validated-state diff teaching measured 140,458 -> 140,556 B.
+_VALIDATED_DIFF_BASELINE_CANONICAL_BYTES = 98
+# CDA-04 (2026-11-13): reviewed slots reach only node-template users, and
+# staging rejects any query override. The corrected teaching measures
+# 140,468 -> 140,621 B on both live and small catalogs (+153 B). Keep the
+# delivery limit, refusal condition and repair together; the rest of this
+# teaching unit is unchanged. Preserve existing headroom and boundary controls.
+_CDA04_REVIEWED_SLOT_CANONICAL_BYTES = 153
+# CDA-02b (2026-11-14): diff reply and version guidance grows the planner's
+# diff_pipeline declaration by 762 canonical bytes; the skill paragraph is not
+# carried in this planner request. Preserve the existing 17-byte headroom.
+_CDA02B_DIFF_GUIDANCE_CANONICAL_BYTES = 762
+# BATCH-GA (2026-11-15): ordinary web-policy fixed scaffolding grew by a
+# measured +1,335 canonical bytes (119,627 -> 120,962 on the pre-3.14 base)
+# when the three batch plugins became required. The maintainer ruled the same
+# day that there is no strict byte allowance: a pin moves by the measured
+# amount. Preserve the baseline and overflow control.
+_BATCH_GA_CATALOG_CANONICAL_BYTES = 1335
+# azure_content_understanding transform catalog entry (2026-11-11), awaiting
+# maintainer review like the allowances above: measured with the same live
+# request, removing only that entry from the discovery digest and its name
+# from the shield-producer list. The scaffold is 140,468 B without it and
+# 141,063 B with it: +595 B, in both the live and small catalog cases. System
+# message and tool palette are unchanged; the azure_document_intelligence entry
+# is byte-identical to its pre-change text. Price only this measured growth:
+# the prior 7 B headroom and the exact-boundary / +1-byte overflow control are
+# preserved.
+_CONTENT_UNDERSTANDING_CATALOG_CANONICAL_BYTES = 595
+# CDA-24 (2026-11-15): diff description measured by AST, 1377 -> 1358 UTF-8 bytes.
+_CDA24_MILESTONE_GUIDANCE_CANONICAL_BYTES = -19
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
@@ -335,6 +365,12 @@ _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     + _SEMANTIC_REVIEW_GUIDANCE_CANONICAL_BYTES
     + _SKILL_REWORK_0812_CANONICAL_BYTES
     + _FILE_INJECT_CATALOG_CANONICAL_BYTES
+    + _VALIDATED_DIFF_BASELINE_CANONICAL_BYTES
+    + _CDA04_REVIEWED_SLOT_CANONICAL_BYTES
+    + _CDA02B_DIFF_GUIDANCE_CANONICAL_BYTES
+    + _BATCH_GA_CATALOG_CANONICAL_BYTES
+    + _CONTENT_UNDERSTANDING_CATALOG_CANONICAL_BYTES
+    + _CDA24_MILESTONE_GUIDANCE_CANONICAL_BYTES
 )
 
 
@@ -2605,6 +2641,8 @@ async def test_every_freeform_planner_discovery_tool_returns_admitted_state(
     assert len(tool_messages) == len(calls)
     for index, (name, _arguments) in enumerate(calls, start=1):
         content = tool_messages[f"call-{index}"]
+        if name == "diff_pipeline":
+            assert json.loads(content)["data"]["baseline_kind"] == "request_start"
         assert _VALIDATION_MESSAGE_CANARY in content
         assert _HIDDEN_CONNECTION_COMPONENT_CANARY in content
         assert _HIDDEN_EDGE_COMPONENT_CANARY in content

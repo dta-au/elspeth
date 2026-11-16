@@ -118,7 +118,17 @@ def _assert_plugin_specific_example_contract(reference: BuiltinReference) -> Non
         assert options["collision_policy"] == "auto_increment"
         schema = cast(Mapping[str, Any], options["schema"])
         assert schema["mode"] == "fixed"
-        assert schema["fields"] == ["announcement_text: str"]
+        assert schema["fields"] == [
+            "announcement_text: str",
+            "report_format: str?",
+            "report_index: int?",
+            "line_start: int?",
+            "line_end: int?",
+            "line_count: int?",
+            "lines_seen_total: int?",
+            "flush_trigger: str?",
+            "is_end_of_source_report: bool?",
+        ]
         # The example must not advertise an append/resume knob this sink
         # deliberately does not offer.
         assert "mode" not in options

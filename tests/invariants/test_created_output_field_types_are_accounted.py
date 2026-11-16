@@ -50,6 +50,7 @@ _REASONS: dict[tuple[str, str], str] = {
     ("batch_drift_compare", "cohort"): _CARRIED,
     ("batch_drift_compare", "category_shifts"): _LIST_OR_MAPPING,
     ("batch_drift_compare", "new_categories"): _LIST_OR_MAPPING,
+    ("batch_drift_compare", "*_indices"): _LIST_OR_MAPPING,
     ("batch_effect_size", "baseline_variant"): _CARRIED,
     ("batch_effect_size", "variant"): _CARRIED,
     ("batch_effect_size", "*_indices"): _LIST_OR_MAPPING,
@@ -78,6 +79,13 @@ _REASONS: dict[tuple[str, str], str] = {
     ("azure_document_intelligence", "di_result"): _LIST_OR_MAPPING,
     ("azure_document_intelligence", "di_tables"): _LIST_OR_MAPPING,
     ("azure_document_intelligence", "di_kv"): _LIST_OR_MAPPING,
+    ("azure_document_intelligence", "di_fields"): _LIST_OR_MAPPING,
+    ("azure_document_intelligence", "di_meta"): _LIST_OR_MAPPING,
+    ("azure_content_understanding", "cu_fields"): _LIST_OR_MAPPING,
+    ("azure_content_understanding", "cu_meta"): _LIST_OR_MAPPING,
+    ("azure_content_understanding", "cu_result"): _LIST_OR_MAPPING,
+    ("azure_content_understanding", "cu_tables"): _LIST_OR_MAPPING,
+    ("azure_content_understanding", "cu_contents"): _LIST_OR_MAPPING,
 }
 
 _OBSERVED: dict[str, Any] = {"schema": {"mode": "observed"}}
@@ -141,7 +149,22 @@ _VARIANTS: dict[str, tuple[Callable[[dict[str, Any]], dict[str, Any]], ...]] = {
         ),
     ),
     "azure_document_intelligence": (
-        _with(page_count_field="di_pages", result_field="di_result", extract={"tables": "di_tables", "key_value_pairs": "di_kv"}),
+        _with(
+            page_count_field="di_pages",
+            fields_field="di_fields",
+            metadata_field="di_meta",
+            result_field="di_result",
+            extract={"tables": "di_tables", "key_value_pairs": "di_kv"},
+        ),
+    ),
+    "azure_content_understanding": (
+        _with(
+            page_count_field="cu_pages",
+            fields_field="cu_fields",
+            metadata_field="cu_meta",
+            result_field="cu_result",
+            extract={"tables": "cu_tables", "contents": "cu_contents"},
+        ),
     ),
 }
 

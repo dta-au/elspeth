@@ -45,12 +45,14 @@ from elspeth.plugins.infrastructure.clients.http import (
 )
 from elspeth.plugins.infrastructure.clients.llm import (
     CONTEXT_LENGTH_PATTERNS,
-    ContentPolicyError,
+    UNSUPPORTED_TOOL_CALLS_MESSAGE,
     ContextLengthError,
     LLMClientError,
     NetworkError,
     RateLimitError,
     ServerError,
+    UnsupportedResponseError,
+    classify_empty_completion,
     public_llm_error_category,
 )
 from elspeth.plugins.infrastructure.telemetry import emit_resource_cleanup_failed
@@ -184,16 +186,12 @@ def _validate_chat_completion_response(response: httpx.Response) -> tuple[dict[s
         raise LLMClientError(f"Expected string content, got {type(content).__name__}", retryable=False)
 
     if content is None or not content.strip():
-        refusal = message.get("refusal")
-        missing_content = "null content" if content is None else "empty content"
-        if raw_finish_reason == "content_filter" or (isinstance(refusal, str) and refusal.strip()):
-            raise ContentPolicyError(f"LLM returned {missing_content}: provider refused or filtered the response")
-        if raw_finish_reason == "length":
-            raise LLMClientError("LLM exhausted the output token budget before returning content", retryable=False)
         if raw_finish_reason == "tool_calls":
-            raise LLMClientError("LLM returned tool_calls response (not supported by ELSPETH)", retryable=False)
-        # Missing content alone does not establish a content-policy refusal.
-        raise LLMClientError(f"LLM returned {missing_content} without an explicit refusal", retryable=False)
+            raise UnsupportedResponseError(UNSUPPORTED_TOOL_CALLS_MESSAGE)
+        # The shared classification every provider records (#123): missing
+        # content alone does not establish a content-policy refusal.
+        refusal = message.get("refusal")
+        raise classify_empty_completion(raw_finish_reason, refused=isinstance(refusal, str) and bool(refusal.strip()))
 
     raw_usage = data.get("usage")
     if isinstance(raw_usage, dict):
@@ -227,7 +225,8 @@ class OpenRouterConfig(LLMConfig):
     Extends LLMConfig with OpenRouter API settings:
     - api_key (str): OpenRouter API key (required)
     - base_url: API base URL (default: https://openrouter.ai/api/v1)
-    - timeout_seconds: Request timeout (default: 60.0)
+    - timeout_seconds: Total wall-clock seconds from dispatch per request;
+      rate-limiter waits have a separate bound (default: 60.0 each)
 
     Tier 2 tracing:
     - tracing: Optional Langfuse configuration (azure_ai not supported for OpenRouter)
@@ -239,12 +238,17 @@ class OpenRouterConfig(LLMConfig):
     # Override base model to make it required — OpenRouter has no deployment_name fallback
     model: str = Field(..., description="Model identifier (e.g., 'openai/gpt-4o')")
 
-    api_key: str = Field(..., description="OpenRouter API key")
+    api_key: str = Field(..., description="OpenRouter API key", repr=False)
     base_url: str = Field(
         default=OPENROUTER_BASE_URL,
         description="OpenRouter API base URL",
+        repr=False,
     )
-    timeout_seconds: float = Field(default=60.0, gt=0, description="Request timeout")
+    timeout_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        description="Total wall-clock seconds from dispatch for each provider HTTP request, including DNS, connect, TLS, send, headers, body, and every redirect hop. Rate-limiter waits are bounded separately by the same number of seconds.",
+    )
 
     @field_validator("base_url")
     @classmethod
@@ -276,6 +280,7 @@ class OpenRouterConfig(LLMConfig):
     tracing: dict[str, Any] | None = Field(
         default=None,
         description="Tier 2 tracing configuration (langfuse only - azure_ai not supported)",
+        repr=False,
     )
 
     # Value-source declaration: ``model`` must appear in the OpenRouter
@@ -461,7 +466,11 @@ class OpenRouterLLMProvider:
             except (HTTPResponseBodyTooLargeError, HTTPResponseEncodingLimitError) as e:
                 raise LLMClientError("Provider response exceeded HTTP transport limits", retryable=False) from e
             except httpx.RequestError as e:
-                raise NetworkError(f"Network error: {e}") from e
+                # Fixed text: httpx/h11 transport errors can quote URLs and
+                # bytes the server sent, and this message reaches the audit
+                # row, the transform error and Langfuse. The original stays
+                # on __cause__.
+                raise NetworkError("Network error: OpenRouter request failed") from e
 
             data, content, usage, finish_reason, response_model = _validate_chat_completion_response(response)
 

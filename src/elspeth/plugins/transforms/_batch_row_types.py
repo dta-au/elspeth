@@ -49,6 +49,15 @@ from decimal import Decimal
 
 from elspeth.contracts.errors import TransformErrorReason
 
+# The one authority for the buffered-row cap of the capped batch transforms
+# (batch_outlier_annotator, batch_rank, batch_paired_preference,
+# batch_drift_compare, batch_duplicate_annotator). Each declares it on its class
+# as ``max_batch_rows``; runtime_factory and the composer refuse an aggregation
+# whose ``trigger.count`` exceeds that declaration before any row is read, and
+# the plugin still refuses an over-cap flush (an end-of-source or timeout flush
+# has no count to check in advance).
+MAX_BATCH_ROWS = 4096
+
 
 def require_scalar_group_key(value: object, *, field: str, row_index: int) -> None:
     """Reject container keys without recording row content.

@@ -16,7 +16,7 @@ import httpx
 import pytest
 import respx
 
-from elspeth.contracts import CallType
+from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
@@ -28,11 +28,14 @@ from elspeth.plugins.infrastructure.clients.llm import (
     AuditedLLMClient,
     ContentPolicyError,
     ContextLengthError,
+    EmptyCompletionError,
+    FilteredCompletionError,
     LLMClientError,
     LLMResponse,
     NetworkError,
     RateLimitError,
     ServerError,
+    UnsupportedResponseError,
 )
 from elspeth.plugins.transforms.llm.provider import (
     FinishReason,
@@ -187,7 +190,7 @@ def test_governance_guards_sdk_and_settles_error_once(preflight: bool, refused: 
 @pytest.mark.parametrize(
     ("content", "finish_reason", "error_type", "error_message"),
     [
-        ("   ", "stop", ContentPolicyError, "empty content"),
+        ("   ", "stop", EmptyCompletionError, "without an explicit refusal"),
         ("partial", "content_filter", LLMClientError, "unusable finish reason"),
     ],
 )
@@ -724,76 +727,53 @@ class TestExecuteQuery:
         assert result.finish_reason is None
         assert result.content == "hi"
 
-    def test_empty_content_raises_content_policy_error(self, provider: AzureLLMProvider) -> None:
-        """Empty string content (from AuditedLLMClient's None→'' conversion)
-        must raise ContentPolicyError, not ValueError from LLMQueryResult invariant."""
-        client = FakeLLMClient(
-            response=_make_llm_response(
-                content="",
-                finish_reason="content_filter",
-            )
-        )
+    @pytest.mark.parametrize(
+        ("content", "finish_reason", "error_type", "category", "diagnostic"),
+        [
+            ("", "content_filter", FilteredCompletionError, "content_policy", "filtered"),
+            ("   ", "stop", EmptyCompletionError, "client", "without an explicit refusal"),
+            ("", "length", EmptyCompletionError, "client", "output token budget"),
+            ("", "tool_calls", UnsupportedResponseError, "response_processing", "tool_calls"),
+        ],
+    )
+    def test_empty_content_is_recorded_and_raised_with_its_classification(
+        self,
+        audit_recorder: FakeAuditRecorder,
+        provider: AzureLLMProvider,
+        content: str,
+        finish_reason: str,
+        error_type: type[LLMClientError],
+        category: str,
+        diagnostic: str,
+    ) -> None:
+        """An empty completion fails with the classification its call row records (#123).
 
-        with _provider_llm_client(provider, client), pytest.raises(ContentPolicyError, match="empty content"):
+        AuditedLLMClient owns the classification; the provider never sees
+        blank content, so this drives the real client through a fake SDK.
+        """
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content), finish_reason=finish_reason)],
+            model="gpt-4o",
+            usage=None,
+            model_dump=lambda: {"choices": [{"message": {"content": content}, "finish_reason": finish_reason}], "model": "gpt-4o"},
+        )
+        provider._underlying_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: response)))
+
+        with pytest.raises(error_type, match=diagnostic) as exc_info:
             provider.execute_query(
                 messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                audit_parent=LLMAuditParent.for_row(
-                    member_token=_MEMBER_TOKEN,
-                    work_item=_WORK_ITEM,
-                    state_id="state-1",
-                    token_id="tok-1",
-                ),
+                audit_parent=LLMAuditParent.for_operation(operation_id="op-1", coordination_token=_LEADER_TOKEN),
             )
-
-    def test_whitespace_only_content_raises_content_policy_error(self, provider: AzureLLMProvider) -> None:
-        """Whitespace-only content from provider must raise ContentPolicyError."""
-        client = FakeLLMClient(
-            response=_make_llm_response(
-                content="   ",
-                finish_reason="stop",
-            )
-        )
-
-        with _provider_llm_client(provider, client), pytest.raises(ContentPolicyError, match="empty content"):
-            provider.execute_query(
-                messages=[ChatMessage(role="user", content="hi")],
-                model="gpt-4o",
-                temperature=0.0,
-                max_tokens=100,
-                audit_parent=LLMAuditParent.for_row(
-                    member_token=_MEMBER_TOKEN,
-                    work_item=_WORK_ITEM,
-                    state_id="state-1",
-                    token_id="tok-1",
-                ),
-            )
-
-    def test_empty_content_with_tool_calls_finish_reason(self, provider: AzureLLMProvider) -> None:
-        """Tool-call responses (content=None→'', finish_reason=tool_calls)
-        must raise LLMClientError, not ValueError."""
-        client = FakeLLMClient(
-            response=_make_llm_response(
-                content="",
-                finish_reason="tool_calls",
-            )
-        )
-
-        with _provider_llm_client(provider, client), pytest.raises(LLMClientError, match="tool_calls"):
-            provider.execute_query(
-                messages=[ChatMessage(role="user", content="hi")],
-                model="gpt-4o",
-                temperature=0.0,
-                max_tokens=100,
-                audit_parent=LLMAuditParent.for_row(
-                    member_token=_MEMBER_TOKEN,
-                    work_item=_WORK_ITEM,
-                    state_id="state-1",
-                    token_id="tok-1",
-                ),
-            )
+        assert type(exc_info.value) is error_type
+        assert exc_info.value.retryable is False
+        assert len(audit_recorder.operation_calls) == 1
+        recorded = audit_recorder.operation_calls[0]
+        assert recorded["status"] is CallStatus.ERROR
+        assert recorded["error"].category == category
+        assert recorded["error"].type == error_type.__name__
 
     def test_operation_parent_constructs_audited_client_and_records_operation_call(
         self,

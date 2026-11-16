@@ -165,11 +165,11 @@ class TestTransformStringTypedInputFields:
 
 
 class TestStringTypedInputFieldsNodeInfoGuard:
-    """declared_string_input_fields is TRANSFORM-only, mirroring its siblings."""
+    """declared_string_input_fields is for transforms and batch aggregations."""
 
     def test_non_transform_node_is_rejected(self) -> None:
         """Offensive programming: stray declarations must not sit unread on a sink."""
-        with pytest.raises(GraphValidationError, match="only meaningful for TRANSFORM nodes"):
+        with pytest.raises(GraphValidationError, match="only meaningful for TRANSFORM or AGGREGATION nodes"):
             NodeInfo(
                 node_id="n1",
                 node_type=NodeType.SINK,
@@ -300,6 +300,19 @@ class TestFamilyDeclarations:
 
         assert transform.declared_string_input_fields == frozenset({"doc_url"})
 
+    def test_truncate_declares_fields(self) -> None:
+        """truncate requires every configured field present and string-valued (plugin review #146).
+
+        It declares that exactly like the scanners: its ``fields`` keys are
+        string-typed declared inputs, with no rules of its own.
+        """
+        from elspeth.plugins.transforms.truncate import Truncate
+
+        transform = Truncate({"fields": {"title": 5, "notes": 80}, "schema": {"mode": "observed"}})
+
+        assert transform.declared_string_input_fields == frozenset({"title", "notes"})
+        assert frozenset({"title", "notes"}) <= transform.declared_read_fields
+
 
 # ---------------------------------------------------------------------------
 # Production build path — projection wiring, end to end (the g11 repro)
@@ -392,3 +405,212 @@ class TestBedrockShieldBuildPath:
         transform_nodes = [data["info"] for _nid, data in graph._graph.nodes(data=True) if data["info"].node_type == NodeType.TRANSFORM]
         assert len(transform_nodes) == 1
         assert transform_nodes[0].declared_string_input_fields == frozenset({"sentence_num"})
+
+
+def _truncate_settings(*, field_spec: str) -> Any:
+    """Fixed-mode CSV source -> truncate on its only column (plugin review #146)."""
+    from elspeth.core.config import (
+        ElspethSettings,
+        SinkSettings,
+        SourceSettings,
+        TransformSettings,
+    )
+
+    return ElspethSettings(
+        sources={
+            "primary": SourceSettings(
+                plugin="csv",
+                on_success="seed_rows",
+                options={
+                    "path": "seed.csv",
+                    "on_validation_failure": "discard",
+                    "schema": {"mode": "fixed", "fields": [field_spec]},
+                },
+            )
+        },
+        transforms=[
+            TransformSettings(
+                name="trim",
+                plugin="truncate",
+                input="seed_rows",
+                on_success="output",
+                on_error="discard",
+                options={"fields": {"count": 3}, "schema": {"mode": "observed"}},
+            )
+        ],
+        sinks={
+            "output": SinkSettings(
+                plugin="json",
+                on_write_failure="discard",
+                options={"path": "out.jsonl", "format": "jsonl", "schema": {"mode": "observed"}},
+            )
+        },
+    )
+
+
+class TestTruncateBuildPath:
+    """truncate fails every non-string value, so a provably non-string producer must not build."""
+
+    def test_truncate_on_declared_int_field_is_rejected(self, plugin_manager: Any) -> None:
+        """Before #146 this built green and then failed 100% of rows with type_mismatch."""
+        with pytest.raises(GraphValidationError, match="'count' is declared int"):
+            _build(_truncate_settings(field_spec="count: int"))
+
+    def test_truncate_on_declared_str_field_builds(self, plugin_manager: Any) -> None:
+        graph = _build(_truncate_settings(field_spec="count: str"))
+
+        transform_nodes = [data["info"] for _nid, data in graph._graph.nodes(data=True) if data["info"].node_type == NodeType.TRANSFORM]
+        assert [info.declared_string_input_fields for info in transform_nodes] == [frozenset({"count"})]
+
+
+@pytest.mark.parametrize(
+    ("plugin", "target_field"),
+    [
+        ("line_explode", "line_explode_text"),
+        ("blob_fetch", "blob_fetch_probe_url"),
+        ("blob_csv_expand", "blob_ref"),
+        ("blob_json_expand", "blob_ref"),
+        ("blob_text_expand", "blob_ref"),
+        ("pdf_rasterize", "blob_ref"),
+        ("web_scrape", "web_scrape_probe_url"),
+        ("aws_textract_inline_analysis", "blob_ref"),
+        ("aws_textract_document_analysis", "document_key"),
+        ("rag_retrieval", "rag_probe_query"),
+        ("azure_ai_search", "rag_probe_query"),
+    ],
+)
+def test_string_only_sibling_rejects_fixed_non_string_producer(plugin: str, target_field: str, plugin_manager: Any) -> None:
+    from elspeth.core.config import TransformSettings
+
+    plugin_type = plugin_manager.get_transform_by_name(plugin)
+    options = plugin_type.probe_config()
+    settings = _truncate_settings(field_spec=f"{target_field}: int")
+    companion_fields = {
+        "blob_json_expand": ["blob_content_type: str"],
+        "aws_textract_document_analysis": ["document_bucket: str"],
+    }
+    settings.sources["primary"].options["schema"]["fields"] = [f"{target_field}: int", *companion_fields.get(plugin, [])]
+    settings.transforms[0] = TransformSettings(
+        name="consumer", plugin=plugin, input="seed_rows", on_success="output", on_error="discard", options=options
+    )
+
+    with pytest.raises(GraphValidationError, match=f"'{target_field}' is declared int"):
+        _build(settings)
+
+
+@pytest.mark.parametrize(
+    ("plugin", "overrides", "removed", "active_field", "inactive_field"),
+    [
+        ("blob_json_expand", {}, (), "blob_content_type", "json_text"),
+        ("blob_json_expand", {"format": "json"}, (), "blob_ref", "blob_content_type"),
+        ("aws_textract_document_analysis", {}, (), "document_bucket", "document_version"),
+        ("aws_textract_document_analysis", {"bucket": "review-bucket"}, ("bucket_field",), "document_key", "document_bucket"),
+        ("aws_textract_document_analysis", {"version_field": "document_version"}, (), "document_version", "unused"),
+        (
+            "aws_textract_document_analysis",
+            {"bucket": "review-bucket", "version_field": "document_version"},
+            ("bucket_field",),
+            "document_version",
+            "document_bucket",
+        ),
+        (
+            "web_scrape",
+            {"query_fields": {"q": "query_value"}, "header_fields": {"Accept": "header_value"}},
+            (),
+            "query_value",
+            "unused",
+        ),
+        (
+            "web_scrape",
+            {"query_fields": {"q": "query_value"}, "header_fields": {"Accept": "header_value"}},
+            (),
+            "header_value",
+            "unused",
+        ),
+        ("web_scrape", {}, (), "web_scrape_probe_url", "query_value"),
+        ("web_scrape", {}, (), "web_scrape_probe_url", "header_value"),
+        (
+            "web_scrape",
+            {"url": "https://93.184.216.34/doc", "query_fields": {"q": "query_value"}},
+            ("url_field",),
+            "query_value",
+            "web_scrape_probe_url",
+        ),
+        (
+            "web_scrape",
+            {"url": "https://93.184.216.34/doc", "header_fields": {"Accept": "header_value"}},
+            ("url_field",),
+            "header_value",
+            "web_scrape_probe_url",
+        ),
+        ("rag_retrieval", {}, (), "rag_probe_query", "unused"),
+        ("rag_retrieval", {"query_template": "{{ query }}"}, (), None, "rag_probe_query"),
+        ("azure_ai_search", {}, (), "rag_probe_query", "unused"),
+        ("azure_ai_search", {"query_template": "{{ query }}"}, (), None, "rag_probe_query"),
+    ],
+)
+def test_conditional_string_inputs_follow_configured_arm(
+    plugin: str,
+    overrides: dict[str, object],
+    removed: tuple[str, ...],
+    active_field: str | None,
+    inactive_field: str,
+    plugin_manager: Any,
+) -> None:
+    """The source schema is fixed independently of the plugin's declarations."""
+    from elspeth.core.config import TransformSettings
+
+    options = plugin_manager.get_transform_by_name(plugin).probe_config()
+    for key in removed:
+        options.pop(key)
+    options.update(overrides)
+
+    def build_with_int(field: str | None) -> ExecutionGraph:
+        columns = (
+            "blob_ref",
+            "blob_content_type",
+            "json_text",
+            "document_bucket",
+            "document_key",
+            "document_version",
+            "web_scrape_probe_url",
+            "query_value",
+            "header_value",
+            "rag_probe_query",
+            "unused",
+        )
+        settings = _truncate_settings(field_spec="blob_ref: str")
+        settings.sources["primary"].options["schema"]["fields"] = [f"{name}: {'int' if name == field else 'str'}" for name in columns]
+        settings.transforms[0] = TransformSettings(
+            name="consumer", plugin=plugin, input="seed_rows", on_success="output", on_error="discard", options=options
+        )
+        return _build(settings)
+
+    build_with_int(None)
+    build_with_int(inactive_field)
+    if active_field is not None:
+        with pytest.raises(GraphValidationError, match=f"'{active_field}' is declared int"):
+            build_with_int(active_field)
+
+
+def test_report_assemble_rejects_fixed_non_string_producer(plugin_manager: Any) -> None:
+    from elspeth.core.config import AggregationSettings, TriggerConfig
+
+    options = plugin_manager.get_transform_by_name("report_assemble").probe_config()
+    settings = _truncate_settings(field_spec="report_assemble_probe_value: int")
+    settings.transforms.clear()
+    settings.aggregations.append(
+        AggregationSettings(
+            name="report",
+            plugin="report_assemble",
+            input="seed_rows",
+            on_success="output",
+            on_error="discard",
+            trigger=TriggerConfig(count=2),
+            output_mode="transform",
+            options=options,
+        )
+    )
+
+    with pytest.raises(GraphValidationError, match="'report_assemble_probe_value' is declared int"):
+        _build(settings)

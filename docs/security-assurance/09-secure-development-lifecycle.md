@@ -203,10 +203,10 @@ these jobs reports `success` [EV-604]:
 | Job | Content |
 |---|---|
 | `Static analysis` | actionlint, ruff, mypy, contract checks, elspeth-lints rules (§ 2.3) |
-| `Test (Python 3.12, shard 0–3)`, `Test (Python 3.13, shard 0–3)` | Four deterministic shards per interpreter over the default pytest selection; 3.13 shards emit coverage data |
-| `Combined coverage` | Requires ordinary, proof and timing-sensitive jobs; validates disjoint manifests for each interpreter, combines 3.13 coverage and enforces every coverage floor |
+| `Test (Python 3.14, shard 0–7)` | Eight deterministic shards over the default pytest selection on the single supported interpreter; every shard emits coverage data |
+| `Combined coverage` | Requires ordinary, proof and timing-sensitive jobs; validates disjoint manifests, combines 3.14 coverage and enforces every coverage floor |
 | `Testcontainer (PostgreSQL contention proofs)` | `pytest tests/ -m testcontainer -n 0` against real PostgreSQL |
-| `Timing-sensitive tests (Python 3.12)`, `Timing-sensitive tests (Python 3.13)` | Required serial timing-sensitive selection; default tests exclude it |
+| `Timing-sensitive tests (Python 3.14)` | Required serial timing-sensitive selection; default tests exclude it |
 | `Host-runner unit (docker CLI, non-root filesystem)` | Tests that need a Docker CLI or a non-root user; required skips become failures |
 | `State-engine catalog and selector validation` | Proof catalogues, plugin lifecycle matrix and documentation links |
 | `Azure Container Apps Bicep bundle` | Compiles every Bicep template and parameter file; compiled-template contract test |
@@ -243,7 +243,7 @@ on `main` (§ 1.3). Pre-commit hooks run on the contributor's machine once
 | Composer skill inventory | The composer skill's tool list matches the registered tools | Pre-commit; CI `Static analysis` | Yes (`CI Success`) | `scripts/cicd/generate_skill_inventory.py` [EV-606] |
 | `elspeth-lints` rules | Project-specific invariants (§ 2.3) | Pre-commit (per rule, on trigger paths); CI `Static analysis` | Yes (`CI Success`), except `trust_tier.tier_model` (§ 2.4) | [ADR-023](../architecture/adr/023-custom-python-ci-analyzer.md) [EV-606] [EV-608] [EV-610] |
 | Lint migration parity | Shadow-mode comparison of migrated lint rules | CI `Static analysis` | Yes (`CI Success`) | `scripts/cicd/parity_harness.py` [EV-604] |
-| Python tests (default selection) | Unit, integration, property, invariant and end-to-end tests (§ 3), on Python 3.12 and 3.13 | CI `Test` | Yes (`CI Success`) | [ci.yaml](../../.github/workflows/ci.yaml) [EV-604] [EV-618] |
+| Python tests (default selection) | Unit, integration, property, invariant and end-to-end tests (§ 3), on Python 3.14 | CI `Test` | Yes (`CI Success`) | [ci.yaml](../../.github/workflows/ci.yaml) [EV-604] [EV-618] |
 | Coverage floors | Branch-enabled coverage ≥ 85 % overall; `core/landscape` ≥ 92 %, `core/canonical.py` ≥ 99 %, `engine/orchestrator` ≥ 90 %, `contracts` ≥ 62 % | CI `Combined coverage`, after all four Python 3.13 shards | Yes (`CI Success`) | as above [EV-621] |
 | PostgreSQL testcontainer suite | Schema, SQL, locking and deployment acceptance against real PostgreSQL (660 tests, § 3.2) | CI `Testcontainer` | Yes (`CI Success`) | as above [EV-604] [EV-619] |
 | Live-provider integration tests | Integration tests with a model API key | CI `Integration Tests`, push only | No — runs after merge; gates image publication (§ 6.2) | as above [EV-604] [EV-617] [EV-625] |
@@ -505,13 +505,14 @@ Limits an assessor should weigh:
 ### 6.1 Build inputs
 
 - **Base images pinned by digest** in the `Dockerfile`: the Node frontend
-  builder (`node:24.18.0-bookworm-slim@sha256:…`), the Python builder
-  (`python:3.13-slim@sha256:…`), the `uv` binary image and the distroless
-  runtime (`gcr.io/distroless/python3-debian13:debug-nonroot@sha256:…`)
-  [EV-627].
+  builder (`node:24.18.0-bookworm-slim@sha256:…`), the Debian 13 Python
+  builder (`debian:trixie-slim@sha256:…`), the `uv` binary image and the
+  distroless runtime (`gcr.io/distroless/cc-debian13:debug-nonroot@sha256:…`)
+  [EV-627]. The CPython 3.14 interpreter is installed by that pinned `uv` from
+  its checksummed build list and copied into the runtime image.
 - **Locked dependencies:** the root `uv.lock`, the separate `gateway/uv.lock`
   and the frontend `package-lock.json` [EV-704] [EV-706].
-- **Gateway build inputs pinned and frozen:** its Python 3.12 Alpine builder
+- **Gateway build inputs pinned and frozen:** its Python 3.14 Alpine builder
   and runtime and its `uv` source are pinned by digest. Separate build and
   runtime environments consume `gateway/uv.lock` with `--frozen`; the exact
   local wheel is installed with `--no-deps` [EV-722].

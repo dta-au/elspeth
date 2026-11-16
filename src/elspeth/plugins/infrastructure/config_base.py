@@ -14,11 +14,14 @@ Example usage:
     path = cfg.path  # Direct access, fails fast if missing
 """
 
+import codecs
+import csv
+import io
 import json
 from pathlib import Path
 from typing import Annotated, Any, ClassVar, Final, Literal, Self
 
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, Field, ValidationError, field_validator, model_validator
 
 from elspeth.contracts.emitted_option import (
     EmittedToOutput,
@@ -251,6 +254,10 @@ class PluginConfig(BaseModel):
         "frozen": True,
         "populate_by_name": True,  # Allow both "schema" (alias) and "schema_config" (field name)
         "field_title_generator": _plugin_config_field_title,
+        # A ValidationError chained as PluginConfigError.__cause__ must not echo
+        # the authored input: a model-level error's input is the whole options
+        # dict, whose truncated repr can open with a credential value.
+        "hide_input_in_errors": True,
     }
 
     schema_config: SchemaConfig | None = Field(
@@ -611,6 +618,65 @@ def validate_headers_value(v: str | dict[str, str] | None) -> str | dict[str, st
             raise ValueError(f"Invalid header mode '{v}'. Expected 'normalized', 'original', or mapping dict.")
         return v
     raise ValueError(f"headers must be 'normalized', 'original', or a dict mapping, got {type(v).__name__}")
+
+
+def validate_csv_delimiter(value: str) -> str:
+    """Validate a CSV ``delimiter`` option the way the csv module will use it.
+
+    A single character is necessary but not sufficient: the csv module also
+    rejects the default quotechar (``"``) and line terminators. Probing both a
+    reader and a writer with the plugins' dialect settings refuses those at
+    config load, so the error cannot first surface as an uncaught
+    ``ValueError`` on a row or at publication.
+
+    This is the one delimiter authority; plugins declare ``CSVDelimiter``.
+    Returns the value unchanged. Raises ValueError for invalid inputs.
+    """
+    if len(value) != 1:
+        raise ValueError(f"delimiter must be a single character, got {value!r}")
+    try:
+        csv.reader((), delimiter=value, strict=True)
+        csv.writer(io.StringIO(), delimiter=value)
+    except ValueError as exc:
+        raise ValueError(f"delimiter {value!r} is not usable by the csv module: {exc}") from exc
+    return value
+
+
+def validate_text_encoding(value: str) -> str:
+    """Validate a text ``encoding`` option: a known codec that maps str <-> bytes.
+
+    ``codecs.lookup()`` also resolves bytes-to-bytes and str-to-str codecs
+    (base64, hex, zlib, rot13). Readers and writers would accept them and then
+    crash on the first row or at publication (LookupError, binascii.Error,
+    TypeError), so they are refused here. ``str.encode()`` checks the same
+    text-encoding flag that ``bytes.decode()`` does; ``b"".decode()`` would
+    not, as it short-circuits on empty input. The incremental encoder and
+    decoder are what the streaming readers and writers build, so they must
+    exist too (the ``undefined`` codec raises on every use).
+
+    This is the one codec authority; plugins declare ``TextEncoding``.
+    Returns the value unchanged. Raises ValueError for invalid inputs.
+    """
+    try:
+        codecs.lookup(value)
+    except LookupError as exc:
+        raise ValueError(f"unknown encoding: {value!r}") from exc
+    try:
+        encoded = "".encode(value)
+        incremental = codecs.getincrementalencoder(value)(errors="strict").encode("", final=True)
+        codecs.getincrementaldecoder(value)(errors="strict")
+    except (LookupError, TypeError, ValueError) as exc:
+        raise ValueError(f"encoding {value!r} is not a text encoding") from exc
+    if type(encoded) is not bytes or type(incremental) is not bytes:
+        raise ValueError(f"encoding {value!r} is not a text encoding")
+    return value
+
+
+TextEncoding = Annotated[str, AfterValidator(validate_text_encoding)]
+"""A text codec option. Every plugin ``encoding`` option uses this type (or a narrower Literal)."""
+
+CSVDelimiter = Annotated[str, AfterValidator(validate_csv_delimiter)]
+"""A CSV field delimiter option. Every plugin CSV ``delimiter`` option uses this type."""
 
 
 class LocalFileSinkConfig(PathConfig):

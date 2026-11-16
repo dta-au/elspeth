@@ -128,8 +128,8 @@ def _run_cli(args: list[str]) -> subprocess.CompletedProcess[str]:
 
 
 @pytest.mark.skipif(
-    sys.version_info[:2] != (3, 13),
-    reason="Python 3.13 is the canonical tier-model lint runtime",
+    sys.version_info[:2] != (3, 14),
+    reason="Python 3.14 is the canonical tier-model lint runtime",
 )
 def test_allowlist_dir_unset_uses_per_rule_defaults(tmp_path: Path) -> None:
     """When --allowlist-dir is unset, rules resolve their own default directories."""

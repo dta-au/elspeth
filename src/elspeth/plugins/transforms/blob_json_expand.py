@@ -28,7 +28,6 @@ clauses below are the whole trust-boundary convention here: like
 
 from __future__ import annotations
 
-import codecs
 import copy
 import json
 from collections.abc import Mapping
@@ -42,14 +41,17 @@ from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.errors import FrameworkBugError, TransformErrorReason
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.json_parser import check_json_depth
 from elspeth.contracts.payload_store import IntegrityError, PayloadNotFoundError
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.contracts.source_read_verification import MAX_JSON_DEPTH
 from elspeth.plugins.infrastructure.base import BaseTransform
-from elspeth.plugins.infrastructure.config_base import NormalizedFieldMappingOption, TransformDataConfig
+from elspeth.plugins.infrastructure.config_base import NormalizedFieldMappingOption, TextEncoding, TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+from elspeth.plugins.infrastructure.text_decoding import decoding_codec
 from elspeth.plugins.sources.field_normalization import ExternalHeaderError, is_normalized_field_name, normalize_field_name
 from elspeth.plugins.transforms.blob_expand_contract import (
     BLOB_CONTENT_TYPE_FIELD_DESCRIPTION,
@@ -120,7 +122,7 @@ class BlobJSONExpandConfig(TransformDataConfig):
     field_mapping: NormalizedFieldMappingOption = Field(
         default=None, description="Optional mapping from normalized JSON record keys to final pipeline field names."
     )
-    encoding: str = Field(default="utf-8", description="Encoding used to decode the JSON blob.")
+    encoding: TextEncoding = Field(default="utf-8", description="Encoding used to decode the JSON blob.")
     include_record_index: bool = Field(default=True, description="Whether to emit the record index within the parsed JSON document.")
     record_index_field: str = Field(default="json_record_index", description="Output field receiving the zero-based JSON record index.")
     max_output_rows: int = Field(default=DEFAULT_MAX_OUTPUT_ROWS, gt=0, description="Maximum rows emitted for one input document.")
@@ -142,15 +144,6 @@ class BlobJSONExpandConfig(TransformDataConfig):
         if not stripped:
             raise ValueError(f"{info.field_name} must not be empty")
         return stripped
-
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, value: str) -> str:
-        try:
-            codecs.lookup(value)
-        except LookupError as exc:
-            raise ValueError(f"unknown encoding: {value!r}") from exc
-        return value
 
     @field_validator("fields")
     @classmethod
@@ -310,6 +303,36 @@ def _json_error_reason(reason: str, **details: object) -> TransformErrorReason:
     return cast(TransformErrorReason, {"reason": reason, **details})
 
 
+def _check_json_nesting(text: str, *, phase: str, line_number: int | None = None) -> None:
+    """Refuse nesting deeper than the external-JSON bound before decoding.
+
+    Deep text either makes the C decoder raise ``RecursionError`` (an engine
+    crash class) or decodes into a value too deep for the row freeze and the
+    audit hash; both must leave as a value-level ``on_error`` failure.
+    """
+    try:
+        check_json_depth(text, max_depth=MAX_JSON_DEPTH)
+    except ValueError as exc:
+        location = {} if line_number is None else {"line_number": line_number}
+        raise _BlobJSONParseError(
+            _json_error_reason("invalid_json", error_type="nesting_too_deep", phase=phase, **location, error=str(exc))
+        ) from exc
+
+
+class _NonFiniteJSONConstantError(ValueError):
+    """A NaN / Infinity / -Infinity literal in the untrusted document."""
+
+
+def _reject_non_finite_constant(constant: str) -> None:
+    """``parse_constant`` hook: refuse non-RFC-8259 constants at the boundary.
+
+    Python's json module otherwise decodes them to non-finite floats, which the
+    canonical-JSON policy rejects later as a plugin contract breach instead of
+    as bad input. The JSON sources reject them at parse time the same way.
+    """
+    raise _NonFiniteJSONConstantError(f"non-standard JSON constant {constant!r} is not allowed; use null, not NaN/Infinity")
+
+
 def _is_payload_hash(value: str) -> bool:
     return len(value) == 64 and all(char in _SHA256_HEX_CHARS for char in value)
 
@@ -373,8 +396,8 @@ class BlobJSONExpand(BaseTransform):
     output_naming_config_keys = frozenset({"record_index_field", "fields"})
     name = "blob_json_expand"
     determinism = Determinism.IO_READ
-    plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:5bc93feb6e7900bd"
+    plugin_version = "2.0.0"
+    source_file_hash: str | None = "sha256:7cf76c4cf5b55de5"
     config_model = BlobJSONExpandConfig
     usage_when_to_use: str = (
         "Use when a row carries a JSON document — either a payload-store reference from blob_fetch or JSON text in a "
@@ -426,6 +449,12 @@ class BlobJSONExpand(BaseTransform):
         super().__init__(options)
         cfg = BlobJSONExpandConfig.from_dict(options, plugin_name=self.name)
         self._initialize_declared_input_fields(cfg)
+        if cfg.source == "field":
+            self.declared_string_input_fields = frozenset({cfg.read_text_field})
+        elif cfg.format is None:
+            self.declared_string_input_fields = frozenset({cfg.read_blob_ref_field, cfg.read_content_type_field})
+        else:
+            self.declared_string_input_fields = frozenset({cfg.read_blob_ref_field})
 
         self._source = cfg.source
         self._blob_ref_field = cfg.read_blob_ref_field
@@ -535,13 +564,18 @@ class BlobJSONExpand(BaseTransform):
         """Drive the real process path with a hermetic JSON payload seam."""
 
         class _InvariantPayloadStore:
-            def retrieve(self, ref: str) -> bytes:
+            # Mirrors PayloadStore.retrieve_bounded: a negative cap is refused,
+            # an unknown ref is not found, an oversize payload yields None.
+            def retrieve_bounded(self, ref: str, *, max_bytes: int) -> bytes | None:
+                if max_bytes < 0:
+                    raise ValueError("max_bytes must be nonnegative")
                 if ref != _INVARIANT_PROBE_BLOB_REF:
                     raise PayloadNotFoundError(ref)
-                return (
+                body = (
                     b'{"probe_documents": [{"probe_document_identifier": "blob_json_expand_probe_value", '
                     b'"probe_section_titles": ["probe_section"]}]}'
                 )
+                return body if len(body) <= max_bytes else None
 
         had_payload_store = "_payload_store" in self.__dict__
         original_payload_store: Any = None
@@ -585,18 +619,10 @@ class BlobJSONExpand(BaseTransform):
         # document, but a record key colliding with the text column is still a
         # genuine collision on the row that arrived. Only the inline arm
         # removes anything; this runtime removal stays separate from the
-        # static declaration, which may abstain for an original-header name.
-        # `base` carries NORMALIZED keys while the configured name may be the
-        # original header, so resolve it through the contract exactly as
-        # line_explode/json_explode and blob_csv_expand do. `_load_field_text`
-        # already read the column through the same resolution, so on this
-        # path the key exists — a `pop(..., None)` here silently left the
-        # whole document on every output row whenever the two spellings
-        # differed.
+        # static declaration. The configured name is the carried payload key.
         runtime_removed_fields = (self._text_field,) if self._source == "field" else ()
         for removed in runtime_removed_fields:
-            normalized_removed = removed if removed in base else row.contract.resolve_name(removed)
-            del base[normalized_removed]
+            del base[removed]
 
         output_rows: list[dict[str, Any]] = []
         for record_index, record in enumerate(parsed.records):
@@ -655,7 +681,9 @@ class BlobJSONExpand(BaseTransform):
 
     def _load_field_text(self, row: PipelineRow) -> tuple[str, str, dict[str, str]]:
         """Read JSON text straight from a row field. No payload store involved."""
-        text = row[self._text_field]
+        if not row.carries(self._text_field):
+            raise _BlobJSONParseError(_json_error_reason("missing_field", field=self._text_field))
+        text = row.carried_value(self._text_field)
         if type(text) is not str:
             raise _BlobJSONParseError(
                 _json_error_reason(
@@ -675,7 +703,9 @@ class BlobJSONExpand(BaseTransform):
 
     def _load_blob_text(self, row: PipelineRow) -> tuple[str, str, dict[str, str]]:
         """Read bytes from the payload store and decode them."""
-        blob_ref = row[self._blob_ref_field]
+        if not row.carries(self._blob_ref_field):
+            raise _BlobJSONParseError(_json_error_reason("missing_field", field=self._blob_ref_field))
+        blob_ref = row.carried_value(self._blob_ref_field)
         if type(blob_ref) is not str:
             # Routed, not raised: a wrong-typed ref is a fact about THIS row,
             # the same kind as the malformed-hash rejection directly below.
@@ -711,7 +741,10 @@ class BlobJSONExpand(BaseTransform):
         resolved = self._resolve_blob_format(row)
 
         try:
-            body = self._payload_store.retrieve(blob_ref)
+            # Bounded read: the store stops after max_blob_bytes + 1 bytes and
+            # returns None for an oversize blob, so the cap limits memory, not
+            # just the accepted size (contracts/payload_store.py).
+            body = self._payload_store.retrieve_bounded(blob_ref, max_bytes=self._max_blob_bytes)
         except IntegrityError:
             # FIRST, ahead of the absence handler. The payload store returning
             # bytes that fail their own hash is ELSPETH's storage being corrupt,
@@ -727,20 +760,18 @@ class BlobJSONExpand(BaseTransform):
                 _json_error_reason("blob_not_found", field=self._blob_ref_field, blob_ref=blob_ref, error=str(exc))
             ) from exc
 
-        body_size = len(body)
-        if body_size > self._max_blob_bytes:
+        if body is None:
             raise _BlobJSONParseError(
                 _json_error_reason(
                     "blob_too_large",
                     field=self._blob_ref_field,
                     blob_ref=blob_ref,
-                    body_size=body_size,
                     max_blob_bytes=self._max_blob_bytes,
                 )
             )
 
         try:
-            text = body.decode(self._encoding)
+            text = body.decode(decoding_codec(self._encoding))
         except UnicodeDecodeError as exc:
             raise _BlobJSONParseError(
                 _json_error_reason("decode_failed", field=self._blob_ref_field, blob_ref=blob_ref, encoding=self._encoding, error=str(exc))
@@ -757,7 +788,7 @@ class BlobJSONExpand(BaseTransform):
         # omitted, so a pipeline that cannot guarantee the column is rejected at
         # build time. A row that still arrives without it is refused here rather
         # than guessed at.
-        if self._content_type_field not in row:
+        if not row.carries(self._content_type_field):
             raise _BlobJSONParseError(
                 _json_error_reason(
                     "unsupported_content_type",
@@ -765,7 +796,7 @@ class BlobJSONExpand(BaseTransform):
                     error=f"no content type on the row to infer the parse format from — set the 'format' option on {self.name}",
                 )
             )
-        content_type = row[self._content_type_field]
+        content_type = row.carried_value(self._content_type_field)
         if type(content_type) is not str:
             raise _BlobJSONParseError(
                 _json_error_reason(
@@ -833,19 +864,36 @@ class BlobJSONExpand(BaseTransform):
                     )
                 )
             elements: list[Any] = []
-            for line_number, line in enumerate(text.splitlines(), start=1):
+            # Split on "\n" only, as the JSONL sources do (a file object /
+            # TextIOWrapper(newline="")). str.splitlines() also breaks on
+            # U+2028, U+2029, U+0085 and \x1c-\x1e, which JSON permits raw
+            # inside strings, so it would cut a valid record mid-string.
+            for line_number, raw_line in enumerate(text.split("\n"), start=1):
+                line = raw_line.removesuffix("\r")
                 if not line.strip():
                     continue
+                _check_json_nesting(line, phase="jsonl_line", line_number=line_number)
                 try:
-                    elements.append(json.loads(line))
+                    elements.append(json.loads(line, parse_constant=_reject_non_finite_constant))
+                except _NonFiniteJSONConstantError as exc:
+                    raise _BlobJSONParseError(
+                        _json_error_reason(
+                            "invalid_json", error_type="non_finite_constant", phase="jsonl_line", line_number=line_number, error=str(exc)
+                        )
+                    ) from exc
                 except json.JSONDecodeError as exc:
                     raise _BlobJSONParseError(
                         _json_error_reason("invalid_json", phase="jsonl_line", line_number=line_number, error=str(exc))
                     ) from exc
             return tuple(elements)
 
+        _check_json_nesting(text, phase="document")
         try:
-            document = json.loads(text)
+            document = json.loads(text, parse_constant=_reject_non_finite_constant)
+        except _NonFiniteJSONConstantError as exc:
+            raise _BlobJSONParseError(
+                _json_error_reason("invalid_json", error_type="non_finite_constant", phase="document", error=str(exc))
+            ) from exc
         except json.JSONDecodeError as exc:
             raise _BlobJSONParseError(_json_error_reason("invalid_json", phase="document", line_number=exc.lineno, error=str(exc))) from exc
 

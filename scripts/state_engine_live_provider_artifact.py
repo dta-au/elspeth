@@ -62,6 +62,7 @@ EXTERNAL_CASE_IDS_BY_JOB = {
         "source:azure_blob@sas_token",
         "source:azure_blob@service_principal",
         "transform:azure_content_safety@default",
+        "transform:azure_content_understanding@default",
         "transform:azure_document_intelligence@default",
         "transform:azure_prompt_shield@default",
     ),

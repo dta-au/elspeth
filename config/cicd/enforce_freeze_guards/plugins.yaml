@@ -17,21 +17,9 @@ per_file_rules:
   reason: MultiQueryStrategy isinstance guard on query_specs tuple conversion
   expires: null
   max_hits: 1
-- pattern: plugins/transforms/llm/validation.py
-  rules:
-  - FG2
-  reason: ValidationSuccess isinstance guard on data MappingProxyType check
-  expires: null
-  max_hits: 1
 - pattern: plugins/infrastructure/clients/llm.py
   rules:
   - FG2
   reason: LLMResponse isinstance guard on raw_response — checks if already frozen before deep_freeze
   expires: null
   max_hits: 1
-- pattern: plugins/infrastructure/clients/replayer.py
-  rules:
-  - FG2
-  reason: ReplayedCall isinstance guards on response_data and error_data — checks if already frozen
-  expires: null
-  max_hits: 2

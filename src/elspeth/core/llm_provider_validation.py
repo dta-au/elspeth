@@ -29,9 +29,11 @@ def validate_openrouter_profile_base_url(value: str) -> str:
     validated = validate_credential_safe_https_url(value, field_name="base_url", allow_http_loopback=True)
     try:
         _ = urlsplit(validated).port
-    except ValueError as exc:
-        raise ValueError("base_url must have a valid port") from exc
-    return validated
+    except ValueError:
+        pass
+    else:
+        return validated
+    raise ValueError("base_url must have a valid port")
 
 
 def validate_bedrock_model(value: str) -> str:
@@ -47,10 +49,15 @@ def validate_gateway_endpoint(value: str) -> str:
     """Validate the gateway's credential-safe endpoint and versioned path."""
     validated = validate_credential_safe_https_url(value, field_name="endpoint", allow_http_loopback=True)
     parsed = urlsplit(validated)
+    port_valid = False
     try:
         _ = parsed.port
-    except ValueError as exc:
-        raise ValueError(f"endpoint must have a valid port: {exc}") from exc
+    except ValueError:
+        pass
+    else:
+        port_valid = True
+    if not port_valid:
+        raise ValueError("endpoint must have a valid port")
     if parsed.scheme == "http" and parsed.hostname != GATEWAY_LOOPBACK_HOST:
         raise ValueError(f"endpoint must use HTTPS unless targeting the literal {GATEWAY_LOOPBACK_HOST} loopback host")
     if parsed.query:

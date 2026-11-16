@@ -30,8 +30,8 @@ Choose your environment:
 
 | Environment | Requirements |
 |-------------|--------------|
-| **Local Python** | Python 3.12+, uv package manager |
-| **Web UI** | Python 3.12+, uv, Node.js 24, npm 11, `webui` extra, local auth user |
+| **Local Python** | Python 3.14+, uv package manager |
+| **Web UI** | Python 3.14+, uv, Node.js 24, npm 11, `webui` extra, local auth user |
 | **Docker** | Docker installed and running |
 
 ---

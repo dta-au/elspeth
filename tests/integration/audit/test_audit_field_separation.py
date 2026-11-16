@@ -325,8 +325,9 @@ class TestAuditFieldSeparationSingleQuery:
                 metadata = sr.get("metadata", {})
                 if f"{response_field}_template_hash" in metadata:
                     found_audit_fields = True
-                    # Verify ALL audit fields are present
-                    for suffix in LLM_AUDIT_SUFFIXES:
+                    # Verify ALL audit fields are present (_parts_hash is
+                    # emitted only when image inputs are bound; this call is text-only)
+                    for suffix in (s for s in LLM_AUDIT_SUFFIXES if s != "_parts_hash"):
                         audit_field = f"{response_field}{suffix}"
                         assert audit_field in metadata, f"Audit field '{audit_field}' missing from success_reason metadata"
 

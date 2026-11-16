@@ -18,6 +18,7 @@ from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.plugin_semantics import ContentKind, FieldSemanticFacts, OutputSemanticDeclaration, SemanticValueType, TextFraming
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
@@ -101,8 +102,8 @@ class ReportAssemble(BaseTransform):
     output_naming_config_keys = frozenset({"output_field"})
     name = "report_assemble"
     determinism = Determinism.DETERMINISTIC
-    plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:500cf78b62c27090"
+    plugin_version = "2.0.0"
+    source_file_hash: str | None = "sha256:73993d5a79b0013b"
     config_model = ReportAssembleConfig
     usage_when_to_use: str = (
         "Use in an aggregations node to assemble each flushed batch into a page or section of a "
@@ -167,6 +168,7 @@ class ReportAssemble(BaseTransform):
         super().__init__(config)
         cfg = ReportAssembleConfig.from_dict(config, plugin_name=self.name)
         self._initialize_declared_input_fields(cfg)
+        self.declared_string_input_fields = frozenset({cfg.text_field})
         self._text_field = cfg.text_field
         self._output_field = cfg.output_field
         self._format = cfg.format
@@ -247,6 +249,35 @@ class ReportAssemble(BaseTransform):
     def created_output_fields(self) -> tuple[FieldDefinition, ...]:
         """The rendered report (``str``, every renderer returns text) plus the metadata table above (ADR-050)."""
         return (FieldDefinition(self._output_field, "str"), *_REPORT_METADATA_CREATED_FIELDS)
+
+    def output_semantics(self) -> OutputSemanticDeclaration:
+        """Declare framing without promising that arbitrary input text is compact.
+
+        Every renderer separates a non-empty title from the body with line
+        boundaries. Separators recognize the splitlines() boundary set, including CR. Otherwise
+        input strings can still contain boundaries, so framing is unconstrained.
+        Content kind deliberately abstains for every format: plain_text forwards
+        arbitrary input markup, markdown adds presentation, and html_fragment
+        wraps escaped content. None warrants a universal PLAIN_TEXT claim.
+        """
+        line_boundaries = "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+        framing = (
+            TextFraming.NEWLINE_FRAMED
+            if self._title or any(char in self._join_with for char in line_boundaries)
+            else TextFraming.UNCONSTRAINED
+        )
+        return OutputSemanticDeclaration(
+            fields=(
+                FieldSemanticFacts(
+                    field_name=self._output_field,
+                    content_kind=ContentKind.UNKNOWN,
+                    text_framing=framing,
+                    value_type=SemanticValueType.STR,
+                    fact_code="report_assemble.output_field.rendered_text",
+                    configured_by=("output_field", "title", "join_with", "format"),
+                ),
+            ),
+        )
 
     def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
         # Hypothesis-generated probe rows arrive without ``text_field``, so the

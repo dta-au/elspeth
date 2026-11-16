@@ -3,18 +3,29 @@
 No I/O. Every function fail-closes (MalformedResponseError) on a structurally
 invalid result; absent optional facets return an empty container, never
 fabricated. These functions are the only place the external analyzeResult shape
-is interpreted, so they are unit-tested in isolation.
+is interpreted, so they are unit-tested in isolation. Helpers shared with the
+Content Understanding transform live in ``analyze_result``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any
-from urllib.parse import urlparse
 
+from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.plugins.transforms.azure.analyze_result import facet_list, flatten_fields
 from elspeth.plugins.transforms.azure.errors import MalformedResponseError
 
 
+@trust_boundary(
+    tier=3,
+    source="Azure Document Intelligence analyzeResult (parsed JSON)",
+    source_param="analyze_result",
+    suppresses=("R1", "R5"),
+    invariant="raises MalformedResponseError when analyzeResult.content is present but not a str; an absent content is '' and never fabricated",
+    test_ref="tests/unit/plugins/transforms/azure/test_document_intelligence_result.py::test_extract_content_wrong_type_fails_closed",
+    test_fingerprint="93ae250a917e3cd19535002cfed3d61894a81a841326bcea486235fbd34be3a1",
+)
 def extract_content(analyze_result: Mapping[str, Any]) -> str:
     """Return analyzeResult.content, or '' when absent. Fail closed on wrong type."""
     content = analyze_result.get("content")
@@ -27,12 +38,7 @@ def extract_content(analyze_result: Mapping[str, Any]) -> str:
 
 def extract_facet_list(analyze_result: Mapping[str, Any], azure_key: str) -> list[Any]:
     """Return analyzeResult[azure_key] (a list), or [] when absent. Fail closed on wrong type."""
-    value = analyze_result.get(azure_key)
-    if value is None:
-        return []
-    if not isinstance(value, list):
-        raise MalformedResponseError(f"analyzeResult.{azure_key} must be a list, got {type(value).__name__}")
-    return value
+    return facet_list(analyze_result, azure_key)
 
 
 def count_pages(analyze_result: Mapping[str, Any]) -> int:
@@ -40,40 +46,26 @@ def count_pages(analyze_result: Mapping[str, Any]) -> int:
     return len(extract_facet_list(analyze_result, "pages"))
 
 
-def operation_location_host_matches(operation_url: str, endpoint: str) -> bool:
-    """True iff operation_url is a well-formed HTTPS URL on the same host AND port as endpoint.
+@trust_boundary(
+    tier=3,
+    source="Azure Document Intelligence analyzeResult (parsed JSON)",
+    source_param="analyze_result",
+    suppresses=("R1", "R5"),
+    invariant="raises MalformedResponseError unless documents is absent or a list whose first entry is an object with well-formed typed fields",
+    test_ref="tests/unit/plugins/transforms/azure/test_document_intelligence_result.py::test_first_document_fields_malformed_fails_closed",
+    test_fingerprint="d1b5a81edb49773143829a332ad616f4b64ea6c41b7a6b1d5ba8be2001d9a7d0",
+)
+def first_document_fields(analyze_result: Mapping[str, Any]) -> dict[str, Any]:
+    """Flattened ``documents[0].fields`` ({} when the model returned no document).
 
-    Guards against the polled Operation-Location (which carries our api-key header)
-    being pointed elsewhere by a malformed/compromised 202 response. We refuse to
-    follow it unless its scheme is https and its host AND port both match the
-    operator-configured endpoint, so the api-key is never sent to a different
-    origin (host:port) than the operator configured.
+    Typed models (prebuilt-invoice, custom extraction, ``queryFields``) report
+    one document per analyzed file; the plain values are what a pipeline routes
+    on. A multi-document result keeps the rest in the ``documents`` facet.
     """
-    try:
-        op = urlparse(operation_url)
-        ep = urlparse(endpoint)
-        # ParseResult.port performs validation lazily and can raise for malformed
-        # or out-of-range ports, so keep access inside the fail-closed guard.
-        parsed_op_port = op.port
-        parsed_ep_port = ep.port
-        op_port = parsed_op_port if parsed_op_port is not None else 443
-        ep_port = parsed_ep_port if parsed_ep_port is not None else 443
-    except ValueError:
-        return False
-    if op.scheme != "https" or not op.hostname:
-        return False
-    if op.hostname.lower() != (ep.hostname or "").lower():
-        return False
-    # Compare effective ports, normalizing the https default (443) so an explicit
-    # ":443" matches an absent port. A same-host but attacker-port URL is rejected.
-    return op_port == ep_port
-
-
-def operation_id_from_url(operation_url: str) -> str | None:
-    """Extract the result id from .../analyzeResults/{id}[?...], or None when absent."""
-    path = urlparse(operation_url).path
-    segments = [segment for segment in path.split("/") if segment]
-    for index, segment in enumerate(segments):
-        if segment == "analyzeResults" and index + 1 < len(segments):
-            return segments[index + 1]
-    return None
+    documents = extract_facet_list(analyze_result, "documents")
+    if not documents:
+        return {}
+    first = documents[0]
+    if not isinstance(first, Mapping):
+        raise MalformedResponseError(f"analyzeResult.documents entries must be objects, got {type(first).__name__}")
+    return flatten_fields(first.get("fields"))

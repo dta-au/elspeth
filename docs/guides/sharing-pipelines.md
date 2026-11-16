@@ -67,20 +67,22 @@ This is the longest lifetime a link can have. The owner picks 1 day, 7
 days or 30 days for each link; the dialog offers only the choices at or
 below this maximum and defaults to the longest of them. When none fits (a
 maximum below one day) the dialog says so and the link lasts the maximum.
-The server refuses a longer `lifetime_seconds` with 422, and re-minting
-keeps the chosen lifetime, clamped to the current maximum. The signer's
+The server refuses a longer `lifetime_seconds` with 422. Re-minting retains
+the expiry recorded at mark time, clamped to mark time plus the current maximum
+if the operator lowers it. It cannot extend the recorded expiry. The signer's
 `verify()` rejects tokens past their expiry regardless of their HMAC
 signature. Operators may lower or raise this to match their review cadence;
 values must be `> 0`.
 
-Nothing in the web application deletes stored snapshots, or the files
-frozen into a link that allows import, from the payload store: they remain
-after the link expires (`payload_store_retention_days` does not apply to
-them). Identical bytes are stored once. Reclamation is tracked in
-[#356](https://github.com/dta-au/elspeth/issues/356). A snapshot or file
-removed by other means, for example by `elspeth purge` of a run payload with
-identical bytes, makes the link answer 404 with an "ask the sender for a
-fresh link" message.
+New snapshots and frozen files live under `<web payload store base>/shares` on
+the existing payload volume. Nothing in the web application deletes them after
+the link expires (`payload_store_retention_days` does not apply). Identical
+share bytes are stored once. Reclamation is tracked in
+[#356](https://github.com/dta-au/elspeth/issues/356). Links minted before
+this namespace change still read from the parent payload store when a share
+object is absent. Those legacy bytes can be removed by `elspeth purge` when
+identical to a run payload, making the link answer 404 with an "ask the sender
+for a fresh link" message.
 
 ## First-deploy operator action
 
@@ -214,16 +216,26 @@ the same instant.
 `GET /api/sessions/{session_id}/shareable-link` mints a fresh token for
 the current composition state's existing mark-time snapshot. It reads the
 prior mark's `payload_digest` and requires that blob to still exist. The
-token string and expiry are fresh, but it resolves to the same frozen blob.
+token string is fresh, but its expiry remains the recorded expiry (or an earlier
+expiry required by a lowered deployment maximum). It resolves to the same frozen blob.
 
 No audit row or blob is written on re-mint, and readiness is not recomputed.
 The original mark-time write remains the auditable decision.
 
-If the current state has no mark or its marked blob is missing, re-mint
-returns HTTP 409. The owner must **Save for review** again: this reruns
+If the current state has no mark, its marked blob is missing, or the recorded
+expiry has passed, re-mint returns HTTP 409. The owner must **Share for review** again: this reruns
 validation, completion and readiness gates, records a new audit event, and
 stores a snapshot. Clicking **Share inspect link** invokes that mark-time
 operation rather than the re-mint GET.
+
+### Published library payloads
+
+Published library YAML lives under `<web payload store base>/library`. This is
+part of the web payload backup set; run purge must target the parent store,
+never `library/`. **Breaking change:** library entries published before this
+namespace change have payloads only in the parent store. They cannot be forked
+after deployment and must be republished. A fork of such an entry returns 409
+`library_payload_unavailable` with a republish instruction.
 
 ### Resolve-time
 
@@ -317,9 +329,10 @@ they can read, not *whether they can read at all*).
 3. **Restart the web service.** The service will load the new key and
    reject every outstanding token immediately.
 4. **Notify users** that previously shared links have been invalidated.
-   The re-mint API can issue a token under the new key if the current
-   state's marked blob still exists. In the UI, click **Share inspect
-   link** to Save for review again, subject to the normal gates.
+   The re-mint API can issue a token under the new key while the recorded
+   expiry is still in the future and the marked blob exists. In the UI,
+   click **Share inspect link** to share for review again, subject to the
+   normal gates.
 
 There is no per-token revocation in v1 — rotation invalidates all.
 
@@ -433,9 +446,11 @@ in-flight operation to finish, then retry.
 
 The re-mint route refuses when the current state has never been marked
 ready ("mark this composition ready for review before requesting a
-shareable link"), or when the mark-time audit row exists but its snapshot
-blob is gone from the payload store ("current composition state has not
-been marked ready for review"). Both require **Save for review** again
+shareable link"), when the recorded expiry has passed ("This share link
+has expired. Share for review again to create a new link."), or when the
+mark-time audit row exists but its snapshot blob is gone from the payload
+store ("current composition state has not been marked ready for review").
+All require **Share for review** again
 (the **Share inspect link** button), with its normal gates and audit write.
 
 ### `GET /sessions/shared/{token}` returns 401 unexpectedly
@@ -445,7 +460,8 @@ been marked ready for review"). Both require **Save for review** again
 * The token was truncated or tampered in transit (URL-decoding issues
   in email clients are a common cause).
 
-Ask the sender to re-mint and resend.
+Ask the sender to re-mint and resend while the recorded expiry is still in
+the future; otherwise the owner must share for review again.
 
 ### `GET /sessions/shared/{token}` returns 404
 

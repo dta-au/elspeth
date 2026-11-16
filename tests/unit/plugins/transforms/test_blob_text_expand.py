@@ -33,6 +33,10 @@ class _PayloadStoreFake:
             raise PayloadNotFoundError(content_hash)
         return self.content_by_hash[content_hash]
 
+    def retrieve_bounded(self, content_hash: str, *, max_bytes: int) -> bytes | None:
+        content = self.retrieve(content_hash)
+        return None if len(content) > max_bytes else content
+
     def exists(self, content_hash: str) -> bool:
         return content_hash in self.content_by_hash
 
@@ -43,6 +47,9 @@ class _PayloadStoreFake:
 class _IntegrityFailingStore:
     def retrieve(self, content_hash: str) -> bytes:
         raise IntegrityError(f"content hash mismatch for {content_hash}")
+
+    def retrieve_bounded(self, content_hash: str, *, max_bytes: int) -> bytes | None:
+        return self.retrieve(content_hash)
 
 
 def _hash(content: bytes) -> str:
@@ -347,7 +354,8 @@ def test_blob_over_max_blob_bytes_is_a_value_level_error() -> None:
     assert result.status == "error"
     assert result.reason is not None
     assert result.reason["reason"] == "blob_too_large"
-    assert result.reason["body_size"] == len(body)
+    # The bounded read stops at max_blob_bytes + 1, so the full size is never measured.
+    assert "body_size" not in result.reason
     assert result.reason["max_blob_bytes"] == 3
 
 
@@ -378,13 +386,13 @@ def test_encoding_option_selects_the_codec() -> None:
     assert [row.to_dict()["line"] for row in result.rows] == ["café", "naïve"]
 
 
-def test_utf8_bom_is_carried_verbatim_into_the_first_row() -> None:
-    """PROVES the documented BOM behaviour; utf-8-sig is the operator's remedy."""
-    body = "﻿alpha\nbeta\n".encode()
+def test_utf8_bom_is_consumed_not_emitted_into_the_first_row() -> None:
+    """PROVES a leading UTF-8 BOM never enters row data, as in every other reader."""
+    body = "\ufeffalpha\nbeta\n".encode()
     _, result = _run(body)
 
     assert result.rows is not None
-    assert result.rows[0].to_dict()["line"] == "﻿alpha"
+    assert result.rows[0].to_dict()["line"] == "alpha"
 
     _, sig_result = _run(body, encoding="utf-8-sig")
     assert sig_result.rows is not None
@@ -431,6 +439,9 @@ class _CorruptAndMissingError(IntegrityError, PayloadNotFoundError):
 class _CorruptAndMissingStore:
     def retrieve(self, content_hash: str) -> bytes:
         raise _CorruptAndMissingError(content_hash)
+
+    def retrieve_bounded(self, content_hash: str, *, max_bytes: int) -> bytes | None:
+        return self.retrieve(content_hash)
 
 
 def test_integrity_failure_propagates_even_when_the_error_is_also_a_not_found() -> None:

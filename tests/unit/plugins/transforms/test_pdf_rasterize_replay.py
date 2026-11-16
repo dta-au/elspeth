@@ -82,7 +82,7 @@ def test_live_receipt_replays_without_worker_and_restores_exact_page(tmp_path: P
     live_result = _transform(source_store, live_renderer).process(row, live_ctx)
     assert live_result.status == "success"
     receipt = live_ctx.landscape.record_call.call_args.kwargs["response_data"].to_dict()
-    assert receipt["format"] == "pdf_rasterize/v1"
+    assert receipt["format"] == "pdf_rasterize/v2"
     assert len(receipt["renderer_identity"]) == 64
     page_ref = hashlib.sha256(_PNG).hexdigest()
     assert receipt["rendered"][0]["page_ref"] == page_ref

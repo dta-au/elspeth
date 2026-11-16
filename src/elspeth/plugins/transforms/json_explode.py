@@ -32,7 +32,8 @@ OUTPUT DECLARATION (ADR-050):
 
 The fields this transform creates are declared before the first row, in every
 schema mode: ``output_field`` is ``any`` and nullable (an array element can be
-anything, including null) and ``item_index`` is ``int``. An operator type in
+anything, including null) and the index field (``index_field``, default
+``item_index``) is ``int``. An operator type in
 ``schema.fields`` takes precedence (``page: int`` pins the element type, and
 the engine routes an emission whose element is not an int). The declaration is
 stamped on every emitted contract, so a heterogeneous array — or two rows
@@ -191,14 +192,19 @@ class JSONExplodeConfig(DataPluginConfig):
     Attributes:
         array_field: Name of the array field to explode (required)
         output_field: Name for the exploded element (default: "item")
-        include_index: Whether to include item_index field (default: True)
+        include_index: Whether to include the index field (default: True)
+        index_field: Name for the emitted index (default: "item_index")
     """
 
     _plugin_component_type: ClassVar[str | None] = "transform"
 
     array_field: str = Field(..., description="Name of the array field to explode")
     output_field: str = Field(default="item", description="Name for the exploded element")
-    include_index: bool = Field(default=True, description="Whether to include item_index field")
+    include_index: bool = Field(default=True, description="Whether to include the element index field")
+    index_field: str = Field(
+        default="item_index",
+        description="Name for the emitted element index; set a distinct name when chaining explodes over nested arrays",
+    )
 
     @field_validator("array_field")
     @classmethod
@@ -207,28 +213,28 @@ class JSONExplodeConfig(DataPluginConfig):
             raise ValueError(f"{info.field_name} must be non-empty")
         return v
 
-    @field_validator("output_field")
+    @field_validator("output_field", "index_field")
     @classmethod
-    def _validate_output_field(cls, v: str) -> str:
+    def _validate_output_identifier(cls, v: str, info: Any) -> str:
         if not v or not v.strip():
-            raise ValueError("output_field must be non-empty")
+            raise ValueError(f"{info.field_name} must be non-empty")
         if not v.isidentifier():
-            raise ValueError(f"output_field must be a valid Python identifier, got {v!r}")
+            raise ValueError(f"{info.field_name} must be a valid Python identifier, got {v!r}")
         return v
 
     @model_validator(mode="after")
     def _reject_field_collision(self) -> JSONExplodeConfig:
         if self.output_field == self.array_field:
             raise ValueError(f"output_field and array_field must differ, both are '{self.output_field}'")
-        if self.include_index and self.array_field == "item_index":
+        if self.include_index and self.array_field == self.index_field:
             raise ValueError(
-                "array_field='item_index' conflicts with the auto-generated index field "
+                f"array_field={self.array_field!r} conflicts with index_field "
                 "when include_index=True — the generated index would overwrite the very "
-                "column being exploded. Rename the source column or set include_index=False."
+                "column being exploded. Set a different index_field or include_index=False."
             )
-        if self.include_index and self.output_field == "item_index":
+        if self.include_index and self.output_field == self.index_field:
             raise ValueError(
-                "output_field='item_index' conflicts with the auto-generated index field "
+                f"output_field={self.output_field!r} conflicts with index_field "
                 "when include_index=True — the index would overwrite the exploded item"
             )
         return self
@@ -269,7 +275,8 @@ class JSONExplode(BaseTransform):
         schema: Required. Schema for input/output (use {mode: observed} for any fields)
         array_field: Required. Name of the array field to explode
         output_field: Name for the exploded element (default: "item")
-        include_index: Whether to include item_index field (default: True)
+        include_index: Whether to include the index field (default: True)
+        index_field: Name for the emitted index (default: "item_index")
 
     Example:
         Input:  {"id": 1, "items": [{"name": "a"}, {"name": "b"}]}
@@ -288,12 +295,12 @@ class JSONExplode(BaseTransform):
           ``missing_field``.
     """
 
-    # array_field is the INPUT column being exploded; output_field is emitted.
-    output_naming_config_keys = frozenset({"output_field"})
+    # array_field is the INPUT column being exploded; output_field and index_field are emitted.
+    output_naming_config_keys = frozenset({"output_field", "index_field"})
     name = "json_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:1919e96964500441"
+    source_file_hash: str | None = "sha256:bc435c1144336235"
     config_model = JSONExplodeConfig
     usage_when_to_use: str = (
         "Use when one JSON array field in each row must become multiple rows, with the surrounding "
@@ -345,6 +352,7 @@ class JSONExplode(BaseTransform):
         self._array_field = cfg.array_field
         self._output_field = cfg.output_field
         self._include_index = cfg.include_index
+        self._index_field = cfg.index_field
         # The array field is the one column this transform cannot run without:
         # a declared input, so the build and the engine's pre-process check
         # settle its presence (see module docstring), never a KeyError in process().
@@ -362,7 +370,7 @@ class JSONExplode(BaseTransform):
         # Declare output fields for centralized collision detection in TransformExecutor.
         fields = [cfg.output_field]
         if cfg.include_index:
-            fields.append("item_index")
+            fields.append(cfg.index_field)
         self.declared_output_fields = frozenset(fields)
 
         self._schema_config = cfg.schema_config
@@ -393,13 +401,14 @@ class JSONExplode(BaseTransform):
             return PluginAssistance(
                 plugin_name="json_explode",
                 issue_code=None,
-                summary="Deaggregate a list-valued field — emits one row per array element, preserving sibling fields and optionally adding an item_index.",
+                summary="Deaggregate a list-valued field — emits one row per array element, preserving sibling fields and optionally adding an index field (index_field, default item_index).",
                 composer_hints=(
                     "Feed array_field from a source that natively parses structured data — a json source reading nested arrays puts a real list in the row.",
                     "Type that field 'any' in the source schema and give json_explode schema {mode: observed}. ELSPETH rows hold discrete values, so the schema DSL has no list type; 'any' is how a list rides to the explode. See examples/json_explode.",
                     "A JSON-looking STRING is not an array_field, and there is no transform that parses one into a list — the value must arrive list-shaped from the source.",
                     "Single-query LLM responses are strings, so do not wire response_field directly to json_explode.",
                     "Sibling fields are duplicated onto every emitted row — that's by design for fan-out lineage.",
+                    "When chaining json_explode over nested arrays, give the inner node a distinct index_field (e.g. sub_index): the default item_index collides with the outer node's index and fails every row.",
                 ),
             )
         if issue_code != "json_explode.array_field.list":
@@ -430,17 +439,17 @@ class JSONExplode(BaseTransform):
         ]
 
     def created_output_fields(self) -> tuple[FieldDefinition, ...]:
-        """``output_field`` is ``any`` (nullable): an element can be anything; ``item_index`` is ``int``."""
+        """``output_field`` is ``any`` (nullable): an element can be anything; ``index_field`` is ``int``."""
         created = [FieldDefinition(name=self._output_field, field_type="any", required=True, nullable=True)]
         if self._include_index:
-            created.append(FieldDefinition(name="item_index", field_type="int", required=True, nullable=False))
+            created.append(FieldDefinition(name=self._index_field, field_type="int", required=True, nullable=False))
         return tuple(created)
 
     def _build_json_explode_output_schema_config(self, cfg: JSONExplodeConfig) -> SchemaConfig:
         """Build output schema config excluding array_field.
 
         JSONExplode removes array_field from output and adds output_field
-        (and optionally item_index). The base _build_output_schema_config()
+        (and optionally index_field). The base _build_output_schema_config()
         incorrectly retains array_field in guaranteed_fields.
         """
         base_guaranteed = set(cfg.schema_config.guaranteed_fields or ())
@@ -459,7 +468,7 @@ class JSONExplode(BaseTransform):
             extra_fields = tuple(field for field in self.created_output_fields() if field.name not in authored)
             output_field_defs = (*kept_fields, *extra_fields)
 
-        # Add declared output fields (output_field + optionally item_index)
+        # Add declared output fields (output_field + optionally index_field)
         output_fields = base_guaranteed | self.declared_output_fields
 
         # Preserve None-vs-empty-tuple semantics: None = abstain, () = explicitly empty.
@@ -491,7 +500,7 @@ class JSONExplode(BaseTransform):
             array_field
 
         Raises:
-            PluginContractViolation: If output_field or item_index would
+            PluginContractViolation: If output_field or index_field would
                 overwrite a field already present in the row (Tier 2: the
                 engine converts it into a routed, non-retryable error)
         """
@@ -554,12 +563,12 @@ class JSONExplode(BaseTransform):
             output = copy.deepcopy(base)
             output[self._output_field] = item
             if self._include_index:
-                output["item_index"] = i
+                output[self._index_field] = i
             output_rows.append(output)
 
         fields_added = [self._output_field]
         if self._include_index:
-            fields_added.append("item_index")
+            fields_added.append(self._index_field)
 
         if len(output_rows) > 1:
             first_keys = set(output_rows[0].keys())
@@ -574,7 +583,7 @@ class JSONExplode(BaseTransform):
 
         # The output contract: the input contract narrowed to the emitted
         # keys, with every created field carrying its DECLARED contract
-        # (output_field 'any' nullable, item_index int, or the operator's
+        # (output_field 'any' nullable, index_field int, or the operator's
         # type) rather than anything inferred from this row's elements.
         output_contract = narrow_contract_to_output(
             input_contract=row.contract,

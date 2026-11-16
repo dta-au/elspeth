@@ -1026,6 +1026,9 @@ Environment Variables:
 
     import asyncio
 
+    from elspeth.core.logging import install_asyncio_diagnostic_scrubber
+
+    install_asyncio_diagnostic_scrubber()
     asyncio.run(run_server(database_url, passphrase=passphrase))
 
 

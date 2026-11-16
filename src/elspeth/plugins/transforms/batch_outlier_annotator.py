@@ -20,7 +20,7 @@ from elspeth.contracts.schema_contract import FieldContract, PipelineRow, Schema
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import PluginConfigError, TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
-from elspeth.plugins.transforms._batch_row_types import BatchRowFieldCollisionError, BatchRowTypeError
+from elspeth.plugins.transforms._batch_row_types import MAX_BATCH_ROWS, BatchRowFieldCollisionError, BatchRowTypeError
 
 type BatchOutlierAnnotationRow = dict[str, object]
 
@@ -62,7 +62,6 @@ _ANNOTATION_CREATED_SUFFIXES: tuple[FieldDefinition, ...] = (
 )
 _ANNOTATION_FIELD_SUFFIXES = tuple(field.name for field in _ANNOTATION_CREATED_SUFFIXES)
 _BACKWARD_INVARIANT_DROPPED_FIELD = "batch_outlier_annotator_dropped_probe_field"
-_MAX_BATCH_ROWS = 4096
 _MAX_SKIPPED_INDEX_DETAILS = 128
 
 
@@ -177,9 +176,10 @@ class BatchOutlierAnnotator(BaseTransform):
     name = "batch_outlier_annotator"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:2501c11261dd8660"
+    source_file_hash: str | None = "sha256:d399987b55a5358a"
     config_model = BatchOutlierAnnotatorConfig
     is_batch_aware = True
+    max_batch_rows: int = MAX_BATCH_ROWS
     # Not passthrough-capable: a row whose value is null or non-finite is not emitted, and a one-row emission is TransformResult.success.
     flush_emits_one_row_per_buffered_row = False
     preserves_input_values = True
@@ -220,6 +220,9 @@ class BatchOutlierAnnotator(BaseTransform):
                 summary="Annotates finite numeric rows with batch z-score and robust-z outlier fields.",
                 composer_hints=(
                     "Use batch_outlier_annotator under aggregations with a trigger; it needs the batch distribution.",
+                    f"An aggregation trigger count above {MAX_BATCH_ROWS} is refused before the run; a flush over "
+                    f"{MAX_BATCH_ROWS} buffered rows fails the whole batch (batch_too_large), so do not rely on an "
+                    "end-of-source flush (omitted trigger) when the input can exceed it.",
                     "value_field must be numeric; missing and non-finite values are skipped and reported, and a present non-numeric value fails the whole batch.",
                     "output_prefix creates many annotation fields, so choose a prefix that cannot collide with input fields; an input row already carrying one fails the whole batch.",
                     "It emits one annotated row per finite input value and may drop skipped rows from success output.",
@@ -418,12 +421,12 @@ class BatchOutlierAnnotator(BaseTransform):
         return TransformResult.error(reason, retryable=False)
 
     @staticmethod
-    def _error_for_batch_too_large(*, batch_size: int) -> TransformResult:
+    def _error_for_batch_too_large(*, batch_size: int, max_batch_rows: int) -> TransformResult:
         reason: TransformErrorReason = {
             "reason": "validation_failed",
             "cause": "batch_too_large",
             "batch_size": batch_size,
-            "expected": f"at most {_MAX_BATCH_ROWS} rows",
+            "expected": f"at most {max_batch_rows} rows",
         }
         return TransformResult.error(reason, retryable=False)
 
@@ -586,8 +589,8 @@ class BatchOutlierAnnotator(BaseTransform):
         """Annotate finite numeric rows in a batch with outlier metrics."""
         if not rows:
             return TransformResult.error({"reason": "empty_batch"}, retryable=False)
-        if len(rows) > _MAX_BATCH_ROWS:
-            return self._error_for_batch_too_large(batch_size=len(rows))
+        if len(rows) > self.max_batch_rows:
+            return self._error_for_batch_too_large(batch_size=len(rows), max_batch_rows=self.max_batch_rows)
 
         try:
             self._reject_runtime_output_field_collision(rows)

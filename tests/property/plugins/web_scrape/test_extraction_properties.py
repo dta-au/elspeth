@@ -29,7 +29,7 @@ from hypothesis.strategies import (
 
 from elspeth.core.security.web import SSRFBlockedError, validate_url_for_ssrf, validate_url_scheme
 from elspeth.plugins.transforms.web_scrape_extraction import extract_content
-from elspeth.plugins.transforms.web_scrape_fingerprint import compute_fingerprint, normalize_for_fingerprint
+from elspeth.plugins.transforms.web_scrape_fingerprint import FetchResponseContext, compute_fingerprint, normalize_for_fingerprint
 
 # ============================================================================
 # Custom Hypothesis Strategies
@@ -162,8 +162,9 @@ def test_fingerprint_collision_resistance(content1: str, content2: str):
     """Different content should produce different fingerprints (with high probability)."""
     assume(content1 != content2)  # Only test when inputs differ
 
-    fp1 = compute_fingerprint(content1, mode="full")
-    fp2 = compute_fingerprint(content2, mode="full")
+    page = FetchResponseContext(status_code=200, final_url="https://example.com/", content_type=None, body_sha256="0" * 64)
+    fp1 = compute_fingerprint(content1, mode="full", responses=(page,))
+    fp2 = compute_fingerprint(content2, mode="full", responses=(page,))
 
     # SHA-256 collision is astronomically unlikely
     assert fp1 != fp2, f"Fingerprint collision detected: {content1!r} vs {content2!r}"

@@ -148,10 +148,12 @@ contract.
 The web service compiles one operator-owned plugin policy at startup. Its
 required authorization set is:
 
-- sources: `source:csv`, `source:json`, `source:text`
-- transforms: `transform:field_mapper`, `transform:llm`,
-  `transform:web_scrape`
-- sinks: `sink:csv`, `sink:json`, `sink:text`
+- sources: `source:csv`, `source:json`, `source:llm`, `source:text`
+- transforms: `transform:batch_experiment_compare`, `transform:batch_replicate`,
+  `transform:batch_stats`, `transform:field_mapper`, `transform:file_inject`,
+  `transform:line_explode`, `transform:llm`, `transform:reference_join`,
+  `transform:report_assemble`, `transform:web_scrape`
+- sinks: `sink:csv`, `sink:document`, `sink:json`, `sink:text`
 
 The operator-profiled LLM is request-available only when that principal has at
 least one usable configured profile. Missing LLM or tutorial credentials do
@@ -1408,7 +1410,7 @@ credential chain. See [AWS Bedrock LLM](#aws-bedrock-llm).
 | `model` | string | **Yes** | — | Model identifier such as `anthropic/claude-sonnet-4.6`; must appear in the OpenRouter catalog while `base_url` is the canonical endpoint |
 | `api_key` | string | **Yes** | — | OpenRouter API key |
 | `base_url` | string | No | `https://openrouter.ai/api/v1` | API base URL; HTTPS is required except for loopback hosts |
-| `timeout_seconds` | float | No | `60.0` | Per-request timeout; must be > 0 |
+| `timeout_seconds` | float | No | `60.0` | Total wall-clock seconds from dispatch for each provider HTTP request, including DNS, connect, TLS, send, headers, body, and redirects. Rate-limiter waits have a separate budget of the same length; must be > 0 |
 | `tracing` | mapping | No | (none) | Optional plugin-internal tracing (`langfuse` only; `azure_ai` is not supported for OpenRouter) |
 
 ```yaml
@@ -1503,8 +1505,10 @@ authorize resuming an old run with changed code.
 
 A per-query `template` may not contain `{{interpretation:...}}` tokens —
 interpretation review rewrites only the node-level `prompt_template`, so a token
-here would survive to the run and fail as a Jinja error. Put reviewed slots in
-the node-level template.
+here would survive to the run and fail as a Jinja error. A node-level reviewed
+slot reaches only queries using that template. Composer rejects the slot at
+staging if any query has its own template; place the reviewed term on a node
+where all queries use the node-level template.
 
 Each query contributes `<query_name>_<response_field>` plus
 `<query_name>_<response_field>_usage` and `<query_name>_<response_field>_model`,
@@ -1583,6 +1587,7 @@ hosted server, which is why the web boundary pins `base_url` separately.
 | Plugin | Purpose |
 |--------|---------|
 | `azure_document_intelligence` | Enrich rows with Azure AI Document Intelligence extraction |
+| `azure_content_understanding` | Enrich rows with an Azure AI Content Understanding analyzer (documents, images, audio, video) |
 | `blob_fetch` | Fetch an operator-authorised remote document into the run payload store |
 | `blob_csv_expand` | Expand a payload-store CSV blob into output rows |
 | `passthrough` | Pass rows unchanged |
@@ -2068,6 +2073,14 @@ Each configured field must receive an explicit safe result. A detect-only
 positive is blocked even when the top-level Guardrail action is `NONE`, and an
 intervention, service failure, or malformed response also fails closed without
 including provider-generated text in row data or error details.
+
+`row_deadline_seconds` (default `300`, must be positive) bounds how long a row
+may keep starting Guardrail calls. A field still unscanned when the deadline
+passes fails the row closed as `retry_timeout` / `row_deadline_exceeded`.
+Throttling, 5xx and transport failures are handed to the engine retry policy,
+which re-runs every configured field under a new attempt; each call from the
+failed attempt stays recorded against that attempt. Web Composer sessions do
+not expose this option and use the default.
 
 The harmful-content categories required by this AWS plugin do not include
 Azure Content Safety's `self_harm` category. A deployment must not claim Azure

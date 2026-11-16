@@ -3346,40 +3346,37 @@ def test_11_patch_helper_rejects_multiple_placeholders() -> None:
         )
 
 
-def test_12_patch_helper_rejects_system_prefix() -> None:
-    """Spec test 12: 'system:' prefix immediately before placeholder ⇒ raise."""
+def test_12_patch_helper_accepts_system_text() -> None:
     state = _state_with_node(_llm_node(prompt_template="System: {{interpretation:cool}}"))
-    with pytest.raises(ValueError, match=r"system:|directive|prefix"):
-        _patch_llm_transform_prompt(
-            state,
-            affected_node_id="llm_transform_1",
-            user_term="cool",
-            accepted_value="Innovative",
-        )
+    nodes = _patch_llm_transform_prompt(
+        state,
+        affected_node_id="llm_transform_1",
+        user_term="cool",
+        accepted_value="Innovative",
+    )
+    assert nodes[0]["options"]["prompt_template"] == "System: Innovative"
 
 
-def test_13_patch_helper_rejects_role_prefix() -> None:
-    """Spec test 13: 'role:' prefix immediately before placeholder ⇒ raise."""
+def test_13_patch_helper_accepts_role_text() -> None:
     state = _state_with_node(_llm_node(prompt_template="Role: {{interpretation:cool}}"))
-    with pytest.raises(ValueError, match=r"role:|directive|prefix"):
-        _patch_llm_transform_prompt(
-            state,
-            affected_node_id="llm_transform_1",
-            user_term="cool",
-            accepted_value="Innovative",
-        )
+    nodes = _patch_llm_transform_prompt(
+        state,
+        affected_node_id="llm_transform_1",
+        user_term="cool",
+        accepted_value="Innovative",
+    )
+    assert nodes[0]["options"]["prompt_template"] == "Role: Innovative"
 
 
-def test_13b_patch_helper_rejects_instructions_prefix() -> None:
-    """Bonus: 'instructions:' prefix is also caught by the structural-directive guard."""
+def test_13b_patch_helper_accepts_instructions_text() -> None:
     state = _state_with_node(_llm_node(prompt_template="Instructions: {{interpretation:cool}}"))
-    with pytest.raises(ValueError, match=r"instructions:|directive|prefix"):
-        _patch_llm_transform_prompt(
-            state,
-            affected_node_id="llm_transform_1",
-            user_term="cool",
-            accepted_value="Innovative",
-        )
+    nodes = _patch_llm_transform_prompt(
+        state,
+        affected_node_id="llm_transform_1",
+        user_term="cool",
+        accepted_value="Innovative",
+    )
+    assert nodes[0]["options"]["prompt_template"] == "Instructions: Innovative"
 
 
 def test_14_patch_helper_succeeds_on_clean_template() -> None:

@@ -320,7 +320,8 @@ stamped with the strict tool contracts its route sends (see
 `ELSPETH_WEB__COMPOSER_STRICT_TOOLS` below), and the advisor model receives
 its structured-output request. When the advisor's route sends strict
 contracts, the advisor model also receives the pipeline planner's
-escape-hatch request (`hatch_terminal`): the proposal tool alone, as a
+escape-hatch request (`hatch_terminal`): the pipeline planner's full tool
+list, stamped for the advisor's route, as a
 16-token check that the request is accepted. A provider *bad request* — for
 example a model that rejects the configured
 `ELSPETH_WEB__COMPOSER_TEMPERATURE` or `ELSPETH_WEB__COMPOSER_SEED`, or a
@@ -604,10 +605,12 @@ change to the policy variables, verify the tutorial rows in
 `"transform:passthrough"`) authorizes *optional* plugins on top of the
 required web core, which is always authorized:
 
-- sources: `source:csv`, `source:json`, `source:text`
-- transforms: `transform:field_mapper`, `transform:llm`,
-  `transform:web_scrape`
-- sinks: `sink:csv`, `sink:json`, `sink:text`
+- sources: `source:csv`, `source:json`, `source:llm`, `source:text`
+- transforms: `transform:batch_experiment_compare`, `transform:batch_replicate`,
+  `transform:batch_stats`, `transform:field_mapper`, `transform:file_inject`,
+  `transform:line_explode`, `transform:llm`, `transform:reference_join`,
+  `transform:report_assemble`, `transform:web_scrape`
+- sinks: `sink:csv`, `sink:document`, `sink:json`, `sink:text`
 
 Consequences:
 
@@ -1005,6 +1008,17 @@ option references `${AZURE_DOCUMENT_INTELLIGENCE_KEY}`. Configure the Document
 Intelligence endpoint in the transform's `options.endpoint`; there is no
 implicit endpoint environment variable.
 
+### Azure Content Understanding
+
+| Variable | Purpose |
+|----------|---------|
+| `AZURE_CONTENT_UNDERSTANDING_KEY` | API key for the Azure AI Foundry / AI Services resource that hosts Content Understanding |
+
+Used by the `azure_content_understanding` transform plugin when the plugin
+option references `${AZURE_CONTENT_UNDERSTANDING_KEY}`. Configure the resource
+endpoint in the transform's `options.endpoint`; there is no implicit endpoint
+environment variable.
+
 ### Azure Blob Storage
 
 | Variable | Purpose |
@@ -1108,6 +1122,9 @@ AZURE_PROMPT_SHIELD_ENDPOINT=https://example-resource.cognitiveservices.azure.co
 
 # Azure Document Intelligence (for azure_document_intelligence transform)
 AZURE_DOCUMENT_INTELLIGENCE_KEY=fake_document_intelligence_key_for_docs_only
+
+# Azure Content Understanding (for azure_content_understanding transform)
+AZURE_CONTENT_UNDERSTANDING_KEY=fake_content_understanding_key_for_docs_only
 
 # =====================================================================
 # Azure Storage

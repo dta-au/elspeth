@@ -18,6 +18,15 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 source "$PROJECT_ROOT/examples/chaosllm_env.sh"
 
+# The readiness poll and attribution queries read the audit DB through the
+# sqlite3 CLI. The poll tolerates query errors (the DB may not exist yet), so a
+# missing binary would surface only as a misleading "never reached RUNNING"
+# timeout. Refuse up front instead.
+if ! command -v sqlite3 >/dev/null 2>&1; then
+    echo "ERROR: this launcher requires the sqlite3 command-line tool (e.g. apt install sqlite3)." >&2
+    exit 2
+fi
+
 CHAOS_CONFIG="${ELSPETH_MULTI_WORKER_CHAOS_CONFIG:-examples/multi_worker/chaos_config.yaml}"
 PIPELINE_CONFIG="examples/multi_worker/settings.yaml"
 DB="examples/multi_worker/runs/audit.db"

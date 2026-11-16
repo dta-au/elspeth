@@ -51,7 +51,6 @@ from elspeth.contracts.blobs_inline import ContentEncoding
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.session_operation import SessionOperationKind
-from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.state import CompositionState
@@ -59,6 +58,7 @@ from elspeth.web.composer.yaml_generator import generate_public_yaml
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.paths import normalise_session_relative_path
+from elspeth.web.sessions.creation import create_session_with_cancellation_cleanup
 from elspeth.web.sessions.protocol import SessionRecord, SessionServiceProtocol
 from elspeth.web.sessions.routes.composer.state import (
     ImportStateYamlRequest,
@@ -294,9 +294,9 @@ async def import_shared_snapshot(*, token: str, request: Request, user: UserIden
     payload, snapshot = await service.load_snapshot(token=token)
     if not snapshot.import_allowed:
         raise ImportNotAllowedError("this share link does not allow import")
-    payload_store: FilesystemPayloadStore = request.app.state.payload_store
     copies = [
-        _FrozenCopy(entry=entry, content=await run_sync_in_worker(payload_store.retrieve, entry["sha256"])) for entry in snapshot.files
+        _FrozenCopy(entry=entry, content=await run_sync_in_worker(service.retrieve_share_payload, entry["sha256"]))
+        for entry in snapshot.files
     ]
     plan = _plan_bindings(snapshot.files, snapshot.sink_paths)
     composition = CompositionState.from_dict(snapshot.blob["composition_snapshot"])
@@ -324,7 +324,7 @@ async def import_shared_snapshot(*, token: str, request: Request, user: UserIden
         ) from exc
     settings: WebSettings = request.app.state.settings
     session_service: SessionServiceProtocol = request.app.state.session_service
-    session = await session_service.create_session(user.user_id, title, settings.auth_provider)
+    session = await create_session_with_cancellation_cleanup(session_service, user.user_id, title, settings.auth_provider)
     try:
         blob_ids = await _copy_files(
             request=request,

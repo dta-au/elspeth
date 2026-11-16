@@ -19,6 +19,7 @@ from elspeth.contracts import Determinism
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.core.canonical import is_non_canonical_number
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -41,6 +42,7 @@ CoercionFailure = Literal[
     "not_boolean_string",
     "not_scalar",
     "unsupported_type",
+    "out_of_range",
 ]
 
 # One fixed sentence per failure arm. The coerced value is row data (Tier 2/3):
@@ -59,6 +61,7 @@ _FAILURE_MESSAGES: dict[CoercionFailure, str] = {
     "not_boolean_string": "string is not a valid boolean string",
     "not_scalar": "value is not a scalar type",
     "unsupported_type": "unsupported type",
+    "out_of_range": "integer is outside the canonical JSON safe range of +/-(2**53-1)",
 }
 
 
@@ -78,6 +81,17 @@ class CoercionError(Exception):
         super().__init__(f"Cannot coerce {actual_type} to {target_type}: {self.message}")
 
 
+def _is_strict_number_text(text: str) -> bool:
+    """Whether ``text`` stays inside the plain ASCII numeric grammar.
+
+    ``int()`` and ``float()`` also accept PEP 515 digit-group underscores
+    ("1_000") and any Unicode decimal digit (fullwidth or Arabic-Indic
+    digits, for example). A strict coercion must not turn such cells into numbers, so the
+    text must be ASCII and underscore-free before the builtin parses it.
+    """
+    return text.isascii() and "_" not in text
+
+
 def coerce_to_int(value: Any) -> int:
     """Coerce value to int with strict rules.
 
@@ -90,10 +104,22 @@ def coerce_to_int(value: Any) -> int:
         - float with fractional part (3.9 -> error)
         - string with decimal ("3.5" -> error)
         - scientific notation string ("1e3" -> error)
+        - digit-group underscores or non-ASCII digits ("1_000", fullwidth digits)
         - empty/whitespace string
         - bool (True/False are technically ints but rejected)
         - None
+        - integers outside the canonical JSON safe range +/-(2**53-1): the
+          row could not be hashed or recorded, so the value routes here as
+          ``out_of_range`` rather than failing later as a non-canonical output
     """
+    result = _coerce_to_int_unchecked(value)
+    if is_non_canonical_number(result):
+        raise CoercionError(failure="out_of_range", target_type="int", actual_type=type(value).__name__)
+    return result
+
+
+def _coerce_to_int_unchecked(value: Any) -> int:
+    """Parse ``value`` as an int by coerce_to_int's grammar, before the range check."""
     # Reject None first
     if value is None:
         raise CoercionError(failure="none_value", target_type="int", actual_type=type(value).__name__)
@@ -119,6 +145,8 @@ def coerce_to_int(value: Any) -> int:
         trimmed = value.strip()
         if not trimmed:
             raise CoercionError(failure="empty_string", target_type="int", actual_type=type(value).__name__)
+        if not _is_strict_number_text(trimmed):
+            raise CoercionError(failure="not_integer_string", target_type="int", actual_type=type(value).__name__)
         try:
             return int(trimmed)
         except ValueError:
@@ -138,6 +166,7 @@ def coerce_to_float(value: Any) -> float:
     Rejects:
         - non-finite floats (NaN, inf, -inf)
         - empty/whitespace string
+        - digit-group underscores or non-ASCII digits ("1_000.5", fullwidth digits)
         - bool
         - None
     """
@@ -164,6 +193,8 @@ def coerce_to_float(value: Any) -> float:
         trimmed = value.strip()
         if not trimmed:
             raise CoercionError(failure="empty_string", target_type="float", actual_type=type(value).__name__)
+        if not _is_strict_number_text(trimmed):
+            raise CoercionError(failure="not_numeric_string", target_type="float", actual_type=type(value).__name__)
         try:
             result = float(trimmed)
         except ValueError:
@@ -177,7 +208,7 @@ def coerce_to_float(value: Any) -> float:
 
 # Boolean string mappings (case-insensitive after trim)
 _BOOL_TRUE_STRINGS: frozenset[str] = frozenset({"true", "1", "yes", "y", "on"})
-_BOOL_FALSE_STRINGS: frozenset[str] = frozenset({"false", "0", "no", "n", "off", ""})
+_BOOL_FALSE_STRINGS: frozenset[str] = frozenset({"false", "0", "no", "n", "off"})
 
 
 def coerce_to_bool(value: Any) -> bool:
@@ -187,11 +218,12 @@ def coerce_to_bool(value: Any) -> bool:
         - bool (unchanged)
         - int 0 -> False, int 1 -> True
         - string true set (case-insensitive): true, 1, yes, y, on
-        - string false set (case-insensitive): false, 0, no, n, off, "" (empty/whitespace-only)
+        - string false set (case-insensitive): false, 0, no, n, off
 
     Rejects:
         - other integers (2, -1, etc.)
-        - other strings
+        - other strings, including empty and whitespace-only strings (a blank
+          value is missing, not False)
         - float
         - None
     """
@@ -340,7 +372,7 @@ class TypeCoerce(BaseTransform):
     name = "type_coerce"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:c1b155d1c89b28cc"
+    source_file_hash: str | None = "sha256:09861e25cfae3f30"
     config_model = TypeCoerceConfig
     usage_when_to_use: str = (
         "Use for explicit field-by-field type normalization when values such as CSV strings must become "

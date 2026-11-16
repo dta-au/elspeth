@@ -21,6 +21,7 @@ from elspeth.contracts import TransformErrorReason, TransformResult
 from elspeth.contracts.engine import BufferEntry
 from elspeth.contracts.errors import CapacityError, PluginRetryableError
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.node_state_context import PoolExecutionContext
 from elspeth.plugins.infrastructure.pooling.config import PoolConfig
 from elspeth.plugins.infrastructure.pooling.reorder_buffer import ReorderBuffer
 from elspeth.plugins.infrastructure.pooling.throttle import AIMDThrottle
@@ -64,6 +65,18 @@ class RowContext:
         freeze_fields(self, "row")
 
 
+@dataclass(frozen=True, slots=True)
+class BatchExecutionResult:
+    """Immutable entries tuple and audit context captured for one locked batch.
+
+    Each entry contains the original mutable TransformResult returned by the
+    process function, just as execute_batch does; results are not copied.
+    """
+
+    entries: tuple[BufferEntry[TransformResult], ...]
+    context: PoolExecutionContext
+
+
 class PooledExecutor:
     """Executor for parallel API calls with strict ordering.
 
@@ -103,7 +116,7 @@ class PooledExecutor:
             print(f"Row {entry.submit_index} completed {entry.complete_index}th")
             print(f"Buffer wait: {entry.buffer_wait_ms}ms")
 
-        # Get pool stats for audit
+        # Inspect the latest batch, which may already belong to another caller.
         stats = executor.get_stats()
     """
 
@@ -190,7 +203,10 @@ class PooledExecutor:
         self._thread_pool.shutdown(wait=wait)
 
     def get_stats(self) -> dict[str, Any]:
-        """Get executor statistics for audit trail.
+        """Get mutable executor statistics for the latest or in-progress batch.
+
+        For per-batch audit attribution, use execute_batch_with_context(); a
+        concurrent caller can start another batch before this method is read.
 
         Returns:
             Dict with pool_config and pool_stats including:
@@ -217,6 +233,20 @@ class PooledExecutor:
                 "max_concurrent_reached": max_concurrent,
             },
         }
+
+    def execute_batch_with_context(
+        self,
+        contexts: list[RowContext],
+        process_fn: Callable[[Mapping[str, Any], str], TransformResult],
+        shutdown_event: Event | None = None,
+    ) -> BatchExecutionResult:
+        """Return ordered entries and their audit context under one batch lock.
+
+        A batch must contain at least one row context.
+        """
+        if not contexts:
+            raise ValueError("execute_batch_with_context requires at least one row context")
+        return self._run_batch(contexts, process_fn, shutdown_event)
 
     def execute_batch(
         self,
@@ -253,14 +283,23 @@ class PooledExecutor:
         """
         if not contexts:
             return []
+        return list(self._run_batch(contexts, process_fn, shutdown_event).entries)
 
-        # Serialize batch execution to prevent result mixing
-        # The ReorderBuffer uses sequential indices, so concurrent batches
-        # would interleave indices and cause results to be returned to the wrong caller
+    def _run_batch(
+        self,
+        contexts: list[RowContext],
+        process_fn: Callable[[Mapping[str, Any], str], TransformResult],
+        shutdown_event: Event | None,
+    ) -> BatchExecutionResult:
+        """Execute a nonempty batch and capture its audit context under the lock."""
+
+        # The ReorderBuffer uses sequential indices; serialize whole batches.
         with self._batch_lock:
             self._buffer = ReorderBuffer()
             try:
-                return self._execute_batch_locked(contexts, process_fn, shutdown_event)
+                entries = self._execute_batch_locked(contexts, process_fn, shutdown_event)
+                context = PoolExecutionContext.from_executor_stats(self.get_stats(), entries)
+                return BatchExecutionResult(entries=tuple(entries), context=context)
             except Exception:
                 self._buffer = ReorderBuffer()
                 raise

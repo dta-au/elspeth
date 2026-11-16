@@ -3,8 +3,8 @@
 **E**xtensible **L**ayered **S**ecure **P**ipeline **E**ngine for **T**ransformation and **H**andling
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-![Status: 0.8.13](https://img.shields.io/badge/status-0.8.13-green.svg)
+[![Python 3.14+](https://img.shields.io/badge/python-3.14+-blue.svg)](https://www.python.org/downloads/)
+![Status: 0.8.14](https://img.shields.io/badge/status-0.8.14-green.svg)
 
 ELSPETH builds, validates, runs, and audits data and LLM workflows whose
 outputs need to be reviewed and explained. You can author a pipeline in
@@ -23,8 +23,10 @@ Landscape audit trail.
 > **Chroma security advisory:** Do not use Chroma with ELSPETH until upstream
 > publishes a fixed release and ELSPETH adopts and verifies it. This includes
 > the `rag_retrieval` transform with `provider: chroma`, the `chroma_sink` sink,
-> and Chroma examples in all connection modes. ChromaDB has unresolved code-execution vulnerabilities;
-> version 1.5.9 is still affected. See the
+> and Chroma examples in all connection modes. ChromaDB has unresolved
+> code-execution vulnerabilities in every release up to and including 1.5.9,
+> the latest at the time of writing, including the 1.5.5 that ELSPETH locks;
+> no fixed release exists. See the
 > [pre-authentication advisory](https://github.com/advisories/GHSA-f4j7-r4q5-qw2c),
 > [collection-update advisory](https://github.com/advisories/GHSA-36p7-vc44-83pf),
 > and [upstream server and client issue](https://github.com/chroma-core/chroma/issues/6717).
@@ -59,7 +61,7 @@ yet run a shared, persisted compiled-pipeline artifact. The
 
 ## Try a YAML pipeline
 
-You need Python 3.12 or newer and [uv](https://docs.astral.sh/uv/). From a
+You need Python 3.14 or newer and [uv](https://docs.astral.sh/uv/). From a
 source checkout:
 
 ```bash
@@ -98,10 +100,57 @@ ELSPETH supports audit export and optional signing. The
 [export settings and limits](docs/reference/configuration.md#export-settings)
 describe what is exported and how to configure it.
 
-## What changed in 0.8.13
+## What changed in 0.8.14
 
-0.8.13 adds the Composer context budget. See the [release notes](CHANGELOG.md),
+0.8.14 moves ELSPETH to Python 3.14. See the [release notes](CHANGELOG.md),
 which also record earlier releases.
+
+Python 3.14 is now required for `elspeth`, `elspeth-lints` and the LLM gateway;
+3.12 and 3.13 are no longer supported or tested. Locked dependency versions are
+unchanged. The release image carries its own CPython 3.14.5 under `/opt/python`
+on a distroless `cc-debian13` base, so it has no `/usr/bin/python3`, and the
+gateway image is `python:3.14-alpine`. Behaviour that changed under the new
+interpreter is corrected: strict JSON parsing bounds nesting explicitly, the
+runtime-validation manifest again records helper dependencies, and asyncio
+diagnostics that carry an exception are logged as the exception class and code
+location only.
+
+Three things need action when upgrading. Startup refuses `JSON_LOGS=true`,
+because LiteLLM's JSON-logs mode logs unhandled exception messages verbatim;
+unset it. The runtime-validation manifest hash changes with the interpreter, so
+a run checkpointed under 3.13 refuses to resume under 3.14 and a web approval
+recorded under 3.13 no longer matches: drain in-flight runs and pending
+approvals before upgrading. CI runs one Python 3.14 lane, so required
+status-check names change and the repository ruleset must be updated to match.
+
+The Web Composer remediation starts in this release. A reply the completion
+review withholds is shown as a system notice and never re-enters the
+conversation as the model's words. The version menu shows the newest 50 versions
+and marks validated milestones, `diff_pipeline` compares against the last
+validated state, and credential-shaped model reasoning is withheld instead of
+failing the turn. `batch_stats`, `batch_replicate` and `batch_experiment_compare`
+are available on every install, which changes the plugin policy hash: web runs
+admitted before the upgrade refuse to resume. A Web Composer graph that feeds
+`report_assemble` straight into a `text` sink is now refused; insert
+`line_explode`. Cancelling a shared-pipeline import or library fork no longer
+leaves an empty session, share tokens are decoded strictly, and `elspeth purge`
+can no longer delete a live share's data: new shares are stored under `shares/`
+in the payload store, links created earlier keep working but remain
+purge-exposed, and `purge --payload-dir` must never point at `shares/`.
+
+Session epoch 78 and Landscape epoch 50 are unchanged from the previous
+release; this release adds no schema-epoch cutover, so existing session and
+Landscape stores need no action. The 0.8.10 cutover guidance below continues to
+apply to older stores. Backwards compatibility is permitted and considered from 0.8.5 within
+explicitly supported boundaries. This release authorizes no in-place migration,
+reset or downgrade. Package metadata is 0.8.14; the package version alone does
+not establish qualification or image publication. Automatic image publication
+from main is held; verify the release tag and image digest before installing a
+published image.
+
+## Previously in 0.8.13
+
+0.8.13 adds the Composer context budget. See the [release notes](CHANGELOG.md).
 
 Long Composer sessions used to grow until the server or the model gateway
 rejected a request for size. Before each compose-loop and planner model call,
@@ -131,10 +180,7 @@ release; this release adds no schema-epoch cutover, so existing session and
 Landscape stores need no action. The 0.8.10 cutover guidance below continues to
 apply to older stores. Backwards compatibility is permitted and considered from 0.8.5 within
 explicitly supported boundaries. This release authorizes no in-place migration,
-reset or downgrade. Package metadata is 0.8.13; the package version alone does
-not establish qualification or image publication. Automatic image publication
-from main is held; verify the release tag and image digest before installing a
-published image.
+reset or downgrade.
 
 ## Previously in 0.8.12
 

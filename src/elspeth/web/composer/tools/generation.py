@@ -9,7 +9,7 @@ import io
 import re
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, Final, Literal, TypedDict, assert_never, final
 from uuid import UUID
@@ -458,7 +458,7 @@ _LEGACY_PLUGIN_UNAVAILABLE_REASONS: Final = (
 _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"diff_baseline_unavailable|No baseline available",
-        "This surface supplied no comparison baseline; this does not establish whether saved revisions exist.",
+        "This surface supplied no usable comparison baseline; this does not establish whether saved revisions exist.",
         "Use get_pipeline_state for the current state. Request a diff again when this surface supplies its comparison baseline.",
     ),
     (
@@ -998,7 +998,11 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "INTERSECTION of its arms; a union coalesce the intersection of its participating branches, or their UNION under "
         "policy require_all. A nested coalesce guarantees only its branch NAMES, only under require_all, never their "
         "inner fields.",
-        "Make 'producer' guarantee every 'missing_fields' name (patch_source_options for a source — source_name is the "
+        "First check whether the consumer creates the missing field itself. For batch_replicate with "
+        "include_copy_index=true, copy_index is an OUTPUT field: remove it from the consumer's input schema "
+        "(fields, required_fields, and guaranteed_fields) via patch_node_options, resending the full schema; "
+        "do not add it to the source. Otherwise, make 'producer' guarantee every 'missing_fields' name "
+        "(patch_source_options for a source — source_name is the "
         "part after 'source:', bare 'source' is the default; patch_node_options for a transform, aggregation or "
         "collector). A queue, row_union, or non-require_all union coalesce is named only by its id: find its arms in your "
         "candidate and add the field to EVERY arm (one for a require_all union). Nested coalesce with policy require_all: "
@@ -1164,6 +1168,11 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         'component="set_pipeline_arguments" and preserve that authoritative material while applying the intended change. '
         "Never author server-owned fields inside interpretation_requirements (id, status, event_id, accepted_value, "
         "resolved_prompt_template_hash); each shell carries only {kind, user_term, draft} plus optional display_title.",
+    ),
+    (
+        r"vague_term_query_override|Pending vague_term review is bypassed by a query template",
+        "A query on the node has its own template, so the node-level reviewed slot would not reach it.",
+        "Remove the per-query template(s) or move the reviewed term to a node whose queries all use the node-level template.",
     ),
     (
         r"vague_term_unwired|Pending vague_term review is not wired for resolution",
@@ -1526,6 +1535,7 @@ _LEGACY_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # gate blocked Run forever. The staging tool's guard now also runs at the
     # node-authoring doors, and its rejection carries this code.
     "vague_term_unwired",
+    "vague_term_query_override",
     # ── Authoritative review reconciliation (session f33fa7c3, 2026-09-01) ─
     # Ten invariants inside reconcile_authoritative_reviews shared one opaque
     # message and no code, so explain_validation_error fell through to its
@@ -4864,11 +4874,24 @@ def _execute_diff_pipeline(
         # A failure, not a success carrying an ``error`` key: ``error`` is a
         # failure-only key on every surface (elspeth-e405ad7cd2 D5). The
         # current version already rides the envelope's ``version``.
-        return _saved_graph_rejection_result(
+        rejection = _saved_graph_rejection_result(
             state,
-            "No baseline available. This surface supplied no comparison state; saved revisions may still exist.",
+            (
+                "No baseline available. The comparison state was refused by the credential policy; saved revisions may still exist."
+                if context.baseline_kind == "last_validated"
+                else "No baseline available. This surface supplied no comparison state; saved revisions may still exist."
+            ),
             error_code="diff_baseline_unavailable",
             rejected_component=None,
+        )
+        # This is a comparison failure, not a graph defect. Preserve the
+        # catalog's standing verdict and findings, plus the refusal reason.
+        # Stamp the snapshot we actually validated so dispatch retains it.
+        validation = context.catalog.validate_composition_state(state).validation
+        return replace(
+            rejection,
+            validation=replace(validation, errors=(rejection.validation.errors[0], *validation.errors)),
+            _validation_snapshot_hash=context.plugin_snapshot.snapshot_hash,
         )
 
     baseline_validation = context.catalog.validate_composition_state(baseline).validation
@@ -4877,6 +4900,7 @@ def _execute_diff_pipeline(
         state,
         baseline_validation=baseline_validation,
         current_validation=current_validation,
+        baseline_kind=context.baseline_kind,
     )
     return _discovery_result(state, changes)
 
@@ -4886,9 +4910,17 @@ _DIFF_PIPELINE_DECLARATION = ToolDeclaration(
     response_contract=DIFF_PIPELINE_RESPONSE_CONTRACT,
     handler=_execute_diff_pipeline,
     kind=ToolKind.DISCOVERY,
-    description="Compare with this surface's baseline (Web Composer: request-start state, fixed across provider rounds). "
-    "On success `data` carries `from_version` (the baseline; the version it "
-    "changed TO is the envelope's own `version`), `sources_changed`, "
+    description="Compare with the newest validated state other than the working state. `baseline_kind`: `last_validated` "
+    "or `request_start` if none is used. In-request edits can compare with request start; planner: `request_start`. "
+    "With no edits yet this turn, `last_validated` compares with the validated version before the current one. "
+    "When available, a broken pipeline compares with its last validated version; a valid one with the previous validated version. "
+    "Name `from_version` and envelope `version`: `version` is the working pipeline's number at this call. "
+    "Give it as the compared version, not the user's final version. "
+    "For `last_validated`, `from_version` is a validated milestone selectable in the version menu, which marks milestones; "
+    "older history may be missing from the menu. "
+    "If `total_changes` is 0 and `baseline_kind` is `last_validated`, say nothing has changed since the compared validated "
+    "version `from_version`. If `total_changes` is 0 and `baseline_kind` is `request_start`, say nothing has changed in this turn. "
+    "`data`: `from_version` (baseline), `sources_changed`, "
     "`metadata_changed`, `total_changes`, `warnings_introduced`, "
     "`warnings_resolved`, and per-collection `added` / `removed` / `modified` "
     "lists under `nodes`, `edges`, `outputs`, and — only when `sources_changed` — `sources`. Without a "

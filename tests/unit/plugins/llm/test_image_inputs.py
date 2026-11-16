@@ -285,7 +285,7 @@ class TestErrorVocabulary:
         spec = ImageInputConfig(field="pictures", format="png")
         result = _resolve(row, [spec], store=store, max_images_per_call=2)
         assert isinstance(result, TransformResult)
-        assert result.reason == {"reason": "too_many_images", "max_images": 2, "actual": "3"}
+        assert result.reason == {"reason": "too_many_images", "max_images": 2, "actual": "more than 2"}
         assert result.retryable is False
         assert store.retrieve_calls == []
 
@@ -307,7 +307,7 @@ class TestErrorVocabulary:
             tracemalloc.stop()
 
         assert isinstance(result, TransformResult)
-        assert result.reason == {"reason": "too_many_images", "max_images": 20, "actual": "21"}
+        assert result.reason == {"reason": "too_many_images", "max_images": 20, "actual": "more than 20"}
         assert store.retrieve_calls == []
         assert peak < 1_000_000
 

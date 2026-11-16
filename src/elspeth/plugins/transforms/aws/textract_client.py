@@ -98,6 +98,15 @@ class TextractServiceError(RuntimeError):
         self.retryable = retryable
 
 
+class TextractRateLimitTimeout(TextractServiceError):
+    """No Textract SDK request was sent because its permit wait expired."""
+
+    def __init__(self, wait_budget_seconds: float) -> None:
+        super().__init__(code="RateLimitTimeout", retryable=True)
+        self.wait_budget_seconds = wait_budget_seconds
+        self.request_sent = False
+
+
 class TextractIdempotencyInvariantError(RuntimeError):
     """Raised when AWS reports reuse of a token with different parameters."""
 
@@ -142,6 +151,16 @@ def _replay_error(evidence: ReplayCallEvidence, *, operation: str, inline: bool 
         retryable = error["retryable"]
         if type(code) is str and 1 <= len(code) <= _MAX_ERROR_CODE_LENGTH and type(retryable) is bool:
             return TextractServiceError(code=code, retryable=retryable)
+    if status == "rate_limiter_refusal" and error["retryable"] is True:
+        budget = error["wait_budget_seconds"] if "wait_budget_seconds" in error else None
+        if (
+            isinstance(budget, (int, float))
+            and not isinstance(budget, bool)
+            and budget > 0
+            and "request_sent" in error
+            and error["request_sent"] is False
+        ):
+            return TextractRateLimitTimeout(float(budget))
     raise AuditIntegrityError(f"Textract replay call {evidence.source_call_id} has incomplete error evidence")
 
 
@@ -299,12 +318,16 @@ def _provider_error(error: Exception, *, observed_attempts: int) -> tuple[str, b
     The exception's ``response`` envelope is vendor data: every member is read
     once, bounded, and re-asserted before it becomes part of the audit record.
     """
-    from botocore.exceptions import ClientError, ConnectionClosedError, ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError
+    from botocore.exceptions import ClientError, HTTPClientError
+    from botocore.exceptions import ConnectionError as BotocoreConnectionError
 
-    if isinstance(error, (ConnectTimeoutError, ConnectionClosedError, EndpointConnectionError, ReadTimeoutError)):
+    # botocore's standard retry mode retries exactly these two families
+    # (TransientRetryableChecker), so they are transport failures whose every
+    # started HTTP attempt was observed by the before-send hook.
+    if isinstance(error, (BotocoreConnectionError, HTTPClientError)):
         return "transport_error", True, observed_attempts, False
     if not isinstance(error, ClientError):
-        return "botocore_error", False, 1, False
+        return "botocore_error", False, observed_attempts, False
 
     error_data = error.response.get("Error")
     code = "unknown"
@@ -396,6 +419,7 @@ class _TextractAuditedClient(AuditedClientBase):
         *,
         region: str,
         max_response_bytes: int,
+        limiter_wait_seconds: float = 30.0,
         limiter: LimiterProtocol | None = None,
         token_id: str | None = None,
         member_token: WorkerMembershipToken,
@@ -409,6 +433,9 @@ class _TextractAuditedClient(AuditedClientBase):
             raise ValueError("max_response_bytes must be positive")
         self._region = region
         self._max_response_bytes = max_response_bytes
+        if limiter_wait_seconds <= 0:
+            raise ValueError("limiter_wait_seconds must be positive")
+        self._limiter_wait_seconds = limiter_wait_seconds
         self._call_mode_session = call_mode_session
 
     def _replay_evidence(
@@ -603,6 +630,7 @@ class TextractClient(_TextractAuditedClient):
         region: str,
         sdk_client: TextractSDKClient,
         max_response_bytes: int,
+        limiter_wait_seconds: float = 30.0,
         limiter: LimiterProtocol | None = None,
         token_id: str | None = None,
         member_token: WorkerMembershipToken,
@@ -616,6 +644,7 @@ class TextractClient(_TextractAuditedClient):
             telemetry_emit,
             region=region,
             max_response_bytes=max_response_bytes,
+            limiter_wait_seconds=limiter_wait_seconds,
             limiter=limiter,
             token_id=token_id,
             member_token=member_token,
@@ -623,6 +652,14 @@ class TextractClient(_TextractAuditedClient):
             call_mode_session=call_mode_session,
         )
         self._sdk_client = sdk_client
+        # Parent-local index of this adapter's latest call. A row state's
+        # Textract calls are sequential on one worker thread, so the next
+        # call takes the following index; replay uses it to ask the archive
+        # whether the source run made that call.
+        self._last_call_index: int | None = None
+        # Verify mode: the source run's provider-generated job id, pinned at
+        # the row's first poll so every later poll must name the same job.
+        self._source_job_id: str | None = None
 
     def start_document_analysis(
         self,
@@ -654,6 +691,7 @@ class TextractClient(_TextractAuditedClient):
             sdk_request["QueriesConfig"] = {"Queries": query_requests}
 
         call_index = self._next_call_index()
+        self._last_call_index = call_index
         location_identity: Mapping[str, str | None] = {"bucket": bucket, "key": key} if audit_identity is None else dict(audit_identity)
         request_payload = RawCallPayload(
             {
@@ -730,7 +768,7 @@ class TextractClient(_TextractAuditedClient):
         terminal_error: Exception | None = None
         attempts = 1
         try:
-            self._acquire_rate_limit()
+            self._acquire_rate_limit(timeout=self._limiter_wait_seconds)
             _reset_send_attempts()
             raw_response = self._sdk_client.start_document_analysis(**sdk_request)
             response = _mapping(raw_response)
@@ -750,6 +788,21 @@ class TextractClient(_TextractAuditedClient):
             )
             call_status = CallStatus.SUCCESS
             error_payload = None
+        except TimeoutError:
+            terminal_error = TextractRateLimitTimeout(self._limiter_wait_seconds)
+            receipt = None
+            response_payload = RawCallPayload(
+                {"operation": "start_document_analysis", "status": "rate_limiter_refusal", "attempts": attempts}
+            )
+            call_status = CallStatus.ERROR
+            error_payload = RawCallPayload(
+                {
+                    "type": "rate_limiter_refusal",
+                    "retryable": True,
+                    "wait_budget_seconds": self._limiter_wait_seconds,
+                    "request_sent": False,
+                }
+            )
         except TextractResponseError as error:
             terminal_error = error
             receipt = None
@@ -799,22 +852,92 @@ class TextractClient(_TextractAuditedClient):
         assert receipt is not None
         return receipt
 
-    def get_document_analysis(self, *, job_id: str, next_token: str | None) -> AnalysisResultPage:
-        sdk_request: dict[str, Any] = {"JobId": job_id, "MaxResults": 1000}
-        next_token_fingerprint = None
-        if next_token is not None:
-            sdk_request["NextToken"] = next_token
-            next_token_fingerprint = _fingerprint(next_token)
-        call_index = self._next_call_index()
-        request_payload = RawCallPayload(
+    @staticmethod
+    def _poll_request_payload(*, job_id: str, next_token: str | None) -> RawCallPayload:
+        return RawCallPayload(
             {
                 "operation": "get_document_analysis",
                 "job_id": job_id,
                 "next_token_present": next_token is not None,
-                "next_token_fingerprint": next_token_fingerprint,
+                "next_token_fingerprint": None if next_token is None else _fingerprint(next_token),
                 "max_results": 1000,
             }
         )
+
+    def source_has_next_poll(self, *, job_id: str, next_token: str | None) -> bool:
+        """Replay only: whether the source run made this poll as the row's next call.
+
+        The source run ended its poll loop on a wall-clock deadline (or a
+        shutdown); replay answers each poll at once, so the clock cannot
+        reproduce that decision. The archive can: the replayed job id and
+        page tokens are the source run's, so the next poll's request is
+        exactly the one the source would have recorded at the next index.
+        """
+        session = self._call_mode_session
+        if session is None or session.mode is not RunMode.REPLAY:
+            raise contract_errors.FrameworkBugError("Textract source poll lookup is replay-only")
+        if self._last_call_index is None:
+            raise contract_errors.FrameworkBugError("Textract source poll lookup before the start call")
+        return session.has_source_call(
+            call_type=CallType.HTTP,
+            request_data=self._poll_request_payload(job_id=job_id, next_token=next_token).to_dict(),
+            current_state_id=self._state_id,
+            current_operation_id=self._operation_id,
+            current_call_index=self._last_call_index + 1,
+        )
+
+    def _verify_poll_lookup(self, *, call_index: int, request_payload: RawCallPayload) -> RawCallPayload:
+        """Verify only: the live poll request with the source run's provider-generated identities.
+
+        A verify run's ClientRequestToken derives from the verify run id, so
+        Textract starts a new job: the live JobId and every NextToken differ
+        from the source run's and cannot be derived. They are substituted
+        from the archived source request at this index, as the start call
+        substitutes the source token fingerprint; every other request member
+        (operation, next-token presence, page size) is still compared exactly.
+        The source job id is pinned at the row's first poll and must not change.
+        """
+        session = self._call_mode_session
+        assert session is not None
+        archived = session.archived_call_request(
+            call_type=CallType.HTTP,
+            current_state_id=self._state_id,
+            current_operation_id=self._operation_id,
+            current_call_index=call_index,
+        ).request_data
+        if "operation" not in archived or archived["operation"] != "get_document_analysis":
+            raise AuditIntegrityError(f"Textract verify source call at index {call_index} is not a GetDocumentAnalysis poll")
+        source_job_id = archived["job_id"] if "job_id" in archived else None
+        if type(source_job_id) is not str or not 1 <= len(source_job_id) <= _MAX_JOB_ID_LENGTH:
+            raise AuditIntegrityError(f"Textract verify source poll at index {call_index} has no valid job id")
+        if self._source_job_id is None:
+            self._source_job_id = source_job_id
+        elif source_job_id != self._source_job_id:
+            raise AuditIntegrityError("Textract verify source job id changed within one row")
+        live = request_payload.to_dict()
+        if "next_token_fingerprint" not in archived:
+            raise AuditIntegrityError(f"Textract verify source poll at index {call_index} has no next-token fingerprint member")
+        source_fingerprint = archived["next_token_fingerprint"]
+        if live["next_token_present"]:
+            if (
+                type(source_fingerprint) is not str
+                or len(source_fingerprint) != 64
+                or any(char not in "0123456789abcdef" for char in source_fingerprint)
+            ):
+                raise AuditIntegrityError(f"Textract verify source poll at index {call_index} has no next-token fingerprint")
+        elif source_fingerprint is not None:
+            raise AuditIntegrityError(f"Textract verify source poll at index {call_index} paginates where the live poll does not")
+        live["job_id"] = source_job_id
+        live["next_token_fingerprint"] = source_fingerprint
+        return RawCallPayload(live)
+
+    def get_document_analysis(self, *, job_id: str, next_token: str | None) -> AnalysisResultPage:
+        sdk_request: dict[str, Any] = {"JobId": job_id, "MaxResults": 1000}
+        if next_token is not None:
+            sdk_request["NextToken"] = next_token
+        call_index = self._next_call_index()
+        self._last_call_index = call_index
+        request_payload = self._poll_request_payload(job_id=job_id, next_token=next_token)
         telemetry_request = RawCallPayload(
             {
                 "operation": "get_document_analysis",
@@ -866,12 +989,16 @@ class TextractClient(_TextractAuditedClient):
                 operation="get_document_analysis",
             )
             return AnalysisResultPage(semantic_response=semantic, next_token=token)
-        self._admit_verify_call(call_index=call_index, request_payload=request_payload)
+        lookup_request: RawCallPayload | None = None
+        session = self._call_mode_session
+        if session is not None and session.mode is RunMode.VERIFY:
+            lookup_request = self._verify_poll_lookup(call_index=call_index, request_payload=request_payload)
+        self._admit_verify_call(call_index=call_index, request_payload=request_payload, lookup_request=lookup_request)
         started = time.perf_counter()
         terminal_error: Exception | None = None
         attempts = 1
         try:
-            self._acquire_rate_limit()
+            self._acquire_rate_limit(timeout=self._limiter_wait_seconds)
             _reset_send_attempts()
             raw_response = self._sdk_client.get_document_analysis(**sdk_request)
             response = _mapping(raw_response)
@@ -901,6 +1028,22 @@ class TextractClient(_TextractAuditedClient):
             )
             call_status = CallStatus.SUCCESS
             error_payload = None
+        except TimeoutError:
+            terminal_error = TextractRateLimitTimeout(self._limiter_wait_seconds)
+            result_page = None
+            returned_next_token = None
+            response_payload = RawCallPayload(
+                {"operation": "get_document_analysis", "status": "rate_limiter_refusal", "attempts": attempts}
+            )
+            call_status = CallStatus.ERROR
+            error_payload = RawCallPayload(
+                {
+                    "type": "rate_limiter_refusal",
+                    "retryable": True,
+                    "wait_budget_seconds": self._limiter_wait_seconds,
+                    "request_sent": False,
+                }
+            )
         except TextractResponseError as error:
             terminal_error = error
             result_page = None
@@ -938,6 +1081,7 @@ class TextractClient(_TextractAuditedClient):
             response_payload=response_payload,
             error_payload=error_payload,
             latency_ms=latency_ms,
+            lookup_request=lookup_request,
         )
         self._emit_after_audit(
             status=call_status,
@@ -972,6 +1116,7 @@ class TextractInlineClient(_TextractAuditedClient):
         region: str,
         sdk_client: TextractSyncSDKClient,
         max_response_bytes: int,
+        limiter_wait_seconds: float = 30.0,
         limiter: LimiterProtocol | None = None,
         token_id: str | None = None,
         member_token: WorkerMembershipToken,
@@ -985,6 +1130,7 @@ class TextractInlineClient(_TextractAuditedClient):
             telemetry_emit,
             region=region,
             max_response_bytes=max_response_bytes,
+            limiter_wait_seconds=limiter_wait_seconds,
             limiter=limiter,
             token_id=token_id,
             member_token=member_token,
@@ -1081,7 +1227,7 @@ class TextractInlineClient(_TextractAuditedClient):
         terminal_error: Exception | None = None
         attempts = 1
         try:
-            self._acquire_rate_limit()
+            self._acquire_rate_limit(timeout=self._limiter_wait_seconds)
             _reset_send_attempts()
             raw_response = self._sdk_client.analyze_document(**sdk_request)
             response = _mapping(raw_response)
@@ -1105,6 +1251,19 @@ class TextractInlineClient(_TextractAuditedClient):
             )
             call_status = CallStatus.SUCCESS
             error_payload = None
+        except TimeoutError:
+            terminal_error = TextractRateLimitTimeout(self._limiter_wait_seconds)
+            result = None
+            response_payload = RawCallPayload({"operation": "analyze_document", "status": "rate_limiter_refusal", "attempts": attempts})
+            call_status = CallStatus.ERROR
+            error_payload = RawCallPayload(
+                {
+                    "type": "rate_limiter_refusal",
+                    "retryable": True,
+                    "wait_budget_seconds": self._limiter_wait_seconds,
+                    "request_sent": False,
+                }
+            )
         except TextractResponseError as error:
             terminal_error = error
             result = None

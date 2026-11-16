@@ -872,7 +872,10 @@ async def test_cl_pp_10d_cancellation_after_commit_before_response_yield_keeps_s
 
     compose_task = asyncio.create_task(_run_one_turn_for_characterization(service, llm=llm, session_id=session_id))
 
-    await asyncio.wait_for(commit_returned.wait(), timeout=2.0)
+    # Hang guard only: this test pins cancellation after COMMIT, not latency.
+    # When it is the first compose turn in a worker it pays the process's cold
+    # start, which coverage on 3.14 stretches past 3 s (0.07 s once warm).
+    await asyncio.wait_for(commit_returned.wait(), timeout=30.0)
     rows_after_commit = _chat_rows(sessions_service, session_id=session_id)
     assert [row.role for row in rows_after_commit] == ["assistant", "tool", "audit"]
 

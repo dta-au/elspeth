@@ -7,6 +7,7 @@ import binascii
 import codecs
 import csv
 import hashlib
+import io
 import json
 import math
 import re
@@ -22,7 +23,6 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from elspeth.contracts import ArtifactDescriptor, CallType, Determinism, PluginSchema
 from elspeth.contracts.contexts import SinkContext
 from elspeth.contracts.diversion import SinkWriteResult
-from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.header_modes import HeaderMode, parse_header_mode
 from elspeth.contracts.plugin_assistance import PluginAssistance
@@ -46,8 +46,10 @@ from elspeth.contracts.wire_visible_identity import reject_operator_required_pla
 from elspeth.plugins.aws_s3_common import build_s3_client
 from elspeth.plugins.infrastructure.base import BaseSink
 from elspeth.plugins.infrastructure.config_base import (
+    CSVDelimiter,
     DataPluginConfig,
     HeaderModeOption,
+    TextEncoding,
     validate_headers_value,
 )
 from elspeth.plugins.infrastructure.display_headers import (
@@ -82,6 +84,8 @@ _MAX_REGION_CHARS = 64
 _MAX_ETAG_BYTES = 1024
 _SAFE_ERROR_TYPE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
+# S3 multipart uploads have 1..10000 parts; a composite checksum carries that count.
+_S3_COMPOSITE_PART_COUNT = re.compile(r"(?:[1-9][0-9]{0,3}|10000)\Z")
 _CONDITIONAL_ERROR_CODES = frozenset({"PreconditionFailed", "ConditionalRequestConflict"})
 _DEFINITE_REJECTION_CODES = frozenset({"AccessDenied", "NoSuchBucket", "InvalidRequest"})
 
@@ -91,32 +95,9 @@ class CSVWriteOptions(BaseModel):
 
     model_config = {"extra": "forbid", "frozen": True}
 
-    delimiter: str = Field(default=",", description="Single-character CSV field delimiter")
-    encoding: str = Field(default="utf-8", description="Character encoding for CSV output")
+    delimiter: CSVDelimiter = Field(default=",", description="Single-character CSV field delimiter")
+    encoding: TextEncoding = Field(default="utf-8", description="Character encoding for CSV output")
     include_header: bool = Field(default=True, description="Write the CSV header record")
-
-    @field_validator("delimiter")
-    @classmethod
-    def _validate_delimiter(cls, value: str) -> str:
-        if len(value) != 1:
-            raise ValueError("delimiter must be a single character")
-        return value
-
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, value: str) -> str:
-        try:
-            codecs.lookup(value)
-        except LookupError as exc:
-            raise ValueError("unknown CSV encoding") from exc
-        try:
-            encoded: object = codecs.getincrementalencoder(value)(errors="strict").encode("", final=True)
-        except (LookupError, TypeError, UnicodeError, ValueError):
-            raise ValueError("CSV encoding must encode text to bytes") from None
-        # Text-to-text codecs such as rot13 look up cleanly but never yield bytes.
-        if type(encoded) is not bytes:
-            raise ValueError("CSV encoding must encode text to bytes")
-        return value
 
 
 class AWSS3SinkConfig(DataPluginConfig):
@@ -134,7 +115,7 @@ class AWSS3SinkConfig(DataPluginConfig):
         description="Normalized, original, or custom output headers",
     )
     region_name: str | None = Field(default=None, description="AWS signing region override")
-    endpoint_url: str | None = Field(default=None, description="CLI/batch-only S3-compatible HTTP endpoint")
+    endpoint_url: str | None = Field(default=None, description="CLI/batch-only S3-compatible HTTP endpoint", repr=False)
     max_object_bytes: int = Field(
         default=256 * 1024 * 1024,
         gt=0,
@@ -316,6 +297,22 @@ class S3RecordSizeLimitError(S3RecordSerializationError):
         ValueError.__init__(self, "S3 output record exceeds configured character limit.")
 
 
+class S3HeaderSerializationError(ValueError):
+    """The configured CSV header record cannot be written.
+
+    The header is derived from the schema, the header mode and the configured
+    encoding and record limit, so this is a configuration defect: it is
+    deliberately NOT an ``S3RecordSerializationError`` and is never diverted
+    as a row failure. The message is static so no header label is echoed.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "S3 CSV header record cannot be written with the configured csv_options.encoding "
+            "and max_record_chars; correct the header labels or the CSV options."
+        )
+
+
 @dataclass(slots=True)
 class _SerializedObject:
     """Own a rewound temporary object and its stable integrity metadata."""
@@ -368,6 +365,7 @@ class _BoundedBinaryWriter:
 class _EncodedTextWriter:
     def __init__(self, writer: _BoundedBinaryWriter, encoding: str) -> None:
         self._writer = writer
+        self._failure: type[S3RecordSerializationError] | type[S3HeaderSerializationError] = S3RecordSerializationError
         try:
             self._encoder = codecs.getincrementalencoder(encoding)(errors="strict")
         except (LookupError, TypeError, UnicodeError, ValueError):
@@ -385,8 +383,12 @@ class _EncodedTextWriter:
         except (LookupError, TypeError, UnicodeError, ValueError):
             encoding_failed = True
         if encoding_failed or type(encoded) is not bytes:
-            raise S3RecordSerializationError from None
+            raise self._failure from None
         return encoded
+
+    def fail_as(self, failure: type[S3RecordSerializationError] | type[S3HeaderSerializationError]) -> None:
+        """Select the static failure raised for the text written next."""
+        self._failure = failure
 
     def write(self, value: str) -> int:
         self._writer.write(self._encode(value, final=False))
@@ -502,13 +504,9 @@ def _csv_scalar_text(value: Any) -> str:
 
 
 def _csv_record_chars(values: Sequence[str], delimiter: str) -> int:
-    total = max(0, len(values) - 1) + 2
-    for value in values:
-        if delimiter in value or '"' in value or "\r" in value or "\n" in value:
-            total += len(value) + value.count('"') + 2
-        else:
-            total += len(value)
-    return total
+    buffer = io.StringIO(newline="")
+    csv.writer(buffer, delimiter=delimiter, lineterminator="\r\n").writerow(values)
+    return len(buffer.getvalue()) - 2
 
 
 def _serialize_rows_to_spool(
@@ -542,8 +540,12 @@ def _serialize_rows_to_spool(
             if csv_options.include_header:
                 header_values = list(fieldnames) if header_fields is None else list(header_fields)
                 if _csv_record_chars(header_values, csv_options.delimiter) > max_record_chars:
-                    raise S3RecordSizeLimitError
+                    raise S3HeaderSerializationError
+                # An encoding failure while writing the header is the header
+                # (configuration) failure, not a row failure.
+                text_writer.fail_as(S3HeaderSerializationError)
                 csv_writer.writerow(header_values)
+                text_writer.fail_as(S3RecordSerializationError)
             for row in rows:
                 if set(row) - set(fieldnames):
                     raise S3RecordSerializationError
@@ -621,32 +623,19 @@ class S3WriteOutcomeUnknownError(RuntimeError):
         super().__init__("S3 object write outcome is unknown; reconciliation is required.")
 
 
-class S3SinkPoisonedError(RuntimeError):
-    """The sink cannot safely make another cumulative request."""
-
-
 class S3SinkClosedError(RuntimeError):
     """The sink has already released its provider resources."""
+
+    def __init__(self) -> None:
+        super().__init__("AWSS3Sink is closed; no further S3 requests may be made.")
 
 
 class S3ClientCloseError(RuntimeError):
     """The detached S3 client failed during close."""
 
 
-def _raise_conditional_rejected() -> Never:
-    raise S3ConditionalWriteRejectedError from None
-
-
-def _raise_sink_write_rejected() -> Never:
-    raise S3SinkWriteError from None
-
-
 def _raise_outcome_unknown() -> Never:
     raise S3WriteOutcomeUnknownError from None
-
-
-def _raise_audit_integrity(error_type: str) -> Never:
-    raise AuditIntegrityError(f"Failed to record S3 call in the audit trail ({error_type}).") from None
 
 
 def _s3_provider_exception_types() -> tuple[type[Exception], ...]:
@@ -736,7 +725,7 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
     name = "aws_s3"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:5d0aa08060d18093"
+    source_file_hash: str | None = "sha256:ef42f750a3679d1f"
     config_model = AWSS3SinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP
@@ -824,6 +813,10 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
         set_resume_field_resolution(self, resolution_mapping)
 
     def _get_s3_client(self) -> _S3Client:
+        # close() released the client; building a replacement would let a
+        # post-close inspect/commit/reconcile silently reopen provider access.
+        if self._closed:
+            raise S3SinkClosedError
         if self._s3_client is None:
             self._s3_client = cast("_S3Client", build_s3_client(self._region_name, self._endpoint_url))
         return self._s3_client
@@ -897,14 +890,22 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
             checksum_value = response["ChecksumSHA256"]
             if not isinstance(checksum_value, str):
                 raise RemoteObjectPreconditionError("S3 object inspection returned malformed checksum")
+            # A multipart upload with SHA-256 checksums reports a COMPOSITE
+            # checksum, "<base64 digest-of-digests>-<part count>". It is a valid
+            # provider shape but not a hash of the object bytes, so it is
+            # recorded as "no full-object checksum" rather than rejected.
+            digest_b64, separator, part_count = checksum_value.partition("-")
+            if separator and _S3_COMPOSITE_PART_COUNT.fullmatch(part_count) is None:
+                raise RemoteObjectPreconditionError("S3 object inspection returned malformed checksum")
             try:
-                checksum_bytes = base64.b64decode(checksum_value, validate=True)
+                checksum_bytes = base64.b64decode(digest_b64, validate=True)
             except (binascii.Error, ValueError):
                 raise RemoteObjectPreconditionError("S3 object inspection returned malformed checksum") from None
             if len(checksum_bytes) != hashlib.sha256().digest_size:
                 raise RemoteObjectPreconditionError("S3 object inspection returned malformed checksum")
-            checksum_b64 = checksum_value
-            checksum_hash = checksum_bytes.hex()
+            if not separator:
+                checksum_b64 = checksum_value
+                checksum_hash = checksum_bytes.hex()
         if content_hash is not None and checksum_hash is not None and checksum_hash != content_hash:
             raise RemoteObjectPreconditionError("S3 object inspection checksum diverges from content hash metadata")
 
@@ -971,6 +972,11 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
             row = deep_thaw(member.row)
             probe_fields = self._get_fieldnames_from_schema_or_rows([row])
             probe_rows = apply_display_headers(self, [row]) if self._format in {"json", "jsonl"} else [row]
+            # The probe writes the same display header the final object
+            # carries, so header encoding and record-length defects surface
+            # here (as configuration errors) rather than only in the
+            # whole-object write.
+            probe_header = self._display_fieldnames(probe_fields) if self._format == "csv" else None
             try:
                 serialized = _serialize_rows_to_spool(
                     probe_rows,
@@ -979,6 +985,7 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
                     fieldnames=probe_fields,
                     max_object_bytes=1024 * 1024 * 1024,
                     max_record_chars=self._max_record_chars,
+                    header_fields=probe_header,
                 )
             except S3RecordSizeLimitError:
                 reason = "record exceeds configured character limit"

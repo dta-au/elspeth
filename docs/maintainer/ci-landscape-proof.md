@@ -27,8 +27,8 @@ concurrently. Each proof job runs one of these existing cases serially:
 All producers first collect `tests/` using normal marker selection. The
 [partition helper](../../scripts/ci_test_shards.py) requires exactly these
 three marked cases. Ordinary shards exclude them; each proof producer selects
-exactly one. Local unsharded selection remains unchanged. Both Python 3.12
-and 3.13 must pass; coverage is collected on 3.13.
+exactly one. Local unsharded selection remains unchanged. CI runs one
+interpreter lane, Python 3.14, which is also the coverage lane.
 
 Ordinary assignment uses deterministic longest-estimated-first scheduling from
 the [duration profile](../../config/cicd/pytest-duration-profile.json). Ties
@@ -48,9 +48,9 @@ collection. Each proof must record a successful singleton call; pytest exit
 zero alone is insufficient. Coverage databases must match finalized hashes
 and contain executed source lines.
 
-The consumer requires eight ordinary plus three proof producers **per
-interpreter**, verifies their disjoint complete union, and re-derives the weighted
-assignment. Only the 3.13 union is combined. Existing coverage floors remain
+The consumer requires eight ordinary plus three proof producers for the 3.14
+lane, verifies their disjoint complete union, re-derives the weighted
+assignment and combines that union's coverage. Existing coverage floors remain
 85% overall, 92% Landscape, 99% canonical, 90% orchestrator and 62% contracts.
 Both the coverage job and `CI Success` require actual successful ordinary and
 proof job results; neither missing evidence nor a skipped producer is success.
@@ -76,13 +76,13 @@ returns `128 + signal`. Cancellation during publication invalidates terminal
 evidence.
 
 Proof concurrency is capped at two within its matrix, not across the host.
-Provisional process caps are 7,200 seconds on 3.12 and 14,400 seconds on covered
-3.13; job caps are 150 and 270 minutes. These are limits, not timing claims.
+The provisional process cap is 14,400 seconds on the covered 3.14 lane; the job
+cap is 270 minutes. These are limits, not timing claims.
 Coordinate broad qualification with other host workloads and avoid launching a
 duplicate local suite alongside candidate CI.
 
 Focused tests cover partition identity, retry recovery, coverage binding,
 failure propagation and process cleanup, with negative controls. Native
-candidate CI must additionally establish collection parity, all six long proofs,
-the complete 3.13 coverage union and every protected required context. Neither
+candidate CI must additionally establish collection parity, all three long proofs,
+the complete 3.14 coverage union and every protected required context. Neither
 source review nor fixture-only tests establish those broader results.

@@ -1,4 +1,4 @@
-"""Explicit structured publication names preserve ordered review and legacy defaults."""
+"""Explicit structured publication names preserve ordered review and default query-name stems."""
 
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ def _ordered_options(*, prefix: str | None = ""):
     )
 
 
-@pytest.mark.parametrize("prefix", [None, "", "published"], ids=["legacy-none", "unprefixed", "custom-prefix"])
+@pytest.mark.parametrize("prefix", [None, "", "published"], ids=["default-stem", "unprefixed", "custom-prefix"])
 @pytest.mark.parametrize("admitted", [False, True], ids=["rejected", "admitted"])
 def test_actual_writer_output_is_bound_to_a_separate_reviewer_before_release(prefix: str | None, admitted: bool) -> None:
     transform, provider = _make_transform_with_mock_provider(_ordered_options(prefix=prefix))
@@ -120,15 +120,12 @@ def test_any_explicit_override_refuses_all_structured_and_operational_final_coll
 
 
 @pytest.mark.parametrize("explicit_none", [False, True], ids=["omitted", "explicit-none"])
-def test_upstream_default_keeps_legacy_operational_precedence(explicit_none: bool) -> None:
+def test_upstream_default_refuses_operational_collision(explicit_none: bool) -> None:
     definition = {"input_fields": {"text": "text"}, "output_fields": [{"suffix": "llm_response", "type": "integer"}]}
     if explicit_none:
         definition["structured_output_prefix"] = None
-    transform, provider = _make_transform_with_mock_provider(_make_config(queries={"quality": definition}))
-    provider.execute_query.return_value = _response({"llm_response": 42})
-    result = transform._process_row(_make_row(), _make_ctx())
-    assert result.status == "success" and result.row["quality_llm_response"] == json.dumps({"llm_response": 42})
-    _run_post_emission_check(transform, result.row)
+    with pytest.raises(PluginConfigError, match="collides with the transform's own response/operational fields"):
+        LLMTransform(_make_config(queries={"quality": definition}))
 
 
 @pytest.mark.parametrize("mode,pool_size", [("ordered", 1), ("upstream", 1), ("upstream", 2)])
@@ -173,7 +170,7 @@ def test_renamed_fields_keep_original_and_generated_namespaces_separate(prefix: 
         LLMTransform(options)
 
 
-def test_explicit_same_prefix_activates_collision_refusal_for_default_named_other_queries() -> None:
+def test_explicit_same_prefix_collides_with_default_named_other_query() -> None:
     options = _make_config(
         queries={
             "first": {

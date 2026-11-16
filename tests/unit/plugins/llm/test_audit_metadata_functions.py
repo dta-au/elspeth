@@ -16,19 +16,19 @@ class TestPopulateLlmOperationalFields:
         }
         assert output["llm_response_model"] == "gpt-4"
 
-    def test_usage_none_sets_none(self):
+    def test_unknown_usage_serialises_to_an_empty_mapping(self):
         from elspeth.plugins.transforms.llm import populate_llm_operational_fields
 
         output: dict[str, object] = {}
-        populate_llm_operational_fields(output, "resp", usage=None, model="claude-3")
-        assert output["resp_usage"] is None
+        populate_llm_operational_fields(output, "resp", usage=TokenUsage.unknown(), model="claude-3")
+        assert output["resp_usage"] == TokenUsage.unknown().to_dict()
         assert output["resp_model"] == "claude-3"
 
     def test_does_not_set_audit_fields(self):
         from elspeth.plugins.transforms.llm import LLM_AUDIT_SUFFIXES, populate_llm_operational_fields
 
         output: dict[str, object] = {}
-        populate_llm_operational_fields(output, "r", usage=None, model=None)
+        populate_llm_operational_fields(output, "r", usage=TokenUsage.unknown(), model="m")
         for suffix in LLM_AUDIT_SUFFIXES:
             assert f"r{suffix}" not in output
 

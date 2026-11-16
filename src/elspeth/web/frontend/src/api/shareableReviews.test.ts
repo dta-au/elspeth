@@ -145,6 +145,17 @@ describe("shareableReviews API client", () => {
     });
   });
 
+  it("fetchShareableLink passes through the expired-link 409 detail", async () => {
+    const detail = "This share link has expired. Share for review again to create a new link.";
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail }), {
+        status: 409,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    await expect(fetchShareableLink(SESSION_ID)).rejects.toMatchObject({ status: 409, detail });
+  });
+
   // ── fetchSharedInspect ──────────────────────────────────────────────
 
   it("fetchSharedInspect GETs /shared/{token} URL-encoded", async () => {

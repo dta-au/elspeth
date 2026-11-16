@@ -102,6 +102,7 @@ def instantiate_plugins_from_config(
     to lifecycle/operation methods.
     """
     from elspeth.core.dag.wiring import WiredTransform
+    from elspeth.plugins.infrastructure.base import aggregation_trigger_count_cap_error
     from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
     from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
 
@@ -210,6 +211,15 @@ def instantiate_plugins_from_config(
                 raise ValueError(
                     f"Aggregation '{agg_config.name}' uses '{agg_config.plugin}', which requires an EOF-only trigger; omit trigger or use {{}}"
                 )
+            # A count trigger above the plugin's declared batch cap fails
+            # every full batch at flush; refuse it here, from the class
+            # declaration, so it never reaches a run. The composer's
+            # placement rule reads the same declaration.
+            batch_cap_error = aggregation_trigger_count_cap_error(
+                agg_config.name, agg_config.plugin, transform_cls.max_batch_rows, agg_config.trigger.count
+            )
+            if batch_cap_error is not None:
+                raise ValueError(batch_cap_error)
             transform = transform_cls(dict(agg_config.options))
             transform.on_success = agg_config.on_success
             transform.on_error = agg_config.on_error
@@ -463,10 +473,26 @@ def validate_sink_effect_eligibility_from_raw_config(
         if not isinstance(raw_sink_name, str) or not raw_sink_name:
             raise ValueError("Sink names must be non-empty strings for sink effect eligibility")
 
-    export_settings = validate_landscape_export_settings_from_raw_config(raw_config)
+    # landscape.export is expanded exactly as the loader expands the whole tree
+    # (sweep finding #104): ``enabled: ${EXPORT_ON:-true}`` and
+    # ``sink: ${AUDIT_SINK}`` mean what the loader will make of them.
+    export_settings = validate_landscape_export_settings_from_raw_config(
+        raw_config,
+        expand_env_placeholders=expand_env_placeholders,
+        deferrable_env_vars=deferrable_env_vars,
+    )
     delayed_export_name: str | None = None
     if export_settings.enabled and export_settings.sink:
         delayed_export_name = export_settings.sink
+    if delayed_export_name is not None and delayed_export_name not in raw_sinks:
+        if expand_env_placeholders and _references_deferrable_env_var(delayed_export_name, deferrable_env_vars):
+            # The export sink's NAME is only known after the secret-loading
+            # phase, so this raw gate cannot tell the export sink from the
+            # pipeline sinks. Defer the whole gate, as for a sink whose options
+            # reference a deferred secret: the post-expansion admission gates
+            # re-run eligibility against the loaded configuration.
+            return {}
+        raise ValueError(f"landscape.export.sink {delayed_export_name!r} is not one of the configured sinks: {sorted(raw_sinks)}")
 
     if purpose is SinkEffectExecutionPurpose.AUDIT_EXPORT:
         if delayed_export_name is None:
@@ -536,8 +562,21 @@ def validate_sink_effect_eligibility_from_raw_config(
     test_ref="tests/unit/plugins/infrastructure/test_runtime_factory.py::test_validate_landscape_export_settings_rejects_non_mapping_landscape",
     test_fingerprint="00ad72be64f927816212e8328687e5d7fc78a80c757a5ee5997cb5dd60acc5b6",
 )
-def validate_landscape_export_settings_from_raw_config(raw_config: Mapping[str, object]) -> LandscapeExportSettings:
-    """Normalize bounded raw export settings through the authoritative model."""
+def validate_landscape_export_settings_from_raw_config(
+    raw_config: Mapping[str, object],
+    *,
+    expand_env_placeholders: bool = False,
+    deferrable_env_vars: frozenset[str] = frozenset(),
+) -> LandscapeExportSettings:
+    """Normalize bounded raw export settings through the authoritative model.
+
+    With ``expand_env_placeholders`` the loader's ``${VAR}`` /
+    ``${VAR:-default}`` expansion is applied to ``landscape.export`` first, as
+    the loader applies it to the whole tree. A placeholder naming a variable in
+    ``deferrable_env_vars`` is left as written (the secret-loading phase
+    populates it later). The default keeps in-memory (web-authored)
+    configurations treating placeholders as literal data.
+    """
     from elspeth.core.config import LandscapeExportSettings
 
     if "landscape" not in raw_config:
@@ -550,7 +589,20 @@ def validate_landscape_export_settings_from_raw_config(raw_config: Mapping[str, 
     raw_export = raw_landscape["export"]
     if not isinstance(raw_export, Mapping):
         raise ValueError("'landscape.export' must be a mapping/object before sink effect eligibility")
-    return LandscapeExportSettings.model_validate(dict(raw_export))
+    export_options = dict(raw_export)
+    if expand_env_placeholders:
+        export_options, _fully_resolved = _expand_env_placeholders_for_raw_preflight(
+            export_options,
+            deferrable_env_vars=deferrable_env_vars,
+        )
+    return LandscapeExportSettings.model_validate(export_options)
+
+
+def _references_deferrable_env_var(text: str, deferrable_env_vars: frozenset[str]) -> bool:
+    """Whether ``text`` still holds a ``${VAR}`` placeholder for a deferred variable."""
+    from elspeth.core.config import _ENV_VAR_PATTERN
+
+    return any(match.group(1) in deferrable_env_vars for match in _ENV_VAR_PATTERN.finditer(text))
 
 
 def _value_source_wired_transforms(bundle: PluginBundle) -> tuple[WiredTransform, ...]:

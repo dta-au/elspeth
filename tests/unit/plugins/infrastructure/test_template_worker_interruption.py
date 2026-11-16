@@ -4,7 +4,6 @@ import queue
 from collections.abc import Iterator
 
 import pytest
-from jinja2.exceptions import UndefinedError
 
 from elspeth.plugins.infrastructure import templates
 
@@ -67,7 +66,7 @@ def test_consumed_error_response_allows_worker_reuse() -> None:
     assert entry is not None
     process, _ = entry
 
-    with pytest.raises(UndefinedError):
+    with pytest.raises(templates.TemplateError, match="Undefined variable"):
         template.render(row={})
 
     assert template.render(row={"text": "NEXT_ROW"}) == "NEXT_ROW"

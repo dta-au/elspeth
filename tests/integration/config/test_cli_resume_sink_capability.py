@@ -107,7 +107,6 @@ class TestDatabaseSinkResumeCapability:
                     "url": "sqlite:///:memory:",
                     "table": "test_output",
                     "schema": {"mode": "fixed", "fields": ["id: int", "name: str"]},
-                    "if_exists": "replace",
                 }
             )
         )
@@ -115,19 +114,18 @@ class TestDatabaseSinkResumeCapability:
         assert sink.supports_resume is True
 
     def test_database_sink_configure_for_resume(self):
-        """configure_for_resume should switch to append mode."""
+        """configure_for_resume leaves the sink in append, its only write mode."""
         sink = inject_write_failure(
             DatabaseSink(
                 {
                     "url": "sqlite:///:memory:",
                     "table": "test_output",
                     "schema": {"mode": "fixed", "fields": ["id: int", "name: str"]},
-                    "if_exists": "replace",
                 }
             )
         )
 
-        assert sink._if_exists == "replace"
+        assert sink._if_exists == "append"
 
         sink.configure_for_resume()
 

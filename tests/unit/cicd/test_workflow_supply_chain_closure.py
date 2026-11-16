@@ -207,7 +207,7 @@ def test_every_workflow_job_container_is_digest_pinned_including_matrix_mappings
 
 
 def test_container_pin_validator_controls_literal_and_matrix_references() -> None:
-    digest = "python:3.13-bookworm@sha256:" + "a" * 64
+    digest = "python:3.14-bookworm@sha256:" + "a" * 64
     _assert_container_is_digest_pinned("literal", {"container": {"image": digest}})
     _assert_container_is_digest_pinned(
         "matrix",
@@ -218,7 +218,7 @@ def test_container_pin_validator_controls_literal_and_matrix_references() -> Non
     )
 
     with pytest.raises(AssertionError, match="mutable"):
-        _assert_container_is_digest_pinned("literal", {"container": {"image": "python:3.13-bookworm"}})
+        _assert_container_is_digest_pinned("literal", {"container": {"image": "python:3.14-bookworm"}})
     with pytest.raises(AssertionError, match="no concrete mappings"):
         _assert_container_is_digest_pinned(
             "matrix",
@@ -329,7 +329,7 @@ def test_active_long_run_target_remains_in_executable_supply_chain_inventory() -
     workflow = workflows[PROOF_WORKFLOW]
     job = workflow["jobs"]["proof"]
     assert _executable_jobs(workflow) == [("proof", job)]
-    assert len(job["strategy"]["matrix"]["include"]) == 6
+    assert len(job["strategy"]["matrix"]["include"]) == 3
     _assert_container_is_digest_pinned("long-run proof", job)
     assert _resolved_setup_uv_versions(workflow) == ["0.10.2"]
     assert [step["uses"] for step in job["steps"] if "uses" in step] == [
@@ -345,7 +345,7 @@ def test_active_long_run_target_remains_in_executable_supply_chain_inventory() -
     assert "${{ secrets." not in json.dumps(workflow)
 
 
-@pytest.mark.parametrize("row_index", range(6))
+@pytest.mark.parametrize("row_index", range(3))
 def test_active_long_run_supply_chain_rejects_mutable_image_in_every_row(row_index: int) -> None:
     workflow = _workflow(PROOF_WORKFLOW)
     job = workflow["jobs"]["proof"]

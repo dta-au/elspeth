@@ -608,6 +608,7 @@ def _build_service(
         sessions_db_engine=engine,
         session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
         payload_store=payload_store,
+        legacy_payload_store=None,
         telemetry=telemetry,
         blob_service=blob_service if blob_service is not None else _FakeBlobService(),
     )
@@ -969,7 +970,7 @@ async def test_share_snapshot_uses_one_recursive_public_projection(
         session_operation_context=session_operation_context,
     )
     stored = json.loads(payload_store.retrieve(marked.payload_digest.removeprefix("sha256:")))
-    resolved = await service.resolve_token(token=marked.token, requesting_user_id="reviewer")
+    resolved = await service.resolve_token(token=marked.token)
     representations = (
         stored,
         resolved.model_dump(mode="json"),
@@ -1462,6 +1463,8 @@ async def test_get_shareable_link_remints_with_stable_digest(
     assert r1.payload_digest == marked.payload_digest
     assert r1.payload_digest == r2.payload_digest
     assert r1.token != r2.token
+    assert r1.expires_at == marked.expires_at
+    assert r2.expires_at == marked.expires_at
 
     with session_engine_with_row.connect() as conn:
         rows = conn.execute(
@@ -1678,7 +1681,7 @@ async def test_resolve_token_returns_frozen_snapshot(
     readiness_service.snapshot = later_snapshot
     readiness_service.reset_counts()
 
-    resolved = await service.resolve_token(token=response.token, requesting_user_id="bob")
+    resolved = await service.resolve_token(token=response.token)
     # Frozen-at-mark-time: composition_version reflects the mark-time view, not the later one.
     assert resolved.audit_readiness.composition_version == 3
     # The readiness service was NOT called during resolve.
@@ -1775,7 +1778,7 @@ async def test_resolve_token_projects_signed_blob_without_mutating_evidence(
         )
     )
 
-    resolved = await service.resolve_token(token=token, requesting_user_id="reviewer")
+    resolved = await service.resolve_token(token=token)
 
     serialized = resolved.model_dump_json()
     for private_value in (private_path, private_output, private_index, blob_id, "17 secret(s) in your inventory"):
@@ -1821,7 +1824,7 @@ async def test_mark_ready_freezes_username_alongside_the_opaque_identity(
     assert blob["created_by_user_id"] == session_record.user_id
     assert blob["created_by_username"] == _OWNER_USERNAME
 
-    resolved = await service.resolve_token(token=response.token, requesting_user_id="bob")
+    resolved = await service.resolve_token(token=response.token)
     assert resolved.created_by_user_id == session_record.user_id
     assert resolved.created_by_username == _OWNER_USERNAME
 
@@ -1871,7 +1874,7 @@ async def test_resolve_token_rejects_obsolete_signed_blob_shape(
     )
 
     with pytest.raises(InvalidToken, match="unsupported share snapshot shape"):
-        await service.resolve_token(token=obsolete_token, requesting_user_id="bob")
+        await service.resolve_token(token=obsolete_token)
 
 
 @pytest.mark.asyncio
@@ -1900,7 +1903,7 @@ async def test_resolve_token_rejects_tampered_token(
     )
     tampered = response.token[:-2] + ("aa" if response.token[-2:] != "aa" else "bb")
     with pytest.raises(InvalidToken):
-        await service.resolve_token(token=tampered, requesting_user_id="bob")
+        await service.resolve_token(token=tampered)
 
 
 @pytest.mark.asyncio
@@ -1931,7 +1934,7 @@ async def test_resolve_token_rejects_expired_token(
         session_operation_context=session_operation_context,
     )
     with pytest.raises(InvalidToken, match="expired"):
-        await service.resolve_token(token=response.token, requesting_user_id="bob")
+        await service.resolve_token(token=response.token)
 
 
 @pytest.mark.asyncio
@@ -1964,7 +1967,7 @@ async def test_resolve_token_blob_expired_raises_not_found(
     digest_hex = response.payload_digest.removeprefix("sha256:")
     payload_store.delete(digest_hex)
     with pytest.raises(PayloadNotFoundError):
-        await service.resolve_token(token=response.token, requesting_user_id="bob")
+        await service.resolve_token(token=response.token)
 
 
 @pytest.mark.asyncio
@@ -1994,7 +1997,7 @@ async def test_resolve_token_does_not_call_readiness_service(
         session_operation_context=session_operation_context,
     )
     readiness_service.reset_counts()
-    await service.resolve_token(token=response.token, requesting_user_id="bob")
+    await service.resolve_token(token=response.token)
     assert readiness_service.compute_snapshot_await_count == 0
 
 
@@ -2692,7 +2695,7 @@ async def test_get_shareable_link_keeps_the_original_lifespan(
         validation=_ok_validation(),
         readiness=_readiness_snapshot(session_record.id),
     )
-    await service.mark_ready_for_review(
+    marked = await service.mark_ready_for_review(
         session_id=session_record.id,
         user_id=session_record.user_id,
         username=_OWNER_USERNAME,
@@ -2700,13 +2703,10 @@ async def test_get_shareable_link_keeps_the_original_lifespan(
         lifetime_seconds=86400,
     )
 
-    before = datetime.now(UTC)
     reminted = await service.get_shareable_link(session_id=session_record.id, user_id=session_record.user_id)
-    after = datetime.now(UTC)
-
-    assert before + timedelta(seconds=86400) <= reminted.expires_at <= after + timedelta(seconds=86400)
+    assert reminted.expires_at == marked.expires_at
     payload = signer.verify(reminted.token)
-    assert payload.expires_at - payload.created_at == timedelta(seconds=86400)
+    assert payload.expires_at == marked.expires_at
 
 
 @pytest.mark.asyncio
@@ -3376,7 +3376,7 @@ async def test_get_shareable_link_clamps_to_a_lowered_maximum(
         readiness=_readiness_snapshot(session_record.id),
         settings=settings,
     )
-    await service.mark_ready_for_review(
+    marked = await service.mark_ready_for_review(
         session_id=session_record.id,
         user_id=session_record.user_id,
         username=_OWNER_USERNAME,
@@ -3385,13 +3385,10 @@ async def test_get_shareable_link_clamps_to_a_lowered_maximum(
     )
     settings.shareable_link_lifetime_seconds = 604800
 
-    before = datetime.now(UTC)
     reminted = await service.get_shareable_link(session_id=session_record.id, user_id=session_record.user_id)
-    after = datetime.now(UTC)
-
-    assert before + timedelta(seconds=604800) <= reminted.expires_at <= after + timedelta(seconds=604800)
+    assert reminted.expires_at == marked.expires_at - timedelta(days=23)
     payload = signer.verify(reminted.token)
-    assert payload.expires_at - payload.created_at == timedelta(seconds=604800)
+    assert payload.expires_at == reminted.expires_at
 
 
 @pytest.mark.asyncio
@@ -3471,7 +3468,7 @@ async def test_resolve_token_exposes_import_flag_and_file_names_only(
         confirmed_file_manifest=await _previewed_manifest(service, session_record, session_operation_context),
     )
 
-    resolved = await service.resolve_token(token=marked.token, requesting_user_id="reviewer")
+    resolved = await service.resolve_token(token=marked.token)
 
     assert resolved.import_allowed is True
     assert [(f.filename, f.size_bytes) for f in resolved.files] == [("customers.csv", len(content))]
@@ -3529,7 +3526,7 @@ async def test_resolve_token_legacy_snapshot_is_view_only_with_no_files(
         )
     )
 
-    resolved = await service.resolve_token(token=legacy_token, requesting_user_id="reviewer")
+    resolved = await service.resolve_token(token=legacy_token)
 
     assert resolved.import_allowed is False
     assert resolved.files == []

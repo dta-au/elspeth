@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
+import numpy as np
 import pytest
+from chromadb.api.types import normalize_insert_record_set, validate_insert_record_set
 from sqlalchemy import update
 
 from elspeth.contracts import NodeType, TerminalOutcome, TerminalPath
@@ -31,14 +34,35 @@ class _ResponseLosingCollection:
         self.documents: dict[str, tuple[str, dict[str, object] | None]] = {}
         self.upsert_count_by_id: dict[str, int] = {}
         self.lose_first_response = True
+        self._client = self
+        self.id = "durable-members"
+        self.tenant = "default_tenant"
+        self.database = "default_database"
 
-    def upsert(
+    def _validate_and_prepare_upsert_request(self, **kwargs: Any) -> dict[str, Any]:
+        records = normalize_insert_record_set(**kwargs)
+        validate_insert_record_set(records)
+        return {
+            "ids": records["ids"],
+            "documents": records["documents"],
+            "metadatas": records["metadatas"],
+            "embeddings": [np.array([1.0, 0.0], dtype=np.float32)],
+            "uris": records["uris"],
+        }
+
+    def _upsert(
         self,
         *,
+        collection_id: str,
         ids: list[str],
+        embeddings: list[np.ndarray],
         documents: list[str],
         metadatas: list[dict[str, object]] | None,
+        uris: list[str] | None,
+        tenant: str,
+        database: str,
     ) -> None:
+        del collection_id, embeddings, uris, tenant, database
         assert len(ids) == len(documents) == 1
         document_id = ids[0]
         metadata = None if metadatas is None else dict(metadatas[0])

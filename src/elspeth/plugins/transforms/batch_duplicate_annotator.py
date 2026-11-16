@@ -23,8 +23,8 @@ from elspeth.core.expression_parser import ExpressionEvaluationError, Expression
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import PluginConfigError, TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.transforms._batch_row_types import MAX_BATCH_ROWS
 
-_MAX_BATCH_ROWS = 4096
 _MAX_CELLS = 256
 _MAX_COMPARISON_CHARS = 4 * 1024 * 1024
 _MAX_CAUSE_CHARS = 128 * 1024
@@ -112,9 +112,10 @@ class BatchDuplicateAnnotator(BaseTransform):
     name = "batch_duplicate_annotator"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ac8e4181bdb2164b"
+    source_file_hash: str | None = "sha256:8355140f7e1278df"
     config_model = BatchDuplicateConfig
     is_batch_aware = True
+    max_batch_rows: int = MAX_BATCH_ROWS
     flush_emits_one_row_per_buffered_row = True
     requires_aggregation_batch_context = True
     requires_complete_source_batch = True
@@ -177,7 +178,7 @@ class BatchDuplicateAnnotator(BaseTransform):
                 "Cells require canonical ASCII field names and actual strings. Optional when expressions use literal row keys and must return bool. False exempts valid text; missing/non-string data or invalid eligibility marks only its member invalid.",
                 "Use observed/nonrestrictive batch schema for per-member error isolation. Explicit typed/required batch input schemas retain existing whole-batch failure behavior.",
                 "The output Boolean <prefix>_valid and JSON-string <prefix>_causes carry all static causes without copied text. An LLM input_checks predicate can reject invalid members before row model calls; retain row_json in its error sink for all causes.",
-                "Bounds: 4096 buffered rows, 16 rules, 256 selected cells total, 4 Mi characters inspected, 128 Ki characters of causes per member. Capacity refusal never splits the source. These caps do not bound memory already buffered before EOF.",
+                f"Bounds: {MAX_BATCH_ROWS} buffered rows, 16 rules, 256 selected cells total, 4 Mi characters inspected, 128 Ki characters of causes per member. Capacity refusal never splits the source. These caps do not bound memory already buffered before EOF.",
                 "Finite serial one-member-per-source-case flow only for unchanged source identity; no append/cross-run or arbitrary forked/partitioned completeness claim. Transform output mode instead creates ordinary child tokens.",
             ),
         )
@@ -190,7 +191,7 @@ class BatchDuplicateAnnotator(BaseTransform):
         if not isinstance(row, list) or not row:
             return self._refuse("nonempty_batch_required")
         rows = row
-        if len(rows) > _MAX_BATCH_ROWS:
+        if len(rows) > self.max_batch_rows:
             return self._refuse("comparison_capacity_exceeded")
         window = ctx.aggregation_batch
         if window is None or not (

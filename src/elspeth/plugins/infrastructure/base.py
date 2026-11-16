@@ -49,7 +49,7 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.diversion import RowDiversion, SinkWriteResult
 from elspeth.contracts.errors import FrameworkBugError
-from elspeth.contracts.field_spelling import FieldMappingKeys, SourceFieldRenames
+from elspeth.contracts.field_spelling import FieldMappingKeys, SourceFieldRenames, normalized_field_name_or_empty
 from elspeth.contracts.plugin_capabilities import (
     CapabilityDeclaration,
     ContentTrust,
@@ -116,24 +116,31 @@ def is_column_naming_config_option(key: str) -> bool:
     suppresses=("R5",),
     invariant=(
         "returns exactly the column names the option value spells: a str is one name, "
-        "a list/tuple contributes only its str items, and every other shape yields (); "
-        "never raises and never coerces a non-str into a name"
+        "a list/tuple contributes only its str items, a Mapping contributes only its str "
+        "keys and only when the plugin declared the option column-keyed, and every other "
+        "shape yields (); never raises and never coerces a non-str into a name"
     ),
     non_raising=True,
 )
-def _column_names_in_option_value(value: Any) -> tuple[str, ...]:
+def _column_names_in_option_value(value: Any, *, column_keyed: bool = False) -> tuple[str, ...]:
     """Column names one column-naming config option value points at.
 
     Plural options hold a LIST of column names (``keyword_filter.fields``,
     ``batch_data_quality_report.inspect_fields``); skipping non-str values
     inside them once made every one invisible to demotion, so list/tuple
-    items are admitted individually. Non-name shapes contribute nothing:
-    per-plugin config validation, not this helper, owns rejecting them.
+    items are admitted individually. A column-KEYED option
+    (``truncate.fields: {column: max_len}``, declared through
+    ``BaseTransform.column_keyed_config_keys``) names its columns as the
+    mapping's keys. A mapping is otherwise opaque: ``web_scrape.query_fields``
+    keys are query parameter names, not columns. Non-name shapes contribute
+    nothing: per-plugin config validation, not this helper, owns rejecting them.
     """
     if isinstance(value, str):
         return (value,)
     if isinstance(value, (list, tuple)):
         return tuple(item for item in value if isinstance(item, str))
+    if column_keyed and isinstance(value, Mapping):
+        return tuple(key for key in value if isinstance(key, str))
     return ()
 
 
@@ -191,6 +198,28 @@ def _demote_required_model_fields(
             __module__=model.__module__,
             **overrides,
         ),
+    )
+
+
+def aggregation_trigger_count_cap_error(
+    aggregation_name: str,
+    plugin_name: str,
+    max_batch_rows: int | None,
+    trigger_count: int | None,
+) -> str | None:
+    """Return the refusal for a count trigger above a plugin's declared batch cap.
+
+    One rule for both authoring surfaces: runtime_factory raises it and the
+    composer's placement rule reports it, each from the plugin class's
+    ``max_batch_rows``. None when the plugin is uncapped or the trigger has
+    no count (an end-of-source or timeout flush has no size known in advance).
+    """
+    if max_batch_rows is None or trigger_count is None or trigger_count <= max_batch_rows:
+        return None
+    return (
+        f"Aggregation '{aggregation_name}' uses '{plugin_name}' with trigger count {trigger_count}, but "
+        f"'{plugin_name}' accepts at most {max_batch_rows} buffered rows per flush, so every full batch would "
+        f"fail (batch_too_large). Set trigger count at or below {max_batch_rows}."
     )
 
 
@@ -410,9 +439,15 @@ class BaseTransform(ABC):
         role: ControlRole,
         options: Mapping[str, object],
     ) -> bool:
-        """Evaluate whether this concrete config can enforce a declared control."""
-        if "detect_only" in options and options["detect_only"] is True:
-            return False
+        """Evaluate whether this concrete config can enforce a declared control.
+
+        The default credits a declared ``blocks_positive_detection`` capability
+        and reads no option: it cannot know which knob makes a given plugin's
+        configuration non-blocking. A plugin with such a knob overrides this
+        and refuses credit for it (azure_content_safety no-op thresholds,
+        aws_bedrock_content_safety ``source``, azure_prompt_shield
+        ``analysis_type``).
+        """
         return any(
             declaration.capability is capability and declaration.control_role is role and declaration.blocks_positive_detection
             for declaration in cls.policy_capabilities
@@ -465,6 +500,12 @@ class BaseTransform(ABC):
     # refuses count/timeout/condition triggers; the plugin also checks its
     # actual durable flush window before producing an admission decision.
     requires_complete_source_batch: bool = False
+
+    # Largest batch a batch-aware plugin's flush accepts, or None for no cap.
+    # A capped plugin refuses a larger flush at run time, and runtime_factory
+    # and the composer refuse an aggregation whose trigger.count exceeds it,
+    # so a count trigger that would fail every batch never reaches a run.
+    max_batch_rows: int | None = None
 
     # True only for a batch-aware plugin whose every successful flush emits
     # exactly one row per buffered row, in buffered order, as
@@ -602,6 +643,15 @@ class BaseTransform(ABC):
     # leaving a genuine output option undeclared makes the parity probe fail,
     # and mis-declaring a consumed one silently drops a real requirement.
     output_naming_config_keys: frozenset[str] = frozenset()
+
+    # Column-naming config options whose value is a MAPPING keyed by the
+    # input column it applies to (``truncate.fields: {column: max_len}``).
+    # Their keys are read columns for the fixed-schema read check and for
+    # demotion protection. This describes the option's shape only; it grants
+    # no lookup semantics (a plugin that requires the columns declares them on
+    # ``declared_input_fields`` / ``declared_string_input_fields``). A mapping option not declared here contributes no
+    # names: ``web_scrape.query_fields`` keys are query parameter names.
+    column_keyed_config_keys: frozenset[str] = frozenset()
 
     # Field collision enforcement (centralized in TransformExecutor).
     # Transforms that add fields to the output row declare WHAT fields they add
@@ -845,7 +895,7 @@ class BaseTransform(ABC):
         for key, value in self.config.items():
             if key in self.output_naming_config_keys or not is_column_naming_config_option(key):
                 continue
-            for item in _column_names_in_option_value(value):
+            for item in _column_names_in_option_value(value, column_keyed=key in self.column_keyed_config_keys):
                 authored_by.setdefault(item, []).append(key)
         # PROVENANCE, honestly. ``declared_input_fields`` is multi-provenance:
         # the author's own ``required_input_fields`` list, and — for the plugins
@@ -885,7 +935,16 @@ class BaseTransform(ABC):
                 authored_by[name] = [_DERIVED_INPUT_FIELD_PROVENANCE]
 
         declared = {field.name for field in schema_config.fields}
-        missing = sorted(name for name in authored_by if name not in declared and name.isidentifier())
+        # A header spelling whose canonical form is declared is not "forbidden
+        # by the schema": it is a misspelling of a declared field, which the
+        # field-name spelling rule refuses at build with its own verdict
+        # (``validate_declared_field_spellings``). Only a name whose canonical
+        # form is ALSO undeclared is this check's to reject.
+        missing = sorted(
+            name
+            for name in authored_by
+            if name not in declared and normalized_field_name_or_empty(name) not in declared and name.isidentifier()
+        )
         if not missing:
             return
 
@@ -1564,17 +1623,18 @@ class BaseTransform(ABC):
           a plugin projects onto it (``url_field``, ``query_field``,
           ``blob_ref_field``, ``key_field``, type_coerce's
           ``conversions[].field`` ...);
-        - ``declared_string_input_fields``: the scan fields the text-scanning
-          family (keyword_filter, the content-safety and prompt-shield
-          guardrails, document intelligence's ``source_field``) requires
-          present and string-valued. The string-type build validator compares
-          them to the upstream schema as written, so a header spelling would
-          walk past it.
+        - ``declared_string_input_fields``: the fields a transform requires
+          present and string-valued — keyword_filter's named ``fields``, the
+          content-safety and prompt-shield guardrails' ``fields``, document
+          intelligence's ``source_field`` and truncate's ``fields`` keys
+          (plugin review #146). The string-type build validator compares them
+          to the upstream schema as written, so a header spelling would walk
+          past it.
 
         Deliberately NOT the column-option limb of ``consumed_input_fields``:
         an option that stays off those surfaces is a row LOOKUP, resolved
-        through ``PipelineRow`` under either spelling (truncate's ``fields``,
-        field_mapper's non-normalized mapping sources), and the ruling keeps lookups
+        through ``PipelineRow`` under either spelling (field_mapper's
+        non-normalized mapping sources), and the ruling keeps lookups
         spelling-free. json_explode's ``array_field`` was one until it became a
         declared input (elspeth-5887fb7928 R2): it is on ``declared_input_fields``
         now, so it is spelled as rows carry the field.
@@ -1634,7 +1694,7 @@ class BaseTransform(ABC):
         for key, value in options.items():
             if key in self.output_naming_config_keys or not is_column_naming_config_option(key):
                 continue
-            named.update(_column_names_in_option_value(value))
+            named.update(_column_names_in_option_value(value, column_keyed=key in self.column_keyed_config_keys))
         resolved = frozenset(named)
         # Config is fixed once construction finishes, so this is recompute-once
         # work; without the memo it was rebuilt on EVERY input_schema read, i.e.

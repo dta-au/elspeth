@@ -54,7 +54,9 @@ def main() -> None:
     import asyncio
 
     from elspeth.composer_mcp.standalone import run_standalone
+    from elspeth.core.logging import install_asyncio_diagnostic_scrubber
 
+    install_asyncio_diagnostic_scrubber()
     asyncio.run(run_standalone(watchdog, draining, args.scratch_dir, args.data_dir))
 
 

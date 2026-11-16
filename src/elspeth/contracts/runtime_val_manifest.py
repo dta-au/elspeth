@@ -141,6 +141,42 @@ def _instructions(code: CodeType) -> tuple[dis.Instruction, ...]:
     return cached
 
 
+# Local loads the dependency analysis treats as a plain ``LOAD_FAST``. Python
+# 3.14 emits ``LOAD_FAST_BORROW`` for most local reads, and ``LOAD_FAST_CHECK``
+# reads a local that may be unbound; a receiver match on ``LOAD_FAST`` alone
+# would miss every helper reached through them.
+_SINGLE_LOCAL_LOAD_OPNAMES = frozenset({"LOAD_FAST", "LOAD_FAST_BORROW", "LOAD_FAST_CHECK"})
+# Superinstructions that push two locals; ``argval`` is the pair of names.
+_PAIRED_LOCAL_LOAD_OPNAMES = frozenset({"LOAD_FAST_LOAD_FAST", "LOAD_FAST_BORROW_LOAD_FAST_BORROW"})
+
+
+def _analysis_instructions(code: CodeType) -> tuple[dis.Instruction, ...]:
+    """The instruction stream the dependency analysis walks.
+
+    Local loads are rewritten to ``LOAD_FAST`` and paired local loads are
+    split into two, so the receiver patterns (``LOAD_FAST self; LOAD_ATTR
+    helper``) match however the compiler spelled the load. Only the analysis
+    reads this view; the manifest hashes ``_instructions``.
+    """
+    analysis: list[dis.Instruction] = []
+    for instruction in _instructions(code):
+        if instruction.opname in _SINGLE_LOCAL_LOAD_OPNAMES:
+            analysis.append(instruction._replace(opname="LOAD_FAST", opcode=dis.opmap["LOAD_FAST"]))
+        elif instruction.opname in _PAIRED_LOCAL_LOAD_OPNAMES:
+            for name in instruction.argval:
+                analysis.append(
+                    instruction._replace(
+                        opname="LOAD_FAST",
+                        opcode=dis.opmap["LOAD_FAST"],
+                        argval=name,
+                        argrepr=name,
+                    )
+                )
+        else:
+            analysis.append(instruction)
+    return tuple(analysis)
+
+
 def _type_identity(cls: type[object]) -> str:
     module_name: object = cls.__module__
     qualname: object = cls.__qualname__
@@ -358,7 +394,9 @@ def _normalize_code_object(code: CodeType) -> dict[str, object]:
         "kwonlyargcount": code.co_kwonlyargcount,
         "nlocals": code.co_nlocals,
         "stacksize": code.co_stacksize,
-        "flags": code.co_flags,
+        # CO_HAS_DOCSTRING (Python 3.14) records only that a docstring exists;
+        # docstring-only edits must not move the implementation hash.
+        "flags": code.co_flags & ~inspect.CO_HAS_DOCSTRING,
         "instructions": [_normalize_instruction(instruction) for instruction in _instructions(code)],
         "names": list(code.co_names),
         "varnames": list(code.co_varnames),
@@ -794,7 +832,7 @@ def _loaded_binding_attribute_names(
 ) -> list[str]:
     names: set[str] = set()
     for _, nested_code in _iter_code_objects_for_binding(code, binding_name=binding_name):
-        instructions = _instructions(nested_code)
+        instructions = _analysis_instructions(nested_code)
         for index, instruction in enumerate(instructions[:-1]):
             if instruction.opname not in load_opnames or instruction.argval != binding_name:
                 continue
@@ -813,7 +851,7 @@ def _binding_is_directly_called(
     binding_name: str,
 ) -> bool:
     for _, nested_code in _iter_code_objects_for_binding(code, binding_name=binding_name):
-        instructions = _instructions(nested_code)
+        instructions = _analysis_instructions(nested_code)
         for index, instruction in enumerate(instructions):
             if instruction.opname not in load_opnames or instruction.argval != binding_name:
                 continue
@@ -944,7 +982,7 @@ def _add_callable_dependency(
 
 def _loaded_global_names(code: CodeType) -> list[str]:
     names: set[str] = set()
-    for instruction in _instructions(code):
+    for instruction in _analysis_instructions(code):
         if instruction.opname not in {"LOAD_GLOBAL", "LOAD_NAME"}:
             continue
         name: str = instruction.argval
@@ -954,7 +992,7 @@ def _loaded_global_names(code: CodeType) -> list[str]:
 
 def _loaded_owner_attribute_names(code: CodeType, *, binding_name: str) -> list[str]:
     names: set[str] = set()
-    instructions = _instructions(code)
+    instructions = _analysis_instructions(code)
     for index, instruction in enumerate(instructions[1:], start=1):
         if instruction.opname not in {"LOAD_ATTR", "LOAD_METHOD"}:
             continue
@@ -1004,7 +1042,7 @@ def _qualified_global_values(
     name: str,
 ) -> list[tuple[str, object, object | None, bool]]:
     qualified_values: list[tuple[str, object, object | None, bool]] = []
-    instructions = _instructions(code)
+    instructions = _analysis_instructions(code)
     for index, instruction in enumerate(instructions[:-1]):
         if instruction.opname not in {"LOAD_GLOBAL", "LOAD_NAME"} or instruction.argval != name:
             continue
@@ -1068,7 +1106,7 @@ def _qualified_bound_values(
 ) -> list[tuple[str, object, object | None, bool]]:
     qualified_values: list[tuple[str, object, object | None, bool]] = []
     for _, nested_code in _iter_code_objects_for_binding(code, binding_name=binding_name):
-        instructions = _instructions(nested_code)
+        instructions = _analysis_instructions(nested_code)
         for index, instruction in enumerate(instructions[:-1]):
             if instruction.opname not in load_opnames or instruction.argval != binding_name:
                 continue
@@ -1113,7 +1151,7 @@ def _qualified_owner_values(
     binding_name: str,
 ) -> list[tuple[str, object, object | None, bool]]:
     qualified_values: list[tuple[str, object, object | None, bool]] = []
-    instructions = _instructions(code)
+    instructions = _analysis_instructions(code)
     for index, instruction in enumerate(instructions[:-1]):
         if instruction.opname not in {"LOAD_FAST", "LOAD_DEREF"} or instruction.argval != binding_name:
             continue

@@ -11,12 +11,13 @@ import math
 import urllib.parse
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 import chromadb
 import chromadb.api
 import chromadb.errors
 import structlog
+from chromadb.api.types import Metadata
 from pydantic import BaseModel, Field, model_validator
 
 import elspeth.contracts.errors as contract_errors
@@ -53,6 +54,7 @@ from elspeth.contracts.sink_effects import (
 from elspeth.contracts.url import SanitizedDatabaseUrl
 from elspeth.core.canonical import canonical_json
 from elspeth.plugins.infrastructure.base import BaseSink
+from elspeth.plugins.infrastructure.clients.retrieval.chroma import _collection_distance_space
 from elspeth.plugins.infrastructure.clients.retrieval.connection import (
     ChromaConnectionConfig,
     ChromaConnectionMode,
@@ -63,16 +65,6 @@ from elspeth.plugins.infrastructure.schema_factory import create_schema_from_con
 from elspeth.plugins.sinks._diversion_attribution import build_diversion_attribution
 
 slog = structlog.get_logger(__name__)
-
-
-class _ChromaPayloadRejection(Exception):
-    """Chroma API rejected the payload with ValueError.
-
-    Wraps ValueError from Chroma write calls (upsert/add) so the error handler
-    can distinguish "Chroma rejected our data" (Tier 3) from "bug in our code"
-    (framework error). Without this, a broad ValueError catch would suppress
-    framework bugs in the surrounding code.
-    """
 
 
 if TYPE_CHECKING:
@@ -110,7 +102,7 @@ class ChromaSinkConfig(DataPluginConfig):
     collection: str = Field(description="ChromaDB collection name")
     mode: ChromaConnectionMode = Field(description="Connection mode")
     persist_directory: str | None = Field(default=None, description="Local persistence directory for persistent Chroma mode.")
-    host: str | None = Field(default=None, description="Chroma server host for client mode.")
+    host: str | None = Field(default=None, description="Chroma server host for client mode.", repr=False)
     port: int = Field(default=8000, ge=1, le=65535, description="Chroma server port for client mode.")
     ssl: bool = Field(default=True, description="Whether to use TLS when connecting to a Chroma server.")
     distance_function: Literal["cosine", "l2", "ip"] = Field(
@@ -119,9 +111,9 @@ class ChromaSinkConfig(DataPluginConfig):
     )
 
     field_mapping: FieldMappingConfig = Field(description="Maps row fields to ChromaDB document/id/metadata")
-    on_duplicate: Literal["overwrite", "skip", "error"] = Field(
+    on_duplicate: Literal["overwrite"] = Field(
         default="overwrite",
-        description="Behaviour when a document ID already exists",
+        description="Behaviour when a document ID already exists; overwrite is the only policy.",
     )
 
     @model_validator(mode="after")
@@ -216,7 +208,7 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
     name = "chroma_sink"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:53866f704b91068f"
+    source_file_hash: str | None = "sha256:8609eab8e69c3992"
     config_model = ChromaSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
@@ -278,10 +270,10 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
                 issue_code=None,
                 summary="Writes rows to a ChromaDB collection as embedded documents with metadata.",
                 composer_hints=(
-                    "Set field_mapping.id_field and document_field to row fields holding string values; Chroma requires str ids and documents. A row missing either required field is diverted per row, but a present-yet-non-string id or document is an upstream type error that aborts the whole batch.",
+                    "Map field_mapping.id_field and document_field to string-valued row fields; Chroma requires str ids and documents. A row whose id or document is missing or non-string, or whose id is empty or whitespace-only, is diverted per row to on_write_failure; valid siblings are written.",
                     "metadata_fields may contain only Chroma-compatible scalar values: str, int, float, bool, or None.",
                     "Use mode=persistent with persist_directory for local storage, or mode=client with host/port/ssl for a server.",
-                    "Choose on_duplicate as overwrite, skip, or error before running; the default overwrites document IDs.",
+                    "on_duplicate accepts only overwrite (the default): an existing document ID is overwritten.",
                     "Chroma sink does not support resume, so plan reruns around idempotent document IDs.",
                 ),
             )
@@ -351,10 +343,23 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
             )
             self._client.heartbeat()
 
-        self._collection = self._client.get_or_create_collection(
+        collection = self._client.get_or_create_collection(
             name=self._config.collection,
             metadata={"hnsw:space": self._config.distance_function},
         )
+        # get_or_create_collection returns an existing collection unchanged:
+        # its creation metadata is not applied. Refuse a collection built with
+        # another distance function rather than silently index into it (the
+        # retrieval provider refuses the same mismatch when reading).
+        actual_space = _collection_distance_space(collection.metadata, self._config.collection)
+        if actual_space != self._config.distance_function:
+            raise ValueError(
+                f"Chroma collection {self._config.collection!r} already exists with "
+                f"distance_function={actual_space!r}, but config specifies "
+                f"distance_function={self._config.distance_function!r}. Either change the "
+                f"config to match the existing collection, or use a different collection name."
+            )
+        self._collection = collection
 
     @staticmethod
     def _compute_payload_hash(
@@ -379,6 +384,12 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
             raise ValueError(f"Chroma effect member is missing required field {exc.args[0]!r}") from exc
         if type(raw_id) is not str or type(raw_document) is not str:
             raise ValueError("Chroma effect member id and document fields must be strings")
+        if not raw_id.strip():
+            # Chroma rejects an empty ID at upsert with InvalidArgumentError (a
+            # ChromaError), which would escape commit on every attempt; a
+            # whitespace-only ID is blank in every meaningful sense and would be
+            # published under an unaddressable key. Divert both here instead.
+            raise ValueError("Chroma effect member id must not be empty or whitespace-only")
         metadata: dict[str, object] = {}
         for field_name in fm.metadata_fields:
             if field_name not in row:
@@ -418,8 +429,9 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
     ) -> tuple[ArtifactDescriptor, str, str, dict[int, tuple[str, str, dict[str, object] | None]], tuple[tuple[int, str], ...]]:
         """Deterministically partition members into extractable payloads and diversions.
 
-        An invalid member (missing/non-string ID or document, unsupported or
-        non-finite metadata) diverts individually with its exact reason instead
+        An invalid member (missing/non-string ID or document, empty or
+        whitespace-only ID, unsupported or non-finite metadata, or an ID already used by an earlier member of
+        the group) diverts individually with its exact reason instead
         of aborting the plan and blocking valid siblings (elspeth-32bf1a9b63).
         The descriptor and payload hash cover only the members that will be
         published. Recomputation over the same members is exact, so plan
@@ -427,14 +439,22 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
         """
         extracted_by_ordinal: dict[int, tuple[str, str, dict[str, object] | None]] = {}
         diversions: list[tuple[int, str]] = []
+        accepted_ids: set[str] = set()
         for member in effect_input.members:
             try:
-                extracted_by_ordinal[member.ordinal] = self._extract_effect_member(member)
+                extracted = self._extract_effect_member(member)
             except ValueError as exc:
                 diversions.append((member.ordinal, str(exc)))
+                continue
+            # Per-member upserts need unique IDs within the group: reconciling an
+            # earlier member would otherwise observe a later member's document.
+            # The first occurrence publishes; later ones divert.
+            if extracted[0] in accepted_ids:
+                diversions.append((member.ordinal, "Chroma effect member duplicates the document id of an earlier member in this group"))
+                continue
+            accepted_ids.add(extracted[0])
+            extracted_by_ordinal[member.ordinal] = extracted
         ids = [item[0] for item in extracted_by_ordinal.values()]
-        if len(ids) != len(set(ids)):
-            raise ValueError("Chroma effect members require unique stable document IDs")
         documents = [item[1] for item in extracted_by_ordinal.values()]
         aligned_metadata = [item[2] for item in extracted_by_ordinal.values()]
         hash_metadata = aligned_metadata if any(item is not None for item in aligned_metadata) else None
@@ -500,11 +520,6 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
         ctx: RestrictedSinkEffectContext,
     ) -> SinkEffectPlan:
         del ctx
-        if self._config.on_duplicate != "overwrite":
-            raise ValueError(
-                "Recoverable Chroma publication requires on_duplicate=overwrite; "
-                "use overwrite or choose a sink with a target-side effect marker"
-            )
         if type(request.effect_input) is not SinkEffectPipelineMembersInput:
             raise TypeError("Chroma effects require pipeline member input")
         descriptor, payload_hash, plan_hash, extracted_by_ordinal, diversions = self._member_effect_material(
@@ -613,15 +628,51 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
         if self._collection is None:
             raise FrameworkBugError("Chroma collection is unavailable — on_start() was not called")
         document_id, document, metadata, descriptor = self._validate_member_effect(plan, member, effect_input)
+        member_metadatas: list[dict[str, Any] | None] | None = None if metadata is None else [metadata]
+        # _extract_effect_member limits metadata to Chroma's scalar value types.
+        # A present list has one non-null member; cast only at the SDK boundary.
+        sdk_metadatas = cast(list[Metadata] | None, member_metadatas)
         try:
-            self._collection.upsert(
+            # Chroma 1.5.5's private preparation performs validation, embedding,
+            # and sparse-metadata enrichment before Collection.upsert dispatches.
+            # A ValueError here is pre-dispatch, so preserve the existing
+            # member-diversion behavior for configured embedding functions too.
+            upsert_request = self._collection._validate_and_prepare_upsert_request(
                 ids=[document_id],
+                embeddings=None,
+                metadatas=sdk_metadatas,
                 documents=[document],
-                metadatas=None if metadata is None else [metadata],  # type: ignore[list-item]
+                images=None,
+                uris=None,
             )
         except ValueError as exc:
-            raise _ChromaPayloadRejection(str(exc)) from exc
-        member_metadatas: list[dict[str, Any] | None] | None = None if metadata is None else [metadata]
+            reason = f"Chroma rejected the member payload: {exc}"
+            row = deep_thaw(member.row)
+            # Live diversion log BEFORE the durable result: fails closed with
+            # FrameworkBugError when no on_write_failure policy is configured.
+            self._divert_row(row, row_index=member.ordinal, reason=reason)
+            attribution = build_diversion_attribution(ordinal=member.ordinal, reason=reason)
+            return SinkEffectCommitResult(
+                descriptor=descriptor,
+                evidence={
+                    **self._member_group_evidence(plan, "diverted"),
+                    "diversion_attribution": [attribution.as_mapping()],
+                },
+                accepted_ordinals=tuple(item.ordinal for item in effect_input.members if item.ordinal != member.ordinal),
+                diverted_ordinals=(member.ordinal,),
+            )
+        # From this point a failure can follow a completed write (including
+        # HTTP response decoding). Propagate it for response-lost reconciliation.
+        self._collection._client._upsert(
+            collection_id=self._collection.id,
+            ids=upsert_request["ids"],
+            embeddings=upsert_request["embeddings"],
+            metadatas=upsert_request["metadatas"],
+            documents=upsert_request["documents"],
+            uris=upsert_request["uris"],
+            tenant=self._collection.tenant,
+            database=self._collection.database,
+        )
         _, payload_size = self._compute_payload_hash([document_id], [document], member_metadatas)
         self._total_written += 1
         self._total_bytes += payload_size

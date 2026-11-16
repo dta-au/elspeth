@@ -12,11 +12,11 @@ from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, model_validator
 
 from elspeth.contracts import CallType, Determinism, PluginSchema
 from elspeth.contracts.diversion import SinkWriteResult
-from elspeth.contracts.errors import SinkEffectCapabilityError
+from elspeth.contracts.errors import FrameworkBugError, SinkEffectCapabilityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.header_modes import HeaderMode
 from elspeth.contracts.plugin_assistance import PluginAssistance
@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.sink import OutputValidationResult
 from elspeth.contracts.contexts import SinkContext
 from elspeth.plugins.infrastructure.base import BaseSink
-from elspeth.plugins.infrastructure.config_base import OutputCollisionPolicy, SinkPathConfig
+from elspeth.plugins.infrastructure.config_base import OutputCollisionPolicy, SinkPathConfig, TextEncoding
 from elspeth.plugins.infrastructure.display_headers import (
     apply_display_headers,
     display_name_for,
@@ -68,21 +68,6 @@ from elspeth.plugins.sinks._local_file_effects import (
 )
 
 
-def _iter_file_without_suffix(path: Path, suffix: bytes) -> Iterator[bytes]:
-    """Stream a file except for one exact structural suffix."""
-    pending = b""
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(64 * 1024), b""):
-            combined = pending + chunk
-            if len(combined) > len(suffix):
-                yield combined[: -len(suffix)]
-                pending = combined[-len(suffix) :]
-            else:
-                pending = combined
-    if pending != suffix:
-        raise ValueError("Existing JSON array does not have the expected terminal boundary")
-
-
 def _indent_json_value(serialized: str, indent: int) -> str:
     prefix = " " * indent
     return "\n".join(prefix + line for line in serialized.splitlines())
@@ -102,7 +87,7 @@ class JSONSinkConfig(SinkPathConfig):
         description="Output JSON format. When omitted, the sink auto-detects JSONL from a .jsonl filename and JSON otherwise.",
     )
     indent: int | None = Field(default=None, description="Indentation level for JSON array output; null writes compact JSON.")
-    encoding: str = Field(
+    encoding: TextEncoding = Field(
         default="utf-8",
         strict=True,
         description="Text encoding used when writing JSON output.",
@@ -111,22 +96,6 @@ class JSONSinkConfig(SinkPathConfig):
         default="write",
         description="Whether to create/replace the JSON output file or append JSONL rows.",
     )
-
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, value: str) -> str:
-        try:
-            codecs.lookup(value)
-        except LookupError as exc:
-            raise ValueError("unknown encoding for JSON sink") from exc
-        try:
-            encoded = "".encode(value)
-            incremental = codecs.getincrementalencoder(value)().encode("", final=True)
-        except (LookupError, TypeError, UnicodeError, ValueError) as exc:
-            raise ValueError("encoding is not a supported text codec for JSON sink") from exc
-        if type(encoded) is not bytes or type(incremental) is not bytes:
-            raise ValueError("encoding is not a supported text codec for JSON sink")
-        return value
 
     @model_validator(mode="after")
     def _validate_mode_format_compatibility(self) -> "JSONSinkConfig":
@@ -167,7 +136,7 @@ class JSONSink(BaseSink):
     name = "json"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9ef547005076060e"
+    source_file_hash: str | None = "sha256:4c5c6d960228d88d"
     config_model = JSONSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM
@@ -260,10 +229,46 @@ class JSONSink(BaseSink):
         self._mode = "append"
         self._collision_policy = "append_or_create"
 
+    def _scan_existing_jsonl(self) -> tuple[str | None, list[str] | None]:
+        """Scan a non-empty JSONL baseline; return (refusal reason, first-line keys).
+
+        An append streams the baseline byte-for-byte and writes the new records
+        straight after it, so every existing line must be a JSON object and the
+        file must end at an LF record boundary; otherwise the first new record
+        is glued onto the last existing line and the artifact is corrupt JSONL.
+        The keys are those of the first line's record, or None when the first
+        line is blank.
+        """
+        first_line_keys: list[str] | None = None
+        final_character = ""
+        try:
+            with open(self._path, encoding=self._encoding, newline="") as f:
+                for line_index, line in enumerate(f):
+                    final_character = line[-1]
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        record = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        return "Existing JSONL file contains invalid JSON", None
+                    # JSONL should contain objects
+                    if not isinstance(record, dict):
+                        return "Existing JSONL file contains non-object records", None
+                    if line_index == 0:
+                        first_line_keys = list(record.keys())
+        except UnicodeError:
+            return f"Existing JSONL file is not valid {self._encoding}", None
+        if final_character != "\n":
+            return "Existing JSONL output does not end at an LF record boundary", None
+        return None, first_line_keys
+
     def validate_output_target(self) -> "OutputValidationResult":
         """Validate existing JSONL file structure against configured schema.
 
-        Reads the first line of the JSONL file to check field structure.
+        Scans every line so a baseline that cannot be appended to byte-for-byte
+        (an invalid or non-object line, or no trailing LF) is refused, and
+        takes the first line's keys to check field structure.
 
         Checks that:
         - Strict mode: Record fields match schema fields exactly (set comparison)
@@ -290,21 +295,12 @@ class JSONSink(BaseSink):
         if not self._path.exists() or self._path.stat().st_size == 0:
             return OutputValidationResult.success()
 
-        # Read first line to check structure
-        with open(self._path, encoding=self._encoding) as f:
-            first_line = f.readline().strip()
-            if not first_line:
-                return OutputValidationResult.success()
-            try:
-                first_record = json.loads(first_line)
-            except json.JSONDecodeError:
-                return OutputValidationResult.failure(message="Existing JSONL file contains invalid JSON")
-
-            # Ensure first record is a dict (JSONL should contain objects)
-            if not isinstance(first_record, dict):
-                return OutputValidationResult.failure(message="Existing JSONL file contains non-object records")
-
-            existing = list(first_record.keys())
+        baseline_failure, existing = self._scan_existing_jsonl()
+        if baseline_failure is not None:
+            return OutputValidationResult.failure(message=baseline_failure)
+        if existing is None:
+            # Blank first line: no field structure to compare against.
+            return OutputValidationResult.success()
 
         # Dynamic schema = no validation needed
         if self._schema_config.is_observed:
@@ -513,34 +509,24 @@ class JSONSink(BaseSink):
                 yield final
 
         def json_array_chunks() -> Iterator[bytes]:
+            # A JSON array is always rebuilt from the full cumulative snapshot:
+            # the config refuses format=json with mode=append and
+            # configure_for_resume refuses every format but jsonl, so
+            # continuation_emission never asks an array to keep file bytes.
+            if include_baseline:
+                raise FrameworkBugError(
+                    "JSONSink format='json' reached a baseline-append rebuild; JSON arrays never append "
+                    "(mode='append' is refused for format='json' and resume is jsonl-only)."
+                )
             encoder = codecs.getincrementalencoder(self._encoding)()
             iterator = iter(serialized_rows())
             try:
                 _first_ordinal, first = next(iterator)
             except StopIteration:
-                if include_baseline and target.exists():
-                    yield from iter_path_chunks(target)
-                else:
-                    yield encoder.encode("[]", final=True)
+                yield encoder.encode("[]", final=True)
                 return
 
-            baseline_nonempty = False
-            if include_baseline and target.exists():
-                size = target.stat().st_size
-                if size > 64:
-                    baseline_nonempty = True
-                else:
-                    with target.open(encoding=self._encoding) as stream:
-                        baseline_nonempty = stream.read().strip() != "[]"
-            if baseline_nonempty:
-                suffix_encoder = codecs.getincrementalencoder(self._encoding)()
-                suffix_encoder.setstate(0)
-                suffix = suffix_encoder.encode("]" if self._indent is None else "\n]", final=True)
-                yield from _iter_file_without_suffix(target, suffix)
-                encoder.setstate(0)
-                yield encoder.encode(", " if self._indent is None else ",\n")
-            else:
-                yield encoder.encode("[" if self._indent is None else "[\n")
+            yield encoder.encode("[" if self._indent is None else "[\n")
 
             if self._indent is None:
                 yield encoder.encode(first)

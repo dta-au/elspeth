@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
+from httpx import AsyncClient
 from sqlalchemy import func, insert, select, update
 
 from elspeth.contracts.session_operation import SessionOperationKind
@@ -92,8 +93,9 @@ def library_client(closed_local_app: SyncASGITestClient, tmp_path: Path) -> tupl
             )
         )
     client.app.state.identity_authority = RepositoryIdentityAuthority(engine, lifecycle_effect=lambda _token, _event: None)
+    parent_store = FilesystemPayloadStore(tmp_path / "payloads")
     client.app.state.library_authority = RepositoryLibraryAuthority(
-        engine, payload_store=FilesystemPayloadStore(tmp_path / "library-payloads")
+        engine, payload_store=FilesystemPayloadStore(parent_store.base_path / "library")
     )
     client.app.include_router(create_library_router())
     return client, actor, events
@@ -104,6 +106,27 @@ def _publish(client: SyncASGITestClient, *, owner: str = "alice") -> tuple[UUID,
     published = client.post(f"/api/sessions/{session_id}/library/publish", json={"title": "shared pipeline"})
     assert published.status_code == 201, published.text
     return session_id, published.json()
+
+
+def test_fork_parent_only_payload_returns_clear_unavailable_conflict(
+    library_client: tuple[SyncASGITestClient, _Actor, list[str]],
+    tmp_path: Path,
+) -> None:
+    client, actor, _events = library_client
+    _session_id, published = _publish(client)
+    actor.identity_id = "carol"
+    accepted = client.post(f"/api/library/{published['entry_id']}/accept", json={})
+    assert accepted.status_code == 200, accepted.text
+    authority = client.app.state.library_authority
+    digest = published["payload_digest"]
+    parent = FilesystemPayloadStore(tmp_path / "payloads")
+    parent.store(authority._payload_store.retrieve(digest))
+    authority._payload_store.delete(digest)
+    actor.identity_id = "bob"
+    response = SyncASGITestClient(client.app, raise_server_exceptions=False).post(f"/api/library/{published['entry_id']}/fork")
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["error_type"] == "library_payload_unavailable"
+    assert "republish" in response.json()["detail"]["detail"]
 
 
 def test_publish_curate_and_browse_hides_source_session(library_client: tuple[SyncASGITestClient, _Actor, list[str]]) -> None:
@@ -351,6 +374,52 @@ def test_fork_archives_new_session_if_seed_raises_internal_error(
     with pytest.raises(SessionNotFoundError):
         asyncio.run(client.app.state.session_service.get_session(created[0]))
     assert client.get("/api/sessions").json() == before
+
+
+def test_cancelled_library_fork_creation_archives_completed_session(
+    library_client: tuple[SyncASGITestClient, _Actor, list[str]],
+) -> None:
+    client, actor, _events = library_client
+    _, published = _publish(client)
+    actor.identity_id = "carol"
+    assert client.post(f"/api/library/{published['entry_id']}/accept", json={}).status_code == 200
+    actor.identity_id = "bob"
+    session_id = uuid4()
+    create_started = asyncio.Event()
+    finish_create = asyncio.Event()
+    archived: list[UUID] = []
+
+    class BlockedSessionService:
+        async def create_session(self, user_id: str, title: str, auth_provider_type: str) -> SimpleNamespace:
+            create_started.set()
+            await finish_create.wait()
+            return SimpleNamespace(id=session_id)
+
+        async def archive_session(self, created_id: UUID) -> None:
+            archived.append(created_id)
+
+    client.app.state.session_service = BlockedSessionService()
+
+    async def seed(**kwargs: object) -> SimpleNamespace:
+        raise AssertionError("seed must not run after cancellation")
+
+    client.app.state.library_state_seeder = seed
+
+    async def cancel_mid_create(http_client: AsyncClient) -> None:
+        request_task = asyncio.create_task(http_client.post(f"/api/library/{published['entry_id']}/fork"))
+        try:
+            await asyncio.wait_for(create_started.wait(), timeout=10)
+        except TimeoutError:
+            if request_task.done():
+                await request_task
+            raise
+        request_task.cancel("fork cancelled")
+        finish_create.set()
+        with pytest.raises(asyncio.CancelledError, match="fork cancelled"):
+            await request_task
+
+    client.run_in_one_loop(cancel_mid_create)
+    assert archived == [session_id]
 
 
 def test_recall_committed_before_fork_authorization_refuses(

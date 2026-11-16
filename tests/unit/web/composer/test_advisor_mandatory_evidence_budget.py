@@ -338,10 +338,9 @@ async def test_bound_end_preserves_mandatory_evidence_beyond_hint_allowance(
             runtime_preflight=None,
             outstanding_findings=None,
             publication_binding=current.binding,
-            saved_scope=evidence.render_saved_scope(),
         )
         assert current_candidate not in blocked.message
-        assert blocked.raw_assistant_content == evidence.render_saved_scope()
+        assert blocked.raw_assistant_content == ""
         await checkpoint._persist_advisor_terminal_publication(
             blocked, session_id=context.fence.session_id, session_operation_context=context
         )

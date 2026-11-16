@@ -127,16 +127,15 @@ class TestTruncateWithSuffixContract(TransformContractPropertyTestBase):
             Truncate(config)
 
 
-class TestTruncateStrictContract(TransformErrorContractTestBase):
-    """Contract tests for Truncate error handling in strict mode."""
+class TestTruncateRequiredFieldContract(TransformErrorContractTestBase):
+    """Contract tests: every configured field is required and string-valued (plugin review #146)."""
 
     @pytest.fixture
     def transform(self) -> TransformProtocol:
-        """Return a configured transform instance in strict mode."""
+        """Return a configured transform instance."""
         return Truncate(
             {
                 "fields": {"required_field": 100},
-                "strict": True,
                 "schema": {"mode": "observed"},
             }
         )
@@ -148,28 +147,29 @@ class TestTruncateStrictContract(TransformErrorContractTestBase):
 
     @pytest.fixture
     def error_input(self) -> dict[str, Any]:
-        """Return input that triggers error (missing required field in strict mode)."""
+        """Return input that triggers error (missing configured field)."""
         return {"other_field": "value", "id": 2}
 
-    def test_strict_missing_field_returns_error(
+    def test_missing_field_returns_error(
         self,
         transform: TransformProtocol,
         error_input: dict[str, Any],
         ctx: Any,
     ) -> None:
-        """Contract: Strict mode MUST return error with missing_field reason."""
+        """Contract: a missing configured field MUST return error with missing_field reason."""
         pipeline_row = make_pipeline_row(error_input)
         result = transform.process(pipeline_row, ctx)
         assert result.status == "error"
         assert result.reason is not None
         assert result.reason["reason"] == "missing_field"
+        assert result.retryable is False
 
-    def test_strict_wrong_type_returns_error(
+    def test_wrong_type_returns_error(
         self,
         transform: TransformProtocol,
         ctx: Any,
     ) -> None:
-        """Contract: Strict mode MUST return error when field is not a string."""
+        """Contract: MUST return error when field is not a string."""
         pipeline_row = make_pipeline_row({"required_field": 42, "id": 3})
         result = transform.process(pipeline_row, ctx)
         assert result.status == "error"
@@ -178,13 +178,14 @@ class TestTruncateStrictContract(TransformErrorContractTestBase):
         assert result.reason["field"] == "required_field"
         assert result.reason["expected"] == "str"
         assert result.reason["actual"] == "int"
+        assert result.retryable is False
 
-    def test_strict_none_value_returns_error(
+    def test_none_value_returns_error(
         self,
         transform: TransformProtocol,
         ctx: Any,
     ) -> None:
-        """Contract: Strict mode MUST return error when field value is None."""
+        """Contract: MUST return error when field value is None."""
         pipeline_row = make_pipeline_row({"required_field": None, "id": 4})
         result = transform.process(pipeline_row, ctx)
         assert result.status == "error"
@@ -198,11 +199,10 @@ class TestTruncateNonStringContract(TransformErrorContractTestBase):
 
     @pytest.fixture
     def transform(self) -> TransformProtocol:
-        """Return a configured transform in lenient (non-strict) mode."""
+        """Return a configured transform."""
         return Truncate(
             {
                 "fields": {"value": 10},
-                "strict": False,
                 "schema": {"mode": "observed"},
             }
         )
@@ -233,12 +233,16 @@ class TestTruncateNonStringContract(TransformErrorContractTestBase):
         assert result.reason["expected"] == "str"
         assert result.reason["actual"] == "int"
 
-    def test_configured_original_field_name_is_resolved(
+    def test_configured_original_field_name_is_not_resolved(
         self,
         transform: TransformProtocol,
         ctx: Any,
     ) -> None:
-        """Configured original names should resolve via PipelineRow contract."""
+        """A header spelling is not a lookup (plugin review #146): process() reads the name rows carry.
+
+        The engine's field-name spelling preflight refuses the header spelling
+        before process(); called directly, the field is simply not on the row.
+        """
         from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 
         mapped_contract = SchemaContract(
@@ -255,13 +259,13 @@ class TestTruncateNonStringContract(TransformErrorContractTestBase):
         original_name_transform = Truncate(
             {
                 "fields": {"Value Text": 5},
-                "strict": False,
                 "schema": {"mode": "observed"},
             }
         )
 
         result = original_name_transform.process(mapped_row, ctx)
 
-        assert result.status == "success"
-        assert result.row is not None
-        assert result.row["value"] == "abcde"
+        assert result.status == "error"
+        assert result.reason is not None
+        assert result.reason["reason"] == "missing_field"
+        assert result.reason["field"] == "Value Text"

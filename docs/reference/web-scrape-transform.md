@@ -43,6 +43,9 @@ HTTP(S) address in each row; `url` fixes the absolute address in the node.
 The latter is useful when many rows search the same site. Both use the same
 request-time SSRF validation and IP pinning. A fixed URL is also checked at
 config time without DNS resolution. `blob_fetch` supports the same URL choice.
+A URL containing an ASCII control character (C0 or DEL, including a trailing
+newline or tab) is refused before DNS as a `malformed_url` row error, whatever
+`allowed_origins` says; non-ASCII characters are unaffected.
 
 Set `http.allowed_origins` to restrict the initial URL and every redirect to
 the listed HTTP(S) origins. Matching uses the scheme, hostname, and effective
@@ -295,7 +298,8 @@ are refused.
 ### Unavailable authenticated and browser execution
 
 Authenticated execution remains unavailable: configured `auth` is hidden
-from Composer's catalog and refuses the row before DNS or HTTP. Response
+from Composer's catalog and a correctly bound `auth` block fails config
+validation, so pre-run validation reports it and no row is processed. Response
 validation does not protect confidential authenticated bodies, which the
 ordinary audit client persists before extraction. Enabling auth requires the
 retention and access policy and a protected response-evidence boundary before
@@ -313,12 +317,21 @@ proof that browser traffic cannot bypass audit and destination policy.
 | Field | Type | Description |
 |-------|------|-------------|
 | `{content_field}` | str | Extracted content |
-| `{fingerprint_field}` | str | SHA-256 fingerprint |
+| `{fingerprint_field}` | str | SHA-256 fingerprint (see below) |
 | `fetch_status` | int | HTTP status code |
 | `fetch_url_final` | str | Final URL after redirects |
 | `fetch_url_final_ip` | str | Final resolved IP after redirects |
 | `{records.field}` | list | CSS-selected or JSON-path candidate objects, when configured |
 | `{records.provenance_field}` | list | Aligned column source evidence, when configured |
+
+`fingerprint_mode: content` (default) hashes the extracted content with
+whitespace collapsed, so only a change of the extracted text changes it.
+`fingerprint_mode: full` hashes the exact extracted content together with, for
+every fetched page in order, the HTTP status, the persisted final URL (as in
+`fetch_url_final`), the raw `Content-Type` header and the SHA-256 of the
+content-decoded body (after transfer and content decoding, before text
+extraction). Other response headers are not covered: values such as `Date`,
+`Age` and cookies change on every fetch and would defeat change detection.
 
 ## Text Extraction And Line Splitting
 

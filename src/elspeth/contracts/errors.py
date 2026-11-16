@@ -758,6 +758,9 @@ class TransformErrorReason(TypedDict):
     configured_region: NotRequired[str]
     observed_region: NotRequired[str]
     bucket_region_verification: NotRequired[BucketRegionVerificationEvidence]
+    # A bucket_region_unverified outcome inherited from a concurrent row's
+    # single-flight HeadBucket call: this row made no call of its own.
+    cache_status: NotRequired[Literal["shared_failure"]]
     url: NotRequired[str]
     blob_ref: NotRequired[str]
     encoding: NotRequired[str]
@@ -2724,23 +2727,6 @@ class RetrievalNotReadyError(Exception):
         self.collection = collection
         self.reason = reason
         super().__init__(f"Collection {collection!r} not ready: {reason}")
-
-
-# TIER-2: Sink duplicate-write rejection — on_duplicate='error' policy enforcement; not a framework bug or audit corruption.
-class DuplicateDocumentError(Exception):
-    """Sink rejected a write because document IDs already exist in the collection.
-
-    Raised when on_duplicate='error' and pre-existing IDs are detected.
-    """
-
-    def __init__(self, *, collection: str, duplicate_ids: list[str]) -> None:
-        if not collection:
-            raise ValueError("collection must not be empty")
-        if not duplicate_ids:
-            raise ValueError("duplicate_ids must not be empty — DuplicateDocumentError requires at least one duplicate")
-        self.collection = collection
-        self.duplicate_ids = tuple(duplicate_ids)
-        super().__init__(f"Duplicate document IDs in collection {collection!r}: {list(self.duplicate_ids)}")
 
 
 # Capacity error classification for pooled API transforms.

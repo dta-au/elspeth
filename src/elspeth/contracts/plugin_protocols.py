@@ -411,6 +411,10 @@ class TransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protoco
     requires_aggregation_batch_context: bool
     requires_complete_source_batch: bool
 
+    # Largest batch the plugin's flush accepts (None: no cap). runtime_factory
+    # and the composer refuse an aggregation trigger.count above it.
+    max_batch_rows: int | None
+
     # True when every successful flush emits exactly one row per buffered row
     # (success_multi, buffered order, no quarantined_indices): the only shape
     # output_mode: passthrough carries. runtime_factory and the composer refuse
@@ -491,8 +495,8 @@ class TransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protoco
     # Fail-closed string-scan declaration surface (elspeth-b19dfe41fb).
     # Fields the transform requires to be present AND string-valued on every
     # arriving row, failing the row closed otherwise. Set at construction by
-    # the text-scanning family from their own scan-field options; empty
-    # frozenset for everything else. The type claim is consumed only at build
+    # the text-scanning family from their own scan-field options and by
+    # truncate from its ``fields`` keys; empty frozenset for everything else. The type claim is consumed only at build
     # time by validate_transform_string_typed_input_fields — there is no
     # runtime type dispatch, the plugins enforce it in their own process
     # paths. The names are also read declarations (declared_read_fields), so
@@ -709,6 +713,10 @@ class BatchTransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Pr
     # aggregation flush supplies; runtime_factory refuses it as a collector.
     requires_aggregation_batch_context: bool
     requires_complete_source_batch: bool
+
+    # Largest batch the plugin's flush accepts (None: no cap). runtime_factory
+    # and the composer refuse an aggregation trigger.count above it.
+    max_batch_rows: int | None
 
     # True when every successful flush emits exactly one row per buffered row
     # (success_multi, buffered order, no quarantined_indices): the only shape

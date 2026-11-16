@@ -88,6 +88,9 @@ def test_lists_only_snapshot_available_plugins(view: PolicyCatalogView) -> None:
     assert {item.name for item in view.list_sources()} == {"csv", "json", "llm", "text"}
     assert {item.name for item in view.list_sinks()} == {"csv", "document", "json", "text"}
     assert {item.name for item in view.list_transforms()} == {
+        "batch_experiment_compare",
+        "batch_replicate",
+        "batch_stats",
         "field_mapper",
         "file_inject",
         "line_explode",
@@ -96,6 +99,17 @@ def test_lists_only_snapshot_available_plugins(view: PolicyCatalogView) -> None:
         "report_assemble",
         "web_scrape",
     }
+
+
+@pytest.mark.parametrize("plugin", ["batch_stats", "batch_replicate", "batch_experiment_compare"])
+@pytest.mark.parametrize("allowlist", [(), ("transform:passthrough",)])
+def test_batch_plugins_are_always_available(plugin: str, allowlist: tuple[str, ...]) -> None:
+    from elspeth.web.plugin_policy.compiler import REQUIRED_WEB_PLUGIN_IDS
+
+    view = _build_view(plugin_allowlist=allowlist)
+    assert PluginId("transform", plugin) in REQUIRED_WEB_PLUGIN_IDS
+    assert plugin in {item.name for item in view.list_transforms()}
+    assert view.get_schema("transform", plugin).name == plugin
 
 
 def test_file_inject_is_in_default_web_surface(view: PolicyCatalogView) -> None:

@@ -21,10 +21,13 @@ from elspeth.plugins.infrastructure.clients.llm import (
     AuditedLLMClient,
     ContentPolicyError,
     ContextLengthError,
+    EmptyCompletionError,
+    FilteredCompletionError,
     LLMClientError,
     NetworkError,
     RateLimitError,
     ServerError,
+    UnsupportedResponseError,
     build_llm_call_request,
 )
 from elspeth.plugins.llm.config_validation import (
@@ -47,7 +50,6 @@ from elspeth.plugins.transforms.llm.provider import (
     FinishReason,
     LLMAuditParent,
     LLMQueryResult,
-    UnrecognizedFinishReason,
     finish_reason_from_raw_response,
 )
 
@@ -151,7 +153,7 @@ class BedrockConfig(LLMConfig):
         repr=False,
         description="Optional resolved AWS session token for temporary static credentials.",
     )
-    tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing (langfuse only)")
+    tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing (langfuse only)", repr=False)
 
     @field_validator("model")
     @classmethod
@@ -206,7 +208,13 @@ class _LiteLLMSDKAdapter:
 
 
 def _redacted_bedrock_error(error: LLMClientError) -> LLMClientError:
-    """Preserve ELSPETH's typed category without provider-controlled text."""
+    """Preserve ELSPETH's typed category without provider-controlled text.
+
+    A completion verdict (empty, filtered, tool calls) carries owned ELSPETH
+    text only, the same text the call row records, so it passes through.
+    """
+    if isinstance(error, (EmptyCompletionError, FilteredCompletionError, UnsupportedResponseError)):
+        return error
     if isinstance(error, RateLimitError):
         return RateLimitError(_STATIC_BEDROCK_ERROR)
     if isinstance(error, ContentPolicyError):
@@ -303,19 +311,13 @@ class BedrockLLMProvider:
         if response is None:
             raise RuntimeError("Bedrock response absent without a typed client error")
 
-        finish_reason = finish_reason_from_raw_response(response.raw_response)
-
-        if not response.content or not response.content.strip():
-            if finish_reason == FinishReason.TOOL_CALLS:
-                raise LLMClientError("Bedrock returned tool_calls response (not supported by ELSPETH)", retryable=False)
-            safe_finish_reason = "unrecognized" if isinstance(finish_reason, UnrecognizedFinishReason) else finish_reason
-            raise ContentPolicyError(f"Bedrock LLM returned empty content (finish_reason={safe_finish_reason})")
-
+        # AuditedLLMClient has already recorded and raised every empty
+        # completion with its classification, so content here is non-blank.
         return LLMQueryResult(
             content=response.content,
             usage=response.usage,
             model=response.model,
-            finish_reason=finish_reason,
+            finish_reason=finish_reason_from_raw_response(response.raw_response),
         )
 
     def runtime_preflight(self, *, operation_id: str, model: str, temperature: float | None, coordination_token: CoordinationToken) -> None:
@@ -352,9 +354,10 @@ class BedrockLLMProvider:
             call_mode_session=self._call_mode_session,
         )
         redacted_error: LLMClientError | None = None
+        response = None
         try:
             try:
-                client.chat_completion(
+                response = client.chat_completion(
                     model=model,
                     messages=smoke_messages,
                     temperature=temperature,
@@ -366,6 +369,15 @@ class BedrockLLMProvider:
             client.close()
         if redacted_error is not None:
             raise redacted_error from None
+        if response is None:
+            raise RuntimeError("Bedrock preflight response absent without a typed client error")
+        # A completed call is not readiness: an empty completion has already
+        # been recorded and raised by AuditedLLMClient, and a smoke reply that
+        # stopped for any reason but "stop" would fail a row too (same check
+        # as the Azure preflight).
+        finish_reason = finish_reason_from_raw_response(response.raw_response)
+        if finish_reason not in (None, FinishReason.STOP):
+            raise LLMClientError("Bedrock preflight returned an unusable finish reason", retryable=False)
 
     def _get_underlying_client(self) -> _LiteLLMSDKAdapter:
         with self._underlying_client_lock:

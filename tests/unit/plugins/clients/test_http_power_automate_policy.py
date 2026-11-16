@@ -57,6 +57,28 @@ def request():
     )
 
 
+def test_limiter_refusal_preserves_budget_and_no_send_in_policy_audit(monkeypatch: pytest.MonkeyPatch) -> None:
+    instance, execution, _telemetry = client()
+
+    def refuse(*, timeout: float | None = None) -> None:
+        assert timeout == 30.0
+        raise TimeoutError("permit unavailable")
+
+    monkeypatch.setattr(instance, "_acquire_rate_limit", refuse)
+    with pytest.raises(HTTPPolicyError) as raised:
+        instance.request_ssrf_safe("GET", request())
+    assert raised.value.code == "deadline_exceeded"
+    assert raised.value.refusal_category == "rate_limiter"
+    assert raised.value.wait_budget_seconds == 30.0
+    assert raised.value.request_sent is False
+    assert execution.record_call.call_count == 1
+    evidence = execution.record_call.call_args.kwargs["error"].to_dict()
+    assert evidence["type"] == "HTTPPolicyError"
+    assert evidence["refusal_category"] == "rate_limiter"
+    assert evidence["wait_budget_seconds"] == 30.0
+    assert evidence["request_sent"] is False
+
+
 def captured(execution):
     return execution.record_call.call_args.kwargs["response_data"].to_dict()
 
@@ -170,7 +192,8 @@ def test_guard_runs_after_limiter_and_prevents_dispatch():
     order = []
 
     class Limiter:
-        def acquire(self):
+        def acquire(self, *, timeout=None):
+            assert timeout == 30.0
             order.append("limiter")
 
     instance, execution, _ = client(limiter=Limiter())
@@ -472,13 +495,20 @@ def test_canonical_pa_json_positive_control(media_type):
 
 
 @respx.mock
-def test_generic_unsafe_integer_parsing_is_unchanged():
+def test_generic_unsafe_integer_is_recorded_as_parse_failure():
+    # An integer outside ±(2**53-1) cannot be canonicalized, so the real
+    # recorder's stable_hash would refuse it and no Call row would be written
+    # (sweep finding #21, 20261111-plugins-review). GENERIC now records the
+    # _json_parse_failed sentinel instead of the inadmissible parsed body.
     instance, execution, _ = client(HTTPAuditPolicy.GENERIC)
     respx.get(request().connection_url).mock(
         return_value=httpx.Response(200, content=b'{"rows":[9007199254740992]}', headers={"content-type": "application/json"})
     )
     instance.request_ssrf_safe("GET", request())
-    assert captured(execution)["body"] == {"rows": [9007199254740992]}
+    body = captured(execution)["body"]
+    assert body["_json_parse_failed"] is True
+    assert body["_raw_text"] == '{"rows":[9007199254740992]}'
+    canonical_json(captured(execution))
 
 
 @pytest.mark.parametrize("media_type", ["application/json-extra", "other/application/json"])

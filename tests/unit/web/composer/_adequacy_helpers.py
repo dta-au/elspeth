@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any
+from typing import Any, Union, get_origin
 
 from elspeth.web.composer.redaction import (
     HandlesNoSensitiveDataReason,
@@ -105,10 +105,16 @@ def _canonicalise_node(node: TraversalNode) -> dict[str, Any]:
     ``test_closure_state_mutation_false_negative`` and spec §4.4.3.
     """
     # Compute type_name: prefer __name__ (concrete type), fall back to repr.
-    try:
-        type_name: str = node.field_type.__name__
-    except AttributeError:
-        type_name = repr(node.field_type)
+    # Unions always take repr: Python 3.14 gave them ``__name__ == "Union"``,
+    # which would collapse every union to one spelling and stop the hash from
+    # seeing a change of union members.
+    if get_origin(node.field_type) is Union:
+        type_name: str = repr(node.field_type)
+    else:
+        try:
+            type_name = node.field_type.__name__
+        except AttributeError:
+            type_name = repr(node.field_type)
 
     # Encode only _SensitiveMarker entries; other metadata is not policy.
     encoded_metadata: list[dict[str, Any]] = []

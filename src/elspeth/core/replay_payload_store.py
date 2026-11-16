@@ -21,6 +21,7 @@ from elspeth.contracts.enums import CallStatus, CallType, RunMode
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.payload_store import IntegrityError, PayloadStore
+from elspeth.contracts.pdf_render import PDF_RENDER_FORMAT, PDF_RENDER_RETIRED_FORMATS
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.checkpoint.serialization import checkpoint_loads
 from elspeth.core.landscape.row_data import CallDataState, RowDataState
@@ -194,7 +195,12 @@ def collect_source_payload_refs(
         if response.state is not CallDataState.AVAILABLE or response.data is None:
             raise AuditIntegrityError(f"Source run {source_run_id}: PDF call {call.call_id} has no retained render receipt")
         receipt: Any = deep_thaw(response.data)
-        if type(receipt) is not dict or "format" not in receipt or receipt["format"] != "pdf_rasterize/v1":
+        if type(receipt) is dict and "format" in receipt and receipt["format"] in PDF_RENDER_RETIRED_FORMATS:
+            raise AuditIntegrityError(
+                f"Source run {source_run_id}: PDF state {call.state_id} was recorded as {receipt['format']}, "
+                f"which is no longer replayed (current {PDF_RENDER_FORMAT})"
+            )
+        if type(receipt) is not dict or "format" not in receipt or receipt["format"] != PDF_RENDER_FORMAT:
             raise AuditIntegrityError(f"Source run {source_run_id}: PDF state {call.state_id} has no typed render receipt")
         identity = receipt["renderer_identity"] if "renderer_identity" in receipt else None
         if type(identity) is not str or _HASH.fullmatch(identity) is None:

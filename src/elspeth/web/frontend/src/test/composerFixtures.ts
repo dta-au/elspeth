@@ -193,5 +193,6 @@ export function makeVersionHistory(): CompositionStateVersion[] {
     version,
     created_at: `2026-08-29T0${version - 10}:00:00Z`,
     node_count: version >= 15 ? 11 : 5,
+    is_milestone: false,
   }));
 }

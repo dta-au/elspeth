@@ -124,7 +124,7 @@ class BatchDistributionProfile(BaseTransform):
     name = "batch_distribution_profile"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e4a5e61cadd31134"
+    source_file_hash: str | None = "sha256:7eda1973294bc95a"
     config_model = BatchDistributionProfileConfig
     is_batch_aware = True
     # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
@@ -408,7 +408,15 @@ class BatchDistributionProfile(BaseTransform):
         lower_value = sorted_values[lower_index]
         upper_value = sorted_values[upper_index]
         fraction = position - lower_index
-        return float(lower_value + (upper_value - lower_value) * fraction)
+        span = upper_value - lower_value
+        if type(span) is float and not math.isfinite(span):
+            # Opposite-sign values near float max: the span overflows although
+            # the interpolated point is representable. The weighted form never
+            # leaves [lower, upper], so only a genuinely non-finite percentile
+            # reaches the float_overflow refusal. The ordinary branch below is
+            # kept for every finite span so existing results are byte-identical.
+            return float(lower_value * (1 - fraction) + upper_value * fraction)
+        return float(lower_value + span * fraction)
 
     @staticmethod
     def _require_finite_float(value: float, *, operation: str) -> float:

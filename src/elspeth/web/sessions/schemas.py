@@ -391,10 +391,15 @@ class CompositionStateResponse(_StrictResponse):
     created_at: datetime
     # Operational/audit metadata produced by the composer pipeline.
     # Known keys include ``repair_turns_used`` and ``implicit_decisions``.
-    # ``None`` is honest for revert/fork paths and
-    # for historical states written before this surface existed.
+    # Copies carry the source metadata; historical states may have none.
     composer_meta: CompositionObject | None = None
     plugin_policy_findings: list[PluginPolicyFindingResponse] = pydantic.Field(default_factory=list)
+
+
+class CompositionStateVersionResponse(CompositionStateResponse):
+    """History-only annotation, outside the immutable revert receipt hash domain."""
+
+    is_milestone: bool
 
 
 class ForkSessionRequest(_SessionOperationRequest):

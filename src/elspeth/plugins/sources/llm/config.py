@@ -192,10 +192,10 @@ class AzureOpenAILLMSourceConfig(LLMSourceConfig):
         description="Sampling temperature. Omitted or null uses the deployment default; set explicitly for deployments supporting sampling.",
     )
     deployment_name: str = Field(..., description="Azure deployment name")
-    endpoint: str = Field(..., description="Azure OpenAI endpoint URL")
+    endpoint: str = Field(..., description="Azure OpenAI endpoint URL", repr=False)
     api_key: str = Field(..., description="Azure OpenAI API key", repr=False)
     api_version: str = Field(default="2024-10-21", description="Azure API version")
-    tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration")
+    tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration", repr=False)
 
     @field_validator("endpoint")
     @classmethod
@@ -220,10 +220,14 @@ class OpenRouterLLMSourceConfig(LLMSourceConfig):
 
     provider: Literal["openrouter"] = Field(default="openrouter", description="LLM provider")
     model: str = Field(..., description="Model identifier")
-    api_key: str = Field(..., description="OpenRouter API key")
-    base_url: str = Field(default=OPENROUTER_BASE_URL, description="OpenRouter API base URL")
-    timeout_seconds: float = Field(default=60.0, gt=0, description="Request timeout")
-    tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration")
+    api_key: str = Field(..., description="OpenRouter API key", repr=False)
+    base_url: str = Field(default=OPENROUTER_BASE_URL, description="OpenRouter API base URL", repr=False)
+    timeout_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        description="Total wall-clock seconds from dispatch for each provider HTTP request, including DNS, connect, TLS, send, headers, body, and every redirect hop. Rate-limiter waits are bounded separately by the same number of seconds.",
+    )
+    tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration", repr=False)
 
     @field_validator("base_url")
     @classmethod
@@ -278,7 +282,7 @@ class BedrockLLMSourceConfig(LLMSourceConfig):
         repr=False,
         description="Optional resolved AWS session token for temporary static credentials.",
     )
-    tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration")
+    tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration", repr=False)
 
     @field_validator("model")
     @classmethod
@@ -308,15 +312,15 @@ class GatewayLLMSourceConfig(LLMSourceConfig):
         max_length=GATEWAY_MODEL_MAX_LENGTH,
         description="Logical model alias",
     )
-    endpoint: str = Field(..., description="Gateway base URL ending in '/v1'")
-    api_key: str = Field(..., description="Resolved gateway bearer credential")
+    endpoint: str = Field(..., description="Gateway base URL ending in '/v1'", repr=False)
+    api_key: str = Field(..., description="Resolved gateway bearer credential", repr=False)
     contract_major: int = Field(default=1, description="Gateway contract major version")
     required_capabilities: tuple[str, ...] = Field(default=(), description="Required gateway capabilities")
     timeout_seconds: float = Field(
         default=60.0,
         gt=GATEWAY_TIMEOUT_MIN_EXCLUSIVE,
         le=GATEWAY_TIMEOUT_MAX_SECONDS,
-        description="Request timeout",
+        description="Total wall-clock seconds from dispatch for each provider HTTP request, including DNS, connect, TLS, send, headers, body, and every redirect hop. Rate-limiter waits are bounded separately by the same number of seconds.",
     )
     max_tokens: int | None = Field(
         default=None,
@@ -324,7 +328,7 @@ class GatewayLLMSourceConfig(LLMSourceConfig):
         le=GATEWAY_MAX_TOKENS_LIMIT,
         description="Maximum tokens in response",
     )
-    tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration")
+    tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration", repr=False)
 
     @field_validator("endpoint")
     @classmethod

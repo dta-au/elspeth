@@ -9,6 +9,7 @@ import base64
 import hashlib
 import os
 import socket
+import traceback
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import patch
@@ -288,7 +289,10 @@ def test_web_scrape_auth_secret_ref_preflight_and_literal_policy() -> None:
     assert collect_credential_field_violations(options) == []
     assert collect_disallowed_secret_ref_markers(options) == []
     redacted = redact_secret_refs_for_validation({"options": options})["options"]
-    WebScrapeTransform(redacted)
+    # The redacted secret ref passes the origin binding and reaches the
+    # reservation refusal, not a credential or binding diagnostic.
+    with pytest.raises(PluginConfigError, match="response evidence is secret safe"):
+        WebScrapeTransform(redacted)
     options["auth"]["credential"] = "literal-token"
     assert collect_credential_field_violations(options) == ["credential"]
 
@@ -301,20 +305,17 @@ def test_web_scrape_basic_auth_accepts_printable_password_space() -> None:
 
 
 @respx.mock
-def test_web_scrape_auth_remains_closed_until_response_evidence_is_secret_safe(mock_ctx) -> None:
+def test_web_scrape_auth_remains_closed_until_response_evidence_is_secret_safe() -> None:
     route = respx.get(f"https://{_TEST_IP}:443/page").mock(return_value=httpx.Response(200, text="result"))
     options = _make_basic_transform_options()
     options["auth"] = {"scheme": "bearer", "origin": "https://example.com", "credential": "token"}
     options["http"]["allowed_origins"] = ["https://example.com"]
-    transform = WebScrapeTransform(options)
-    transform.on_start(mock_ctx)
-    with patch("socket.getaddrinfo", side_effect=AssertionError("DNS must not run")):
-        result = transform.process(make_pipeline_row({"url": "https://example.com/page"}), mock_ctx)
-    assert result.status == "error"
-    assert result.reason["reason"] == "validation_failed"
-    assert "response evidence is secret safe" in result.reason["error"]
+    with (
+        patch("socket.getaddrinfo", side_effect=AssertionError("DNS must not run")),
+        pytest.raises(PluginConfigError, match="response evidence is secret safe"),
+    ):
+        WebScrapeTransform(options)
     assert route.call_count == 0
-    assert mock_ctx.landscape.record_call.call_count == 0
 
 
 def test_web_scrape_auth_is_hidden_from_composer_catalog() -> None:
@@ -2185,8 +2186,25 @@ def test_query_options_reject_sensitive_names_and_duplicate_bindings() -> None:
 
     options["query_fields"] = {"SearchText": "company_query"}
     options["query"] = {"SearchText": "static"}
-    with pytest.raises(PluginConfigError, match="SearchText"):
+    with pytest.raises(PluginConfigError, match="query and query_fields repeat a parameter"):
         WebScrapeTransform(options)
+
+    duplicate_secret = "p5-duplicate-" + "runtime-secret"
+    duplicate_name = f"SearchText_{duplicate_secret}"
+    options["query_fields"] = {duplicate_name: "company_query"}
+    options["query"] = {duplicate_name: "static"}
+    with pytest.raises(PluginConfigError) as duplicate_error:
+        WebScrapeTransform(options)
+    assert "query and query_fields repeat a parameter" in str(duplicate_error.value)
+    assert duplicate_secret not in "".join(traceback.format_exception(duplicate_error.value))
+
+    secret = "p5-query-" + "runtime-secret"
+    options["query_fields"] = {f"api_key_{secret}": "company_query"}
+    options["query"] = {}
+    with pytest.raises(PluginConfigError) as caught:
+        WebScrapeTransform(options)
+    assert "query parameter must be nonempty and must not carry credentials" in str(caught.value)
+    assert secret not in "".join(traceback.format_exception(caught.value))
 
 
 @pytest.mark.parametrize(

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, Final, Literal, NotRequired, TypedDict
 
 from pydantic import ValidationError
 
+from elspeth.contracts.composer_llm_audit import ReasoningWithhold
 from elspeth.contracts.credential_material import (
     CREDENTIAL_REFUSAL_DETAIL as CREDENTIAL_REFUSAL_DETAIL,
 )
@@ -31,10 +33,27 @@ from elspeth.web.composer.protocol import ComposerAdmissionRefused
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
 
 if TYPE_CHECKING:
+    from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMProviderMetadata
     from elspeth.web.composer.state import CompositionState
 
 _OUT_OF_SCOPE_DATA_PLANE_CONTENT = "<data-plane-content>"
 _MALFORMED_TOOL_WIRE = object()
+_MODEL_OUTPUT_SURFACES: Final[frozenset[str]] = frozenset(
+    {
+        "composer_provider_response",
+        "composer_planner_response",
+        "composer_advisor_response",
+        "composer_provider_thinking",
+        "composer_tool_batch",
+        "composer_tool_wire",
+        "composer_recovery_reply",
+    }
+)
+_MODEL_OUTPUT_CREDENTIAL_REFUSAL_DETAIL: Final[str] = (
+    "The model's output appears to contain a credential, so it was blocked. "
+    "If you gave the Composer a credential, store it through the secret service and use a secret reference instead. "
+    "Otherwise, retry your request."
+)
 
 
 class CredentialMaterialRefusalPayload(TypedDict):
@@ -46,6 +65,7 @@ class CredentialMaterialRefusalPayload(TypedDict):
     category: str
     surface: str
     detector_version: str
+    cause: NotRequired[Literal["current_tool_loop_thinking_credential"]]
 
 
 class CredentialMaterialRefused(ComposerAdmissionRefused):
@@ -54,17 +74,41 @@ class CredentialMaterialRefused(ComposerAdmissionRefused):
     def __init__(self, *, surface: str, finding: CredentialMaterialFinding) -> None:
         self.surface = surface
         self.finding = finding
-        super().__init__(CREDENTIAL_REFUSAL_DETAIL)
+        self.detail = _MODEL_OUTPUT_CREDENTIAL_REFUSAL_DETAIL if surface in _MODEL_OUTPUT_SURFACES else CREDENTIAL_REFUSAL_DETAIL
+        super().__init__(self.detail)
 
     def to_payload(self) -> CredentialMaterialRefusalPayload:
         return {
             "error_type": "credential_material_rejected",
             "failure_code": "credential_material_rejected",
-            "detail": CREDENTIAL_REFUSAL_DETAIL,
+            "detail": self.detail,
             "category": self.finding.category,
             "surface": self.surface,
             "detector_version": self.finding.detector_version,
         }
+
+
+class CurrentToolLoopThinkingRefused(CredentialMaterialRefused):
+    """Native replay cannot omit or modify thinking within a provider turn."""
+
+    def __init__(self, *, finding: CredentialMaterialFinding) -> None:
+        super().__init__(surface="composer_provider_thinking", finding=finding)
+
+    def to_payload(self) -> CredentialMaterialRefusalPayload:
+        payload = super().to_payload()
+        payload["cause"] = "current_tool_loop_thinking_credential"
+        return payload
+
+
+def require_no_credential_material_in_native_thinking(blocks: Sequence[Mapping[str, str]]) -> None:
+    """Scan readable native thinking only; opaque replay bytes are not text."""
+    for block in blocks:
+        if block["type"] == "redacted_thinking":
+            continue
+        text = block["thinking"]
+        finding = find_credential_material(text, CredentialTraversalPolicy(max_string_bytes=len(text.encode("utf-8"))))
+        if finding is not None:
+            raise CurrentToolLoopThinkingRefused(finding=finding)
 
 
 def require_no_credential_material(
@@ -88,6 +132,37 @@ def require_no_credential_material(
         raise CredentialMaterialRefused(surface=surface, finding=finding)
 
 
+@dataclass(frozen=True, slots=True)
+class ReasoningScrubOutcome:
+    """Retained reasoning and value-free evidence, applied before release."""
+
+    reasoning_content: str | None
+    reasoning_details: Any | None
+    thinking_blocks: Any | None
+    withholds: tuple[ReasoningWithhold, ...]
+
+    def apply(self, metadata: _AdmittedLLMProviderMetadata) -> _AdmittedLLMProviderMetadata:
+        return replace(
+            metadata,
+            reasoning_content=self.reasoning_content,
+            reasoning_details=self.reasoning_details,
+            thinking_blocks=self.thinking_blocks,
+            reasoning_withholds=metadata.reasoning_withholds + self.withholds,
+        )
+
+
+def _readable_reasoning_details(value: Any) -> Any:
+    """Omit only opaque encrypted data from the bounded detector projection."""
+    if isinstance(value, (list, tuple)):
+        return [
+            {key: item_value for key, item_value in item.items() if key != "data"}
+            if isinstance(item, Mapping) and item.get("type") == "reasoning.encrypted"
+            else item
+            for item in value
+        ]
+    return value
+
+
 def require_no_credential_material_in_llm_metadata(
     *,
     content: str | None,
@@ -100,23 +175,29 @@ def require_no_credential_material_in_llm_metadata(
     finish_reason: str | None,
     provider_served: str | None,
     surface: str,
-) -> None:
-    """Reject every provider-authored text field that can be audited or replayed."""
+    thinking_replay_required: bool | None = None,
+) -> ReasoningScrubOutcome:
+    """Refuse control output; withhold credential-shaped diagnostic reasoning."""
+    withholds: list[ReasoningWithhold] = []
     unavailable_native = type(thinking_blocks) is str and thinking_blocks == PROVIDER_ARTIFACT_UNAVAILABLE
     if thinking_blocks is not None and not unavailable_native:
         from elspeth.web.composer.provider_thinking import native_thinking_blocks
 
-        # Native fields are scanned whole under their closed grammar; the
-        # generic control-value traversal limit is not a provider field cap.
+        # Readable native thinking is scanned whole under its closed grammar.
+        # Opaque replay fields are excluded from credential-text inspection.
         # The value-free unavailable diagnostic can be audited, but the native
         # replay parser still refuses it as an incomplete block list.
-        native_thinking_blocks(thinking_blocks)
+        try:
+            native_thinking_blocks(thinking_blocks)
+        except CurrentToolLoopThinkingRefused as exc:
+            if thinking_replay_required if thinking_replay_required is not None else bool(tool_calls):
+                raise
+            thinking_blocks = None
+            withholds.append(ReasoningWithhold(surface, exc.finding.category, exc.finding.detector_version, "thinking_blocks"))
     require_no_credential_material(
         {
             "content": content,
             "tool_calls": [{"id": call_id, "name": name} for call_id, name in tool_calls],
-            "reasoning_content": reasoning_content,
-            "reasoning_details": reasoning_details,
             "model_returned": model_returned,
             "provider_request_id": provider_request_id,
             "finish_reason": finish_reason,
@@ -124,6 +205,15 @@ def require_no_credential_material_in_llm_metadata(
         },
         surface=surface,
     )
+    content_finding = find_credential_material(reasoning_content)
+    if content_finding is not None:
+        reasoning_content = None
+        withholds.append(ReasoningWithhold(surface, content_finding.category, content_finding.detector_version, "reasoning_content"))
+    details_finding = find_credential_material(_readable_reasoning_details(reasoning_details))
+    if details_finding is not None:
+        reasoning_details = None
+        withholds.append(ReasoningWithhold(surface, details_finding.category, details_finding.detector_version, "reasoning_details"))
+    return ReasoningScrubOutcome(reasoning_content, reasoning_details, thinking_blocks, tuple(withholds))
 
 
 def field_mapper_credential_options_projection(options: Any) -> Any:

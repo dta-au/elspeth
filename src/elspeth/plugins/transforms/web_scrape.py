@@ -15,18 +15,19 @@ Audit Trail:
 - Generates fingerprints for change detection
 """
 
+import hashlib
 import ipaddress
 import math
 import time
 from collections.abc import Mapping
 from dataclasses import asdict, replace
 from ipaddress import IPv4Network, IPv6Network
-from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 from urllib.parse import parse_qsl, urlsplit
 from xml.sax.saxutils import escape as escape_xml_text
 
 import httpx
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, Field, field_validator, model_validator
 
 from elspeth.contracts import CallType, Determinism
 from elspeth.contracts.audit import Call
@@ -52,16 +53,19 @@ from elspeth.core.security.web import (
     HTTPOrigin,
     SSRFBlockedError,
     SSRFSafeRequest,
+    configured_url_refusal_message,
     parse_http_origin,
     validate_allowed_http_origin,
     validate_archived_ssrf_request,
     validate_configured_url_for_ssrf,
     validate_url_for_ssrf,
+    validate_url_scheme,
 )
 from elspeth.core.security.web import (
     NetworkError as SSRFNetworkError,
 )
 from elspeth.plugins.infrastructure.base import BaseTransform
+from elspeth.plugins.infrastructure.clients.deadline import http_deadline_scope
 from elspeth.plugins.infrastructure.clients.fingerprinting import (
     MAX_AUDIT_QUERY_CHARS,
     MAX_AUDIT_QUERY_FIELDS,
@@ -97,7 +101,7 @@ from elspeth.plugins.transforms.web_scrape_extraction import (
     extract_css_records,
     extract_css_records_with_provenance,
 )
-from elspeth.plugins.transforms.web_scrape_fingerprint import compute_fingerprint
+from elspeth.plugins.transforms.web_scrape_fingerprint import FetchResponseContext, compute_fingerprint
 from elspeth.plugins.transforms.web_scrape_json_extraction import JSONRecordsConfig, extract_json_records_with_provenance
 from elspeth.plugins.transforms.web_scrape_links import resolve_discovered_href
 from elspeth.plugins.transforms.web_scrape_pagination import (
@@ -225,7 +229,7 @@ class WebScrapeHTTPConfig(BaseModel):
     timeout: int = Field(
         default=30,
         gt=0,
-        description="Request timeout in seconds",
+        description="Total wall-clock seconds from dispatch for each HTTP request, including DNS, connect, TLS, send, headers, body, and every redirect hop. Rate-limiter waits are bounded separately by the same number of seconds.",
     )
     max_body_bytes: int = Field(
         default=10 * 1024 * 1024,  # 10 MB
@@ -251,7 +255,9 @@ class WebScrapeHTTPConfig(BaseModel):
         default="public_only",
         description="SSRF allowlist: 'public_only' (default), 'allow_private', or list of CIDR ranges",
     )
-    allowed_origins: tuple[str, ...] = Field(default=(), description="Exact HTTP(S) origins permitted for initial requests and redirects.")
+    allowed_origins: tuple[str, ...] = Field(
+        default=(), description="Exact HTTP(S) origins permitted for initial requests and redirects.", repr=False
+    )
 
     @field_validator("allowed_origins")
     @classmethod
@@ -294,10 +300,6 @@ class WebScrapeHTTPConfig(BaseModel):
 class WebScrapeConfig(TransformDataConfig):
     """Configuration for web scrape transform."""
 
-    # A nested secret can appear in an outer model's rejected input mapping,
-    # including when validation fails on an unrelated option.
-    model_config: ClassVar[ConfigDict] = ConfigDict(**TransformDataConfig.model_config, hide_input_in_errors=True)
-
     url_field: str | None = Field(
         default=None,
         description=(
@@ -309,7 +311,7 @@ class WebScrapeConfig(TransformDataConfig):
             "value_transform that prepends 'https://' before this transform."
         ),
     )
-    url: str | None = Field(default=None, description="Fixed absolute HTTP(S) URL for every row; exclusive with url_field.")
+    url: str | None = Field(default=None, description="Fixed absolute HTTP(S) URL for every row; exclusive with url_field.", repr=False)
     content_field: str = Field(description="Output field that receives the fetched page content.")
     fingerprint_field: str = Field(description="Output field that receives the page fingerprint.")
     method: Literal["GET", "POST"] = Field(default="GET", description="HTTP method for fetching the row URL.")
@@ -318,9 +320,9 @@ class WebScrapeConfig(TransformDataConfig):
     request_multipart_field: str | None = Field(
         default=None, description="Row field containing ordered multipart text entries or payload-store blob references."
     )
-    query: dict[str, str] = Field(default_factory=dict, description="Static URL query parameters sent with each request.")
+    query: dict[str, str] = Field(default_factory=dict, description="Static URL query parameters sent with each request.", repr=False)
     query_fields: dict[str, str] = Field(default_factory=dict, description="Map URL query parameter names to input row field names.")
-    headers: dict[str, str] = Field(default_factory=dict, description="Validated static public-page request headers.")
+    headers: dict[str, str] = Field(default_factory=dict, description="Validated static public-page request headers.", repr=False)
     header_fields: dict[str, str] = Field(default_factory=dict, description="Map validated request header names to input row fields.")
     format: Literal["markdown", "text", "raw"] = Field(
         default="markdown",
@@ -346,7 +348,10 @@ class WebScrapeConfig(TransformDataConfig):
     )
     fingerprint_mode: Literal["content", "full"] = Field(
         default="content",
-        description="Whether fingerprints cover processed content only or the full fetch response context.",
+        description=(
+            "Hash of the extracted content with whitespace collapsed (content), or of the exact content plus each "
+            "fetched page's HTTP status, final URL, content type and content-decoded body hash (full)."
+        ),
     )
     strip_elements: list[str] = Field(
         default_factory=lambda: ["script", "style"],
@@ -399,10 +404,10 @@ class WebScrapeConfig(TransformDataConfig):
     def _validate_query_options(self) -> "WebScrapeConfig":
         duplicate_names = self.query.keys() & self.query_fields.keys()
         if duplicate_names:
-            raise ValueError(f"query and query_fields repeat parameter {sorted(duplicate_names)[0]!r}")
+            raise ValueError("query and query_fields repeat a parameter")
         for name in self.query.keys() | self.query_fields.keys():
             if not name or is_sensitive_query_param(name):
-                raise ValueError(f"query parameter {name!r} must be nonempty and must not carry credentials")
+                raise ValueError("query parameter must be nonempty and must not carry credentials")
         for field_name in self.query_fields.values():
             if not field_name:
                 raise ValueError("query_fields row field names must not be empty")
@@ -455,7 +460,7 @@ class WebScrapeConfig(TransformDataConfig):
                 validate_configured_url_for_ssrf(self.url, allowed_ranges=allowed_ranges)
                 validate_allowed_http_origin(self.url, tuple(parse_http_origin(value) for value in self.http.allowed_origins))
             except SSRFBlockedError as exc:
-                raise ValueError(f"url: {exc}") from exc
+                raise ValueError(configured_url_refusal_message(exc.kind)) from None
         if self.auth is not None:
             auth_origin = self.auth.parsed_origin
             allowed_origins = tuple(parse_http_origin(value) for value in self.http.allowed_origins)
@@ -466,6 +471,10 @@ class WebScrapeConfig(TransformDataConfig):
                     validate_allowed_http_origin(self.url, (auth_origin,))
                 except SSRFBlockedError as exc:
                     raise ValueError("fixed url must match auth.origin") from exc
+            # The binding checks above keep their specific diagnostics; a
+            # correctly bound auth block is still refused here, before any row,
+            # rather than failing every row at process time.
+            raise ValueError("authenticated web_scrape is unavailable until response evidence is secret safe")
         return self
 
     @model_validator(mode="after")
@@ -743,6 +752,22 @@ def _build_web_scrape_output_semantics(
     )
 
 
+def _fetch_response_context(response: httpx.Response, final_hostname_url: str) -> FetchResponseContext:
+    """Return the per-page response facts a ``full`` fingerprint covers.
+
+    ``final_url`` is the persisted ``fetch_url_final`` rendering, so the
+    fingerprint never hashes a raw URL secret the row itself does not carry.
+    ``response.content`` is the body after transfer and content decoding,
+    before text extraction.
+    """
+    return FetchResponseContext(
+        status_code=response.status_code,
+        final_url=fingerprint_url(final_hostname_url),
+        content_type=response.headers["content-type"] if "content-type" in response.headers else None,
+        body_sha256=hashlib.sha256(response.content).hexdigest(),
+    )
+
+
 def _final_response_ip(response: httpx.Response) -> str:
     """Extract the final IP-pinned destination from an SSRF-safe response."""
     try:
@@ -787,12 +812,15 @@ class WebScrapeTransform(BaseTransform):
         fingerprint_field: Field to store content fingerprint
         format: Output format ("markdown", "text", "raw")
         text_separator: Separator between DOM text nodes when format is text
-        fingerprint_mode: Fingerprinting mode ("content", "full")
+        fingerprint_mode: Fingerprinting mode ("content": whitespace-normalized content;
+            "full": exact content plus each page's status, final URL, content type and content-decoded body hash)
         strip_elements: HTML tags to remove (default: ["script", "style"])
         http:
             abuse_contact: Email for abuse reports (required)
             scraping_reason: Why we're scraping (required)
-            timeout: Request timeout in seconds (default: 30)
+            timeout: Total wall-clock seconds from dispatch per request (default: 30),
+                including DNS, connect, TLS, send, headers, body, and redirects;
+                rate-limiter waits have a separate bound of the same duration.
 
     Error Handling (follows LLM plugin pattern):
         - Retryable errors (5xx, 429, network): Re-raised for engine retry
@@ -818,8 +846,8 @@ class WebScrapeTransform(BaseTransform):
     output_naming_config_keys = frozenset({"content_field", "fingerprint_field"})
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
-    plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:eb90d8e44c6ff93d"
+    plugin_version = "2.0.0"
+    source_file_hash: str | None = "sha256:4c81c5d216a479f8"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -875,6 +903,10 @@ class WebScrapeTransform(BaseTransform):
         # Parse and validate config
         cfg = WebScrapeConfig.from_dict(options, plugin_name=self.name)
         self._initialize_declared_input_fields(cfg)
+        string_fields = set(cfg.query_fields.values()) | set(cfg.header_fields.values())
+        if cfg.url_field is not None:
+            string_fields.add(cfg.url_field)
+        self.declared_string_input_fields = frozenset(string_fields)
 
         # Required fields
         self._url_field = cfg.url_field
@@ -1330,6 +1362,9 @@ class WebScrapeTransform(BaseTransform):
                 raise FrameworkBugError("web_scrape has no configured URL source")
             if type(url) is not str:
                 raise TypeError("URL field must be a string")
+            # The shared origin check refuses ASCII control characters (C0 and
+            # DEL, which httpx rejects with httpx.InvalidURL) whatever
+            # allowed_origins says, so a trailing newline is a row error.
             validate_allowed_http_origin(url, self._request_allowed_origins)
             if request_params:
                 try:
@@ -1339,6 +1374,11 @@ class WebScrapeTransform(BaseTransform):
                     return TransformResult.error({"reason": "validation_failed", "error": "query parameters cannot be URL encoded"})
                 if encoded_url_size > 8192:
                     return TransformResult.error({"reason": "validation_failed", "error": "URL with query parameters exceeds 8192 bytes"})
+            # Refuse a malformed URL shape before replay/verify compute
+            # fingerprint_url, whose urlsplit raises a bare ValueError; this is
+            # the same first check live mode's validate_url_for_ssrf applies,
+            # so every run mode records the same row refusal.
+            validate_url_scheme(url)
             session = ctx.call_mode_session
             if session is not None and session.mode is RunMode.REPLAY:
                 archived = session.replay_ssrf_request(
@@ -1498,6 +1538,7 @@ class WebScrapeTransform(BaseTransform):
             )
 
         body_size = len(response.content)
+        response_contexts = [_fetch_response_context(response, final_hostname_url)]
         records: list[dict[str, str | list[str] | None]] | None = None
         record_provenance: list[dict[str, dict[str, object]]] | None = None
         if self._records is not None:
@@ -1522,7 +1563,10 @@ class WebScrapeTransform(BaseTransform):
             initial_request_url = str(httpx.Request("GET", url, params=request_params or None).url)
             page_contents = [content]
             page_records = list(records) if records is not None else None
-            seen_urls = {initial_request_url, final_hostname_url}
+            # Every discovered next URL is canonicalized with fingerprint_url
+            # before the cycle check, so seen URLs must be held in that same
+            # spelling; httpx and urlencode escape query characters differently.
+            seen_urls = {fingerprint_url(initial_request_url), fingerprint_url(final_hostname_url)}
             total_body_bytes = body_size
             next_source = self._pagination.mode
             pagination_pages.append(
@@ -1579,11 +1623,18 @@ class WebScrapeTransform(BaseTransform):
                     safe_next = self._validate_pagination_url(next_url, ctx, request_headers=request_headers)
                 except (SSRFBlockedError, SSRFNetworkError) as exc:
                     return TransformResult.error(row_url_policy_refusal(exc))
+                # The page fetch shares the pagination budget: the nested
+                # deadline scope cuts a slow page off when max_elapsed_seconds
+                # runs out instead of letting it overrun by one HTTP timeout.
+                pagination_remaining = self._pagination.max_elapsed_seconds - (time.monotonic() - pagination_started)
+                if pagination_remaining <= 0:
+                    return TransformResult.error({"reason": "pagination_limit_exceeded", "error": "elapsed time limit exceeded"})
                 try:
-                    if request_headers:
-                        response, final_hostname_url, call = self._fetch_url(safe_next, ctx, request_headers=request_headers)
-                    else:
-                        response, final_hostname_url, call = self._fetch_url(safe_next, ctx)
+                    with http_deadline_scope(pagination_remaining):
+                        if request_headers:
+                            response, final_hostname_url, call = self._fetch_url(safe_next, ctx, request_headers=request_headers)
+                        else:
+                            response, final_hostname_url, call = self._fetch_url(safe_next, ctx)
                 except BodyTooLargeError as exc:
                     return TransformResult.error(
                         {"reason": "body_too_large", "body_size": exc.body_size, "max_body_bytes": exc.max_body_bytes}
@@ -1593,6 +1644,8 @@ class WebScrapeTransform(BaseTransform):
                         {"reason": "body_too_large", "error": "response encoding limit exceeded", "error_type": exc.reason}
                     )
                 except WebScrapeError as exc:
+                    if time.monotonic() - pagination_started > self._pagination.max_elapsed_seconds:
+                        return TransformResult.error({"reason": "pagination_limit_exceeded", "error": "elapsed time limit exceeded"})
                     if exc.retryable:
                         raise
                     return TransformResult.error({"reason": "api_error", "error": str(exc), "error_type": type(exc).__name__})
@@ -1638,6 +1691,7 @@ class WebScrapeTransform(BaseTransform):
                         {"reason": "content_extraction_failed", "error": str(exc), "error_type": type(exc).__name__}
                     )
                 page_contents.append(next_content)
+                response_contexts.append(_fetch_response_context(response, final_hostname_url))
                 if len(self._aggregate_page_contents(page_contents)) > self._pagination.max_total_content_chars or (
                     page_records is not None and len(page_records) > self._pagination.max_total_records
                 ):
@@ -1653,13 +1707,13 @@ class WebScrapeTransform(BaseTransform):
                         next_source=next_source,
                     )
                 )
-                seen_urls.update((next_url, final_hostname_url))
+                seen_urls.update((next_url, fingerprint_url(final_hostname_url)))
             content = self._aggregate_page_contents(page_contents)
             records = page_records
             final_resolved_ip = _final_response_ip(response)
 
         # Compute fingerprint
-        fingerprint = compute_fingerprint(content, mode=self._fingerprint_mode)
+        fingerprint = compute_fingerprint(content, mode=self._fingerprint_mode, responses=response_contexts)
 
         # Field collision check already done before fetch — no need to re-check here.
 

@@ -92,7 +92,7 @@ may select, so a deployment exposes a subset [EV-009], [EV-013].
 | Kind | Count | Registered plugins that can reach outside the process |
 |---|---:|---|
 | Sources | 9 | `aws_s3`, `azure_blob`, `dataverse`, `llm` |
-| Transforms | 39 | `llm`, `blob_fetch`, `web_scrape`, `azure_ai_search`, `rag_retrieval`, `azure_content_safety`, `azure_prompt_shield`, `azure_document_intelligence`, `aws_bedrock_content_safety`, `aws_bedrock_prompt_shield`, `aws_textract_document_analysis`, `aws_textract_inline_analysis` |
+| Transforms | 39 | `llm`, `blob_fetch`, `web_scrape`, `azure_ai_search`, `rag_retrieval`, `azure_content_safety`, `azure_prompt_shield`, `azure_document_intelligence`, `azure_content_understanding`, `aws_bedrock_content_safety`, `aws_bedrock_prompt_shield`, `aws_textract_document_analysis`, `aws_textract_inline_analysis` |
 | Sinks | 9 | `aws_s3`, `azure_blob`, `chroma_sink`, `database`, `dataverse` |
 
 The exact enabled set and its operator profiles belong in the controlled
@@ -103,7 +103,7 @@ corresponding boundary crossings.
 
 | Layer | Product baseline at the reviewed commit | Evidence |
 |---|---|---|
-| Language and runtime | Python 3.12+ from source; Python 3.13 in the official distroless container runtime | [EV-627] |
+| Language and runtime | Python 3.14+ from source; CPython 3.14, shipped with the application, on the distroless `cc-debian13` container runtime | [EV-627] |
 | Web | FastAPI served by uvicorn; React and TypeScript frontend built with Vite | [EV-003] |
 | Data access | SQLAlchemy Core | [EV-003] |
 | Databases | SQLite, with optional SQLCipher for the Landscape, for single-host use; PostgreSQL 16 for external-state deployment profiles | [EV-003], [EV-320] |
@@ -150,7 +150,7 @@ The product creates or writes the following stores [EV-010], [EV-103],
 | Store | Product content | Location setting | Product boundary |
 |---|---|---|---|
 | Landscape audit database | Runs, rows, tokens, node states, external calls, routing, outcomes, authentication events and secret-resolution fingerprints | `landscape_url`; otherwise SQLite under `data_dir` | Authoritative audit record; optional SQLCipher passphrase for SQLite |
-| Payload store | Retained row and call payloads referenced from the Landscape | `payload_store_path`; otherwise under `data_dir` | Default retention 90 days; purge removes eligible payloads while hashes remain [EV-325], [EV-326] |
+| Payload store | Retained row and call payloads referenced from Landscape; share snapshots and frozen files in `shares/`; published library YAML in `library/` | `payload_store_path`; otherwise under `data_dir` | Run payloads have default retention 90 days and purge removes eligible hashes while audit hashes remain [EV-325], [EV-326]; run purge pointed at the parent store does not enter `shares/` or `library/` (never point purge at either subtree). Back up both. Pre-change share bytes in the parent store remain purge-exposed when identical to run bytes; pre-change library entries require republication |
 | Sessions database | Composer sessions/messages/state, web run records, identities, local roles, SSO handoffs, quotas, preferences and encrypted user secrets | `session_db_url`; otherwise SQLite under `data_dir` | Separate from the Landscape; user secrets are encrypted and scoped [EV-212], [EV-306] |
 | Local credential store (`auth.db`) | Local bcrypt password hashes, hashed verification tokens and durable verification-delivery intents | Under `data_dir` | Local authentication only; owner-only regular file [EV-103], [EV-018] |
 | Email-verification delivery outbox | Email address, local user ID, delivery ID, one-time token and verification URL awaiting a deployment delivery process | `email-verifications.jsonl` under `data_dir` | Optional; owner-only file. ELSPETH does not deliver email [EV-018] |

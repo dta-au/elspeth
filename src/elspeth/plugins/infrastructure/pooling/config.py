@@ -10,6 +10,40 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from elspeth.plugins.infrastructure.pooling.throttle import ThrottleConfig
 
 
+def validate_pool_delay_invariants(
+    *,
+    min_dispatch_delay_ms: int,
+    max_dispatch_delay_ms: int,
+    recovery_step_ms: int,
+    pooled: bool,
+) -> None:
+    """Validate delay ordering and, for a pooled config, AIMD backoff viability.
+
+    Shared by ``PoolConfig`` and by configs that carry the pool knobs flat
+    (``LLMConfig``), so the rule has one authority and a flat config can run
+    it inside its own ``model_validate``. Ensures that:
+
+    1. min_dispatch_delay_ms <= max_dispatch_delay_ms (always: the pair is
+       contradictory whether or not a pool is built)
+    2. when ``pooled``, AIMD backoff can actually produce a non-zero delay,
+       preventing infinite-speed retry loops on capacity errors
+
+    Raises:
+        ValueError: naming the violated invariant.
+    """
+    if min_dispatch_delay_ms > max_dispatch_delay_ms:
+        raise ValueError(f"min_dispatch_delay_ms ({min_dispatch_delay_ms}) cannot exceed max_dispatch_delay_ms ({max_dispatch_delay_ms})")
+    if not pooled:
+        return
+    if max_dispatch_delay_ms == 0:
+        raise ValueError("max_dispatch_delay_ms must be > 0 to allow AIMD backoff on capacity errors")
+    if min_dispatch_delay_ms == 0 and recovery_step_ms == 0:
+        raise ValueError(
+            "min_dispatch_delay_ms and recovery_step_ms cannot both be 0: "
+            "AIMD recovery would never increase delay above 0, disabling backoff entirely"
+        )
+
+
 class PoolConfig(BaseModel):
     """Pool configuration for concurrent API requests.
 
@@ -40,24 +74,13 @@ class PoolConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_delay_invariants(self) -> Self:
-        """Validate delay ordering and AIMD backoff viability.
-
-        Ensures that:
-        1. min_dispatch_delay_ms <= max_dispatch_delay_ms
-        2. AIMD backoff can actually produce a non-zero delay, preventing
-           infinite-speed retry loops on capacity errors
-        """
-        if self.min_dispatch_delay_ms > self.max_dispatch_delay_ms:
-            raise ValueError(
-                f"min_dispatch_delay_ms ({self.min_dispatch_delay_ms}) cannot exceed max_dispatch_delay_ms ({self.max_dispatch_delay_ms})"
-            )
-        if self.max_dispatch_delay_ms == 0:
-            raise ValueError("max_dispatch_delay_ms must be > 0 to allow AIMD backoff on capacity errors")
-        if self.min_dispatch_delay_ms == 0 and self.recovery_step_ms == 0:
-            raise ValueError(
-                "min_dispatch_delay_ms and recovery_step_ms cannot both be 0: "
-                "AIMD recovery would never increase delay above 0, disabling backoff entirely"
-            )
+        """Validate delay ordering and AIMD backoff viability (see ``validate_pool_delay_invariants``)."""
+        validate_pool_delay_invariants(
+            min_dispatch_delay_ms=self.min_dispatch_delay_ms,
+            max_dispatch_delay_ms=self.max_dispatch_delay_ms,
+            recovery_step_ms=self.recovery_step_ms,
+            pooled=True,
+        )
         return self
 
     def to_throttle_config(self) -> ThrottleConfig:

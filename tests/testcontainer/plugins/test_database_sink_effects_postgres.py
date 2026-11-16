@@ -101,8 +101,15 @@ def test_postgres_marker_rows_and_result_partition_commit_atomically(postgres_ur
         _CTX,
     )
 
+    effect_input = SinkEffectPipelineMembersInput(
+        members=members, target_snapshot_members=members, target_delivered_member_count=len(members)
+    )
+    racers = [inject_write_failure(DatabaseSink(config)) for _ in range(2)]
+    for racer in racers:
+        # The executor restages commit rows from durable members before every commit.
+        racer.restage_effect(plan, effect_input, _CTX)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(inject_write_failure(DatabaseSink(config)).commit_effect, plan, _CTX) for _ in range(2)]
+        futures = [pool.submit(racer.commit_effect, plan, _CTX) for racer in racers]
         committed, concurrent_replay = (future.result(timeout=10) for future in futures)
     recovered = inject_write_failure(DatabaseSink(config)).reconcile_effect(plan, _CTX)
 

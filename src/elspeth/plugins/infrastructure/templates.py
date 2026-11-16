@@ -85,6 +85,13 @@ _MAX_WORKER_ADDRESS_GROWTH = 256 * 1024 * 1024
 # The render's wall clock. It starts when the request reaches a worker that
 # has reported ready, so interpreter start and imports are never charged to a row.
 _WORKER_TIMEOUT_SECONDS = 5.0
+# CPU seconds each request may use beyond what the worker had already used:
+# the soft RLIMIT_CPU a request runs under (``_serve_request``). It also
+# decides whose a wall-clock timeout is: a template can neither sleep nor do
+# I/O in the sandbox, so a worker that used less than this when the clock ran
+# out was off-CPU (a contended host, swapping, a stopped process), which says
+# nothing about the row (``_render_timeout_error``).
+_RENDER_CPU_BUDGET_SECONDS = 2
 # How long a new worker may take to report ready. Starting ELSPETH's own
 # worker is not row work: one that never becomes ready is ELSPETH's failure.
 _WORKER_START_TIMEOUT_SECONDS = 60.0
@@ -716,9 +723,12 @@ def _serve_request(source: str, payload: bytes, value_free: bool) -> tuple[str, 
     bug too: the template sees only plain row values (``TemplateRow``), never
     owned framework API, so it cannot come from row data (``render_tier1``).
     A read of a field the node does not declare is reported with its own
-    value-free text (``undeclared_field``). Any other failure is this row's
-    and is reported by its class alone, whatever ``value_free`` says, because
-    its message can quote row data.
+    value-free text (``undeclared_field``). Any other failure is reported by
+    its class alone when ``value_free`` is set, because its message can quote
+    row data; otherwise its bounded message is returned. ``value_free`` is the
+    default, and the parent sets it for every context that carries a
+    ``TemplateRow`` (``_BoundedTemplate.render``), so only an operator-only
+    context (no row) whose caller opted out ever gets the raw message.
     """
     try:
         # RLIMIT_CPU is cumulative over a process lifetime. Give each
@@ -726,7 +736,7 @@ def _serve_request(source: str, payload: bytes, value_free: bool) -> tuple[str, 
         # worker lifts the soft limit back to that bound after the render.
         _, hard_limit = resource.getrlimit(resource.RLIMIT_CPU)
         usage = resource.getrusage(resource.RUSAGE_SELF)
-        cpu_limit = math.ceil(usage.ru_utime + usage.ru_stime + 2)
+        cpu_limit = math.ceil(usage.ru_utime + usage.ru_stime + _RENDER_CPU_BUDGET_SECONDS)
         if hard_limit != resource.RLIM_INFINITY and cpu_limit > hard_limit:
             return "worker_spent", ""
         resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, hard_limit))
@@ -748,7 +758,9 @@ def _serve_request(source: str, payload: bytes, value_free: bool) -> tuple[str, 
         for piece in template.generate(**context):
             size += len(piece.encode("utf-8"))
             if size > _MAX_RENDER_BYTES:
-                raise TemplateError(f"Rendered template exceeds {_MAX_RENDER_BYTES} UTF-8 bytes")
+                # ELSPETH's own bound: its text names no value, so it is
+                # reported in full whatever value_free says.
+                return "render_too_large", ""
             pieces.append(piece)
         return "ok", "".join(pieces)
     except _ValueFreeUndefinedError as exc:
@@ -888,13 +900,52 @@ def _start_worker(index: int) -> tuple[Any, Any]:
     return process, parent
 
 
+def _process_cpu_seconds(pid: int) -> float:
+    """User plus system CPU seconds a live (or unreaped) process has used.
+
+    Read from ``/proc/<pid>/stat`` (the worker already relies on ``/proc``):
+    fields 14 and 15, counted after the parenthesised command name, which may
+    itself contain spaces or parentheses.
+    """
+    stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    fields = stat[stat.rindex(")") + 2 :].split()
+    return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+
+
+def _render_timeout_error(*, cpu_used_seconds: float) -> Exception:
+    """Classify a render whose wall clock ran out, by the CPU it used.
+
+    A worker that used its request's CPU budget ran the row's template for
+    that long: the row's ``TemplateError`` (RLIMIT_CPU's SIGXCPU is about to
+    end it anyway). One that used less was off-CPU for most of the wall clock
+    (host contention, swapping, a stopped process), which says nothing about
+    the row: ``TemplateWorkerLostError``, which the run retries on a new worker.
+    The text names only times, never row data.
+    """
+    if cpu_used_seconds >= _RENDER_CPU_BUDGET_SECONDS:
+        return TemplateError("Template exceeded the execution time limit")
+    return TemplateWorkerLostError(
+        f"Template worker did not reply within {_WORKER_TIMEOUT_SECONDS:g} s of wall clock "
+        f"after using {cpu_used_seconds:.2f} s of its {_RENDER_CPU_BUDGET_SECONDS} s CPU budget"
+    )
+
+
 def _exchange(entry: tuple[Any, Any], source: str, payload: bytes, value_free: bool) -> tuple[str, str]:
     """Send one request to a running worker and read its reply."""
     process, parent = entry
     try:
+        cpu_before = _process_cpu_seconds(process.pid)
+    except OSError as exc:
+        # No /proc entry: the worker has already been reaped.
+        raise _worker_death(process, rendering=False) from exc
+    try:
         parent.send((source, payload, value_free))
         if not parent.poll(_WORKER_TIMEOUT_SECONDS):
-            raise TemplateError("Template exceeded the execution time limit")
+            try:
+                cpu_used = _process_cpu_seconds(process.pid) - cpu_before
+            except OSError as exc:
+                raise _worker_death(process, rendering=True) from exc
+            raise _render_timeout_error(cpu_used_seconds=cpu_used)
         status, value = parent.recv()
     except (EOFError, BrokenPipeError, ConnectionResetError) as exc:
         # A worker that ended with the request still unread resets the
@@ -903,7 +954,7 @@ def _exchange(entry: tuple[Any, Any], source: str, payload: bytes, value_free: b
     return status, value
 
 
-def _run_template_worker(source: str, payload: bytes, *, value_free: bool = False) -> str:
+def _run_template_worker(source: str, payload: bytes, *, value_free: bool = True) -> str:
     if len(payload) > _MAX_CONTEXT_BYTES:
         raise TemplateError(f"Template context exceeds {_MAX_CONTEXT_BYTES} bytes")
     index = _AVAILABLE_WORKERS.get_nowait()
@@ -941,6 +992,8 @@ def _run_template_worker(source: str, payload: bytes, *, value_free: bool = Fals
         if status == "retired_row_name":
             # A fixed text: it names the reserved set, never the name read.
             raise TemplateError(f"Reserved row name: {value}")
+        if status == "render_too_large":
+            raise TemplateError(f"Rendered template exceeds {_MAX_RENDER_BYTES} UTF-8 bytes")
         if value_free:
             if status == "safe_undefined":
                 raise TemplateError(f"Undefined variable: {value}")
@@ -981,7 +1034,7 @@ def _run_template_worker(source: str, payload: bytes, *, value_free: bool = Fals
 
 
 class _BoundedTemplate:
-    def __init__(self, source: str, *, value_free: bool = False) -> None:
+    def __init__(self, source: str, *, value_free: bool = True) -> None:
         self._source = source
         self._value_free = value_free
 
@@ -989,14 +1042,20 @@ class _BoundedTemplate:
         _check_template_source(self._source)
         _WORKER_SLOTS.acquire()
         try:
-            transport = _pack_context_value(context)
-            return _run_template_worker(self._source, pickle.dumps(transport, protocol=5), value_free=self._value_free)
+            packed: dict[int, Any] = {}
+            transport = _pack_context_value(context, memo=packed)
+            # A render failure's message can quote row data, so a context that
+            # carries a row always renders value-free, whatever the environment
+            # was built with; raw messages are kept only for operator-only
+            # contexts whose caller opted out with value_free=False.
+            value_free = self._value_free or any(type(value) is _RowTransport for value in packed.values())
+            return _run_template_worker(self._source, pickle.dumps(transport, protocol=5), value_free=value_free)
         finally:
             _WORKER_SLOTS.release()
 
 
 class _BoundedEnvironment(_LocalSandboxedEnvironment):
-    def __init__(self, *, value_free: bool = False, **kwargs: Any) -> None:
+    def __init__(self, *, value_free: bool = True, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._value_free = value_free
 
@@ -1224,11 +1283,15 @@ def _literal_argument(argument: nodes.Expr) -> tuple[bool, int | float | str | N
     return False, None
 
 
-def create_sandboxed_environment(*, value_free: bool = False) -> ImmutableSandboxedEnvironment:
+def create_sandboxed_environment(*, value_free: bool = True) -> ImmutableSandboxedEnvironment:
     """Create an ImmutableSandboxedEnvironment with StrictUndefined.
 
     Args:
-        value_free: Render failures use only operator-authored keys and types.
+        value_free: Render failures use only operator-authored keys and types
+            (the default). Pass ``False`` only where no row data can ever reach
+            the render context, to keep raw diagnostics for operator-only
+            values. A render whose context carries a ``TemplateRow`` is
+            value-free whatever this says.
 
     Returns:
         A sandboxed Jinja2 environment that:

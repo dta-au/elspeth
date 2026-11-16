@@ -19,7 +19,7 @@ from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
-from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError, require_scalar_group_key
+from elspeth.plugins.transforms._batch_row_types import MAX_BATCH_ROWS, BatchRowTypeError, require_scalar_group_key
 from elspeth.plugins.transforms._scalar_buckets import (
     ScalarBucketKey,
     same_scalar_bucket_value,
@@ -37,19 +37,27 @@ ValueType = Literal["numeric", "categorical"]
 # numeric statistics are floats whatever the input's numeric type (the means
 # sum ``float(value)``; the KS distance and the categorical total variation and
 # chi-square accumulate from float literals); ``category_shifts`` and
-# ``new_categories`` are lists the schema DSL has no type for.
+# ``new_categories`` are lists the schema DSL has no type for, and so are the
+# ``*_missing_indices`` / ``*_non_finite_indices`` lists, which name each
+# skipped row by its BATCH index (empty when nothing was skipped).
+# ``chi_square_statistic`` is Pearson's chi-square test of homogeneity over the
+# 2 x k table of every category seen in either cohort (``_categorical_shifts``).
 _COMMON_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
     FieldDefinition("baseline_cohort", "any"),
     FieldDefinition("baseline_count", "int"),
     FieldDefinition("baseline_missing_count", "int"),
+    FieldDefinition("baseline_missing_indices", "any"),
     FieldDefinition("baseline_non_finite_count", "int"),
+    FieldDefinition("baseline_non_finite_indices", "any"),
     FieldDefinition("baseline_total_count", "int"),
     FieldDefinition("batch_size", "int"),
     FieldDefinition("cohort", "any"),
     FieldDefinition("cohort_count", "int"),
     FieldDefinition("cohort_field", "str"),
     FieldDefinition("cohort_missing_count", "int"),
+    FieldDefinition("cohort_missing_indices", "any"),
     FieldDefinition("cohort_non_finite_count", "int"),
+    FieldDefinition("cohort_non_finite_indices", "any"),
     FieldDefinition("cohort_total_count", "int"),
     FieldDefinition("value_field", "str"),
     FieldDefinition("value_type", "str"),
@@ -71,7 +79,6 @@ _CATEGORICAL_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
 )
 _NUMERIC_OUTPUT_FIELDS = frozenset(field.name for field in _NUMERIC_CREATED_FIELDS)
 _CATEGORICAL_OUTPUT_FIELDS = frozenset(field.name for field in _CATEGORICAL_CREATED_FIELDS)
-_MAX_BATCH_ROWS = 4096
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,9 +157,10 @@ class BatchDriftCompare(BaseTransform):
     name = "batch_drift_compare"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:187be834da2fa281"
+    source_file_hash: str | None = "sha256:04ff6dd1e539b73f"
     config_model = BatchDriftCompareConfig
     is_batch_aware = True
+    max_batch_rows: int = MAX_BATCH_ROWS
     # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
     flush_emits_one_row_per_buffered_row = False
     usage_when_to_use: str = (
@@ -192,8 +200,12 @@ class BatchDriftCompare(BaseTransform):
                 composer_hints=(
                     "Use output_mode: transform; passthrough requires one emitted row per buffered row. A failed batch applies on_error to every buffered input; discard records quarantine outcomes.",
                     "Use batch_drift_compare under aggregations with a trigger; it compares distributions after a batch flush.",
+                    f"An aggregation trigger count above {MAX_BATCH_ROWS} is refused before the run; a flush over "
+                    f"{MAX_BATCH_ROWS} buffered rows fails the whole batch (batch_too_large), so do not rely on an "
+                    "end-of-source flush (omitted trigger) when the input can exceed it.",
                     "cohort_field and value_field must differ; baseline_cohort defaults to the first-seen cohort.",
-                    "Set value_type=numeric for mean and KS-style distance, or categorical for category shifts and total variation.",
+                    "Set value_type=numeric for mean and KS-style distance, or categorical for category shifts, total variation "
+                    "and a chi-square homogeneity statistic over every category seen in either cohort.",
                     "Output is cohort comparison rows and does not preserve the original row shape.",
                 ),
             )
@@ -395,12 +407,12 @@ class BatchDriftCompare(BaseTransform):
         return TransformResult.error(reason, retryable=False)
 
     @staticmethod
-    def _error_for_batch_too_large(*, batch_size: int) -> TransformResult:
+    def _error_for_batch_too_large(*, batch_size: int, max_batch_rows: int) -> TransformResult:
         reason: TransformErrorReason = {
             "reason": "validation_failed",
             "cause": "batch_too_large",
             "batch_size": batch_size,
-            "expected": f"at most {_MAX_BATCH_ROWS} rows",
+            "expected": f"at most {max_batch_rows} rows",
         }
         return TransformResult.error(reason, retryable=False)
 
@@ -442,6 +454,7 @@ class BatchDriftCompare(BaseTransform):
         shifts: list[dict[str, object]] = []
         total_variation_sum = 0.0
         chi_square = 0.0
+        pooled_count = baseline.count + cohort.count
         new_categories: list[object] = []
         for value in values:
             value_key = scalar_bucket_key(value)
@@ -450,9 +463,16 @@ class BatchDriftCompare(BaseTransform):
             baseline_prop = baseline_count / baseline.count
             cohort_prop = cohort_count / cohort.count
             total_variation_sum += abs(baseline_prop - cohort_prop)
-            expected = baseline_prop * cohort.count
-            if expected > 0:
-                chi_square += ((cohort_count - expected) ** 2) / expected
+            # Pearson's chi-square test of homogeneity over the 2 x k table of
+            # every category seen in EITHER cohort. Each cell's expected count
+            # is its cohort's size times the category's pooled share. Both
+            # cohorts are non-empty and every category in the union was seen
+            # at least once, so no expected count is zero: a category new in
+            # the cohort (or one the cohort lost) contributes like any other.
+            category_count = baseline_count + cohort_count
+            for observed, cohort_size in ((baseline_count, baseline.count), (cohort_count, cohort.count)):
+                expected = cohort_size * category_count / pooled_count
+                chi_square += ((observed - expected) ** 2) / expected
             if baseline_count == 0 and cohort_count > 0:
                 new_categories.append(value)
             shifts.append(
@@ -484,6 +504,12 @@ class BatchDriftCompare(BaseTransform):
             "cohort_missing_count": cohort.missing_count,
             "baseline_non_finite_count": baseline.non_finite_count,
             "cohort_non_finite_count": cohort.non_finite_count,
+            # The rows left out of the published statistic, by BATCH index
+            # (row content stays out), as batch_stats records its skips.
+            "baseline_missing_indices": list(baseline.missing_indices),
+            "cohort_missing_indices": list(cohort.missing_indices),
+            "baseline_non_finite_indices": list(baseline.non_finite_indices),
+            "cohort_non_finite_indices": list(cohort.non_finite_indices),
         }
 
     def _numeric_result(self, *, baseline: _CohortValues, cohort: _CohortValues, batch_size: int) -> BatchDriftCompareRow:
@@ -562,8 +588,8 @@ class BatchDriftCompare(BaseTransform):
         """Compare baseline and current cohort distributions over a batch."""
         if not rows:
             return TransformResult.error({"reason": "empty_batch"}, retryable=False)
-        if len(rows) > _MAX_BATCH_ROWS:
-            return self._error_for_batch_too_large(batch_size=len(rows))
+        if len(rows) > self.max_batch_rows:
+            return self._error_for_batch_too_large(batch_size=len(rows), max_batch_rows=self.max_batch_rows)
 
         non_finite_error = self._non_finite_group_key_error(rows)
         if non_finite_error is not None:

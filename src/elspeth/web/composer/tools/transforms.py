@@ -83,6 +83,7 @@ from elspeth.web.composer.tools.declarations import (
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_TEMPLATE_PARTS_KEY,
+    VAGUE_TERM_QUERY_OVERRIDE_PREFIX,
     approved_prompt_artifact_hash_from_options,
     composition_review_contract_error,
     reconcile_authoritative_reviews,
@@ -771,7 +772,13 @@ def _execute_upsert_node(
             return _saved_graph_plugin_policy_failure(state, plugin_error, component=None, rejected_component=node_ref)
         context.catalog.get_schema("transform", plugin)
 
-        batch_placement_error = _batch_aware_placement_error(node_id, node_type, plugin, validated.output_mode)
+        batch_placement_error = _batch_aware_placement_error(
+            node_id,
+            node_type,
+            plugin,
+            validated.output_mode,
+            validated.trigger.model_dump(exclude_unset=True) if validated.trigger is not None else None,
+        )
         if batch_placement_error is not None:
             return _saved_graph_rejection_result(
                 state, batch_placement_error, error_code="batch_transform_misplaced", rejected_component=node_ref
@@ -933,7 +940,14 @@ def _execute_upsert_node(
     review_contract_error = composition_review_contract_error(new_state)
     if review_contract_error is not None:
         return _saved_graph_rejection_result(
-            state, review_contract_error, error_code="interpretation_review_contract_unsatisfied", rejected_component=None
+            state,
+            review_contract_error,
+            error_code=(
+                "vague_term_query_override"
+                if review_contract_error.startswith(VAGUE_TERM_QUERY_OVERRIDE_PREFIX)
+                else "interpretation_review_contract_unsatisfied"
+            ),
+            rejected_component=None,
         )
 
     # Affected: the node itself plus nodes with edges referencing it
@@ -1455,7 +1469,14 @@ def _execute_splice_transform(
     review_contract_error = composition_review_contract_error(reconciled)
     if review_contract_error is not None:
         return _saved_graph_rejection_result(
-            state, review_contract_error, error_code="interpretation_review_contract_unsatisfied", rejected_component=None
+            state,
+            review_contract_error,
+            error_code=(
+                "vague_term_query_override"
+                if review_contract_error.startswith(VAGUE_TERM_QUERY_OVERRIDE_PREFIX)
+                else "interpretation_review_contract_unsatisfied"
+            ),
+            rejected_component=None,
         )
     profile_validation = context.catalog.validate_composition_state(reconciled)
     if not profile_validation.validation.is_valid:
@@ -1878,7 +1899,9 @@ def _execute_patch_node_options(
         # run, in the same order. Without them a required_input_fields patch
         # on a batch-aware node reached plugin construction, whose fail-closed
         # FrameworkBugError escaped the tool and ended the turn as a 500.
-        batch_placement_error = _batch_aware_placement_error(node_id, current.node_type, current.plugin, current.output_mode)
+        batch_placement_error = _batch_aware_placement_error(
+            node_id, current.node_type, current.plugin, current.output_mode, current.trigger
+        )
         if batch_placement_error is not None:
             return _saved_graph_rejection_result(
                 state, batch_placement_error, error_code="batch_transform_misplaced", rejected_component=node_ref
@@ -1991,7 +2014,14 @@ def _execute_patch_node_options(
     review_contract_error = composition_review_contract_error(new_state)
     if review_contract_error is not None:
         return _saved_graph_rejection_result(
-            state, review_contract_error, error_code="interpretation_review_contract_unsatisfied", rejected_component=None
+            state,
+            review_contract_error,
+            error_code=(
+                "vague_term_query_override"
+                if review_contract_error.startswith(VAGUE_TERM_QUERY_OVERRIDE_PREFIX)
+                else "interpretation_review_contract_unsatisfied"
+            ),
+            rejected_component=None,
         )
     echo_note = _echoed_metadata_note(requirement_echo=requirement_echo)
     return _mutation_result(
@@ -2153,7 +2183,7 @@ def _prepare_transform_candidate(
     if plugin_error is not None:
         return _saved_graph_plugin_policy_failure(state, plugin_error, component=None, rejected_component=node_ref)
     context.catalog.get_schema("transform", plugin)
-    batch_placement_error = _batch_aware_placement_error(node_id, node_type, plugin, output_mode)
+    batch_placement_error = _batch_aware_placement_error(node_id, node_type, plugin, output_mode, trigger)
     if batch_placement_error is not None:
         return _saved_graph_rejection_result(
             state, batch_placement_error, error_code="batch_transform_misplaced", rejected_component=node_ref

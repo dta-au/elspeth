@@ -160,6 +160,7 @@ from elspeth.web.interpretation_state import (
     BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX,
     INTERPRETATION_REQUIREMENTS_KEY,
     SOURCE_AUTHORING_KEY,
+    VAGUE_TERM_QUERY_OVERRIDE_PREFIX,
     VAGUE_TERM_UNWIRED_PREFIX,
     InterpretationReviewCapacityError,
     UnknownInterpretationRequirementError,
@@ -1608,7 +1609,9 @@ def build_set_pipeline_candidate(
             if plugin_error is not None:
                 _record_component_rejection(_plugin_policy_failure(state, plugin_error, rejected_component=node_ref))
                 continue
-            batch_placement_error = _batch_aware_placement_error(node_id, node_type, node_plugin, node.output_mode)
+            batch_placement_error = _batch_aware_placement_error(
+                node_id, node_type, node_plugin, node.output_mode, node.trigger.model_dump() if node.trigger is not None else None
+            )
             if batch_placement_error is not None:
                 _record_component_rejection(
                     _failure_result(state, batch_placement_error, error_code="batch_transform_misplaced", rejected_component=node_ref)
@@ -2079,7 +2082,9 @@ def build_set_pipeline_candidate(
         # wiring a prompt_template_parts interpretation_ref, not restaging
         # (session 4c42a794, 2026-09-01).
         review_contract_code = (
-            "vague_term_unwired"
+            "vague_term_query_override"
+            if review_contract_error.startswith(VAGUE_TERM_QUERY_OVERRIDE_PREFIX)
+            else "vague_term_unwired"
             if review_contract_error.startswith(VAGUE_TERM_UNWIRED_PREFIX)
             else "interpretation_review_contract_unsatisfied"
         )

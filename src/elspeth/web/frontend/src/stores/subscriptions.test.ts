@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { act, waitFor } from "@testing-library/react";
@@ -7,6 +7,7 @@ import { useSessionStore } from "./sessionStore";
 import { useExecutionStore } from "./executionStore";
 import { useAuditReadinessStore } from "./auditReadinessStore";
 import { useAuthStore } from "./authStore";
+import { usePreferencesStore } from "./preferencesStore";
 import { useInterpretationEventsStore } from "./interpretationEventsStore";
 import * as api from "@/api/client";
 import type { Session } from "../types/api";
@@ -175,6 +176,9 @@ describe("subscriptions — auditReadiness clearSession on session removal", () 
 });
 
 describe("subscriptions — validation result side effects", () => {
+  afterEach(() => {
+    usePreferencesStore.setState(usePreferencesStore.getInitialState(), true);
+  });
   beforeEach(() => {
     _resetSubscriptionsForTesting();
     // The review-note phrasing reads the pending kinds from this store; clear
@@ -613,7 +617,12 @@ describe("subscriptions — validation result side effects", () => {
     expect(leaf).not.toMatch(/\.tsx"/);
   });
 
-  it("replaces the pending message with a ready-to-run nudge once reviews resolve", () => {
+  it.each([
+    [null, "Run pipeline"],
+    ["sess-1", "Continue to Run"],
+    ["other-session", "Run pipeline"],
+  ])("replaces the pending message with the correct run control for tutorial session %s", (tutorialSessionId, control) => {
+    usePreferencesStore.setState({ tutorialStage: "build", tutorialSessionId });
     const injectSystemMessage = vi.fn();
     useSessionStore.setState({
       activeSessionId: "sess-1",
@@ -672,7 +681,8 @@ describe("subscriptions — validation result side effects", () => {
     const calls = injectSystemMessage.mock.calls;
     const lastCall = calls[calls.length - 1] as [string, string];
     expect(lastCall[0]).toContain("ready");
-    expect(lastCall[0]).toContain("Run pipeline");
+    expect(lastCall[0]).toContain(control);
+    if (control === "Continue to Run") expect(lastCall[0]).not.toContain("Run pipeline");
     // Names the CONTROL, never a place (ux-review 2026-08-13, the
     // elspeth-eba8820005 defect class): a locative is a second thing that can
     // contradict the layout, and this copy previously said "in the side

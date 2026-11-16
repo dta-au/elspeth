@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, cast
 
@@ -21,7 +22,7 @@ from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError, require_scalar_group_key
 from elspeth.plugins.transforms._scalar_buckets import same_scalar_bucket_value
 
-type TopKValue = str | int | float | bool | None
+type TopKValue = str | int | float | bool | Decimal | datetime | None
 type BatchTopKRow = dict[str, object]
 
 # Every output field with the type the plugin's code fixes (ADR-050):
@@ -86,7 +87,7 @@ class BatchTopK(BaseTransform):
     name = "batch_top_k"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:26510751574334a4"
+    source_file_hash: str | None = "sha256:1d3cfb23e9f4708c"
     config_model = BatchTopKConfig
     is_batch_aware = True
     # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
@@ -248,7 +249,9 @@ class BatchTopK(BaseTransform):
         if value is None:
             return None
 
-        if type(value) not in (str, int, float, bool):
+        # The same scalar set require_scalar_group_key admits for group_by:
+        # a value this plugin partitions by is a value it can count.
+        if type(value) not in (str, int, float, bool, Decimal, datetime):
             # BATCH-level failure, not a skip. A missing value (None, above) and a
             # non-finite float (in `_top_k_row_for`) skip-and-report; a non-scalar
             # (a JSON array or object, deep-frozen to tuple / mappingproxy) has no
@@ -260,7 +263,7 @@ class BatchTopK(BaseTransform):
             raise BatchRowTypeError(
                 field=field_name,
                 row_index=row_index,
-                expected="a scalar top-k value (str, int, float, bool, or None)",
+                expected="a scalar top-k value (str, int, float, bool, Decimal, datetime, or None)",
                 found=type(value).__name__,
             )
 
@@ -289,7 +292,9 @@ class BatchTopK(BaseTransform):
                 if not self._include_missing:
                     continue
 
-            if type(value) is float and not math.isfinite(value):
+            if self._is_non_finite_group_key(value):
+                # A non-finite float or Decimal has no stable frequency bucket
+                # (NaN != NaN): skip-and-report, the same for both types.
                 non_finite_count += 1
                 continue
 

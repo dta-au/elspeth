@@ -248,7 +248,7 @@ class TestAWSS3SinkConfig:
     def test_non_text_to_bytes_csv_codec_is_rejected_at_config(self, encoding: str) -> None:
         from elspeth.plugins.sinks.aws_s3_sink import AWSS3SinkConfig
 
-        with pytest.raises(PluginConfigError, match="text to bytes"):
+        with pytest.raises(PluginConfigError, match="not a text encoding"):
             AWSS3SinkConfig.from_dict(_base_config(csv_options={"encoding": encoding}), plugin_name="aws_s3")
 
 
@@ -322,11 +322,11 @@ class TestSerialization:
             with pytest.raises(S3RecordSizeLimitError):
                 _serialize([row], format="json", fieldnames=["v"], max_record_chars=100)
 
-    @pytest.mark.parametrize(("value_size", "accepted"), [(97, True), (98, True), (99, False)])
+    @pytest.mark.parametrize(("value_size", "accepted"), [(99, True), (100, True), (101, False)])
     def test_csv_record_limit_max_minus_one_max_and_max_plus_one(self, value_size: int, accepted: bool) -> None:
         from elspeth.plugins.sinks.aws_s3_sink import S3RecordSizeLimitError
 
-        row = {"v": "x" * value_size}  # one value plus CRLF is value_size + 2
+        row = {"v": "x" * value_size}  # the final CRLF frames the record and is excluded
         if accepted:
             serialized = _serialize(
                 [row],
@@ -387,12 +387,14 @@ class TestSerialization:
     def test_non_text_codec_runtime_failure_is_static_and_cause_free(self, encoding: str) -> None:
         from elspeth.plugins.sinks.aws_s3_sink import (
             CSVWriteOptions,
-            S3RecordSerializationError,
+            S3HeaderSerializationError,
             _serialize_rows_to_spool,
         )
 
+        # The codec first fails on the header record, which is a configuration
+        # defect (sweep finding #28), not a row failure.
         options = CSVWriteOptions.model_construct(delimiter=",", encoding=encoding, include_header=True)
-        with pytest.raises(S3RecordSerializationError) as captured:
+        with pytest.raises(S3HeaderSerializationError) as captured:
             _serialize_rows_to_spool(
                 [{"id": 1}],
                 format="csv",

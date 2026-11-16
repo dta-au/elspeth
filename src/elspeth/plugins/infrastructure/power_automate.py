@@ -217,16 +217,18 @@ class _PowerAutomateOptions(DataPluginConfig):
     trigger_url: StrictStr | None = Field(
         default=None,
         description="Unsigned HTTPS trigger URL for OAuth authentication; omit when auth supplies a signed callback URL.",
+        repr=False,
     )
     allowed_origin: StrictStr = Field(
-        description="Exact approved HTTPS origin for the flow, without a path or query; every request must stay on this origin."
+        description="Exact approved HTTPS origin for the flow, without a path or query; every request must stay on this origin.",
+        repr=False,
     )
     timeout_seconds: float = Field(
         default=90,
         gt=0,
         le=110,
         allow_inf_nan=False,
-        description="Absolute HTTP exchange deadline in seconds, including connection and bounded response reading; maximum 110 seconds.",
+        description="Total wall-clock seconds from dispatch for each HTTP exchange, including DNS, connect, TLS, send, headers, body, and every redirect hop; maximum 110 seconds. Rate-limiter waits are bounded separately by the same number of seconds.",
     )
     max_request_body_bytes: PositiveInt = Field(
         default=1048576, description="Maximum UTF-8 byte size of a serialized read, status or write request before dispatch."

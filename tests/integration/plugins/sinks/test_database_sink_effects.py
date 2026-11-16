@@ -357,12 +357,18 @@ def test_response_loss_recovers_exact_zero_row_result_from_marker(tmp_path: Path
     with engine.begin() as conn:
         conn.execute(insert(target), [{"id": 7, "name": "existing"}])
 
-    plan = _prepare(
-        inject_write_failure(DatabaseSink(_config(url))),
-        ({"id": 7, "name": "duplicate-a"}, {"id": 7, "name": "duplicate-b"}),
-        effect_id="b" * 64,
+    rows = ({"id": 7, "name": "duplicate-a"}, {"id": 7, "name": "duplicate-b"})
+    plan = _prepare(inject_write_failure(DatabaseSink(_config(url))), rows, effect_id="b" * 64)
+    # A fresh instance holds no commit rows; the executor restages them from
+    # the durable members before every commit.
+    committing = inject_write_failure(DatabaseSink(_config(url)))
+    members = tuple(_member(ordinal, row) for ordinal, row in enumerate(rows))
+    committing.restage_effect(
+        plan,
+        SinkEffectPipelineMembersInput(members=members, target_snapshot_members=members, target_delivered_member_count=len(members)),
+        _CTX,
     )
-    lost_result = inject_write_failure(DatabaseSink(_config(url))).commit_effect(plan, _CTX)
+    lost_result = committing.commit_effect(plan, _CTX)
     recovered = inject_write_failure(DatabaseSink(_config(url))).reconcile_effect(plan, _CTX)
 
     assert lost_result.accepted_ordinals == ()

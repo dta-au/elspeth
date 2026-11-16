@@ -569,3 +569,70 @@ describe("resolvePromptDisplaySegments — multi-query prompt surface", () => {
     expect(displayText(result)).toBe("Summarise concise and neutral.");
   });
 });
+
+// ── Multi-query surface without a shared prompt_template ────────────────────
+//
+// Staging report 2026-11-16: the backend's multi_query_prompt_surface_from_options
+// accepts an absent or null node-level prompt_template, but this recognizer
+// required a string, so every such card fell back to the bounded event draft
+// with reviewAvailable=false and Approve could never unlock.
+
+/** Backend render_for_review() of MULTI_QUERY_OWN_TEMPLATES (with or without prompt_template: null). */
+const OWN_TEMPLATES_BACKEND_DRAFT =
+  "Multi-query LLM node: for every row the model receives one call per query below.\n\nSystem prompt (sent with every query):\nReply briefly.\n\nQuery 'first':\nSummarise {{ row.text }}.\n\nQuery 'second':\nList themes in {{ row.text }}.\n\nNode-level prompt_template: not used (every query supplies its own template).";
+
+const MULTI_QUERY_OWN_TEMPLATES = {
+  system_prompt: "Reply briefly.",
+  queries: [
+    { name: "first", template: "Summarise {{ row.text }}." },
+    { name: "second", template: "List themes in {{ row.text }}." },
+  ],
+};
+
+describe("resolvePromptDisplaySegments — multi-query surface without a shared template", () => {
+  it("renders the complete surface, reviewable, when prompt_template is omitted", () => {
+    const state = makeState([makeNode({ ...MULTI_QUERY_OWN_TEMPLATES })]);
+    const result = resolvePromptDisplaySegments(state, surfaceEvent());
+    expect(result.reviewAvailable).toBe(true);
+    expect(result.usedFallback).toBe(false);
+    expect(displayText(result)).toBe(OWN_TEMPLATES_BACKEND_DRAFT);
+  });
+
+  it("renders the complete surface, reviewable, when prompt_template is null", () => {
+    const state = makeState([makeNode({ ...MULTI_QUERY_OWN_TEMPLATES, prompt_template: null })]);
+    const result = resolvePromptDisplaySegments(state, surfaceEvent());
+    expect(result.reviewAvailable).toBe(true);
+    expect(result.usedFallback).toBe(false);
+    expect(displayText(result)).toBe(OWN_TEMPLATES_BACKEND_DRAFT);
+  });
+
+  it("shows every per-query template in full past the event draft's 8000-character budget", () => {
+    const queries = Array.from({ length: 6 }, (_, index) => ({
+      name: `q${index}`,
+      template: `Template ${index}: ${"detail ".repeat(400)}end ${index}.`,
+    }));
+    const state = makeState([makeNode({ system_prompt: "Reply briefly.", queries })]);
+    const result = resolvePromptDisplaySegments(state, surfaceEvent());
+    const text = displayText(result);
+    expect(text.length).toBeGreaterThan(8000);
+    expect(result.reviewAvailable).toBe(true);
+    for (const query of queries) {
+      expect(text).toContain(`Query '${query.name}':\n${query.template}\n`);
+    }
+  });
+
+  it("keeps review unavailable when a query needs the missing shared template", () => {
+    const state = makeState([
+      makeNode({
+        system_prompt: "Reply briefly.",
+        queries: [{ name: "first", template: "A." }, { name: "second" }],
+      }),
+    ]);
+    const result = resolvePromptDisplaySegments(state, surfaceEvent());
+    expect(result.reviewAvailable).toBe(false);
+    const text = displayText(result);
+    expect(text).toContain("Query 'second': uses the node-level prompt_template (below).");
+    expect(text).toContain("Node-level prompt_template, used by queries without their own template: second");
+    expect(text).toContain("no node-level prompt_template is set");
+  });
+});

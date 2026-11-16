@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import create_autospec, patch
 
 import chromadb
+import numpy as np
 import pytest
 from chromadb.api import ClientAPI
+from chromadb.api.types import EmbeddingFunction, normalize_insert_record_set, validate_insert_record_set
+from chromadb.config import Settings
 
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError, TelemetryExporterError
 from elspeth.contracts.events import ChromaWriteStatistics, TelemetryEvent
@@ -66,8 +70,14 @@ def _telemetry_emit(event: TelemetryEvent) -> None:
 
 
 def _make_chroma_collection_double() -> Any:
-    """Create a Chroma collection double specced to the SDK collection API."""
-    return create_autospec(chromadb.Collection, instance=True, spec_set=True)
+    """Create a Chroma collection double specced to the SDK collection API.
+
+    Its metadata carries the default ``hnsw:space`` so ``on_start``'s
+    distance-function check sees a collection built as configured.
+    """
+    collection = create_autospec(chromadb.Collection, instance=True, spec_set=True)
+    collection.metadata = {"hnsw:space": "cosine"}
+    return collection
 
 
 def _make_chroma_client_double() -> Any:
@@ -418,16 +428,52 @@ def _chroma_effect_context() -> RestrictedSinkEffectContext:
 
 class _RecoverableChromaCollection:
     def __init__(self) -> None:
+        # Read by ChromaSink.on_start's distance-function check.
+        self.metadata: dict[str, object] = {"hnsw:space": "cosine"}
         self.documents: dict[str, tuple[str, dict[str, object] | None]] = {}
         self.upsert_count_by_id: dict[str, int] = {}
+        self._client = self
+        self.id = "test-collection"
+        self.tenant = "default_tenant"
+        self.database = "default_database"
 
-    def upsert(
+    def _validate_and_prepare_upsert_request(self, **kwargs: Any) -> dict[str, Any]:
+        records = normalize_insert_record_set(**kwargs)
+        validate_insert_record_set(records)
+        return {
+            "ids": records["ids"],
+            "documents": records["documents"],
+            "metadatas": records["metadatas"],
+            "embeddings": [np.array([1.0, 0.0], dtype=np.float32)],
+            "uris": records["uris"],
+        }
+
+    def upsert(self, *, ids: list[str], documents: list[str], metadatas: list[dict[str, object]] | None) -> None:
+        request = self._validate_and_prepare_upsert_request(ids=ids, embeddings=None, documents=documents, metadatas=metadatas)
+        self._upsert(
+            collection_id=self.id,
+            ids=request["ids"],
+            embeddings=request["embeddings"],
+            metadatas=request["metadatas"],
+            documents=request["documents"],
+            uris=request["uris"],
+            tenant=self.tenant,
+            database=self.database,
+        )
+
+    def _upsert(
         self,
         *,
+        collection_id: str,
         ids: list[str],
+        embeddings: list[np.ndarray],
         documents: list[str],
         metadatas: list[dict[str, object]] | None,
+        uris: list[str] | None,
+        tenant: str,
+        database: str,
     ) -> None:
+        del collection_id, embeddings, uris, tenant, database
         for index, (document_id, document) in enumerate(zip(ids, documents, strict=True)):
             metadata = None if metadatas is None else dict(metadatas[index])
             self.documents[document_id] = (document, metadata)
@@ -444,6 +490,132 @@ class _RecoverableChromaCollection:
 
 
 class TestChromaMemberEffects:
+    def test_chroma_155_pre_dispatch_validator_contract(self) -> None:
+        # The private preparation and dispatch calls must be reviewed together
+        # whenever Chroma changes version.
+        assert chromadb.__version__ == "1.5.5"
+
+    def test_real_collection_rejections_precede_dispatch_and_valid_payload_is_prepared(self, tmp_path) -> None:
+        class LocalEmbedding(EmbeddingFunction):
+            def __init__(self) -> None:
+                pass
+
+            def __call__(self, input: list[str]) -> list[np.ndarray]:
+                if "REJECT" in input:
+                    raise ValueError("document rejected by local embedding policy")
+                return [np.array([1.0, 0.0], dtype=np.float32) for _ in input]
+
+            @staticmethod
+            def name() -> str:
+                return "chroma_member_dispatch_guard"
+
+            def get_config(self) -> dict[str, object]:
+                return {}
+
+            @staticmethod
+            def build_from_config(config: dict[str, object]) -> LocalEmbedding:
+                return LocalEmbedding()
+
+        client = chromadb.PersistentClient(path=str(tmp_path / "dispatch-guard"), settings=Settings(anonymized_telemetry=False))
+        collection = client.create_collection("test-collection", embedding_function=LocalEmbedding(), metadata={"hnsw:space": "cosine"})
+        original_prepare = collection._validate_and_prepare_upsert_request
+        prepared: list[dict[str, Any]] = []
+
+        def prepare(**kwargs: Any) -> dict[str, Any]:
+            request = original_prepare(**kwargs)
+            prepared.append(request)
+            return request
+
+        sink = _make_sink_with_collection(
+            collection,
+            field_mapping={"document_field": "text", "id_field": "doc_id", "metadata_fields": ["topic", "chroma:document"]},
+            schema={"mode": "observed"},
+        )
+        ctx = _chroma_effect_context()
+        with (
+            patch.object(collection, "_validate_and_prepare_upsert_request", side_effect=prepare),
+            patch.object(collection._client, "_upsert", wraps=collection._client._upsert) as dispatch,
+        ):
+            for ordinal, row in enumerate(
+                [
+                    {"doc_id": "bad-metadata", "text": "one", "chroma:document": "reserved"},
+                    {"doc_id": "bad-embedding", "text": "REJECT", "topic": "alpha"},
+                    {"doc_id": "good", "text": "one", "topic": "alpha"},
+                ]
+            ):
+                member = _chroma_effect_member(0, row)
+                effect_input = SinkEffectPipelineMembersInput((member,), (member,), 1)
+                inspection = sink.inspect_effect(
+                    SinkEffectInspectionRequest(effect_id="b" * 64, target="{}", predecessor_descriptor=None), ctx
+                )
+                plan = sink.prepare_effect(
+                    SinkEffectPrepareRequest(effect_id="b" * 64, effect_input=effect_input, inspection=inspection), ctx
+                )
+                result = sink.commit_member_effect(plan, member, effect_input, ctx)
+                assert result.diverted_ordinals == ((0,) if ordinal < 2 else ())
+                assert dispatch.call_count == (0 if ordinal < 2 else 1)
+
+        request = prepared[0]
+        assert dispatch.call_args.kwargs == {
+            "collection_id": collection.id,
+            "ids": request["ids"],
+            "embeddings": request["embeddings"],
+            "metadatas": request["metadatas"],
+            "documents": request["documents"],
+            "uris": request["uris"],
+            "tenant": collection.tenant,
+            "database": collection.database,
+        }
+        assert collection.get()["ids"] == ["good"]
+        assert [diversion.row_index for diversion in sink._get_diversions()] == [0, 0]
+        client.close()
+
+    def test_http_response_decode_after_write_is_reconciled_not_diverted(self) -> None:
+        class WrittenThenUnparseable(_RecoverableChromaCollection):
+            def _upsert(self, **kwargs: Any) -> None:
+                super()._upsert(**kwargs)
+                raise json.JSONDecodeError("empty successful response", "", 0)
+
+        collection = WrittenThenUnparseable()
+        sink = _make_sink_with_collection(collection)
+        member = _chroma_effect_member(0, {"doc_id": "d1", "text": "one", "topic": "alpha"})
+        effect_input = SinkEffectPipelineMembersInput((member,), (member,), 1)
+        ctx = _chroma_effect_context()
+        inspection = sink.inspect_effect(SinkEffectInspectionRequest(effect_id="b" * 64, target="{}", predecessor_descriptor=None), ctx)
+        plan = sink.prepare_effect(SinkEffectPrepareRequest(effect_id="b" * 64, effect_input=effect_input, inspection=inspection), ctx)
+
+        commit_result = None
+        with suppress(json.JSONDecodeError):
+            commit_result = sink.commit_member_effect(plan, member, effect_input, ctx)
+
+        assert commit_result is None  # No accepted or diverted result for an uncertain write.
+        assert sink._get_diversions() == ()
+        assert collection.documents == {"d1": ("one", {"topic": "alpha"})}
+        reconciled = sink.reconcile_member_effect(plan, member, effect_input, ctx)
+        assert reconciled.kind is SinkEffectReconcileKind.APPLIED_WITH_EXACT_DESCRIPTOR
+        assert reconciled.descriptor == plan.expected_descriptor
+        assert reconciled.accepted_ordinals is None
+        assert reconciled.diverted_ordinals is None
+
+    def test_sdk_pre_dispatch_reserved_metadata_rejection_diverts(self) -> None:
+        collection = _RecoverableChromaCollection()
+        sink = _make_sink_with_collection(
+            collection,
+            field_mapping={"document_field": "text", "id_field": "doc_id", "metadata_fields": ["chroma:document"]},
+            schema={"mode": "observed"},
+        )
+        member = _chroma_effect_member(0, {"doc_id": "d1", "text": "one", "chroma:document": "reserved"})
+        effect_input = SinkEffectPipelineMembersInput((member,), (member,), 1)
+        ctx = _chroma_effect_context()
+        inspection = sink.inspect_effect(SinkEffectInspectionRequest(effect_id="b" * 64, target="{}", predecessor_descriptor=None), ctx)
+        plan = sink.prepare_effect(SinkEffectPrepareRequest(effect_id="b" * 64, effect_input=effect_input, inspection=inspection), ctx)
+
+        result = sink.commit_member_effect(plan, member, effect_input, ctx)
+
+        assert result.accepted_ordinals == ()
+        assert result.diverted_ordinals == (0,)
+        assert collection.documents == {}
+
     def test_overwrite_declares_complete_member_effect_capability(self) -> None:
         validate_sink_effect_type_capability(
             ChromaSink,

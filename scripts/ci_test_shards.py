@@ -27,6 +27,11 @@ PROOF_MARKER = "landscape_long_run"
 TIMING_MARKER = "timing_sensitive"
 ASSIGNMENT_ALGORITHM = "duration-lpt-v1"
 DURATION_PROFILE_PATH = Path("config/cicd/pytest-duration-profile.json")
+# The interpreter lanes CI produces evidence for, and the one whose shards carry
+# the authoritative coverage. Must match the python-version matrices in
+# .github/workflows/ci.yaml and landscape-long-run.yml.
+COVERAGE_PYTHON_VERSION = "3.14"
+SUPPORTED_PYTHON_VERSIONS = frozenset({COVERAGE_PYTHON_VERSION})
 _PROOF_CALL_PASSED = pytest.StashKey[bool | None]()
 _TIMING_CALL_OUTCOMES = pytest.StashKey[dict[str, str]]()
 LONG_RUN_CASES = {
@@ -450,7 +455,7 @@ def combine_shards(artifact_dir: Path, count: int, checkout: Path) -> None:
     databases: list[str] = []
     identity = evidence_identity(checkout)
     for index in range(count):
-        folder = artifact_dir / f"coverage-shard-3.13-{index}"
+        folder = artifact_dir / f"coverage-shard-{COVERAGE_PYTHON_VERSION}-{index}"
         manifest = json.loads((folder / "shard-manifest.json").read_text(encoding="utf-8"))
         # Downloads are confined to this native workflow run. Earlier producer
         # attempts at the same SHA remain valid when rerunning only failed jobs.
@@ -460,7 +465,7 @@ def combine_shards(artifact_dir: Path, count: int, checkout: Path) -> None:
             or any(type(manifest.get(field)) is not int for field in ("schema_version", "shard_count", "shard_index", "exit_status"))
             or manifest["schema_version"] != 2
             or manifest.get("tested_commit") != identity["tested_commit"]
-            or manifest.get("python_version") != "3.13"
+            or manifest.get("python_version") != COVERAGE_PYTHON_VERSION
             or manifest.get("partition") != "all"
             or manifest.get("github_run_id") != identity["github_run_id"]
             or manifest.get("producer_job") != ("test" if identity["github_run_id"] is not None else None)
@@ -515,7 +520,7 @@ def _combine_coverage(databases: list[str], checkout: Path) -> None:
 
 
 def validate_long_run_shards(artifact_dir: Path, count: int, checkout: Path, python_version: str) -> dict[str, str]:
-    """Validate ordinary/proof and disjoint timing evidence, combining covered 3.13.
+    """Validate ordinary/proof and disjoint timing evidence, combining coverage on the coverage lane.
 
     Each artifact name binds a producer and attempt. Select the highest observed
     attempt before reading its content; superseded content is irrelevant. Never
@@ -525,8 +530,8 @@ def validate_long_run_shards(artifact_dir: Path, count: int, checkout: Path, pyt
     """
     if type(count) is not int:
         raise ValueError("Supply a literal integer ordinary shard count")
-    if count < 1 or python_version not in {"3.12", "3.13"}:
-        raise ValueError("Supply a positive shard count and Python 3.12 or 3.13")
+    if count < 1 or python_version not in SUPPORTED_PYTHON_VERSIONS:
+        raise ValueError(f"Supply a positive shard count and a supported Python version: {sorted(SUPPORTED_PYTHON_VERSIONS)}")
     profile = load_duration_profile(checkout)
     identity = evidence_identity(checkout)
     if identity["github_run_id"] is None:
@@ -633,7 +638,7 @@ def validate_long_run_shards(artifact_dir: Path, count: int, checkout: Path, pyt
             digests.add(digest)
             selected.extend(nodeids)
         resolved[producer] = folder.name
-        if python_version == "3.13":
+        if python_version == COVERAGE_PYTHON_VERSION:
             databases.append(_coverage_database(folder, manifest))
     if len(selected) != len(set(selected)) or digests != {collection_digest(selected)}:
         raise ValueError("Ordinary and proof collections overlap, differ, or omit selected tests")
@@ -642,7 +647,7 @@ def validate_long_run_shards(artifact_dir: Path, count: int, checkout: Path, pyt
     assignment = ordinary_assignment([node for group in ordinary_groups.values() for node in group], count, profile)
     if any(assignment[node] != index for index, group in ordinary_groups.items() for node in group):
         raise ValueError("Artifact union contains a misassigned ordinary test")
-    if python_version == "3.13":
+    if python_version == COVERAGE_PYTHON_VERSION:
         _combine_coverage(databases, checkout)
     return resolved
 
@@ -653,7 +658,7 @@ def main() -> None:
     parser.add_argument("--shard-count", type=int, required=True)
     parser.add_argument("--checkout", type=Path, default=Path.cwd())
     parser.add_argument("--partitioned", action="store_true")
-    parser.add_argument("--python-version", choices=("3.12", "3.13"))
+    parser.add_argument("--python-version", choices=sorted(SUPPORTED_PYTHON_VERSIONS))
     args = parser.parse_args()
     if args.partitioned:
         if args.python_version is None:

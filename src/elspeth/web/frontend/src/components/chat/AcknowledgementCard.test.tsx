@@ -1337,6 +1337,71 @@ describe("AcknowledgementCard — resolved-prompt rendering", () => {
   });
 });
 
+describe("AcknowledgementCard — multi-query prompt without a shared template", () => {
+  // Staging report 2026-11-16: every query supplies its own template and the
+  // optional node-level prompt_template is omitted. The card must render the
+  // live surface and let the user approve after viewing it.
+  function multiQueryState(queries: unknown[]): CompositionState {
+    return {
+      ...makeCompositionState(7),
+      nodes: [
+        {
+          id: "node-1",
+          node_type: "transform",
+          plugin: "llm",
+          input: "rows",
+          on_success: null,
+          on_error: null,
+          options: { system_prompt: "Reply briefly.", queries },
+        },
+      ],
+    };
+  }
+
+  it("shows every per-query template and unlocks Approve after View prompt", async () => {
+    const user = userEvent.setup();
+    const event = makeEvent({ kind: "llm_prompt_template", llm_draft: "Bounded staging-time preview." });
+    vi.mocked(api.resolveInterpretation).mockResolvedValue(makeResolveResponse(event));
+    renderCard(event, {
+      showAmend: false,
+      compositionState: multiQueryState([
+        { name: "first", template: "Summarise {{ row.text }}." },
+        { name: "second", template: "List themes in {{ row.text }}." },
+      ]),
+    });
+    const approve = screen.getByRole("button", { name: /approve the llm prompt template/i });
+    expect(approve.getAttribute("aria-disabled")).toBe("true");
+
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+
+    const region = screen.getByRole("region", { name: /prompt template review/i });
+    const text = region.querySelector("pre.ack-card-prompt-pre")?.textContent ?? "";
+    expect(text).toContain("System prompt (sent with every query):\nReply briefly.\n");
+    expect(text).toContain("Query 'first':\nSummarise {{ row.text }}.\n");
+    expect(text).toContain("Query 'second':\nList themes in {{ row.text }}.\n");
+    expect(screen.queryByText(/the complete prompt is not available/i)).toBeNull();
+    expect(approve.getAttribute("aria-disabled")).not.toBe("true");
+    expect(api.resolveInterpretation).not.toHaveBeenCalled();
+
+    await user.click(approve);
+    await waitFor(() => expect(api.resolveInterpretation).toHaveBeenCalledTimes(1));
+  });
+
+  it("keeps Approve unavailable when a query needs the missing shared template", async () => {
+    const user = userEvent.setup();
+    renderCard(makeEvent({ kind: "llm_prompt_template", llm_draft: "Bounded staging-time preview." }), {
+      showAmend: false,
+      compositionState: multiQueryState([{ name: "first", template: "A." }, { name: "second" }]),
+    });
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    const approve = screen.getByRole("button", { name: /approve the llm prompt template/i });
+    expect(approve.getAttribute("aria-disabled")).toBe("true");
+    expect(screen.getByText(/the complete prompt is not available/i)).toBeTruthy();
+    await user.click(approve);
+    expect(api.resolveInterpretation).not.toHaveBeenCalled();
+  });
+});
+
 // ── Accessibility / focus ────────────────────────────────────────────────────
 
 describe("AcknowledgementCard — a11y", () => {

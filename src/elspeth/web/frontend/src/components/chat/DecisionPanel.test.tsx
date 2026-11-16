@@ -13,7 +13,7 @@ import { act, fireEvent, render, screen, within } from "@testing-library/react";
 
 import type { CompositionProposal, ValidationEntryDTO } from "@/types/index";
 
-import { DecisionPanel, DecisionPanelLiveRegion, decisionAnnounceText } from "./DecisionPanel";
+import { DecisionPanel, DecisionPanelLiveRegion, blockedVerbsSentence, decisionAnnounceText } from "./DecisionPanel";
 import type { DecisionRow } from "./decisionPanelRows";
 import { actionableProposals } from "./actionableProposals";
 import { projectDecisionRows } from "./decisionPanelRows";
@@ -25,6 +25,13 @@ const S1: ValidationEntryDTO = {
     "Consider adding error routing to a retention output — failed rows are currently discarded rather than kept for review.",
   severity: "low",
 };
+
+it("names the tutorial control without treating a share-only blocker as a run blocker", () => {
+  expect(blockedVerbsSentence(["run"], true)).toBe("Continue to Run is blocked.");
+  expect(blockedVerbsSentence(["run", "save_for_review"], true)).toBe("Continue to Run is blocked.");
+  expect(blockedVerbsSentence(["save_for_review"], true)).toBe("Continue to Run is still available.");
+  expect(blockedVerbsSentence([], true)).toBeNull();
+});
 
 const blockerRow: Extract<DecisionRow, { kind: "blocker" }> = {
   kind: "blocker",

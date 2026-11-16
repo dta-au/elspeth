@@ -48,6 +48,7 @@ from elspeth.contracts.composer_llm_audit import (
     is_provider_served_name,
 )
 from elspeth.contracts.composer_provider_context import PrivateProviderContext
+from elspeth.contracts.credential_material import CREDENTIAL_PATTERN_SPECS, find_credential_material
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import observation_boundary
@@ -75,6 +76,7 @@ from elspeth.web.composer.protocol import ComposerAdmissionRefused
 from elspeth.web.composer.provider_quota import ProviderCallCustody, bind_provider_attempt
 from elspeth.web.composer.provider_thinking import parse_native_thinking_blocks
 from elspeth.web.credential_guard import require_no_credential_material_in_llm_metadata
+from elspeth.web.validation import _redact_sensitive_content
 
 if TYPE_CHECKING:
     from elspeth.web.composer.audit import BufferingRecorder
@@ -94,18 +96,74 @@ _LLM_ERROR_MESSAGE_MAX_CHARS = 512
 _LLM_ERROR_HASH_CHARS = 16
 _LLM_ERROR_REDACTED_DETAIL = "provider error detail redacted"
 _LLM_ERROR_HASH_LABEL = "raw_error_hash"
+_LLM_ERROR_URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
+_LLM_ERROR_DOTTED_RE = re.compile(r"\b[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{4,}\b")
 
-_LLM_ERROR_SENSITIVE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("authorization_header", re.compile(r"\bAuthorization\s*[:=]\s*[^\s,;}]+(?:\s+[^\s,;}]+)?", re.IGNORECASE)),
-    ("bearer_token", re.compile(r"Bearer\s+[A-Za-z0-9._\-]{20,}", re.IGNORECASE)),
-    ("aws_access_key", re.compile(r"AKIA[0-9A-Z]{16}")),
-    ("github_pat", re.compile(r"ghp_[A-Za-z0-9]{36}")),
-    ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_\-]{40,}")),
-    ("openai_key", re.compile(r"sk-[A-Za-z0-9]{40,}")),
-    ("jwt", re.compile(r"\b[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{4,}\b")),
-    ("url", re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)),
-    ("email", re.compile(r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b")),
-    ("ssn", re.compile(r"\b\d{3}[-\s]\d{2}[-\s]\d{4}\b")),
+# Request and field words from the Composer provider payloads and the reviewed
+# diagnostic examples. Membership alone exempts a dotted segment; additions
+# require review because an admitted word can also occur in a credential.
+_LLM_ERROR_DOTTED_WORDS: frozenset[str] = frozenset(
+    {
+        "address",
+        "api",
+        "arguments",
+        "assistant",
+        "budget",
+        "cache",
+        "choice",
+        "code",
+        "completion",
+        "content",
+        "control",
+        "customer",
+        "delta",
+        "description",
+        "error",
+        "example",
+        "format",
+        "function",
+        "image",
+        "index",
+        "input",
+        "items",
+        "json",
+        "max",
+        "message",
+        "messages",
+        "metadata",
+        "model",
+        "module",
+        "name",
+        "output",
+        "package",
+        "param",
+        "parameters",
+        "preview",
+        "prompt",
+        "properties",
+        "required",
+        "response",
+        "role",
+        "schema",
+        "sequences",
+        "status",
+        "stop",
+        "stream",
+        "street",
+        "system",
+        "temperature",
+        "test",
+        "text",
+        "thinking",
+        "token",
+        "tokens",
+        "tool",
+        "tools",
+        "type",
+        "url",
+        "usage",
+        "user",
+    }
 )
 
 _LLM_ERROR_HIGH_RISK_FIELD_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -640,6 +698,31 @@ def _append_llm_error_hash(message: str, *, raw_message: str) -> str:
     return f"{message[:budget].rstrip()}{ellipsis}{suffix}"
 
 
+def _is_ordinary_dotted_name(candidate: str) -> bool:
+    """Keep request-structure paths readable only through reviewed word membership.
+
+    The fixed vocabulary is the sole word exemption; adding a word is a
+    reviewed change. Decimal path indices of at most four digits are allowed
+    beside known words, but an all-numeric dotted value is never exempt.
+    """
+    found_word = False
+    for segment in candidate.split("."):
+        if segment.startswith("eyJ"):
+            return False
+        if segment.isdecimal() and len(segment) <= 4:
+            continue
+        words = re.split(r"[_-]", re.sub(r"([a-z])([A-Z])", r"\1_\2", segment).lower())
+        if not words or any(word not in _LLM_ERROR_DOTTED_WORDS for word in words):
+            return False
+        found_word = True
+    return found_word
+
+
+def _redact_dotted_match(match: re.Match[str]) -> str:
+    candidate = match.group(0)
+    return candidate if _is_ordinary_dotted_name(candidate) else "<redacted-sensitive:jwt>"
+
+
 def _safe_llm_error_message(error_message: str | None) -> str | None:
     """Return the audit-safe provider error detail for ``ComposerLLMCall``.
 
@@ -656,11 +739,25 @@ def _safe_llm_error_message(error_message: str | None) -> str | None:
     if not raw_message:
         return error_message
 
+    raw_finding = find_credential_material(raw_message)
     redacted_message = raw_message
-    for name, pattern in _LLM_ERROR_SENSITIVE_PATTERNS:
+    for name, pattern in CREDENTIAL_PATTERN_SPECS:
         redacted_message = pattern.sub(f"<redacted-sensitive:{name}>", redacted_message)
+    redacted_message = _LLM_ERROR_DOTTED_RE.sub(_redact_dotted_match, redacted_message)
+    redacted_message = _redact_sensitive_content(redacted_message, pii_shapes="email_ssn")
 
     if any(pattern.search(raw_message) for pattern in _LLM_ERROR_HIGH_RISK_FIELD_PATTERNS):
+        return _append_llm_error_hash(_LLM_ERROR_REDACTED_DETAIL, raw_message=raw_message)
+
+    # Non-token findings need whole-detail redaction before substitution can
+    # erase the syntax that identified them (notably a database URL's @).
+    # Token shapes retain surrounding diagnostic text after substitution.
+    # The HTTP fallback also preserves the old policy of redacting any URL.
+    if (
+        (raw_finding is not None and raw_finding.category != "token_shape")
+        or find_credential_material(redacted_message) is not None
+        or _LLM_ERROR_URL_RE.search(raw_message) is not None
+    ):
         return _append_llm_error_hash(_LLM_ERROR_REDACTED_DETAIL, raw_message=raw_message)
 
     if redacted_message != raw_message or len(redacted_message) > _LLM_ERROR_MESSAGE_MAX_CHARS:
@@ -753,7 +850,7 @@ def build_llm_call_record(
         finish_reason = response_metadata.finish_reason
         provider_request_id = response_metadata.provider_request_id
         provider_served = response_metadata.provider_served
-    require_no_credential_material_in_llm_metadata(
+    scrub = require_no_credential_material_in_llm_metadata(
         content=None,
         tool_calls=(),
         reasoning_content=reasoning_metadata["reasoning_content"],
@@ -764,6 +861,7 @@ def build_llm_call_record(
         finish_reason=finish_reason,
         provider_served=provider_served,
         surface=credential_surface,
+        thinking_replay_required=bool(_response_field(_first_response_message(response), "tool_calls")) if response is not None else False,
     )
     # The dialect and strict count are read off the exact list that was sent
     # (the bytes ``tools_spec_hash`` covers): every tool stamped with an exact
@@ -796,9 +894,10 @@ def build_llm_call_record(
         cache_creation_input_tokens=usage.cache_creation_input_tokens,
         cache_read_input_tokens=usage.cache_read_input_tokens,
         reasoning_tokens=usage.reasoning_tokens,
-        reasoning_content=reasoning_metadata["reasoning_content"],
-        reasoning_details=reasoning_metadata["reasoning_details"],
-        thinking_blocks=reasoning_metadata["thinking_blocks"],
+        reasoning_content=scrub.reasoning_content,
+        reasoning_details=scrub.reasoning_details,
+        reasoning_withholds=(response_metadata.reasoning_withholds if response_metadata is not None else ()) + scrub.withholds,
+        thinking_blocks=scrub.thinking_blocks,
         provider_cost=provider_cost,
         provider_cost_source=provider_cost_source,
         latency_ms=elapsed_ns // 1_000_000,

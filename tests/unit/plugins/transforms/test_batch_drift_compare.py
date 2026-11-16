@@ -186,7 +186,9 @@ class TestBatchDriftCompare:
         assert result.row is not None
         assert result.row["value_type"] == "categorical"
         assert result.row["total_variation"] == pytest.approx(5 / 12)
-        assert result.row["chi_square_statistic"] == pytest.approx(1.375)
+        # Pearson homogeneity over the union {a, b, c}: 8/9 (baseline row) + 2/3 (current row);
+        # the new category 'c' contributes like any other.
+        assert result.row["chi_square_statistic"] == pytest.approx(14 / 9)
         assert result.row["new_category_count"] == 1
         assert tuple(result.row["new_categories"]) == ("c",)
         shifts = {entry["value"]: entry for entry in result.row["category_shifts"]}
@@ -347,10 +349,9 @@ class TestBatchDriftCompare:
         assert not result.retryable
 
     def test_excessive_batch_size_is_rejected_before_drift_work(self, ctx: PluginContext, monkeypatch: pytest.MonkeyPatch) -> None:
-        import elspeth.plugins.transforms.batch_drift_compare as module
         from elspeth.plugins.transforms.batch_drift_compare import BatchDriftCompare
 
-        monkeypatch.setattr(module, "_MAX_BATCH_ROWS", 3, raising=False)
+        monkeypatch.setattr(BatchDriftCompare, "max_batch_rows", 3)
         transform = BatchDriftCompare({"schema": DYNAMIC_SCHEMA, "cohort_field": "cohort", "value_field": "score"})
         rows = [
             _make_row({"cohort": "baseline", "score": 1.0}),
@@ -441,7 +442,9 @@ class TestBatchDriftCompareConfig:
                 "baseline_count",
                 "baseline_mean",
                 "baseline_missing_count",
+                "baseline_missing_indices",
                 "baseline_non_finite_count",
+                "baseline_non_finite_indices",
                 "baseline_total_count",
                 "batch_size",
                 "cohort",
@@ -449,7 +452,9 @@ class TestBatchDriftCompareConfig:
                 "cohort_field",
                 "cohort_mean",
                 "cohort_missing_count",
+                "cohort_missing_indices",
                 "cohort_non_finite_count",
+                "cohort_non_finite_indices",
                 "cohort_total_count",
                 "ks_statistic",
                 "mean_delta",

@@ -35,6 +35,7 @@ from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.plugins.infrastructure.clients.llm import (
     ContentPolicyError,
     ContextLengthError,
+    EmptyCompletionError,
     LLMClientError,
     NetworkError,
     RateLimitError,
@@ -567,21 +568,20 @@ class TestBedrockProvider:
 
     def test_empty_content_error_does_not_expose_unknown_finish_reason(self) -> None:
         sentinel = "provider-private-finish-reason"
-        provider = _provider()
-        response = SimpleNamespace(
-            content="",
-            raw_response={"choices": [{"finish_reason": sentinel}]},
-            usage=Usage(prompt_tokens=11, completion_tokens=0, total_tokens=11),
-            model=MODEL,
-        )
-        client = SimpleNamespace(chat_completion=lambda **_kwargs: response)
+        recorder = FakeAuditRecorder()
+        provider = _provider(recorder=recorder)
 
-        with patch.object(provider, "_get_llm_client", return_value=client), pytest.raises(ContentPolicyError) as exc_info:
+        with (
+            patch("litellm.completion", return_value=_response(content="", finish_reason=sentinel)),
+            pytest.raises(EmptyCompletionError) as exc_info,
+        ):
             _execute(provider)
 
-        assert str(exc_info.value) == "Bedrock LLM returned empty content (finish_reason=unrecognized)"
+        assert str(exc_info.value) == "LLM returned empty content without an explicit refusal"
         assert sentinel not in str(exc_info.value)
         assert sentinel not in repr(exc_info.value)
+        assert recorder.calls[0]["error"].type == "EmptyCompletionError"
+        assert sentinel not in recorder.calls[0]["error"].message
 
     @pytest.mark.parametrize(
         ("provider_error", "expected_type", "retryable"),

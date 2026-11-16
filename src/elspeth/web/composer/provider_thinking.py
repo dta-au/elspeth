@@ -13,7 +13,7 @@ from elspeth.contracts.prompt_guard import (
 )
 from elspeth.web.composer.prompt_guard_rendering import JsonPath, json_content_parts
 from elspeth.web.composer.protocol import ComposerAdmissionRefused
-from elspeth.web.credential_guard import require_no_credential_material
+from elspeth.web.credential_guard import require_no_credential_material_in_native_thinking
 
 _INSPECTION_UNIT_CHARACTERS = 8_000
 _INSPECTION_OVERLAP_CHARACTERS = 1_000
@@ -52,16 +52,9 @@ def parse_native_thinking_blocks(value: object) -> list[dict[str, str]]:
 
 
 def native_thinking_blocks(value: object) -> list[dict[str, str]]:
-    """Admit complete blocks and credential-scan each complete native field."""
+    """Admit complete blocks and scan readable thinking, never opaque data."""
     blocks = parse_native_thinking_blocks(value)
-    for block in blocks:
-        # The schema is already closed. Scan complete strings, including token
-        # and URL seams, with the same detector rather than a local size cap.
-        require_no_credential_material(
-            block,
-            surface="composer_provider_thinking",
-            max_string_bytes=max(len(text.encode("utf-8")) for text in block.values()),
-        )
+    require_no_credential_material_in_native_thinking(blocks)
     return blocks
 
 

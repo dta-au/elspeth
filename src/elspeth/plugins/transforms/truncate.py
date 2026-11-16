@@ -2,6 +2,12 @@
 
 Truncates specified string fields to maximum lengths.
 
+Every configured field is a string-typed declared input
+(``declared_string_input_fields``), exactly as keyword_filter's and the
+guardrails' scan fields are: it must be present and string-valued on every
+row, its name is the normalized field name rows carry, and a producer schema
+that provably types it non-string is refused at build time.
+
 IMPORTANT: Transforms use allow_coercion=False to catch upstream bugs.
 If the source outputs wrong types, the transform crashes immediately.
 """
@@ -17,7 +23,7 @@ from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
-from elspeth.plugins.infrastructure.config_base import PluginConfigError, TransformDataConfig
+from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 
 
@@ -30,7 +36,7 @@ class TruncateConfig(TransformDataConfig):
 
     fields: dict[str, int] = Field(
         default_factory=dict,
-        description="Mapping of field names to maximum lengths",
+        description="Mapping of string field names (as rows carry them, normalized) to maximum lengths",
     )
     suffix: Annotated[
         str,
@@ -38,10 +44,6 @@ class TruncateConfig(TransformDataConfig):
     ] = Field(
         default="",
         description="Suffix to append when truncating (e.g., '...'). Counts toward max length.",
-    )
-    strict: bool = Field(
-        default=False,
-        description="If True, error when a specified field is missing (default: False)",
     )
 
     @field_validator("fields")
@@ -73,9 +75,10 @@ class Truncate(BaseTransform):
 
     Config options:
         schema: Required. Schema for input/output (use {mode: observed} for any fields)
-        fields: Dict of field_name -> max_length (e.g., {"title": 100, "description": 500})
+        fields: Dict of field_name -> max_length (e.g., {"title": 100, "description": 500}).
+            Each field must be present and string-valued on every row; names are
+            the normalized field names rows carry (``notes``, not ``Notes``).
         suffix: String to append when truncating (e.g., "..."). Included in max length.
-        strict: If True, error on missing configured fields (default: False, skip missing fields)
         on_error: Sink to route errors to (default: None, will quarantine)
 
     Example config:
@@ -92,8 +95,8 @@ class Truncate(BaseTransform):
 
     name = "truncate"
     determinism = Determinism.DETERMINISTIC
-    plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:59df23578303bf55"
+    plugin_version = "2.0.0"
+    source_file_hash: str | None = "sha256:ad81c95b6ead6493"
     config_model = TruncateConfig
     usage_when_to_use: str = (
         "Use for a deterministic character-length cap on selected text fields, optionally reserving "
@@ -109,12 +112,17 @@ class Truncate(BaseTransform):
     fields:
       notes: 80
     suffix: "..."
-    strict: false
     schema:
       mode: observed
 """
     capability_tags: tuple[str, ...] = ("text", "truncation", "length-limit")
     passes_through_input = True
+    # ``fields`` maps each input column to its max length: the KEYS are read
+    # columns. This only describes the option's SHAPE (a mapping, where
+    # keyword_filter's ``fields`` is a list) so the fixed-schema read check
+    # and demotion protection see the keys; ``consumed_input_fields`` does not
+    # read ``declared_string_input_fields``. It grants no lookup semantics.
+    column_keyed_config_keys = frozenset({"fields"})
 
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__(config)
@@ -122,7 +130,11 @@ class Truncate(BaseTransform):
         self._initialize_declared_input_fields(cfg)
         self._fields = cfg.fields
         self._suffix = cfg.suffix
-        self._strict = cfg.strict
+        # Every configured field must arrive present and string-valued or
+        # process() fails the row closed — declared exactly as the
+        # text-scanning siblings declare theirs, so the build refuses a
+        # provably non-string producer and the spelling rule governs the names.
+        self.declared_string_input_fields = frozenset(cfg.fields)
 
         self._schema_config = cfg.schema_config
         self._output_schema_config = self._build_output_schema_config(cfg.schema_config)
@@ -144,71 +156,6 @@ class Truncate(BaseTransform):
             )
         ]
 
-    def _resolve_output_field_name(
-        self,
-        *,
-        config_field: str,
-        row: PipelineRow,
-        output_keys: set[str],
-    ) -> str:
-        """Resolve a configured field name to the emitted row key.
-
-        Prefer an exact key already present in the row payload so observed/flexible
-        extra fields keep their raw identity. Otherwise resolve through the
-        contract so original-header aliases collapse to the normalized engine key.
-        """
-        if config_field in output_keys:
-            return config_field
-
-        resolved = row.contract.find_name(config_field)
-        if resolved is not None:
-            return resolved
-
-        return config_field
-
-    def _build_truncation_plan(
-        self,
-        *,
-        row: PipelineRow,
-        output_keys: set[str],
-    ) -> tuple[tuple[str, str, int], ...]:
-        """Canonicalize configured field names and reject alias collisions."""
-        plan: list[tuple[str, str, int]] = []
-        collisions_by_output: dict[str, list[str]] = {}
-
-        for config_field, max_len in self._fields.items():
-            output_field = self._resolve_output_field_name(
-                config_field=config_field,
-                row=row,
-                output_keys=output_keys,
-            )
-            if output_field in collisions_by_output:
-                collisions_by_output[output_field].append(config_field)
-            else:
-                collisions_by_output[output_field] = [config_field]
-            plan.append((config_field, output_field, max_len))
-
-        duplicate_targets = {
-            output_field: config_fields for output_field, config_fields in collisions_by_output.items() if len(config_fields) > 1
-        }
-        if duplicate_targets:
-            collision_details = ", ".join(
-                f"{output_field!r} <- {config_fields!r}" for output_field, config_fields in sorted(duplicate_targets.items())
-            )
-            cause = (
-                "Truncate config has duplicate logical field names after alias resolution: "
-                f"{collision_details}. Use exactly one configured name per logical field."
-            )
-            raise PluginConfigError(
-                cause,
-                cause=cause,
-                plugin_class=self.config_model.__name__,
-                plugin_name=self.name,
-                component_type="transform",
-            )
-
-        return tuple(plan)
-
     def process(self, row: PipelineRow, ctx: TransformContext) -> TransformResult:
         """Truncate specified fields in row.
 
@@ -220,21 +167,22 @@ class Truncate(BaseTransform):
             TransformResult with truncated field values
         """
         output = copy.deepcopy(row.to_dict())
-        truncation_plan = self._build_truncation_plan(row=row, output_keys=set(output))
         fields_modified: list[str] = []
 
-        for field_name, normalized_field_name, max_len in truncation_plan:
-            if field_name not in row:
-                if self._strict:
-                    return TransformResult.error(
-                        {
-                            "reason": "missing_field",
-                            "field": field_name,
-                        }
-                    )
-                continue  # Skip missing fields in non-strict mode
+        for field_name, max_len in self._fields.items():
+            # Configured names are the field names rows carry: read and write
+            # the payload key itself, never a header alias resolved through
+            # the contract (the spelling rule refuses those before process()).
+            if field_name not in output:
+                return TransformResult.error(
+                    {
+                        "reason": "missing_field",
+                        "field": field_name,
+                    },
+                    retryable=False,
+                )
 
-            value = row[field_name]
+            value = output[field_name]
 
             # Type mismatches are upstream contract bugs; always surface explicitly.
             if type(value) is not str:
@@ -244,7 +192,8 @@ class Truncate(BaseTransform):
                         "field": field_name,
                         "expected": "str",
                         "actual": type(value).__name__,
-                    }
+                    },
+                    retryable=False,
                 )
 
             # Truncate if needed
@@ -252,10 +201,10 @@ class Truncate(BaseTransform):
                 if self._suffix:
                     # Truncate leaving room for suffix
                     truncate_at = max_len - len(self._suffix)
-                    output[normalized_field_name] = value[:truncate_at] + self._suffix
+                    output[field_name] = value[:truncate_at] + self._suffix
                 else:
-                    output[normalized_field_name] = value[:max_len]
-                fields_modified.append(normalized_field_name)
+                    output[field_name] = value[:max_len]
+                fields_modified.append(field_name)
 
         # The ONE stamp writes the operator's declared fields onto the emitted
         # contract (ADR-050 Decision 2); a truncated value is still a str.
@@ -280,6 +229,8 @@ class Truncate(BaseTransform):
                 issue_code=None,
                 summary="Truncate string fields to max_length with optional suffix marker. Non-destructive on shorter values.",
                 composer_hints=(
+                    "Each fields key must be a string field every row carries, named as rows carry it (normalized, "
+                    "e.g. notes not Notes); a missing or non-string field fails the row, so route on_error.",
                     "max_length is character count (Python len()), not bytes. Multi-byte content may exceed byte limits even after truncation.",
                     "suffix (e.g. '…') counts toward max_length; the truncated portion is shorter than max_length when suffix is set.",
                     "Use for display preparation, audit-summary fields, or controlling downstream LLM prompt size — not for security boundaries.",

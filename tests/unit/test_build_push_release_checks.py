@@ -698,9 +698,12 @@ def test_release_dockerfile_keeps_builder_os_packages_out_of_the_runtime() -> No
     runtime = dockerfile.split("# Stage 3: Runtime", maxsplit=1)[1]
 
     assert (
-        "FROM gcr.io/distroless/python3-debian13:debug-nonroot"
-        "@sha256:2f1a59f813c1742411f4a27c164d1ace60bbcc422e42b649c5100283c6d5b74c AS runtime"
+        "FROM gcr.io/distroless/cc-debian13:debug-nonroot"
+        "@sha256:c69d16acb50ae6ee26adfb0645467b507753c0eb91c389afad87914cd2ecf6de AS runtime"
     ) in runtime
+    # Distroless ships no Python 3.14, so the uv-managed interpreter the venv
+    # records travels with it, at the same /opt/python path as in the builder.
+    assert "COPY --from=builder /opt/python /opt/python" in runtime
     assert "COPY --from=builder /opt/venv /opt/venv" in runtime
     assert "COPY --from=builder /runtime-root/ /" in runtime
     assert "RUN " not in runtime

@@ -1,6 +1,11 @@
 # `file_inject` upload-only guard: fork provenance gap
 
-**Status:** closed for `file_inject`, open for the `llm` prompt-surface guard.
+**Status:** closed for `file_inject` by the ruling below, and for the `llm`
+prompt-surface guard by option 1 below (dta-au/elspeth#365):
+`copy_blobs_for_fork` carries the source's modality and `creating_*` fields and
+anchors an LLM-authored copy to the child's `session_fork` plan row. Fork
+copies made before that change keep `VERBATIM`. The paragraph that follows
+records the state at the ruling, when the `llm` guard was still open.
 Maintainer ruling, 2026-11-11: an agent write is an agent write. `update_blob`
 now records any blob it rewrites with `created_by == "assistant"`, as it
 records a file the agent created new, so a rewritten upload and every fork copy

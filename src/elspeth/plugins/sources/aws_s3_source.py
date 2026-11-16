@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import codecs
 import csv
 import enum
 import hashlib
@@ -13,11 +12,12 @@ import math
 import re
 import tempfile
 import time
-from collections.abc import Generator, Mapping
+from collections.abc import Callable, Generator, Mapping
 from collections.abc import Iterator as ABCIterator
+from dataclasses import dataclass
 from decimal import Decimal
 from types import TracebackType
-from typing import Any, BinaryIO, ClassVar, Literal, Never, Protocol, Self, cast, runtime_checkable
+from typing import Any, BinaryIO, ClassVar, Literal, Never, Protocol, Self, cast
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, JsonValue, ValidationError, field_validator, model_validator
@@ -41,13 +41,22 @@ from elspeth.contracts.wire_visible_identity import reject_operator_required_pla
 from elspeth.plugins.aws_s3_common import build_s3_client
 from elspeth.plugins.infrastructure.base import BaseSource
 from elspeth.plugins.infrastructure.config_base import (
+    CSVDelimiter,
     DataPluginConfig,
     NormalizedColumnsOption,
     NormalizedFieldMappingOption,
+    TextEncoding,
     declared_source_schema_field_names,
 )
 from elspeth.plugins.infrastructure.config_content import reject_nonfinite_constant
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+from elspeth.plugins.infrastructure.text_decoding import (
+    BYTE_ESCAPE_ERRORS,
+    contains_escaped_bytes,
+    decoding_codec,
+    escaped_line_to_bytes,
+    line_byte_codec_from_head,
+)
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,
     FieldMappingCollisionError,
@@ -56,10 +65,6 @@ from elspeth.plugins.sources.field_normalization import (
     extend_field_resolution,
     normalize_field_name,
     resolve_field_names,
-)
-from elspeth.plugins.sources.json_source import (
-    _contains_surrogateescape_chars,
-    _surrogateescape_line_to_bytes,
 )
 
 _DOWNLOAD_CHUNK_BYTES = 64 * 1024
@@ -85,22 +90,9 @@ class CSVOptions(BaseModel):
 
     model_config = {"extra": "forbid", "frozen": True}
 
-    delimiter: str = ","
+    delimiter: CSVDelimiter = ","
     has_header: bool = True
-    encoding: str = "utf-8"
-
-    @field_validator("delimiter")
-    @classmethod
-    def _validate_delimiter(cls, value: str) -> str:
-        if len(value) != 1:
-            raise ValueError("delimiter must be a single character")
-        return value
-
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, value: str) -> str:
-        _validate_text_encoding(value, format_name="CSV")
-        return value
+    encoding: TextEncoding = "utf-8"
 
 
 class JSONOptions(BaseModel):
@@ -108,24 +100,8 @@ class JSONOptions(BaseModel):
 
     model_config = {"extra": "forbid", "frozen": True}
 
-    encoding: str = "utf-8"
+    encoding: TextEncoding = "utf-8"
     data_key: str | None = None
-
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, value: str) -> str:
-        _validate_text_encoding(value, format_name="JSON")
-        return value
-
-
-def _validate_text_encoding(value: str, *, format_name: str) -> None:
-    try:
-        decoder = codecs.getincrementaldecoder(value)(errors="strict")
-        decoded = decoder.decode(b"", final=True)
-    except (LookupError, TypeError, UnicodeError, ValueError) as exc:
-        raise ValueError(f"{format_name} encoding must decode bytes to text") from exc
-    if not isinstance(decoded, str):
-        raise ValueError(f"{format_name} encoding must decode bytes to text")
 
 
 class AWSS3SourceConfig(DataPluginConfig):
@@ -142,7 +118,7 @@ class AWSS3SourceConfig(DataPluginConfig):
     field_mapping: NormalizedFieldMappingOption = Field(default=None, description="Overrides for normalized source fields")
     on_validation_failure: str = Field(..., description="Quarantine sink name or explicit discard")
     region_name: str | None = Field(default=None, description="AWS signing region override")
-    endpoint_url: str | None = Field(default=None, description="CLI/batch-only S3-compatible HTTP endpoint")
+    endpoint_url: str | None = Field(default=None, description="CLI/batch-only S3-compatible HTTP endpoint", repr=False)
     max_object_bytes: int = Field(
         default=256 * 1024 * 1024,
         gt=0,
@@ -276,16 +252,42 @@ class _S3Client(Protocol):
     def close(self) -> None: ...
 
 
-@runtime_checkable
-class _S3Body(Protocol):
-    def read(self, size: int) -> bytes: ...
+@dataclass(frozen=True, slots=True)
+class _AdmittedS3Body:
+    """The SDK response Body reduced to the two bound methods ELSPETH calls.
 
-    def close(self) -> None: ...
+    Every ``read`` result is still checked (``type(chunk) is bytes``): the
+    admission proves only that the methods exist and are callable.
+    """
+
+    read: Callable[[int], object]
+    close: Callable[[], object]
 
 
-@runtime_checkable
-class _S3Closable(Protocol):
-    def close(self) -> None: ...
+_MISSING_BODY_MEMBER = object()
+
+
+def _s3_body_member(raw_body: object, name: Literal["read", "close"]) -> object:
+    """Read one member of the SDK-owned Body once; an absent member is a sentinel, never a default."""
+    try:
+        return getattr(raw_body, name)
+    except AttributeError:
+        return _MISSING_BODY_MEMBER
+
+
+def _admit_s3_body(raw_body: object) -> tuple[_AdmittedS3Body | None, Callable[[], object] | None]:
+    """Parse the SDK-owned Body at the boundary (ADR-032): sentinel read plus callable checks.
+
+    Returns the admitted body, or ``None`` with the body's own callable
+    ``close`` (when it has one) so the caller can release the stream it is
+    rejecting.
+    """
+    read = _s3_body_member(raw_body, "read")
+    close = _s3_body_member(raw_body, "close")
+    usable_close = close if callable(close) else None
+    if not callable(read) or usable_close is None:
+        return None, usable_close
+    return _AdmittedS3Body(read=read, close=usable_close), usable_close
 
 
 class S3SourceReadError(RuntimeError):
@@ -375,9 +377,9 @@ def _read_error(
     )
 
 
-def _close_body(body: _S3Closable) -> str | None:
+def _close_body(close: Callable[[], object]) -> str | None:
     try:
-        body.close()
+        close()
     except _s3_provider_exception_types() as exc:
         return _normalize_error_type(exc)
     return None
@@ -456,13 +458,12 @@ def _download_s3_object(client: _S3Client, *, bucket: str, key: str, max_object_
 
     if "Body" not in get_response:
         _raise_safe(_read_error("InvalidS3Body", max_object_bytes=max_object_bytes))
-    raw_body = get_response["Body"]
-    if not isinstance(raw_body, _S3Body):
+    body, raw_close = _admit_s3_body(get_response["Body"])
+    if body is None:
         interface_error = _read_error("InvalidS3Body", max_object_bytes=max_object_bytes)
-        if isinstance(raw_body, _S3Closable):
-            interface_error.cleanup_error_type = _close_body(raw_body)
+        if raw_close is not None:
+            interface_error.cleanup_error_type = _close_body(raw_close)
         _raise_safe(interface_error)
-    body = raw_body
 
     get_length = _validated_length(get_response)
     validation_error: S3SourceReadError | None = None
@@ -473,7 +474,7 @@ def _download_s3_object(client: _S3Client, *, bucket: str, key: str, max_object_
     elif get_length != head_length:
         validation_error = _read_error("InvalidS3Metadata", max_object_bytes=max_object_bytes)
     if validation_error is not None:
-        validation_error.cleanup_error_type = _close_body(body)
+        validation_error.cleanup_error_type = _close_body(body.close)
         _raise_safe(validation_error)
 
     spool_created = False
@@ -482,7 +483,7 @@ def _download_s3_object(client: _S3Client, *, bucket: str, key: str, max_object_
         spool_created = True
     finally:
         if not spool_created:
-            _close_body(body)
+            _close_body(body.close)
 
     digest = hashlib.sha256()
     total = 0
@@ -516,7 +517,7 @@ def _download_s3_object(client: _S3Client, *, bucket: str, key: str, max_object_
             total = observed
 
         try:
-            cleanup_error_type = _close_body(body)
+            cleanup_error_type = _close_body(body.close)
         except Exception as exc:
             if primary_error is None:
                 raise
@@ -538,7 +539,7 @@ def _download_s3_object(client: _S3Client, *, bucket: str, key: str, max_object_
         return _DownloadedObject(spool, size_bytes=total, content_hash=digest.hexdigest())
     finally:
         if not body_closed:
-            _close_body(body)
+            _close_body(body.close)
         if not transfer_spool:
             spool.close()
 
@@ -558,24 +559,69 @@ class _BoundedDecodedLineIterator:
         self._stream = stream
         self._max_record_chars = max_record_chars
         self._logical_chars = 0
+        self._pending_terminator_chars = 0
+        self._last_read_ended_line = True
+        self._last_read_ended_cr = False
+
+    def _readline(self, limit: int) -> str:
+        """Read one bounded physical line, treating CR+LF as one terminator.
+
+        ``readline(limit)`` can stop between the CR and LF of a CRLF when the
+        limit falls there. The lone LF that the next read returns completes
+        that terminator; it is not an empty line, so it is consumed here
+        rather than advancing the caller's line count.
+        """
+        line = self._stream.readline(limit)
+        if self._last_read_ended_cr and line == "\n":
+            if self._pending_terminator_chars:
+                self._pending_terminator_chars += 1
+            line = self._stream.readline(limit)
+        self._last_read_ended_cr = line.endswith("\r")
+        return line
 
     def __iter__(self) -> Self:
         return self
 
     def __next__(self) -> str:
-        remaining = self._max_record_chars - self._logical_chars
-        if remaining < 0:
-            raise _RecordLimitExceeded("decoded record exceeds configured character limit")
-        line = self._stream.readline(remaining + 1)
+        # Defer the previous physical terminator until another physical line
+        # proves it was embedded in this logical CSV record. finish_record()
+        # drops the final framing terminator for both CSV and JSONL.
+        line = self._readline(self._max_record_chars + 1)
         if line == "":
             raise StopIteration
-        self._logical_chars += len(line)
+        self._logical_chars += self._pending_terminator_chars
+        self._pending_terminator_chars = 0
+        self._last_read_ended_line = line.endswith(("\n", "\r"))
+        if line.endswith("\r\n"):
+            content_chars, self._pending_terminator_chars = len(line) - 2, 2
+        elif self._last_read_ended_line:
+            content_chars, self._pending_terminator_chars = len(line) - 1, 1
+        else:
+            content_chars = len(line)
+        self._logical_chars += content_chars
         if self._logical_chars > self._max_record_chars:
             raise _RecordLimitExceeded("decoded record exceeds configured character limit")
         return line
 
     def finish_record(self) -> None:
         self._logical_chars = 0
+        self._pending_terminator_chars = 0
+
+    def skip_rest_of_line(self) -> None:
+        """Discard the unread remainder of an oversized physical line.
+
+        Reads in chunks bounded by the record limit so an oversized line is
+        never held in memory whole, then resets the record budget so the next
+        physical line starts a fresh record. Only valid for newline-framed
+        formats (JSONL); CSV records may span lines.
+        """
+        while not self._last_read_ended_line:
+            chunk = self._readline(self._max_record_chars + 1)
+            if chunk == "":
+                break
+            self._last_read_ended_line = chunk.endswith(("\n", "\r"))
+        self._last_read_ended_line = True
+        self.finish_record()
 
 
 class _BoundedJSONTokenReader:
@@ -885,7 +931,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ecf90258957184af"
+    source_file_hash: str | None = "sha256:d84d272b6ff2ea82"
     config_model = AWSS3SourceConfig
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 
@@ -1115,7 +1161,20 @@ class AWSS3Source(BaseSource):
                 self._active_download = None
             download.close()
 
-    def _file_error(self, ctx: SourceContext, message: str) -> Generator[SourceRow, None, None]:
+    def _file_error(
+        self,
+        ctx: SourceContext,
+        message: str,
+        *,
+        source_row_index: int = 0,
+    ) -> Generator[SourceRow, None, None]:
+        """Record a file-level parse failure as one quarantined row.
+
+        ``source_row_index`` must be the next index this load has not yet
+        used: a streaming parser can fail after earlier records were already
+        yielded, and reusing index 0 would collide with the first emitted row
+        (landscape rows are unique per run, source node and source row index).
+        """
         raw_row = {**self._audit_object_identity(), "error": message}
         ctx.record_validation_error(
             row=raw_row,
@@ -1128,18 +1187,26 @@ class AWSS3Source(BaseSource):
                 row=raw_row,
                 error=message,
                 destination=self._on_validation_failure,
-                source_row_index=0,
+                source_row_index=source_row_index,
             )
 
     def _load_csv(self, handle: BinaryIO, ctx: SourceContext) -> Generator[SourceRow, None, None]:
-        stream = io.TextIOWrapper(handle, encoding=self._csv_options.encoding, errors="strict", newline="")
+        stream = io.TextIOWrapper(handle, encoding=decoding_codec(self._csv_options.encoding), errors="strict", newline="")
         lines = _BoundedDecodedLineIterator(stream, self._max_record_chars)
         reader = csv.reader(lines, delimiter=self._csv_options.delimiter, strict=True)
         try:
             if self._csv_options.has_header:
                 try:
-                    raw_headers = next(reader, _ROW_EXHAUSTED)
-                    lines.finish_record()
+                    # csv.reader yields [] for a blank physical line. Skip those
+                    # before header discovery (as the data loop below and
+                    # csv_source do) so a leading blank line cannot become a
+                    # zero-column header; a blank-only object reaches EOF and
+                    # takes the empty-file path.
+                    while True:
+                        raw_headers = next(reader, _ROW_EXHAUSTED)
+                        lines.finish_record()
+                        if raw_headers != []:
+                            break
                 except (_RecordLimitExceeded, csv.Error, UnicodeDecodeError):
                     yield from self._file_error(ctx, "CSV header could not be parsed safely")
                     return
@@ -1189,12 +1256,16 @@ class AWSS3Source(BaseSource):
                 try:
                     values = next(reader, _ROW_EXHAUSTED)
                     lines.finish_record()
+                # A CSV record may span physical lines and a csv.Error or
+                # decode failure leaves the reader state untrustworthy, so the
+                # loader cannot resync: it stops and says so in the record.
                 except _RecordLimitExceeded:
                     row_count += 1
                     yield from self._quarantine_parse_row(
                         ctx,
                         {"__row_number__": str(row_count)},
-                        "CSV record exceeds configured character limit",
+                        "CSV record exceeds configured character limit; "
+                        f"processing stopped at row {row_count} and later records were not read",
                         row_count - 1,
                     )
                     return
@@ -1203,7 +1274,7 @@ class AWSS3Source(BaseSource):
                     yield from self._quarantine_parse_row(
                         ctx,
                         {"__row_number__": str(row_count)},
-                        "CSV record could not be parsed safely",
+                        f"CSV record could not be parsed safely; processing stopped at row {row_count} and later records were not read",
                         row_count - 1,
                     )
                     return
@@ -1231,10 +1302,16 @@ class AWSS3Source(BaseSource):
                 stream.detach()
 
     def _load_jsonl(self, handle: BinaryIO, ctx: SourceContext) -> Generator[SourceRow, None, None]:
+        # BYTE_ESCAPE_ERRORS keeps an undecodable code unit on its own line for
+        # every codec; surrogateescape cannot for UTF-16/UTF-32, where the
+        # decode error aborted the whole read-ahead chunk.
+        head = handle.read(4)
+        handle.seek(0)
+        line_codec = line_byte_codec_from_head(head, decoding_codec(self._json_options.encoding))
         stream = io.TextIOWrapper(
             handle,
-            encoding=self._json_options.encoding,
-            errors="surrogateescape",
+            encoding=decoding_codec(self._json_options.encoding),
+            errors=BYTE_ESCAPE_ERRORS,
             newline="",
         )
         lines = _BoundedDecodedLineIterator(stream, self._max_record_chars)
@@ -1245,6 +1322,10 @@ class AWSS3Source(BaseSource):
                     raw_line = next(lines, _ROW_EXHAUSTED)
                     lines.finish_record()
                 except _RecordLimitExceeded:
+                    # JSONL is newline-framed: drop the rest of this line and
+                    # carry on with the next one rather than abandoning the
+                    # remainder of the object.
+                    lines.skip_rest_of_line()
                     line_number += 1
                     yield from self._quarantine_parse_row(
                         ctx,
@@ -1252,13 +1333,13 @@ class AWSS3Source(BaseSource):
                         "JSONL record exceeds configured character limit",
                         line_number - 1,
                     )
-                    return
+                    continue
                 except UnicodeDecodeError:
                     line_number += 1
                     yield from self._quarantine_parse_row(
                         ctx,
                         {**self._audit_object_identity(), "__line_number__": line_number},
-                        "JSONL record has invalid encoded text",
+                        f"JSONL record has invalid encoded text; processing stopped at line {line_number} and later records were not read",
                         line_number - 1,
                     )
                     return
@@ -1268,8 +1349,8 @@ class AWSS3Source(BaseSource):
                 line = raw_line.strip()
                 if not line:
                     continue
-                if _contains_surrogateescape_chars(raw_line):
-                    raw_bytes = _surrogateescape_line_to_bytes(raw_line.rstrip("\r\n"), self._json_options.encoding)
+                if contains_escaped_bytes(raw_line):
+                    raw_bytes = escaped_line_to_bytes(raw_line.rstrip("\r\n"), line_codec, line_number=line_number)
                     yield from self._quarantine_parse_row(
                         ctx,
                         {"__raw_bytes_hex__": raw_bytes.hex(), "__line_number__": line_number},
@@ -1298,7 +1379,7 @@ class AWSS3Source(BaseSource):
         except ImportError as exc:
             raise ImportError('ijson is required for aws_s3 JSON sources; install Elspeth with the "aws" extra') from exc
 
-        stream = io.TextIOWrapper(handle, encoding=self._json_options.encoding, errors="strict", newline="")
+        stream = io.TextIOWrapper(handle, encoding=decoding_codec(self._json_options.encoding), errors="strict", newline="")
         bounded = _BoundedJSONTokenReader(stream, self._max_record_chars)
         events = cast(ABCIterator[tuple[str, Any]], iter(ijson.basic_parse(bounded, use_float=False)))
         items = _iter_selected_json_items(
@@ -1312,7 +1393,14 @@ class AWSS3Source(BaseSource):
                 try:
                     row = next(items, _ROW_EXHAUSTED)
                 except (ijson.JSONError, UnicodeDecodeError, _RecordLimitExceeded, _JSONBoundaryError):
-                    yield from self._file_error(ctx, "JSON object could not be parsed within configured bounds")
+                    # Items are streamed, so the document can prove invalid
+                    # after earlier items were already emitted. Those rows
+                    # stand; the file error takes the next unused index and
+                    # says so, rather than colliding with row 0.
+                    message = "JSON object could not be parsed within configured bounds"
+                    if source_row_index:
+                        message = f"{message}; {source_row_index} rows were already emitted from this document before it proved invalid"
+                    yield from self._file_error(ctx, message, source_row_index=source_row_index)
                     return
                 if row is _ROW_EXHAUSTED:
                     return

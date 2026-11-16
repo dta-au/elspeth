@@ -35,7 +35,9 @@ class JSONRecordColumn(BaseModel):
     model_config = {"extra": "forbid"}
 
     field: str = Field(min_length=1, max_length=128)
-    path: JSONPath = Field(default_factory=list, max_length=32)
+    # An empty path selects the record object itself, which is never a scalar,
+    # so the column could only fail every row; require at least one step.
+    path: JSONPath = Field(min_length=1, max_length=32)
     required: bool = False
     multiple: Literal["first", "one", "all"] = "first"
     max_values: int = Field(default=16, ge=1, le=256)
@@ -162,7 +164,8 @@ def _selected_values(selected: object, column: JSONRecordColumn) -> list[str]:
     if selected is _MISSING or selected is None:
         return []
     if type(selected) is list:
-        elements = cast("list[object]", selected)
+        # A null element is absent, exactly like a selected top-level null.
+        elements = [element for element in cast("list[object]", selected) if element is not None]
         count = len(elements)
         if column.multiple == "one" and count > 1:
             raise ValueError(f"JSON record column {column.field!r} has multiple values")

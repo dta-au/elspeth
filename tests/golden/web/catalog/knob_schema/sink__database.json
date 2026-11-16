@@ -31,10 +31,9 @@
       },
       {
         "default": "append",
-        "description": "Whether to append to an existing table or replace it before writing.",
+        "description": "Write behaviour against the existing table; append is the only mode.",
         "enum": [
-          "append",
-          "replace"
+          "append"
         ],
         "kind": "enum",
         "label": "If Exists",

@@ -4,6 +4,1003 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
+## 0.8.14 - 2026-11-15
+
+Python 3.14, Web Composer remediation and plugin fixes. ELSPETH now requires
+and runs on Python 3.14 only; this release moves the packages, the images and
+CI to it and corrects the behaviour that changed under the new interpreter. It
+also carries the first part of the Web Composer remediation (withheld replies,
+version history, `diff_pipeline`, credential handling, the tutorial, the batch
+plugins and `report_assemble`), a fix that stops `elspeth purge` from deleting a
+live share link's data, and a broad round of plugin fixes. The dated entry and
+package version do not establish qualification, a published tag or an image. Not
+run for this work: the PostgreSQL testcontainer suites, a live provider,
+end-to-end browser tests and CI itself on the new single lane.
+
+### Upgrade notes
+
+These changes are breaking:
+
+- **Runs admitted before the upgrade refuse to resume in the Web Composer.**
+  Making the three batch plugins available on every install changes the
+  compiled plugin policy hash, so a web run admitted under the previous policy
+  is refused on resume as `POLICY_CHANGED` (`admitted_policy_changed`). Drain
+  in-flight web runs before upgrading.
+- **A Web Composer graph that feeds `report_assemble` straight into a `text`
+  sink is refused at semantic validation.** The text sink diverts rows that
+  contain a line break, so such a graph used to pass validation and then fail
+  at run time. Put `line_explode` between them. CLI YAML and `report_assemble`'s
+  emitted row shapes are unchanged.
+- **Deploy the Web Composer backend and frontend together.** The version
+  history response gains an `is_milestone` field that the new version menu
+  reads. No schema changes and no stored row is rewritten.
+- **Share links minted before this release keep working, but their data stays
+  exposed to `elspeth purge`.** New share data lives in a separate `shares/`
+  subtree of the payload store. Never point `elspeth purge --payload-dir` at
+  `shares/`. See the Sharing section below.
+- **Library entries published before this release must be republished before
+  they can be forked.** Library payloads now live in their own
+  `<payload base>/library` subtree, with no fallback to the parent store and no
+  migration. Forking an older entry returns 409 `library_payload_unavailable`
+  asking for a republish. Back up `library/` with the payload store, and never
+  point `elspeth purge --payload-dir` at it.
+
+- **Python 3.14 is required** for `elspeth`, `elspeth-lints` and the LLM
+  gateway (and the gateway adapter template). Python 3.12 and 3.13 are no
+  longer supported or tested. Locked dependency versions are unchanged; only
+  the 3.12 and 3.13 markers and wheels left the lockfiles.
+- **Startup refuses `JSON_LOGS=true`.** This applies to the CLI, the web
+  server and both MCP servers. LiteLLM's JSON-logs mode logs unhandled
+  exception messages verbatim through its own handler, which ELSPETH's log
+  scrubbing cannot reach. Unset it; ELSPETH's JSON output has its own setting.
+- **Drain in-flight runs and pending approvals before upgrading.** The
+  runtime-validation manifest hash changes with the interpreter, so a run
+  checkpointed under 3.13 refuses to resume under 3.14, and a web approval
+  recorded under 3.13 no longer matches. The `database` sink's effect plan
+  format also changed, so a batch prepared but not committed before the
+  upgrade is refused.
+- **The release image carries its own interpreter.** The runtime base is now
+  `gcr.io/distroless/cc-debian13:debug-nonroot`, and the image carries CPython
+  3.14.5, installed by the pinned uv under `/opt/python`, with the venv at
+  `/opt/venv`. There is no `/usr/bin/python3` in the image any more. The
+  builder is `debian:trixie-slim`. The gateway image is `python:3.14-alpine`.
+  3.14.5 is the newest CPython the pinned uv offers; a later patch release
+  needs a uv image bump.
+- **Dataverse FetchXML runs recorded before this release cannot be replayed
+  in verify mode.** The `Prefer` header is now part of the recorded request,
+  so the earlier records no longer match. OData runs are unaffected.
+- **Plugin configs and inputs that used to load are now refused.** Each was
+  either a latent failure or silently wrong:
+  - `reference_join` reference data containing NaN, Infinity or integers
+    beyond 2^53.
+  - Dataverse endpoints that are not HTTPS origins, or that carry a path or
+    query; `select` entries that are not valid logical names; FetchXML with
+    zero or several entities; a sink lookup whose key is not mapped
+    (previously ignored).
+  - Azure blob `account_url` values with a query string or fragment; put a
+    SAS token in `sas_token`.
+  - `batch_classifier_metrics` with a `positive_label` whose type differs
+    from the data (for example `1.0` against integer labels), and baseline
+    labels in the paired-preference, effect-size and experiment-compare batch
+    transforms that relied on coercion (`2.0` no longer matches `2`).
+  - In observed mode, a row key the S3 or Azure blob sink cannot encode in
+    the CSV header is now a config error instead of a row failure.
+  - A non-text codec (base64, hex, zlib, rot13) in any plugin `encoding`
+    option (sources, sinks, the blob expand transforms and `file_inject`), and
+    a `"`, newline or carriage-return delimiter in any CSV `delimiter`
+    option. These used to fail at run time; a CSV source could not read a row
+    after the strict-decoding fix below.
+  - `database` sink `if_exists: replace` and `chroma_sink` `on_duplicate:
+    skip` or `error`. None of them worked, and they were refused only once
+    the sink ran. `append` and `overwrite` are now the only values.
+  - `truncate`'s `strict` option, which is removed (see below).
+  - OpenRouter `base_url` values with a query string or fragment.
+  - A `web_scrape` `auth` setting, which previously failed every row, and a
+    JSON record column without a path.
+  - An empty `query_template` or `query_pattern` in retrieval transforms.
+  - Multi-query LLM configs whose generated field names collide across
+    queries, including the raw, `_usage` and `_model` fields. Uniqueness used
+    to be checked only when a query set `structured_output_prefix`; the
+    legacy precedence mode is removed.
+  - LLM pool delay settings that contradict each other (minimum above
+    maximum, or AIMD settings that cannot hold when `pool_size` is above 1).
+  - A tracing config that sets other keys while its provider is `none` or
+    omitted; those keys were previously ignored.
+- **`type_coerce` is stricter.** Converting to `bool` no longer turns a blank
+  or whitespace-only string into `False`; it is a `not_boolean_string` row
+  error. Numeric strings with underscores or non-ASCII digits, and integers
+  outside the safe range (`out_of_range`), are refused instead of converted.
+- **Single-query LLM `metadata.model` is now the configured model.** The
+  model the provider actually served is in `metadata.served_model`
+  (`<query>_served_model` for multi-query). Readers that treated
+  `metadata.model` as the served model must switch fields.
+- **Some outputs and error shapes change.**
+  - `batch_paired_preference` 95% intervals use Student's t at n-1 degrees
+    of freedom instead of z = 1.96, so they widen for small samples (for
+    n = 3, ±0.34 becomes ±0.75).
+  - JSONL append in the `json` sink refuses an existing file that is not
+    newline-terminated or whose lines are not JSON objects; it previously
+    glued the first new record onto the last line.
+  - Azure blob JSONL output now ends every record with a newline, so
+    restaging a JSONL body written before this release fails closed.
+  - JSON, JSONL and blob inputs nested deeper than 64 levels are now
+    quarantined or routed as row errors.
+  - S3 JSONL objects with an oversized line now yield the rows after it.
+  - Azure and Bedrock LLM batch waits can be noticeably longer (see Plugins).
+  - The `blob_too_large` reason no longer carries `body_size`, and
+    `S3SinkPoisonedError` has been removed. So has
+    `elspeth.contracts.errors.DuplicateDocumentError`, which only
+    `on_duplicate: error` raised.
+  - An undecodable UTF-16 or UTF-32 record in an Azure blob CSV or JSONL
+    source, or an S3 JSONL source, is quarantined on its own, with its raw
+    bytes, instead of quarantining the whole object.
+  - A URL containing an ASCII control character is refused as
+    `malformed_url` by every SSRF and origin check, even with no allowed
+    origins configured; the origin check used to report `origin_not_allowed`.
+  - The `OutputPort` protocol gains `fail_pending`; in-tree implementations
+    are updated, out-of-tree ones must add it.
+- **`CallVerifier` and `CallReplayer` are removed** from
+  `elspeth.plugins.infrastructure.clients`. `CallModeSession.verify_call` is
+  the single verify authority, and replaying an unrecorded ordered query now
+  raises `AuditIntegrityError`.
+- **`CallModeSession` gains `has_source_call`**, a read-only lookup used by
+  Textract replay and verify. Out-of-tree session implementations must add
+  it.
+- **Textract retries go through the engine.** Throttled and transient
+  Textract and S3 HeadBucket failures raise `PluginRetryableError` and
+  consume engine retry attempts; with no retry policy they end as the
+  engine's retry-exhausted row failure instead of `submit_failed` or
+  `analysis_failed`. `poll_timeout` stays a row error and is non-retryable.
+  SSL, proxy, response-streaming and HTTP-client botocore errors are now
+  retryable transport errors instead of a permanent `botocore_error`. In
+  verify mode a poll is admitted against the source job id instead of always
+  being refused.
+- **`aws_textract_inline_analysis` limits are capped.** `max_blocks`
+  (100000), `max_result_bytes` (50 MB), `request_timeout_seconds` (120) and
+  `batch_wait_timeout_seconds` (480) have ceilings, and a config above them
+  is refused at load. The `batch_wait_timeout_seconds` default rises from
+  420 to 480, the wait that was already in effect.
+- **A per-row Textract S3 key over 1024 UTF-8 bytes** fails locally as
+  `invalid_input` / `invalid_s3_key` instead of `submit_failed`.
+- **`request_ssrf_safe` refuses `follow_redirects=True`** except for a
+  body-less GET, raising `ValueError` before any network I/O.
+- **An Azure prompt shield earns `PROMPT_SHIELD` control credit only with
+  `analysis_type: both`** (explicit or as the configured default). A pipeline
+  that requires a `PROMPT_SHIELD` control and uses a shield set to
+  `user_prompt` or `document` alone is now refused at admission.
+- **Guardrail and safety error reasons change.** AWS guardrail transforms
+  report empty or over-length text as `invalid_input` (`empty_field`,
+  `field_too_long`) instead of `api_call_failed`. Azure safety transforms
+  stop with `retry_timeout` / `row_deadline_exceeded` once the row deadline
+  has passed. Textract `blob_too_large` reports its actual size as `>max`.
+  AWS guardrail transforms no longer report `guardrail_service_error`: a
+  terminal failure is `malformed_response` or `service_error`, retryable
+  throttling, 5xx and transport failures go to the engine retry policy
+  (`transient_error_no_retry` without one), and a row can end as
+  `row_deadline_exceeded` or `shutdown_requested`.
+- **A Bedrock guardrail ARN that contradicts `region` is refused.**
+  `aws_bedrock_prompt_shield` and `aws_bedrock_content_safety` configs whose
+  guardrail ARN names another region or a non-`aws` partition now fail
+  config validation with `PluginConfigError`, as the operator profile
+  already did.
+- **A mistyped landscape export sink is refused for every run.** A `FRESH`
+  run now refuses a `landscape.export` sink name that is not in `sinks`, as
+  some run purposes already did, and `${VAR}` references in
+  `landscape.export` are expanded before that check.
+- **`truncate` 2.0.0 requires every configured field to be a string the row
+  carries.** A configured field missing from a row now fails the row with
+  `missing_field` through `on_error`; it used to be skipped unless `strict`
+  was set, and `strict` is gone. `fields` keys must be the normalised names
+  rows carry (`notes`, not `Notes`): a header spelling is refused at build,
+  or routed per row as `declared_field_is_header_spelling` when the upstream
+  cannot prove it. A producer whose schema types a truncated field as `int`,
+  `float` or `bool` is refused at build instead of failing every row. Remove
+  `strict` from configs, and re-inspect Web Composer graphs that set it.
+- **Twelve more transforms declare the row fields they read as strings**, and
+  move to `plugin_version` 2.0.0: `line_explode`, `blob_fetch` (`url_field`),
+  `blob_csv_expand`, `blob_json_expand`, `blob_text_expand`, `pdf_rasterize`,
+  `report_assemble`, `web_scrape` (row URL, query and header fields), both
+  Textract transforms, and `rag_retrieval` and `azure_ai_search` (the query
+  field, when no template is set). A producer that types one of those fields
+  as `int`, `float` or `bool` is refused at build instead of failing every
+  row. `line_explode`, `blob_csv_expand` and `blob_json_expand` read and
+  remove the field under the name rows carry, so configs that named it by a
+  header spelling need the normalised name.
+- **An aggregation `trigger.count` above 4096 is refused** for
+  `batch_outlier_annotator`, `batch_rank`, `batch_paired_preference` and
+  `batch_drift_compare`, at pipeline build and in the Web Composer. Such a
+  pipeline used to fail every full batch with `batch_too_large`. Lower the
+  count. An end-of-source or timeout flush over the cap is still refused when
+  it runs. `TransformProtocol` and `BatchTransformProtocol` gain
+  `max_batch_rows`; out-of-tree implementations that do not derive from
+  `BaseTransform` must add it.
+- **`batch_drift_compare` `chi_square_statistic` values change.** It is now
+  Pearson's chi-square test of homogeneity over every category seen in either
+  cohort, so categories absent from the baseline count toward it. Re-derive
+  any threshold set on the old values; the field name and type are
+  unchanged.
+- **Dataverse throttling waits instead of failing.** A retryable 429 or 503
+  now waits and re-sends, up to 300 s of throttle waits per request; a 429
+  whose `Retry-After` exceeds 60 s still fails immediately. The source
+  records one extra ERROR call per waited-out throttle, so call indexes for
+  that page shift, and sink commit evidence may carry `throttle_wait_ms`.
+- **`web_scrape` auth is stricter.** An `api_key` `header_name` of
+  `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `Forwarded` or
+  `X-Forwarded-*` now fails config validation, and a basic secret without
+  `:` raises `ValueError` (without echoing the secret) when the header is
+  built.
+- **`web_scrape` JSON records skip nulls.** `first` returns the first
+  non-null value, `one` counts only non-null values and `all` omits nulls; an
+  all-null array gives `None` for `first` and `one` and `[]` for `all`, and
+  provenance `selected_count` counts only non-null values. A required column
+  with only nulls still fails. Pages that used to fail now extract.
+- **Every `web_scrape` `fingerprint_mode: full` value changes.** The `full`
+  fingerprint now covers each fetched page's HTTP status, final URL,
+  Content-Type and body hash as well as the content, so the first run after
+  the upgrade reports every page as changed. `content` fingerprints are
+  unchanged.
+- **HTTP timeouts are now a total per request.** For `web_scrape`,
+  `blob_fetch`, the OpenRouter and gateway LLM transforms and sources, the
+  Azure content safety, prompt shield, AI Search, Document Intelligence and
+  Content Understanding transforms, Power Automate and the Dataverse client,
+  the configured timeout bounds the whole request, redirects included, where
+  it used to bound each network operation. Slow but steady responses that
+  used to finish can now time out; raise the timeout for large or slow
+  responses. A rate-limiter wait has its own bound of the same length and,
+  when exceeded, is recorded as a refusal with no request sent. A
+  `web_scrape` page cut off by the pagination time budget returns
+  `pagination_limit_exceeded` instead of a retryable timeout.
+- **LLM runs that recorded an empty completion cannot be replayed.** Replay
+  refuses a SUCCESS call record with empty or whitespace-only content, and a
+  null-content `ContentPolicyError` record that carries a response; re-run
+  such runs live. An empty completion now raises `FilteredCompletionError`
+  (a `ContentPolicyError`), `EmptyCompletionError` or, for tool calls,
+  `UnsupportedResponseError` on every provider, so Gateway and Bedrock empty
+  replies are no longer always content-policy errors.
+- **A leading UTF-8 byte-order mark is no longer data.** Every source and
+  CSV, JSON, text, S3 and Azure blob source, and every blob expand transform,
+  reading `utf-8` consumes it, so it no longer prefixes the first value or
+  header.
+- **Power Automate archived SAS VERIFY** without `ELSPETH_FINGERPRINT_KEY`
+  fails with `fingerprint_key_required`, still before DNS and preflight.
+- **PDF runs recorded before this release cannot be replayed or verified.**
+  The `pdf_rasterize` render request format is now `pdf_rasterize/v2`; replay
+  or verify of a run recorded as `pdf_rasterize/v1` fails closed with
+  `AuditIntegrityError` naming the retired format, in both the replay payload
+  preload and receipt restore. Live runs are unaffected.
+- **`elspeth.plugins.transforms.llm.validation` loses public names.**
+  `validate_json_object_response` and its result types are removed, and
+  `get_llm_audit_fields()` returns one more name (`_parts_hash`). Landscape
+  `too_many_images` reason text changes.
+- **`batch_threshold_summary` refuses a non-numeric threshold.** A
+  `value: true`/`false` or a quoted number now fails at config load; it used
+  to be coerced to 1.0, 0.0 or the number. `batch_top_k` `wrong_type`
+  `expected` text changes, and batches with Decimal or datetime values, or
+  extreme opposite-sign values in `batch_distribution_profile`, now succeed
+  where they used to fail.
+- **Bedrock guardrails validate the whole row first.** A row with any invalid
+  field fails with the same payload and makes no Bedrock call, so earlier
+  fields leave no billed call, call record or telemetry, and a validation
+  error now precedes a shutdown or deadline result. Guardrail profile aliases
+  of 65 or more characters fail at web config load, naming `alias`.
+- **Textract query text and aliases** containing non-ASCII whitespace are
+  rejected at config load; the provider already rejected them per row. A
+  provider message mentioning `max_blocks` or `max_result_bytes` is now
+  recorded as `malformed_response`.
+- **Template errors on row data are value-free.** A template render failure
+  whose context carries a row now reports the exception class only; error
+  text that used to quote row values no longer does.
+- **S3 and audit export changes.** An `aws_s3` source body with a
+  non-callable `read` fails as `InvalidS3Body`. An `aws_s3` sink with
+  `overwrite: true` can now replace an existing object whose checksum is a
+  multipart SHA-256 composite, which used to be refused as malformed. Audit
+  export preflight now fails when its scratch probe cannot be removed, and
+  reconcile evidence values for the staging state change.
+- **A missing core dependency stops plugin discovery.** Only `jinja2` is
+  treated as optional; a missing `chromadb`, `bs4` or `html2text` now raises
+  instead of silently dropping plugins from the catalog.
+- **CI runs one Python 3.14 lane**, which is the coverage lane. Required
+  status-check names change with it, for example
+  `Test (Python 3.14, shard N)` and `Timing-sensitive tests (Python 3.14)`,
+  and the repository ruleset must be updated to match.
+
+Schema and stored data:
+
+- No schema epoch changed and no stored data is migrated, reset or rewritten.
+  Session epoch 78 and Landscape epoch 50 are unchanged from the previous
+  release; this release adds no schema-epoch cutover. Existing 0.8.13 session
+  and Landscape stores need no action beyond the drain above, and the 0.8.10
+  cutover guidance below continues to apply to older stores. This authorizes
+  no migration, reset, restamping or downgrade.
+
+### Engine and runtime
+
+Each of these keeps the behaviour ELSPETH had under Python 3.13.
+
+- **Strict JSON parsing bounds nesting explicitly** at the interpreter
+  recursion limit. Python 3.14's C decoder no longer stops there.
+- **The runtime-validation manifest again records helper dependencies reached
+  through local loads**, for which 3.14 emits new instructions. It also
+  ignores docstring-only edits, which 3.14 marks with a new `CO_HAS_DOCSTRING`
+  flag.
+- **Runtime preflight keeps reporting an abandoned task failure by class
+  only.** Python 3.14's `asyncio.shield` began logging the message and
+  traceback.
+
+### Plugins
+
+- **A timed-out batch attempt's late lease loss no longer ends the run.** When
+  a row's wait timed out, the row was recorded and its worker kept running; if
+  that worker later lost its own scheduler lease, the
+  `SchedulerLeaseLostError` was treated as an orphaned worker failure and
+  failed the whole run. A lease loss from an already-evicted attempt is now
+  discarded. Every other late failure, including `RunWorkerEvictedError` and
+  audit-integrity errors, still ends the run, and errors for live rows are
+  delivered as before.
+- **The LLM transform waits at least an hour for a row's result.** Its wait
+  was sized from the capacity-retry budget plus one request per query, but the
+  query pool runs one row's batch at a time, so a pooled multi-query row also
+  queues behind earlier rows. With a short `max_capacity_retry_seconds` (for
+  example 30), an ordinary row could time out while still queued. The wait now
+  keeps the one-hour batch-wait default as a floor, like the other batch
+  transforms, and still grows with a larger budget. Provider request timeouts
+  and capacity retries are unchanged.
+- **New `azure_content_understanding` transform.** It runs an Azure AI
+  Content Understanding analyzer (GA api-version `2025-11-01`) over one
+  document, image, audio or video reference per row. The reference is a URL or
+  a base64 string. Like `azure_document_intelligence`, it submits an
+  asynchronous analyze operation, polls it to completion and writes the
+  configured outputs onto the row: `content_field` (markdown), `fields_field`
+  (the analyzer's fields as plain values), `page_count_field`,
+  `metadata_field`, `result_field`, and `extract` facets that are
+  concatenated across the result's contents. Options also cover
+  `content_range`, `mime_type`, `processing_location`, `string_encoding` and
+  per-request `model_deployments`. Its key is `AZURE_CONTENT_UNDERSTANDING_KEY`.
+- **`azure_document_intelligence` no longer records a SAS signature in its
+  HTTP request record.** A `urlSource` that carried a SAS `sig` was recorded
+  verbatim in the Landscape request record and its telemetry. The recorded
+  request now fingerprints the credential-shaped query values and userinfo,
+  while Azure still receives the URL unchanged. The fingerprint key
+  requirement is the same one the api-key header already had. The row's own
+  `source_field` value is unchanged, so the URL is still stored wherever row
+  data is stored.
+- **`azure_document_intelligence` reports `canceled` and `skipped` operations
+  as `analysis_failed`.** They were reported as `malformed_response`. The
+  error reason now carries `error_type` (`failed` or `canceled`) alongside the
+  bounded `cause`.
+- **Rejected Document Intelligence calls name Azure's error code.** An
+  `api_error` now carries `code` (Azure's `error.code`) and `cause` (its
+  `innererror.code`), both bounded tokens from Azure's error envelope; the
+  error message is still never placed in the error reason.
+- **Document Intelligence retry timing follows Azure's `Retry-After`.**
+  Capacity retries (429/503) wait as long as Azure asks. A request for longer
+  than the remaining budget fails the row at once. `max_capacity_retry_seconds`
+  now bounds each call's retrying (clamped to `poll_timeout_seconds`) instead
+  of being measured from the row start, so a 429 on a late poll is retried. A
+  poll `Retry-After` is honoured up to 60 seconds.
+- **Two Document Intelligence failures no longer end the run.** A document
+  URL with a malformed bracketed host fails the row as
+  `invalid_input/invalid_document_url`, and a response with a refused
+  `Content-Encoding` fails it as
+  `malformed_response/response_encoding_refused`.
+- **Invalid base64 is rejected before it is sent.** A base64 source that is
+  not padded standard-alphabet base64 fails the row with
+  `invalid_input/invalid_base64` instead of costing a billed Azure call. This
+  includes a `data:` URI, the URL-safe alphabet, and line-wrapped or
+  whitespace-containing output, which was previously forwarded to Azure;
+  strip line breaks upstream.
+- **The Document Intelligence batch wait now covers a full request
+  timeout.** A large `request_timeout_seconds` could previously let a row
+  outlive the batch wait.
+- **New `azure_document_intelligence` outputs.** `fields_field` writes the
+  first document's typed fields as plain values (for example `InvoiceTotal`).
+  `metadata_field` writes bounded analysis metadata: model id, operation id,
+  page and document counts, and warning codes.
+- **Smaller `azure_document_intelligence` changes.** A `malformed_response`
+  message now names the facet without the `analyzeResult.` prefix. The
+  success metadata's `operation_id` is omitted when Azure's id is not a plain
+  token. The catalogue lists the shared source, polling and timeout options
+  before `endpoint` and `model_id`. Option names and defaults are unchanged.
+- **Generic HTTP JSON responses are admitted only if the audit can record
+  them.** A body nested deeper than 64 levels, a number that overflows to
+  infinity or an integer outside the canonical range is now recorded as a
+  JSON parse failure. Previously the call raised with no audit record.
+- **`web_scrape` refuses a row URL that contains a control character**, such
+  as a trailing newline, as a `validation_failed` row error. It previously
+  crashed the run. The shared SSRF and origin checks now refuse ASCII control
+  characters and DEL as `malformed_url` for every caller, including
+  discovered, paginated and redirected `web_scrape` URLs, `blob_fetch`, and
+  Dataverse requests and `nextLink` URLs. `blob_fetch` used to crash on such
+  a URL and Dataverse admitted it.
+- **Every audited HTTP request is cut off at its configured timeout.** The
+  timeout is now one deadline covering DNS, connect, TLS, sending, headers,
+  the full body and every redirect hop, where it used to bound each socket
+  operation, so an upstream that trickled bytes could hold a worker without
+  limit. This applies to `web_scrape`, `blob_fetch`, the OpenRouter and
+  gateway LLM transforms and sources, the Azure content safety, prompt
+  shield, AI Search, Document Intelligence and Content Understanding
+  transforms, Power Automate and the Dataverse client (30 s per request).
+  Rate-limiter waits are bounded separately by the same number of seconds,
+  and `web_scrape`'s pagination `max_elapsed_seconds` also bounds the page in
+  flight. Timeout option descriptions state the total bound.
+- **Chroma search records and classifies HTTP-layer failures.** Transport
+  errors and HTTP 408, 429 and 5xx are retryable; other 4xx responses and
+  non-JSON bodies are permanent. These calls were previously unrecorded and
+  not retried.
+- **Dataverse FetchXML paging works past the first page.** The request now
+  asks for the paging annotations, a page without `morerecords` ends the
+  results, and the paging cookie sent back is the annotation's inner
+  `pagingcookie` value. If the server ignores the annotations and a second
+  page exists, the source fails instead of truncating.
+- **The `database` sink publishes batches larger than about 64 KiB.** The
+  effect plan no longer embeds every row; it binds them by hash and member
+  count, and commit re-derives them from the durable member payloads. Such
+  batches previously failed at prepare. Not run for this change: the
+  PostgreSQL testcontainer suite.
+- **The `database` sink writes object and list values as RFC 8785 canonical
+  JSON text** (`{"k":1}`), where it previously wrote `json.dumps` output
+  (`{"k": 1}`). Consumers that compare the stored text byte-for-byte will see
+  the difference.
+
+Sources:
+
+- **External JSON is bounded at 64 levels of nesting before it is decoded**
+  in the JSON source (JSON arrays and each JSONL line), the Azure blob
+  source, `blob_json_expand`, the schema value walker and LLM response
+  validation. Over-deep input is quarantined (for JSONL, that line only)
+  instead of exhausting recursion and crashing the run.
+- **JSON source:** `data_key` and non-array quarantines record the same row
+  they route, so the validation-error link is kept, and resume snapshots no
+  longer crash.
+- **CSV source:** the file is decoded strictly in binary, so a decode error
+  names the physical line and row holding the bad byte. A bad byte on the
+  header line still quarantines the whole file without a line number.
+- **S3 source:** an object that fails partway gives its error row the next
+  unused index and says rows were already emitted. A JSONL object resyncs
+  past an oversized line, quarantining it, and a CSV or JSONL read that stops
+  records that it stopped. JSONL line numbers no longer shift by one when an
+  oversized line is split between its CR and LF. `max_record_chars` counts a
+  CSV record's content without its line terminator, so a record exactly at
+  the limit is now accepted; the S3 sink measures each record as it writes
+  it, so the sink and source agree at the limit.
+- **Azure blob source:** CSV is decoded per record, so an undecodable row is
+  quarantined on its own with its raw bytes, line and row number. An
+  undecodable header still quarantines the whole file.
+- **S3 CSV** skips blank records before header discovery; a blank-only
+  object raises the existing empty-file error.
+- **Undecodable UTF-16 and UTF-32 records are quarantined one at a time.**
+  The JSON source (JSONL), text source, Azure blob source (CSV and JSONL) and
+  S3 source (JSONL) quarantine only the bad line or record, with its true
+  line number and raw bytes, instead of the whole file or object. The
+  recorded bytes are the line as the file holds it: in the byte order the
+  file's BOM declares, with the BOM only on line 1. One shared decoder does
+  this for every source, and registers a namespaced codec error handler,
+  `elspeth.source_byte_escape`, process-wide on import. Every reader of
+  `utf-8` input consumes a leading byte-order mark; a mid-file U+FEFF is
+  still data.
+- **Text source:** undecodable lines are quarantined one at a time.
+- **Dataverse source:** formatted values are requested with a `Prefer`
+  header and their annotations stripped. `top` must be at least 1, and
+  FetchXML must have exactly one named entity; both are checked at config
+  time rather than at load.
+
+Transforms:
+
+- **`web_scrape`:**
+  - Pagination cycle detection compares canonical URLs, so a self-link that
+    canonicalisation rewrites is caught instead of fetched again.
+  - In replay and verify, a malformed URL fails the row with a scheme/shape
+    refusal instead of crashing; live behaviour is unchanged.
+  - An invalid `next_link_selector` is a config error.
+  - A discovered link is used exactly as validated, without re-encoding its
+    query. Links found in `href`s refuse the same cursor and session query
+    keys that Link-header links already did (`cursor`, `continuation`,
+    `next_token`, `page_token`, `session`, `state`), and the
+    sensitive-parameter check also splits on `;`.
+  - `fingerprint_mode: full` hashes what it claims: the exact extracted
+    content plus each fetched page's HTTP status, final URL (as recorded in
+    `fetch_url_final`), raw Content-Type and decoded-body SHA-256. It used to
+    hash the extracted content only. `content` mode is unchanged (#5).
+  - Null elements inside a selected JSON records array are treated as
+    absent, like a top-level null, instead of failing the page (#153).
+  - `compute_fingerprint` refuses an unknown fingerprint mode instead of
+    silently hashing as `full` (#157).
+  - API-key header names exclude hop-by-hop and proxy headers, and basic
+    credentials must be `user:password` (#164).
+- **Power Automate:** an archived SAS VERIFY run with no fingerprint key
+  reports `fingerprint_key_required` instead of a misleading
+  `authentication_failed` (#130).
+- **`reference_join`** refuses non-canonical reference values at config load
+  (see Upgrade notes); the first matching row previously crashed the run or
+  was misrouted as a contract violation.
+- **`truncate`** declares its `fields` keys as string-typed inputs, as
+  `keyword_filter` and the guardrails declare theirs, so the build refuses a
+  producer that types one non-string and the field-name spelling rule
+  applies. A missing field fails the row; `strict` is removed (#146).
+  Transforms that read other configured row fields as strings declare them
+  the same way (see Upgrade notes).
+- **`field_mapper`** runs its dotted-source collision check, so an existing
+  field is no longer silently overwritten when the executor collision gate is
+  off.
+- **`batch_replicate`** joins the output contract across all buffered rows;
+  the first row's contract previously won, so copies could carry a contract
+  that misdescribed their own values.
+- **Batch statistics transforms:**
+  - `batch_stats` records integer sums beyond 2^53-1 and overflowing or
+    non-finite float sums as a `float_overflow` error.
+  - `batch_classifier_metrics` fails the batch on a `positive_label` type
+    mismatch instead of reporting tp = fn = 0.
+  - Baseline labels in `batch_paired_preference`, `batch_effect_size` and
+    `batch_experiment_compare` are type-strict; blank and non-finite labels
+    are refused, and `batch_experiment_compare` baselines are no longer
+    string-only.
+  - The `batch_paired_preference` interval uses Student's t.
+  - `batch_data_quality_report` counts distinct values in linear time.
+  - The outlier, rank, paired-preference and drift-compare transforms
+    declare their 4096-row flush cap, and an aggregation whose
+    `trigger.count` exceeds it is refused at pipeline build and by the
+    composer, instead of failing every full batch at flush. Their composer
+    hints state the cap (#20).
+  - `batch_drift_compare` success rows list skipped missing and non-finite
+    rows by batch index per cohort, as `batch_stats` does, in four new fields
+    (`baseline_`/`cohort_missing_indices`,
+    `baseline_`/`cohort_non_finite_indices`) (#101).
+  - `batch_drift_compare` `chi_square_statistic` is Pearson's chi-square test
+    of homogeneity over every category seen in either cohort. Categories
+    absent from the baseline used to be left out; they now count toward the
+    statistic (#102).
+  - `batch_distribution_profile` percentiles of extreme opposite-sign finite
+    values no longer fail with `float_overflow` (#121).
+  - `batch_threshold_summary` requires a numeric threshold `value` (#135).
+  - `batch_top_k` counts datetime and Decimal values, as `group_by` already
+    admits; non-finite Decimals are skipped and reported (#136).
+- **Batch transform engine:** a timed-out row's late failure is no longer
+  charged to the next row, and a dead release thread fails pending rows at
+  once instead of leaving them blocked until timeout. A refused eviction no
+  longer replaces a completed row's result with a `KeyError` (#120).
+- **`blob_json_expand`, `blob_text`, `blob_csv`:** `max_blob_bytes` is enforced
+  while the blob is read, not after it is loaded. `blob_csv_expand` validates
+  its delimiter the same way the CSV sink does. `blob_json_expand` splits
+  JSONL only on `\n` (one trailing `\r` stripped), so records containing
+  U+2028, U+2029 or U+0085 stay whole, and it rejects NaN and Infinity.
+  `blob_csv_expand` parse-phase error reasons name their source (`field`,
+  `blob_ref`), like `empty_csv` and load errors, and every routed error
+  reason has a focused unit test (#53, #54).
+- **`json_explode`** has a new `index_field` option (default `item_index`), so
+  nested explodes do not collide (#111).
+- **JSON sink:** the unreachable JSON-array append path is removed;
+  `format: json` never appends (#105).
+- **`pdf_rasterize`:**
+  - The parent re-checks every page the worker reports and refuses bad
+    geometry, pages over `max_page_pixels`, text when `extract_text` is off,
+    and text over `max_page_text_bytes`.
+  - A memory error on one page refuses only that page.
+  - The temporary output directory is removed on every failure path.
+  - Multi-page replay works, and duplicate page rows are refused.
+  - The renderer identity check also accepts the macOS and Windows pdfium
+    library names.
+  - The audited render request records `max_total_bytes`, and its format is
+    `pdf_rasterize/v2` (#59).
+- **Textract:** FORMS entries carry `value_selection_status` (`SELECTED`,
+  `NOT_SELECTED` or none), and a malformed selection fails closed. Inline
+  analysis reads its input with a size bound. Closing a Textract transform no
+  longer sets the engine's shutdown event. When a bucket-region lookup fails,
+  rows waiting on the same lookup get the shared failure, marked with
+  `cache_status: shared_failure`.
+  From the AWS review:
+  - Throttled and transient failures raise `PluginRetryableError`, so the
+    engine retry policy applies; a `retryable=True` row result used to be
+    silently ignored. Transient poll errors retry in place until the poll
+    deadline (#1).
+  - `aws_textract_document_analysis` replay no longer sleeps or races the
+    wall clock and ends polling from the archive; verify substitutes the
+    source job id and `next_token` fingerprint, and HeadBucket single-flight
+    leadership in replay follows the source run (#2, #3).
+  - Textract and S3 HeadBucket audit records carry the observed HTTP attempt
+    count for every botocore transport error, and SSL, proxy and streaming
+    failures are classified as retryable, as botocore does (#6).
+  - Inline analysis limits are capped (#7).
+  - Page projection is linear in the block count instead of quadratic (#9).
+  - Per-row bucket mode bounds S3 keys in UTF-8 bytes (1024), as
+    static-bucket mode does (#10).
+  - `too_many_blocks` and `result_too_large` are recorded from a structured
+    error category, so provider text in a malformed response can no longer
+    pick the audited failure reason (#38).
+  - Query text and alias validation rejects non-ASCII whitespace such as
+    U+00A0 at config load, matching the provider pattern (#158).
+- **AWS guardrails** count botocore attempts as they are sent, so a transport
+  error reports the attempts actually made. They stop scanning at a row
+  deadline, set by the new `row_deadline_seconds` option (positive integer,
+  default 300; not exposed on the web operator profile), honour shutdown
+  between fields, and hand retryable failures to the engine retry policy
+  (AWS review #4). The response parser records a wrong-typed `confidence`,
+  `action` or `filterStrength` as a malformed response instead of crashing
+  with an unaudited `TypeError` (#5), and the guardrail ARN is cross-checked
+  against `region` (#8). Every configured field is validated before the
+  first ApplyGuardrail call, so a later invalid field no longer lets earlier
+  fields be sent and billed (#145), and profile aliases are limited to 64
+  characters at config load, matching the live check (#159).
+- **`azure_content_safety`** composer hint no longer claims a default
+  threshold of 4: every category threshold is required, and lower values are
+  stricter (#127).
+- **Azure analyze transforms** (Document Intelligence, Content Understanding)
+  retry network errors while polling until the poll deadline.
+- **LLM transforms:**
+  - Replaying a recorded content-policy refusal raises the same error as the
+    live run, so the row is handled the same way.
+  - The Azure and Bedrock batch wait covers the whole batch: the budget plus
+    queries × request timeout plus 30 seconds.
+  - Tracing imports its instrumentor before configuring, refuses a second,
+    conflicting tracing policy in one process, and type-checks its boolean
+    flags and credentials.
+  - An empty or whitespace-only completion is classified by why it is empty:
+    a content filter or explicit refusal raises a content-policy error,
+    `length` a token-budget error, tool calls an unsupported-response error,
+    and anything else a non-retryable error. The audited LLM client does this
+    once for every provider, and records the call as an ERROR with that
+    classification instead of SUCCESS; replay raises the same error (#123).
+    Bedrock's readiness check validates content and finish reason the same
+    way.
+  - OpenRouter network errors use fixed text, so the URL no longer reaches
+    the audit trail or Langfuse.
+  - The LLM gateway rejects malformed usage when the `usage` capability is
+    required, and rejects a malformed readiness response.
+  - The OpenRouter and gateway source configs no longer show the API key in
+    their repr. Plugin configs now hide credential, endpoint and tracing
+    fields from repr across the LLM, Azure, AWS, Chroma, database and
+    `web_scrape` plugins, and a plugin config validation error no longer
+    echoes the authored input values (#128).
+  - Single-query `fields_added` declares the `<response_field>_usage` and
+    `<response_field>_model` fields the transform already wrote.
+  - The Langfuse tracer refuses a cached client whose base URL or secret key
+    differs from the one requested, and a conflicting `LANGFUSE_BASE_URL`.
+  - A required image field holding an empty list is an `invalid_input` row
+    error (`empty_image_list`).
+  - Config refusals for row-object misuse or dynamic row access name the
+    query template at fault instead of always blaming `prompt_template`
+    (#33).
+  - Ordered-mode config validation compiles the ordered query plan once per
+    validation pass instead of once per query (#34).
+  - Single-query transforms no longer record an empty system message in
+    Langfuse when `system_prompt` is `""` (#46).
+  - `_parts_hash` is registered as an LLM audit-only field, so the row/audit
+    separation guards cover it (#87).
+  - `populate_llm_operational_fields` requires a `TokenUsage` and a model
+    string, matching the non-nullable output schema (#88).
+  - The unused `validate_json_object_response` parser is removed; response
+    property tests exercise the production parser `extract_structured_fields`
+    (#143).
+  - `too_many_images` reasons report "more than N" instead of a misleading
+    max+1 count (#154).
+- **`keyword_filter`:** the ReDoS guard treats `{,n}` and `{,}` as
+  quantifiers (`{}` stays literal), and a single-string `fields` declares
+  that one field rather than all fields.
+- **Unscanned fields are reported.** `keyword_filter` and the Azure content
+  safety and prompt shield transforms list fields they skipped because the
+  value was not a string in `success_reason.validation_warnings`. They do not
+  recurse into containers, by design.
+- **RAG:** the registry hides only a missing `chromadb` module, and its error
+  names the `elspeth[rag]` extra.
+
+Sinks and retrieval:
+
+- **Chroma sink:**
+  - An empty, whitespace-only or duplicate document id in an effect group is
+    diverted per row at prepare; the whole effect previously failed, an empty
+    id was recommitted forever, and a whitespace-only id was published.
+  - `on_duplicate` accepts only `overwrite`, the one policy the sink
+    performs; `skip` and `error` fail config validation.
+  - A row is diverted only when chromadb rejects it before sending
+    (validation, embedding, metadata preparation). A failure after the write
+    is sent, such as an unreadable HTTP response, is reconciled by reading the
+    write back; it used to be recorded as a diversion of a row that had been
+    written. This uses chromadb's private upsert path, so `chromadb` is pinned
+    to 1.5.5.
+  - Startup refuses an existing collection whose `hnsw:space` differs from
+    `distance_function`.
+- **HTTP replay** re-raises a recorded transport failure and records the
+  replay call as an error; other recorded failure types still raise
+  `AuditIntegrityError`.
+- **Azure Search** result metadata excludes the vector field and
+  `@search.*` keys.
+- **Chroma retrieval** records a failure in runtime preflight or deferred
+  initialisation as a failed call.
+- **Dataverse sink:**
+  - Reconciliation no longer treats a server echo of the same value as a
+    mismatch.
+  - Apostrophes in upsert alternate-key values are OData-escaped.
+  - A lookup whose key is not mapped is a config error.
+- **Dataverse client:** errors carry a typed `retry_after` parsed from
+  `Retry-After`. The Dataverse source and sink honour it on 429 and 503
+  throttling: the client waits at least `Retry-After` (with an exponential
+  backoff floor and a 300 s throttle-wait budget per request, cancellable on
+  shutdown) and re-sends instead of failing the run. Each waited-out
+  throttled call is recorded with its `retry_wait_ms`, and sink commit
+  evidence names the waits as `throttle_wait_ms` (#76).
+- **S3 sink:** a closed sink refuses further requests, the CSV probe checks
+  the header it will actually write, and an unencodable header raises a
+  `ValueError`.
+- **Azure blob sink:** JSON and JSONL bodies are streamed in 64 KiB chunks.
+  The Azure blob sink and source close the service client and credential.
+- **CSV sink:** the delimiter is validated by building a real CSV writer, and
+  non-text encodings are refused. A new opt-in `neutralize_formulas` setting
+  (off by default, so output is byte-identical unless enabled) neutralises
+  spreadsheet formulas.
+- **Local file effects** admit storage per 64 KiB accumulated rather than per
+  chunk, with exact cumulative reservations.
+- **Audit-export bundles:** a bundle being built is held under an exclusive
+  lock, and the stale-scratch sweep skips locked trees, so it can no longer
+  delete a live bundle.
+- **`database` sink** composer guidance now matches what it supports:
+  SQLite or PostgreSQL, an existing table, no DDL, a required effect ledger,
+  and append only. `if_exists` accepts only `append`, so `replace` fails
+  config validation.
+- **Plugin infrastructure:**
+  - `PluginManager.create_*` builds the plugin class from its own registry
+    and validates config against that same class (#126).
+  - Plugin discovery raises on a missing core dependency (#129).
+  - The Chroma readiness probe reports a persistent path that is not an
+    existing directory as unreachable, without creating a client (#149).
+  - An unknown landscape export sink is refused for every run purpose,
+    `landscape.export` values are expanded before eligibility checks, and a
+    deferred Key Vault reference defers the raw-settings gate, in the CLI
+    preflight as well (#104).
+  - A template render timeout is classified by worker CPU time: a template
+    that used its 2 s CPU budget is a row `TemplateError`, anything else a
+    retryable worker-lost error (#6).
+  - Parallel LLM multi-query records the pool execution context in
+    `context_after` (#100). The context is captured under the batch lock, so
+    with concurrent rows each row records its own batch's retries, throttling
+    and concurrency rather than another row's.
+  - Control credit no longer reads a `detect_only` option that no plugin
+    config admits (#1).
+  - A template render whose context carries a row reports failures by
+    exception class only, so row values cannot reach error text. Value-free
+    reporting is also the default for every sandboxed template environment;
+    only the Azure Blob sink's blob path, whose context never carries row
+    data, opts in to the detailed message. The output-size limit message is
+    kept in value-free renders (#7).
+  - Every plugin `encoding` option refuses non-text codecs, and every CSV
+    `delimiter` option refuses `"`, newline and carriage return, at config
+    load, through one shared check.
+  - Sink pre-validation resolves the config model from the config, as the
+    runtime factory does, and reports a provider dispatch rejection as a
+    `provider` validation error, matching sources and transforms (#8).
+- **S3, audit export and Dataverse:**
+  - The `aws_s3` source admits the SDK `GetObject` body by parsing its
+    `read`/`close` members rather than a runtime-checkable protocol; a body
+    whose `read` is not callable is closed and reported as `InvalidS3Body`
+    instead of a mid-download `TypeError` (#12).
+  - The `aws_s3` sink records a multipart composite `ChecksumSHA256`
+    (`<base64>-<parts>`) as having no full-object checksum instead of
+    rejecting it as malformed; malformed composites are still refused (#31).
+  - Audit export bundle preflight reports a scratch probe it could not
+    remove (#15), the same-device guard compares the staging parent rather
+    than the target parent with itself (#16), and reconcile evidence records
+    the measured staging state, using `divergent` only for a tree actually
+    compared against the plan (#17).
+  - Dataverse member-effect validation computes batch plan material once per
+    batch rather than per member; the plan-vs-material integrity check still
+    runs for every member (#89).
+
+### Web Composer
+
+- **Multi-query prompt reviews can be approved without a shared template.**
+  When every query supplies its own template and the optional node-level
+  `prompt_template` is omitted or null, the review card now shows the system
+  prompt and every query template in full from the live composition, and
+  Approve unlocks after View prompt. Before, the card fell back to the bounded
+  staging preview and approval stayed unavailable. A query that relies on a
+  missing shared template still keeps approval unavailable.
+- **A reply the completion review withholds is shown as a system notice.** The
+  assistant message is empty and the notice says why (review unavailable,
+  malformed, rejected, out of budget, or not admitted). The withheld text never
+  re-enters the conversation history sent to the model, so it is never treated
+  as the model's own words. The saved-scope facts appear once, in the
+  checkpoint receipt.
+- **Credential-shaped model reasoning no longer fails the turn.** It is dropped
+  and recorded as a value-free withhold, and the turn continues. Where the
+  provider forbids editing or omitting thinking blocks (a tool-call
+  completion), the call is refused with a typed cause instead.
+- **Credential refusals on model output no longer blame the user.** When the
+  guard blocks content the model produced, the message says the model's output
+  was blocked and to retry, and keeps the secret-service remedy for the case
+  where the user supplied the value.
+- **Stored provider-error text is scrubbed with the shared credential
+  patterns.** The scrubber kept its own list, which missed database-URL
+  passwords and over-redacted ordinary request paths. Hyphenated provider keys
+  are never stored in an audit row's `error_message`. New rows may carry the
+  shared marker labels `ssn_like` and `github_token`; existing rows are not
+  rewritten. Redis, AMQP and raw-slash URL passwords are not recognised by the
+  shared detector and remain a gap.
+- **The version menu shows the newest 50 versions and marks validated
+  milestones.** It used to request the oldest 50, so in a long session the
+  baseline `diff_pipeline` names could not be found. Strictly validated
+  versions are labelled without relying on colour and are never hidden by the
+  identical-snapshot filter. If the head keeps moving while the history loads,
+  the menu says so and offers Retry.
+- **A forked session's first version no longer claims a validation that never
+  ran on its bytes.** Fork rewrites blob and sink paths; when that changes the
+  structure, the marker is now `authoring_only` (`is_valid` is kept). An
+  unchanged fork keeps its marker.
+- **`diff_pipeline` compares against the last validated state.** The baseline
+  is the newest strictly validated state other than the working state, reported
+  as `baseline_kind: last_validated`; with none, it is the request-start state
+  (`request_start`). A state checked only by the mid-turn authoring check does
+  not count. The tool description and the composer skill now tell the model to
+  name both version numbers and to say plainly when nothing has changed. The
+  skill text change moves `composer_skill_hash`.
+- **A reviewed interpretation slot that a per-query template bypasses is
+  refused at staging.** A multi-query node whose query supplies its own template
+  never rendered the node-level slot, so the approved value did not reach that
+  prompt. `set_pipeline`, `upsert_node`, `splice_transform` and `patch_node_options`
+  now refuse the shape with the validation code `vague_term_query_override`
+  and a repair message that names the real cause.
+- **Ordinary prose no longer blocks resolving an accepted interpretation.**
+  The guard that refused any template whose text before the placeholder ended
+  in `system:`, `role:` or `instructions:` is removed (for example "Describe
+  the user's role:"). Braces and control characters are still refused.
+- **The end-of-turn advisor review gets the plugin capability record** bound to
+  the same snapshot as the candidate, and a rubric that separates a prose
+  objection (the reply is withheld) from a graph finding. Repair copy says the
+  user has not seen the draft.
+- **The three batch plugins are available on every install.** `batch_stats`,
+  `batch_replicate` and `batch_experiment_compare` no longer depend on an
+  operator allowlist; both AWS terraform mirrors and the docs lists follow. The
+  schema-contract repair text now says `copy_index` is an output field of
+  `batch_replicate` when `include_copy_index` is enabled. The planner request
+  grows by a measured 1,335 bytes.
+- **`report_assemble` declares the text framing it produces**, so the Web
+  Composer rejects a direct link to a `text` sink at validation (see Upgrade
+  notes). The `document` sink example admits the eight report metadata fields as
+  optional, and the `text` and `document` sink guidance states what each
+  writes.
+- **The tutorial's Build step is script-only.** After the brief is sent, the
+  learner can take only the card decisions the script needs: no chat input,
+  upload, suggestion Apply, repair, inline-source edit or use-as-input. The
+  interpretation card has no "Change..." control. Cancel and the
+  interrupted-request retry stay, and a resend control re-sends the scripted
+  brief. The launch check's 409 detail names what differs. The ordinary chat is
+  unchanged.
+- **The escape-hatch boot probe sends the real request.** It used to send three
+  tools; it now sends the full planner palette a production hatch turn sends,
+  so the probe now exercises the request production sends.
+- **A reply that fits is no longer refused by the context budget.** Savings
+  from shed history and stubbed tool results are now counted in wire bytes (and
+  on the quoted records the reply stage sends), where they were counted in
+  content bytes, and a reply-stage refusal's audit components are sized on the
+  request that was measured.
+- **A forked session's copy of a model-written file stays model-written**
+  (#365). Forking used to record the copy as VERBATIM, which let a session
+  fork turn LLM-generated text into a file the composer would accept as
+  prompt text. The copy now keeps its source's creation modality and the
+  `creating_*` provenance fields, anchored to the child session's own
+  `session_fork` audit row, so the prompt-surface guard, blob admission and
+  share checks treat it as model-written through forks of forks as well.
+
+### Sharing
+
+- **Cancelling a shared-pipeline import or a library fork no longer leaves an
+  empty session.** A client disconnect during creation used to commit a live,
+  empty "Copy of ..." or "Fork of ..." session that nothing archived. The
+  session is now archived on cancellation.
+- **Share tokens are decoded strictly.** A token containing characters outside
+  the URL-safe base64 alphabet is refused; it used to verify with the junk
+  discarded. Every token issued before this release still verifies. The unused
+  `requesting_user_id` parameter of `ShareableReviewService.resolve_token` is
+  removed; the route keeps its authentication and rate limit.
+- **`elspeth purge` can no longer delete a live share's data.** Share snapshots
+  and frozen import files shared the content-addressed payload store with run
+  payloads, so a share whose bytes matched a run's canonical row JSON was
+  deleted with the run and its link returned 404. Shares now have their own
+  store at `<payload base>/shares`, on the same mounted volume with no new
+  setting. Links created before this release keep working (reads fall back to
+  the parent store), but their data stays where it is and remains
+  purge-exposed; there is no migration. Never point `purge --payload-dir` at
+  `shares/`.
+- **Copying a share link again keeps its original expiry.** A re-minted link
+  is signed with the expiry recorded when the pipeline was shared for review,
+  shortened if the deployment maximum has since been lowered. It used to start
+  a fresh lifetime. Once that expiry has passed, the request returns 409
+  `share_link_expired`; share for review again to create a new link.
+- **Library payloads have their own store**, at `<payload base>/library`, so
+  `elspeth purge` cannot delete a published entry's pipeline. A missing payload
+  is reported as `library_payload_unavailable` (republish); a corrupt one is
+  still an integrity error. See the upgrade note above.
+
+### Logging
+
+- **asyncio diagnostics that carry an exception are reduced to class and code
+  location.** A task exception that was never retrieved, a failed loop
+  callback and 3.14's shielded-future report are logged as
+  `asyncio_unhandled_exception exc_class=… frames=file:line:function,…`, on
+  every event loop in the process. Records without an exception are
+  unchanged.
+
+### Examples
+
+- **The `multi_worker`, `multi_worker_showcase` and `join_refused` launchers
+  require the `sqlite3` command-line tool** and exit 2 with a clear message
+  when it is missing. Without it they used to fail as a misleading "leader
+  never reached RUNNING" timeout. `examples/AGENTS.md` lists `sqlite3` as a
+  prerequisite and documents `reference_join_chain`, which ends PARTIAL with
+  exit 1 by design.
+
+### Known limits
+
+- Ruff still targets `py313`, so that the formatter does not rewrite 169 files
+  to the PEP 758 `except A, B:` form. That is separate work.
+- One `elspeth-lints` masquerade test, of definition-time annotation order,
+  stays skipped on 3.14: the model it checks predates PEP 649.
+- Four signed tier-model allowlist entries for
+  `contracts/runtime_val_manifest.py` drift and await operator re-signing.
+  Keyless scans report them. The plugin fixes leave more awaiting re-signing:
+  one for the batch transform mixin, four for the S3 sink, and the signed
+  `http.py` entries after the client changes.
+- In pooled LLM mode, time a row spends queueing is still unbounded.
+- The plugin source-hash lint now checks the AWS transforms, which it had
+  skipped: it did not scan `plugins/transforms/aws` or recognise the Bedrock
+  guardrail base. The stale `aws_bedrock_prompt_shield` hash it then found is
+  re-pinned, and a test now requires the rule to cover every registered
+  plugin.
+- Bedrock's readiness check still requests 32 tokens, so reasoning models may
+  fail it.
+- Azure OpenAI and Bedrock LLM requests go through provider SDKs and still
+  bound each network operation separately rather than the whole request.
+- Seven allowlist entries for audit-export bundle effects also await
+  re-signing.
+- `azure-ai-inference` is not a declared dependency of LLM tracing, and if
+  `instrument()` fails the exporter is left running.
+- Dataverse sink errors are not yet diverted per row: which error codes are
+  attributable to a row needs a maintainer decision. Reconciliation does not
+  normalise decimal or datetime values.
+- The PostgreSQL testcontainer suite has not been run for the `database` sink
+  change or the fork provenance fix (#365).
+- Textract verify mode still compares responses and indexes `IN_PROGRESS`
+  polls per live run, so provider-generated `JobId` and `NextToken` values
+  are not yet normalised; replay residuals, a HeadBucket verify race, and
+  whether follower evidence should name the leader's state await
+  maintainer decisions.
+- The Dataverse 300 s throttle-wait budget is not configurable, and the
+  client retries only 429 and 503; 500, 502, 504 and timeouts are not
+  retried in the client.
+- The batch transform mixin's `evict_submission` allowlist entry is stale
+  and awaits re-signing.
+- Power Automate still acquires an OAuth token per POST; reusing it (#131)
+  awaits a maintainer decision.
+- An engine retry of a guardrail row re-scans, and re-bills, fields that
+  already passed.
+  The guardrails client also awaits operator re-signing of three tier-model
+  allowlist entries for `BedrockGuardrailsClient.apply_guardrail`.
+- `diff_pipeline` moves its baseline to the request-start state as soon as the
+  turn edits, and after a revert it compares with the validated state before
+  the revert.
+- The vague-term bypass refusal does not tell the planner which query bypasses
+  the slot; a slot resolved before an override is added is still accepted; and
+  a stored session with a pending card on such a node is treated as orphaned on
+  the next compose turn.
+- The advisor does not yet receive blocker detail. The handoff override before
+  the pre-scan still drops the masked-red diagnostic.
+- The tutorial's script-only Build step has not had its browser walk: no
+  Chromium was available.
+- Fork copies made before the #365 fix stay VERBATIM; they are not rewritten.
+  A fork interrupted mid-copy across the upgrade fails closed on retry with a
+  modality mismatch. Pipeline `llm`-node output is still recorded VERBATIM
+  and has not been checked as a route to model-written prompt text.
+- Two masquerade baseline entries added for the `aws_s3` source body parse
+  and a test double await maintainer review, and tier-model allowlist
+  entries for audit export preflight and the `aws_s3` source download await
+  operator re-signing.
+
+### Publication and acceptance
+
+Automatic image publication from main remains held. The 0.8.14 tag and
+container publication follow successful required checks and the protected
+merge. Operator signing, live-provider acceptance and deployment remain
+separate steps.
+
+---
+
 ## 0.8.13 - 2026-11-11
 
 Composer context budget. Long Composer sessions grew until the server or the

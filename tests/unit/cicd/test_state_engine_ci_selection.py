@@ -172,7 +172,7 @@ def test_test_job_steps_carry_no_marker_expression_of_their_own() -> None:
     that no ``pytest`` invocation in the Test job re-states it.
     """
     pytest_steps = [step for step in _job("test")["steps"] if "pytest" in str(step.get("run", ""))]
-    assert len(pytest_steps) == 2, [step.get("name") for step in pytest_steps]
+    assert len(pytest_steps) == 1, [step.get("name") for step in pytest_steps]
     for step in pytest_steps:
         tokens = _pytest_arguments(step["run"])
         assert "-m" not in tokens, step.get("name")
@@ -239,14 +239,14 @@ def test_no_job_restates_the_marker_selection_except_required_partition_override
             if markers:
                 marker_expressions.setdefault(job_name, []).extend(markers)
     assert len(steps_with_pytest) >= 6, steps_with_pytest  # never pass by finding nothing to check
-    assert sum(job_name == "landscape-proof/proof" for job_name, _ in steps_with_pytest) == 2
+    assert sum(job_name == "landscape-proof/proof" for job_name, _ in steps_with_pytest) == 1
     assert set(marker_expressions) == {"testcontainer", "timing-sensitive"}, marker_expressions
     assert marker_expressions["testcontainer"] == ["testcontainer"], marker_expressions
     addopts = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["tool"]["pytest"]["ini_options"]["addopts"]
     default_expression = addopts[addopts.index("-m") + 1]
     assert default_expression.count("not timing_sensitive") == 1
     timing_expression = default_expression.replace("not timing_sensitive", "timing_sensitive")
-    assert marker_expressions["timing-sensitive"] == [timing_expression, timing_expression], marker_expressions
+    assert marker_expressions["timing-sensitive"] == [timing_expression], marker_expressions
 
 
 def test_testcontainer_job_selects_the_postgresql_matrix() -> None:

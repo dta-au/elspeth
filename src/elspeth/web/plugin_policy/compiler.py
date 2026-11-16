@@ -28,6 +28,9 @@ REQUIRED_WEB_PLUGIN_IDS = frozenset(
         PluginId("sink", "document"),
         PluginId("sink", "json"),
         PluginId("sink", "text"),
+        PluginId("transform", "batch_experiment_compare"),
+        PluginId("transform", "batch_replicate"),
+        PluginId("transform", "batch_stats"),
         PluginId("transform", "field_mapper"),
         # Feeds uploaded guidance text to prompts. The composer admits only a
         # user-uploaded file as its content (web/execution upload-only guard).

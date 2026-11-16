@@ -73,10 +73,19 @@ MAX_AUDIT_QUERY_FINGERPRINTS = 64
 _QUERY_REDACTION_SENTINEL_KEY = "__elspeth_query_redacted"
 _QUERY_REDACTION_SENTINEL_VALUE = "too_many_fields"
 _URL_BEARING_RESPONSE_HEADERS = frozenset({"content-location", "location"})
-_LINK_CAPABILITY_QUERY_KEYS = frozenset({"cursor", "continuation", "next_token", "page_token", "session", "state"})
+# Query keys whose value is a navigable capability (a session, an OAuth state,
+# or an opaque continuation handle) rather than a credential word. A URL that
+# carries one cannot be persisted as-is, and cannot be fingerprinted in place
+# when the URL itself must stay navigable, so callers refuse or redact it.
+_CAPABILITY_QUERY_KEYS = frozenset({"cursor", "continuation", "next_token", "page_token", "session", "state"})
 _LINK_ITEM = r'<[^<>\r\n]+>\s*;\s*rel\s*=\s*(?:"[a-z ]+"|[a-z]+)'
 _SAFE_LINK_HEADER = re.compile(rf"{_LINK_ITEM}(?:\s*,\s*{_LINK_ITEM})*", re.IGNORECASE)
 _LINK_URL = re.compile(r"<([^<>\r\n]+)>")
+
+
+def is_capability_query_param(name: str) -> bool:
+    """Return whether a query key carries a navigable capability value."""
+    return name.lower() in _CAPABILITY_QUERY_KEYS
 
 
 def safe_link_header_for_audit(value: str, *, honor_development_mode: bool = True) -> str:
@@ -97,10 +106,7 @@ def safe_link_header_for_audit(value: str, *, honor_development_mode: bool = Tru
                 return "<redacted-http-link>"
             pairs = parse_qsl(parsed.query, keep_blank_values=True, max_num_fields=MAX_AUDIT_QUERY_FIELDS)
             if any(
-                not key
-                or is_sensitive_query_param(key)
-                or key.lower() in _LINK_CAPABILITY_QUERY_KEYS
-                or len(key) + len(val) > MAX_AUDIT_QUERY_CHARS
+                not key or is_sensitive_query_param(key) or is_capability_query_param(key) or len(key) + len(val) > MAX_AUDIT_QUERY_CHARS
                 for key, val in pairs
             ):
                 return "<redacted-http-link>"

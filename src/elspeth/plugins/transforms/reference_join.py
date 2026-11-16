@@ -47,6 +47,7 @@ from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig, declare_missing_guaranteed_fields
 from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.core.canonical import is_non_canonical_number
 from elspeth.core.expression_parser import (
     ExpressionEvaluationError,
     ExpressionParser,
@@ -101,6 +102,31 @@ def _bounded_canonical_size(value: object, *, limit: int) -> int:
         raise TypeError("reference output objects must use string keys") from exc
     except NonCanonicalValueTypeError as exc:
         raise TypeError(f"reference output value of type {exc.type_name} is not canonical JSON") from exc
+
+
+def _refuse_non_canonical_numbers(value: object, *, field_name: str, key: str, position: int) -> None:
+    """Refuse a resolved value holding a number the row hasher refuses.
+
+    Every joined value is hashed with each row that receives it, so a NaN,
+    an infinity or an integer outside the JSON safe range would pass load and
+    then fail every matching row. The number rule is the hasher's own
+    (``is_non_canonical_number``). Iterative, and descending into exactly what
+    ``bounded_canonical_size`` descends into.
+    """
+    pending: list[object] = [value]
+    while pending:
+        item = pending.pop()
+        if type(item) in (int, float) and is_non_canonical_number(item):
+            described = "a non-finite number (NaN or Infinity)" if type(item) is float else "an integer outside plus or minus 2^53 - 1"
+            raise ReferenceTableError(
+                f"output field {field_name!r} resolves to {described} for reference entry {key!r} "
+                f"(position {position}). Canonical JSON cannot carry it, so every matching row would fail; "
+                "fix the table value, or write a large integer as a quoted string."
+            )
+        if isinstance(item, Mapping):
+            pending.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            pending.extend(item)
 
 
 class _SingleReferenceJoinConfig(TransformDataConfig):
@@ -424,6 +450,7 @@ def build_reference_index(
                     ) from exc
                 values[field_name] = _UNRESOLVED
             else:
+                _refuse_non_canonical_numbers(value, field_name=field_name, key=key, position=position)
                 retained_bytes += _bounded_canonical_size(value, limit=available_bytes - retained_bytes)
                 values[field_name] = value
                 resolved_count[field_name] += 1
@@ -860,7 +887,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:d2a1c1af474e1429"
+    source_file_hash: str | None = "sha256:6b310e8be342a48d"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (
