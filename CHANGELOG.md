@@ -4,6 +4,15 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
+## Unreleased (0.8.15)
+
+### Web Composer
+
+- The pipeline graph no longer blanks and redraws its connectors when the view
+  loads, a node is selected or failure routes are toggled. React Flow had been
+  re-measuring every node on each rebuild; measured sizes are now carried
+  forward, and nodes re-read their handles when their parallel routes change.
+
 ## 0.8.14 - 2026-11-15
 
 Python 3.14, Web Composer remediation and plugin fixes. ELSPETH now requires
