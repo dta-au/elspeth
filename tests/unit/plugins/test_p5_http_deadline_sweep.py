@@ -306,7 +306,9 @@ def test_dns_capacity_refuses_new_worker_after_timed_out_resolver(monkeypatch: p
 
     def resolve(*_args: object, **_kwargs: object) -> list[object]:
         started.set()
-        release.wait(1)
+        # Hold the only slot until the test releases it; a short cap let a slow host free it
+        # before the second call and turned "capacity exhausted" into a DNS deadline.
+        release.wait(30)
         return []
 
     monkeypatch.setattr(socket, "getaddrinfo", resolve)

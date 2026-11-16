@@ -1146,6 +1146,15 @@ sinks:
 """
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
+            # Warm the import path on another session first. A cold first request pays one-off
+            # costs on the loop (lazy imports; coverage parsing each newly executed file), which
+            # stalled CI's loop for 1.7 s; the bound below is about the measured request.
+            warm_session = await service.create_session("alice", "Jinja bound warm-up", "local")
+            release.set()
+            warmed = await client.post(f"/api/sessions/{warm_session.id}/state/yaml", json={"yaml": yaml_text})
+            assert warmed.status_code < 500
+            entered.clear()
+            release.clear()
             loop = asyncio.get_running_loop()
             loop_gaps: list[float] = []
             watching = True
