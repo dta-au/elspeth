@@ -769,6 +769,13 @@ Sinks and retrieval:
 
 ### Web Composer
 
+- **Multi-query prompt reviews can be approved without a shared template.**
+  When every query supplies its own template and the optional node-level
+  `prompt_template` is omitted or null, the review card now shows the system
+  prompt and every query template in full from the live composition, and
+  Approve unlocks after View prompt. Before, the card fell back to the bounded
+  staging preview and approval stayed unavailable. A query that relies on a
+  missing shared template still keeps approval unavailable.
 - **A reply the completion review withholds is shown as a system notice.** The
   assistant message is empty and the notice says why (review unavailable,
   malformed, rejected, out of budget, or not admitted). The withheld text never
