@@ -580,8 +580,8 @@ def test_reservation_vs_outcome_uses_token_first_order_without_deadlock(
     outcome_pid: list[int] = []
     complete_witnesses: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
 
-    def pause_after_first_token(pid: int, token_ids: tuple[str, ...]) -> None:
-        if len(token_ids) == 1 and not first_token_locked.is_set():
+    def pause_after_first_token(pid: int, locked_count: int, _token_id: str) -> None:
+        if locked_count == 1 and not first_token_locked.is_set():
             reservation_pid.append(pid)
             first_token_locked.set()
             assert release_reservation.wait(timeout=5)
