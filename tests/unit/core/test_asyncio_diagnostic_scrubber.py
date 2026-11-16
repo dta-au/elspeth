@@ -89,8 +89,41 @@ async def _loop_callback_fails() -> None:
     await asyncio.sleep(0.01)
 
 
+def _interpreter_logs_a_retrieved_shielded_failure() -> bool:
+    """Whether this interpreter logs the shielded scenario at all.
+
+    CPython 3.14.4 logs a shielded task's late failure even after the outcome
+    is retrieved; 3.14.10 does not (measured 2026-11-16). Where nothing is
+    logged there is nothing to scrub and no leak for the negative control to
+    prove, so the scenario runs only where the interpreter emits it. Counting
+    records, not secrets, keeps the probe valid with the scrubber installed.
+    """
+    records: list[logging.LogRecord] = []
+
+    class _Count(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    logger = logging.getLogger("asyncio")
+    counter = _Count(level=logging.DEBUG)
+    logger.addHandler(counter)
+    try:
+        asyncio.run(_shielded_task_fails_after_awaiter_cancelled())
+        gc.collect()
+    finally:
+        logger.removeHandler(counter)
+    return bool(records)
+
+
 SCENARIOS = [
-    pytest.param(_shielded_task_fails_after_awaiter_cancelled, id="shielded-late-failure"),
+    pytest.param(
+        _shielded_task_fails_after_awaiter_cancelled,
+        id="shielded-late-failure",
+        marks=pytest.mark.skipif(
+            not _interpreter_logs_a_retrieved_shielded_failure(),
+            reason="this interpreter does not log a retrieved shielded task failure",
+        ),
+    ),
     pytest.param(_task_failure_never_retrieved, id="never-retrieved"),
     pytest.param(_loop_callback_fails, id="callback-failure"),
 ]

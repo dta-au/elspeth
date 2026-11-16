@@ -536,11 +536,20 @@ class TestCleanupDiagnosticAttribution:
             # Coverage indexes frame filenames before application code runs,
             # invoking a hostile str subclass itself. Only the synthetic frame
             # is untraced; restore the tracer before cleanup handles its error.
+            # On 3.12+ coverage may measure through sys.monitoring instead of
+            # settrace (its default core on 3.14), and its PY_START callback
+            # hashes co_filename, so pause every monitoring tool's global
+            # events for the synthetic call as well.
             tracer = sys.gettrace()
+            monitored = {tool: sys.monitoring.get_events(tool) for tool in range(6) if sys.monitoring.get_tool(tool) is not None}
             sys.settrace(None)
+            for tool in monitored:
+                sys.monitoring.set_events(tool, sys.monitoring.events.NO_EVENTS)
             try:
                 generated()
             finally:
+                for tool, events in monitored.items():
+                    sys.monitoring.set_events(tool, events)
                 sys.settrace(tracer)
 
         original_tracer = sys.gettrace()
