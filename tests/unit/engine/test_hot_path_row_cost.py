@@ -39,7 +39,7 @@ from sqlalchemy.engine import Connection
 
 import elspeth
 import elspeth_lints
-from elspeth.contracts import RunStatus
+from elspeth.contracts import RunStatus, SourceRow
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.hashing import canonical_json as contracts_canonical_json
 from elspeth.contracts.hashing import stable_hash as contracts_stable_hash
@@ -90,7 +90,7 @@ _PINS: dict[str, dict[str, dict[str, object]]] = {
                 "commits": (67, 13),
                 "core.canonical.canonical_json": (20, 14),
                 "core.canonical.stable_hash": (16, 20),
-                "contracts.hashing.canonical_json": (97, 55),
+                "contracts.hashing.canonical_json": (98, 54),
                 "contracts.hashing.stable_hash": (29, 21),
             },
             "sql_buckets": _bucket_pins("""
@@ -163,7 +163,7 @@ UPDATE token_work_items 1 2
                 "commits": (70, 45),
                 "core.canonical.canonical_json": (24, 36),
                 "core.canonical.stable_hash": (20, 29),
-                "contracts.hashing.canonical_json": (105, 87),
+                "contracts.hashing.canonical_json": (106, 86),
                 "contracts.hashing.stable_hash": (33, 30),
             },
             "sql_buckets": _bucket_pins("""
@@ -248,7 +248,7 @@ UPDATE token_work_items 1 11
                 "commits": (67, 13),
                 "core.canonical.canonical_json": (20, 14),
                 "core.canonical.stable_hash": (16, 20),
-                "contracts.hashing.canonical_json": (97, 55),
+                "contracts.hashing.canonical_json": (98, 54),
                 "contracts.hashing.stable_hash": (29, 21),
             },
             "sql_buckets": {
@@ -318,7 +318,7 @@ UPDATE token_work_items 1 11
                 "commits": (70, 45),
                 "core.canonical.canonical_json": (24, 36),
                 "core.canonical.stable_hash": (20, 29),
-                "contracts.hashing.canonical_json": (105, 87),
+                "contracts.hashing.canonical_json": (106, 86),
                 "contracts.hashing.stable_hash": (33, 30),
             },
             "sql_buckets": {
@@ -400,6 +400,25 @@ UPDATE token_work_items 1 11
 _KNOWN_SUPERLINEAR = frozenset()
 
 
+class _SharedContractListSource(ListSource):
+    """Reuse one contract as CSV, JSON, and Text sources do for stable fields.
+
+    See csv_source.py, json_source.py, and text_source.py. This models the
+    default source path only. With ``snapshot_for_resume`` enabled the engine
+    decodes a contract per row (source_snapshot.py), and a JSON source whose
+    later rows add fields changes its contract; these pins cover neither.
+    """
+
+    def load(self, ctx: Any) -> Iterator[SourceRow]:
+        if not self._data:
+            return
+        yield from self.wrap_rows(self._data[:1])
+        contract = self._schema_contract
+        assert contract is not None
+        for source_row_index, row in enumerate(self._data[1:], start=1):
+            yield SourceRow.valid(row, contract=contract, source_row_index=source_row_index)
+
+
 def _sql_bucket(statement: str) -> str:
     """Group an execution by leading SQL verb and first target table."""
     sql = statement.strip()
@@ -419,7 +438,7 @@ def _sql_bucket(statement: str) -> str:
 
 
 def _pipeline(shape: str, rows: int, db: LandscapeDB, root: Path) -> None:
-    source = ListSource([{"value": index} for index in range(rows)], on_success="gate_in")
+    source = _SharedContractListSource([{"value": index} for index in range(rows)], on_success="gate_in")
     source_settings = SourceSettings(plugin="list_source", on_success="gate_in", options={})
     output = CollectSink(name="output")
     transform = PassTransform()
