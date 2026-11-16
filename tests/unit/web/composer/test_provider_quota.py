@@ -162,13 +162,19 @@ async def test_timeout_preserves_unknown_usage_and_real_timeout_audit() -> None:
     service = AttemptService()
     recorder = BufferingRecorder()
 
-    async def provider(**kwargs: Any) -> None:
-        await asyncio.Event().wait()
-
     @quota_provider_calls
     async def timed_call() -> None:
         try:
-            await asyncio.wait_for(_legacy_dispatch(provider), timeout=0.01)
+            # The deadline expires only once the provider is entered. A fixed
+            # wall-clock deadline could expire during admission on a loaded
+            # runner, which is the separate cancelled-before-dispatch path.
+            async with asyncio.timeout(None) as deadline:
+
+                async def provider(**kwargs: Any) -> None:
+                    deadline.reschedule(asyncio.get_running_loop().time())
+                    await asyncio.Event().wait()
+
+                await _legacy_dispatch(provider)
         finally:
             terminal(recorder, ComposerLLMCallStatus.TIMEOUT)
 
