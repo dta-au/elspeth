@@ -29,8 +29,8 @@ Tools fall into two categories:
 
 | Category | Behaviour | Budget |
 |----------|-----------|--------|
-| **Discovery** | Read-only. Return plugin catalogs, schemas, or grammar references. Cacheable per-composition. | 10 discovery-only turns |
-| **Mutation** | Modify the `CompositionState`. Return updated state + validation. | 15 turns with at least one mutation |
+| **Discovery** | Read-only. Return plugin catalogs, schemas, or grammar references. Cacheable per-composition. | `ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS` discovery-only turns (required setting; no built-in default) |
+| **Mutation** | Modify the `CompositionState`. Return updated state + validation. | `ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS` turns with at least one mutation (required setting; no built-in default) |
 
 Every mutation tool returns a `ToolResult` containing the full validation state, so the LLM can detect and fix errors immediately.
 
