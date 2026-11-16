@@ -329,6 +329,22 @@ Each of these keeps the behaviour ELSPETH had under Python 3.13.
 
 ### Plugins
 
+- **A timed-out batch attempt's late lease loss no longer ends the run.** When
+  a row's wait timed out, the row was recorded and its worker kept running; if
+  that worker later lost its own scheduler lease, the
+  `SchedulerLeaseLostError` was treated as an orphaned worker failure and
+  failed the whole run. A lease loss from an already-evicted attempt is now
+  discarded. Every other late failure, including `RunWorkerEvictedError` and
+  audit-integrity errors, still ends the run, and errors for live rows are
+  delivered as before.
+- **The LLM transform waits at least an hour for a row's result.** Its wait
+  was sized from the capacity-retry budget plus one request per query, but the
+  query pool runs one row's batch at a time, so a pooled multi-query row also
+  queues behind earlier rows. With a short `max_capacity_retry_seconds` (for
+  example 30), an ordinary row could time out while still queued. The wait now
+  keeps the one-hour batch-wait default as a floor, like the other batch
+  transforms, and still grows with a larger budget. Provider request timeouts
+  and capacity retries are unchanged.
 - **New `azure_content_understanding` transform.** It runs an Azure AI
   Content Understanding analyzer (GA api-version `2025-11-01`) over one
   document, image, audio or video reference per row. The reference is a URL or

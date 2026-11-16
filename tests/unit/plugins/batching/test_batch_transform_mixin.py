@@ -18,7 +18,7 @@ import pytest
 
 from elspeth.contracts import Determinism, TransformResult
 from elspeth.contracts.contexts import TransformContext
-from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError, RunWorkerEvictedError, SchedulerLeaseLostError
 from elspeth.contracts.identity import TokenInfo
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema_contract import PipelineRow
@@ -412,6 +412,67 @@ class TestBatchTransformMixinEviction:
         with pytest.raises(AuditIntegrityError) as caught_flush:
             transform.flush_batch_processing()
         assert caught_flush.value is failure
+
+    @staticmethod
+    def _evict_then_fail_late(transform: SimpleBatchTransform, failure: BaseException, row_id: str) -> None:
+        """Submit one row, evict its ticket while the worker runs, then let the worker raise ``failure``."""
+        entered = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def fail_after_eviction(row: PipelineRow, ctx: TransformContext) -> TransformResult:
+            entered.set()
+            assert release.wait(timeout=5)
+            try:
+                raise failure
+            finally:
+                finished.set()
+
+        token = make_token(row_id)
+        ctx = make_context(landscape=_make_factory(), token=token, state_id=f"{row_id}-state")
+        try:
+            transform.accept_row(make_pipeline_row({}), ctx, fail_after_eviction)
+            assert entered.wait(timeout=5)
+            assert transform.evict_submission(token.token_id, f"{row_id}-state")
+        finally:
+            release.set()
+        assert finished.wait(timeout=5)
+
+    def test_evicted_worker_late_lease_loss_is_discarded(self) -> None:
+        """Staging 0.8.12 (2026-11-16): an evicted attempt's late lease loss failed the whole run.
+
+        The waiter timed out and the row is already recorded; the worker's later
+        SchedulerLeaseLostError belongs to the discarded attempt, not to the run
+        or to any later row, so it must not become a sticky worker failure.
+        """
+        transform = SimpleBatchTransform()
+        output = CollectorOutputPort()
+        transform.connect_output(output)
+        self._evict_then_fail_late(
+            transform,
+            SchedulerLeaseLostError(work_item_id="wi-late", lease_owner="worker-a", run_id="run-late"),
+            "late-lease",
+        )
+        try:
+            transform.flush_batch_processing()
+        finally:
+            transform.shutdown_batch_processing()
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            RuntimeError("late plugin failure"),
+            RunWorkerEvictedError(run_id="run-late", worker_id="worker-a"),
+        ],
+        ids=["ordinary", "run_worker_evicted"],
+    )
+    def test_evicted_worker_other_late_failures_still_end_the_run(self, failure: BaseException) -> None:
+        transform = SimpleBatchTransform()
+        transform.connect_output(CollectorOutputPort())
+        self._evict_then_fail_late(transform, failure, "late-other")
+        with pytest.raises(FrameworkBugError) as caught:
+            transform.shutdown_batch_processing()
+        assert caught.value.__cause__ is failure
 
     """Tests for eviction of timed-out submissions.
 

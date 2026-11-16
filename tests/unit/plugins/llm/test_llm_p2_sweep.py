@@ -149,6 +149,24 @@ class TestFinding44BatchWaitCoversRetryBudget:
 
         assert wait > _RETRY_BUDGET_SECONDS + 3 * _OPENROUTER_TIMEOUT_SECONDS
 
+    def test_parallel_multi_query_wait_keeps_the_one_hour_batch_wait_floor(self) -> None:
+        """Staging 0.8.12 (2026-11-16): a normal multi-query row timed out on a short budget.
+
+        The query pool runs one row's batch at a time, so a pooled row also waits
+        behind every earlier row's queries; that queue is outside budget + one
+        request per query. The wait keeps the one-hour batch-wait default as a
+        floor (as every other batch transform does) and any larger budget.
+        """
+        queries = {name: {"input_fields": {"text": "text"}, "output_fields": _QUERY_FIELDS} for name in ("q1", "q2", "q3")}
+        wait = _connected_wait_timeout(_openrouter(queries=queries, pool_size=3))
+
+        assert wait >= 3600.0
+
+    def test_a_larger_retry_budget_still_extends_the_wait(self) -> None:
+        wait = _connected_wait_timeout(_openrouter(max_capacity_retry_seconds=7200))
+
+        assert wait > 7200 + _OPENROUTER_TIMEOUT_SECONDS
+
     def test_azure_wait_covers_the_sdk_request_timeout(self) -> None:
         import openai
 
