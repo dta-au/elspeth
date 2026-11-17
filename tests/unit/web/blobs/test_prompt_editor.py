@@ -19,13 +19,25 @@ from tests.unit.web.blobs.test_routes import TestIDORProtection as _IDORFixture
 from tests.unit.web.blobs.test_routes import _create_session, _make_app, _upload_blob
 
 
-def _bound(client: SyncASGITestClient, session_id: str, blob_id: str, content_sha256: str, service, *, mixed: bool = False) -> None:
-    marker = {"mode": "inline_content", "blob_ref": blob_id, "sha256": content_sha256}
+def _bound(
+    client: SyncASGITestClient,
+    session_id: str,
+    blob_id: str,
+    content_sha256: str,
+    service,
+    *,
+    mixed: bool = False,
+    shared: bool = False,
+    encoding: str | None = None,
+) -> None:
+    marker: dict[str, str] = {"mode": "inline_content", "blob_ref": blob_id, "sha256": content_sha256}
+    if encoding is not None:
+        marker["encoding"] = encoding
+    nodes = [{"id": "first", "plugin": "llm", "options": {"prompt_template": marker}}]
+    if shared:
+        nodes.append({"id": "second", "plugin": "llm", "options": {"system_prompt": marker}})
     data = CompositionStateData(
-        nodes=[
-            {"id": "first", "plugin": "llm", "options": {"prompt_template": marker}},
-            {"id": "second", "plugin": "llm", "options": {"system_prompt": marker}},
-        ],
+        nodes=nodes,
         sources={"source": {"options": {"blob_ref": blob_id}}} if mixed else None,
         is_valid=True,
     )
@@ -39,7 +51,7 @@ def _save(client: SyncASGITestClient, session_id: str, blob_id: str, content: st
     )
 
 
-def test_owner_save_records_each_binding_inside_metadata_transaction(tmp_path, monkeypatch) -> None:
+def test_owner_save_records_its_binding_inside_metadata_transaction(tmp_path, monkeypatch) -> None:
     app, service, _ = _make_app(tmp_path)
     client = SyncASGITestClient(app)
     session_id = _create_session(client)
@@ -67,8 +79,50 @@ def test_owner_save_records_each_binding_inside_metadata_transaction(tmp_path, m
     stored = client.get(f"/api/sessions/{session_id}/blobs/{blob['id']}/content")
     assert stored.content == b"after\n"
     assert stored.headers["X-Content-SHA256"] == content_hash(stored.content)
-    assert {(call.node_id, call.field_path) for call, _ in calls} == {("first", "prompt_template"), ("second", "system_prompt")}
+    assert [(call.node_id, call.field_path) for call, _ in calls] == [("first", "prompt_template")]
     assert all(call.trigger is PromptApprovalTrigger.EDITOR_SAVE and call.content_sha256 == content_hash(b"after\n") for call, _ in calls)
+
+
+@pytest.mark.parametrize(
+    ("bound", "code"),
+    [
+        ({"shared": True}, "prompt_file_shared_binding"),
+        ({"encoding": "latin-1"}, "prompt_file_encoding_unsupported"),
+        ({"encoding": "utf-16"}, "prompt_file_encoding_unsupported"),
+    ],
+)
+def test_save_refuses_what_the_user_cannot_see_or_would_not_run(tmp_path, monkeypatch, bound, code) -> None:
+    """A save approves only the one prompt on screen, read as the UTF-8 text the user typed.
+
+    Shared: a second binding (here another node's system prompt, as an assistant re-point would
+    leave it) must keep its own review. Encoding: a latin-1/utf-16 prompt would decode different
+    text from the saved UTF-8 bytes while the approved hash still matched.
+    """
+    app, service, _ = _make_app(tmp_path)
+    client = SyncASGITestClient(app)
+    session_id = _create_session(client)
+    blob = _upload_blob(client, session_id, b"before\n", "prompt.txt", "text/plain")
+    _bound(client, session_id, blob["id"], blob["content_hash"], service, **bound)
+    calls = []
+    monkeypatch.setattr(routes, "record_prompt_file_approval", lambda conn, request, *, now: calls.append(request), raising=False)
+
+    response = _save(client, session_id, blob["id"], "caf\u00e9\n", blob["content_hash"])
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["error_code"] == code
+    assert calls == []
+    assert client.get(f"/api/sessions/{session_id}/blobs/{blob['id']}/content").content == b"before\n"
+
+
+def test_utf8_sig_binding_saves(tmp_path, monkeypatch) -> None:
+    app, service, _ = _make_app(tmp_path)
+    client = SyncASGITestClient(app)
+    session_id = _create_session(client)
+    blob = _upload_blob(client, session_id, b"before\n", "prompt.txt", "text/plain")
+    _bound(client, session_id, blob["id"], blob["content_hash"], service, encoding="utf-8-sig")
+    monkeypatch.setattr(routes, "record_prompt_file_approval", lambda conn, request, *, now: None, raising=False)
+
+    assert _save(client, session_id, blob["id"], "after\n", blob["content_hash"]).status_code == 200
 
 
 def test_failed_approval_rolls_back_bytes_and_approval_row(tmp_path, monkeypatch) -> None:

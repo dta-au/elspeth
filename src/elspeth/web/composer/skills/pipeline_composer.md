@@ -767,7 +767,9 @@ approval for the saved bytes without a separate card. A multi-query template is 
 `node:<node_id>.options.queries.<index>.template` (the query's existing 0-based
 position). The blob must have an inline-text MIME type; a PDF or other binary
 file is refused. Upload or create the prompt as plain text (.txt or .md), then
-wire that file and approve its full-content card. A structured prompt with
+wire that file and approve its full-content card. The editor saves only a file
+that backs exactly one prompt and is read as UTF-8, so give each prompt its own
+file and do not set a non-UTF-8 `encoding` on a file the user may edit. A structured prompt with
 `prompt_template_parts` has interpretation slots and cannot be replaced by a
 file in this release. Edit its text parts in place with `change_substring` or
 `patch_node_options` on `prompt_template_parts`, preserving `interpretation_ref`

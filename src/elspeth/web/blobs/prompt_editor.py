@@ -15,6 +15,7 @@ from elspeth.web.sessions.protocol import CompositionStateRecord
 class PromptBinding:
     node_id: str
     field_path: str
+    encoding: str
 
 
 def prompt_bindings_for_blob(state: CompositionStateRecord | None, blob: BlobRecord) -> tuple[tuple[PromptBinding, ...], bool]:
@@ -56,7 +57,8 @@ def prompt_bindings_for_blob(state: CompositionStateRecord | None, blob: BlobRec
             and isinstance(value.get("blob_ref"), str)
             and names_same_blob(value["blob_ref"], str(blob.id))
         ):
-            bindings.append(PromptBinding(node_id, field_path))
+            encoding = value.get("encoding", "utf-8")
+            bindings.append(PromptBinding(node_id, field_path, encoding if isinstance(encoding, str) else repr(encoding)))
         else:
             mixed = True
 

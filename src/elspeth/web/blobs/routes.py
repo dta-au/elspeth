@@ -80,6 +80,9 @@ class SavePromptFileResponse(BaseModel):
     content_sha256: str
 
 
+_EDITOR_SAVE_ENCODINGS: frozenset[str] = frozenset({"utf-8", "utf-8-sig"})
+
+
 def _prompt_save_refusal(status: int, code: str, message: str) -> HTTPException:
     return HTTPException(status_code=status, detail={"error_code": code, "message": message})
 
@@ -223,6 +226,22 @@ def create_blobs_router() -> APIRouter:
                 )
             if not bindings:
                 raise _prompt_save_refusal(409, "prompt_file_unbound", "Bind this file to a prompt before saving it here.")
+            if len(bindings) > 1:
+                # A save approves what the user is looking at. A second binding (another node or
+                # another prompt field, possibly re-pointed by the assistant) has its own review.
+                raise _prompt_save_refusal(
+                    409,
+                    "prompt_file_shared_binding",
+                    "This file backs more than one prompt; give each prompt its own file before editing it here.",
+                )
+            if any(binding.encoding not in _EDITOR_SAVE_ENCODINGS for binding in bindings):
+                # The editor saves UTF-8; a prompt that decodes this file another way would run
+                # different text from what the user saved.
+                raise _prompt_save_refusal(
+                    409,
+                    "prompt_file_encoding_unsupported",
+                    "This prompt reads the file with a non-UTF-8 encoding; re-attach it as UTF-8 text before editing it here.",
+                )
             if new_bytes == old_bytes:
                 return SavePromptFileResponse(changed=False, content_sha256=blob.content_hash)
             replacement = replace(
