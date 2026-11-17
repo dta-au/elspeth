@@ -158,10 +158,16 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
             "INLINE_BLOB_NOT_TEXT_CODE if not_text else f'{violation.category}_inline_blob_content'",
         ),
         ("composer/tools/blobs.py", "_execute_wire_blob_inline_ref", "INLINE_BLOB_NOT_TEXT_CODE"),
+        # YAML import refuses a non-text prompt file with the same Final constant.
+        ("sessions/routes/composer/state.py", "_state_with_imported_inline_blobs", "INLINE_BLOB_NOT_TEXT_CODE"),
+        ("sessions/routes/composer/state.py", "_reject_pasted_inline_prompt_blob_mime", "INLINE_BLOB_NOT_TEXT_CODE"),
         ("execution/service.py", "_merge_authoritative_proof_diagnostics", "code"),
         # Route projections and persistence of codes produced (and censused)
         # elsewhere; none of them authors a code.
-        ("execution/routes.py", "execute_pipeline", "err.error_code"),
+        # The execute route and the tutorial run share this one projection.
+        ("execution/http_errors.py", "pipeline_validation_http_exception", "err.error_code"),
+        # RuntimeYamlImportError's only code is the literal censused at yaml_importer.py.
+        ("sessions/routes/composer/state.py", "seed_state_from_runtime_yaml", "exc.error_code"),
         ("coordination/repository.py", "record_composition_rejection", "error_code"),
         ("sessions/protocol.py", "decode_stored_composition_validation_errors", "error_code"),
         ("sessions/protocol.py", "serialize_composition_validation_error", "value.error_code"),
