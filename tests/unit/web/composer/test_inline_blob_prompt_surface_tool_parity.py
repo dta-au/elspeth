@@ -30,7 +30,7 @@ from tests.unit.web.composer import test_splice_transform_tool as splice_fixture
 # Reuse the session/blob fixture the blob-tool suite already owns.
 blob_env = blob_tools.blob_env
 
-_GUARDED_FIELDS = ("prompt_template", "system_prompt", "model", "queries.q.template", "queries.q", "queries")
+_GUARDED_FIELDS = ("prompt_template", "system_prompt", "model", "queries.q.template", "queries.0.template", "queries.q", "queries")
 # Plugin prevalidation withholds a marker only as a whole top-level option, so
 # only these fields can reach a successful write for the verbatim control. (A
 # whole-``queries`` marker is also withheld, but the multi-query provider policy
@@ -57,6 +57,8 @@ def _options(field: str, marker: dict[str, str]) -> dict[str, Any]:
         options[field] = marker
     elif field == "queries.q.template":
         options["queries"] = {"q": {"input_fields": {"x": "x"}, "template": marker}}
+    elif field == "queries.0.template":
+        options["queries"] = [{"name": "q", "input_fields": {"x": "x"}, "template": marker}]
     elif field == "queries.q":
         options["queries"] = {"q": marker}
     else:

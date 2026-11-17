@@ -31,7 +31,7 @@ from elspeth.web.composer.tools import _options_with_default_llm_reviews
 # importing YAML must not manufacture a policy the author did not choose.
 from elspeth.web.composer.tools._common import FailureRouteChoiceError, resolve_failure_route_choice
 
-MAX_RUNTIME_YAML_IMPORT_CHARS = 262_144
+MAX_RUNTIME_YAML_IMPORT_CHARS = 524_288
 _UNSUPPORTED_COALESCE_FIELDS = frozenset(
     {
         "union_collision_policy",
@@ -1001,7 +1001,7 @@ def _queues_from_runtime_mapping(section: object) -> list[NodeSpec]:
 def composition_state_from_runtime_yaml(pipeline_yaml: str, *, version: int = 1) -> CompositionState:
     """Build a composer state from runtime pipeline YAML."""
     if len(pipeline_yaml) > MAX_RUNTIME_YAML_IMPORT_CHARS:
-        raise RuntimeYamlImportError("pipeline YAML exceeds the 262144 character import limit")
+        raise RuntimeYamlImportError(f"pipeline YAML exceeds the {MAX_RUNTIME_YAML_IMPORT_CHARS} character import limit")
     try:
         _reject_yaml_aliases(pipeline_yaml)
         # Explicit Loader= is intentional: _UniqueKeySafeLoader subclasses

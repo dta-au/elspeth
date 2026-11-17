@@ -16,12 +16,56 @@ lives in a blob.
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 import pytest
 
 from elspeth.web.composer.tools import _prevalidate_plugin_options
 
 VALID_HASH = "a" * 64
 BLOB_ID = "5b7a4e0e-9e4a-4f0b-8d3e-2c0e1f0d3a4b"
+
+
+def _file_query_options() -> dict[str, object]:
+    return {
+        "provider": "gateway",
+        "model": "demo",
+        "endpoint": "https://example.invalid/v1",
+        "api_key": {"secret_ref": "GATEWAY_API_KEY"},
+        "schema": {"mode": "observed"},
+        "queries": [
+            {
+                "name": "first",
+                "input_fields": {"text": "text"},
+                "template": {"blob_ref": BLOB_ID, "mode": "inline_content", "sha256": VALID_HASH},
+            },
+            {"name": "second", "input_fields": {"text": "text"}, "template": "Review {{ row.text }}"},
+        ],
+    }
+
+
+def test_list_query_file_template_needs_no_root_fallback_and_is_not_rewritten() -> None:
+    options = _file_query_options()
+    original = deepcopy(options)
+    assert _prevalidate_plugin_options("transform", "llm", options) is None
+    assert options == original
+    assert "prompt_template" not in options
+
+
+@pytest.mark.parametrize("defect", ["missing_template", "invalid_hash", "extra_field", "invalid_format"])
+def test_list_query_file_template_does_not_excuse_other_errors(defect: str) -> None:
+    options = _file_query_options()
+    queries = options["queries"]
+    assert isinstance(queries, list)
+    if defect == "missing_template":
+        del queries[1]["template"]
+    elif defect == "invalid_hash":
+        queries[0]["template"]["sha256"] = "invalid"
+    elif defect == "extra_field":
+        queries[1]["unknown_option"] = True
+    else:
+        queries[1]["response_format"] = "invalid"
+    assert _prevalidate_plugin_options("transform", "llm", options) is not None
 
 
 def test_prevalidate_accepts_inline_content_marker_on_required_prompt_template() -> None:

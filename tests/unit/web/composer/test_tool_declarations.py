@@ -1056,7 +1056,9 @@ class TestStep3BlobDiscoveryTierMigration:
                         "description": (
                             "Canonical path: source.options.<field>, source:<name>.options.<field>, "
                             "node:<node_id>.options.<field> for a transform, aggregation, or collector, "
-                            "or output:<name>.options.<field>." + _BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE
+                            "or output:<name>.options.<field>. Address an existing list item by its 0-based position, "
+                            "e.g. node:<node_id>.options.queries.0.template; a position never creates an item or a key."
+                            + _BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE
                         ),
                     },
                     "blob_id": {

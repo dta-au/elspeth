@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import threading
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -2642,7 +2644,9 @@ sinks:
         client = TestClient(app)
 
         session = await service.create_session("alice", "Replay", "local")
-        oversized = "sources:\n  source:\n    plugin: csv\n" + ("x" * 300_000)
+        from elspeth.web.composer.yaml_importer import MAX_RUNTIME_YAML_IMPORT_CHARS
+
+        oversized = "sources:\n  source:\n    plugin: csv\n" + ("x" * MAX_RUNTIME_YAML_IMPORT_CHARS)
 
         resp = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": oversized})
 
@@ -3056,8 +3060,18 @@ sinks:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         blob_id = "22222222-2222-4222-8222-222222222222"
-        file_digest = "cd" * 32
+        file_content = b"key,value\nexample,reference\n"
+        file_digest = hashlib.sha256(file_content).hexdigest()
         session = await service.create_session("alice", "Node file", "local")
+        blob = replace(
+            _ready_blob_record(blob_id=uuid.UUID(blob_id), session_id=session.id, storage_path="inputs/reference.csv"),
+            content_hash=file_digest,
+            size_bytes=len(file_content),
+        )
+        app.state.blob_service = SimpleNamespace(
+            get_blob_sync=lambda _blob_id, _context: blob,
+            read_blob_content_sync=lambda _blob_id, _context: (blob, file_content),
+        )
         await _save_test_composition_state(
             service,
             session.id,

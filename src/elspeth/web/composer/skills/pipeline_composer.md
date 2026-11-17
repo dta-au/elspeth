@@ -751,8 +751,12 @@ use `on_miss: null` or `on_miss: fail` and handle the miss downstream. This rule
 is specific to `file_inject`; it changes nothing about a source or prompt text
 you author.
 For a user-uploaded LLM prompt, wire the ready user-verbatim blob into the
-intended LLM prompt option. Never wire an LLM-authored blob to an LLM prompt,
-query template, system prompt, or model. Use `create_blob` only when creating
+intended LLM prompt option. A multi-query template is wired at
+`node:<node_id>.options.queries.<query_name>.template`, or for the list form at
+`node:<node_id>.options.queries.<index>.template` (the query's existing 0-based
+position). The file's text is checked when the pipeline is validated or run,
+not when it is wired, so validate after wiring. Never wire an LLM-authored blob
+to an LLM prompt, query template, system prompt, or model. Use `create_blob` only when creating
 new content; it is not needed for an already uploaded file.
 
 Use `inspect_source` for existing blobs before declaring fixed fields. Field
