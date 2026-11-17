@@ -3937,6 +3937,15 @@ _STRUCTURED_LLM_YAML = _REBIND_LLM_YAML.replace(
     "    profile: task-role\n    prompt_template_parts:\n    - kind: text\n      text: PARTS WIN",
 )
 
+
+def _unstructured_llm_marker_yaml(blob_id: uuid.UUID) -> str:
+    return _REBIND_LLM_YAML.replace(
+        "    model: anthropic/claude-haiku-4.5",
+        f"    profile: task-role\n    prompt_template:\n      blob_ref: {blob_id}\n"
+        f"      mode: inline_content\n      sha256: {_REBIND_DIGEST_A}",
+    )
+
+
 _BLOB_ROWS_YAML = """
 sources:
   source:
@@ -4007,6 +4016,70 @@ class TestImportRebindsSharedFiles:
         unstructured_yaml = marker_yaml.replace("    prompt_template_parts:\n    - kind: text\n      text: PARTS WIN\n", "")
         unstructured = composition_state_from_runtime_yaml(unstructured_yaml)
         assert unstructured.nodes[0].options["prompt_template"]["mode"] == "inline_content"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mime_type, expected_status", [("application/pdf", 400), ("text/plain", 200)])
+    async def test_import_checks_pasted_marker_mime_under_unstructured_prompt(
+        self, tmp_path: Path, mime_type: str, expected_status: int
+    ) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        blob = replace(
+            _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A),
+            mime_type=mime_type,
+        )
+        app.state.blob_service = _blob_service_for(blob)
+        marker_yaml = _unstructured_llm_marker_yaml(blob.id)
+
+        resp = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": marker_yaml})
+
+        assert resp.status_code == expected_status, resp.text
+        record = await service.get_current_state(session.id)
+        if mime_type == "application/pdf":
+            assert resp.json()["detail"]["error_code"] == "inline_blob_not_text"
+            assert record is None
+        else:
+            assert record is not None
+            assert record.version == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mime_type, expected_status", [("application/pdf", 400), ("text/plain", 200)])
+    async def test_import_checks_rebind_mime_under_unstructured_prompt(self, tmp_path: Path, mime_type: str, expected_status: int) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        blob = replace(
+            _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A),
+            mime_type=mime_type,
+        )
+        app.state.blob_service = _blob_service_for(blob)
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={
+                "yaml": _REBIND_LLM_YAML.replace("    model: anthropic/claude-haiku-4.5", "    profile: task-role"),
+                "inline_blob_bindings": {"node:score.options.prompt_template": {"blob_id": str(blob.id)}},
+            },
+        )
+
+        assert resp.status_code == expected_status, resp.text
+        record = await service.get_current_state(session.id)
+        if mime_type == "application/pdf":
+            detail = resp.json()["detail"]
+            assert isinstance(detail, dict), resp.text
+            assert detail["error_code"] == "inline_blob_not_text"
+            assert record is None
+            pasted = client.post(
+                f"/api/sessions/{session.id}/state/yaml",
+                json={"yaml": _unstructured_llm_marker_yaml(blob.id)},
+            )
+            assert pasted.status_code == 400, pasted.text
+            assert pasted.json()["detail"]["error_code"] == "inline_blob_not_text"
+            assert await service.get_current_state(session.id) is None
+        else:
+            assert record is not None
+            assert record.version == 1
 
     def test_legacy_structured_marker_refused_before_execution_materialization(self) -> None:
         from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml

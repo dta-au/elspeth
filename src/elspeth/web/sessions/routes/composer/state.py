@@ -9,7 +9,13 @@ from typing import Annotated, NotRequired, TypedDict
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
 from elspeth.contracts.blobs import ALLOWED_MIME_TYPES, BlobRecord
-from elspeth.contracts.blobs_inline import INLINE_BLOB_NOT_TEXT_CODE, INLINE_BLOB_NOT_TEXT_REPAIR, BlobInlineRef, ContentEncoding
+from elspeth.contracts.blobs_inline import (
+    INLINE_BLOB_NOT_TEXT_CODE,
+    INLINE_BLOB_NOT_TEXT_REPAIR,
+    BlobInlineRef,
+    ContentEncoding,
+    is_widened_blob_ref,
+)
 from elspeth.contracts.composer_interpretation import InterpretationSurfaceOrigin
 from elspeth.contracts.enums import is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError
@@ -677,6 +683,36 @@ def _ready_blob_content_hash(blob: BlobRecord) -> str:
     return blob.content_hash
 
 
+async def _reject_pasted_inline_prompt_blob_mime(
+    state: CompositionState,
+    *,
+    request: Request,
+    session_id: UUID,
+    session_operation_context: SessionOperationContext,
+) -> None:
+    """Check pasted LLM prompt markers against session-scoped blob metadata before publication."""
+    for node in state.nodes:
+        if node.plugin != "llm":
+            continue
+        marker = is_widened_blob_ref(deep_thaw(node.options.get("prompt_template")))
+        if marker is None or marker.mode != "inline_content":
+            continue
+        blob = await _ready_import_blob(
+            marker.blob_id,
+            request=request,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+        )
+        if blob.mime_type not in ALLOWED_MIME_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error_code": INLINE_BLOB_NOT_TEXT_CODE,
+                    "message": f"Blob '{blob.id}' is not inline text. {INLINE_BLOB_NOT_TEXT_REPAIR}",
+                },
+            )
+
+
 async def _state_with_imported_inline_blobs(
     state: CompositionState,
     *,
@@ -1318,6 +1354,12 @@ async def seed_state_from_runtime_yaml(
                 env_ref_names=env_ref_names,
             )
             _reject_imported_plugin_policy(imported_state, catalog, plugin_snapshot)
+            await _reject_pasted_inline_prompt_blob_mime(
+                imported_state,
+                request=request,
+                session_id=session.id,
+                session_operation_context=lease.context,
+            )
             imported_state = await _state_with_imported_source_blobs(
                 imported_state,
                 source_blob_ids=body.source_blob_ids,
