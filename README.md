@@ -1,6 +1,6 @@
 # ELSPETH
 
-**E**xtensible **L**ayered **S**ecure **P**ipeline **E**ngine for **T**ransformation and **H**andling
+**E**xtensible **L**ayered **S**ystem for **P**rocessing, **E**valuation, **T**ransformation and **H**andling
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.14+](https://img.shields.io/badge/python-3.14+-blue.svg)](https://www.python.org/downloads/)
