@@ -8,6 +8,7 @@ from uuid import UUID
 import pytest
 
 from elspeth.web.composer.tools._registry import _MUTATION_TOOL_NAMES
+from elspeth.web.credential_guard import CredentialMaterialRefused
 from tests.unit.web.composer.test_prompt_patch_reviews import _approved_state
 from tests.unit.web.composer.test_tools import _mock_catalog, execute_tool
 
@@ -114,9 +115,54 @@ def test_overlap_and_replace_all_do_not_rematch_inserted_text() -> None:
 
     ambiguous = _apply_exact_substring_edits("aaa", [SubstringEditModel(old="aa", replacement="x")])
     assert ambiguous[0] is None and ambiguous[1][0] == "substring_not_unique"
-    assert ambiguous[1][1] == "Edit 1 matched 2 locations; provide a longer exact substring or explicitly set replace_all."
+    assert ambiguous[1][1] == "Edit 1 matched more than one location; provide a longer exact substring or explicitly set replace_all."
     assert _apply_exact_substring_edits("aaa", [SubstringEditModel(old="aa", replacement="x", replace_all=True)]) == ("xa", 1)
     assert _apply_exact_substring_edits("a", [SubstringEditModel(old="a", replacement="aa", replace_all=True)]) == ("aa", 1)
+
+
+def test_exact_matching_bounds_overlap_scans() -> None:
+    from elspeth.web.composer.redaction import SubstringEditModel
+    from elspeth.web.composer.tools.transforms import _apply_exact_substring_edits
+
+    class CountedText(str):
+        find_calls = 0
+
+        def find(self, sub: str, start: int = 0) -> int:
+            self.find_calls += 1
+            assert self.find_calls <= 2, "uniqueness scan examined more than two matches"
+            return super().find(sub, start)
+
+    ambiguous = CountedText("a" * 4096)
+    result = _apply_exact_substring_edits(ambiguous, [SubstringEditModel(old="aa", replacement="x")])
+    assert result[0] is None and result[1][0] == "substring_not_unique"
+    assert ambiguous.find_calls == 2
+
+    all_matches = CountedText("a" * 4096)
+    result = _apply_exact_substring_edits(all_matches, [SubstringEditModel(old="aa", replacement="x", replace_all=True)])
+    assert result == ("x" * 2048, 2048)
+    assert all_matches.find_calls <= 2
+
+
+def test_old_credential_removed_from_candidate_is_refused_before_handler() -> None:
+    state = _approved_state()
+    candidate = "sk-" + "a" * 24
+    stored_text = f"Classify {candidate}"
+    state = state.with_node(replace(state.nodes[0], options={**state.nodes[0].options, "prompt_template": stored_text}))
+    args = _edit(stored_text, candidate, "removed")
+    with pytest.raises(CredentialMaterialRefused):
+        execute_tool("change_substring", args, state, _mock_catalog(), current_state_id="state-1")
+    assert candidate in state.nodes[0].options["prompt_template"]
+
+
+def test_intermediate_replacement_credential_is_refused_before_handler() -> None:
+    state = _approved_state()
+    text = state.nodes[0].options["prompt_template"]
+    candidate = "sk-" + "a" * 24
+    args = _edit(text, "Classify", candidate)
+    args["edits"].append({"old": candidate, "replacement": "Assess", "replace_all": False})
+    with pytest.raises(CredentialMaterialRefused):
+        execute_tool("change_substring", args, state, _mock_catalog(), current_state_id="state-1")
+    assert candidate not in state.nodes[0].options["prompt_template"]
 
 
 def test_sequential_edits_and_utf8_limits() -> None:

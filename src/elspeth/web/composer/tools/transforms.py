@@ -86,7 +86,11 @@ from elspeth.web.composer.tools.declarations import (
     ToolEffects,
     ToolKind,
 )
-from elspeth.web.composer.tools.prompt_target_responses import PROMPT_TARGETS_RESPONSE_CONTRACT
+from elspeth.web.composer.tools.prompt_target_responses import (
+    PROMPT_TARGETS_RESPONSE_CONTRACT,
+    PromptTargetMetadata,
+    PromptTargetsResponse,
+)
 from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material_for_tool
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -1829,7 +1833,7 @@ def _apply_guarded_node_option_patch(
 ) -> ToolResult:
     """One guarded candidate builder for whole-option and exact-text edits."""
     node_ref = f"node:{node_id}"
-    patch: Mapping[str, Any] = option_patch
+    patch = option_patch
     current = next((n for n in state.nodes if n.id == node_id), None)
     if current is None:
         return _saved_graph_rejection_result(
@@ -2075,22 +2079,21 @@ def _apply_exact_substring_edits(text: str, edits: Sequence[Any]) -> tuple[str, 
             return None, ("edit_too_large", "Edit fragments exceed the allowed byte limit.")
         if not edit.old:
             return None, ("empty_old", f"Edit {index} needs a non-empty old substring.")
-        starts: list[int] = []
-        offset = 0
-        while True:
-            position = current.find(edit.old, offset)
-            if position < 0:
-                break
-            starts.append(position)
-            offset = position + 1
-        if not starts:
+        if edit.replace_all:
+            count = current.count(edit.old)
+        else:
+            first = current.find(edit.old)
+            if first < 0:
+                count = 0
+            elif current.find(edit.old, first + 1) >= 0:
+                return None, (
+                    "substring_not_unique",
+                    f"Edit {index} matched more than one location; provide a longer exact substring or explicitly set replace_all.",
+                )
+            else:
+                count = 1
+        if count == 0:
             return None, ("substring_not_found", f"Edit {index} matched no text.")
-        if len(starts) > 1 and not edit.replace_all:
-            return None, (
-                "substring_not_unique",
-                f"Edit {index} matched {len(starts)} locations; provide a longer exact substring or explicitly set replace_all.",
-            )
-        count = current.count(edit.old) if edit.replace_all else 1
         current_bytes = _utf8_bytes(current)
         assert current_bytes is not None
         if len(current_bytes) + count * (len(new_bytes) - len(old_bytes)) > 262144:
@@ -2152,7 +2155,7 @@ def _execute_change_substring(args: dict[str, object], state: CompositionState, 
         return _substring_refusal(state, error[1], error[0])
     new_text, replacement_count = edited
     if target.kind == "node_option":
-        patch: Mapping[str, Any] = {target.option: new_text}
+        patch: dict[str, str] = {target.option: new_text}
     else:
         from elspeth.contracts.freeze import deep_thaw
 
@@ -2209,7 +2212,7 @@ def _inspect_prompt_targets(args: dict[str, object], state: CompositionState, co
         return _substring_refusal(state, "Node not found; inspect the pipeline and retry.", "node_not_found")
     if node.plugin != "llm":
         return _substring_refusal(state, "Select an LLM prompt text target.", "unsupported_target")
-    targets: list[dict[str, Any]] = []
+    targets: list[PromptTargetMetadata] = []
     for option in ("prompt_template", "system_prompt"):
         if option == "prompt_template" and node.options.get(PROMPT_TEMPLATE_PARTS_KEY) is not None:
             continue
@@ -2218,12 +2221,14 @@ def _inspect_prompt_targets(args: dict[str, object], state: CompositionState, co
             raw = _utf8_bytes(value)
             if raw is not None:
                 targets.append(
-                    {
-                        "target": {"kind": "node_option", "node_id": node_id, "option": option},
-                        "length_chars": len(value),
-                        "size_bytes": len(raw),
-                        "sha256": sha256(raw).hexdigest(),
-                    }
+                    PromptTargetMetadata.model_validate(
+                        {
+                            "target": {"kind": "node_option", "node_id": node_id, "option": option},
+                            "length_chars": len(value),
+                            "size_bytes": len(raw),
+                            "sha256": sha256(raw).hexdigest(),
+                        }
+                    )
                 )
     parts = node.options.get(PROMPT_TEMPLATE_PARTS_KEY)
     if isinstance(parts, tuple | list):
@@ -2233,14 +2238,17 @@ def _inspect_prompt_targets(args: dict[str, object], state: CompositionState, co
                 raw = _utf8_bytes(value)
                 if raw is not None:
                     targets.append(
-                        {
-                            "target": {"kind": "prompt_part", "node_id": node_id, "part_index": index},
-                            "length_chars": len(value),
-                            "size_bytes": len(raw),
-                            "sha256": sha256(raw).hexdigest(),
-                        }
+                        PromptTargetMetadata.model_validate(
+                            {
+                                "target": {"kind": "prompt_part", "node_id": node_id, "part_index": index},
+                                "length_chars": len(value),
+                                "size_bytes": len(raw),
+                                "sha256": sha256(raw).hexdigest(),
+                            }
+                        )
                     )
-    return _discovery_result(state, {"state_id": context.current_state_id, "targets": targets})
+    response = PromptTargetsResponse(state_id=context.current_state_id, targets=tuple(targets))
+    return _discovery_result(state, response.model_dump(mode="json"))
 
 
 _INSPECT_PROMPT_TARGETS_DECLARATION = ToolDeclaration(
