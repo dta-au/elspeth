@@ -384,7 +384,6 @@ async def test_history_shed_on_an_earlier_turn_stays_shed_between_the_marks(tmp_
     context = _context(users={0: "Build CSV to JSON."}, assistants={1: "a" * 20_000})
     full_request, _ = await _decline(tmp_path, tool_context, context)
     full_bytes = _sent_bytes(full_request) + _ALLOWANCE
-    ratio = 4.0
     # The full request sits at 70% of the cap: under the high mark, over the low mark.
     policy = _context_policy(max_prompt_tokens=math.ceil(full_bytes / _FALLBACK_RATIO / 0.7), max_request_bytes=1_000_000)
 
@@ -393,14 +392,14 @@ async def test_history_shed_on_an_earlier_turn_stays_shed_between_the_marks(tmp_
         tool_context,
         context,
         policy=policy,
-        history=ContextBudgetHistory(bytes_per_token=ratio, previously_shed_history=frozenset()),
+        history=ContextBudgetHistory(previously_shed_history=frozenset()),
     )
     sticky_request, sticky = await _decline(
         tmp_path,
         tool_context,
         context,
         policy=policy,
-        history=ContextBudgetHistory(bytes_per_token=ratio, previously_shed_history=frozenset({"history:1"})),
+        history=ContextBudgetHistory(previously_shed_history=frozenset({"history:1"})),
     )
 
     assert _payload(fresh_request)["conversation_context"] == context.to_dict()
@@ -492,11 +491,7 @@ async def test_the_escape_hatch_request_sheds_its_conversation_context_and_keeps
 @pytest.mark.asyncio
 async def test_each_planner_call_uses_a_safe_bound_despite_its_measured_ratio(tmp_path: Path, tool_context: ToolContext) -> None:
     """Neither a planner nor a hatch prose measurement may lower the admission bound."""
-    history = ContextBudgetHistory(
-        bytes_per_token=2.5,
-        previously_shed_history=frozenset(),
-        bytes_per_token_by_model=(("some/other-model", 2.5), (_UNMARKED, 4.25), ("test/advisor", 3.5)),
-    )
+    history = ContextBudgetHistory.empty()
     completion = _hatch_completion()
     recorder = BufferingRecorder()
     with pytest.raises(PlannerDeclined):

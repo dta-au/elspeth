@@ -257,8 +257,8 @@ omissions from a promise of a stable cache prefix under continued growth.
 - **`src/elspeth/web/composer/context_budget.py`** (new). Pure, no I/O.
   - Input: the request's wire size, the labelled segments, the policy, the
     anchor token count and shared protected bytes, the keys shed on an
-    earlier call, and the keys held for the rest of the turn. The legacy
-    ratio input is diagnostic and does not affect admission.
+    earlier call, and the keys held for the rest of the turn. Historical
+    byte ratios are not inputs to the decision.
   - Output: which segments to shed and the sizes before and after, or a
     refusal. It knows nothing about message shapes.
   - The same input always yields the same output, so the recorded
@@ -449,10 +449,10 @@ first said:
   thinking, so both ceilings and the ratio moved to the wire bytes of the
   request sent, recorded on each call as `request_wire_bytes` (Rulings 10 and
   13).
-- **The ratio's source.** Budgeted calls only, the same model preferred,
-  clamped; the approved design took it from any successful call (Ruling 11).
-  The v2 correction supersedes ratio-based admission with same-exchange
-  provider anchoring; these stored ratios remain diagnostic only.
+- **Historical ratios.** Earlier versions read measured ratios from budgeted
+  calls. Admission now uses same-exchange provider anchoring; the persisted
+  audit rate remains for replay, but the shed-state reader does not derive a
+  historical ratio.
 - **The reply stage** is fitted from the budgeted loop messages and degrades
   without failing the turn (Ruling 11); its refusal is recorded and has its
   own notice (Ruling 14).

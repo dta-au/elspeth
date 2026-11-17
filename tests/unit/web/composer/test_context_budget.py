@@ -42,7 +42,7 @@ def test_constants_are_exact() -> None:
 
 
 def test_below_high_mark_sheds_nothing() -> None:
-    d = decide_context_budget(policy=_policy(), request_bytes=850, segments=_segs(), bytes_per_token=1.0, previously_shed=frozenset())
+    d = decide_context_budget(policy=_policy(), request_bytes=850, segments=_segs(), previously_shed=frozenset())
     assert d.shed_keys == () and d.estimated_tokens_after == 850
 
 
@@ -54,7 +54,7 @@ def test_crossing_high_mark_sheds_in_kind_order_oldest_first_to_low_mark() -> No
         _seg(ASSISTANT_PROSE, "history:1", 100),
         _seg(HATCH_EVENT, "hatch:0", 100),
     ]
-    d = decide_context_budget(policy=_policy(), request_bytes=900, segments=segs, bytes_per_token=1.0, previously_shed=frozenset())
+    d = decide_context_budget(policy=_policy(), request_bytes=900, segments=segs, previously_shed=frozenset())
     assert d.shed_keys == ("tool:a", "tool:b", "history:1")
     assert d.estimated_tokens_after == 600
 
@@ -64,7 +64,6 @@ def test_byte_ceiling_overflow_sheds_even_under_token_high_mark() -> None:
         policy=_policy(cap=10**9, max_bytes=500),
         request_bytes=560,
         segments=[_seg(TOOL_RESULT, "tool:a", 100)],
-        bytes_per_token=1.0,
         previously_shed=frozenset(),
     )
     assert d.shed_keys == ("tool:a",) and d.request_bytes_after == 460
@@ -75,7 +74,6 @@ def test_previously_shed_stays_shed_between_marks() -> None:
         policy=_policy(),
         request_bytes=700,
         segments=[_seg(ASSISTANT_PROSE, "history:1", 50)],
-        bytes_per_token=1.0,
         previously_shed=frozenset({"history:1"}),
     )
     assert d.shed_keys == ("history:1",)
@@ -86,7 +84,6 @@ def test_previously_shed_is_released_at_or_below_low_mark() -> None:
         policy=_policy(),
         request_bytes=600,
         segments=[_seg(ASSISTANT_PROSE, "history:1", 50)],
-        bytes_per_token=1.0,
         previously_shed=frozenset({"history:1"}),
     )
     assert d.shed_keys == ()
@@ -97,7 +94,6 @@ def test_unknown_previously_shed_keys_are_ignored() -> None:
         policy=_policy(),
         request_bytes=700,
         segments=[],
-        bytes_per_token=1.0,
         previously_shed=frozenset({"history:99", "tool:gone"}),
     )
     assert d.shed_keys == ()
@@ -108,7 +104,6 @@ def test_everything_shed_but_under_ceiling_is_allowed() -> None:
         policy=_policy(),
         request_bytes=990,
         segments=[_seg(TOOL_RESULT, "tool:a", 100)],
-        bytes_per_token=1.0,
         previously_shed=frozenset(),
     )
     assert d.shed_keys == ("tool:a",) and d.estimated_tokens_after == 890
@@ -120,7 +115,6 @@ def test_protected_overflow_refuses_naming_the_ceiling() -> None:
             policy=_policy(),
             request_bytes=1200,
             segments=[_seg(TOOL_RESULT, "tool:a", 100)],
-            bytes_per_token=1.0,
             previously_shed=frozenset(),
         )
     assert e.value.ceiling == "tokens" and e.value.estimated_tokens == 1100
@@ -129,22 +123,21 @@ def test_protected_overflow_refuses_naming_the_ceiling() -> None:
             policy=_policy(cap=10**9, max_bytes=500),
             request_bytes=700,
             segments=[],
-            bytes_per_token=1.0,
             previously_shed=frozenset(),
         )
     assert e.value.ceiling == "bytes"
 
 
-def test_missing_ratio_uses_fallback_and_rounds_tokens_up() -> None:
-    d = decide_context_budget(policy=_policy(cap=10**6), request_bytes=10, segments=[], bytes_per_token=None, previously_shed=frozenset())
-    assert d.bytes_per_token == 1.0 and d.estimated_tokens_before == 10
+def test_foreign_bytes_are_priced_conservatively() -> None:
+    d = decide_context_budget(policy=_policy(cap=10**6), request_bytes=10, segments=[], previously_shed=frozenset())
+    assert d.estimated_tokens_before == 10
 
 
 def test_same_input_same_decision_and_policy_hash_changes_with_each_parameter() -> None:
     segs = [_seg(TOOL_RESULT, "tool:a", 100), _seg(ASSISTANT_PROSE, "history:1", 100)]
 
     def run() -> ContextBudgetDecision:
-        return decide_context_budget(policy=_policy(), request_bytes=900, segments=segs, bytes_per_token=1.0, previously_shed=frozenset())
+        return decide_context_budget(policy=_policy(), request_bytes=900, segments=segs, previously_shed=frozenset())
 
     first, second = run(), run()
     assert first == second
@@ -198,9 +191,7 @@ def test_sticky_segments_are_shed_before_the_ranked_remainder() -> None:
         _seg(TOOL_RESULT, "tool:a", 100),
         _seg(ASSISTANT_PROSE, "history:1", 100),
     ]
-    d = decide_context_budget(
-        policy=_policy(), request_bytes=1000, segments=segs, bytes_per_token=1.0, previously_shed=frozenset({"history:0"})
-    )
+    d = decide_context_budget(policy=_policy(), request_bytes=1000, segments=segs, previously_shed=frozenset({"history:0"}))
     # 1000 - 100 (sticky) = 900 is over the high mark, so shedding continues by kind to the low mark.
     assert d.shed_keys == ("history:0", "tool:a")
     assert d.estimated_tokens_after == 800
@@ -214,9 +205,7 @@ def test_over_is_judged_on_the_size_with_the_sticky_set_already_shed() -> None:
         _seg(ASSISTANT_PROSE, "history:3", 90),
         _seg(USER_REQUEST, "history:0", 60),
     ]
-    d = decide_context_budget(
-        policy=_policy(), request_bytes=1200, segments=segs, bytes_per_token=1.0, previously_shed=frozenset({"history:1"})
-    )
+    d = decide_context_budget(policy=_policy(), request_bytes=1200, segments=segs, previously_shed=frozenset({"history:1"}))
     assert d.shed_keys == ("history:1",)
     assert d.estimated_tokens_before == 1200 and d.estimated_tokens_after == 800
 
@@ -227,7 +216,6 @@ def test_sticky_set_alone_over_the_byte_ceiling_keeps_shedding() -> None:
         policy=_policy(cap=10**9, max_bytes=500),
         request_bytes=650,
         segments=segs,
-        bytes_per_token=1.0,
         previously_shed=frozenset({"tool:a"}),
     )
     assert d.shed_keys == ("tool:a", "tool:b")
@@ -247,7 +235,7 @@ def _grow_session(turns: int) -> list[tuple[int, int, tuple[str, ...], tuple[str
             segs.append(_seg(USER_REQUEST, f"history:{2 * prior}", 60))
             segs.append(_seg(ASSISTANT_PROSE, f"history:{2 * prior + 1}", 90))
         full = 300 + 150 * (turn - 1)
-        d = decide_context_budget(policy=_policy(), request_bytes=full, segments=segs, bytes_per_token=1.0, previously_shed=carried)
+        d = decide_context_budget(policy=_policy(), request_bytes=full, segments=segs, previously_shed=carried)
         newly = tuple(key for key in d.shed_keys if key not in carried)
         rows.append((full, d.estimated_tokens_after, d.shed_keys, newly))
         carried = frozenset(d.shed_keys)
@@ -282,9 +270,7 @@ def test_within_a_turn_tool_stubs_hold_the_band_between_sheds() -> None:
     for call in range(1, 10):
         segs = [_seg(TOOL_RESULT, f"tool:c{earlier}", 120) for earlier in range(1, call)]
         full = 300 + 150 * call
-        d = decide_context_budget(
-            policy=_policy(), request_bytes=full, segments=segs, bytes_per_token=1.0, previously_shed=frozenset(carried)
-        )
+        d = decide_context_budget(policy=_policy(), request_bytes=full, segments=segs, previously_shed=frozenset(carried))
         newly_by_call.append(tuple(key for key in d.shed_keys if key not in carried))
         after_by_call.append(d.estimated_tokens_after)
         # Within a turn every earlier call's stubs stay stubbed.
@@ -307,21 +293,16 @@ def test_one_measure_serves_both_ceilings_and_a_refusal_reports_it() -> None:
         policy=_policy(cap=1000, max_bytes=500),
         request_bytes=560,
         segments=[_seg(TOOL_RESULT, "tool:a", 100)],
-        bytes_per_token=1.0,
         previously_shed=frozenset(),
     )
     assert d.shed_keys == ("tool:a",)
     assert (d.request_bytes_before, d.request_bytes_after) == (560, 460)
     assert (d.estimated_tokens_before, d.estimated_tokens_after) == (560, 460)
     with pytest.raises(ContextBudgetRefusal) as e:
-        decide_context_budget(
-            policy=_policy(cap=1000, max_bytes=500), request_bytes=560, segments=[], bytes_per_token=1.0, previously_shed=frozenset()
-        )
+        decide_context_budget(policy=_policy(cap=1000, max_bytes=500), request_bytes=560, segments=[], previously_shed=frozenset())
     assert (e.value.ceiling, e.value.estimated_tokens, e.value.request_bytes) == ("bytes", 560, 560)
     with pytest.raises(ContextBudgetRefusal) as e:
-        decide_context_budget(
-            policy=_policy(cap=1000, max_bytes=10_000), request_bytes=1200, segments=[], bytes_per_token=1.0, previously_shed=frozenset()
-        )
+        decide_context_budget(policy=_policy(cap=1000, max_bytes=10_000), request_bytes=1200, segments=[], previously_shed=frozenset())
     assert (e.value.ceiling, e.value.estimated_tokens, e.value.request_bytes) == ("tokens", 1200, 1200)
 
 
@@ -330,17 +311,9 @@ def test_sticky_set_is_kept_while_the_unshed_request_is_over_the_byte_ceiling_ev
         policy=_policy(cap=1000, max_bytes=500),
         request_bytes=560,
         segments=[_seg(TOOL_RESULT, "tool:a", 100), _seg(TOOL_RESULT, "tool:b", 100)],
-        bytes_per_token=1.0,
         previously_shed=frozenset({"tool:a"}),
     )
     assert d.shed_keys == ("tool:a",)
-
-
-@pytest.mark.parametrize("ratio", [float("inf"), float("-inf"), float("nan"), 0.0, -1.0])
-def test_a_ratio_that_is_not_a_finite_positive_number_is_rejected(ratio: float) -> None:
-    """An infinite ratio would estimate zero tokens for any request and switch the token ceiling off."""
-    with pytest.raises(ValueError, match="bytes_per_token must be a finite positive number"):
-        decide_context_budget(policy=_policy(), request_bytes=10**9, segments=[], bytes_per_token=ratio, previously_shed=frozenset())
 
 
 def test_held_keys_stay_shed_when_the_unshed_request_is_back_under_the_low_mark() -> None:
@@ -350,7 +323,6 @@ def test_held_keys_stay_shed_when_the_unshed_request_is_back_under_the_low_mark(
         policy=_policy(),
         request_bytes=500,
         segments=segs,
-        bytes_per_token=1.0,
         previously_shed=frozenset({"history:1", "tool:a"}),
         held=frozenset({"tool:a"}),
     )
@@ -358,9 +330,7 @@ def test_held_keys_stay_shed_when_the_unshed_request_is_back_under_the_low_mark(
     assert d.shed_keys == ("tool:a",)
     assert d.estimated_tokens_after == 400
     # Control: without the hold, the same request releases everything.
-    released = decide_context_budget(
-        policy=_policy(), request_bytes=500, segments=segs, bytes_per_token=1.0, previously_shed=frozenset({"history:1", "tool:a"})
-    )
+    released = decide_context_budget(policy=_policy(), request_bytes=500, segments=segs, previously_shed=frozenset({"history:1", "tool:a"}))
     assert released.shed_keys == ()
 
 
@@ -370,7 +340,6 @@ def test_held_keys_count_as_already_shed_above_the_low_mark_and_keep_segment_ord
         policy=_policy(),
         request_bytes=1000,
         segments=segs,
-        bytes_per_token=1.0,
         previously_shed=frozenset({"history:1"}),
         held=frozenset({"tool:a"}),
     )
@@ -378,6 +347,6 @@ def test_held_keys_count_as_already_shed_above_the_low_mark_and_keep_segment_ord
     assert d.shed_keys == ("history:1", "tool:a")
     # A held key that matches no segment is ignored.
     d = decide_context_budget(
-        policy=_policy(), request_bytes=500, segments=segs, bytes_per_token=1.0, previously_shed=frozenset(), held=frozenset({"tool:gone"})
+        policy=_policy(), request_bytes=500, segments=segs, previously_shed=frozenset(), held=frozenset({"tool:gone"})
     )
     assert d.shed_keys == ()

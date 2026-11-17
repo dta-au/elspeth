@@ -303,7 +303,7 @@ async def test_history_shed_on_the_previous_turn_stays_shed_between_the_marks(
         session_id,
         history,
         provider,
-        budget_history=ContextBudgetHistory(bytes_per_token=None, previously_shed_history=previously_shed),
+        budget_history=ContextBudgetHistory(previously_shed_history=previously_shed),
     )
 
     (call,) = result.llm_calls
@@ -651,7 +651,7 @@ async def test_the_final_byte_guard_refuses_a_request_the_decision_did_not_fit(c
             [],
             _empty_state(),
             session_id=session_id,
-            context_budget_history=ContextBudgetHistory(None, carried_indices),
+            context_budget_history=ContextBudgetHistory(carried_indices),
         )
 
     assert provider.requests == []
@@ -1106,7 +1106,7 @@ async def test_a_result_stubbed_on_an_earlier_call_stays_stubbed_in_the_reply_st
     assert second in selected[7]["content"]
 
 
-# --- The bytes-per-token ratio is the budgeted model's own ---------------------------------------
+# --- Conservative estimate despite historical measurements ---------------------------------------
 
 
 @pytest.mark.asyncio
@@ -1114,12 +1114,7 @@ async def test_the_compose_loop_uses_a_safe_bound_despite_its_measured_ratio() -
     model = "openrouter/openai/gpt-5.5"
     service, session_id = _service(_GENEROUS_TOKENS, composer_model=model)
     provider = _RecordingProvider(_make_llm_response(content="Done."))
-    # The newest budgeted call of any model was the escape hatch's; the compose loop's own model measured 4.25.
-    budget_history = ContextBudgetHistory(
-        bytes_per_token=2.5,
-        previously_shed_history=frozenset(),
-        bytes_per_token_by_model=(("test/escape-hatch", 2.5), (model, 4.25)),
-    )
+    budget_history = ContextBudgetHistory.empty()
 
     result = await _compose(service, session_id, [], provider, budget_history=budget_history)
 

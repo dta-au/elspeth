@@ -9,6 +9,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
+from elspeth.contracts.errors import FrameworkBugError
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.context_budget import (
     ContextBudgetPolicy,
@@ -20,6 +21,7 @@ from elspeth.web.composer.context_budget import (
 )
 from elspeth.web.composer.context_budget_apply import request_wire_bytes
 from elspeth.web.composer.context_budget_history import ContextBudgetHistory, request_anchor
+from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.service import _ContextBudgetRefusalScope
 from tests.unit.web.composer.test_compose_loop_context_budget import _assistant, _empty_state, _service, _user
@@ -101,7 +103,6 @@ def test_provider_anchor_prices_growth_without_average_ratio_credit():
         policy=policy(),
         request_bytes=4000,
         segments=[],
-        bytes_per_token=None,
         previously_shed=frozenset(),
         anchor_tokens=500,
         anchor_shared_bytes=3700,
@@ -118,7 +119,6 @@ def test_anchor_arrival_and_loss_never_release_sticky_history():
             policy=policy(),
             request_bytes=900,
             segments=segments,
-            bytes_per_token=None,
             previously_shed=previous,
             anchor_tokens=anchor_tokens,
             anchor_shared_bytes=shared,
@@ -134,7 +134,6 @@ def test_anchor_cannot_overlap_sheddable_bytes():
             policy=policy(),
             request_bytes=900,
             segments=[SheddableSegment(SheddableKind.USER_REQUEST, "a", 400)],
-            bytes_per_token=None,
             previously_shed=frozenset(),
             anchor_tokens=100,
             anchor_shared_bytes=600,
@@ -149,7 +148,6 @@ def test_anchored_decision_properties(savings, protected, count, cap):
         "policy": policy(cap),
         "request_bytes": protected + sum(savings),
         "segments": segments,
-        "bytes_per_token": None,
         "previously_shed": frozenset(),
         "anchor_tokens": count,
         "anchor_shared_bytes": protected,
@@ -179,22 +177,18 @@ def test_dense_growth_after_prose_anchor_is_priced_per_byte():
             policy=policy(),
             request_bytes=request_wire_bytes(current, None),
             segments=[],
-            bytes_per_token=6.0,
             previously_shed=frozenset(),
             anchor_tokens=anchor.tokens,
             anchor_shared_bytes=anchor.shared_bytes,
         )
 
 
-def decide(size, segments=(), ratio=1.0, previous=frozenset(), held=frozenset(), budget=None):
-    return decide_context_budget(
-        policy=budget or policy(), request_bytes=size, segments=segments, bytes_per_token=ratio, previously_shed=previous, held=held
-    )
+def decide(size, segments=(), previous=frozenset(), held=frozenset(), budget=None):
+    return decide_context_budget(policy=budget or policy(), request_bytes=size, segments=segments, previously_shed=previous, held=held)
 
 
-@pytest.mark.parametrize("ratio", [None, 3.0, 4.78, 6.0])
-def test_dense_payload_has_byte_upper_bound(ratio):
-    result = decide(900, ratio=ratio)
+def test_dense_payload_has_byte_upper_bound():
+    result = decide(900)
     assert result.estimated_tokens_before >= 900
 
 
@@ -202,16 +196,16 @@ def test_ratio_step_does_not_regrow_fifteen_messages():
     segments = [SheddableSegment(SheddableKind.ASSISTANT_PROSE, f"history:{i}", 6000) for i in range(20)]
     # The review's first turn at ratio 3 shed fifteen. Replay its persisted set.
     previous = frozenset(f"history:{i}" for i in range(15))
-    result = decide(270000, segments, 4.6, previous, budget=policy(300000))
+    result = decide(270000, segments, previous, budget=policy(300000))
     assert previous <= set(result.shed_keys)
 
 
 def test_three_turn_ratio_step_keeps_the_same_yardstick():
     segments = [SheddableSegment(SheddableKind.ASSISTANT_PROSE, f"history:{i}", 6000) for i in range(20)]
     # Scale the review's cap by three for the new one-byte yardstick.
-    first = decide(270000, segments, 1.0, budget=policy(300000))
-    second = decide(270000, segments, 4.6, frozenset(first.shed_keys), budget=policy(300000))
-    third = decide(400000, segments, 4.6, frozenset(second.shed_keys), budget=policy(300000))
+    first = decide(270000, segments, budget=policy(300000))
+    second = decide(270000, segments, frozenset(first.shed_keys), budget=policy(300000))
+    third = decide(400000, segments, frozenset(second.shed_keys), budget=policy(300000))
     assert len(first.shed_keys) == 15
     assert second.shed_keys == first.shed_keys
     assert len(third.shed_keys) == 20
@@ -339,7 +333,7 @@ def test_reply_does_not_reshed_history_released_by_the_loop(with_history):
         session_id=None,
         plugin_snapshot=snapshot,
         policy_catalog=catalog,
-        history=ContextBudgetHistory(None, frozenset({"history:1"})),
+        history=ContextBudgetHistory(frozenset({"history:1"})),
     )
     recorder = BufferingRecorder()
     recorder.record_llm_call(_earlier_call(()))
@@ -369,7 +363,7 @@ def test_reply_holds_history_even_when_its_smaller_request_fits_low_mark(with_hi
         session_id=None,
         plugin_snapshot=snapshot,
         policy_catalog=catalog,
-        history=ContextBudgetHistory(None, frozenset({"history:1"})),
+        history=ContextBudgetHistory(frozenset({"history:1"})),
     )
     recorder = BufferingRecorder()
     applied, record, _ = service._shed_to_context_budget(
@@ -408,9 +402,7 @@ def test_newest_usable_anchor_survives_interleaved_model_and_failure():
 
 def test_static_authorship_prices_only_explicitly_labelled_bytes():
     assert "authored_bytes" in inspect.signature(decide_context_budget).parameters
-    result = decide_context_budget(
-        policy=policy(), request_bytes=2000, segments=[], bytes_per_token=None, previously_shed=frozenset(), authored_bytes=1800
-    )
+    result = decide_context_budget(policy=policy(), request_bytes=2000, segments=[], previously_shed=frozenset(), authored_bytes=1800)
     assert result.estimated_tokens_after == 800
     with pytest.raises(ContextBudgetRefusal):
         decide(2000)
@@ -465,7 +457,6 @@ def test_refusal_has_replayable_pricing_and_byte_arm_is_named():
             policy=policy(100),
             request_bytes=500,
             segments=[],
-            bytes_per_token=None,
             previously_shed=frozenset(),
             anchor_tokens=400,
             anchor_shared_bytes=200,
@@ -687,7 +678,6 @@ def test_unreachable_low_mark_bounds_growth_churn_without_restoring_history():
             policy=policy(400000),
             request_bytes=400000 + turn * 1000,
             segments=segments,
-            bytes_per_token=None,
             previously_shed=previous,
             anchor_tokens=50000,
             anchor_shared_bytes=100000,
@@ -724,3 +714,71 @@ def test_non_manifest_tool_disables_anchor_with_capture_reason():
     )
     assert anchor.tokens is None
     assert anchor.reason == "unsupported"
+
+
+def test_compose_rejects_a_sheddable_position_missing_from_mutable_set(monkeypatch):
+    from elspeth.web.composer import service as service_module
+
+    service, _ = _service(10_000_000)
+    snapshot, catalog = service._policy_context.build("test-user")
+    state = _empty_state()
+    chat = [_user(0, "Earlier request"), _assistant("Earlier reply")]
+    messages = service._build_messages(chat, state, "Current request", plugin_snapshot=snapshot, policy_catalog=catalog)
+    frame = service._context_budget_frame(
+        chat_history=chat,
+        llm_messages=messages,
+        state=state,
+        session_id=None,
+        plugin_snapshot=snapshot,
+        policy_catalog=catalog,
+        history=ContextBudgetHistory.empty(),
+    )
+    original = service_module._sheddable_message_positions
+
+    def dropped_position(frame, tool_positions):
+        positions = original(frame, tool_positions)
+        positions.remove(2)
+        return positions
+
+    monkeypatch.setattr(service_module, "_sheddable_message_positions", dropped_position)
+    with pytest.raises(InvariantError, match="outside mutable messages"):
+        service._shed_to_context_budget(
+            messages=messages,
+            tools=[],
+            frame=frame,
+            recorder=BufferingRecorder(),
+            refusal_scope=_ContextBudgetRefusalScope(state, state.version, 0, 0, None, BufferingRecorder()),
+        )
+
+
+def test_planner_rejects_a_sheddable_position_missing_from_mutable_set(monkeypatch):
+    from elspeth.web.composer import pipeline_planner
+    from tests.unit.web.composer.test_planner_context_budget import _context
+
+    context = _context(users={0: "Earlier request"})
+    messages = [
+        {"role": "system", "content": "System"},
+        {"role": "user", "content": "Reference"},
+        pipeline_planner._planner_request_message({"intent": "Convert", "conversation_context": context.to_dict()}),
+    ]
+    original = pipeline_planner._planner_mutable_positions
+
+    def dropped_position(tool_positions, history_index_by_key, hatch_index_by_key, hatch_transcript_index):
+        positions = original(tool_positions, history_index_by_key, hatch_index_by_key, hatch_transcript_index)
+        positions.remove(2)
+        return positions
+
+    monkeypatch.setattr(pipeline_planner, "_planner_mutable_positions", dropped_position)
+    with pytest.raises(FrameworkBugError, match="outside mutable messages"):
+        pipeline_planner._fit_planner_context_budget(
+            messages=messages,
+            tools=[],
+            request_conversation_context=context,
+            hatch_transcript_index=None,
+            hatch_transcript=None,
+            policy=policy(10_000_000),
+            history=ContextBudgetHistory.empty(),
+            model="test/model",
+            earlier_calls=[],
+            mark_for_cache=False,
+        )

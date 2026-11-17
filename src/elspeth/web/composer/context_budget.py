@@ -21,14 +21,10 @@ from elspeth.core.canonical import canonical_json, stable_hash
 CONTEXT_BUDGET_FALLBACK_BYTES_PER_TOKEN: Final[float] = 3.0
 # Every size in this module is WIRE bytes: the canonical JSON of the request
 # body's ``{messages, tools}`` as sent, so content, tool-call arguments,
-# replayed thinking blocks and tool definitions all count. The ratio is wire
-# bytes per provider-reported prompt token.
-#
-# Historical ratios remain diagnostic only. A same-exchange provider count
+# replayed thinking blocks and tool definitions all count.
+# A same-exchange provider count
 # can price unchanged protected messages; without one, only authored bytes get the fallback rate.
 # Release always uses the byte yardstick, independently of anchor availability.
-CONTEXT_BUDGET_MIN_BYTES_PER_TOKEN: Final[float] = 2.0
-CONTEXT_BUDGET_MAX_BYTES_PER_TOKEN: Final[float] = 6.0
 CONTEXT_BUDGET_TOOL_RESULT_STUB: Final[str] = "[Result omitted by ELSPETH to fit the context budget. Call the tool again if you need it.]"
 
 
@@ -145,7 +141,6 @@ class ContextBudgetDecision:
     """
 
     policy_hash: str
-    bytes_per_token: float
     request_bytes_before: int
     estimated_tokens_before: int
     request_bytes_after: int
@@ -179,7 +174,6 @@ def decide_context_budget(
     policy: ContextBudgetPolicy,
     request_bytes: int,
     segments: Sequence[SheddableSegment],
-    bytes_per_token: float | None,
     previously_shed: frozenset[str],
     held: frozenset[str] = frozenset(),
     anchor_tokens: int | None = None,
@@ -219,8 +213,6 @@ def decide_context_budget(
     in the size, which grows with the history until a request that fits once
     shed is refused.
     """
-    if bytes_per_token is not None and not (math.isfinite(bytes_per_token) and bytes_per_token > 0):
-        raise ValueError("bytes_per_token must be a finite positive number or None")
     if type(request_bytes) is not int or request_bytes < 0:
         raise ValueError("request_bytes must be a non-negative exact integer")
     if len({segment.key for segment in segments}) != len(segments):
@@ -236,9 +228,6 @@ def decide_context_budget(
         raise ValueError("shared bytes require an anchor")
     if type(authored_bytes) is not int or not 0 <= authored_bytes <= request_bytes - savings:
         raise ValueError("authored bytes must exclude every sheddable byte")
-    # Legacy ratio input is accepted and validated for API compatibility only.
-    # It cannot classify foreign bytes or change admission/release decisions.
-    ratio = 1.0
     high = policy.shed_above * policy.max_prompt_tokens
     low = policy.shed_to * policy.max_prompt_tokens
 
@@ -303,7 +292,6 @@ def decide_context_budget(
 
     return ContextBudgetDecision(
         policy_hash=policy.audit_hash,
-        bytes_per_token=ratio,
         request_bytes_before=request_bytes,
         estimated_tokens_before=tokens_before,
         request_bytes_after=bytes_after,

@@ -12015,9 +12015,9 @@ class TestSendMessageTranscriptSnapshot:
     def test_send_message_passes_context_budget_history_from_the_transcript(self, tmp_path) -> None:
         """The route derives the context-budget history from the turn's records and hands it to compose.
 
-        A stored budgeted call record that shed history index 1, with a
-        recorded 400 wire bytes over 100 prompt tokens, must reach the composer as
-        exactly that ratio, for its model, and that shed set.
+        A stored budgeted call record that shed history index 1 must reach the
+        composer as exactly that shed set. Historical ratios are no longer derived:
+        admission uses live anchors or authored-prefix pricing.
         """
         mock_composer = _make_composer_mock(response_text="Budgeted")
         app, _service = _make_app(tmp_path)
@@ -12076,9 +12076,7 @@ class TestSendMessageTranscriptSnapshot:
         assert resp.status_code == 200, resp.text
         assert mock_composer.compose.await_count == 1
         assert mock_composer.compose.await_args.kwargs["context_budget_history"] == ContextBudgetHistory(
-            bytes_per_token=4.0,
             previously_shed_history=frozenset({"history:1"}),
-            bytes_per_token_by_model=(("test/composer-model", 4.0),),
         )
 
     def test_send_message_transcript_snapshot_contains_prior_turns(self, tmp_path) -> None:

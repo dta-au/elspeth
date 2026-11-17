@@ -3421,6 +3421,20 @@ def _planner_context_budget_exhausted(ceiling: Literal["tokens", "bytes"], compo
     )
 
 
+def _planner_mutable_positions(
+    tool_positions: Mapping[str, list[int]],
+    history_index_by_key: Mapping[str, int],
+    hatch_index_by_key: Mapping[str, int],
+    hatch_transcript_index: int | None,
+) -> set[int]:
+    positions = {index for result_positions in tool_positions.values() for index in result_positions}
+    if history_index_by_key:
+        positions.add(_PLANNER_REQUEST_INDEX)
+    if hatch_index_by_key and hatch_transcript_index is not None:
+        positions.add(hatch_transcript_index)
+    return positions
+
+
 def _fit_planner_context_budget(
     *,
     messages: list[dict[str, Any]],
@@ -3448,7 +3462,7 @@ def _fit_planner_context_budget(
 
     ``model`` is the model this call requests (the planner's, or the escape
     hatch's on a hatch turn); only a same-model, same-dialect live call can
-    supply a provider-count anchor. Stored ratios remain diagnostic.
+    supply a provider-count anchor. Stored ratios are not admission inputs.
 
     The decision is fed the request as it will be sent and checked: cache
     markers applied when ``mark_for_cache``, prompt-guard keys detached,
@@ -3527,11 +3541,14 @@ def _fit_planner_context_budget(
         CONTEXT_BUDGET_TRANSCRIPT_GAP_ALLOWANCE_BYTES if hatch_segments else 0
     )
     scratch_messages, scratch_tools = apply_anthropic_cache_markers(messages, tools) if mark_for_cache else (messages, tools)
-    mutable_positions = {index for positions in tool_positions.values() for index in positions}
-    if history_index_by_key:
-        mutable_positions.add(_PLANNER_REQUEST_INDEX)
-    if hatch_segments and hatch_transcript_index is not None:
-        mutable_positions.add(hatch_transcript_index)
+    mutable_positions = _planner_mutable_positions(tool_positions, history_index_by_key, hatch_index_by_key, hatch_transcript_index)
+    segment_positions = {
+        **{key: {_PLANNER_REQUEST_INDEX} for key in history_index_by_key},
+        **{key: set(positions) for key, positions in tool_positions.items()},
+        **({key: {hatch_transcript_index} for key in hatch_index_by_key} if hatch_transcript_index is not None else {}),
+    }
+    if any(not segment_positions.get(segment.key) or not segment_positions[segment.key] <= mutable_positions for segment in segments):
+        raise FrameworkBugError("context-budget sheddable segment is outside mutable messages")
     anchor = request_anchor(
         calls=earlier_calls,
         model=model,
@@ -3552,7 +3569,6 @@ def _fit_planner_context_budget(
             authored_bytes=shipped_skill_bytes
             + (message_wire_split([], scratch_tools).tools_bytes or 0)
             + protected_reference_bytes(scratch_messages, excluded_positions=frozenset({0, *mutable_positions})),
-            bytes_per_token=history.ratio_for(model),
             previously_shed=previously_shed_keys(history, earlier_calls),
             held=held_tool_keys(earlier_calls),
         )
@@ -4072,7 +4088,7 @@ async def _plan_pipeline_inner(
         # so it is reached only when the planner's byte budget is set below
         # the context budget's ceiling.
         request_size = _planner_request_size(marked_messages, marked_tools)
-        # The exact wire bytes of the request sent, where a later call's bytes-per-token ratio is read from.
+        # The exact wire bytes of the request sent, retained in the audit record.
         context_budget = replace(context_budget, request_wire_bytes=request_size)
         if request_size > budget_policy.max_request_bytes:
             raise PipelinePlannerError("planner request byte budget exhausted", code="REQUEST_BYTES_EXHAUSTED")

@@ -18,7 +18,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Final, Literal, Protocol, Self
+from typing import Any, Final, Literal, Protocol, Self, get_args
 
 from elspeth.contracts.composer_audit import PrivateFailureFacts, PrivateReceivedDiagnostic
 from elspeth.contracts.composer_provider_context import PrivateProviderContext
@@ -251,6 +251,8 @@ class ComposerContextBudgetRecord:
             raise ValueError("invalid pricing_mode")
         if self.anchor_status is not None:
             _require_non_empty_str(self.anchor_status, "anchor_status")
+            if self.anchor_status not in get_args(ContextBudgetAnchorStatus):
+                raise ValueError("invalid anchor_status")
         if self.anchor_prompt_tokens is not None:
             _require_component_bytes(self.anchor_prompt_tokens, "anchor_prompt_tokens")
             if self.anchor_prompt_tokens == 0:
