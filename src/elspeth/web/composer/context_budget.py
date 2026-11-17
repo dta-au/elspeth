@@ -130,6 +130,7 @@ class ContextBudgetPricing:
     shared_bytes: int
     request_bytes: int
     authored_bytes: int
+    authored_refuted: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +180,7 @@ def decide_context_budget(
     anchor_tokens: int | None = None,
     anchor_shared_bytes: int = 0,
     anchor_wire_bytes: int = 0,
+    anchor_authored_bytes: int | None = None,
     anchor_status: ContextBudgetAnchorStatus = "no_previous_call",
     authored_bytes: int = 0,
 ) -> ContextBudgetDecision:
@@ -196,7 +198,9 @@ def decide_context_budget(
     everything the model reads (content, tool-call arguments, thinking
     blocks, tool definitions). Authored bytes keep the fallback rate even when
     an anchor exists. The other arm pays the anchor's ENTIRE reported count
-    plus every non-shared byte. Use the smaller of these two upper bounds.
+    plus every non-shared byte. Use the smaller arm unless the anchor's own
+    provider count refutes its authored-model estimate; then use the anchored
+    arm alone.
     Shared bytes must belong only to unchanged protected messages/tools;
     no segment saving may overlap them. This deliberately gives no token
     credit for content removed from the anchor. It assumes provider accounting
@@ -226,6 +230,10 @@ def decide_context_budget(
         raise ValueError("anchor_tokens must be a positive exact integer")
     if anchor_tokens is None and anchor_shared_bytes:
         raise ValueError("shared bytes require an anchor")
+    if anchor_authored_bytes is not None and (
+        type(anchor_authored_bytes) is not int or not 0 <= anchor_authored_bytes <= anchor_wire_bytes
+    ):
+        raise ValueError("anchor authored bytes must fit the anchor request")
     if type(authored_bytes) is not int or not 0 <= authored_bytes <= request_bytes - savings:
         raise ValueError("authored bytes must exclude every sheddable byte")
     high = policy.shed_above * policy.max_prompt_tokens
@@ -237,18 +245,31 @@ def decide_context_budget(
     def authored_tokens(size: int) -> int:
         return size - authored_bytes + math.ceil(authored_bytes / policy.fallback_bytes_per_token)
 
+    authored_refuted = anchor_tokens is not None and (
+        anchor_authored_bytes is None
+        or (
+            anchor_tokens <= anchor_wire_bytes <= 8 * anchor_tokens
+            and anchor_wire_bytes - anchor_authored_bytes + math.ceil(anchor_authored_bytes / policy.fallback_bytes_per_token)
+            < anchor_tokens
+        )
+    )
+
     def tokens(size: int) -> int:
         if anchor_tokens is None:
             return authored_tokens(size)
+        if authored_refuted:
+            return anchor_tokens + size - anchor_shared_bytes
         return min(authored_tokens(size), anchor_tokens + size - anchor_shared_bytes)
 
     def pricing(size: int) -> ContextBudgetPricing:
         mode: Literal["anchored", "conservative", "authored_prefix"] = "conservative"
-        if anchor_tokens is not None and anchor_tokens + size - anchor_shared_bytes < authored_tokens(size):
+        if anchor_tokens is not None and (authored_refuted or anchor_tokens + size - anchor_shared_bytes < authored_tokens(size)):
             mode = "anchored"
         elif authored_bytes:
             mode = "authored_prefix"
-        return ContextBudgetPricing(mode, anchor_status, anchor_tokens, anchor_wire_bytes, anchor_shared_bytes, size, authored_bytes)
+        return ContextBudgetPricing(
+            mode, anchor_status, anchor_tokens, anchor_wire_bytes, anchor_shared_bytes, size, authored_bytes, authored_refuted
+        )
 
     target = high if tokens(request_bytes - savings) > low else low
 

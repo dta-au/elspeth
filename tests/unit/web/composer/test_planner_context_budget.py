@@ -29,7 +29,7 @@ from elspeth.contracts.composer_llm_audit import (
 )
 from elspeth.contracts.composer_planner_audit import ComposerPlannerAttemptOutcome, ComposerPlannerAttemptPhase, ComposerPlannerCode
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
-from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.prompt_guard import PROMPT_GUARD_CONTENT_PARTS_KEY, detach_prompt_guard_evidence
 from elspeth.core.canonical import canonical_json
 from elspeth.web.composer import pipeline_planner
@@ -43,7 +43,7 @@ from elspeth.web.composer.context_budget_apply import (
     message_bytes,
     message_wire_split,
 )
-from elspeth.web.composer.context_budget_history import ContextBudgetHistory
+from elspeth.web.composer.context_budget_history import ContextBudgetHistory, request_anchor
 from elspeth.web.composer.llm_response_parsing import _hash_and_measure_request, build_llm_call_record
 from elspeth.web.composer.pipeline_planner import (
     _HATCH_TRANSCRIPT_HEADER,
@@ -489,8 +489,8 @@ async def test_the_escape_hatch_request_sheds_its_conversation_context_and_keeps
 
 
 @pytest.mark.asyncio
-async def test_each_planner_call_uses_a_safe_bound_despite_its_measured_ratio(tmp_path: Path, tool_context: ToolContext) -> None:
-    """Neither a planner nor a hatch prose measurement may lower the admission bound."""
+async def test_each_planner_call_persists_its_conservative_rate(tmp_path: Path, tool_context: ToolContext) -> None:
+    """Planner and hatch calls record the conservative rate used for admission."""
     history = ContextBudgetHistory.empty()
     completion = _hatch_completion()
     recorder = BufferingRecorder()
@@ -702,6 +702,136 @@ async def test_six_producer_schema_results_fit_authored_budget_with_foreign_cont
             message.pop(PROMPT_GUARD_CONTENT_PARTS_KEY, None)
     with pytest.raises(PipelinePlannerError, match="context budget exhausted"):
         original_fit(**foreign)
+
+
+@pytest.mark.asyncio
+async def test_six_schema_batch_costs_more_without_producer_labels(tmp_path: Path, tool_context: ToolContext) -> None:
+    """Base-collectable control: producer-labelled schema text is priced below foreign text.
+
+    Reads only the planner fit's inputs and its refusal, never lane-only record fields.
+    """
+    schemas = (
+        ("transform", "llm"),
+        ("source", "llm"),
+        ("transform", "web_scrape"),
+        ("transform", "azure_document_intelligence"),
+        ("transform", "azure_content_understanding"),
+        ("transform", "aws_textract_document_analysis"),
+    )
+    lookup = _response_with_call_id("first", "get_plugin_schema", {"plugin_type": "transform", "name": "llm"})
+    lookup.choices[0].message.tool_calls = [
+        _response_with_call_id(f"schema-{index}", "get_plugin_schema", {"plugin_type": kind, "name": name}).choices[0].message.tool_calls[0]
+        for index, (kind, name) in enumerate(schemas)
+    ]
+    lookup.usage = {"prompt_tokens": 63_201, "completion_tokens": 5, "total_tokens": 63_206, "cost": 0.01}
+    completion = _ScriptedCompletion(lookup, _text_response("Which output format do you want?"))
+    recorder = BufferingRecorder()
+    policy = ContextBudgetPolicy(max_prompt_tokens=200_000, max_request_bytes=1_000_000, shed_above=0.85, shed_to=0.6)
+    captured: list[dict[str, Any]] = []
+    original_fit = pipeline_planner._fit_planner_context_budget
+
+    def capture_fit(**kwargs: Any) -> tuple[list[dict[str, Any]], ComposerContextBudgetRecord]:
+        captured.append(deepcopy(kwargs))
+        return original_fit(**kwargs)
+
+    with patch.object(pipeline_planner, "_fit_planner_context_budget", capture_fit):
+        try:
+            await _plan(
+                tmp_path=tmp_path,
+                tool_context=tool_context,
+                completion=completion,
+                recorder=recorder,
+                context_policy=policy,
+                model_overrides={"model_identifier": _UNMARKED, "max_tool_calls_per_turn": 16},
+            )
+        except PlannerDeclined:
+            pass
+        except PipelinePlannerError as error:
+            raise AssertionError(f"protected producer schema batch was refused: {error}") from error
+    assert len(completion.requests) == 2
+    assert len(captured) == 2
+    foreign = deepcopy(captured[1])
+    for message in foreign["messages"]:
+        if message["role"] == "tool":
+            message.pop(PROMPT_GUARD_CONTENT_PARTS_KEY, None)
+    with pytest.raises(PipelinePlannerError, match="context budget exhausted"):
+        original_fit(**foreign)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("anchor_tokens", "minimum"), [(100_000, 100_000), (40_000, 57_407)])
+async def test_planner_anchor_refutes_authored_pricing(tmp_path: Path, tool_context: ToolContext, anchor_tokens: int, minimum: int) -> None:
+    lookup = _response_with_call_id("schema", "get_plugin_schema", {"plugin_type": "transform", "name": "web_scrape"})
+    lookup.usage = {"prompt_tokens": anchor_tokens, "completion_tokens": 5, "total_tokens": anchor_tokens + 5, "cost": 0.01}
+    completion = _ScriptedCompletion(lookup, _text_response("Which output format do you want?"))
+    recorder = BufferingRecorder()
+    with pytest.raises(PlannerDeclined):
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            context_policy=ContextBudgetPolicy(max_prompt_tokens=200_000, max_request_bytes=1_000_000, shed_above=0.85, shed_to=0.6),
+            model_overrides={"model_identifier": _UNMARKED},
+        )
+    assert len(completion.requests) == 2
+    budget = recorder.llm_calls[1].context_budget
+    assert budget is not None
+    if anchor_tokens == 100_000:
+        assert budget.estimated_tokens_after >= minimum
+    else:
+        assert budget.estimated_tokens_after == minimum
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata", ["missing", "legacy", "oversize"])
+async def test_planner_anchor_authored_metadata_fails_closed(
+    tmp_path: Path, tool_context: ToolContext, monkeypatch: pytest.MonkeyPatch, metadata: str
+) -> None:
+    def anchor_with_metadata(**kwargs: Any) -> Any:
+        calls = []
+        for call in kwargs["calls"]:
+            if call.context_budget is not None:
+                if metadata == "missing":
+                    call = replace(call, context_budget=None)
+                else:
+                    value = None if metadata == "legacy" else 1_000_000
+                    call = replace(call, context_budget=replace(call.context_budget, authored_bytes=value))
+            calls.append(call)
+        return request_anchor(**{**kwargs, "calls": calls})
+
+    monkeypatch.setattr(pipeline_planner, "request_anchor", anchor_with_metadata)
+    lookup = _response_with_call_id("schema", "get_plugin_schema", {"plugin_type": "transform", "name": "web_scrape"})
+    lookup.usage = {"prompt_tokens": 100_000, "completion_tokens": 5, "total_tokens": 100_005, "cost": 0.01}
+    completion = _ScriptedCompletion(lookup, _text_response("Which output format do you want?"))
+    recorder = BufferingRecorder()
+    if metadata == "oversize":
+        with pytest.raises(AuditIntegrityError, match="Anchor authored bytes"):
+            await _plan(
+                tmp_path=tmp_path,
+                tool_context=tool_context,
+                completion=completion,
+                recorder=recorder,
+                context_policy=ContextBudgetPolicy(max_prompt_tokens=200_000, max_request_bytes=1_000_000, shed_above=0.85, shed_to=0.6),
+                model_overrides={"model_identifier": _UNMARKED},
+            )
+        return
+    with pytest.raises(PlannerDeclined):
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            context_policy=ContextBudgetPolicy(max_prompt_tokens=200_000, max_request_bytes=1_000_000, shed_above=0.85, shed_to=0.6),
+            model_overrides={"model_identifier": _UNMARKED},
+        )
+    assert len(completion.requests) == 2
+    budget = recorder.llm_calls[1].context_budget
+    assert budget is not None
+    assert budget.estimated_tokens_after >= 100_000
+    assert budget.pricing_mode == "anchored"
+    assert budget.anchor_status == "authored_evidence_unavailable"
+    assert budget.authored_refuted is True
 
 
 @pytest.mark.asyncio

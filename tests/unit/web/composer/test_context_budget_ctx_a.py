@@ -151,6 +151,9 @@ def test_anchored_decision_properties(savings, protected, count, cap):
         "previously_shed": frozenset(),
         "anchor_tokens": count,
         "anchor_shared_bytes": protected,
+        # Known evidence: the anchor carried no authored bytes. Omitting the
+        # argument means unknown evidence, which prices the anchored arm alone.
+        "anchor_authored_bytes": 0,
     }
     try:
         result = decide_context_budget(**arguments)
@@ -462,6 +465,7 @@ def test_refusal_has_replayable_pricing_and_byte_arm_is_named():
             anchor_shared_bytes=200,
             anchor_wire_bytes=2000,
             anchor_status="anchored",
+            anchor_authored_bytes=0,
         )
     evidence = caught.value.pricing
     assert evidence is not None
@@ -782,3 +786,29 @@ def test_planner_rejects_a_sheddable_position_missing_from_mutable_set(monkeypat
             earlier_calls=[],
             mark_for_cache=False,
         )
+
+
+def test_omitted_anchor_authored_evidence_fails_closed_like_unknown():
+    """F9-1: omitting the anchor's authored bytes must not mean a measured zero.
+
+    Zero authored bytes price the anchor's own request at its full wire size,
+    which no plausible count can exceed, so a contradictory provider count
+    would be discarded. Omission must behave exactly as explicit unknown
+    evidence: the anchored arm alone.
+    """
+    arguments = {
+        "policy": ContextBudgetPolicy(90_000, 1_000_000, 0.85, 0.6),
+        "request_bytes": 159_396,
+        "segments": (),
+        "previously_shed": frozenset(),
+        "anchor_tokens": 100_000,
+        "anchor_shared_bytes": 141_989,
+        "anchor_wire_bytes": 142_015,
+        "anchor_status": "anchored",
+        "authored_bytes": 121_325,
+    }
+    with pytest.raises(ContextBudgetRefusal) as omitted:
+        decide_context_budget(**arguments)
+    with pytest.raises(ContextBudgetRefusal) as unknown:
+        decide_context_budget(**arguments, anchor_authored_bytes=None)
+    assert omitted.value.estimated_tokens == unknown.value.estimated_tokens == 117_407

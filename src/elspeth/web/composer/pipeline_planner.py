@@ -3565,6 +3565,7 @@ def _fit_planner_context_budget(
             anchor_tokens=anchor.tokens,
             anchor_shared_bytes=anchor.shared_bytes,
             anchor_wire_bytes=anchor.wire_bytes,
+            anchor_authored_bytes=anchor.authored_bytes,
             anchor_status=anchor.reason,
             authored_bytes=shipped_skill_bytes
             + (message_wire_split([], scratch_tools).tools_bytes or 0)
@@ -3600,6 +3601,7 @@ def _fit_planner_context_budget(
         record,
         pricing_mode=decision.pricing.mode,
         authored_bytes=decision.pricing.authored_bytes,
+        authored_refuted=decision.pricing.authored_refuted,
         anchor_status=anchor.reason,
         anchor_prompt_tokens=anchor.tokens,
         anchor_wire_bytes=anchor.wire_bytes,

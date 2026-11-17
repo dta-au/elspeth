@@ -41,6 +41,7 @@ class ContextBudgetAnchor:
     tokens: int | None = None
     wire_bytes: int = 0
     shared_bytes: int = 0
+    authored_bytes: int | None = None
     reason: ContextBudgetAnchorStatus = "no_previous_call"
 
 
@@ -95,6 +96,12 @@ def _call_anchor(
     old_messages = captured["messages"]
     old_tools = captured["tools"] or []
     wire = len(canonical_json({"messages": old_messages, "tools": old_tools}).encode("utf-8"))
+    # A present budget count is owned Tier-1 evidence from this exchange's
+    # captured request. Its producer labels were detached from the private
+    # wire capture, so the classification cannot be recomputed here.
+    authored_bytes = call.context_budget.authored_bytes if call.context_budget is not None else None
+    if authored_bytes is not None and (type(authored_bytes) is not int or not 0 <= authored_bytes <= wire):
+        raise AuditIntegrityError("Anchor authored bytes are inconsistent with the captured request")
     # LiteLLM normalizes Anthropic and Bedrock cache reads/creation into
     # prompt_tokens; OpenAI's cached count is a subset of prompt_tokens.
     # Adding the separately reported fields would charge those tokens twice.
@@ -111,7 +118,8 @@ def _call_anchor(
     encoded_tools = canonical_json(list(tools) if tools is not None else [])
     if encoded_tools == canonical_json(old_tools):
         shared += len(encoded_tools.encode("utf-8"))
-    return ContextBudgetAnchor(tokens=count, wire_bytes=wire, shared_bytes=shared, reason="anchored")
+    reason: ContextBudgetAnchorStatus = "anchored" if authored_bytes is not None else "authored_evidence_unavailable"
+    return ContextBudgetAnchor(tokens=count, wire_bytes=wire, shared_bytes=shared, authored_bytes=authored_bytes, reason=reason)
 
 
 def _history_key(index: int) -> str:

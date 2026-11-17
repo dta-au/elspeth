@@ -32,6 +32,7 @@ ContextBudgetAnchorStatus = Literal[
     "request_unavailable",
     "invalid_prompt_count",
     "anchored",
+    "authored_evidence_unavailable",
     "bounds",
     "unsupported",
     "malformed_json",
@@ -208,9 +209,8 @@ class ComposerContextBudgetRecord:
     UPPER BOUND on the estimate of the request sent, not that estimate: it
     credits each shed segment with a lower bound of what shedding it saves
     and includes the decision's re-render allowance, so it can be larger
-    than ``request_wire_bytes`` over the ratio. A later call's
-    bytes-per-token ratio is ``request_wire_bytes`` over the call's reported
-    prompt tokens. (``request_byte_split`` on the call stays the content split.)
+    than ``request_wire_bytes`` over the persisted conservative or fallback
+    rate. ``request_byte_split`` on the call stays the content split.
     The shed decisions are by position
     (``shed_history_indices``, ``shed_hatch_event_indices``, ascending) or by
     tool-call id (``stubbed_tool_call_ids``, in request order).
@@ -231,7 +231,8 @@ class ComposerContextBudgetRecord:
     decision_wire_bytes: int = 0
     decision_wire_bytes_after: int = 0
     anchor_status: ContextBudgetAnchorStatus | None = None
-    authored_bytes: int = 0
+    authored_bytes: int | None = None
+    authored_refuted: bool | None = None
 
     def __post_init__(self) -> None:
         _require_non_empty_str(self.policy_hash, "policy_hash")
@@ -240,15 +241,18 @@ class ComposerContextBudgetRecord:
         _require_component_bytes(self.estimated_tokens_after, "estimated_tokens_after")
         _require_component_bytes(self.request_wire_bytes, "request_wire_bytes")
         for name, value in (
-            ("authored_bytes", self.authored_bytes),
             ("anchor_wire_bytes", self.anchor_wire_bytes),
             ("anchor_shared_bytes", self.anchor_shared_bytes),
             ("decision_wire_bytes", self.decision_wire_bytes),
             ("decision_wire_bytes_after", self.decision_wire_bytes_after),
         ):
             _require_component_bytes(value, name)
+        if self.authored_bytes is not None:
+            _require_component_bytes(self.authored_bytes, "authored_bytes")
         if self.pricing_mode is not None and self.pricing_mode not in {"anchored", "conservative", "authored_prefix"}:
             raise ValueError("invalid pricing_mode")
+        if self.authored_refuted is not None and type(self.authored_refuted) is not bool:
+            raise TypeError("authored_refuted must be bool or None")
         if self.anchor_status is not None:
             _require_non_empty_str(self.anchor_status, "anchor_status")
             if self.anchor_status not in get_args(ContextBudgetAnchorStatus):
@@ -332,6 +336,8 @@ class ComposerContextBudgetRecord:
                 anchor_status=self.anchor_status,
                 authored_bytes=self.authored_bytes,
             )
+        if self.authored_refuted is not None:
+            result["authored_refuted"] = self.authored_refuted
         return result
 
 

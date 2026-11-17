@@ -19,7 +19,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from elspeth.contracts.composer_llm_audit import ComposerContextBudgetRecord, ComposerLLMCall, ComposerLLMCallStatus
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json, stable_hash
+from elspeth.web.composer import service as composer_service
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.context_budget import CONTEXT_BUDGET_TOOL_RESULT_STUB
@@ -31,7 +33,7 @@ from elspeth.web.composer.context_budget_apply import (
     stubbed_tool_message,
     tool_result_segments,
 )
-from elspeth.web.composer.context_budget_history import ContextBudgetHistory
+from elspeth.web.composer.context_budget_history import ContextBudgetHistory, request_anchor
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
 from elspeth.web.composer.prompts import STATE_CONTEXT_PREFIX
 from elspeth.web.composer.protocol import (
@@ -1110,7 +1112,64 @@ async def test_a_result_stubbed_on_an_earlier_call_stays_stubbed_in_the_reply_st
 
 
 @pytest.mark.asyncio
-async def test_the_compose_loop_uses_a_safe_bound_despite_its_measured_ratio() -> None:
+async def test_compose_anchor_refutes_authored_pricing() -> None:
+    service, session_id = _service(_GENEROUS_TOKENS)
+    service._context_budget_policy = replace(service._context_budget_policy, fallback_bytes_per_token=3.0)
+    provider = _RecordingProvider(
+        _make_llm_response(
+            tool_calls=[{"id": "anchor-call", "name": "set_metadata", "arguments": {"patch": {"name": "anchor"}}}],
+            prompt_tokens=100_000,
+        ),
+        _make_llm_response(content="Done."),
+    )
+    result = await _compose(service, session_id, [], provider)
+    assert len(provider.requests) >= 2
+    budget = result.llm_calls[1].context_budget
+    assert budget is not None
+    assert budget.estimated_tokens_after >= 100_000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata", ["missing", "legacy", "oversize"])
+async def test_compose_anchor_authored_metadata_fails_closed(monkeypatch: pytest.MonkeyPatch, metadata: str) -> None:
+    def anchor_with_metadata(**kwargs: Any) -> Any:
+        calls = []
+        for call in kwargs["calls"]:
+            if call.context_budget is not None:
+                if metadata == "missing":
+                    call = replace(call, context_budget=None)
+                else:
+                    value = None if metadata == "legacy" else 1_000_000
+                    call = replace(call, context_budget=replace(call.context_budget, authored_bytes=value))
+            calls.append(call)
+        return request_anchor(**{**kwargs, "calls": calls})
+
+    monkeypatch.setattr(composer_service, "request_anchor", anchor_with_metadata)
+    service, session_id = _service(_GENEROUS_TOKENS)
+    service._context_budget_policy = replace(service._context_budget_policy, fallback_bytes_per_token=3.0)
+    provider = _RecordingProvider(
+        _make_llm_response(
+            tool_calls=[{"id": "anchor-call", "name": "set_metadata", "arguments": {"patch": {"name": "anchor"}}}],
+            prompt_tokens=100_000,
+        ),
+        _make_llm_response(content="Done."),
+    )
+    if metadata == "oversize":
+        with pytest.raises(AuditIntegrityError, match="Anchor authored bytes"):
+            await _compose(service, session_id, [], provider)
+        return
+    result = await _compose(service, session_id, [], provider)
+    assert len(provider.requests) >= 2
+    budget = result.llm_calls[1].context_budget
+    assert budget is not None
+    assert budget.estimated_tokens_after >= 100_000
+    assert budget.pricing_mode == "anchored"
+    assert budget.anchor_status == "authored_evidence_unavailable"
+    assert budget.authored_refuted is True
+
+
+@pytest.mark.asyncio
+async def test_the_compose_loop_records_its_conservative_estimate() -> None:
     model = "openrouter/openai/gpt-5.5"
     service, session_id = _service(_GENEROUS_TOKENS, composer_model=model)
     provider = _RecordingProvider(_make_llm_response(content="Done."))
