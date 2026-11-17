@@ -4,7 +4,7 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
-## Unreleased (0.8.15)
+## 0.8.15 - 2026-11-17
 
 ### Upgrade notes
 
