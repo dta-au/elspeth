@@ -114,6 +114,27 @@ def test_save_refuses_what_the_user_cannot_see_or_would_not_run(tmp_path, monkey
     assert client.get(f"/api/sessions/{session_id}/blobs/{blob['id']}/content").content == b"before\n"
 
 
+@pytest.mark.parametrize("body_extra", [{}, {"expected_sha256": None}])
+def test_save_without_expected_hash_is_refused_and_writes_nothing(tmp_path, monkeypatch, body_extra) -> None:
+    """No blind overwrite: the client must name the content it started editing."""
+    app, service, _ = _make_app(tmp_path)
+    client = SyncASGITestClient(app)
+    session_id = _create_session(client)
+    blob = _upload_blob(client, session_id, b"before\n", "prompt.txt", "text/plain")
+    _bound(client, session_id, blob["id"], blob["content_hash"], service)
+    calls = []
+    monkeypatch.setattr(routes, "record_prompt_file_approval", lambda conn, request, *, now: calls.append(request), raising=False)
+
+    response = client.put(
+        f"/api/sessions/{session_id}/blobs/{blob['id']}/prompt-text",
+        json={"content": "after\n", **body_extra},
+    )
+
+    assert response.status_code == 422, response.text
+    assert calls == []
+    assert client.get(f"/api/sessions/{session_id}/blobs/{blob['id']}/content").content == b"before\n"
+
+
 def test_utf8_sig_binding_saves(tmp_path, monkeypatch) -> None:
     app, service, _ = _make_app(tmp_path)
     client = SyncASGITestClient(app)

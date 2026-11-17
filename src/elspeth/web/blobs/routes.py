@@ -70,7 +70,7 @@ class SavePromptFileRequest(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
     content: str
-    expected_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    expected_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class SavePromptFileResponse(BaseModel):
@@ -214,7 +214,7 @@ def create_blobs_router() -> APIRouter:
                 old_bytes.decode("utf-8")
             except UnicodeDecodeError as exc:
                 raise _prompt_save_refusal(422, "prompt_file_not_text", "This file is not valid UTF-8 text; use a text file.") from exc
-            if body.expected_sha256 is not None and body.expected_sha256 != content_hash(old_bytes):
+            if body.expected_sha256 != content_hash(old_bytes):
                 raise _prompt_save_refusal(409, "prompt_file_stale", "This file changed since you opened it. Reload it and retry.")
             state = await session_service.get_current_state(session_id)
             bindings, mixed = prompt_bindings_for_blob(state, blob)
