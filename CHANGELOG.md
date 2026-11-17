@@ -64,6 +64,29 @@ Schema and stored data:
   low mark, so long sessions keep a stable prompt prefix. Composer LLM audit
   records gain optional anchor and pricing fields; records written by earlier
   versions still load.
+- `wire_blob_inline_ref` can bind a session file to a list entry by position,
+  such as `options.queries.0.template`. A numeric path segment always means a
+  list position. An option key that is not a plain name (for example `v1.2`
+  or `2024`) holding a file marker is refused as malformed rather than
+  misread as a nested path.
+- A prompt backed by a session file is validated when the file's content is
+  resolved, not refused at authoring time for not being literal text. Binary
+  files at such a prompt still fail with an internal error instead of a
+  repairable refusal; that is fixed later in this release.
+- Exporting a pipeline as YAML no longer fails with a 409 when an option is
+  backed by a session file.
+- Composer provider requests now scan text values up to 2 MiB for credential
+  material (was 256 KiB), so real file-backed prompts and a maximum-size YAML
+  import fit; larger values are still refused unscanned, never passed
+  through. The limit applies to each text value, not to a whole request.
+- The composer runtime preflight timeout
+  (`composer_runtime_preflight_timeout_seconds`) now defaults to 60 s (was
+  5 s), so preflight that reads and verifies real file-backed prompts can
+  finish.
+- Runtime YAML import, including the browser Import YAML dialog, accepts
+  documents up to 524,288 characters (was 262,144), so pipelines carrying real
+  file-backed prompts fit. This supersedes the 0.8.14 decision to leave the
+  limit unchanged (composer remediation checklist item 05.21).
 
 ### Release pipeline
 
