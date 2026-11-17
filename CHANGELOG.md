@@ -70,9 +70,7 @@ Schema and stored data:
   or `2024`) holding a file marker is refused as malformed rather than
   misread as a nested path.
 - A prompt backed by a session file is validated when the file's content is
-  resolved, not refused at authoring time for not being literal text. Binary
-  files at such a prompt still fail with an internal error instead of a
-  repairable refusal; that is fixed later in this release.
+  resolved, not refused at authoring time for not being literal text.
 - Exporting a pipeline as YAML no longer fails with a 409 when an option is
   backed by a session file.
 - Composer provider requests now scan text values up to 2 MiB for credential
@@ -98,6 +96,14 @@ Schema and stored data:
   edit now sends a few hundred bytes of tool arguments instead of the whole
   prompt. Editing text inside a session file is not yet supported. The
   composer now offers 45 tools by default (was 43).
+- A prompt that points at a session file now gets a clear, typed refusal
+  instead of an internal error or a silent change when the file is not
+  plain text (`inline_blob_not_text`) or the prompt is a structured prompt
+  (`prompt_template_parts_required`). This applies when the file is wired,
+  when the pipeline is validated, exported, approved or run (including the
+  tutorial run), and when pipeline YAML is imported. Each refusal says how to
+  fix it; switching a structured prompt to a file is not supported in this
+  release.
 
 ### Release pipeline
 
