@@ -31,7 +31,6 @@ from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.node_state_context import GateEvaluationContext
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.types import NodeID, StepResolver
-from elspeth.core.canonical import stable_hash
 from elspeth.core.config import GateSettings
 from elspeth.core.expression_parser import (
     ExpressionEvaluationError,
@@ -282,10 +281,9 @@ class GateExecutor:
         # Resolve step position from node_id (injected StepResolver)
         step = self._step_resolver(NodeID(node_id))
 
-        # Extract dict from PipelineRow for hashing and Landscape recording
+        # Extract dict from PipelineRow for Landscape recording
         # Landscape stores raw dicts, not PipelineRow objects
         input_dict = token.row_data.to_dict()
-        input_hash = stable_hash(input_dict)
 
         # Set ctx.contract for plugins that use fallback access (dual-name resolution)
         ctx.contract = token.row_data.contract
@@ -373,7 +371,7 @@ class GateExecutor:
                     action=action,
                     contract=token.row_data.contract,
                 )
-                result.input_hash = input_hash
+                result.input_hash = guard.state.input_hash
                 result.duration_ms = duration_ms
                 updated_token = token.with_updated_data(token.row_data)
                 return GateOutcome(
@@ -440,8 +438,8 @@ class GateExecutor:
                 action=action,
                 contract=token.row_data.contract,  # Preserve contract reference
             )
-            result.input_hash = input_hash
-            result.output_hash = input_hash  # Gates don't modify data — output equals input
+            result.input_hash = guard.state.input_hash
+            result.output_hash = guard.state.input_hash  # Gates don't modify data — output equals input
             result.duration_ms = duration_ms
 
             # Complete node state - always "completed" for successful execution
