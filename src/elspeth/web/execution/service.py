@@ -1276,15 +1276,18 @@ class ExecutionServiceImpl:
         for node in state.nodes:
             if node.plugin != "llm" or not prompt_file_binding_paths(node.options):
                 continue
-            snapshot = resolve_prompt_review_snapshot(
-                session_id=session_id,
-                node_id=node.id,
-                options=node.options,
-                read_blob=read_blob,
-            )
-            if snapshot is None:
-                raise PromptFileReviewStale()
-            self._call_async(self._session_service.assert_prompt_file_approvals(snapshot))
+            try:
+                snapshot = resolve_prompt_review_snapshot(
+                    session_id=session_id,
+                    node_id=node.id,
+                    options=node.options,
+                    read_blob=read_blob,
+                )
+                if snapshot is None:
+                    raise PromptFileReviewStale()
+                self._call_async(self._session_service.assert_prompt_file_approvals(snapshot))
+            except PromptFileReviewStale as exc:
+                raise PromptFileReviewStale(node_id=node.id) from exc
             snapshots.append(snapshot)
         return tuple(snapshots)
 

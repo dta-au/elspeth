@@ -762,7 +762,7 @@ may be user-created or agent-authored. Binding opens a mandatory
 that card before validation or Run admits it. A content change or re-point
 opens a fresh card and requires approval again. The session owner can edit a
 bound prompt file as plain text in the graph node inspector; saving it records
-approval for the saved bytes without a separate card. A multi-query template is wired at
+approval for the saved bytes without a separate card. An agent cannot change a bound prompt file's bytes (`update_blob` is refused, and in-file substring edits are unsupported); create a new text file and re-point it for a fresh review, or ask the user to edit it in the node inspector. A multi-query template is wired at
 `node:<node_id>.options.queries.<query_name>.template`, or for the list form at
 `node:<node_id>.options.queries.<index>.template` (the query's existing 0-based
 position). The blob must have an inline-text MIME type; a PDF or other binary

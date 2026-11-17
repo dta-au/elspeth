@@ -28,8 +28,9 @@ class PromptFileReviewStale(ValueError):
 
     error_code = "prompt_file_review_stale"
 
-    def __init__(self) -> None:
-        super().__init__(PROMPT_FILE_CHANGED_MESSAGE)
+    def __init__(self, *, node_id: str | None = None) -> None:
+        self.node_id = node_id
+        super().__init__(f"Node {node_id}: {PROMPT_FILE_CHANGED_MESSAGE}" if node_id is not None else PROMPT_FILE_CHANGED_MESSAGE)
 
 
 @dataclass(frozen=True, slots=True)
