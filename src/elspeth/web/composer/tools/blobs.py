@@ -1168,11 +1168,11 @@ def _structured_prompt_template_refusal(
     if parts is None or "prompt_template" not in patch:
         return None
     candidate = patch["prompt_template"]
-    if is_widened_blob_ref(candidate) is not None:
+    if is_widened_blob_ref(deep_thaw(candidate)) is not None:
         return (
             f"Node '{node_id}' has a structured prompt with interpretation slots. A file cannot replace a structured prompt yet. "
-            "Keep editing its text parts with change_substring or patch_node_options, or remove prompt_template_parts first "
-            "to use a plain file-backed prompt."
+            "Edit its text parts in place with change_substring or patch_node_options on prompt_template_parts, "
+            "preserving interpretation_ref entries. Switching a structured prompt to a file is not supported in this release."
         )
     if candidate != current_options.get("prompt_template") and PROMPT_TEMPLATE_PARTS_KEY not in patch:
         return (
@@ -1320,7 +1320,7 @@ _WIRE_BLOB_INLINE_REF_DECLARATION = ToolDeclaration(
         "Author a widened blob_ref inline_content marker at a canonical field_path. "
         "Composer pins sha256 from blob metadata; callers must not pass content bytes. "
         "Only inline-text MIME is accepted; upload or create a plain-text .txt or .md file for a prompt. "
-        "A structured prompt with prompt_template_parts cannot be replaced by a file; edit its parts or remove the structure first. "
+        "A structured prompt with prompt_template_parts cannot be replaced by a file in this release; edit its text parts with change_substring or patch_node_options on prompt_template_parts, preserving interpretation_ref entries. "
         "Returns the `field_path` that was wired."
     ),
     json_schema={

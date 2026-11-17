@@ -3932,6 +3932,11 @@ sinks:
     on_write_failure: discard
 """
 
+_STRUCTURED_LLM_YAML = _REBIND_LLM_YAML.replace(
+    "    model: anthropic/claude-haiku-4.5",
+    "    profile: task-role\n    prompt_template_parts:\n    - kind: text\n      text: PARTS WIN",
+)
+
 _BLOB_ROWS_YAML = """
 sources:
   source:
@@ -3981,6 +3986,72 @@ blob_env = _file_inject_tool_parity.blob_env
 
 
 class TestImportRebindsSharedFiles:
+    @pytest.mark.asyncio
+    async def test_import_refuses_pasted_marker_under_structured_prompt(self, tmp_path: Path) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        marker_yaml = _STRUCTURED_LLM_YAML.replace(
+            "    prompt_template_parts:",
+            f"    prompt_template:\n      blob_ref: {uuid.uuid4()}\n      mode: inline_content\n      sha256: {'a' * 64}\n    prompt_template_parts:",
+        )
+
+        resp = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": marker_yaml})
+
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"]["error_code"] == "prompt_template_parts_required"
+        assert "preserving interpretation_ref entries" in resp.json()["detail"]["message"]
+        assert await service.get_current_state(session.id) is None
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        unstructured_yaml = marker_yaml.replace("    prompt_template_parts:\n    - kind: text\n      text: PARTS WIN\n", "")
+        unstructured = composition_state_from_runtime_yaml(unstructured_yaml)
+        assert unstructured.nodes[0].options["prompt_template"]["mode"] == "inline_content"
+
+    def test_legacy_structured_marker_refused_before_execution_materialization(self) -> None:
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+        from elspeth.web.interpretation_state import InterpretationReviewIntegrityError, materialize_state_for_execution
+
+        state = composition_state_from_runtime_yaml(_STRUCTURED_LLM_YAML)
+        node = state.nodes[0]
+        old_node = replace(
+            node,
+            options={
+                **node.options,
+                "prompt_template": {"blob_ref": str(uuid.uuid4()), "mode": "inline_content", "sha256": "a" * 64},
+            },
+        )
+        with pytest.raises(InterpretationReviewIntegrityError) as exc_info:
+            materialize_state_for_execution(replace(state, nodes=(old_node,)))
+        assert exc_info.value.error_code == "prompt_template_parts_required"
+        assert "preserving interpretation_ref entries" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "mime_type, expected_code", [("text/plain", "prompt_template_parts_required"), ("application/pdf", "inline_blob_not_text")]
+    )
+    async def test_import_refuses_structured_prompt_rebind(self, tmp_path: Path, mime_type: str, expected_code: str) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        blob = replace(
+            _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A),
+            mime_type=mime_type,
+        )
+        app.state.blob_service = _blob_service_for(blob)
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={
+                "yaml": _STRUCTURED_LLM_YAML,
+                "inline_blob_bindings": {"node:score.options.prompt_template": {"blob_id": str(blob.id)}},
+            },
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"]["error_code"] == expected_code
+        assert await service.get_current_state(session.id) is None
+
     @pytest.mark.asyncio
     async def test_import_rebinds_inline_marker_at_field_path(self, tmp_path: Path) -> None:
         app, service = _make_app(tmp_path)

@@ -517,7 +517,7 @@ Wire a ready blob into a plugin option as audited inline content.
 | `encoding` | string | No | One of `utf-8`, `utf-8-sig`, `utf-16`, or `latin-1`; defaults to `utf-8` |
 
 **When to use:** When a long-form config field, such as an LLM prompt template or SQL query, should be supplied from a blob without exposing the bytes to the composer LLM. The tool pins `sha256` from blob metadata. Wiring does not read the file: its text is checked when the pipeline is validated or run.
-Binary MIME is refused. A structured prompt with `prompt_template_parts` has interpretation slots and cannot be replaced by a file yet; edit a text part with `change_substring` or `patch_node_options`, or remove the structure first.
+Binary MIME is refused. A structured prompt with `prompt_template_parts` has interpretation slots. Edit its text parts in place with `change_substring` or `patch_node_options` on `prompt_template_parts`, preserving `interpretation_ref` entries. Switching a structured prompt to a file is not supported in this release.
 
 ---
 

@@ -30,6 +30,7 @@ from elspeth.web.composer.tools import _options_with_default_llm_reviews
 # Share explicit failure-choice validation with Composer authoring tools;
 # importing YAML must not manufacture a policy the author did not choose.
 from elspeth.web.composer.tools._common import FailureRouteChoiceError, resolve_failure_route_choice
+from elspeth.web.composer.tools.blobs import _structured_prompt_template_refusal
 
 MAX_RUNTIME_YAML_IMPORT_CHARS = 524_288
 _UNSUPPORTED_COALESCE_FIELDS = frozenset(
@@ -190,6 +191,10 @@ def _reject_unimportable_sections(doc: Mapping[Any, object]) -> None:
 
 class RuntimeYamlImportError(ValueError):
     """Raised when runtime YAML cannot be represented as composer state."""
+
+    def __init__(self, message: str, *, error_code: str | None = None) -> None:
+        super().__init__(message)
+        self.error_code = error_code
 
 
 class _DuplicateYamlKeyError(yaml.YAMLError):
@@ -1053,6 +1058,13 @@ def composition_state_from_runtime_yaml(pipeline_yaml: str, *, version: int = 1)
         # so an imported queue survives as a first-class node (elspeth-a5b86149d4).
         *_queues_from_runtime_mapping(doc.get("queues")),
     ]
+    for node in nodes:
+        if node.plugin == "llm" and "prompt_template" in node.options:
+            structured_error = _structured_prompt_template_refusal(
+                node.id, node.options, {"prompt_template": node.options["prompt_template"]}
+            )
+            if structured_error is not None:
+                raise RuntimeYamlImportError(structured_error, error_code="prompt_template_parts_required")
     # Imported states must honour the same stage-then-surface review contract
     # as every composer tool mutation (elspeth-ae5160c3cb): an LLM node whose
     # prompt_template/model carries no pending requirement is fail-closed at
