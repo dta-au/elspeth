@@ -97,6 +97,21 @@ class TestWidenedBlobRefRecognition:
 
 
 class TestValueObjectValidation:
+    @pytest.mark.parametrize("position", ["0", "1", "12"])
+    def test_blob_inline_ref_accepts_canonical_list_positions(self, position: str) -> None:
+        path = f"node:classify.options.queries.{position}.template"
+        assert BlobInlineRef(field_path=path, blob_id=UUID(VALID_BLOB_ID), sha256=VALID_HASH, encoding="utf-8").field_path == path
+
+    @pytest.mark.parametrize("position", ["-1", "00", "01", "\u0661"])
+    def test_blob_inline_ref_rejects_non_canonical_list_positions(self, position: str) -> None:
+        with pytest.raises(ValueError, match="field_path"):
+            BlobInlineRef(
+                field_path=f"node:classify.options.queries.{position}.template",
+                blob_id=UUID(VALID_BLOB_ID),
+                sha256=VALID_HASH,
+                encoding="utf-8",
+            )
+
     def test_blob_inline_ref_accepts_canonical_field_paths(self) -> None:
         for path in (
             "source.options.system_prompt",

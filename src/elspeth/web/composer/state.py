@@ -113,7 +113,9 @@ from elspeth.plugins.transforms.llm.multi_query import (
 )
 from elspeth.web.composer._validation_probe import (
     DeferredBlobContractProbe,
+    is_deferred_blob_error,
     is_inline_content_reference,
+    prepare_query_definition_probe,
     prepare_validation_probe_options,
 )
 from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
@@ -2242,9 +2244,7 @@ class ValidationProbeCache:
                             cause = config_error if isinstance(config_error, PydanticValidationError) else config_error.__cause__
                             if isinstance(cause, PydanticValidationError):
                                 details = cause.errors(include_url=False, include_context=False)
-                                if details and all(
-                                    detail["type"] == "string_type" and is_inline_content_reference(detail["input"]) for detail in details
-                                ):
+                                if details and all(is_deferred_blob_error(detail, details) for detail in details):
                                     raise DeferredBlobContractProbe from exc
                     raise
         except Exception as exc:
@@ -4399,7 +4399,7 @@ def _validate_multi_query_required_input_columns(node: NodeSpec) -> tuple[Valida
         try:
             definitions: dict[str, QueryDefinition] | list[QueryDefinition] = TypeAdapter(
                 dict[str, QueryDefinition] | list[QueryDefinition]
-            ).validate_python(LLMConfig._inject_mapping_query_names(deep_thaw(queries)))
+            ).validate_python(LLMConfig._inject_mapping_query_names(prepare_query_definition_probe(queries)))
             specs = resolve_queries(definitions, allow_empty_inputs=True)
             response_field = TypeAdapter(str).validate_python(node.options.get("response_field", "llm_response"))
             plan = compile_ordered_query_plan(tuple(specs), response_field)
@@ -4482,7 +4482,7 @@ def _validate_multi_query_generated_input_requirements(node: NodeSpec) -> tuple[
     try:
         definitions: dict[str, QueryDefinition] | list[QueryDefinition] = TypeAdapter(
             dict[str, QueryDefinition] | list[QueryDefinition]
-        ).validate_python(LLMConfig._inject_mapping_query_names(deep_thaw(queries)))
+        ).validate_python(LLMConfig._inject_mapping_query_names(prepare_query_definition_probe(queries)))
         mode = TypeAdapter(QueryInputMode).validate_python(node.options.get("query_input_mode", "upstream"))
         specs = resolve_queries(definitions, allow_empty_inputs=mode == QueryInputMode.ORDERED)
         required_names: list[str] | None = TypeAdapter(list[str] | None).validate_python(
@@ -4499,10 +4499,18 @@ def _validate_multi_query_generated_input_requirements(node: NodeSpec) -> tuple[
         response_field = TypeAdapter(str).validate_python(node.options.get("response_field", "llm_response"))
         if any(spec.structured_output_prefix is not None for spec in specs):
             unique_query_generated_fields(tuple(specs), response_field)
-        node_template: str | None = TypeAdapter(str | None).validate_python(node.options.get("prompt_template"))
+        authored_template = deep_thaw(node.options.get("prompt_template"))
+        node_template: str | None = (
+            None if is_inline_content_reference(authored_template) else TypeAdapter(str | None).validate_python(authored_template)
+        )
         # Every query without an override renders the one node-level template;
         # analyse each distinct effective template once, not once per query.
-        effective_templates = {spec.template if spec.template is not None else node_template for spec in specs}
+        deferred_overrides = {
+            name for name, entry in _well_formed_query_entries(queries) if is_inline_content_reference(deep_thaw(entry.get("template")))
+        }
+        effective_templates = {
+            spec.template if spec.template is not None else node_template for spec in specs if spec.name not in deferred_overrides
+        }
         for template in effective_templates:
             if template is not None:
                 required.update(multi_query_source_row_columns(INTERPRETATION_PLACEHOLDER_RE.sub(" ", template)))

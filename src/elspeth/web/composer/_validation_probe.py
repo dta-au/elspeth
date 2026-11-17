@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, cast
 
+from pydantic_core import ErrorDetails
+
 from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.llm_profiles import LLM_PROFILE_PRIVATE_FIELDS
@@ -19,6 +21,48 @@ def is_inline_content_reference(value: object) -> bool:
     """Recognize an unresolved value only when it is a valid inline marker."""
     marker = is_widened_blob_ref(value)
     return marker is not None and marker.mode == "inline_content"
+
+
+def is_deferred_blob_error(error: ErrorDetails, errors: list[ErrorDetails]) -> bool:
+    """Defer string markers, retaining errors on their siblings and containers.
+
+    Pydantic reports both branches of the queries list-or-mapping union. The
+    wrong container branch is irrelevant only when the selected branch contains
+    a valid deferred template. Its other errors must still be reported.
+    """
+    if error["type"] == "string_type" and is_inline_content_reference(error["input"]):
+        return True
+    location = error["loc"]
+    if location == ("queries", "dict[str,QueryDefinition]") and error["type"] == "dict_type" and type(error["input"]) is list:
+        selected = "list[QueryDefinition]"
+    elif location == ("queries", "list[QueryDefinition]") and error["type"] == "list_type" and type(error["input"]) is dict:
+        selected = "dict[str,QueryDefinition]"
+    else:
+        return False
+    return any(
+        detail["loc"][:2] == ("queries", selected) and detail["type"] == "string_type" and is_inline_content_reference(detail["input"])
+        for detail in errors
+    )
+
+
+def prepare_query_definition_probe(queries: object) -> object:
+    """Detach query declarations and defer only valid file-backed templates.
+
+    Input/output declarations remain available for contract checks. Prompt
+    text is checked after authorized materialization; this projection never
+    supplies replacement text or changes the saved authoring values.
+    """
+    prepared = deep_thaw(queries)
+    if isinstance(prepared, dict):
+        entries = list(prepared.values())
+    elif isinstance(prepared, list):
+        entries = prepared
+    else:
+        return prepared
+    for entry in entries:
+        if isinstance(entry, dict) and is_inline_content_reference(entry.get("template")):
+            del entry["template"]
+    return prepared
 
 
 def prepare_validation_probe_options(options: Mapping[str, Any], *, plugin: str | None) -> dict[str, Any]:

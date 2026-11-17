@@ -351,7 +351,9 @@ class BatchTransformMixin(BatchTransformRuntime):
         if not self._batch_buffer.complete(ticket, (token, result, state_id)):
             from elspeth.contracts import ExceptionResult
 
-            if isinstance(result, ExceptionResult):
+            # Losing an already-evicted attempt's item lease is expected;
+            # it must not poison later rows. Other late failures remain fatal.
+            if isinstance(result, ExceptionResult) and not isinstance(result.exception, contract_errors.SchedulerLeaseLostError):
                 raise result.exception
             _logger.debug(
                 "late_result_discarded",

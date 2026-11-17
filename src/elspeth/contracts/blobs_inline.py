@@ -36,7 +36,7 @@ _SHA256_HEX_PATTERN: Final = re.compile(r"^[0-9a-f]{64}$")
 _UUID_PATTERN: Final = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _FIELD_PATH_PATTERN: Final = re.compile(
     r"^(?:source(?::[^.\[\]]+)?|node:[^.\[\]]+|output:[^.\[\]]+)"
-    r"\.options(?:\.[A-Za-z_][A-Za-z0-9_-]*)+$"
+    r"\.options\.[A-Za-z_][A-Za-z0-9_-]*(?:\.(?:[A-Za-z_][A-Za-z0-9_-]*|0|[1-9][0-9]*))*$"
 )
 _ALLOWED_MARKER_KEYS: Final = frozenset({"blob_ref", "mode", "path", "sha256", "encoding"})
 

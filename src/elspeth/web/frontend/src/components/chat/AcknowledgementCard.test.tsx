@@ -638,6 +638,42 @@ describe("AcknowledgementCard — error mapping", () => {
 // Approve button that stays disabled until the prompt has been viewed.
 
 describe("AcknowledgementCard — prompt-template View/Approve controls", () => {
+  it("unlocks approval after viewing all query templates when no shared template exists", async () => {
+    const user = userEvent.setup();
+    const event = makeEvent({ kind: "llm_prompt_template", llm_draft: "Shortened preview" });
+    const queries = Array.from({ length: 6 }, (_, index) => ({
+      name: `query_${index}`,
+      template: `Instruction ${index}: ${"detail ".repeat(250)}end ${index}.`,
+    }));
+    renderCard(event, {
+      compositionState: {
+        ...makeCompositionState(),
+        nodes: [{
+          id: "node-1", node_type: "transform", plugin: "llm", input: "rows",
+          on_success: null, on_error: null,
+          options: { system_prompt: "Shared system instruction.", queries },
+        }],
+      },
+    });
+    const approve = screen.getByRole("button", { name: /approve the llm prompt template/i });
+    expect(approve).toHaveAttribute("aria-disabled", "true");
+    await user.click(approve);
+    expect(api.resolveInterpretation).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    const text = screen.getByRole("region", { name: /prompt template review/i })
+      .querySelector("pre.ack-card-prompt-pre")?.textContent ?? "";
+    expect(text.length).toBeGreaterThan(8000);
+    expect(text).toContain("System prompt (sent with every query):\nShared system instruction.");
+    for (const query of queries) {
+      expect(text).toContain(`Query '${query.name}':\n${query.template}\n`);
+    }
+    expect(approve).not.toHaveAttribute("aria-disabled");
+    expect(api.resolveInterpretation).not.toHaveBeenCalled();
+    vi.mocked(api.resolveInterpretation).mockResolvedValue(makeResolveResponse(event));
+    await user.click(approve);
+    expect(api.resolveInterpretation).toHaveBeenCalledTimes(1);
+  });
+
   it("does not approve a bounded draft while full prompt state is unavailable", async () => {
     const user = userEvent.setup();
     renderCard(makeEvent({ kind: "llm_prompt_template", llm_draft: "Shortened preview" }), {

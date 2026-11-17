@@ -1074,6 +1074,34 @@ def test_set_nested_option_refuses_occupied_leaf_when_not_replacing() -> None:
     assert _set_nested_option({}, ["a", "b"], "marker", replace_existing=False) == {"a": {"b": "marker"}}
 
 
+def test_set_nested_option_binds_existing_list_query_without_changing_order() -> None:
+    from elspeth.web.composer.tools.blobs import _set_nested_option
+
+    options = {"queries": [{"name": "first", "template": "Original"}, {"name": "second", "template": "Other"}]}
+    marker = {"blob_ref": "user-file"}
+    updated = _set_nested_option(options, ["queries", "0", "template"], marker)
+    assert updated == {"queries": [{"name": "first", "template": marker}, {"name": "second", "template": "Other"}]}
+
+
+@pytest.mark.parametrize("position", ["-1", "00", "2", "two", "\u0661"])
+def test_set_nested_option_rejects_invalid_list_positions(position: str) -> None:
+    from elspeth.web.composer.tools.blobs import _set_nested_option
+
+    options = {"queries": [{"template": "Original"}]}
+    with pytest.raises(ValueError):
+        _set_nested_option(options, ["queries", position, "template"], "Replacement")
+    assert options == {"queries": [{"template": "Original"}]}
+
+
+def test_set_nested_option_does_not_overwrite_occupied_list_template_when_rebinding() -> None:
+    from elspeth.web.composer.tools.blobs import _set_nested_option
+
+    options = {"queries": [{"template": "Original"}]}
+    with pytest.raises(ValueError, match="already holds a value"):
+        _set_nested_option(options, ["queries", "0", "template"], "Replacement", replace_existing=False)
+    assert options == {"queries": [{"template": "Original"}]}
+
+
 def test_set_nested_option_rejects_empty_field_path() -> None:
     from elspeth.web.composer.tools.blobs import _set_nested_option
 

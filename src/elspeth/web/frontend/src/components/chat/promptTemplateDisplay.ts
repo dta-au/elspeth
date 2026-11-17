@@ -133,7 +133,7 @@ interface SurfaceQuery {
 }
 
 interface MultiQuerySurface {
-  nodePromptTemplate: string;
+  nodePromptTemplate: string | null;
   systemPrompt: string | null;
   queries: SurfaceQuery[];
 }
@@ -177,9 +177,9 @@ function wellFormedQueryEntries(
 
 /**
  * The multi-query prompt surface, mirroring interpretation_state.py
- * `multi_query_prompt_surface_from_options`: null unless a string
- * `prompt_template` sits beside a `queries` value with at least one
- * well-formed entry (every other shape is a single-prompt node there too).
+ * `multi_query_prompt_surface_from_options`: queries with their own templates
+ * do not require a shared `prompt_template`. Malformed shared templates stay
+ * unavailable rather than being presented as reviewable text.
  */
 function multiQuerySurfaceFromOptions(
   options: Record<string, unknown>,
@@ -189,7 +189,9 @@ function multiQuerySurfaceFromOptions(
   if (
     rawQueries === undefined ||
     rawQueries === null ||
-    typeof promptTemplate !== "string"
+    (promptTemplate !== undefined &&
+      promptTemplate !== null &&
+      typeof promptTemplate !== "string")
   ) {
     return null;
   }
@@ -207,7 +209,7 @@ function multiQuerySurfaceFromOptions(
   });
   const systemPrompt = options.system_prompt;
   return {
-    nodePromptTemplate: promptTemplate,
+    nodePromptTemplate: promptTemplate ?? null,
     systemPrompt: typeof systemPrompt === "string" ? systemPrompt : null,
     queries,
   };
@@ -267,6 +269,17 @@ function segmentsFromSurface(
     lines.push(
       "Node-level prompt_template: not used (every query supplies its own template).",
     );
+  }
+
+  if (surface.nodePromptTemplate === null) {
+    if (users.length > 0) {
+      lines.push("(not set; queries without their own template cannot run)");
+    }
+    return {
+      segments: [{ kind: "text", text: lines.join("\n") }],
+      usedFallback: false,
+      reviewAvailable: users.length === 0,
+    };
   }
 
   const requirements = parseRequirements(options.interpretation_requirements);

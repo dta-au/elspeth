@@ -533,7 +533,11 @@ async def _litellm_acompletion(
             credential_messages.append(message)
     if prepared_advisor_content is not None:
         credential_messages = scan_prepared_advisor_content(credential_messages, prepared_advisor_content, role=prompt_guard_role)
-    require_no_credential_material(credential_messages, surface="composer_provider_request")
+    require_no_credential_material(
+        credential_messages,
+        surface="composer_provider_request",
+        max_string_bytes=500 * 1024,
+    )
     await enforce_prompt_guard(
         mount=prompt_guard_mount,
         mode=prompt_guard_mode,

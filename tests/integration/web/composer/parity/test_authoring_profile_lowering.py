@@ -103,6 +103,30 @@ def test_upsert_node_admits_profiled_multi_query_llm(parity_env: Any) -> None:
     assert "max_capacity_retry_seconds" not in node.options
 
 
+@pytest.mark.parametrize("slot", ["system_prompt", "prompt_template", "query_template"])
+def test_profiled_authoring_admits_pinned_file_prompts(parity_env: Any, slot: str) -> None:
+    options = _profiled_multi_query_options()
+    marker = {"blob_ref": "5b7a4e0e-9e4a-4f0b-8d3e-2c0e1f0d3a4b", "mode": "inline_content", "sha256": "a" * 64}
+    if slot == "query_template":
+        options.pop("prompt_template")
+        options["queries"] = [
+            {"name": "blue", "input_fields": {"color_name": "color_name"}, "template": marker},
+            {"name": "review", "input_fields": {"color_name": "color_name"}, "template": "Review {{ row.color_name }}"},
+        ]
+    else:
+        options[slot] = marker
+    result = _run(parity_env, "upsert_node", _profiled_node(options), _empty_state())
+    assert result.success is True, result.data
+    node = result.updated_state.nodes[0]
+    assert node.options["profile"] == "task-role"
+    if slot == "query_template":
+        assert [q["name"] for q in node.options["queries"]] == ["blue", "review"]
+        assert dict(node.options["queries"][0]["template"]) == marker
+        assert "prompt_template" not in node.options
+    else:
+        assert dict(node.options[slot]) == marker
+
+
 @pytest.mark.parametrize("prefix", ["", "published"])
 def test_profiled_authoring_preserves_explicit_structured_publication_names(parity_env: Any, prefix: str) -> None:
     options = _profiled_multi_query_options()

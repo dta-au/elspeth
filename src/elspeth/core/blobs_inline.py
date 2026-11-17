@@ -478,13 +478,32 @@ def _output_options(config: dict[str, Any], output_name: str) -> dict[str, Any]:
 
 
 def _assign_nested_option(container: dict[str, Any], keys: list[str], value: str) -> None:
-    current = container
+    current: object = container
     for key in keys[:-1]:
-        child = current[key]
-        if type(child) is not dict:
-            raise TypeError(f"Inline blob path segment {key!r} must point to a mapping")
-        current = cast(dict[str, Any], child)
-    current[keys[-1]] = value
+        if type(current) is dict:
+            current = cast(dict[str, Any], current)[key]
+        elif type(current) is list:
+            entries = cast(list[object], current)
+            current = entries[_inline_list_index(key, len(entries))]
+        else:
+            raise TypeError(f"Inline blob path segment {key!r} must point to a mapping or list")
+    if type(current) is dict:
+        cast(dict[str, Any], current)[keys[-1]] = value
+    elif type(current) is list:
+        entries = cast(list[object], current)
+        entries[_inline_list_index(keys[-1], len(entries))] = value
+    else:
+        raise TypeError("Inline blob path leaf must belong to a mapping or list")
+
+
+def _inline_list_index(segment: str, length: int) -> int:
+    """Accept only an existing, canonical non-negative list position."""
+    if not segment.isascii() or not segment.isdecimal():
+        raise ValueError("Inline blob list position must be a non-negative integer")
+    index = int(segment)
+    if str(index) != segment or index >= length:
+        raise ValueError("Inline blob list position must name an existing item")
+    return index
 
 
 def _walk_source(
@@ -503,7 +522,7 @@ def _walk_source(
     options = source_dict["options"]
     if type(options) is not dict:
         return
-    _walk_options(cast(dict[str, object], options), "source.options", refs, malformed)
+    _walk_options(cast(dict[str, object], options), "source.options", refs, malformed, source_options=True)
 
 
 def _walk_sources(
@@ -525,7 +544,7 @@ def _walk_sources(
         options = source_dict["options"]
         if type(options) is not dict:
             continue
-        _walk_options(cast(dict[str, object], options), f"source:{source_name}.options", refs, malformed)
+        _walk_options(cast(dict[str, object], options), f"source:{source_name}.options", refs, malformed, source_options=True)
 
 
 def _walk_nodes(
@@ -580,10 +599,12 @@ def _walk_options(
     field_path: str,
     refs: list[BlobInlineRef],
     malformed: list[tuple[str, str]],
+    *,
+    source_options: bool = False,
 ) -> None:
     if type(value) is dict:
         mapping = cast(dict[object, object], value)
-        if _is_source_options_path(field_path) and _is_source_options_bind_source(mapping):
+        if source_options and _is_source_options_bind_source(mapping):
             for key, child in mapping.items():
                 if type(key) is str:
                     _walk_options(child, f"{field_path}.{key}", refs, malformed)
@@ -597,25 +618,8 @@ def _walk_options(
         return
 
     if type(value) is list:
-        for child in cast(list[object], value):
-            if _contains_blob_ref_marker(child):
-                malformed.append((field_path, "inline blob refs inside lists are not supported"))
-                return
-
-
-def _contains_blob_ref_marker(value: object) -> bool:
-    if type(value) is dict:
-        mapping = cast(dict[object, object], value)
-        if "blob_ref" in mapping:
-            return True
-        return any(_contains_blob_ref_marker(child) for child in mapping.values())
-    if type(value) is list:
-        return any(_contains_blob_ref_marker(child) for child in cast(list[object], value))
-    return False
-
-
-def _is_source_options_path(field_path: str) -> bool:
-    return field_path == "source.options" or (field_path.startswith("source:") and field_path.endswith(".options"))
+        for index, child in enumerate(cast(list[object], value)):
+            _walk_options(child, f"{field_path}.{index}", refs, malformed)
 
 
 def _collect_or_reject_marker(
@@ -639,7 +643,10 @@ def _is_source_options_bind_source(mapping: dict[object, object]) -> bool:
     mode = mapping["mode"]
     if mode != "bind_source":
         return False
-    if "sha256" in mapping or "encoding" in mapping:
+    # This is the root source plugin configuration, not a standalone marker.
+    # Its encoding (for example CSV's utf-8-sig) belongs to the source plugin.
+    # Nested bind_source markers still use the strict marker recognizer.
+    if "sha256" in mapping:
         return False
     return "path" not in mapping or type(mapping["path"]) is str
 

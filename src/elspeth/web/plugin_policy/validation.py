@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 
 from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError as SchemaValidationError
+from jsonschema.validators import extend
 
 from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities, S3ProfiledAuditIdentity
 from elspeth.contracts.aws_textract import TextractProfiledAuditIdentities, TextractProfiledAuditIdentity
+from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.plugin_capabilities import ControlMode, WebConfigAuthority
 from elspeth.contracts.trust_boundary import observation_boundary
@@ -52,6 +55,30 @@ PolicyValidationStage = Literal[
 ]
 
 _PROFILE_LOWERING_METADATA_OPTION_KEYS = AUTHORING_METADATA_OPTION_KEYS | {"approved_prompt_artifact_hash"}
+
+
+def _validate_profile_option_type(
+    validator: Draft202012Validator,
+    expected: str | list[str],
+    instance: object,
+    schema: object,
+) -> Iterator[SchemaValidationError]:
+    """A pinned inline file provisions a string without revealing its content.
+
+    Only type checking is deferred. Enums, unknown properties and all sibling
+    constraints still use the public schema; materialized bytes must later pass
+    the complete plugin config validation before execution.
+    """
+    marker = is_widened_blob_ref(instance)
+    expects_string = expected == "string" or (type(expected) is list and "string" in expected)
+    if expects_string and marker is not None and marker.mode == "inline_content":
+        return
+    yield from Draft202012Validator.VALIDATORS["type"](validator, expected, instance, schema)
+
+
+_ProfileOptionsValidator = cast(Callable[..., type[Draft202012Validator]], extend)(
+    Draft202012Validator, {"type": _validate_profile_option_type}
+)
 
 # Profiled plugins whose operator binding is a STORAGE location rather than an
 # LLM-family provider/model/credential set — their rejection prose must speak
@@ -528,7 +555,7 @@ def _lower_profiled_components(
         public_schema = resolved_public_schema.json_schema
         public_options = {"profile": alias, **authored_options}
         schema_errors = sorted(
-            Draft202012Validator(public_schema).iter_errors(public_options),
+            _ProfileOptionsValidator(public_schema).iter_errors(public_options),
             key=lambda error: tuple(str(part) for part in error.absolute_path),
         )
         if schema_errors:

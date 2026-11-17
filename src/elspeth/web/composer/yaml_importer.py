@@ -31,7 +31,7 @@ from elspeth.web.composer.tools import _options_with_default_llm_reviews
 # importing YAML must not manufacture a policy the author did not choose.
 from elspeth.web.composer.tools._common import FailureRouteChoiceError, resolve_failure_route_choice
 
-MAX_RUNTIME_YAML_IMPORT_CHARS = 262_144
+MAX_RUNTIME_YAML_IMPORT_CHARS = 524_288
 _UNSUPPORTED_COALESCE_FIELDS = frozenset(
     {
         "union_collision_policy",

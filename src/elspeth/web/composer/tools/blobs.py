@@ -726,6 +726,20 @@ def _set_nested_option(
     head = keys[0]
     if head in container:
         child = container[head]
+        if type(child) is list:
+            from elspeth.core.blobs_inline import _inline_list_index
+
+            position = _inline_list_index(keys[1], len(child))
+            if len(keys) == 2:
+                if not replace_existing:
+                    raise ValueError(f"field_path leaf {keys[1]!r} already holds a value")
+                child[position] = value
+            else:
+                entry = child[position]
+                if not isinstance(entry, Mapping):
+                    raise ValueError(f"field_path segment {keys[1]!r} already exists and is not an object")
+                child[position] = _set_nested_option(dict(deep_thaw(entry)), keys[2:], value, replace_existing=replace_existing)
+            return container
         if not isinstance(child, Mapping):
             raise ValueError(f"field_path segment {head!r} already exists and is not an object")
         nested = dict(deep_thaw(child))
@@ -942,6 +956,8 @@ def _inline_content_marker_blob_ids(value: object, option_path: str) -> list[tup
     shape = is_widened_blob_ref(value)
     if shape is not None:
         return [(option_path, shape.blob_id)] if shape.mode == "inline_content" else []
+    if type(value) is list:
+        return [marker for index, child in enumerate(value) for marker in _inline_content_marker_blob_ids(child, f"{option_path}.{index}")]
     if type(value) is not dict:
         return []
     found: list[tuple[str, UUID]] = []

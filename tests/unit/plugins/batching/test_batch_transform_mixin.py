@@ -18,7 +18,7 @@ import pytest
 
 from elspeth.contracts import Determinism, TransformResult
 from elspeth.contracts.contexts import TransformContext
-from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError, SchedulerLeaseLostError
 from elspeth.contracts.identity import TokenInfo
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema_contract import PipelineRow
@@ -386,6 +386,44 @@ class BlockingBatchTransform(BaseTransform, BatchTransformMixin):
 
 
 class TestBatchTransformMixinEviction:
+    def test_late_evicted_lease_loss_does_not_poison_next_row(self) -> None:
+        adapter = SharedBatchAdapter()
+        transform = SimpleBatchTransform()
+        transform.connect_output(adapter, max_pending=1)
+        entered = threading.Event()
+        release = threading.Event()
+        failure = SchedulerLeaseLostError(work_item_id="first-work", lease_owner="worker", run_id="run")
+
+        def lose_lease_after_eviction(row: PipelineRow, ctx: TransformContext) -> TransformResult:
+            entered.set()
+            assert release.wait(timeout=5)
+            raise failure
+
+        first = make_token("evicted-row")
+        first_ctx = make_context(landscape=_make_factory(), token=first, state_id="evicted-state")
+        waiter = adapter.register(first.token_id, "evicted-state")
+        try:
+            transform.accept_row(make_pipeline_row({}), first_ctx, lose_lease_after_eviction)
+            assert entered.wait(timeout=5)
+            with pytest.raises(TimeoutError):
+                waiter.wait(timeout=0)
+            assert transform.evict_submission(first.token_id, "evicted-state")
+            release.set()
+            # A single worker makes this a barrier after the first Future's
+            # completion callback, without relying on a sleep or polling race.
+            transform._batch_executor.submit(lambda: None).result(timeout=5)
+
+            second = make_token("next-row")
+            second_ctx = make_context(landscape=_make_factory(), token=second, state_id="next-state")
+            next_waiter = adapter.register(second.token_id, "next-state")
+            transform.accept({"data": "next"}, second_ctx)
+            result = next_waiter.wait(timeout=5)
+            assert result.row is not None
+            assert result.row["processed"] is True
+        finally:
+            release.set()
+            transform.close()
+
     def test_evicted_worker_integrity_failure_reaches_shutdown(self) -> None:
         transform = SimpleBatchTransform()
         transform.connect_output(CollectorOutputPort())

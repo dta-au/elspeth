@@ -1242,7 +1242,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:498b84f2c8939775"
+    source_file_hash: str | None = "sha256:72ef5962166a786b"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1814,7 +1814,8 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             output=output,
             name=self.name,
             max_workers=max_pending,
-            batch_wait_timeout=float(self._max_capacity_retry_seconds),
+            # Capacity retry limits do not bound ordinary multi-query work.
+            batch_wait_timeout=max(3600.0, float(self._max_capacity_retry_seconds)),
         )
         self._batch_initialized = True
 

@@ -413,7 +413,7 @@ class WebSettings(BaseModel):
             self.composer_transport_idle_ceiling_seconds - self.composer_transport_headroom_seconds,
         )
 
-    composer_runtime_preflight_timeout_seconds: float = Field(default=5.0, gt=0)
+    composer_runtime_preflight_timeout_seconds: float = Field(default=60.0, gt=0)
     composer_rate_limit_per_minute: int = Field(..., ge=1)
     audit_readiness_rate_limit_per_minute: int = Field(
         default=60,

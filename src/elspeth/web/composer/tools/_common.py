@@ -67,7 +67,7 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService, PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer._producer_resolver import published_success_connection
-from elspeth.web.composer._validation_probe import is_inline_content_reference
+from elspeth.web.composer._validation_probe import is_deferred_blob_error, is_inline_content_reference
 from elspeth.web.composer.plugin_policy_disclosure import (
     WEB_PROHIBITED_PLUGIN_EXPLANATION,
     ProhibitedPluginDisclosure,
@@ -2571,16 +2571,16 @@ def _deferred_value_source_error(
 
 
 def _deferred_nested_blob_key(error: ErrorDetails) -> str | None:
-    """Identify only a deferred string value at a supported nested mapping path.
+    """Identify only a deferred string value at a nested mapping or list path.
 
     Keep sibling, container and extra-field errors. No replacement content is
-    invented, and list paths remain outside the inline-blob field-path protocol.
+    invented. Integer positions retain the authored list order.
     """
     location = error["loc"]
     if (
         len(location) > 1
         and type(location[0]) is str
-        and all(type(part) is str for part in location)
+        and all(type(part) in (str, int) for part in location)
         and error["type"] == "string_type"
         and is_inline_content_reference(error["input"])
     ):
@@ -2654,6 +2654,12 @@ def _prevalidate_plugin_options(
                 merged[k] = v
     if plugin_type == "transform" and plugin_name == "llm":
         _mask_pending_interpretation_placeholders_for_authoring_validation(merged)
+        # Deferred query templates stop model validators from running. Retain
+        # the knowable fallback prerequisite without inventing template text.
+        queries = merged["queries"] if "queries" in merged else None
+        query_entries = queries.values() if type(queries) is dict else queries if type(queries) is list else ()
+        if merged.get("prompt_template") is None and any(type(query) is dict and query.get("template") is None for query in query_entries):
+            return f"Invalid options for {plugin_type} '{plugin_name}': prompt_template: Field required"
 
     # Withhold secret_ref markers from the primary validation pass. A
     # secret-ref'd field IS provisioned (the user called wire_secret_ref, or
@@ -2717,7 +2723,8 @@ def _prevalidate_plugin_options(
                         remaining = [
                             error
                             for error in placeholder_cause.errors()
-                            if not (error["loc"] and error["loc"][0] in blob_inline_ref_keys) and _deferred_nested_blob_key(error) is None
+                            if not (error["loc"] and error["loc"][0] in blob_inline_ref_keys)
+                            and not is_deferred_blob_error(error, placeholder_cause.errors())
                         ]
                         if not remaining:
                             return _deferred_value_source_error(
@@ -2742,7 +2749,9 @@ def _prevalidate_plugin_options(
                 return f"Invalid options for {plugin_type} '{plugin_name}': {msg}"
 
             remaining = [
-                e for e in cause.errors() if not (e["loc"] and e["loc"][0] in blob_inline_ref_keys) and _deferred_nested_blob_key(e) is None
+                e
+                for e in cause.errors()
+                if not (e["loc"] and e["loc"][0] in blob_inline_ref_keys) and not is_deferred_blob_error(e, cause.errors())
             ]
             if not remaining:
                 return _deferred_value_source_error(
