@@ -46,7 +46,8 @@ from elspeth.web.config import WebSettings
 from elspeth.web.coordination.contracts import SessionOperationFenceLost, SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.repository import SessionOperationConflictError
-from elspeth.web.execution.errors import UnresolvedInterpretationPlaceholderError
+from elspeth.web.execution.errors import PipelineValidationError, UnresolvedInterpretationPlaceholderError
+from elspeth.web.execution.http_errors import pipeline_validation_http_exception
 from elspeth.web.execution.outputs import filesystem_path_candidates
 from elspeth.web.execution.protocol import ExecutionService
 from elspeth.web.execution.service import acquire_execute_lease, close_execute_lease_before_transfer
@@ -392,6 +393,8 @@ async def _run_live_tutorial(
     except asyncio.CancelledError as error:
         cancellation = error
         raise
+    except PipelineValidationError as exc:
+        raise pipeline_validation_http_exception(exc) from exc
     except UnresolvedInterpretationPlaceholderError as exc:
         # A pending interpretation review (e.g. the planner-authored LLM
         # prompt awaiting its Accept card) is a launch blocker in the

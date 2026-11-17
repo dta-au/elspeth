@@ -6,10 +6,16 @@ import re
 from dataclasses import replace
 from typing import Annotated, NotRequired, TypedDict
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
-from elspeth.contracts.blobs import BlobRecord
-from elspeth.contracts.blobs_inline import BlobInlineRef, ContentEncoding
+from elspeth.contracts.blobs import ALLOWED_MIME_TYPES, BlobRecord
+from elspeth.contracts.blobs_inline import (
+    INLINE_BLOB_NOT_TEXT_CODE,
+    INLINE_BLOB_NOT_TEXT_REPAIR,
+    BlobInlineRef,
+    ContentEncoding,
+    is_widened_blob_ref,
+)
 from elspeth.contracts.composer_interpretation import InterpretationSurfaceOrigin
 from elspeth.contracts.enums import is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError
@@ -28,6 +34,7 @@ from elspeth.web.composer.tools.blobs import (
     _apply_inline_blob_marker,
     _file_inject_blob_binding_error,
     _llm_authored_prompt_surface_error,
+    _structured_prompt_template_refusal,
 )
 from elspeth.web.composer.yaml_generator import (
     PUBLIC_EXPORT_REBIND_GUIDANCE,
@@ -676,6 +683,36 @@ def _ready_blob_content_hash(blob: BlobRecord) -> str:
     return blob.content_hash
 
 
+async def _reject_pasted_inline_prompt_blob_mime(
+    state: CompositionState,
+    *,
+    request: Request,
+    session_id: UUID,
+    session_operation_context: SessionOperationContext,
+) -> None:
+    """Check pasted LLM prompt markers against session-scoped blob metadata before publication."""
+    for node in state.nodes:
+        if node.plugin != "llm":
+            continue
+        marker = is_widened_blob_ref(deep_thaw(node.options.get("prompt_template")))
+        if marker is None or marker.mode != "inline_content":
+            continue
+        blob = await _ready_import_blob(
+            marker.blob_id,
+            request=request,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+        )
+        if blob.mime_type not in ALLOWED_MIME_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error_code": INLINE_BLOB_NOT_TEXT_CODE,
+                    "message": f"Blob '{blob.id}' is not inline text. {INLINE_BLOB_NOT_TEXT_REPAIR}",
+                },
+            )
+
+
 async def _state_with_imported_inline_blobs(
     state: CompositionState,
     *,
@@ -711,6 +748,14 @@ async def _state_with_imported_inline_blobs(
             session_operation_context=session_operation_context,
         )
         content_hash = _ready_blob_content_hash(blob)
+        if blob.mime_type not in ALLOWED_MIME_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error_code": INLINE_BLOB_NOT_TEXT_CODE,
+                    "message": f"Blob '{blob.id}' is not inline text. {INLINE_BLOB_NOT_TEXT_REPAIR}",
+                },
+            )
         try:
             ref = BlobInlineRef(field_path=field_path, blob_id=blob.id, sha256=content_hash, encoding=encoding)
         except ValueError:
@@ -721,6 +766,17 @@ async def _state_with_imported_inline_blobs(
                     "(source:<name>.options.<field>, node:<id>.options.<field> or output:<name>.options.<field>)"
                 ),
             ) from None
+        node_id = ref.field_path.partition(".options.")[0].removeprefix("node:")
+        if ref.field_path == f"node:{node_id}.options.prompt_template":
+            node = next((item for item in state.nodes if item.id == node_id), None)
+            if node is not None and node.plugin == "llm":
+                marker: dict[str, JsonValue] = {"blob_ref": str(blob.id), "mode": "inline_content", "sha256": content_hash}
+                structured_error = _structured_prompt_template_refusal(node_id, node.options, {"prompt_template": marker})
+                if structured_error is not None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"error_code": "prompt_template_parts_required", "message": structured_error},
+                    )
         prompt_surface_error = _llm_authored_prompt_surface_error(
             state,
             ref.field_path,
@@ -1288,7 +1344,8 @@ async def seed_state_from_runtime_yaml(
             try:
                 imported_state = composition_state_from_runtime_yaml(body.yaml)
             except RuntimeYamlImportError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+                detail = {"error_code": exc.error_code, "message": str(exc)} if exc.error_code is not None else str(exc)
+                raise HTTPException(status_code=400, detail=detail) from exc
             secret_service = request.app.state.scoped_secret_resolver
             env_ref_names = frozenset(item.name for item in secret_service.list_refs(str(user.user_id)))
             require_no_credential_material_in_state(
@@ -1297,6 +1354,12 @@ async def seed_state_from_runtime_yaml(
                 env_ref_names=env_ref_names,
             )
             _reject_imported_plugin_policy(imported_state, catalog, plugin_snapshot)
+            await _reject_pasted_inline_prompt_blob_mime(
+                imported_state,
+                request=request,
+                session_id=session.id,
+                session_operation_context=lease.context,
+            )
             imported_state = await _state_with_imported_source_blobs(
                 imported_state,
                 source_blob_ids=body.source_blob_ids,

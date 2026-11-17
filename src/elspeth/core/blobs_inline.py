@@ -18,6 +18,7 @@ from typing import Any, Final, cast
 from uuid import UUID
 
 from elspeth.contracts.blobs import (
+    ALLOWED_MIME_TYPES,
     AllowedMimeType,
     BlobContentMissingError,
     BlobIntegrityError,
@@ -29,6 +30,7 @@ from elspeth.contracts.blobs_inline import (
     BlobContentResolutionError,
     BlobInlineRef,
     BlobInlineValidationViolation,
+    InlineBlobNotTextError,
     ResolvedBlobContent,
     WidenedBlobRefShape,
     is_widened_blob_ref,
@@ -74,6 +76,7 @@ class _BlobMetadataEvaluation:
     not_ready: tuple[tuple[str, str], ...] = ()
     hash_mismatches: tuple[tuple[BlobInlineRef, str | None], ...] = ()
     oversized: tuple[tuple[str, int, int], ...] = ()
+    not_text: tuple[str, ...] = ()
 
 
 def _discover_blob_content_refs(config: dict[str, Any]) -> list[BlobInlineRef]:
@@ -138,6 +141,7 @@ def _evaluate_blob_content_ref_metadata(
     not_ready: list[tuple[str, str]] = []
     hash_mismatches: list[tuple[BlobInlineRef, str | None]] = []
     oversized: list[tuple[str, int, int]] = []
+    not_text: list[str] = []
     not_ready_lookup = not_ready_by_blob_id or {}
 
     aggregate_bytes = 0
@@ -151,6 +155,9 @@ def _evaluate_blob_content_ref_metadata(
         record = records_by_blob_id[ref.blob_id]
         if record.status != "ready":
             not_ready.append((ref.field_path, f"blob {ref.blob_id} status is {record.status!r}"))
+            continue
+        if record.mime_type not in ALLOWED_MIME_TYPES:
+            not_text.append(ref.field_path)
             continue
         if record.content_hash != ref.sha256:
             hash_mismatches.append((ref, record.content_hash))
@@ -167,6 +174,7 @@ def _evaluate_blob_content_ref_metadata(
         not_ready=tuple(not_ready),
         hash_mismatches=tuple(hash_mismatches),
         oversized=tuple(oversized),
+        not_text=tuple(not_text),
     )
 
 
@@ -181,8 +189,14 @@ def _metadata_evaluation_validation_violations(
     oversized_by_path = {
         field_path: (size_bytes, cap) for field_path, size_bytes, cap in evaluation.oversized if field_path != "(aggregate)"
     }
+    not_text_paths = set(evaluation.not_text)
 
     for ref in refs:
+        if ref.field_path in not_text_paths:
+            violations.append(
+                BlobInlineValidationViolation(category="not_text", field_path=ref.field_path, detail="blob MIME is not inline text")
+            )
+            continue
         if ref.field_path in missing_by_path:
             violations.append(
                 BlobInlineValidationViolation(
@@ -272,6 +286,8 @@ def _enforce_blob_content_ref_metadata(
         per_ref_byte_cap=per_ref_byte_cap,
         aggregate_byte_cap=aggregate_byte_cap,
     )
+    if evaluation.not_text:
+        raise InlineBlobNotTextError(evaluation.not_text[0])
     if evaluation.hash_mismatches:
         ref, actual = evaluation.hash_mismatches[0]
         raise BlobIntegrityError(
@@ -363,6 +379,9 @@ def _substitute_blob_content_refs(
         actual_hash = hashlib.sha256(content).hexdigest()
         if not hmac.compare_digest(actual_hash, ref.sha256):
             raise BlobIntegrityError(str(ref.blob_id), expected=ref.sha256, actual=actual_hash)
+        mime_type, byte_length = blob_metadata[ref.blob_id]
+        if mime_type not in ALLOWED_MIME_TYPES:
+            raise InlineBlobNotTextError(ref.field_path)
         decoded, decode_error = _decode_blob_content(ref, content)
         if decode_error is not None:
             undecodable.append(decode_error)
@@ -371,7 +390,6 @@ def _substitute_blob_content_refs(
             raise RuntimeError("Blob inline decode helper returned neither decoded content nor an error")
 
         decoded_by_ref[ref] = decoded
-        mime_type, byte_length = blob_metadata[ref.blob_id]
         audit.append(
             ResolvedBlobContent(
                 field_path=ref.field_path,

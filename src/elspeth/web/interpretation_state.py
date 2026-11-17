@@ -389,11 +389,13 @@ class InterpretationReviewIntegrityError(ValueError):
         component_id: str,
         component_type: Literal["source", "transform"],
         kind: InterpretationKind,
+        error_code: str | None = None,
     ) -> None:
         super().__init__(message)
         self.component_id = component_id
         self.component_type: Literal["source", "transform"] = component_type
         self.kind = kind
+        self.error_code = error_code
 
 
 class InterpretationReviewCapacityError(ValueError):
@@ -1306,6 +1308,21 @@ def _materialize_node_for_execution(
             del options["approved_prompt_artifact_hash"]
             return replace(node, options=options)
         return node
+    if "prompt_template" in node.options:
+        # Import and tool writers refuse this combination. Defend execution
+        # materialization of an older persisted state before rendering can
+        # silently discard the marker.
+        from elspeth.web.composer.tools.blobs import _structured_prompt_template_refusal
+
+        structured_error = _structured_prompt_template_refusal(node.id, node.options, {"prompt_template": node.options["prompt_template"]})
+        if structured_error is not None:
+            raise InterpretationReviewIntegrityError(
+                structured_error,
+                component_id=node.id,
+                component_type="transform",
+                kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
+                error_code="prompt_template_parts_required",
+            )
     prompt = _render_prompt_parts(parts, _requirements_by_id(node.options), unresolved_text=None)
     _validate_prompt_template_review(node, prompt)
     return _replace_prompt_if_changed(node, prompt, include_hash=True)

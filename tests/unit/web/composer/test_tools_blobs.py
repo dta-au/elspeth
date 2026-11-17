@@ -3643,6 +3643,7 @@ class TestUpdateBlobActiveRunGuard:
 
         assert result.success is False
         assert "referenced by the current composition" in result.validation.errors[0].message
+        assert result.validation.errors[0].error_code == "blob_bound_update"
         assert self.storage_path.read_bytes() == self.original_content
         with self.engine.begin() as conn:
             row = conn.execute(select(blobs_table).where(blobs_table.c.id == self.blob_id)).one()

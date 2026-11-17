@@ -38,6 +38,8 @@ from sqlalchemy import Engine, func, select
 from elspeth.contracts.blobs import ALLOWED_MIME_TYPES, BlobCreator, BlobStatus, names_same_blob
 from elspeth.contracts.blobs_inline import (
     ALLOWED_CONTENT_ENCODINGS,
+    INLINE_BLOB_NOT_TEXT_CODE,
+    INLINE_BLOB_NOT_TEXT_REPAIR,
     BlobInlineRef,
     ContentEncoding,
     is_widened_blob_ref,
@@ -112,7 +114,11 @@ from elspeth.web.execution._validation_materialization import (
     is_llm_authored_prompt_surface_binding,
     llm_prompt_surface_field,
 )
-from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, reconcile_authoritative_reviews
+from elspeth.web.interpretation_state import (
+    INTERPRETATION_REQUIREMENTS_KEY,
+    PROMPT_TEMPLATE_PARTS_KEY,
+    reconcile_authoritative_reviews,
+)
 from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
 from elspeth.web.resource_identity import canonical_resource_uuid
 from elspeth.web.sessions.models import (
@@ -1152,6 +1158,30 @@ def _file_inject_wired_marker_error(state: CompositionState, field_path: str) ->
     return None
 
 
+def _structured_prompt_template_refusal(
+    node_id: str,
+    current_options: Mapping[str, JsonValue],
+    patch: Mapping[str, JsonValue],
+) -> str | None:
+    """Shared structured-prompt guard for option patches and file binding."""
+    parts = patch[PROMPT_TEMPLATE_PARTS_KEY] if PROMPT_TEMPLATE_PARTS_KEY in patch else current_options.get(PROMPT_TEMPLATE_PARTS_KEY)
+    if parts is None or "prompt_template" not in patch:
+        return None
+    candidate = patch["prompt_template"]
+    if is_widened_blob_ref(deep_thaw(candidate)) is not None:
+        return (
+            f"Node '{node_id}' has a structured prompt with interpretation slots. A file cannot replace a structured prompt yet. "
+            "Edit its text parts in place with change_substring or patch_node_options on prompt_template_parts, "
+            "preserving interpretation_ref entries. Switching a structured prompt to a file is not supported in this release."
+        )
+    if candidate != current_options.get("prompt_template") and PROMPT_TEMPLATE_PARTS_KEY not in patch:
+        return (
+            f"Node '{node_id}': edit prompt_template_parts to change this structured prompt, "
+            "preserving its interpretation_ref entries; prompt_template is compiled from those parts."
+        )
+    return None
+
+
 def _execute_wire_blob_inline_ref(
     arguments: dict[str, Any],
     state: CompositionState,
@@ -1162,12 +1192,12 @@ def _execute_wire_blob_inline_ref(
     session_engine = context.session_engine
     session_id = context.session_id
     if session_engine is None or session_id is None:
-        return _failure_result(state, "Blob tools require session context.")
+        return _failure_result(state, "Blob tools require session context.", error_code="inline_blob_session_required")
 
     field_path = validated.field_path
     selector = canonical_resource_uuid(validated.blob_id)
     if selector is None:
-        return _failure_result(state, _BLOB_ID_UUID_ERROR)
+        return _failure_result(state, _BLOB_ID_UUID_ERROR, error_code="inline_blob_id_invalid")
     blob_id = UUID(selector)
 
     # The argument model validates ContentEncoding and defaults absence to utf-8.
@@ -1175,9 +1205,13 @@ def _execute_wire_blob_inline_ref(
 
     blob = _sync_get_blob(session_engine, selector, session_id)
     if blob is None:
-        return _failure_result(state, f"Blob '{blob_id}' not found.")
+        return _failure_result(state, f"Blob '{blob_id}' not found.", error_code="inline_blob_missing")
     if blob["status"] != "ready":
-        return _failure_result(state, f"Blob '{blob_id}' is not ready (status: {blob['status']}).")
+        return _failure_result(state, f"Blob '{blob_id}' is not ready (status: {blob['status']}).", error_code="inline_blob_not_ready")
+    if blob["mime_type"] not in ALLOWED_MIME_TYPES:
+        return _failure_result(
+            state, f"Blob '{blob_id}' is not inline text. {INLINE_BLOB_NOT_TEXT_REPAIR}", error_code=INLINE_BLOB_NOT_TEXT_CODE
+        )
     pinned_hash = blob["content_hash"]
     if pinned_hash is None:
         raise AuditIntegrityError(f"Ready blob '{blob_id}' has null content_hash; cannot author inline_content ref")
@@ -1190,7 +1224,21 @@ def _execute_wire_blob_inline_ref(
             encoding=encoding,
         )
     except ValueError as exc:
-        return _failure_result(state, f"Invalid field_path for inline blob ref: {exc}")
+        return _failure_result(state, f"Invalid field_path for inline blob ref: {exc}", error_code="inline_blob_field_path_invalid")
+
+    node_id = ref.field_path.partition(".options.")[0].removeprefix("node:")
+    if ref.field_path.startswith("node:"):
+        node = next((item for item in state.nodes if item.id == node_id), None)
+        if node is not None and node.plugin == "llm":
+            structured_error = (
+                _structured_prompt_template_refusal(
+                    node_id, node.options, {"prompt_template": {"blob_ref": str(blob_id), "mode": "inline_content", "sha256": pinned_hash}}
+                )
+                if ref.field_path == f"node:{node_id}.options.prompt_template"
+                else None
+            )
+            if structured_error is not None:
+                return _failure_result(state, structured_error, error_code="prompt_template_parts_required")
 
     prompt_surface_error = _llm_authored_prompt_surface_error(
         state,
@@ -1199,7 +1247,7 @@ def _execute_wire_blob_inline_ref(
         creation_modality=CreationModality(blob["creation_modality"]),
     )
     if prompt_surface_error is not None:
-        return _failure_result(state, prompt_surface_error)
+        return _failure_result(state, prompt_surface_error, error_code="llm_authored_inline_blob_content")
     file_inject_blob_error = _file_inject_blob_binding_error(
         state,
         ref.field_path,
@@ -1221,7 +1269,7 @@ def _execute_wire_blob_inline_ref(
     try:
         new_state = _apply_inline_blob_marker(state, ref.field_path, marker)
     except ValueError as exc:
-        return _failure_result(state, str(exc))
+        return _failure_result(state, str(exc), error_code="inline_blob_field_path_invalid")
     file_inject_error = _file_inject_wired_marker_error(new_state, ref.field_path)
     if file_inject_error is not None:
         return _failure_result(state, file_inject_error, error_code="file_inject_content_not_uploaded")
@@ -1237,7 +1285,7 @@ def _execute_wire_blob_inline_ref(
         )
     endpoint_policy_error = _inline_blob_endpoint_policy_error(new_state, ref.field_path)
     if endpoint_policy_error is not None:
-        return _failure_result(state, endpoint_policy_error)
+        return _failure_result(state, endpoint_policy_error, error_code="aws_s3_endpoint_url_not_allowed")
     # The marker rewrites the component's options in place, so a resolved
     # review whose artifact covers the wired field must reopen (or the edit is
     # refused here) — the same post-mutation invariant splice_transform and the
@@ -1271,6 +1319,8 @@ _WIRE_BLOB_INLINE_REF_DECLARATION = ToolDeclaration(
     description=(
         "Author a widened blob_ref inline_content marker at a canonical field_path. "
         "Composer pins sha256 from blob metadata; callers must not pass content bytes. "
+        "Only inline-text MIME is accepted; upload or create a plain-text .txt or .md file for a prompt. "
+        "A structured prompt with prompt_template_parts cannot be replaced by a file in this release; edit its text parts with change_substring or patch_node_options on prompt_template_parts, preserving interpretation_ref entries. "
         "Returns the `field_path` that was wired."
     ),
     json_schema={
@@ -1286,7 +1336,11 @@ _WIRE_BLOB_INLINE_REF_DECLARATION = ToolDeclaration(
                     + _BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE
                 ),
             },
-            "blob_id": {"type": "string", "format": "uuid", "description": "Ready blob ID to wire as inline content."},
+            "blob_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "Ready inline-text blob ID; binary MIME is refused. For a prompt, upload or create plain text (.txt or .md).",
+            },
             "encoding": {
                 "type": "string",
                 "enum": sorted(ALLOWED_CONTENT_ENCODINGS),
@@ -1965,6 +2019,7 @@ def admit_blob_mutation(tool_name: str, arguments: object, state: CompositionSta
             return _failure_result(
                 state,
                 f"Blob '{blob_id}' is referenced by the current composition and cannot be {'deleted' if deleting else 'updated'}; unbind it first.",
+                error_code="blob_bound_delete" if deleting else "blob_bound_update",
             )
         try:
             if deleting:
@@ -2035,6 +2090,7 @@ def _execute_update_blob(
             return _failure_result(
                 state,
                 f"Blob '{blob_id}' is referenced by the current composition and cannot be updated; unbind it first.",
+                error_code="blob_bound_update",
             )
         replacement = _blob_replacement_record(expected, content_bytes, provenance, context)
         result = driver.replace_blob(
@@ -2125,6 +2181,7 @@ def _execute_delete_blob(
             return _failure_result(
                 state,
                 f"Blob '{blob_id}' is referenced by the current composition and cannot be deleted; unbind it first.",
+                error_code="blob_bound_delete",
             )
         try:
             service._delete_blob_with_ledger(

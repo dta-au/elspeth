@@ -330,6 +330,87 @@ class TestListComposerBlobs:
 
 
 class TestWireBlobInlineRef:
+    @pytest.mark.parametrize("field", ["prompt_template", "system_prompt", "queries.0.template", "queries.q.template"])
+    def test_binary_mime_refuses_before_writing_marker(self, blob_env: dict[str, Any], field: str) -> None:
+        blob = _create_blob(blob_env, content="PDF shaped bytes")
+        with blob_env["engine"].begin() as conn:
+            conn.execute(blobs_table.update().where(blobs_table.c.id == blob.data["blob_id"]).values(mime_type="application/pdf"))
+        state = _inline_ref_state()
+        node = state.nodes[0]
+        options = dict(node.options)
+        options["queries"] = (
+            [{"name": "q", "input_fields": {"text": "text"}, "template": "Before"}]
+            if field == "queries.0.template"
+            else {"q": {"input_fields": {"text": "text"}, "template": "Before"}}
+        )
+        state = replace(state, nodes=(replace(node, options=options),))
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {"field_path": f"node:classify.options.{field}", "blob_id": blob.data["blob_id"]},
+            state,
+            _catalog(),
+            data_dir=blob_env["data_dir"],
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.validation.errors[0].error_code == "inline_blob_not_text"
+        assert ".txt or .md" in result.validation.errors[0].message
+        assert "PDF shaped bytes" not in result.validation.errors[0].message
+
+    def test_structured_prompt_wire_refuses_without_mutation(self, blob_env: dict[str, Any]) -> None:
+        blob = _create_blob(blob_env, content="Replacement prompt")
+        state = _inline_ref_state()
+        node = state.nodes[0]
+        state = replace(
+            state,
+            nodes=(
+                replace(node, options={**node.options, "prompt_template_parts": [{"kind": "text", "text": "Original structured prompt"}]}),
+            ),
+        )
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {"field_path": "node:classify.options.prompt_template", "blob_id": blob.data["blob_id"]},
+            state,
+            _catalog(),
+            data_dir=blob_env["data_dir"],
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.validation.errors[0].error_code == "prompt_template_parts_required"
+        assert "interpretation slots" in result.validation.errors[0].message
+        assert state.nodes[0].options["prompt_template"] == "Placeholder"
+
+    def test_structured_prompt_patch_marker_refuses_without_mutation(self, blob_env: dict[str, Any]) -> None:
+        blob = _create_blob(blob_env, content="Replacement prompt")
+        state = _inline_ref_state()
+        node = state.nodes[0]
+        state = replace(
+            state,
+            nodes=(
+                replace(node, options={**node.options, "prompt_template_parts": [{"kind": "text", "text": "Original structured prompt"}]}),
+            ),
+        )
+        marker = {"blob_ref": blob.data["blob_id"], "mode": "inline_content", "sha256": blob.data["content_hash"]}
+
+        result = execute_tool("patch_node_options", {"node_id": "classify", "patch": {"prompt_template": marker}}, state, _catalog())
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.validation.errors[0].error_code == "prompt_template_parts_required"
+        assert "interpretation slots" in result.validation.errors[0].message
+
     @pytest.mark.parametrize(
         ("node_type", "overrides"),
         (

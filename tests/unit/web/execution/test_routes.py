@@ -395,6 +395,40 @@ class TestValidateEndpoint:
     """POST /api/sessions/{session_id}/validate"""
 
     @pytest.mark.asyncio
+    async def test_non_text_inline_marker_returns_200_with_typed_errors(self, tmp_path: Path) -> None:
+        from dataclasses import replace
+        from types import SimpleNamespace
+
+        from elspeth.contracts.enums import CreationModality
+        from elspeth.web.composer import yaml_generator
+        from elspeth.web.execution.validation import validate_pipeline_for_trained_operator
+        from tests.unit.web.execution import test_inline_blob_prompt_surface_readiness as prompt_readiness
+
+        state = prompt_readiness._state(tmp_path, "prompt_template")
+        record = replace(prompt_readiness._record(CreationModality.VERBATIM), mime_type="application/pdf")
+        try:
+            validation = validate_pipeline_for_trained_operator(
+                state,
+                SimpleNamespace(data_dir=tmp_path),
+                yaml_generator,
+                blob_get_metadata=lambda _blob_id: record,
+                blob_get_content=lambda _blob_id: (record, prompt_readiness._CONTENT),
+                session_id=str(prompt_readiness._SESSION_ID),
+            )
+        except ValueError:
+            pytest.fail("Non-text inline content escaped /validate as an exception")
+        svc = _execution_service()
+        svc.validate = AsyncMock(spec=ExecutionService.validate, return_value=validation)
+        app = _create_test_app(execution_service=svc)
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(f"/api/sessions/{uuid4()}/validate")
+
+        assert resp.status_code == 200
+        assert resp.json()["is_valid"] is False
+        assert any(error["error_code"] == "inline_blob_not_text" for error in resp.json()["errors"])
+
+    @pytest.mark.asyncio
     async def test_valid_pipeline_returns_200(self) -> None:
         svc = _execution_service()
         svc.validate = AsyncMock(

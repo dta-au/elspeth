@@ -12,6 +12,7 @@ admission share. User-uploaded (verbatim) blobs are the accepted control.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -109,11 +110,20 @@ def _set_pipeline_arguments(blob_env: dict[str, Any], options: dict[str, Any]) -
     }
 
 
-def _run(tool: str, field: str, marker: dict[str, str], blob_env: dict[str, Any]) -> tuple[ToolResult, CompositionState, str]:
+def _run(
+    tool: str, field: str, marker: dict[str, str], blob_env: dict[str, Any], *, structured: bool = False
+) -> tuple[ToolResult, CompositionState, str]:
     options = _options(field, marker)
+    if structured:
+        options["prompt_template_parts"] = [{"kind": "text", "text": "Original structured prompt"}]
     catalog = blob_tools._catalog()
     if tool == "upsert_node":
         state = blob_tools._inline_ref_state()
+        if structured:
+            node = state.nodes[0]
+            state = replace(
+                state, nodes=(replace(node, options={**node.options, "prompt_template_parts": options["prompt_template_parts"]}),)
+            )
         node_id = "classify"
         arguments: dict[str, Any] = {
             "id": node_id,
@@ -126,6 +136,11 @@ def _run(tool: str, field: str, marker: dict[str, str], blob_env: dict[str, Any]
         }
     elif tool == "patch_node_options":
         state = blob_tools._inline_ref_state()
+        if structured:
+            node = state.nodes[0]
+            state = replace(
+                state, nodes=(replace(node, options={**node.options, "prompt_template_parts": options["prompt_template_parts"]}),)
+            )
         node_id = "classify"
         root = field.split(".")[0]
         arguments = {"node_id": node_id, "patch": {root: options[root]}}
@@ -159,6 +174,18 @@ def _run(tool: str, field: str, marker: dict[str, str], blob_env: dict[str, Any]
 
 
 _TOOLS = ("upsert_node", "patch_node_options", "splice_transform", "set_pipeline")
+
+
+@pytest.mark.parametrize("tool", _TOOLS)
+def test_structured_prompt_refuses_manually_supplied_marker(blob_env: dict[str, Any], tool: str) -> None:
+    marker = _blob(blob_env, CreationModality.VERBATIM)
+
+    result, state, _node_id = _run(tool, "prompt_template", marker, blob_env, structured=True)
+
+    assert result.success is False
+    assert result.updated_state is state
+    assert result.validation.errors[0].error_code == "prompt_template_parts_required"
+    assert "interpretation slots" in result.validation.errors[0].message
 
 
 @pytest.mark.parametrize("modality", _LLM_AUTHORED_MODALITIES, ids=lambda modality: modality.value)

@@ -17,6 +17,8 @@ import yaml
 
 from elspeth.contracts.blobs import AllowedMimeType, BlobCreator, BlobNotFoundError, BlobRecord, BlobStateError
 from elspeth.contracts.blobs_inline import (
+    INLINE_BLOB_NOT_TEXT_CODE,
+    INLINE_BLOB_NOT_TEXT_REPAIR,
     BlobContentResolutionError,
     BlobInlineRef,
     BlobInlineValidationViolation,
@@ -175,12 +177,21 @@ def _blob_inline_validation_detail(violations: list[BlobInlineValidationViolatio
 
 
 def _blob_inline_validation_error(violation: BlobInlineValidationViolation) -> ValidationError:
+    not_text = violation.category == "not_text"
     return ValidationError(
         component_id=_blob_inline_component_id(violation.field_path),
         component_type=_blob_inline_component_type(violation.field_path),
-        message=f"Inline content blob reference at {violation.field_path} is {violation.category}: {violation.detail}",
-        suggestion="Verify the blob exists, is ready, is under the configured size caps, and matches the pinned sha256.",
-        error_code=f"{violation.category}_inline_blob_content",
+        message=(
+            f"Inline content blob reference at {violation.field_path} is not text. {INLINE_BLOB_NOT_TEXT_REPAIR}"
+            if not_text
+            else f"Inline content blob reference at {violation.field_path} is {violation.category}: {violation.detail}"
+        ),
+        suggestion=(
+            INLINE_BLOB_NOT_TEXT_REPAIR
+            if not_text
+            else "Verify the blob exists, is ready, is under the configured size caps, and matches the pinned sha256."
+        ),
+        error_code=INLINE_BLOB_NOT_TEXT_CODE if not_text else f"{violation.category}_inline_blob_content",
     )
 
 
