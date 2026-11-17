@@ -38,6 +38,15 @@ def test_readme_operational_cutover_states_the_live_schema_epochs() -> None:
     assert "the package version alone does not establish qualification or image publication" in text
     assert "Automatic image publication from main is held" in text
     assert "verify the release tag and image digest" in text
+    assert "It supersedes 0.8.14, which was tagged but never published" in text
+    assert "the 0.8.14 upgrade actions apply" in text
+    assert "A run interrupted before upgrading cannot be resumed after it" in text
+
+
+def test_readme_keeps_the_0_8_14_python_move_as_a_historical_pin() -> None:
+    """The 0.8.14 section keeps its own statements and no current-release claim."""
+    text = _section(_readme_text(), "\n## Previously in 0.8.14\n")
+
     assert "0.8.14 moves ELSPETH to Python 3.14" in text
     assert "Python 3.14 is now required for `elspeth`, `elspeth-lints` and the LLM gateway" in text
     assert "3.12 and 3.13 are no longer supported or tested" in text
@@ -46,6 +55,7 @@ def test_readme_operational_cutover_states_the_live_schema_epochs() -> None:
     assert "drain in-flight runs and pending approvals before upgrading" in text
     assert "it has no `/usr/bin/python3`" in text
     assert "the repository ruleset must be updated to match" in text
+    assert "Package metadata is" not in text
 
 
 def test_readme_keeps_the_0_8_13_context_budget_as_a_historical_pin() -> None:
