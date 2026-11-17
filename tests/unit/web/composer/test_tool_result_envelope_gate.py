@@ -62,6 +62,7 @@ from elspeth.web.composer.prompts import build_system_prompt
 from elspeth.web.composer.tools import _common as common
 from elspeth.web.composer.tools import _dispatch, _registry, blobs, secrets
 from elspeth.web.composer.tools._dispatch import get_tool_definitions
+from elspeth.web.composer.tools.prompt_target_responses import PromptTargetMetadata
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 from elspeth.web.execution.schemas import ValidationResult
 from tests.helpers.tree_gate import ParsedPythonFile, iter_gate_sources
@@ -205,6 +206,7 @@ _CONTAINER_ELEMENT_PAYLOADS: dict[str, type | _Elsewhere] = {
     "validation.warnings": _Elsewhere("_validation_typed_sites"),
     "validation.suggestions": _Elsewhere("_validation_typed_sites"),
     "data.edge_contracts": state.EdgeContractDict,
+    "data.targets": PromptTargetMetadata,
 }
 # A nested value the walker can see is a REFERENCE and not a container: its shape lives at the
 # other end of a name, an attribute, a subscript or a call, and this position has no enclosing

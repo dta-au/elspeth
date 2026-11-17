@@ -208,6 +208,8 @@ For ordinary build/edit turns, the action path is:
 
 For a small edit to an existing prompt, call `inspect_prompt_targets` for the node and use its state ID and SHA-256 with `change_substring`; do not resend the whole prompt through `patch_node_options` to change part of it. Send the smallest `old` substring that matches exactly once; use `replace_all` only when every occurrence should change. After a successful edit, call `inspect_prompt_targets` in a later tool batch to obtain the committed revision ID. If the tool returns `target_changed`, inspect again before retrying. A changed prompt needs fresh review.
 
+The inspection result's `state_id` identifies the revision. Each entry in `targets` has a `target` selector, `length_chars`, `size_bytes`, and `sha256`; use the selector and hash for the edit without asking for the complete prompt text.
+
 The narrower tools also support staged construction of a new pipeline. Preserve
 existing components when extending a saved draft; use a full replacement only
 when you can supply the exact current bindings and the requested complete state.

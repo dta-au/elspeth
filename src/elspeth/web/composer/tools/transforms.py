@@ -2248,7 +2248,10 @@ def _inspect_prompt_targets(args: dict[str, object], state: CompositionState, co
                         )
                     )
     response = PromptTargetsResponse(state_id=context.current_state_id, targets=tuple(targets))
-    return _discovery_result(state, response.model_dump(mode="json"))
+    return _discovery_result(
+        state,
+        {"state_id": response.state_id, "targets": [target.model_dump(mode="json") for target in response.targets]},
+    )
 
 
 _INSPECT_PROMPT_TARGETS_DECLARATION = ToolDeclaration(
@@ -2256,7 +2259,7 @@ _INSPECT_PROMPT_TARGETS_DECLARATION = ToolDeclaration(
     handler=_inspect_prompt_targets,
     kind=ToolKind.DISCOVERY,
     response_contract=PROMPT_TARGETS_RESPONSE_CONTRACT,
-    description="Inspect an LLM node's inline prompt text targets. Result `state_id` is the inspected composition revision; `targets` lists each text target's length, UTF-8 byte size and SHA-256. No prompt text or interpretation slot values are returned.",
+    description="Inspect an LLM node's inline prompt text targets. Result `state_id` is the inspected composition revision; `targets` lists text targets. In each entry, `target` identifies the prompt option or text part, `length_chars` counts characters, `size_bytes` counts UTF-8 bytes, and `sha256` hashes those bytes. No prompt text or interpretation slot values are returned.",
     json_schema={
         "type": "object",
         "properties": {"node_id": {"type": "string", "description": "ID of the LLM node whose prompt text targets should be inspected."}},
