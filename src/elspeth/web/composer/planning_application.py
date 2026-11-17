@@ -51,7 +51,7 @@ from elspeth.web.composer.audit_storage import (
 from elspeth.web.composer.availability import ComposerAvailability
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
 from elspeth.web.composer.composer_preflight import ComposerPreflight
-from elspeth.web.composer.context_budget import ContextBudgetPolicy
+from elspeth.web.composer.context_budget import ContextBudgetPolicy, escaped_bytes
 from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.discovery_cache import RuntimePreflightCache as _RuntimePreflightCache
 from elspeth.web.composer.graph_recovery import GraphRecoveryContext
@@ -82,7 +82,7 @@ from elspeth.web.composer.pipeline_proposal import (
     composition_content_hash,
 )
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount
-from elspeth.web.composer.prompts import project_server_owned_option_metadata
+from elspeth.web.composer.prompts import SYSTEM_PROMPT, project_server_owned_option_metadata
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import (
     COMPOSER_HISTORY_USER_AUTHORED_KEY,
@@ -1206,6 +1206,7 @@ class PlanningApplication:
                     prompt_guard_mode=self._settings.composer_prompt_guard_mode,
                 ),
                 rendered_skill=rendered_skill,
+                shipped_skill_bytes=escaped_bytes(SYSTEM_PROMPT),
                 repair_budget=self._settings.composer_planner_repair_budget,
                 budget_policy=PlannerBudgetPolicy(
                     max_total_provider_calls=self._settings.composer_planner_max_provider_calls,

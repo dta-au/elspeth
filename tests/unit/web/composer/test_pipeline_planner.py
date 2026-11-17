@@ -816,7 +816,13 @@ def _context_policy(
 ) -> ContextBudgetPolicy:
     """A context budget far above any scripted request by default, so nothing is shed unless a test lowers it."""
     return ContextBudgetPolicy(
-        max_prompt_tokens=max_prompt_tokens, max_request_bytes=max_request_bytes, shed_above=shed_above, shed_to=shed_to
+        max_prompt_tokens=max_prompt_tokens,
+        max_request_bytes=max_request_bytes,
+        shed_above=shed_above,
+        shed_to=shed_to,
+        # Boundary scenarios use a worst-density prefix; production defaults
+        # are independently exercised with the shipped request and tokenizer.
+        fallback_bytes_per_token=1.0,
     )
 
 

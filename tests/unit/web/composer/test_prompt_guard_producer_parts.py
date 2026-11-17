@@ -673,11 +673,19 @@ async def test_real_advisor_keeps_oversized_indivisible_summary_scalar_refused(i
 
 
 @pytest.mark.asyncio
-async def test_real_freeform_batch_and_cache_retain_complete_nominal_schema(invocation, monkeypatch, catalog, azure):
-    from sqlalchemy import select
+@pytest.mark.parametrize("schema_count", [1, 2])
+async def test_real_freeform_batch_and_cache_retain_complete_nominal_schema(invocation, monkeypatch, catalog, azure, schema_count):
+    import math
 
+    import tiktoken
+    from sqlalchemy import select, update
+
+    from elspeth.core.canonical import canonical_json
     from elspeth.web.composer import provider_gateway
-    from elspeth.web.sessions.models import chat_messages_table
+    from elspeth.web.composer import service as service_module
+    from elspeth.web.composer.prompts import SYSTEM_PROMPT
+    from elspeth.web.composer.protocol import ComposerConvergenceError
+    from elspeth.web.sessions.models import chat_messages_table, quota_policies_table
     from tests.unit.web.composer._helpers import _clean_advisor_checkpoint, _make_settings
     from tests.unit.web.composer.test_pipeline_planner import _response, _ScriptedCompletion, _text_response
 
@@ -692,36 +700,42 @@ async def test_real_freeform_batch_and_cache_retain_complete_nominal_schema(invo
     )
     owner = invocation[2]
     context = owner.required_work.coordinator.authority.context
-    completion = _ScriptedCompletion(
-        _response(
-            ("get_plugin_schema", {"plugin_type": "transform", "name": "llm"}),
-            ("get_plugin_schema", {"plugin_type": "transform", "name": "llm"}),
-        ),
-        _text_response("The registered schema is available for review."),
-    )
+    with invocation[0].begin() as connection:
+        connection.execute(update(quota_policies_table).values(tokens_per_day=200_000))
+    first_response = _response(*[("get_plugin_schema", {"plugin_type": "transform", "name": "llm"})] * schema_count)
+    first_response.usage = {"prompt_tokens": 63201, "completion_tokens": 5, "total_tokens": 63206, "cost": 0.01}
+    completion = _ScriptedCompletion(first_response, _text_response("The registered schema is available for review."))
     monkeypatch.setattr(litellm, "acompletion", completion)
     monkeypatch.setattr(service._advisor_checkpoint, "_run_advisor_checkpoint", _clean_advisor_checkpoint)
     with (
         prompt_guard_user_scope(_USER),
         patch.object(provider_gateway, "enforce_prompt_guard", autospec=True, side_effect=provider_gateway.enforce_prompt_guard) as checks,
+        patch.object(service_module, "decide_context_budget", wraps=service_module.decide_context_budget) as budgets,
     ):
-        result = await service._compose_loop(
-            _USER,
-            [],
-            _empty(),
-            session_id=context.fence.session_id,
-            user_id="alice",
-            deadline=asyncio.get_running_loop().time() + 30.0,
-            plugin_snapshot=snapshot,
-            policy_catalog=policy,
-            session_operation_context=context,
-            required_work=owner.required_work,
-            provider_owner=owner,
-        )
+        try:
+            result = await service._compose_loop(
+                _USER,
+                [],
+                _empty(),
+                session_id=context.fence.session_id,
+                user_id="alice",
+                deadline=asyncio.get_running_loop().time() + 30.0,
+                plugin_snapshot=snapshot,
+                policy_catalog=policy,
+                session_operation_context=context,
+                required_work=owner.required_work,
+                provider_owner=owner,
+            )
+        except ComposerConvergenceError:
+            result = None
+    assert result is not None, "plausible anchor must admit authored schema at the shipped cap"
     assert len(completion.requests) == 2
-    assert [invocation.cache_hit for invocation in result.tool_invocations] == [False, True]
+    assert result.llm_calls[0].context_budget.bytes_per_token == repr(3.0)
+    assert result.llm_calls[1].context_budget.bytes_per_token == repr(3.0)
+    assert result.llm_calls[1].context_budget.pricing_mode == "authored_prefix"
+    assert [invocation.cache_hit for invocation in result.tool_invocations] == ([False] if schema_count == 1 else [False, True])
     tools = [message for message in completion.requests[1]["messages"] if message["role"] == "tool"]
-    assert len(tools) == 2
+    assert len(tools) == schema_count
     assert all("json_schema" in message["content"] for message in tools)
     assert all(guard_contracts.PROMPT_GUARD_CONTENT_PARTS_KEY not in message for message in tools)
     assert "json_schema" not in "\n".join(document for body in sent for document in body["documents"])
@@ -730,6 +744,41 @@ async def test_real_freeform_batch_and_cache_retain_complete_nominal_schema(invo
     assert any(parts is not None for parts in forwarded["content_parts"])
     assert any(parts is not None for parts in forwarded["tool_argument_parts"])
     wire = completion.requests[1]
+    # Each region is identified by its producer, including both copies of the
+    # nominal schema (the second, when present, came from the tool cache). Foreign state and
+    # model/user text must remain at one token per canonical wire byte.
+    regions = {
+        "skill": [canonical_json(SYSTEM_PROMPT)[1:-1]],
+        "tool schemas and descriptions": [canonical_json(wire["tools"])],
+        "plugin catalogue/discovery": [canonical_json(wire["messages"][1]["content"])[1:-1]],
+        "nominal schema text": [
+            canonical_json(part.text)[1:-1]
+            for parts in forwarded["content_parts"]
+            if parts is not None
+            for part in parts
+            if part.trust is guard_contracts.PromptGuardTrust.REFERENCE
+        ],
+    }
+    region_bytes = {name: sum(len(text.encode()) for text in texts) for name, texts in regions.items()}
+    assert all(size > 0 for size in region_bytes.values())
+    priced = budgets.call_args_list[1].kwargs
+    assert priced["authored_bytes"] == sum(region_bytes.values())
+    assert priced["anchor_tokens"] == 63201
+    foreign_bytes = priced["request_bytes"] - priced["authored_bytes"]
+    estimate = foreign_bytes + math.ceil(priced["authored_bytes"] / 3)
+    encoder = tiktoken.get_encoding("o200k_base")
+    real = len(encoder.encode(canonical_json({"messages": wire["messages"], "tools": wire["tools"]})))
+    assert math.ceil(real * 1.4) <= estimate <= 200000
+    assert result.llm_calls[1].context_budget.estimated_tokens_after == estimate
+    for name, texts in regions.items():
+        tokens = sum(len(encoder.encode(text)) for text in texts)
+        assert tokens <= math.ceil(region_bytes[name] / 3), name
+        print(
+            f"region={name} bytes={region_bytes[name]} o200k={tokens} price={math.ceil(region_bytes[name] / 3)} real_1.4={math.ceil(tokens * 1.4)}"
+        )
+    print(
+        f"authored_regions={region_bytes} rate=1/3 foreign_bytes={foreign_bytes} rate=1 estimate={estimate} o200k={real} margin_1.4={math.ceil(real * 1.4)}"
+    )
     assert wire["messages"] == forwarded["messages"]
     assert wire["messages"][0]["cache_control"] == {"type": "ephemeral"}
     assert wire["tools"][-1]["cache_control"] == {"type": "ephemeral"}

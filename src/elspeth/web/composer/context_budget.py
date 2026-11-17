@@ -9,42 +9,22 @@ translate messages into :class:`SheddableSegment` and apply the decision.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final, Literal
 
+from elspeth.contracts.composer_llm_audit import ContextBudgetAnchorStatus
+from elspeth.contracts.prompt_guard import PROMPT_GUARD_TRUST_KEY, PromptGuardTrust, detach_prompt_guard_evidence
 from elspeth.core.canonical import canonical_json, stable_hash
 
 CONTEXT_BUDGET_FALLBACK_BYTES_PER_TOKEN: Final[float] = 3.0
 # Every size in this module is WIRE bytes: the canonical JSON of the request
 # body's ``{messages, tools}`` as sent, so content, tool-call arguments,
-# replayed thinking blocks and tool definitions all count. The ratio is wire
-# bytes per provider-reported prompt token.
-#
-# The closed range a ratio measured from a stored call record is clamped to.
-# The ratio is provider-reported data steering a control decision, so a value
-# outside the range is clamped, never trusted and never rejected. The one
-# measured composer figure is about 4.3 bytes per prompt token
-# (docs/development/composer-context-budget-brief.md), on a prose-heavy
-# request whose wire size is close to its content size. JSON carried as
-# content grows on the wire by a measured 1.02x (prose) to 1.36x (JSON nested
-# as a string), which puts honest wire ratios between about 4.4 and 5.8.
-#
-# Upper bound 6.0: just above that span. A ratio that is too high
-# under-estimates tokens and sheds late, so nothing above the honest span is
-# believed: a prompt count reported without cached tokens (a ratio several
-# times too high) degrades to 6.0 rather than switching the token ceiling off.
-#
-# Lower bound 2.0: a ratio that is too low over-estimates tokens, which is the
-# safe direction, but without a floor a wildly inflated prompt count would
-# refuse every request. 2.0 is below the 3.0 fallback and still admits the
-# fixed prefix under any realistic ceiling.
-#
-# The 3.0 fallback is below every honest wire ratio, so before a session has
-# a measured ratio the estimate is high and shedding starts early.
-CONTEXT_BUDGET_MIN_BYTES_PER_TOKEN: Final[float] = 2.0
-CONTEXT_BUDGET_MAX_BYTES_PER_TOKEN: Final[float] = 6.0
+# replayed thinking blocks and tool definitions all count.
+# A same-exchange provider count
+# can price unchanged protected messages; without one, only authored bytes get the fallback rate.
+# Release always uses the byte yardstick, independently of anchor availability.
 CONTEXT_BUDGET_TOOL_RESULT_STUB: Final[str] = "[Result omitted by ELSPETH to fit the context budget. Call the tool again if you need it.]"
 
 
@@ -56,6 +36,23 @@ def escaped_bytes(text: str) -> int:
     content (a serialized payload or transcript) with it.
     """
     return len(canonical_json(text).encode("utf-8")) - 2
+
+
+def protected_reference_bytes(messages: Sequence[Mapping[str, object]], *, excluded_positions: frozenset[int]) -> int:
+    """Count only producer-labelled reference content in protected messages."""
+    evidence = detach_prompt_guard_evidence(messages)
+    total = 0
+    for index, message in enumerate(messages):
+        if index in excluded_positions:
+            continue
+        if message.get(PROMPT_GUARD_TRUST_KEY) is PromptGuardTrust.REFERENCE:
+            content = message["content"]
+            if type(content) is not str:
+                raise ValueError("producer-labelled reference content must be text")
+            total += escaped_bytes(content)
+        elif (parts := evidence.content_parts[index]) is not None:
+            total += sum(escaped_bytes(part.text) for part in parts if part.trust is PromptGuardTrust.REFERENCE)
+    return total
 
 
 class SheddableKind(StrEnum):
@@ -101,7 +98,7 @@ class ContextBudgetPolicy:
     def audit_hash(self) -> str:
         return stable_hash(
             {
-                "schema": "composer.context-budget.v1",
+                "schema": "composer.context-budget.v2",
                 "max_prompt_tokens": self.max_prompt_tokens,
                 "max_request_bytes": self.max_request_bytes,
                 "shed_above": repr(self.shed_above),
@@ -123,6 +120,20 @@ class SheddableSegment:
 
 
 @dataclass(frozen=True, slots=True)
+class ContextBudgetPricing:
+    """Content-free inputs and the selected pricing arm, including refusals."""
+
+    mode: Literal["anchored", "conservative", "authored_prefix"]
+    anchor_status: ContextBudgetAnchorStatus
+    anchor_tokens: int | None
+    anchor_wire_bytes: int
+    shared_bytes: int
+    request_bytes: int
+    authored_bytes: int
+    authored_refuted: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class ContextBudgetDecision:
     """What to shed, with the request's wire size before and after.
 
@@ -131,24 +142,32 @@ class ContextBudgetDecision:
     """
 
     policy_hash: str
-    bytes_per_token: float
     request_bytes_before: int
     estimated_tokens_before: int
     request_bytes_after: int
     estimated_tokens_after: int
     shed_keys: tuple[str, ...]
+    pricing: ContextBudgetPricing
 
 
 class ContextBudgetRefusal(Exception):
     """Protected content alone exceeds a ceiling; ``request_bytes`` is wire bytes."""
 
-    def __init__(self, *, ceiling: Literal["tokens", "bytes"], estimated_tokens: int, request_bytes: int) -> None:
+    def __init__(
+        self,
+        *,
+        ceiling: Literal["tokens", "bytes"],
+        estimated_tokens: int,
+        request_bytes: int,
+        pricing: ContextBudgetPricing | None = None,
+    ) -> None:
         super().__init__(
             f"context budget exceeded the {ceiling} ceiling: estimated_tokens={estimated_tokens} request_bytes={request_bytes}"
         )
         self.ceiling = ceiling
         self.estimated_tokens = estimated_tokens
         self.request_bytes = request_bytes
+        self.pricing = pricing
 
 
 def decide_context_budget(
@@ -156,9 +175,14 @@ def decide_context_budget(
     policy: ContextBudgetPolicy,
     request_bytes: int,
     segments: Sequence[SheddableSegment],
-    bytes_per_token: float | None,
     previously_shed: frozenset[str],
     held: frozenset[str] = frozenset(),
+    anchor_tokens: int | None = None,
+    anchor_shared_bytes: int = 0,
+    anchor_wire_bytes: int = 0,
+    anchor_authored_bytes: int | None = None,
+    anchor_status: ContextBudgetAnchorStatus = "no_previous_call",
+    authored_bytes: int = 0,
 ) -> ContextBudgetDecision:
     """Decide which segments to shed from one request, or refuse.
 
@@ -172,8 +196,17 @@ def decide_context_budget(
     included. One measure serves both ceilings. It is what the gateway's body
     cap sees, so ``max_request_bytes`` bounds it directly; and it counts
     everything the model reads (content, tool-call arguments, thinking
-    blocks, tool definitions), so with a ratio calibrated on the same measure
-    it gives the token estimate.
+    blocks, tool definitions). Authored bytes keep the fallback rate even when
+    an anchor exists. The other arm pays the anchor's ENTIRE reported count
+    plus every non-shared byte. Use the smaller arm unless the anchor's own
+    provider count refutes its authored-model estimate; then use the anchored
+    arm alone.
+    Shared bytes must belong only to unchanged protected messages/tools;
+    no segment saving may overlap them. This deliberately gives no token
+    credit for content removed from the anchor. It assumes provider accounting
+    is additive across independently framed messages/tools and unchanged
+    content on the same model/dialect retains its price. Hidden provider-side
+    expansion is outside the byte bound, as it is for conservative admission.
 
     A segment's ``saving_bytes`` must never exceed what shedding it removes
     from the wire, and should be close to it: callers count what the segment
@@ -184,17 +217,64 @@ def decide_context_budget(
     in the size, which grows with the history until a request that fits once
     shed is refused.
     """
-    if bytes_per_token is not None and not (math.isfinite(bytes_per_token) and bytes_per_token > 0):
-        raise ValueError("bytes_per_token must be a finite positive number or None")
-    ratio = bytes_per_token if bytes_per_token is not None else policy.fallback_bytes_per_token
+    if type(request_bytes) is not int or request_bytes < 0:
+        raise ValueError("request_bytes must be a non-negative exact integer")
+    if len({segment.key for segment in segments}) != len(segments):
+        raise ValueError("segment keys must be unique")
+    savings = sum(segment.saving_bytes for segment in segments)
+    if savings > request_bytes:
+        raise ValueError("segment savings exceed request_bytes")
+    if type(anchor_shared_bytes) is not int or not 0 <= anchor_shared_bytes <= request_bytes - savings:
+        raise ValueError("anchor shared bytes must exclude every sheddable byte")
+    if anchor_tokens is not None and (type(anchor_tokens) is not int or anchor_tokens <= 0):
+        raise ValueError("anchor_tokens must be a positive exact integer")
+    if anchor_tokens is None and anchor_shared_bytes:
+        raise ValueError("shared bytes require an anchor")
+    if anchor_authored_bytes is not None and (
+        type(anchor_authored_bytes) is not int or not 0 <= anchor_authored_bytes <= anchor_wire_bytes
+    ):
+        raise ValueError("anchor authored bytes must fit the anchor request")
+    if type(authored_bytes) is not int or not 0 <= authored_bytes <= request_bytes - savings:
+        raise ValueError("authored bytes must exclude every sheddable byte")
     high = policy.shed_above * policy.max_prompt_tokens
     low = policy.shed_to * policy.max_prompt_tokens
 
+    # When the protected prefix makes the low mark unreachable, shed only
+    # to the high mark. If even that is unreachable, exhaust the segments
+    # before judging the hard ceilings. Current requests are never segments.
+    def authored_tokens(size: int) -> int:
+        return size - authored_bytes + math.ceil(authored_bytes / policy.fallback_bytes_per_token)
+
+    authored_refuted = anchor_tokens is not None and (
+        anchor_authored_bytes is None
+        or (
+            anchor_tokens <= anchor_wire_bytes <= 8 * anchor_tokens
+            and anchor_wire_bytes - anchor_authored_bytes + math.ceil(anchor_authored_bytes / policy.fallback_bytes_per_token)
+            < anchor_tokens
+        )
+    )
+
     def tokens(size: int) -> int:
-        return math.ceil(size / ratio)
+        if anchor_tokens is None:
+            return authored_tokens(size)
+        if authored_refuted:
+            return anchor_tokens + size - anchor_shared_bytes
+        return min(authored_tokens(size), anchor_tokens + size - anchor_shared_bytes)
+
+    def pricing(size: int) -> ContextBudgetPricing:
+        mode: Literal["anchored", "conservative", "authored_prefix"] = "conservative"
+        if anchor_tokens is not None and (authored_refuted or anchor_tokens + size - anchor_shared_bytes < authored_tokens(size)):
+            mode = "anchored"
+        elif authored_bytes:
+            mode = "authored_prefix"
+        return ContextBudgetPricing(
+            mode, anchor_status, anchor_tokens, anchor_wire_bytes, anchor_shared_bytes, size, authored_bytes, authored_refuted
+        )
+
+    target = high if tokens(request_bytes - savings) > low else low
 
     def fits_low(size: int) -> bool:
-        return tokens(size) <= low and size <= policy.max_request_bytes
+        return size <= low and size <= policy.max_request_bytes
 
     tokens_before = tokens(request_bytes)
 
@@ -219,7 +299,7 @@ def decide_context_budget(
         )
         after = kept
         for segment in remaining:
-            if fits_low(after):
+            if tokens(after) <= target and after <= policy.max_request_bytes:
                 break
             shed.append(segment)
             after -= segment.saving_bytes
@@ -227,16 +307,16 @@ def decide_context_budget(
     bytes_after = request_bytes - sum(segment.saving_bytes for segment in shed)
     tokens_after = tokens(bytes_after)
     if tokens_after > policy.max_prompt_tokens:
-        raise ContextBudgetRefusal(ceiling="tokens", estimated_tokens=tokens_after, request_bytes=bytes_after)
+        raise ContextBudgetRefusal(ceiling="tokens", estimated_tokens=tokens_after, request_bytes=bytes_after, pricing=pricing(bytes_after))
     if bytes_after > policy.max_request_bytes:
-        raise ContextBudgetRefusal(ceiling="bytes", estimated_tokens=tokens_after, request_bytes=bytes_after)
+        raise ContextBudgetRefusal(ceiling="bytes", estimated_tokens=tokens_after, request_bytes=bytes_after, pricing=pricing(bytes_after))
 
     return ContextBudgetDecision(
         policy_hash=policy.audit_hash,
-        bytes_per_token=ratio,
         request_bytes_before=request_bytes,
         estimated_tokens_before=tokens_before,
         request_bytes_after=bytes_after,
         estimated_tokens_after=tokens_after,
         shed_keys=tuple(segment.key for segment in shed),
+        pricing=pricing(bytes_after),
     )
