@@ -206,7 +206,7 @@ For ordinary build/edit turns, the action path is:
 | Change a small exact span of an existing LLM prompt | `inspect_prompt_targets`, then `change_substring` |
 | Add or rewire a node in an existing pipeline, when neither narrower row above fits | `upsert_node` / `upsert_edge` |
 
-For a small edit to an existing prompt, call `inspect_prompt_targets` for the node and use its state ID and SHA-256 with `change_substring`. Send the smallest `old` substring that matches exactly once; use `replace_all` only when every occurrence should change. After a successful edit, call `inspect_prompt_targets` in a later tool batch to obtain the committed revision ID. If the tool returns `target_changed`, inspect again before retrying. A changed prompt needs fresh review.
+For a small edit to an existing prompt, call `inspect_prompt_targets` for the node and use its state ID and SHA-256 with `change_substring`; do not resend the whole prompt through `patch_node_options` to change part of it. Send the smallest `old` substring that matches exactly once; use `replace_all` only when every occurrence should change. After a successful edit, call `inspect_prompt_targets` in a later tool batch to obtain the committed revision ID. If the tool returns `target_changed`, inspect again before retrying. A changed prompt needs fresh review.
 
 The narrower tools also support staged construction of a new pipeline. Preserve
 existing components when extending a saved draft; use a full replacement only
