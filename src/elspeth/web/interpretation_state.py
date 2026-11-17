@@ -2791,21 +2791,52 @@ def prompt_review_anchor_hash_from_options(options: Mapping[str, Any]) -> str | 
     * unstructured single-prompt node → ``None``; callers use
       ``stable_hash(prompt_template)``.
     """
+    base_anchor: str | None
     surface = multi_query_prompt_surface_from_options(options)
     if surface is not None:
-        return surface.anchor_hash()
-    structure = prompt_structure_hash_from_options(options)
-    system = options["system_prompt"] if "system_prompt" in options else None
-    if system is None:
-        return structure
-    prompt = options["prompt_template"] if "prompt_template" in options else None
-    return stable_hash(
-        {
-            "domain": "elspeth.single-prompt-review.v1",
-            "node_prompt": structure if structure is not None else stable_hash(prompt),
-            "system_prompt": system,
-        }
-    )
+        base_anchor = surface.anchor_hash()
+    else:
+        structure = prompt_structure_hash_from_options(options)
+        system = options["system_prompt"] if "system_prompt" in options else None
+        if system is None:
+            base_anchor = structure
+        else:
+            prompt = options["prompt_template"] if "prompt_template" in options else None
+            base_anchor = stable_hash(
+                {
+                    "domain": "elspeth.single-prompt-review.v1",
+                    "node_prompt": structure if structure is not None else stable_hash(prompt),
+                    "system_prompt": system,
+                }
+            )
+
+    # The existing inline domains stay intact. File-backed requirements add
+    # the marker identity so a re-point to equal bytes cannot reuse a card.
+    file_bindings: list[dict[str, str]] = []
+
+    def add_binding(path: str, value: object) -> None:
+        marker = is_widened_blob_ref(deep_thaw(value))
+        if marker is not None and marker.mode == "inline_content":
+            if type(marker.sha256) is not str:
+                raise ValueError("file-backed prompt marker requires a SHA-256 hash")
+            file_bindings.append({"field_path": path, "blob_id": str(marker.blob_id), "sha256": marker.sha256, "encoding": marker.encoding})
+
+    for key in ("prompt_template", "system_prompt"):
+        if key in options:
+            add_binding(key, options[key])
+    queries = options["queries"] if "queries" in options else None
+    if isinstance(queries, Mapping):
+        for name, entry in queries.items():
+            if isinstance(entry, Mapping) and "template" in entry:
+                add_binding(f"queries.{name}.template", entry["template"])
+    elif isinstance(queries, (list, tuple)):
+        for index, entry in enumerate(queries):
+            if isinstance(entry, Mapping) and "template" in entry:
+                add_binding(f"queries.{index}.template", entry["template"])
+    if not file_bindings:
+        return base_anchor
+    file_bindings.sort(key=lambda binding: binding["field_path"])
+    return stable_hash({"domain": "elspeth.file-prompt-requirement.v1", "base_anchor": base_anchor, "bindings": file_bindings})
 
 
 @trust_boundary(
@@ -2818,11 +2849,10 @@ def prompt_review_anchor_hash_from_options(options: Mapping[str, Any]) -> str | 
     test_fingerprint="8fa66b482b95e4f28e3a87d6a002972ad57a000eadbd54b167f5d793a436cbbf",
 )
 def approved_prompt_artifact_hash_from_options(options: Mapping[str, Any]) -> str | None:
-    """Hash resolved text, or return no approval link for unresolved blob sources.
+    """Hash effective text after resolution, or return None for deferred files.
 
-    Uploaded content is verified through blob identity, hash and resolution
-    records. It does not acquire full-text approval merely by substituting
-    after a review. Per-site review evidence remains independently enforced.
+    File-backed review evidence binds the blob identity and bytes separately;
+    this existing hash domain continues to describe the effective prompt text.
     """
     prompt = options["prompt_template"] if "prompt_template" in options else None
     system = options["system_prompt"] if "system_prompt" in options else None
@@ -2882,8 +2912,8 @@ def prompt_review_draft_from_options(options: Mapping[str, Any]) -> str | None:
     """The text the operator reviews for an LLM node's prompt-template review.
 
     Multi-query nodes review the rendered prompt surface; every other shape
-    keeps reviewing ``prompt_template`` itself. ``None`` when the node carries
-    no string ``prompt_template`` (nothing to review yet).
+    keeps reviewing ``prompt_template`` itself. A deferred file marker gets a
+    bounded label; the full text lives in the event-bound snapshot read.
 
     Both shapes stay within ``PROMPT_SURFACE_REVIEW_MAX_CHARS`` so the draft
     always fits the bounded ``llm_draft`` wire field. A single-prompt template
@@ -2892,6 +2922,29 @@ def prompt_review_draft_from_options(options: Mapping[str, Any]) -> str | None:
     bounded: the review anchor and the node-level
     ``resolved_prompt_template_hash`` cover the complete template.
     """
+    # A file marker is a deferred text source.  Its bounded event draft is a
+    # label only; the complete, custody-read text is supplied by the prompt
+    # review snapshot endpoint before the card can be approved.
+    file_labels: list[str] = []
+    for key in ("prompt_template", "system_prompt"):
+        marker = is_widened_blob_ref(deep_thaw(options[key])) if key in options else None
+        if marker is not None and marker.mode == "inline_content":
+            file_labels.append(f"{key}: file {marker.blob_id} (SHA-256 {marker.sha256})")
+    queries = options["queries"] if "queries" in options else None
+    if isinstance(queries, Mapping):
+        query_entries = [(str(name), entry) for name, entry in queries.items()]
+    elif isinstance(queries, (list, tuple)):
+        query_entries = [(str(index), entry) for index, entry in enumerate(queries)]
+    else:
+        query_entries = []
+    for name, entry in query_entries:
+        if not isinstance(entry, Mapping) or "template" not in entry:
+            continue
+        marker = is_widened_blob_ref(deep_thaw(entry["template"]))
+        if marker is not None and marker.mode == "inline_content":
+            file_labels.append(f"queries.{name}.template: file {marker.blob_id} (SHA-256 {marker.sha256})")
+    if file_labels:
+        return "File-backed prompt pending full-content review:\n" + "\n".join(sorted(file_labels))
     surface = multi_query_prompt_surface_from_options(options)
     if surface is not None:
         return surface.render_for_review()

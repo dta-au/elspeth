@@ -587,6 +587,7 @@ _REQUIRED_COLUMNS += (
     ("operations", "occurrence_index"),
     *(("collector_group_failures", column.name) for column in metadata.tables["collector_group_failures"].columns),
     ("rows", "source_contract_json"),
+    *(("run_prompt_inputs", column.name) for column in metadata.tables["run_prompt_inputs"].columns),
 )
 
 # Required foreign keys for audit integrity (Tier 1 trust).

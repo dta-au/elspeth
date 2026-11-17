@@ -58,7 +58,9 @@ def test_epoch_is_forty_seven() -> None:
     # source-row replay, and admits the resume_refused coordination event.
     # Epoch 49 adds the pending-identity purge event to the closed auth trail.
     # Epoch 50 retains provider-returned model attribution with call outcomes.
-    assert SQLITE_SCHEMA_EPOCH == 50
+    # Epoch 51 adds exact admitted file prompt inputs.
+    assert SQLITE_SCHEMA_EPOCH == 51
+    assert ("run_prompt_inputs", "content_sha256") in set(_REQUIRED_COLUMNS)
     assert ("calls", "returned_model") in set(_REQUIRED_COLUMNS)
     assert ("rows", "source_contract_json") in set(_REQUIRED_COLUMNS)
     assert ("node_states", "ix_node_states_run") in set(_REQUIRED_INDEXES)

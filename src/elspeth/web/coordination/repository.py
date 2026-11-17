@@ -123,6 +123,7 @@ from elspeth.web.sessions.models import (
     interpretation_events_table,
     library_entries_table,
     output_storage_reservations_table,
+    prompt_review_snapshots_table,
     proposal_blob_effect_receipts_table,
     proposal_events_table,
     quota_provider_attempts_table,
@@ -1355,6 +1356,36 @@ class _RepositoryInterpretationMutations:
                 surface_origin=command.surface_origin.value,
             )
         )
+        if command.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
+            from elspeth.web.sessions.prompt_file_review import (
+                PromptFileReviewStale,
+                prompt_file_binding_paths,
+                resolve_prompt_review_snapshot,
+            )
+
+            node = next((item for item in live_state.nodes or () if item["id"] == command.affected_node_id), None)
+            if node is not None:
+                options = node["options"]
+                if prompt_file_binding_paths(options):
+                    if inline_blob_snapshot is None:
+                        raise PromptFileReviewStale()
+                    file_snapshot = resolve_prompt_review_snapshot(
+                        session_id=UUID(state._session_id),
+                        node_id=command.affected_node_id,
+                        options=options,
+                        read_blob=inline_blob_snapshot.content,
+                    )
+                    if file_snapshot is None:
+                        raise AuditIntegrityError("file prompt event lost its binding during snapshot derivation")
+                    connection.execute(
+                        insert(prompt_review_snapshots_table).values(
+                            event_id=str(command.event_id),
+                            session_id=state._session_id,
+                            anchor=file_snapshot.anchor,
+                            snapshot_json=file_snapshot.payload(),
+                            created_at=command.created_at,
+                        )
+                    )
         appended_record = None
         if appended_state is not None:
             predecessor = connection.execute(

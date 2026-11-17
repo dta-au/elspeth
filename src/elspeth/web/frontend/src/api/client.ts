@@ -61,6 +61,7 @@ import type {
   InterpretationResolveResponse,
   ListInterpretationEventsResponse,
   OptOutSummaryResponse,
+  PromptReviewSnapshotResponse,
 } from "@/types/interpretation";
 import type { RecoveryTranscriptRow } from "@/types/recovery";
 import type {
@@ -1816,6 +1817,18 @@ export async function listInterpretationEvents(
   );
   const body = await parseResponse<ListInterpretationEventsResponse>(response);
   return body.events;
+}
+
+export async function getPromptReviewSnapshot(
+  sessionId: string,
+  eventId: string,
+  signal?: AbortSignal,
+): Promise<PromptReviewSnapshotResponse> {
+  const response = await authFetch(
+    `/api/sessions/${sessionId}/interpretations/${eventId}/prompt`,
+    { method: "GET", headers: authHeaders(), signal },
+  );
+  return parseResponse<PromptReviewSnapshotResponse>(response);
 }
 
 /**

@@ -25,7 +25,7 @@
 // ============================================================================
 
 import type { CompositionState } from "@/types/index";
-import type { InterpretationEvent } from "@/types/interpretation";
+import type { InterpretationEvent, PromptReviewSnapshotResponse } from "@/types/interpretation";
 
 /**
  * The literal the backend authoring render substitutes for an unresolved
@@ -142,6 +142,62 @@ interface MultiQuerySurface {
 /** A JSON object value (not an array, not null). */
 function isJsonObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isDeferredTextMarker(value: unknown): boolean {
+  return isJsonObject(value) &&
+    value.mode === "inline_content" &&
+    typeof value.blob_ref === "string" &&
+    typeof value.sha256 === "string";
+}
+
+/** The card must load its immutable full-text snapshot for these options. */
+export function hasFilePromptBinding(
+  state: CompositionState | null,
+  event: InterpretationEvent,
+): boolean {
+  const node = state?.nodes.find((candidate) => candidate.id === event.affected_node_id);
+  if (node === undefined) return false;
+  const options = node.options;
+  if (isDeferredTextMarker(options.prompt_template) || isDeferredTextMarker(options.system_prompt)) return true;
+  return wellFormedQueryEntries(options.queries).some(([, entry]) => isDeferredTextMarker(entry.template));
+}
+
+function stateWithSnapshotText(
+  state: CompositionState,
+  event: InterpretationEvent,
+  snapshot: PromptReviewSnapshotResponse,
+): CompositionState {
+  return {
+    ...state,
+    nodes: state.nodes.map((node) => {
+      if (node.id !== event.affected_node_id) return node;
+      const options = { ...node.options };
+      for (const binding of snapshot.bindings) {
+        if (binding.field_path === "prompt_template" || binding.field_path === "system_prompt") {
+          options[binding.field_path] = binding.text;
+          continue;
+        }
+        const match = /^queries\.([^.]+)\.template$/.exec(binding.field_path);
+        if (match === null) continue;
+        const queries = options.queries;
+        if (Array.isArray(queries)) {
+          const index = Number(match[1]);
+          if (Number.isInteger(index) && index >= 0 && index < queries.length && isJsonObject(queries[index])) {
+            const copy = [...queries];
+            copy[index] = { ...queries[index] as Record<string, unknown>, template: binding.text };
+            options.queries = copy;
+          }
+        } else if (isJsonObject(queries) && isJsonObject(queries[match[1]])) {
+          options.queries = {
+            ...queries,
+            [match[1]]: { ...queries[match[1]] as Record<string, unknown>, template: binding.text },
+          };
+        }
+      }
+      return { ...node, options };
+    }),
+  };
 }
 
 /**
@@ -317,7 +373,25 @@ function segmentsFromSurface(
 export function resolvePromptDisplaySegments(
   state: CompositionState | null,
   event: InterpretationEvent,
+  snapshot: PromptReviewSnapshotResponse | null = null,
 ): PromptDisplayResult {
+  if (hasFilePromptBinding(state, event)) {
+    if (snapshot === null || snapshot.event_id !== event.id || !snapshot.is_live_review || state === null) {
+      return {
+        segments: [{ kind: "text", text: "Prompt file content is loading or has changed. Open the current review card." }],
+        usedFallback: false,
+        reviewAvailable: false,
+      };
+    }
+    const resolved = resolvePromptDisplaySegments(stateWithSnapshotText(state, event, snapshot), event);
+    const labels = snapshot.bindings.map((binding) => `File: ${binding.filename} (${binding.field_path})`).join("\n");
+    return {
+      ...resolved,
+      segments: [{ kind: "text", text: `${labels}\n\n` }, ...resolved.segments],
+      usedFallback: false,
+      reviewAvailable: resolved.reviewAvailable,
+    };
+  }
   const node =
     event.affected_node_id !== null
       ? (state?.nodes.find((n) => n.id === event.affected_node_id) ?? null)

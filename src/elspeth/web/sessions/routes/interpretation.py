@@ -4,6 +4,8 @@ from typing import Annotated, Literal
 
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.sessions.prompt_file_approval import PromptFileApprovalStale
+from elspeth.web.sessions.prompt_file_review import PromptFileReviewStale
 
 from ._helpers import (
     UUID,
@@ -202,6 +204,11 @@ def register_interpretation_routes(router: APIRouter) -> None:
                     "message": "This interpretation kind does not support inline amendment in this release.",
                 },
             ) from exc
+        except (PromptFileApprovalStale, PromptFileReviewStale) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "prompt_file_review_stale", "message": str(exc)},
+            ) from exc
         except AuditIntegrityError as exc:
             raise HTTPException(
                 status_code=500,
@@ -218,6 +225,23 @@ def register_interpretation_routes(router: APIRouter) -> None:
             event=_interpretation_event_response(event),
             new_state=_state_response(new_state),
         )
+
+    @router.get(
+        "/{session_id}/interpretations/{event_id}/prompt",
+    )
+    async def get_interpretation_prompt_snapshot(
+        session_id: UUID,
+        event_id: UUID,
+        raw_request: Request,
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
+    ) -> dict[str, object]:
+        """Return the complete, escaped-by-JSON historical review text."""
+        await _verify_session_ownership(session_id, user, raw_request)
+        service: SessionServiceProtocol = raw_request.app.state.session_service
+        snapshot = await service.get_prompt_review_snapshot(session_id, event_id)
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail={"code": "prompt_review_snapshot_not_found"})
+        return dict(snapshot)
 
     @router.get(
         "/{session_id}/interpretations",

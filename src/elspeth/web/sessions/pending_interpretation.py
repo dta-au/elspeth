@@ -13,6 +13,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast, final
 from uuid import UUID
 
+from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.composer_interpretation import (
     INTERPRETATION_HASH_DOMAIN_V2,
     InterpretationChoice,
@@ -54,6 +55,7 @@ from elspeth.web.sessions.interpretation_validation import (
     SessionInterpretationValidationInputs,
     validate_composition_state_with_interpretation_inputs,
 )
+from elspeth.web.sessions.prompt_file_review import PromptReviewSnapshot
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateRecord,
@@ -187,10 +189,11 @@ def _find_llm_transform_node(
         if multi_query_prompt_surface_from_options(options) is not None:
             approved_prompt_artifact_hash_from_options(options)
             return node
-        if "prompt_template" not in options or type(options["prompt_template"]) is not str:
+        prompt_value = options["prompt_template"] if "prompt_template" in options else None
+        prompt_marker = is_widened_blob_ref(deep_thaw(prompt_value))
+        if type(prompt_value) is not str and (prompt_marker is None or prompt_marker.mode != "inline_content"):
             raise InterpretationPlaceholderConsumedError(f"{context}: node {affected_node_id!r} options.prompt_template is not a string")
-        prompt_template = options["prompt_template"]
-        if not prompt_template:
+        if not prompt_value:
             raise InterpretationPlaceholderConsumedError(
                 f"{context}: node {affected_node_id!r} must declare non-empty options.prompt_template"
             )
@@ -555,7 +558,8 @@ def _reviewed_content_identity(
         structure_hash = prompt_review_anchor_hash_from_options(options)
         if structure_hash is None:
             prompt_template = options["prompt_template"] if "prompt_template" in options else None
-            if type(prompt_template) is not str:
+            marker = is_widened_blob_ref(deep_thaw(prompt_template))
+            if type(prompt_template) is not str and (marker is None or marker.mode != "inline_content"):
                 raise InterpretationPlaceholderConsumedError(f"{context}: llm_prompt_template review requires options.prompt_template")
             structure_hash = stable_hash(prompt_template)
         domain["artifact_hash"] = structure_hash
@@ -1122,6 +1126,7 @@ def _resolve_prompt_template_review(
     user_term: str,
     accepted_value: str,
     surfacing_structure_hash: str | None,
+    file_snapshot: PromptReviewSnapshot | None = None,
 ) -> tuple[Mapping[str, Mapping[str, Any]] | None, list[Mapping[str, Any]], str | None]:
     node = _find_llm_transform_node(
         state_record,
@@ -1133,7 +1138,12 @@ def _resolve_prompt_template_review(
         message=f"resolve_interpretation_event: node {affected_node_id!r} options is not a mapping",
     )
     prompt_template = options["prompt_template"] if "prompt_template" in options else None
-    if type(prompt_template) is not str and multi_query_prompt_surface_from_options(options) is None:
+    marker = is_widened_blob_ref(deep_thaw(prompt_template))
+    if (
+        type(prompt_template) is not str
+        and multi_query_prompt_surface_from_options(options) is None
+        and (marker is None or marker.mode != "inline_content")
+    ):
         raise InterpretationPlaceholderConsumedError(
             f"resolve_interpretation_event: node {affected_node_id!r} options.prompt_template is not a string"
         )
@@ -1172,7 +1182,9 @@ def _resolve_prompt_template_review(
     # The event and runtime node share the effective artifact identity. The
     # requirement separately attests the authored surface/skeleton, so resolving
     # a vague-term slot does not invalidate the approval of that skeleton.
-    artifact_hash = approved_prompt_artifact_hash_from_options(options)
+    artifact_hash = (
+        file_snapshot.effective_artifact_hash if file_snapshot is not None else approved_prompt_artifact_hash_from_options(options)
+    )
     structure_hash = prompt_review_anchor_hash_from_options(options)
     requirement_anchor_hash = structure_hash if structure_hash is not None else stable_hash(prompt_template)
     requirement = dict(requirements[matching_index])
@@ -1861,7 +1873,12 @@ class _SessionPendingInterpretationPlanner:
                         )
             elif kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
                 prompt_template = options["prompt_template"] if "prompt_template" in options else None
-                if type(prompt_template) is not str and multi_query_prompt_surface_from_options(options) is None:
+                marker = is_widened_blob_ref(deep_thaw(prompt_template))
+                if (
+                    type(prompt_template) is not str
+                    and multi_query_prompt_surface_from_options(options) is None
+                    and (marker is None or marker.mode != "inline_content")
+                ):
                     raise ValueError(
                         f"create_pending_interpretation_event: node {affected_node_id!r} options.prompt_template is not a string"
                     )

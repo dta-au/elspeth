@@ -38,8 +38,9 @@ from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.canonical import stable_hash
 from elspeth.web.composer.source_demand import SOURCE_DATA_CONTRACT_USER_TERM, build_source_data_contract_draft
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
+from elspeth.web.composer.tools._common import _options_with_default_prompt_template_review
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, SOURCE_AUTHORING_KEY, SOURCE_COMPONENT_ID
-from elspeth.web.sessions.models import session_operation_fences_table
+from elspeth.web.sessions.models import prompt_review_snapshots_table, session_operation_fences_table
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateProvenance,
@@ -660,6 +661,37 @@ async def test_08_resolve_event_from_different_session_returns_404(
         test_client,
         f"/api/sessions/{seeded_a['session_id']}/interpretations/{seeded_b['event'].id}/resolve",
         json={"choice": "accepted_as_drafted"},
+    )
+    assert response.status_code == 404, response.text
+
+
+@pytest.mark.asyncio
+async def test_prompt_snapshot_route_refuses_non_owner_before_read(test_client: TestClient) -> None:
+    node = _llm_node(user_term="file")
+    node["options"] = _options_with_default_prompt_template_review(node_id=node["id"], plugin="llm", options=node["options"])
+    seeded = await _seed_session_with_pending_event(
+        test_client,
+        user_id="bob",
+        node=node,
+        user_term="llm_prompt_template:llm_transform_1",
+        kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
+        llm_draft=node["options"]["prompt_template"],
+    )
+    # A present snapshot row makes this an authorization test: without the
+    # ownership check the reader reaches the row and this request cannot 404.
+    with test_client.app.state.phase3_engine.begin() as conn:
+        conn.execute(
+            prompt_review_snapshots_table.insert().values(
+                event_id=str(seeded["event"].id),
+                session_id=str(seeded["session_id"]),
+                anchor="a" * 64,
+                snapshot_json={},
+                created_at=datetime.now(UTC),
+            )
+        )
+    response = await _get(
+        test_client,
+        f"/api/sessions/{seeded['session_id']}/interpretations/{seeded['event'].id}/prompt",
     )
     assert response.status_code == 404, response.text
 

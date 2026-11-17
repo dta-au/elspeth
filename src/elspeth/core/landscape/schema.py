@@ -479,7 +479,9 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        item that the new resume refuses as corruption, so only a bump — not
 #        a fold — keeps such a store from opening. Populated epoch-47 stores
 #        require delete/recreate.
-SQLITE_SCHEMA_EPOCH = 50
+#   51 → run_prompt_inputs records the exact approved prompt-file identities
+#        and bytes admitted for a Web run before its first provider call.
+SQLITE_SCHEMA_EPOCH = 51
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -600,6 +602,23 @@ runs_table = Table(
     CheckConstraint(_LowerHex64Check("openrouter_catalog_sha256"), name="ck_runs_openrouter_catalog_sha256_hex"),
 )
 Index("uq_runs_export_witness", runs_table.c.run_id, runs_table.c.status, runs_table.c.completed_at, unique=True)
+
+run_prompt_inputs_table = Table(
+    "run_prompt_inputs",
+    metadata,
+    Column("run_id", String(64), nullable=False),
+    Column("node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
+    Column("field_path", String(256), nullable=False),
+    Column("blob_id", String(36), nullable=False),
+    Column("content_sha256", String(64), nullable=False),
+    Column("review_anchor", String(64), nullable=False),
+    Column("effective_artifact_hash", String(64), nullable=True),
+    Column("admitted_at", DateTime(timezone=True), nullable=False),
+    PrimaryKeyConstraint("run_id", "node_id", "field_path", name="pk_run_prompt_inputs"),
+    CheckConstraint(_LowerHex64Check("content_sha256"), name="ck_run_prompt_inputs_content_sha256"),
+    CheckConstraint(_LowerHex64Check("review_anchor"), name="ck_run_prompt_inputs_review_anchor"),
+    CheckConstraint(_OptionalLowerHex64Check("effective_artifact_hash"), name="ck_run_prompt_inputs_artifact_hash"),
+)
 
 run_start_admissions_table = Table(
     "run_start_admissions",

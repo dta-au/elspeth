@@ -4546,33 +4546,39 @@ class TestImportRebindsSharedFiles:
         assert await service.get_current_state(session.id) is None
 
     @pytest.mark.asyncio
-    async def test_import_inline_binding_refuses_llm_authored_blob_on_prompt_surface(self, tmp_path: Path) -> None:
+    async def test_import_inline_binding_stages_llm_authored_prompt_review(self, tmp_path: Path) -> None:
         from dataclasses import replace as dataclass_replace
 
+        from fastapi import HTTPException
+
         from elspeth.contracts.enums import CreationModality
+        from elspeth.contracts.freeze import deep_thaw
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+        from elspeth.web.sessions.routes.composer.state import InlineBlobBindingRequest, _state_with_imported_inline_blobs
 
         app, service = _make_app(tmp_path)
-        client = TestClient(app)
         session = await service.create_session("alice", "Rebind", "local")
         blob = dataclass_replace(
             _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A),
             creation_modality=CreationModality.LLM_GENERATED,
         )
         app.state.blob_service = _blob_service_for(blob)
-
-        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_rebind_preflight):
-            resp = client.post(
-                f"/api/sessions/{session.id}/state/yaml",
-                json={
-                    "yaml": _REBIND_LLM_YAML,
-                    "inline_blob_bindings": {"node:score.options.prompt_template": {"blob_id": str(blob.id)}},
-                },
+        imported = composition_state_from_runtime_yaml(_REBIND_LLM_YAML)
+        try:
+            rebound = await _state_with_imported_inline_blobs(
+                imported,
+                inline_blob_bindings={"node:score.options.prompt_template": InlineBlobBindingRequest(blob_id=str(blob.id))},
+                request=SimpleNamespace(app=app),
+                session_id=session.id,
+                session_operation_context=None,
             )
-
-        assert resp.status_code == 400, resp.text
-        assert resp.json()["detail"].startswith(
-            f"wire_blob_inline_ref cannot wire LLM-authored blob '{blob.id}' into LLM node 'score' option 'prompt_template'"
-        )
+        except HTTPException:
+            rebound = None
+        assert rebound is not None
+        options = deep_thaw(rebound.nodes[0].options)
+        [review] = [item for item in options["interpretation_requirements"] if item["kind"] == "llm_prompt_template"]
+        assert review["status"] == "pending"
+        assert str(blob.id) in review["draft"]
         assert await service.get_current_state(session.id) is None
 
     @staticmethod

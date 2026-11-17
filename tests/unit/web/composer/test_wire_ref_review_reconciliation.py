@@ -17,12 +17,14 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any, Literal, cast
+from uuid import UUID
 
 import pytest
 
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.secrets import ResolvedSecret, SecretInventoryItem
+from elspeth.web.composer.interpretation_surfacing import _backend_surface_args_for_site
 from elspeth.web.composer.state import CompositionState, NodeSpec
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.tools._common import ToolContext
@@ -133,14 +135,15 @@ def _requirement_status(state: CompositionState, node_id: str, kind: str) -> str
     return status
 
 
-# ── (A) LLM-authored blobs never become an LLM prompt surface or model ──────
+# ── (A) scalar prompt files bind with review; unsupported positions refuse ──
 
 
 # Every option path the shared guard names: the three prompt/model roots, a
 # query's template, and a whole ``queries.<name>`` or ``queries`` value that
 # would carry one. Dropping any arm of the guard turns its row red.
-_GUARDED_FIELDS = ("prompt_template", "model", "system_prompt", "queries.q.template", "queries.q", "queries")
 _LLM_AUTHORED_MODALITIES = tuple(modality for modality in CreationModality if modality.requires_llm_provenance())
+_PROMPT_FILE_FIELDS = ("prompt_template", "system_prompt", "queries.q.template")
+_UNSUPPORTED_FILE_FIELDS = ("model", "queries.q", "queries")
 
 
 def _llm_authored_blob_id(blob_env: dict[str, Any], modality: CreationModality) -> str:
@@ -153,7 +156,7 @@ def _llm_authored_blob_id(blob_env: dict[str, Any], modality: CreationModality) 
 
 
 @pytest.mark.parametrize("modality", _LLM_AUTHORED_MODALITIES, ids=lambda modality: modality.value)
-@pytest.mark.parametrize("field", _GUARDED_FIELDS)
+@pytest.mark.parametrize("field", _UNSUPPORTED_FILE_FIELDS)
 def test_llm_authored_blob_is_refused_into_llm_prompt_surface_and_model(
     blob_env: dict[str, Any], field: str, modality: CreationModality
 ) -> None:
@@ -165,13 +168,13 @@ def test_llm_authored_blob_is_refused_into_llm_prompt_surface_and_model(
     assert result.success is False
     assert result.updated_state is state
     message = result.validation.errors[0].message
-    assert message.startswith(f"wire_blob_inline_ref cannot wire LLM-authored blob '{blob_id}' into LLM node 'classify' option '{field}': ")
+    assert "File-backed LLM prompts bind only" in message
     assert "Planner-written prompt" not in message
 
 
-@pytest.mark.parametrize("field", _GUARDED_FIELDS)
+@pytest.mark.parametrize("field", _PROMPT_FILE_FIELDS)
 def test_user_uploaded_blob_is_accepted_into_every_llm_prompt_surface_and_model(blob_env: dict[str, Any], field: str) -> None:
-    """The accepted control for each guarded field: only the modality decides."""
+    """Each supported scalar stages a prompt review even for a user file."""
     blob = blob_tools._create_blob(blob_env, content="Uploaded prompt {{ row.x }}")
     assert blob.success is True
     state = _with_node_options(blob_tools._inline_ref_state(), "classify", _multi_query_options())
@@ -179,6 +182,40 @@ def test_user_uploaded_blob_is_accepted_into_every_llm_prompt_surface_and_model(
     result = _wire_blob(blob_env, state, f"node:classify.options.{field}", _blob_id(blob))
 
     assert result.success is True, [error.message for error in result.validation.errors]
+    assert _requirement_status(result.updated_state, "classify", "llm_prompt_template") == "pending"
+
+
+@pytest.mark.parametrize("modality", _LLM_AUTHORED_MODALITIES, ids=lambda modality: modality.value)
+@pytest.mark.parametrize("field", _PROMPT_FILE_FIELDS)
+def test_agent_file_wire_stages_prompt_review(blob_env: dict[str, Any], field: str, modality: CreationModality) -> None:
+    blob_id = _llm_authored_blob_id(blob_env, modality)
+    state = _with_node_options(blob_tools._inline_ref_state(), "classify", _multi_query_options())
+    result = _wire_blob(blob_env, state, f"node:classify.options.{field}", blob_id)
+    assert result.success is True, [error.message for error in result.validation.errors]
+    assert _requirement_status(result.updated_state, "classify", "llm_prompt_template") == "pending"
+    assert isinstance(materialize_state_for_execution(result.updated_state), InterpretationReviewPending)
+
+
+def test_agent_file_manual_patch_stages_prompt_review(blob_env: dict[str, Any]) -> None:
+    blob_id = _llm_authored_blob_id(blob_env, CreationModality.LLM_GENERATED)
+    record = blob_env["authority"].mutate(blob_env["operation"], lambda transaction: transaction.blobs.read_blob(blob_id=UUID(blob_id)))
+    marker = {"blob_ref": blob_id, "mode": "inline_content", "sha256": record.content_hash}
+    options = _multi_query_options()
+    options["max_capacity_retry_seconds"] = 1
+    state = _with_node_options(blob_tools._inline_ref_state(), "classify", options)
+    result = blob_tools.execute_tool(
+        "patch_node_options",
+        {"node_id": "classify", "patch": {"prompt_template": marker}},
+        state,
+        blob_tools._catalog(),
+        data_dir=blob_env["data_dir"],
+        session_engine=blob_env["engine"],
+        session_id=blob_env["session_id"],
+        session_operation_context=blob_env["operation"],
+        session_operation_authority=blob_env["authority"],
+    )
+    assert result.success is True, [error.message for error in result.validation.errors]
+    assert _requirement_status(result.updated_state, "classify", "llm_prompt_template") == "pending"
 
 
 def test_llm_authored_blob_refusal_leaves_non_prompt_llm_options_wireable(blob_env: dict[str, Any]) -> None:
@@ -204,6 +241,24 @@ def test_user_uploaded_blob_into_system_prompt_is_still_accepted(blob_env: dict[
     assert marker["mode"] == "inline_content"
 
 
+def test_non_utf8_file_cannot_bind_to_llm_prompt(blob_env: dict[str, Any]) -> None:
+    blob = blob_tools._create_blob(blob_env, content="Prompt text")
+    assert blob.success
+    result = blob_tools.execute_tool(
+        "wire_blob_inline_ref",
+        {"field_path": "node:classify.options.prompt_template", "blob_id": _blob_id(blob), "encoding": "utf-16"},
+        blob_tools._inline_ref_state(),
+        blob_tools._catalog(),
+        data_dir=blob_env["data_dir"],
+        session_engine=blob_env["engine"],
+        session_id=blob_env["session_id"],
+        session_operation_context=blob_env["operation"],
+        session_operation_authority=blob_env["authority"],
+    )
+    assert result.success is False
+    assert result.validation.errors[0].error_code == "inline_blob_field_path_invalid"
+
+
 # ── (B) the wire reconciles authoritative reviews ───────────────────────────
 
 
@@ -222,6 +277,93 @@ def test_resolved_multi_query_surface_review_reopens_after_user_blob_wire(blob_e
         ("classify", "llm_prompt_template")
     ]
     assert isinstance(materialize_state_for_execution(wired), InterpretationReviewPending)
+
+
+def test_repoint_to_identical_file_bytes_reopens_prompt_card(blob_env: dict[str, Any]) -> None:
+    first = blob_tools._create_blob(blob_env, content="Same reviewed text")
+    second = blob_tools._create_blob(blob_env, content="Same reviewed text")
+    assert first.success and second.success
+    first_wired = _wire_blob(
+        blob_env,
+        _reviewed_multi_query_state(),
+        "node:classify.options.queries.q.template",
+        _blob_id(first),
+    )
+    assert first_wired.success
+    options = deep_thaw(first_wired.updated_state.nodes[0].options)
+    anchor = prompt_review_anchor_hash_from_options(options)
+    assert anchor is not None
+    options[INTERPRETATION_REQUIREMENTS_KEY] = [
+        _resolved(
+            "llm_prompt_template:classify",
+            "llm_prompt_template",
+            "llm_prompt_template:classify",
+            artifact_hash=anchor,
+            draft="reviewed file",
+        ),
+        _resolved(
+            "llm_model_choice:classify",
+            "llm_model_choice",
+            "llm_model_choice:classify",
+            artifact_hash=model_choice_artifact_hash(options["model"]),
+            draft=options["model"],
+        ),
+    ]
+    reviewed = _with_node_options(first_wired.updated_state, "classify", options)
+    assert pending_execution_interpretation_sites(reviewed) == ()
+    repointed = _wire_blob(blob_env, reviewed, "node:classify.options.queries.q.template", _blob_id(second))
+    assert repointed.success
+    assert _requirement_status(repointed.updated_state, "classify", "llm_prompt_template") == "pending"
+
+
+def test_wiring_over_reviewed_single_prompt_keeps_a_surfaceable_card(blob_env: dict[str, Any]) -> None:
+    blob = blob_tools._create_blob(blob_env, content="New file prompt {{ row.x }}")
+    options = _multi_query_options()
+    del options["queries"]
+    anchor = prompt_review_anchor_hash_from_options(options)
+    assert anchor is not None
+    options[INTERPRETATION_REQUIREMENTS_KEY] = [
+        _resolved(
+            "llm_prompt_template:classify",
+            "llm_prompt_template",
+            "llm_prompt_template:classify",
+            artifact_hash=anchor,
+            draft="old prompt",
+        )
+    ]
+    state = _with_node_options(blob_tools._inline_ref_state(), "classify", options)
+    result = _wire_blob(blob_env, state, "node:classify.options.prompt_template", _blob_id(blob))
+    assert result.success is True
+    sites = [site for site in pending_execution_interpretation_sites(result.updated_state) if site.kind.value == "llm_prompt_template"]
+    assert len(sites) == 1
+    surfaced = _backend_surface_args_for_site(result.updated_state, sites[0])
+    assert surfaced is not None
+    assert surfaced[0] == "classify"
+
+
+def test_explicit_model_review_is_surfaceable_with_file_prompt(blob_env: dict[str, Any]) -> None:
+    blob = blob_tools._create_blob(blob_env, content="File prompt {{ row.x }}")
+    options = _multi_query_options()
+    del options["queries"]
+    options[INTERPRETATION_REQUIREMENTS_KEY] = [
+        {
+            "id": "llm_model_choice:classify",
+            "kind": "llm_model_choice",
+            "user_term": "llm_model_choice:classify",
+            "status": "pending",
+            "draft": _MODEL,
+            "event_id": None,
+            "accepted_value": None,
+            "accepted_artifact_hash": None,
+            "resolved_prompt_template_hash": None,
+        }
+    ]
+    state = _with_node_options(blob_tools._inline_ref_state(), "classify", options)
+    result = _wire_blob(blob_env, state, "node:classify.options.prompt_template", _blob_id(blob))
+    assert result.success is True
+    model_sites = [site for site in pending_execution_interpretation_sites(result.updated_state) if site.kind.value == "llm_model_choice"]
+    assert len(model_sites) == 1
+    assert _backend_surface_args_for_site(result.updated_state, model_sites[0]) == ("classify", "llm_model_choice:classify", _MODEL)
 
 
 @pytest.mark.parametrize("field", ["abuse_contact", "scraping_reason"])

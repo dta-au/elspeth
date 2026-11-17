@@ -68,7 +68,9 @@ from elspeth.web.sessions.composer_operations import COMPOSER_OPERATION_REQUEST_
 # Epoch 78 binds settled provider attempts to the exact ledger custody tuple,
 # rejects negative token measures, records shared rate bucket policy, and
 # reserves local run output storage before writing physical bytes.
-SESSION_SCHEMA_EPOCH = 78
+# Epoch 79 adds file-prompt review snapshots and approval evidence. Earlier
+# rows remain valid with no snapshot; older databases are preserved/refused.
+SESSION_SCHEMA_EPOCH = 79
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -1290,6 +1292,50 @@ Index(
 Index(
     "ix_interpretation_events_composition_state",
     interpretation_events_table.c.composition_state_id,
+)
+
+# Full text is retained with the event, outside ordinary event-list responses.
+# Legacy events simply have no row here and continue to load unchanged.
+prompt_review_snapshots_table = Table(
+    "prompt_review_snapshots",
+    metadata,
+    Column("event_id", String(36), ForeignKey("interpretation_events.id", ondelete="CASCADE"), primary_key=True),
+    Column("session_id", String(36), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False),
+    Column("anchor", String(64), nullable=False),
+    Column("snapshot_json", JSON, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    *_lower_sha256_constraints("anchor", name="ck_prompt_review_snapshots_anchor_format"),
+)
+Index("ix_prompt_review_snapshots_session", prompt_review_snapshots_table.c.session_id)
+
+# An editor save has no card event. Both triggers write the same append-only
+# evidence shape; the latest row per binding is the admission authority.
+prompt_file_approvals_table = Table(
+    "prompt_file_approvals",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column("session_id", String(36), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False),
+    Column("node_id", String, nullable=False),
+    Column("field_path", String, nullable=False),
+    Column("blob_id", String(36), ForeignKey("blobs.id"), nullable=False),
+    Column("content_sha256", String(64), nullable=False),
+    Column("review_anchor", String(64), nullable=False),
+    Column("effective_artifact_hash", String(64), nullable=True),
+    Column("event_id", String(36), ForeignKey("interpretation_events.id"), nullable=True),
+    Column("actor_user_id", String, nullable=False),
+    Column("trigger", String(16), nullable=False),
+    Column("approved_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint("trigger IN ('card', 'editor_save')", name="ck_prompt_file_approvals_trigger"),
+    *_lower_sha256_constraints("content_sha256", name="ck_prompt_file_approvals_content_hash_format"),
+    *_lower_sha256_constraints("review_anchor", name="ck_prompt_file_approvals_anchor_format"),
+    *_lower_sha256_constraints("effective_artifact_hash", name="ck_prompt_file_approvals_effective_hash_format", nullable=True),
+)
+Index(
+    "ix_prompt_file_approvals_latest",
+    prompt_file_approvals_table.c.session_id,
+    prompt_file_approvals_table.c.node_id,
+    prompt_file_approvals_table.c.field_path,
+    prompt_file_approvals_table.c.approved_at,
 )
 
 # ``composition_rejection_events_table`` (elspeth-3e28029d2f — durable

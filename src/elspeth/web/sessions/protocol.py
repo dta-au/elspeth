@@ -67,6 +67,7 @@ from elspeth.web.coordination.contracts import (
 )
 from elspeth.web.sessions.pipeline_publication import PipelineProposalSettlementResult as PipelineProposalSettlementResult
 from elspeth.web.sessions.pipeline_settlement_payloads import ComposerOperationBinding
+from elspeth.web.sessions.prompt_file_review import PromptReviewSnapshot
 
 if TYPE_CHECKING:
     from elspeth.web.composer.advisor_audit import AdvisorGraphReviewFact
@@ -2952,6 +2953,14 @@ class SessionServiceProtocol(Protocol):
         ``auto_interpreted_opt_out`` and ``auto_interpreted_no_surfaces``
         rows. ``None`` (default) imposes no source filter.
         """
+        ...
+
+    async def get_prompt_review_snapshot(self, session_id: UUID, event_id: UUID) -> Mapping[str, Any] | None:
+        """Full historical file-prompt card snapshot for a same-session event."""
+        ...
+
+    async def assert_prompt_file_approvals(self, snapshot: PromptReviewSnapshot) -> None:
+        """Refuse unless all current prompt-file bindings have matching approval."""
         ...
 
     async def record_session_interpretation_opt_out(

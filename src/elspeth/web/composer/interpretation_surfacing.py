@@ -12,8 +12,10 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID, uuid4
 
+from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.composer_interpretation import InterpretationKind, InterpretationSource, InterpretationSurfaceOrigin
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.composer.invariants import InvariantError
@@ -340,7 +342,8 @@ def _backend_surface_args_for_site(
         # _has_pending_prompt_template_requirement) and leave the site
         # fail-closed at the run-time gate — the designed advisory polarity.
         prompt_template = options["prompt_template"] if "prompt_template" in options else None
-        if type(prompt_template) is not str or not prompt_template:
+        marker = is_widened_blob_ref(deep_thaw(prompt_template))
+        if (type(prompt_template) is not str or not prompt_template) and (marker is None or marker.mode != "inline_content"):
             return None
         draft = _matching_requirement_draft(options, kind=site.kind, user_term=site.user_term)
         if draft is None or draft != model:

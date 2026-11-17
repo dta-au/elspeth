@@ -1081,6 +1081,12 @@ files:
     boundary: 1
     dict[str, Any]: 6
     dict[str, object]: 1
+  src/elspeth/web/sessions/prompt_file_approval.py:
+    Mapping[str, Any]: 3
+  src/elspeth/web/sessions/prompt_file_review.py:
+    Mapping[str, Any]: 4
+    MutableMapping[str, Any]: 1
+    dict[str, object]: 3
   src/elspeth/web/sessions/proposal_authority.py:
     Mapping[str, Any]: 4
   src/elspeth/web/sessions/proposal_blob_refs.py:
@@ -1088,7 +1094,7 @@ files:
   src/elspeth/web/sessions/proposal_decoder.py:
     Mapping[str, Any]: 2
   src/elspeth/web/sessions/protocol.py:
-    Mapping[str, Any]: 37
+    Mapping[str, Any]: 38
   src/elspeth/web/sessions/routes/_helpers.py:
     Mapping[str, Any]: 4
     dict[str, Any]: 1
@@ -1100,21 +1106,23 @@ files:
   src/elspeth/web/sessions/routes/composer/state.py:
     boundary: 1
     dict[str, Any]: 1
+  src/elspeth/web/sessions/routes/interpretation.py:
+    dict[str, object]: 1
   src/elspeth/web/sessions/routes/sessions.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 2
   src/elspeth/web/sessions/service.py:
-    Mapping[str, Any]: 15
+    Mapping[str, Any]: 17
     dict[str, Any]: 1
   src/elspeth/web/shareable_reviews/file_manifest.py:
     dict[str, object]: 1
   src/elspeth/web/shareable_reviews/service.py:
     dict[str, object]: 1
 totals:
-  Mapping[str, Any]: 804
+  Mapping[str, Any]: 814
   Mapping[str, object]: 319
-  MutableMapping[str, Any]: 8
+  MutableMapping[str, Any]: 9
   boundary: 69
   dict[str, Any]: 1124
-  dict[str, object]: 403
-  soft: 2658
+  dict[str, object]: 407
+  soft: 2673

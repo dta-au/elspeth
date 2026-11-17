@@ -1,24 +1,17 @@
-"""/validate and run admission agree on LLM-authored inline blobs in an llm prompt surface.
-
-Finding #1 policy (ADR-034): a user-uploaded ``inline_content`` blob may back an
-``llm`` node's prompt surface or model, but an LLM-authored blob may not, because
-the prompt-template and model-choice reviews read those options as strings and
-the run substitutes the blob text afterwards. Run admission refuses it
-(``InlineBlobPromptSurfaceAdmissionError``). Before this fix nothing on the
-/validate path applied the refusal, so the pipeline showed ready and the run
-failed after creation. These tests feed ONE state fixture to both paths.
-"""
+"""File-backed scalar prompts require current approval regardless of author modality."""
 
 from __future__ import annotations
 
 import hashlib
 import sys
 import threading
+from collections.abc import Callable
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -41,6 +34,8 @@ from elspeth.web.interpretation_state import (
     model_choice_artifact_hash,
     prompt_review_anchor_hash_from_options,
 )
+from elspeth.web.sessions.prompt_file_review import PromptFileReviewStale
+from elspeth.web.sessions.protocol import CompositionStateRecord
 from tests.helpers import execution_custody
 from tests.helpers.execution_custody import ExecutionTestCustody
 
@@ -104,11 +99,12 @@ def _llm_options(field: str) -> dict[str, Any]:
     reviews: list[dict[str, Any]] = []
     # One anchor derivation: the multi-query surface or structured skeleton,
     # else ``stable_hash(prompt_template)`` for an unstructured string prompt.
-    # A marker-valued prompt_template carries no reviewable text, so no row.
+    # A marker-valued prompt_template has no literal text to review in this
+    # metadata fixture. Other shapes retain their existing skeleton review.
     anchor = prompt_review_anchor_hash_from_options(options)
     if anchor is None and type(options["prompt_template"]) is str:
         anchor = stable_hash(options["prompt_template"])
-    if anchor is not None:
+    if anchor is not None and field != "prompt_template":
         reviews.append(_resolved("llm_prompt_template", artifact_hash=anchor, draft="surface"))
     if field != "model":
         reviews.append(_resolved("llm_model_choice", artifact_hash=model_choice_artifact_hash(_MODEL), draft=_MODEL))
@@ -202,34 +198,33 @@ def test_predicate_leaves_other_fields_unguarded(field_path: str) -> None:
     assert llm_prompt_surface_field(field_path) is None
 
 
-# ── /validate refuses what run admission refuses ────────────────────────────
+# ── /validate accepts supported bytes and refuses unsupported positions ────
 
 
 @pytest.mark.parametrize("modality", _LLM_AUTHORED_MODALITIES, ids=lambda modality: modality.value)
 @pytest.mark.parametrize("field", _GUARDED_FIELDS)
-def test_validate_blocks_llm_authored_blob_in_llm_prompt_surface(tmp_path: Path, field: str, modality: CreationModality) -> None:
+def test_validate_accepts_llm_authored_scalar_prompt_bytes(tmp_path: Path, field: str, modality: CreationModality) -> None:
     result = _validate(tmp_path, field, modality)
-
-    assert result.is_valid is False
-    assert result.readiness.execution_ready is False
     check = _blob_check(result)
-    assert check.passed is False
-    assert check.detail == f"node:classify.options.{field}: llm_authored"
-    [error] = [error for error in result.errors if error.error_code == "llm_authored_inline_blob_content"]
-    assert error.component_id == "classify"
-    assert error.component_type == "transform"
-    assert f"node:classify.options.{field}" in error.message
-    assert [blocker.code for blocker in result.readiness.blockers] == ["blob_inline_refs"]
+    if field in {"prompt_template", "system_prompt", "queries.q.template", "queries.0.template"}:
+        assert check.passed is True, check.detail
+        assert all(error.error_code != "llm_authored_inline_blob_content" for error in result.errors)
+    else:
+        assert check.passed is False
+        assert any(error.error_code == "inline_blob_field_path_invalid" for error in result.errors)
 
 
 @pytest.mark.parametrize("modality", _USER_MODALITIES, ids=lambda modality: modality.value)
 @pytest.mark.parametrize("field", _GUARDED_FIELDS)
-def test_validate_admits_user_uploaded_blob_in_llm_prompt_surface(tmp_path: Path, field: str, modality: CreationModality) -> None:
+def test_validate_accepts_user_scalar_prompt_bytes(tmp_path: Path, field: str, modality: CreationModality) -> None:
     result = _validate(tmp_path, field, modality)
 
     check = _blob_check(result)
-    assert check.passed is True, check.detail
-    assert all(error.error_code != "llm_authored_inline_blob_content" for error in result.errors)
+    if field in {"prompt_template", "system_prompt", "queries.q.template", "queries.0.template"}:
+        assert check.passed is True, check.detail
+    else:
+        assert check.passed is False
+        assert any(error.error_code == "inline_blob_field_path_invalid" for error in result.errors)
 
 
 @pytest.mark.parametrize("field", ["prompt_template", "queries.0.template"])
@@ -250,6 +245,11 @@ def test_deferred_prompt_validation_does_not_admit_a_binary_blob(tmp_path: Path,
         options["prompt_template"] = marker
     else:
         options["queries"][0]["template"] = marker
+        anchor = prompt_review_anchor_hash_from_options(options)
+        assert anchor is not None
+        for review in options[INTERPRETATION_REQUIREMENTS_KEY]:
+            if review["kind"] == "llm_prompt_template":
+                review["resolved_prompt_template_hash"] = anchor
     state = replace(state, nodes=(replace(node, options=options),))
     try:
         result = validate_pipeline_for_trained_operator(
@@ -305,6 +305,8 @@ def _run_admission(
     execution_fixture: ExecutionTestCustody,
     *,
     mime_type: str = "text/plain",
+    approved: bool = False,
+    after_substitution: Callable[[dict[str, Any], Any], None] | None = None,
 ) -> tuple[BaseException | None, Any, Any]:
     """Drive ``_run_pipeline`` with the runtime YAML the composer generates for the same state.
 
@@ -314,11 +316,52 @@ def _run_admission(
     service, session_service, loop = agreement.TestComposerRuntimeBlobInlineAgreement._execution_service(
         tmp_path, execution_fixture=execution_fixture
     )
+    source_state = _state(tmp_path, field)
+    state_data = source_state.to_dict()
+    state_id = uuid4()
+    state_record = CompositionStateRecord(
+        id=state_id,
+        session_id=session_service.run.session_id,
+        version=1,
+        sources=state_data["sources"],
+        nodes=state_data["nodes"],
+        edges=state_data["edges"],
+        outputs=state_data["outputs"],
+        metadata_=state_data["metadata"],
+        is_valid=True,
+        validation_errors=None,
+        created_at=datetime.now(UTC),
+        derived_from_state_id=None,
+    )
+
+    class PromptAwareSessionService:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(session_service, name)
+
+        async def get_run(self, requested_run_id: UUID) -> Any:
+            del requested_run_id
+            return SimpleNamespace(
+                session_id=session_service.run.session_id,
+                state_id=state_id,
+                status=session_service.run.status,
+                error=session_service.run.error,
+            )
+
+        async def get_state_in_session(self, requested_state_id: UUID, requested_session_id: UUID) -> CompositionStateRecord:
+            assert requested_state_id == state_id
+            assert requested_session_id == session_service.run.session_id
+            return state_record
+
+        async def assert_prompt_file_approvals(self, _snapshot: Any) -> None:
+            if not approved:
+                raise PromptFileReviewStale()
+
+    cast(Any, service)._session_service = PromptAwareSessionService()
     record = replace(_record(modality), session_id=session_service.run.session_id, mime_type=mime_type)
     blob_service = agreement._FakeBlobService(blob_record=record, content=_CONTENT)
     cast(Any, service)._blob_service = blob_service
     pipeline_yaml = resolve_runtime_yaml_paths(
-        composer_yaml_generator.generate_yaml(_state(tmp_path, field)),
+        composer_yaml_generator.generate_yaml(source_state),
         str(tmp_path),
         session_id=str(_SESSION_ID),
     )
@@ -327,10 +370,18 @@ def _run_admission(
     raised: BaseException | None = None
     with (
         patch("elspeth.web.execution.service.Orchestrator"),
-        patch("elspeth.web.execution.service.load_settings_from_config_dict"),
+        patch("elspeth.web.execution.service.load_settings_from_config_dict") as mock_load,
         patch("elspeth.web.execution.service.open_landscape_db"),
         patch("elspeth.web.execution.service.FilesystemPayloadStore"),
     ):
+        if after_substitution is not None:
+
+            def inspect_substituted(config_dict: dict[str, Any], *, expand_env_vars: bool) -> None:
+                assert expand_env_vars is False
+                after_substitution(config_dict, blob_service)
+                raise RuntimeError("stop after admitted rows")
+
+            mock_load.side_effect = inspect_substituted
         lease: SessionOperationLease | None = None
         try:
             lease = agreement._execute_lease(loop, session_service.run.session_id, service=service, execution_fixture=execution_fixture)
@@ -358,37 +409,93 @@ def test_run_admission_refuses_non_text_marker_with_typed_code(tmp_path: Path, e
 
 @pytest.mark.parametrize("modality", _LLM_AUTHORED_MODALITIES, ids=lambda modality: modality.value)
 @pytest.mark.parametrize("field", _GUARDED_FIELDS)
-def test_validate_and_run_admission_both_refuse_the_same_llm_authored_fixture(
+def test_run_admission_refuses_unapproved_agent_file_or_unsupported_position(
     tmp_path: Path, field: str, modality: CreationModality, execution_fixture: ExecutionTestCustody
 ) -> None:
     validate_result = _validate(tmp_path / "validate", field, modality)
     raised, blob_service, session_service = _run_admission(tmp_path / "run", field, modality, execution_fixture)
 
-    assert validate_result.is_valid is False
-    assert _blob_check(validate_result).detail == f"node:classify.options.{field}: llm_authored"
-    assert type(raised) is InlineBlobPromptSurfaceAdmissionError
-    assert f"node:classify.options.{field}" in str(raised)
-    assert blob_service.link_blob_to_run_calls == []
-    assert blob_service.read_blob_content_calls == []
+    if field in {"prompt_template", "system_prompt", "queries.q.template", "queries.0.template"}:
+        assert _blob_check(validate_result).passed is True
+        assert type(raised) is PromptFileReviewStale
+        assert [call[0] for call in blob_service.link_blob_to_run_calls] == [_BLOB_ID]
+        assert blob_service.read_blob_content_calls == [_BLOB_ID]
+    else:
+        assert _blob_check(validate_result).passed is False
+        assert type(raised) is InlineBlobPromptSurfaceAdmissionError
+        assert blob_service.link_blob_to_run_calls == []
+        assert blob_service.read_blob_content_calls == []
     assert session_service.recorded_blob_inline_resolutions == []
 
 
 @pytest.mark.parametrize("field", _GUARDED_FIELDS)
-def test_validate_and_run_admission_both_admit_the_same_user_uploaded_fixture(
+def test_run_admission_refuses_unapproved_user_file_or_unsupported_position(
     tmp_path: Path, field: str, execution_fixture: ExecutionTestCustody
 ) -> None:
     validate_result = _validate(tmp_path / "validate", field, CreationModality.VERBATIM)
     raised, blob_service, session_service = _run_admission(tmp_path / "run", field, CreationModality.VERBATIM, execution_fixture)
 
-    assert _blob_check(validate_result).passed is True
-    # Admission passed, and substitution completed against the pinned hash: the
-    # blob was linked, read once, and its inline resolution recorded. The run
-    # stops later on the fixture's settings fake, outside this contract, so what
-    # it raises there is not asserted.
-    assert type(raised) is not InlineBlobPromptSurfaceAdmissionError
-    assert [call[0] for call in blob_service.link_blob_to_run_calls] == [_BLOB_ID]
+    if field in {"prompt_template", "system_prompt", "queries.q.template", "queries.0.template"}:
+        assert _blob_check(validate_result).passed is True
+        assert type(raised) is PromptFileReviewStale
+        assert [call[0] for call in blob_service.link_blob_to_run_calls] == [_BLOB_ID]
+        assert blob_service.read_blob_content_calls == [_BLOB_ID]
+    else:
+        assert _blob_check(validate_result).passed is False
+        assert type(raised) is InlineBlobPromptSurfaceAdmissionError
+        assert blob_service.link_blob_to_run_calls == []
+        assert blob_service.read_blob_content_calls == []
+    assert session_service.recorded_blob_inline_resolutions == []
+
+
+def test_admitted_prompt_bytes_are_reused_for_later_rows(tmp_path: Path, execution_fixture: ExecutionTestCustody) -> None:
+    provider = Mock(spec=agreement.LLMProvider)
+    provider.execute_query.return_value = agreement.LLMQueryResult(
+        content="accepted",
+        usage=agreement.TokenUsage.known(4, 1),
+        model=_MODEL,
+        finish_reason=agreement.FinishReason.STOP,
+    )
+
+    def run_two_rows(config_dict: dict[str, Any], blob_service: Any) -> None:
+        prompt = config_dict["transforms"][0]["options"]["prompt_template"]
+        assert prompt == _CONTENT.decode()
+        transform = agreement.LLMTransform(
+            {
+                "provider": "openrouter",
+                "model": _MODEL,
+                "api_key": "test-key",
+                "prompt_template": prompt,
+                "schema": {"mode": "observed"},
+                "required_input_fields": [],
+            }
+        )
+        transform._provider = provider
+        for index in range(2):
+            context = agreement.make_context(
+                state_id="state-123",
+                run_id="run-123",
+                token=agreement.TokenInfo(row_id=f"row-{index}", token_id=f"token-{index}", row_data=agreement.make_pipeline_row({})),
+            )
+            assert transform._process_row(agreement.make_pipeline_row({"text": str(index)}), context).status == "success"
+            if index == 0:
+                blob_service.content = b"Changed after admission"
+
+    raised, blob_service, session_service = _run_admission(
+        tmp_path,
+        "prompt_template",
+        CreationModality.LLM_GENERATED,
+        execution_fixture,
+        approved=True,
+        after_substitution=run_two_rows,
+    )
+    assert str(raised) == "stop after admitted rows"
     assert blob_service.read_blob_content_calls == [_BLOB_ID]
     assert len(session_service.recorded_blob_inline_resolutions) == 1
+    assert provider.execute_query.call_count == 2
+    assert all(
+        call.args[0] == [agreement.ChatMessage(role="user", content=_CONTENT.decode())] for call in provider.execute_query.call_args_list
+    )
 
 
 @pytest.mark.parametrize("field", ["prompt_template", "system_prompt", "queries.q.template", "queries.q", "queries"])

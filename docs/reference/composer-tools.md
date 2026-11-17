@@ -516,8 +516,8 @@ Wire a ready blob into a plugin option as audited inline content.
 | `blob_id` | string | **Yes** | Ready inline-text blob ID to wire; for prompts, upload or create plain text (.txt or .md) |
 | `encoding` | string | No | One of `utf-8`, `utf-8-sig`, `utf-16`, or `latin-1`; defaults to `utf-8` |
 
-**When to use:** When a long-form config field, such as an LLM prompt template or SQL query, should be supplied from a blob without exposing the bytes to the composer LLM. The tool pins `sha256` from blob metadata. Wiring does not read the file: its text is checked when the pipeline is validated or run.
-Binary MIME is refused. A structured prompt with `prompt_template_parts` has interpretation slots. Edit its text parts in place with `change_substring` or `patch_node_options` on `prompt_template_parts`, preserving `interpretation_ref` entries. Switching a structured prompt to a file is not supported in this release.
+**When to use:** When a long-form config field, such as an LLM prompt template or SQL query, should be supplied from a session blob without exposing the bytes to the composer LLM. The tool pins `sha256` from blob metadata. A user-created or agent-authored UTF-8 text file may bind to `llm` `prompt_template`, `system_prompt`, or one `queries.<name>.template` / `queries.<index>.template` scalar. Binding opens a mandatory card with the full file text. The user approves it before validation or Run admits the file. A content change or re-point opens a new card and requires another approval. The server checks current file bytes again at run admission and records their hash in Landscape.
+Binary MIME, `model`, whole `queries`, malformed markers, and structured prompts with `prompt_template_parts` are refused. Edit structured prompt text parts in place with `change_substring` or `patch_node_options`, preserving `interpretation_ref` entries. The editor and in-file substring editing are outside this release.
 
 ---
 
