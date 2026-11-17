@@ -234,12 +234,7 @@ def test_validate_admits_user_uploaded_blob_in_llm_prompt_surface(tmp_path: Path
 
 @pytest.mark.parametrize("field", ["prompt_template", "queries.0.template"])
 def test_deferred_prompt_validation_does_not_admit_a_binary_blob(tmp_path: Path, field: str) -> None:
-    """Authoring defers file-backed prompt text; materialization must still refuse non-text bytes.
-
-    Investigation defect 7: an ASCII-decodable PDF reaches ``ResolvedBlobContent``,
-    whose MIME allowlist raises ``ValueError`` that validation does not catch.
-    Neither outcome may admit the blob; a typed refusal is the open repair.
-    """
+    """A manually authored PDF marker has a typed validation refusal."""
     content = b"%PDF-1.4\n%%EOF\n"
     record = replace(
         _record(CreationModality.VERBATIM, content=content),
@@ -265,11 +260,11 @@ def test_deferred_prompt_validation_does_not_admit_a_binary_blob(tmp_path: Path,
             blob_get_content=lambda _blob_id: (record, content),
             session_id=str(_SESSION_ID),
         )
-    except ValueError as exc:
-        assert "mime_type must be one of" in str(exc)
-        return
+    except ValueError:
+        pytest.fail("Non-text inline content escaped validation as an exception")
     assert result.is_valid is False
     assert _blob_check(result).passed is False
+    assert any(error.error_code == "inline_blob_not_text" and ".txt or .md" in error.message for error in result.errors)
 
 
 def test_validate_admits_llm_authored_blob_outside_the_prompt_surface(tmp_path: Path) -> None:
@@ -304,7 +299,12 @@ def test_validate_admits_llm_authored_blob_outside_the_prompt_surface(tmp_path: 
 
 
 def _run_admission(
-    tmp_path: Path, field: str, modality: CreationModality, execution_fixture: ExecutionTestCustody
+    tmp_path: Path,
+    field: str,
+    modality: CreationModality,
+    execution_fixture: ExecutionTestCustody,
+    *,
+    mime_type: str = "text/plain",
 ) -> tuple[BaseException | None, Any, Any]:
     """Drive ``_run_pipeline`` with the runtime YAML the composer generates for the same state.
 
@@ -314,7 +314,7 @@ def _run_admission(
     service, session_service, loop = agreement.TestComposerRuntimeBlobInlineAgreement._execution_service(
         tmp_path, execution_fixture=execution_fixture
     )
-    record = replace(_record(modality), session_id=session_service.run.session_id)
+    record = replace(_record(modality), session_id=session_service.run.session_id, mime_type=mime_type)
     blob_service = agreement._FakeBlobService(blob_record=record, content=_CONTENT)
     cast(Any, service)._blob_service = blob_service
     pipeline_yaml = resolve_runtime_yaml_paths(
@@ -341,6 +341,19 @@ def _run_admission(
         finally:
             agreement._close_direct_runtime_probe(loop, lease, execution_fixture, sys.exc_info()[1] or raised)
     return raised, blob_service, session_service
+
+
+def test_run_admission_refuses_non_text_marker_with_typed_code(tmp_path: Path, execution_fixture: ExecutionTestCustody) -> None:
+    raised, blob_service, session_service = _run_admission(
+        tmp_path, "prompt_template", CreationModality.VERBATIM, execution_fixture, mime_type="application/pdf"
+    )
+
+    assert type(raised).__name__ == "InlineBlobNotTextError"
+    assert getattr(raised, "error_code", None) == "inline_blob_not_text"
+    assert ".txt or .md" in str(raised)
+    assert blob_service.link_blob_to_run_calls == []
+    assert blob_service.read_blob_content_calls == []
+    assert session_service.recorded_blob_inline_resolutions == []
 
 
 @pytest.mark.parametrize("modality", _LLM_AUTHORED_MODALITIES, ids=lambda modality: modality.value)

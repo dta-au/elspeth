@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from copy import deepcopy
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -17,7 +18,12 @@ from elspeth.contracts.blobs import (
     BlobRecord,
     BlobStateError,
 )
-from elspeth.contracts.blobs_inline import BlobContentResolutionError, BlobInlineRef, BlobInlineValidationViolation, ResolvedBlobContent
+from elspeth.contracts.blobs_inline import (
+    BlobContentResolutionError,
+    BlobInlineRef,
+    BlobInlineValidationViolation,
+    ResolvedBlobContent,
+)
 from elspeth.contracts.enums import CreationModality
 from elspeth.core.blobs_inline import (
     _discover_blob_content_refs,
@@ -81,6 +87,37 @@ def _blob_record(
         creating_composer_skill_hash=None,
         creating_arguments_hash=None,
     )
+
+
+def test_non_text_metadata_is_a_typed_refusal_before_content_read() -> None:
+    ref = _ref()
+    record = replace(_blob_record(), mime_type="application/pdf")
+    config = {"source": {"options": {"x": _marker()}}}
+
+    violations = _validate_blob_content_refs_sync(lambda _blob_id: record, config)
+    assert violations == [
+        BlobInlineValidationViolation(category="not_text", field_path=ref.field_path, detail="blob MIME is not inline text")
+    ]
+    with pytest.raises(ValueError) as caught:
+        _enforce_blob_content_ref_metadata([ref], {ref.blob_id: record})
+    assert getattr(caught.value, "error_code", None) == "inline_blob_not_text"
+
+
+def test_direct_materialization_refuses_non_text_mime_before_audit_row() -> None:
+    content = b"PDF shaped bytes"
+    ref = _ref_with_hash(content)
+    config = {"source": {"options": {"system_prompt": _marker(sha256=ref.sha256)}}}
+
+    with pytest.raises(ValueError) as caught:
+        _substitute_blob_content_refs(
+            config,
+            {ref: content},
+            refs=[ref],
+            blob_metadata={ref.blob_id: ("application/pdf", len(content))},
+        )
+
+    assert getattr(caught.value, "error_code", None) == "inline_blob_not_text"
+    assert config["source"]["options"]["system_prompt"] == _marker(sha256=ref.sha256)
 
 
 class TestDiscoverBlobContentRefs:

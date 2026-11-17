@@ -152,7 +152,12 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("execution/validation.py", "_interpretation_review_capacity_failure", "SOURCE_DATA_CONTRACT_ANALYSIS_LIMIT_CODE"),
         ("execution/validation.py", "_interpretation_review_drift_failure", "INTERPRETATION_REVIEW_DRIFT_CODE"),
         ("execution/_validation_diagnostics.py", "_reframe_settings_missing_parts", "_SETTINGS_MISSING_PART_REFRAMES[part][0]"),
-        ("execution/_validation_materialization.py", "_blob_inline_validation_error", "f'{violation.category}_inline_blob_content'"),
+        (
+            "execution/_validation_materialization.py",
+            "_blob_inline_validation_error",
+            "INLINE_BLOB_NOT_TEXT_CODE if not_text else f'{violation.category}_inline_blob_content'",
+        ),
+        ("composer/tools/blobs.py", "_execute_wire_blob_inline_ref", "INLINE_BLOB_NOT_TEXT_CODE"),
         ("execution/service.py", "_merge_authoritative_proof_diagnostics", "code"),
         # Route projections and persistence of codes produced (and censused)
         # elsewhere; none of them authors a code.
@@ -410,7 +415,10 @@ class TestRegistryCensus:
             SOURCE_DATA_CONTRACT_ANALYSIS_LIMIT_CODE,
         } <= REGISTERED_ERROR_CODES
         assert {reframe[0] for reframe in _SETTINGS_MISSING_PART_REFRAMES.values()} <= REGISTERED_ERROR_CODES
-        assert {f"{category}_inline_blob_content" for category in get_args(BlobInlineValidationCategory)} <= REGISTERED_ERROR_CODES
+        assert {
+            f"{category}_inline_blob_content" for category in get_args(BlobInlineValidationCategory) if category != "not_text"
+        } <= REGISTERED_ERROR_CODES
+        assert "inline_blob_not_text" in REGISTERED_ERROR_CODES
         assert {"web_scrape_private_network_not_allowed", "web_fetch_private_network_not_allowed"} <= REGISTERED_ERROR_CODES
 
     def test_every_blocking_proof_diagnostic_code_is_registered(self) -> None:
@@ -523,6 +531,15 @@ def _persisted_first_error(tool_name: str, error_code: str) -> dict[str, object]
         ("patch_node_options", "plugin_options_invalid"),
         ("patch_node_options", "prompt_template_parts_required"),
         ("inspect_prompt_targets", "inspect_after_uncheckpointed_mutation"),
+        ("wire_blob_inline_ref", "prompt_template_parts_required"),
+        ("wire_blob_inline_ref", "inline_blob_not_text"),
+        ("wire_blob_inline_ref", "inline_blob_missing"),
+        ("wire_blob_inline_ref", "inline_blob_not_ready"),
+        ("wire_blob_inline_ref", "inline_blob_field_path_invalid"),
+        ("wire_blob_inline_ref", "inline_blob_session_required"),
+        ("wire_blob_inline_ref", "inline_blob_id_invalid"),
+        ("update_blob", "blob_bound_update"),
+        ("delete_blob", "blob_bound_delete"),
         # Plugin-policy and execution-validation codes (produced outside
         # web/composer) on option tools.
         ("upsert_node", "profile_alias_used_as_bucket"),

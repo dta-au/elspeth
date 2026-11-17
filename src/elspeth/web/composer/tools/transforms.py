@@ -79,7 +79,11 @@ from elspeth.web.composer.tools._common import (
     review_reconciliation_failure_message,
 )
 from elspeth.web.composer.tools._naming_disclosure import _disclose_node_name_constraints
-from elspeth.web.composer.tools.blobs import _file_inject_node_option_error, _llm_authored_inline_prompt_surface_error
+from elspeth.web.composer.tools.blobs import (
+    _file_inject_node_option_error,
+    _llm_authored_inline_prompt_surface_error,
+    _structured_prompt_template_refusal,
+)
 from elspeth.web.composer.tools.declarations import (
     EffectDomain,
     ToolDeclaration,
@@ -94,7 +98,6 @@ from elspeth.web.composer.tools.prompt_target_responses import (
 from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material_for_tool
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
-    PROMPT_TEMPLATE_PARTS_KEY,
     VAGUE_TERM_QUERY_OVERRIDE_PREFIX,
     approved_prompt_artifact_hash_from_options,
     composition_review_contract_error,
@@ -743,6 +746,14 @@ def _execute_upsert_node(
         options=node_options,
         existing_options=existing_node.options if existing_node is not None else None,
     )
+    if plugin == "llm":
+        structured_error = _structured_prompt_template_refusal(
+            node_id, existing_node.options if existing_node is not None else {}, review_options
+        )
+        if structured_error is not None:
+            return _saved_graph_rejection_result(
+                state, structured_error, error_code="prompt_template_parts_required", rejected_component=node_ref
+            )
     canonical_error = _canonical_interpretation_requirement_error(
         review_options,
         tool_name="upsert_node",
@@ -1862,17 +1873,11 @@ def _apply_guarded_node_option_patch(
         return _saved_graph_rejection_result(
             state, f"Node '{node_id}': {runtime_owned_error}", error_code=error_code, rejected_component=node_ref
         )
-    if (
-        current.plugin == "llm"
-        and current.options.get(PROMPT_TEMPLATE_PARTS_KEY) is not None
-        and "prompt_template" in patch
-        and patch["prompt_template"] != current.options.get("prompt_template")
-        and PROMPT_TEMPLATE_PARTS_KEY not in patch
-    ):
+    structured_error = _structured_prompt_template_refusal(node_id, current.options, patch) if current.plugin == "llm" else None
+    if structured_error is not None:
         return _saved_graph_rejection_result(
             state,
-            f"Node '{node_id}': edit prompt_template_parts to change this structured prompt, "
-            "preserving its interpretation_ref entries; prompt_template is compiled from those parts.",
+            structured_error,
             error_code="prompt_template_parts_required",
             rejected_component=node_ref,
         )
@@ -2470,6 +2475,12 @@ def _prepare_transform_candidate(
         options=options,
         existing_options=existing_options,
     )
+    if plugin == "llm":
+        structured_error = _structured_prompt_template_refusal(node_id, existing_options or {}, review_options)
+        if structured_error is not None:
+            return _saved_graph_rejection_result(
+                state, structured_error, error_code="prompt_template_parts_required", rejected_component=node_ref
+            )
     canonical_error = _canonical_interpretation_requirement_error(
         review_options,
         tool_name=tool_name,

@@ -157,6 +157,14 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "part_not_found",
         "power_automate_origin_not_allowed",
         "prompt_template_parts_required",
+        "inline_blob_not_text",
+        "inline_blob_missing",
+        "inline_blob_not_ready",
+        "inline_blob_field_path_invalid",
+        "inline_blob_session_required",
+        "inline_blob_id_invalid",
+        "blob_bound_update",
+        "blob_bound_delete",
         "prompt_template_unbound_variables",
         "field_name_header_spelling",
         "field_name_lookup_unreachable",
@@ -308,7 +316,7 @@ REGISTERED_ERROR_CODES: Final[frozenset[str]] = frozenset(
         *_EMITTED_VALIDATION_ERROR_CODES,
         *_EMITTED_POLICY_AND_EXECUTION_ERROR_CODES,
         # Inline-blob validation builds its code from the closed category.
-        *(f"{category}_inline_blob_content" for category in get_args(BlobInlineValidationCategory)),
+        *(f"{category}_inline_blob_content" for category in get_args(BlobInlineValidationCategory) if category != "not_text"),
         # The closed ``ToolArgumentError.code`` values, forwarded as
         # ``error_code`` by planner and discovery argument feedback.
         "DISCOVERY_ONLY",

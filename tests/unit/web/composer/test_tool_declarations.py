@@ -1047,6 +1047,8 @@ class TestStep3BlobDiscoveryTierMigration:
             "description": (
                 "Author a widened blob_ref inline_content marker at a canonical field_path. "
                 "Composer pins sha256 from blob metadata; callers must not pass content bytes. "
+                "Only inline-text MIME is accepted; upload or create a plain-text .txt or .md file for a prompt. "
+                "A structured prompt with prompt_template_parts cannot be replaced by a file; edit its parts or remove the structure first. "
                 "Returns the `field_path` that was wired."
             ),
             "parameters": {
@@ -1065,7 +1067,7 @@ class TestStep3BlobDiscoveryTierMigration:
                     "blob_id": {
                         "type": "string",
                         "format": "uuid",
-                        "description": "Ready blob ID to wire as inline content.",
+                        "description": "Ready inline-text blob ID; binary MIME is refused. For a prompt, upload or create plain text (.txt or .md).",
                     },
                     "encoding": {
                         "type": "string",
