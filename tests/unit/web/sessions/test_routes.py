@@ -4604,6 +4604,7 @@ class TestIDORCoverageDrift:
             # cross-session 404 assertion lives in
             # ``tests/unit/web/blobs/test_routes.py::TestIDORProtection``.
             "preview_blob_content",
+            "save_prompt_text",
             "delete_blob",
         }
     )

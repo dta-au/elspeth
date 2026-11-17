@@ -2592,6 +2592,7 @@ class _RepositoryBlobMutations:
         plan: BlobReplacementPlan,
         max_storage_per_session: int,
         accepting_proposal_id: UUID | None,
+        on_metadata_commit: Callable[[Connection], None] | None = None,
     ) -> BlobReplacementPlan:
         """Atomically replace exact blob metadata and record purge obligation."""
         state = self.__state
@@ -2674,6 +2675,8 @@ class _RepositoryBlobMutations:
             raise AuditIntegrityError("blob replacement commit ledger postcondition failed")
         if self._blob_record(state._require_blob(exact.blob_id)) != replacement:
             raise AuditIntegrityError("blob replacement commit metadata postcondition failed")
+        if on_metadata_commit is not None:
+            on_metadata_commit(connection)
         return committed
 
     def retire_blob_replacement(self, *, plan: BlobReplacementPlan, remaining_output_storage_bytes: int | None = None) -> bool:

@@ -749,6 +749,9 @@ files:
     Mapping[str, object]: 2
   src/elspeth/web/auth/session_token.py:
     dict[str, object]: 3
+  src/elspeth/web/blobs/prompt_editor.py:
+    Mapping[str, Any]: 2
+    dict[str, Any]: 1
   src/elspeth/web/catalog/knob_schema.py:
     Mapping[str, Any]: 1
     dict[str, object]: 1
@@ -1119,10 +1122,10 @@ files:
   src/elspeth/web/shareable_reviews/service.py:
     dict[str, object]: 1
 totals:
-  Mapping[str, Any]: 814
+  Mapping[str, Any]: 816
   Mapping[str, object]: 319
   MutableMapping[str, Any]: 9
   boundary: 69
-  dict[str, Any]: 1124
+  dict[str, Any]: 1125
   dict[str, object]: 407
-  soft: 2673
+  soft: 2676

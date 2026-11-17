@@ -760,7 +760,9 @@ For a file-backed LLM prompt, wire a ready UTF-8 text session blob into
 may be user-created or agent-authored. Binding opens a mandatory
 `llm_prompt_template` card showing the full file text. The user must approve
 that card before validation or Run admits it. A content change or re-point
-opens a fresh card and requires approval again. A multi-query template is wired at
+opens a fresh card and requires approval again. The session owner can edit a
+bound prompt file as plain text in the graph node inspector; saving it records
+approval for the saved bytes without a separate card. A multi-query template is wired at
 `node:<node_id>.options.queries.<query_name>.template`, or for the list form at
 `node:<node_id>.options.queries.<index>.template` (the query's existing 0-based
 position). The blob must have an inline-text MIME type; a PDF or other binary

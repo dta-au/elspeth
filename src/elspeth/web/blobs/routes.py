@@ -7,12 +7,16 @@ belong to the authenticated user's session.
 
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import UTC, datetime
 from typing import Annotated, cast
 from urllib.parse import quote
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import Response
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import Connection, desc, select
 
 from elspeth.contracts.binary_documents import (
     BINARY_DOCUMENT_FORMAT_BY_MIME,
@@ -21,8 +25,12 @@ from elspeth.contracts.binary_documents import (
     binary_document_signature_matches,
     detect_binary_document_signature,
 )
+from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.middleware import require_pipeline_user
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.blobs.prompt_editor import prompt_bindings_for_blob, repin_prompt_bindings
 from elspeth.web.blobs.protocol import (
     ALLOWED_MIME_TYPES,
     BINARY_DOCUMENT_MIME_TYPES,
@@ -39,12 +47,41 @@ from elspeth.web.blobs.protocol import (
     StorageAccountingUnavailableError,
     StorageMimeType,
 )
+from elspeth.web.blobs.replacement import BlobReplacementCoordinator
 from elspeth.web.blobs.schemas import BlobMetadataResponse, CreateInlineBlobRequest
-from elspeth.web.blobs.service import BlobServiceImpl, sanitize_filename
+from elspeth.web.blobs.service import BlobServiceImpl, content_hash, sanitize_filename
 from elspeth.web.blobs.sniff import detect_mime_type
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.credential_guard import require_no_credential_material
+from elspeth.web.sessions.models import composition_states_table
+from elspeth.web.sessions.prompt_file_approval import (
+    PromptApprovalTrigger,
+    PromptFileApprovalRequest,
+    PromptFileApprovalStale,
+    record_prompt_file_approval,
+)
+from elspeth.web.sessions.protocol import CompositionStateData, SessionCompositionStateCreation, SessionOperationMutationTransaction
+
+_MAX_PROMPT_FILE_BYTES = 256 * 1024
+
+
+class SavePromptFileRequest(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    content: str
+    expected_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class SavePromptFileResponse(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    changed: bool
+    content_sha256: str
+
+
+def _prompt_save_refusal(status: int, code: str, message: str) -> HTTPException:
+    return HTTPException(status_code=status, detail={"error_code": code, "message": message})
 
 
 def _blob_response(record: BlobRecord) -> BlobMetadataResponse:
@@ -135,6 +172,144 @@ def create_blobs_router() -> APIRouter:
         prefix="/api/sessions/{session_id}/blobs",
         tags=["blobs"],
     )
+
+    @router.put("/{blob_id}/prompt-text", response_model=SavePromptFileResponse)
+    async def save_prompt_text(
+        session_id: UUID,
+        blob_id: UUID,
+        body: SavePromptFileRequest,
+        request: Request,
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
+    ) -> SavePromptFileResponse:
+        """Save an existing bound text file; the owner's save approves its bytes."""
+        try:
+            blob_service = await _verify_session_and_get_blob_service(session_id, user, request)
+        except HTTPException as exc:
+            raise _prompt_save_refusal(404, "prompt_file_not_found", "This session or file is unavailable.") from exc
+        session_service = request.app.state.session_service
+        lease = await SessionOperationLease.acquire(
+            session_service.session_operation_authority,
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
+        )
+        try:
+            blob = await _get_owned_blob(blob_service, session_id, blob_id, session_operation_context=lease.context)
+            if blob.status != "ready":
+                raise _prompt_save_refusal(409, "prompt_file_not_ready", "Wait for this file to become ready, then retry.")
+            if blob.mime_type not in ALLOWED_MIME_TYPES:
+                raise _prompt_save_refusal(422, "prompt_file_not_text", "Choose a UTF-8 text file for this prompt.")
+            try:
+                new_bytes = body.content.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise _prompt_save_refusal(422, "prompt_file_not_text", "Enter valid UTF-8 text.") from exc
+            if len(new_bytes) > _MAX_PROMPT_FILE_BYTES:
+                raise _prompt_save_refusal(413, "prompt_file_too_large", "Keep this prompt file at or below 256 KiB.")
+            old_bytes = await blob_service.read_blob_content(blob_id, session_operation_context=lease.context)
+            try:
+                old_bytes.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise _prompt_save_refusal(422, "prompt_file_not_text", "This file is not valid UTF-8 text; use a text file.") from exc
+            if body.expected_sha256 is not None and body.expected_sha256 != content_hash(old_bytes):
+                raise _prompt_save_refusal(409, "prompt_file_stale", "This file changed since you opened it. Reload it and retry.")
+            state = await session_service.get_current_state(session_id)
+            bindings, mixed = prompt_bindings_for_blob(state, blob)
+            if mixed:
+                raise _prompt_save_refusal(
+                    409,
+                    "prompt_file_mixed_use",
+                    "This file is also used outside a prompt; create a separate prompt file or unbind those uses.",
+                )
+            if not bindings:
+                raise _prompt_save_refusal(409, "prompt_file_unbound", "Bind this file to a prompt before saving it here.")
+            if new_bytes == old_bytes:
+                return SavePromptFileResponse(changed=False, content_sha256=blob.content_hash)
+            replacement = replace(
+                blob,
+                created_by="user",
+                size_bytes=len(new_bytes),
+                content_hash=content_hash(new_bytes),
+                creation_modality=CreationModality.VERBATIM,
+                created_from_message_id=None,
+                creating_model_identifier=None,
+                creating_model_version=None,
+                creating_provider=None,
+                creating_composer_skill_hash=None,
+                creating_arguments_hash=None,
+            )
+            driver = BlobReplacementCoordinator(
+                engine=blob_service._engine,
+                data_dir=blob_service._data_dir,
+                session_operation_authority=session_service.session_operation_authority,
+            )
+
+            def approve_stored_bytes(conn: Connection, stored_bytes: bytes, transaction: SessionOperationMutationTransaction) -> None:
+                current_head = conn.execute(
+                    select(composition_states_table.c.id)
+                    .where(composition_states_table.c.session_id == str(session_id))
+                    .order_by(desc(composition_states_table.c.version))
+                    .limit(1)
+                ).scalar_one_or_none()
+                if state is None or current_head != str(state.id):
+                    raise PromptFileApprovalStale()
+                stored_hash = content_hash(stored_bytes)
+                if stored_hash != replacement.content_hash:
+                    raise AuditIntegrityError("stored prompt bytes differ from replacement metadata")
+                now = datetime.now(UTC)
+                transaction.composition_states.append_state(
+                    SessionCompositionStateCreation(
+                        id=uuid4(),
+                        data=CompositionStateData(
+                            sources=state.sources,
+                            nodes=repin_prompt_bindings(state, bindings, stored_hash),
+                            edges=state.edges,
+                            outputs=state.outputs,
+                            metadata_=state.metadata_,
+                            is_valid=False,
+                            composer_meta=state.composer_meta,
+                        ),
+                        provenance="interpretation_resolve",
+                        created_at=now,
+                        derived_from_state_id=state.id,
+                    )
+                )
+                for binding in bindings:
+                    record_prompt_file_approval(
+                        conn,
+                        PromptFileApprovalRequest(
+                            session_id=session_id,
+                            node_id=binding.node_id,
+                            field_path=binding.field_path,
+                            blob_id=blob_id,
+                            content_sha256=stored_hash,
+                            actor_user_id=user.user_id,
+                            trigger=PromptApprovalTrigger.EDITOR_SAVE,
+                        ),
+                        now=now,
+                    )
+
+            try:
+                await run_sync_in_worker(
+                    lambda: driver.replace_blob(
+                        expected=blob,
+                        replacement=replacement,
+                        content=new_bytes,
+                        context=lease.context,
+                        max_storage_per_session=request.app.state.settings.max_blob_storage_per_session_bytes,
+                        accepting_proposal_id=None,
+                        on_metadata_commit=approve_stored_bytes,
+                    )
+                )
+            except PromptFileApprovalStale as exc:
+                raise _prompt_save_refusal(409, "prompt_file_stale", "Prompt bindings changed. Reload the session and retry.") from exc
+            except (BlobActiveRunError, BlobPendingProposalError, BlobInProgressForkError) as exc:
+                raise _prompt_save_refusal(409, "prompt_file_retained", str(exc)) from exc
+            except BlobQuotaExceededError as exc:
+                raise _prompt_save_refusal(413, "prompt_file_too_large", "This save exceeds the session storage limit.") from exc
+            return SavePromptFileResponse(changed=True, content_sha256=replacement.content_hash)
+        finally:
+            await lease.close()
 
     @router.post("", status_code=201, response_model=BlobMetadataResponse)
     async def create_blob_upload(
@@ -450,7 +625,10 @@ def create_blobs_router() -> APIRouter:
             return Response(
                 content=content,
                 media_type=blob.mime_type,
-                headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(blob.filename, safe='')}"},
+                headers={
+                    "Content-Disposition": f"attachment; filename*=UTF-8''{quote(blob.filename, safe='')}",
+                    "X-Content-SHA256": content_hash(content),
+                },
             )
         finally:
             await lease.close()

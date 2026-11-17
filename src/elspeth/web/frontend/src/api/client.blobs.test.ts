@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { previewBlobContentSnippet } from "./client";
+import { previewBlobContentSnippet, savePromptFile } from "./client";
 
 describe("api/client blob preview", () => {
   let fetchSpy: ReturnType<typeof vi.spyOn>;
@@ -38,5 +38,22 @@ describe("api/client blob preview", () => {
       truncated: true,
       limit: 5000,
     });
+  });
+
+  it("sends the editor's observed hash as a concurrency precondition", async () => {
+    fetchSpy.mockResolvedValue({
+      ok: true,
+      json: async () => ({ changed: true, content_sha256: "b".repeat(64) }),
+    } as Response);
+
+    await savePromptFile("session-1", "blob-1", "line one\n  line two\n", "a".repeat(64));
+
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "/api/sessions/session-1/blobs/blob-1/prompt-text",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ content: "line one\n  line two\n", expected_sha256: "a".repeat(64) }),
+      }),
+    );
   });
 });

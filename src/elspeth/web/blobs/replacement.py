@@ -5,14 +5,14 @@ from __future__ import annotations
 import hmac
 import os
 import stat
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 from uuid import UUID, uuid4
 
-from sqlalchemy import Engine
+from sqlalchemy import Connection, Engine
 
 from elspeth.contracts.blobs import BlobRecord, BlobReplacementPlan
 from elspeth.contracts.errors import AuditIntegrityError
@@ -28,7 +28,7 @@ from elspeth.web.blobs.service import (
     _require_stable_custody_session,
     content_hash,
 )
-from elspeth.web.sessions.protocol import SessionOperationAuthority
+from elspeth.web.sessions.protocol import SessionOperationAuthority, SessionOperationMutationTransaction
 
 _REPLACE_KINDS = frozenset({SessionOperationKind.COMPOSE, SessionOperationKind.PROPOSAL})
 _RECOVERY_KINDS = frozenset(
@@ -251,6 +251,7 @@ class BlobReplacementCoordinator:
         context: SessionOperationContext,
         max_storage_per_session: int,
         accepting_proposal_id: UUID | None,
+        on_metadata_commit: Callable[[Connection, bytes, SessionOperationMutationTransaction], None] | None = None,
     ) -> BlobRecord:
         _require_blob_operation_context(context, allowed_kinds=_REPLACE_KINDS)
         if type(expected) is not BlobRecord or type(replacement) is not BlobRecord or type(content) is not bytes:
@@ -325,15 +326,24 @@ class BlobReplacementCoordinator:
                     plan = self._authority.mutate(context, lambda transaction: transaction.blobs.mark_blob_replacement_staged(plan=plan))
                     self._rename(storage, backup, directory_fd, context)
                     self._rename(staging, storage, directory_fd, context)
+                    stored_bytes = self._read_bytes(storage, directory_fd)
+                    if stored_bytes is None or content_hash(stored_bytes) != replacement.content_hash:
+                        raise AuditIntegrityError("stored replacement bytes differ from proposed metadata")
                     self._authority.compare_and_swap(context)
-                    plan = self._authority.mutate(
-                        context,
-                        lambda transaction: transaction.blobs.commit_blob_replacement(
+
+                    def commit_with_approval(transaction: SessionOperationMutationTransaction) -> BlobReplacementPlan:
+                        return transaction.blobs.commit_blob_replacement(
                             plan=plan,
                             max_storage_per_session=max_storage_per_session,
                             accepting_proposal_id=accepting_proposal_id,
-                        ),
-                    )
+                            on_metadata_commit=(
+                                (lambda conn: on_metadata_commit(conn, stored_bytes, transaction))
+                                if on_metadata_commit is not None
+                                else None
+                            ),
+                        )
+
+                    plan = self._authority.mutate(context, commit_with_approval)
                 except Exception as exc:
                     observed = self._observe(context, expected.id, exc)
                     if observed is None or observed.replacement_id != replacement_id:
