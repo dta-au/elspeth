@@ -787,6 +787,14 @@ jobs:
           rm -rf examples/threshold_gate_container/output examples/threshold_gate_container/runs
           mkdir -p examples/threshold_gate_container/output examples/threshold_gate_container/runs
 
+          # The image runs as uid 1654, not the runner user, and a hardened
+          # runner (UMask=0077) checks out owner-only files. Open just the
+          # mounted example to the container: read the inputs, write the outputs.
+          # The runner's own work root stays 0700, so nothing else on the host
+          # can reach these files.
+          chmod -R a+rX examples/threshold_gate_container
+          chmod a+rwx examples/threshold_gate_container/output examples/threshold_gate_container/runs
+
           # Run the pipeline in the container
           # This example has paths configured for /app/pipeline mount point
           docker run --rm \
@@ -794,6 +802,14 @@ jobs:
             "$IMAGE" run \
             --settings /app/pipeline/settings.yaml \
             --execute
+
+          # Sinks write their files 0600 as uid 1654. Let the owner (the image
+          # user) open them to the runner so the next step can verify them and
+          # later cleanup can remove them.
+          docker run --rm \
+            -v "$PWD/examples/threshold_gate_container:/app/pipeline:rw" \
+            --entrypoint /bin/sh "$IMAGE" -c \
+            'chmod -R a+rwX /app/pipeline/output /app/pipeline/runs'
 
           echo "=== Pipeline execution completed ==="
 
@@ -856,15 +872,24 @@ jobs:
           IMAGE="$SMOKE_IMAGE"
 
           echo "=== Test 6: Run representative no-secret examples ==="
+          # The whole checkout is mounted at /app; the image user (uid 1654)
+          # needs to traverse it and read the examples (see Test 4).
+          chmod a+rX .
+          chmod -R a+rX examples
           for example in boolean_routing batch_aggregation json_explode schema_contracts_demo; do
             echo "Running example: ${example}"
             rm -rf "examples/${example}/output" "examples/${example}/runs"
             mkdir -p "examples/${example}/output" "examples/${example}/runs"
+            chmod a+rwx "examples/${example}/output" "examples/${example}/runs"
             docker run --rm \
               -v "$PWD:/app:rw" \
               "$IMAGE" run \
               --settings "examples/${example}/settings.yaml" \
               --execute
+            docker run --rm \
+              -v "$PWD:/app:rw" \
+              --entrypoint /bin/sh "$IMAGE" -c \
+              "chmod -R a+rwX /app/examples/${example}/output /app/examples/${example}/runs"
           done
 
       - name: Test summary
