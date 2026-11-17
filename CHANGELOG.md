@@ -87,6 +87,17 @@ Schema and stored data:
   documents up to 524,288 characters (was 262,144), so pipelines carrying real
   file-backed prompts fit. This supersedes the 0.8.14 decision to leave the
   limit unchanged (composer remediation checklist item 05.21).
+- The composer can change part of an existing LLM prompt without resending
+  it: `inspect_prompt_targets` reports a prompt's length and SHA-256 (never
+  its text), and `change_substring` applies up to 32 exact, all-or-none
+  substring edits to that prompt (or one text part of a structured prompt)
+  against that hash, under the same checks as `patch_node_options`. A match
+  must be unique unless `replace_all` is set; edit text is redacted to its
+  length in tool results, proposal cards and audit records, and is checked
+  for credentials. Changing a prompt reopens its prompt review. A one-line
+  edit now sends a few hundred bytes of tool arguments instead of the whole
+  prompt. Editing text inside a session file is not yet supported. The
+  composer now offers 45 tools by default (was 43).
 
 ### Release pipeline
 
