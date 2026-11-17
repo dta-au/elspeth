@@ -3865,6 +3865,7 @@ class ToolContext:
     require_data_dir_for_paths: bool = False
     session_engine: Engine | None = None
     session_id: str | None = None
+    current_state_id: str | None = None
     session_operation_context: SessionOperationContext | None = None
     session_operation_authority: SessionOperationAuthority | None = None
     secret_service: WebSecretResolver | None = None

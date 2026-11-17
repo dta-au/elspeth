@@ -897,6 +897,7 @@ class TestStep3MutationTierMigration:
             "remove_output",
             "patch_source_options",
             "patch_node_options",
+            "change_substring",
             "patch_output_options",
             "set_pipeline",
             "clear_source",

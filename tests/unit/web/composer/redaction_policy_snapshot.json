@@ -1,4 +1,9 @@
 {
+  "change_substring": {
+    "hash": "01e83df6f1feab1347b8c55fbfa0328d9c319b2687fa15fc7e001dfa9f0e39b0",
+    "sensitive_path_count": 11,
+    "shape": "type_driven"
+  },
   "clear_source": {
     "hash": "eb700d5632463ccbbd45077aadf4e10703f2c9937cd15cc7f6a7a37d334d22b2",
     "sensitive_path_count": 0,
@@ -58,6 +63,11 @@
     "hash": "8cd92a2e54f8267753b59f69f94325f9c520b2611edee3833b65e4669992f2f9",
     "sensitive_path_count": 0,
     "shape": "declarative"
+  },
+  "inspect_prompt_targets": {
+    "hash": "15afc477945f657be38b535d99f4fb192a14108042bcf3f19c3650f9cf2bf95b",
+    "sensitive_path_count": 9,
+    "shape": "type_driven"
   },
   "inspect_source": {
     "hash": "74ca7f95ec4adb3e330bdbde203f415279eac103d1027a258e758e11f077caf8",

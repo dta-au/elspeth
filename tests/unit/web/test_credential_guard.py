@@ -422,6 +422,42 @@ def test_blob_body_content_remains_outside_control_plane_admission() -> None:
     )
 
 
+@pytest.mark.parametrize("fragment", ("old", "replacement"))
+def test_inline_substring_fragments_remain_in_credential_projection(fragment: str) -> None:
+    candidate = "sk-" + "a" * 24
+    edit = {"old": "benign", "replacement": "clean", "replace_all": False}
+    edit[fragment] = candidate
+    arguments = {
+        "target": {"kind": "node_option", "node_id": "code_themes", "option": "prompt_template"},
+        "edits": [edit],
+    }
+    projected = credential_material_tool_arguments_projection("change_substring", arguments)
+    assert projected["edits"][0][fragment] == candidate
+    with pytest.raises(CredentialMaterialRefused):
+        require_no_credential_material_for_tool("change_substring", arguments, surface="test_surface")
+
+
+def test_benign_inline_substring_edit_passes_credential_projection() -> None:
+    arguments = {
+        "target": {"kind": "node_option", "node_id": "code_themes", "option": "prompt_template"},
+        "edits": [{"old": "benign", "replacement": "clean", "replace_all": False}],
+    }
+    assert credential_material_tool_arguments_projection("change_substring", arguments) == arguments
+    require_no_credential_material_for_tool("change_substring", arguments, surface="test_surface")
+
+
+def test_blob_substring_fragments_keep_data_plane_exclusion() -> None:
+    candidate = "sk-" + "a" * 24
+    arguments = {
+        "target": {"kind": "blob", "blob_id": "test-blob"},
+        "edits": [{"old": candidate, "replacement": candidate, "replace_all": False}],
+    }
+    projected = credential_material_tool_arguments_projection("change_substring", arguments)
+    assert projected["edits"][0]["old"] == "<data-plane-content>"
+    assert projected["edits"][0]["replacement"] == "<data-plane-content>"
+    require_no_credential_material_for_tool("change_substring", arguments, surface="test_surface")
+
+
 def test_wire_secret_ref_scans_the_option_name_without_treating_it_as_a_secret_value() -> None:
     arguments = {"name": "OPENROUTER_API_KEY", "target": "source", "option_key": "api_key"}
 

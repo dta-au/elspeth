@@ -110,8 +110,11 @@ def referenced_resources(tool: str, arguments: Mapping[str, JsonValue]) -> froze
     elif tool == "upsert_edge":
         for key in ("from_node", "to_node"):
             _add(resources, "component", arguments.get(key))
-    elif tool == "patch_node_options":
+    elif tool in ("patch_node_options", "inspect_prompt_targets"):
         _add(resources, "node", arguments.get("node_id"))
+    elif tool == "change_substring":
+        target_record = _object(arguments.get("target"))
+        _add(resources, "node", target_record.get("node_id"))
     elif tool in ("wire_secret_ref", "wire_blob_inline_ref"):
         target = arguments.get("target")
         if type(target) is str and target in ("node", "source", "output"):

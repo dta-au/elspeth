@@ -1669,7 +1669,20 @@ async def run_tool_batch(
         containment = approval_containment_refusal if _stages_composition_proposal(tool_name) else None
         reject = _candidate_rejection_result if tool_name == "set_pipeline" else _saved_graph_rejection_result
         blocked: ToolResult | None = None
-        if containment is not None and containment[0] == "batch":
+        if tool_name == "inspect_prompt_targets" and (
+            mutation_success_observed
+            or any(
+                isinstance(outcome.response, ToolResult) and outcome.response.success and is_mutation_tool(outcome.call.function.name)
+                for outcome in tool_outcomes
+            )
+        ):
+            blocked = reject(
+                state,
+                "A mutation has applied in this tool batch. Inspect prompt targets in the next tool batch after the checkpoint.",
+                error_code="inspect_after_uncheckpointed_mutation",
+                rejected_component=None,
+            )
+        elif containment is not None and containment[0] == "batch":
             blocked = reject(state, containment[1], error_code="approval_batch_not_atomic", rejected_component=None)
         elif containment is not None:
             blocked = reject(state, containment[1], error_code="approval_proposal_pending", rejected_component=None)
@@ -2267,6 +2280,7 @@ async def run_tool_batch(
                         data_dir=ctx.custody.data_dir,
                         session_engine=ctx.custody.session_engine,
                         session_id=session_id,
+                        current_state_id=current_state_id,
                         session_operation_context=ctx.session_operation_context,
                         session_operation_authority=ctx.session_operation_authority,
                         secret_service=ctx.custody.secret_service,
@@ -3340,6 +3354,7 @@ async def run_tool_batch(
                 data_dir=ctx.custody.data_dir,
                 session_engine=ctx.custody.session_engine,
                 session_id=session_id,
+                current_state_id=current_state_id,
                 session_operation_context=ctx.session_operation_context,
                 session_operation_authority=ctx.session_operation_authority,
                 secret_service=ctx.custody.secret_service,

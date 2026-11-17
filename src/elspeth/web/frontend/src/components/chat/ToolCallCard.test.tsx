@@ -97,6 +97,23 @@ describe("ToolCallCard", () => {
     expect(screen.queryByText(/uploaded file|transform or gate/)).not.toBeInTheDocument();
   });
 
+  it("shows a compact edit target and count without rendering fragments", () => {
+    render(
+      <ToolCallCard
+        toolCall={makeToolCall("change_substring")}
+        proposal={{
+          ...proposal,
+          tool_name: "change_substring",
+          summary: 'Edit prompt text on node "classifier" — 1 exact edit.',
+          arguments_redacted_json: { target: { kind: "node_option", node_id: "classifier", option: "prompt_template" }, edits: [{ old: "PRIVATE-OLD", replacement: "PRIVATE-NEW" }] },
+        }}
+      />,
+    );
+    expect(screen.getByText(/classifier.*1 exact edit/)).toBeInTheDocument();
+    expect(screen.queryByText(/PRIVATE-OLD|PRIVATE-NEW/)).not.toBeInTheDocument();
+    expect(screen.queryByText("View arguments (JSON)")).not.toBeInTheDocument();
+  });
+
   it.each(["source_data_contract", "pipeline_decision"])("renders kind-neutral Why text for %s review", (kind) => {
     const rationale = "Review the planner's proposed interpretation or assumption before it is accepted into the pipeline.";
     render(

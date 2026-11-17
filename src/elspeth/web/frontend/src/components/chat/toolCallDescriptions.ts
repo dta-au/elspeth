@@ -30,6 +30,8 @@ const READ_ONLY_TOOL_CALL_DESCRIPTIONS: Record<string, string> = {
     "Looks up usage guidance and worked examples for a specific plugin.",
   get_pipeline_state:
     "Reads the current pipeline state being composed in this session.",
+  inspect_prompt_targets:
+    "Reads an LLM node's prompt text lengths and hashes without returning the text.",
   get_audit_info:
     "Looks up audit metadata for the current session (run IDs, lineage anchors).",
   get_expression_grammar:
@@ -76,6 +78,8 @@ const MUTATING_TOOL_CALL_DESCRIPTIONS: Record<string, string> = {
     "Updates one or more configuration options on the source without replacing it.",
   patch_node_options:
     "Updates configuration options on a pipeline node.",
+  change_substring:
+    "Changes exact text in an LLM prompt. Changed prompts require fresh review.",
   patch_output_options:
     "Updates one or more configuration options on an output sink.",
   new_session: "Starts a fresh composer session.",
