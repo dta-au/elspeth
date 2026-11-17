@@ -9,6 +9,8 @@ from uuid import UUID
 
 import pytest
 import structlog
+from sqlalchemy import update
+from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.web.composer.tools._common import _options_with_default_prompt_template_review
@@ -120,6 +122,30 @@ async def test_card_snapshot_and_shared_approval_match_current_bytes(blob_env: d
         )
         assert approval.event_id == event_id
         assert conn.execute(prompt_file_approvals_table.select()).one().content_sha256 == record.content_hash
+
+
+@pytest.mark.asyncio
+async def test_prompt_file_approval_update_refused(blob_env: dict[str, Any]) -> None:
+    _service, session_id, _event_id, blob_id = await _pending_file_review(blob_env)
+    record = blob_env["authority"].mutate(blob_env["operation"], lambda tx: tx.blobs.read_blob(blob_id=blob_id))
+    with blob_env["engine"].begin() as conn:
+        approval = record_prompt_file_approval(
+            conn,
+            PromptFileApprovalRequest(
+                session_id=session_id,
+                node_id="classify",
+                field_path="prompt_template",
+                blob_id=blob_id,
+                content_sha256=record.content_hash,
+                actor_user_id="test-user",
+                trigger=PromptApprovalTrigger.CARD,
+            ),
+            now=datetime.now(UTC),
+        )
+    with pytest.raises(IntegrityError, match="prompt_file_approvals is append-only"), blob_env["engine"].begin() as conn:
+        conn.execute(
+            update(prompt_file_approvals_table).where(prompt_file_approvals_table.c.id == str(approval.id)).values(content_sha256="b" * 64)
+        )
 
 
 @pytest.mark.asyncio

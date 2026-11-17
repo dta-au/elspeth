@@ -17,7 +17,11 @@ from elspeth.web.blobs import routes
 from elspeth.web.blobs.service import content_hash
 from elspeth.web.composer.tools._common import _options_with_default_prompt_template_review
 from elspeth.web.execution.service import ExecutionServiceImpl
-from elspeth.web.interpretation_state import prompt_review_draft_from_options
+from elspeth.web.interpretation_state import (
+    InterpretationReviewPending,
+    materialize_state_for_execution,
+    prompt_review_draft_from_options,
+)
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.models import blobs_table, composition_states_table, interpretation_events_table, prompt_file_approvals_table
 from elspeth.web.sessions.prompt_file_approval import PromptApprovalTrigger, _blob_record, _read_custody_bytes
@@ -63,36 +67,29 @@ def _save(client: SyncASGITestClient, session_id: str, blob_id: str, content: st
     )
 
 
-def test_owner_save_records_its_binding_inside_metadata_transaction(tmp_path, monkeypatch) -> None:
-    app, service, _ = _make_app(tmp_path)
-    client = SyncASGITestClient(app)
-    session_id = _create_session(client)
-    blob = _upload_blob(client, session_id, b"before\n", "prompt.txt", "text/plain")
-    _bound(client, session_id, blob["id"], blob["content_hash"], service)
-    calls = []
-
-    def record(conn, request, *, now):
-        stored = conn.execute(select(blobs_table.c.content_hash).where(blobs_table.c.id == blob["id"])).scalar_one()
-        assert stored == content_hash(b"after\n")
-        nodes = conn.execute(
-            select(composition_states_table.c.nodes)
-            .where(composition_states_table.c.session_id == session_id)
-            .order_by(composition_states_table.c.version.desc())
-            .limit(1)
-        ).scalar_one()
-        assert unwrap_state_column(nodes)[0]["options"]["prompt_template"]["sha256"] == stored
-        assert conn.in_transaction()
-        calls.append((request, now))
-
-    monkeypatch.setattr(routes, "record_prompt_file_approval", record, raising=False)
+def test_owner_save_records_its_binding_inside_metadata_transaction(tmp_path) -> None:
+    client, _service, blob_service, session_id, blob, _second, _events = _live_prompt_setup(tmp_path)
     response = _save(client, session_id, blob["id"], "after\n", blob["content_hash"])
     assert response.status_code == 200, response.text
     assert response.json() == {"changed": True, "content_sha256": content_hash(b"after\n")}
     stored = client.get(f"/api/sessions/{session_id}/blobs/{blob['id']}/content")
     assert stored.content == b"after\n"
     assert stored.headers["X-Content-SHA256"] == content_hash(stored.content)
-    assert [(call.node_id, call.field_path) for call, _ in calls] == [("first", "prompt_template")]
-    assert all(call.trigger is PromptApprovalTrigger.EDITOR_SAVE and call.content_sha256 == content_hash(b"after\n") for call, _ in calls)
+    with blob_service._engine.connect() as conn:
+        approval = conn.execute(select(prompt_file_approvals_table)).one()
+        nodes = conn.execute(
+            select(composition_states_table.c.nodes)
+            .where(composition_states_table.c.session_id == session_id)
+            .order_by(composition_states_table.c.version.desc())
+            .limit(1)
+        ).scalar_one()
+    assert unwrap_state_column(nodes)[0]["options"]["prompt_template"]["sha256"] == approval.content_sha256
+    assert (approval.node_id, approval.field_path, approval.trigger, approval.content_sha256) == (
+        "first",
+        "prompt_template",
+        PromptApprovalTrigger.EDITOR_SAVE.value,
+        content_hash(b"after\n"),
+    )
 
 
 @pytest.mark.parametrize(
@@ -101,9 +98,10 @@ def test_owner_save_records_its_binding_inside_metadata_transaction(tmp_path, mo
         ({"shared": True}, "prompt_file_shared_binding"),
         ({"encoding": "latin-1"}, "prompt_file_encoding_unsupported"),
         ({"encoding": "utf-16"}, "prompt_file_encoding_unsupported"),
+        ({"encoding": "utf-8-sig"}, "prompt_file_encoding_unsupported"),
     ],
 )
-def test_save_refuses_what_the_user_cannot_see_or_would_not_run(tmp_path, monkeypatch, bound, code) -> None:
+def test_save_refuses_what_the_user_cannot_see_or_would_not_run(tmp_path, bound, code) -> None:
     """A save approves only the one prompt on screen, read as the UTF-8 text the user typed.
 
     Shared: a second binding (here another node's system prompt, as an assistant re-point would
@@ -115,47 +113,68 @@ def test_save_refuses_what_the_user_cannot_see_or_would_not_run(tmp_path, monkey
     session_id = _create_session(client)
     blob = _upload_blob(client, session_id, b"before\n", "prompt.txt", "text/plain")
     _bound(client, session_id, blob["id"], blob["content_hash"], service, **bound)
-    calls = []
-    monkeypatch.setattr(routes, "record_prompt_file_approval", lambda conn, request, *, now: calls.append(request), raising=False)
-
     response = _save(client, session_id, blob["id"], "caf\u00e9\n", blob["content_hash"])
 
     assert response.status_code == 409, response.text
     assert response.json()["detail"]["error_code"] == code
-    assert calls == []
+    with service._engine.connect() as conn:
+        assert conn.execute(select(prompt_file_approvals_table)).all() == []
     assert client.get(f"/api/sessions/{session_id}/blobs/{blob['id']}/content").content == b"before\n"
 
 
+def test_save_refuses_node_with_two_prompt_files(tmp_path: Path) -> None:
+    client, service, blob_service, session_id, first, _other, _events = _live_prompt_setup(tmp_path)
+    second = _upload_blob(client, session_id, b"second", "second.txt", "text/plain")
+    current = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert current is not None
+    data = state_from_record(current).to_dict()
+    data["nodes"][0]["options"]["system_prompt"] = {"blob_ref": second["id"], "mode": "inline_content", "sha256": second["content_hash"]}
+    with fenced_operation_context(blob_service._engine, session_id) as operation:
+        asyncio.run(
+            service.save_composition_state(
+                UUID(session_id),
+                CompositionStateData(
+                    sources=data["sources"],
+                    nodes=data["nodes"],
+                    edges=data["edges"],
+                    outputs=data["outputs"],
+                    metadata_=data["metadata"],
+                    is_valid=True,
+                ),
+                provenance="tool_call",
+                session_operation_context=operation,
+            )
+        )
+    before = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert before is not None
+    response = _save(client, session_id, first["id"], "edited", first["content_hash"])
+    assert response.status_code == 409
+    assert response.json()["detail"]["error_code"] == "prompt_file_node_multi_binding"
+    assert client.get(f"/api/sessions/{session_id}/blobs/{first['id']}/content").content == b"first before"
+    with blob_service._engine.connect() as conn:
+        assert conn.execute(select(prompt_file_approvals_table)).all() == []
+        assert conn.execute(select(blobs_table.c.content_hash).where(blobs_table.c.id == first["id"])).scalar_one() == first["content_hash"]
+    after = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert after is not None and after.id == before.id
+
+
 @pytest.mark.parametrize("body_extra", [{}, {"expected_sha256": None}])
-def test_save_without_expected_hash_is_refused_and_writes_nothing(tmp_path, monkeypatch, body_extra) -> None:
+def test_save_without_expected_hash_is_refused_and_writes_nothing(tmp_path, body_extra) -> None:
     """No blind overwrite: the client must name the content it started editing."""
     app, service, _ = _make_app(tmp_path)
     client = SyncASGITestClient(app)
     session_id = _create_session(client)
     blob = _upload_blob(client, session_id, b"before\n", "prompt.txt", "text/plain")
     _bound(client, session_id, blob["id"], blob["content_hash"], service)
-    calls = []
-    monkeypatch.setattr(routes, "record_prompt_file_approval", lambda conn, request, *, now: calls.append(request), raising=False)
-
     response = client.put(
         f"/api/sessions/{session_id}/blobs/{blob['id']}/prompt-text",
         json={"content": "after\n", **body_extra},
     )
 
     assert response.status_code == 422, response.text
-    assert calls == []
+    with service._engine.connect() as conn:
+        assert conn.execute(select(prompt_file_approvals_table)).all() == []
     assert client.get(f"/api/sessions/{session_id}/blobs/{blob['id']}/content").content == b"before\n"
-
-
-def test_utf8_sig_binding_saves(tmp_path, monkeypatch) -> None:
-    app, service, _ = _make_app(tmp_path)
-    client = SyncASGITestClient(app)
-    session_id = _create_session(client)
-    blob = _upload_blob(client, session_id, b"before\n", "prompt.txt", "text/plain")
-    _bound(client, session_id, blob["id"], blob["content_hash"], service, encoding="utf-8-sig")
-    monkeypatch.setattr(routes, "record_prompt_file_approval", lambda conn, request, *, now: None, raising=False)
-
-    assert _save(client, session_id, blob["id"], "after\n", blob["content_hash"]).status_code == 200
 
 
 def test_failed_approval_rolls_back_bytes_and_approval_row(tmp_path, monkeypatch) -> None:
@@ -171,6 +190,7 @@ def test_failed_approval_rolls_back_bytes_and_approval_row(tmp_path, monkeypatch
         conn.execute(text("INSERT INTO prompt_save_probe (hash) VALUES (:hash)"), {"hash": request.content_sha256})
         raise RuntimeError("approval failed")
 
+    # Fault injection proves the byte write and approval share one rollback boundary.
     monkeypatch.setattr(routes, "record_prompt_file_approval", fail_after_write, raising=False)
     with pytest.raises(RuntimeError, match="approval failed"):
         _save(client, session_id, blob["id"], "after", blob["content_hash"])
@@ -183,31 +203,28 @@ def test_failed_approval_rolls_back_bytes_and_approval_row(tmp_path, monkeypatch
     assert client.get(f"/api/sessions/{session_id}/blobs/{blob['id']}/content").content == b"before"
 
 
-def test_stale_and_identical_saves_do_not_approve(tmp_path, monkeypatch) -> None:
+def test_stale_and_identical_saves_do_not_approve(tmp_path) -> None:
     app, service, _ = _make_app(tmp_path)
     client = SyncASGITestClient(app)
     session_id = _create_session(client)
     blob = _upload_blob(client, session_id, b"before", "prompt.txt", "text/plain")
     _bound(client, session_id, blob["id"], blob["content_hash"], service)
-    calls = []
-    monkeypatch.setattr(routes, "record_prompt_file_approval", lambda *args, **kwargs: calls.append(args), raising=False)
     stale = _save(client, session_id, blob["id"], "after", "f" * 64)
     assert stale.status_code == 409
     assert stale.json()["detail"]["error_code"] == "prompt_file_stale"
     same = _save(client, session_id, blob["id"], "before", blob["content_hash"])
     assert same.status_code == 200
     assert same.json()["changed"] is False
-    assert calls == []
+    with service._engine.connect() as conn:
+        assert conn.execute(select(prompt_file_approvals_table)).all() == []
 
 
-def test_mixed_use_and_binary_refuse(tmp_path, monkeypatch) -> None:
+def test_mixed_use_and_binary_refuse(tmp_path) -> None:
     app, service, _ = _make_app(tmp_path)
     client = SyncASGITestClient(app)
     session_id = _create_session(client)
     blob = _upload_blob(client, session_id, b"before", "prompt.txt", "text/plain")
     _bound(client, session_id, blob["id"], blob["content_hash"], service, mixed=True)
-    calls = []
-    monkeypatch.setattr(routes, "record_prompt_file_approval", lambda *args, **kwargs: calls.append(args), raising=False)
     response = _save(client, session_id, blob["id"], "after", blob["content_hash"])
     assert response.status_code == 409
     assert response.json()["detail"]["error_code"] == "prompt_file_mixed_use"
@@ -215,37 +232,34 @@ def test_mixed_use_and_binary_refuse(tmp_path, monkeypatch) -> None:
     response = _save(client, session_id, binary["id"], "after", binary["content_hash"])
     assert response.status_code == 422
     assert response.json()["detail"]["error_code"] == "prompt_file_not_text"
-    assert calls == []
+    with service._engine.connect() as conn:
+        assert conn.execute(select(prompt_file_approvals_table)).all() == []
 
 
-def test_oversized_text_refuses_without_approval(tmp_path, monkeypatch) -> None:
+def test_oversized_text_refuses_without_approval(tmp_path) -> None:
     app, service, _ = _make_app(tmp_path)
     client = SyncASGITestClient(app)
     session_id = _create_session(client)
     blob = _upload_blob(client, session_id, b"before", "prompt.txt", "text/plain")
     _bound(client, session_id, blob["id"], blob["content_hash"], service)
-    calls = []
-    monkeypatch.setattr(routes, "record_prompt_file_approval", lambda *args, **kwargs: calls.append(args), raising=False)
     response = _save(client, session_id, blob["id"], "x" * (256 * 1024 + 1), blob["content_hash"])
     assert response.status_code == 413
     assert response.json()["detail"]["error_code"] == "prompt_file_too_large"
     assert client.get(f"/api/sessions/{session_id}/blobs/{blob['id']}/content").content == b"before"
-    assert calls == []
+    with service._engine.connect() as conn:
+        assert conn.execute(select(prompt_file_approvals_table)).all() == []
 
 
-def test_non_owner_cannot_save_or_approve(tmp_path, monkeypatch) -> None:
+def test_non_owner_cannot_save_or_approve(tmp_path) -> None:
     alice, bob = _IDORFixture()._make_two_session_app(tmp_path)
     session_id = _create_session(alice)
     blob = _upload_blob(alice, session_id, b"before", "prompt.txt", "text/plain")
-    calls = []
-    monkeypatch.setattr(routes, "record_prompt_file_approval", lambda *args, **kwargs: calls.append(args), raising=False)
     response = _save(bob, session_id, blob["id"], "after", blob["content_hash"])
     assert response.status_code == 404
     detail = response.json()["detail"]
     assert isinstance(detail, dict)
     assert detail["error_code"] == "prompt_file_not_found"
     assert alice.get(f"/api/sessions/{session_id}/blobs/{blob['id']}/content").content == b"before"
-    assert calls == []
 
 
 def _live_prompt_setup(
@@ -331,6 +345,22 @@ def _admit(service: Any, blob_service: Any, session_id: str) -> tuple[Any, ...]:
         )
 
 
+def _review_state(service: Any, session_id: str) -> tuple[dict[str, str], Any]:
+    record = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert record is not None
+    state = state_from_record(record)
+    requirements = {
+        node.id: next(
+            requirement["status"]
+            for requirement in node.options["interpretation_requirements"]
+            if requirement["kind"] == "llm_prompt_template"
+        )
+        for node in state.nodes
+        if node.plugin == "llm"
+    }
+    return requirements, materialize_state_for_execution(state)
+
+
 def _approve_card(service: Any, blob_service: Any, session_id: str, event_id: UUID) -> None:
     with fenced_operation_context(blob_service._engine, session_id) as operation:
         resolved, _state = asyncio.run(
@@ -347,9 +377,16 @@ def _approve_card(service: Any, blob_service: Any, session_id: str, event_id: UU
 
 
 def test_save_admits_then_agent_edit_requires_review(tmp_path: Path) -> None:
-    client, service, blob_service, session_id, first, _second, _events = _live_prompt_setup(tmp_path)
+    client, service, blob_service, session_id, first, _second, events = _live_prompt_setup(tmp_path)
+    assert events["first"]
+    assert _review_state(service, session_id)[0]["first"] == "pending"
     saved = _save(client, session_id, first["id"], "owner-edited prompt", first["content_hash"])
     assert saved.status_code == 200, saved.text
+    requirements, materialized = _review_state(service, session_id)
+    assert requirements["first"] == "resolved"
+    assert not isinstance(materialized, InterpretationReviewPending) or all(
+        site.kind is not InterpretationKind.LLM_PROMPT_TEMPLATE for site in materialized.sites
+    )
     assert [snapshot.node_id for snapshot in _admit(service, blob_service, session_id)] == ["first"]
 
     new_blob = _upload_blob(client, session_id, b"agent replacement prompt", "replacement.txt", "text/plain")
@@ -434,6 +471,62 @@ def test_save_admits_then_agent_edit_requires_review(tmp_path: Path) -> None:
     assert [snapshot.node_id for snapshot in _admit(service, blob_service, session_id)] == ["first"]
 
 
+def test_approved_unbound_blob_can_be_deleted_with_evidence_retained(tmp_path: Path) -> None:
+    client, service, blob_service, session_id, first, _second, _events = _live_prompt_setup(tmp_path)
+    assert _save(client, session_id, first["id"], "approved edit", first["content_hash"]).status_code == 200
+    replacement = _upload_blob(client, session_id, b"replacement", "replacement.txt", "text/plain")
+    record = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert record is not None
+    state = state_from_record(record)
+    from tests.unit.web.composer.test_blob_inline_tools import _catalog, execute_tool
+
+    with fenced_operation_context(blob_service._engine, session_id) as operation:
+        wired = execute_tool(
+            "wire_blob_inline_ref",
+            {"field_path": "node:first.options.prompt_template", "blob_id": replacement["id"]},
+            state,
+            _catalog(),
+            data_dir=str(tmp_path),
+            session_engine=blob_service._engine,
+            session_id=session_id,
+            session_operation_context=operation,
+            session_operation_authority=service.session_operation_authority,
+        )
+        assert wired.success, wired.to_dict()
+        next_state = wired.updated_state.to_dict()
+        asyncio.run(
+            service.save_composition_state(
+                UUID(session_id),
+                CompositionStateData(
+                    sources=next_state["sources"],
+                    nodes=next_state["nodes"],
+                    edges=next_state["edges"],
+                    outputs=next_state["outputs"],
+                    metadata_=next_state["metadata"],
+                    is_valid=True,
+                ),
+                provenance="tool_call",
+                session_operation_context=operation,
+            )
+        )
+        deleted = execute_tool(
+            "delete_blob",
+            {"blob_id": first["id"]},
+            wired.updated_state,
+            _catalog(),
+            data_dir=str(tmp_path),
+            session_engine=blob_service._engine,
+            session_id=session_id,
+            session_operation_context=operation,
+            session_operation_authority=service.session_operation_authority,
+        )
+        assert deleted.success, deleted.to_dict()
+    with blob_service._engine.connect() as conn:
+        assert conn.execute(select(blobs_table.c.id).where(blobs_table.c.id == first["id"])).one_or_none() is None
+        rows = conn.execute(select(prompt_file_approvals_table).where(prompt_file_approvals_table.c.blob_id == first["id"])).all()
+    assert len(rows) == 1 and rows[0].content_sha256 == content_hash(b"approved edit")
+
+
 def test_editor_save_resolves_only_its_node_card(tmp_path: Path) -> None:
     client, service, blob_service, session_id, first, second, events = _live_prompt_setup(tmp_path, two_nodes=True)
     assert second is not None
@@ -448,11 +541,52 @@ def test_editor_save_resolves_only_its_node_card(tmp_path: Path) -> None:
         ).all()
     assert [(row.node_id, row.field_path, row.trigger) for row in rows] == [("first", "prompt_template", "editor_save")]
     assert dict(cards) == {"first": "superseded", "second": "pending"}
+    requirements, materialized = _review_state(service, session_id)
+    assert requirements == {"first": "resolved", "second": "pending"}
+    assert isinstance(materialized, InterpretationReviewPending)
+    assert [(site.component_id, site.kind) for site in materialized.sites if site.kind is InterpretationKind.LLM_PROMPT_TEMPLATE] == [
+        ("second", InterpretationKind.LLM_PROMPT_TEMPLATE)
+    ]
     with pytest.raises(PromptFileReviewStale) as refusal:
         _admit(service, blob_service, session_id)
     assert refusal.value.error_code == "prompt_file_review_stale"
     assert "second" in str(refusal.value)
     assert "first" not in str(refusal.value)
+
+
+def test_editor_save_keeps_card_pending_for_inline_query(tmp_path: Path) -> None:
+    client, service, blob_service, session_id, first, _second, events = _live_prompt_setup(tmp_path)
+    record = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert record is not None
+    data = state_from_record(record).to_dict()
+    data["nodes"][0]["options"]["queries"] = {"q": {"input_fields": {}, "template": "inline query"}}
+    with fenced_operation_context(blob_service._engine, session_id) as operation:
+        asyncio.run(
+            service.save_composition_state(
+                UUID(session_id),
+                CompositionStateData(
+                    sources=data["sources"],
+                    nodes=data["nodes"],
+                    edges=data["edges"],
+                    outputs=data["outputs"],
+                    metadata_=data["metadata"],
+                    is_valid=True,
+                ),
+                provenance="tool_call",
+                session_operation_context=operation,
+            )
+        )
+    response = _save(client, session_id, first["id"], "edited file", first["content_hash"])
+    assert response.status_code == 200, response.text
+    with blob_service._engine.connect() as conn:
+        assert conn.execute(select(prompt_file_approvals_table.c.trigger)).scalar_one() == "editor_save"
+        assert (
+            conn.execute(
+                select(interpretation_events_table.c.choice).where(interpretation_events_table.c.id == str(events["first"]))
+            ).scalar_one()
+            == "pending"
+        )
+    assert _review_state(service, session_id)[0]["first"] == "pending"
 
 
 def test_same_id_replacement_refuses_until_new_card_approval(tmp_path: Path) -> None:

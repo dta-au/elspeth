@@ -28,7 +28,12 @@ from elspeth.web.sessions.models import (
     prompt_review_snapshots_table,
     sessions_table,
 )
-from elspeth.web.sessions.prompt_file_review import PromptFileReviewStale, PromptReviewSnapshot, resolve_prompt_review_snapshot
+from elspeth.web.sessions.prompt_file_review import (
+    PromptFileReviewStale,
+    PromptReviewSnapshot,
+    _surface_slots,
+    resolve_prompt_review_snapshot,
+)
 from elspeth.web.sessions.state_envelope import unwrap_state_column
 
 
@@ -282,7 +287,12 @@ def record_prompt_file_approval(
             ):
                 all_approved = False
                 break
-        if all_approved:
+        requirements = options["interpretation_requirements"] if "interpretation_requirements" in options else ()
+        inline_pending = any(requirement["status"] == "pending" and requirement["kind"] == "vague_term" for requirement in requirements)
+        inline_pending = inline_pending or any(
+            path != request.field_path and path != "system_prompt" and type(value) is str for path, value in _surface_slots(options)
+        )
+        if all_approved and not inline_pending:
             conn.execute(
                 update(interpretation_events_table)
                 .where(

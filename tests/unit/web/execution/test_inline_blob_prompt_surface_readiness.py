@@ -307,6 +307,8 @@ def _run_admission(
     mime_type: str = "text/plain",
     approved: bool = False,
     after_substitution: Callable[[dict[str, Any], Any], None] | None = None,
+    landscape_probe: Any | None = None,
+    run_id: UUID | None = None,
 ) -> tuple[BaseException | None, Any, Any]:
     """Drive ``_run_pipeline`` with the runtime YAML the composer generates for the same state.
 
@@ -371,9 +373,18 @@ def _run_admission(
     with (
         patch("elspeth.web.execution.service.Orchestrator"),
         patch("elspeth.web.execution.service.load_settings_from_config_dict") as mock_load,
-        patch("elspeth.web.execution.service.open_landscape_db"),
+        patch("elspeth.web.execution.service.open_landscape_db") as mock_open_landscape,
         patch("elspeth.web.execution.service.FilesystemPayloadStore"),
+        patch("elspeth.web.execution.service.build_validated_runtime_graph") as mock_runtime_graph,
+        patch("elspeth.web.execution.service.assemble_and_validate_pipeline_config") as mock_assemble,
     ):
+        if landscape_probe is not None:
+            from tests.unit.web.execution.test_service import _execution_graph_stub, _mock_pipeline_settings, _plugin_bundle_stub
+
+            mock_open_landscape.return_value = landscape_probe
+            mock_load.return_value = _mock_pipeline_settings()
+            mock_runtime_graph.return_value = SimpleNamespace(plugin_bundle=_plugin_bundle_stub(), graph=_execution_graph_stub())
+            mock_assemble.side_effect = RuntimeError("stop after prompt input evidence")
         if after_substitution is not None:
 
             def inspect_substituted(config_dict: dict[str, Any], *, expand_env_vars: bool) -> None:
@@ -386,7 +397,7 @@ def _run_admission(
         try:
             lease = agreement._execute_lease(loop, session_service.run.session_id, service=service, execution_fixture=execution_fixture)
             try:
-                service._run_pipeline(str(uuid4()), pipeline_yaml, threading.Event(), session_operation_lease=lease)
+                service._run_pipeline(str(run_id or uuid4()), pipeline_yaml, threading.Event(), session_operation_lease=lease)
             except Exception as exc:
                 raised = exc
         finally:
@@ -496,6 +507,35 @@ def test_admitted_prompt_bytes_are_reused_for_later_rows(tmp_path: Path, executi
     assert all(
         call.args[0] == [agreement.ChatMessage(role="user", content=_CONTENT.decode())] for call in provider.execute_query.call_args_list
     )
+
+
+def test_final_admission_records_exact_prompt_input(tmp_path: Path, execution_fixture: ExecutionTestCustody) -> None:
+    from sqlalchemy import select
+
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.core.landscape.schema import run_prompt_inputs_table
+
+    landscape_url = f"sqlite:///{tmp_path / 'landscape.db'}"
+    run_id = uuid4()
+    with LandscapeDB(landscape_url) as db:
+        raised, blob_service, _session_service = _run_admission(
+            tmp_path,
+            "prompt_template",
+            CreationModality.LLM_GENERATED,
+            execution_fixture,
+            approved=True,
+            landscape_probe=db,
+            run_id=run_id,
+        )
+        assert str(raised) == "stop after prompt input evidence"
+        assert blob_service.read_blob_content_calls == [_BLOB_ID]
+    with LandscapeDB.from_url(landscape_url, create_tables=False) as db, db.read_only_connection() as conn:
+        row = conn.execute(select(run_prompt_inputs_table)).one()
+    assert row.run_id == str(run_id)
+    assert row.node_id == "classify"
+    assert row.field_path == "prompt_template"
+    assert row.blob_id == str(_BLOB_ID)
+    assert row.content_sha256 == hashlib.sha256(_CONTENT).hexdigest()
 
 
 @pytest.mark.parametrize("field", ["prompt_template", "system_prompt", "queries.q.template", "queries.q", "queries"])

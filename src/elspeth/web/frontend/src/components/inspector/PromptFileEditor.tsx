@@ -83,8 +83,10 @@ export function PromptFileEditor({ blobId, fieldPath }: PromptFileEditorProps) {
       }
     } catch (failure: unknown) {
       if (useSessionStore.getState().activeSessionId === sessionId) {
-        const typed = failure as { detail?: unknown };
-        setError(typeof typed.detail === "string" ? typed.detail : "Could not save this prompt file. Reload and retry.");
+        const typed = failure as { detail?: unknown; error_type?: unknown };
+        setError(typed.error_type === "prompt_file_node_multi_binding"
+          ? "This node uses more than one prompt file. Re-point it through the agent and approve the review card."
+          : typeof typed.detail === "string" ? typed.detail : "Could not save this prompt file. Reload and retry.");
       }
     } finally {
       setSaving(false);

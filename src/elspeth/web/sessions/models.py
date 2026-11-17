@@ -1317,7 +1317,7 @@ prompt_file_approvals_table = Table(
     Column("session_id", String(36), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False),
     Column("node_id", String, nullable=False),
     Column("field_path", String, nullable=False),
-    Column("blob_id", String(36), ForeignKey("blobs.id"), nullable=False),
+    Column("blob_id", String(36), nullable=False),
     Column("content_sha256", String(64), nullable=False),
     Column("review_anchor", String(64), nullable=False),
     Column("effective_artifact_hash", String(64), nullable=True),
@@ -1604,6 +1604,27 @@ POSTGRESQL_AUDIT_DDL_COHORT: tuple[PostgresqlAuditDDL, ...] = (
         ),
     ),
     PostgresqlAuditDDL(
+        table=prompt_file_approvals_table,
+        trigger_name="trg_prompt_file_approvals_no_update",
+        function_name="elspeth_prompt_file_approvals_no_update",
+        function_sql="""
+        CREATE FUNCTION elspeth_prompt_file_approvals_no_update()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+          RAISE EXCEPTION 'prompt_file_approvals is append-only; UPDATE is forbidden'
+            USING ERRCODE = '23000';
+        END;
+        $$
+        """,
+        trigger_sql=(
+            "CREATE TRIGGER trg_prompt_file_approvals_no_update "
+            "BEFORE UPDATE ON prompt_file_approvals "
+            "FOR EACH ROW EXECUTE FUNCTION elspeth_prompt_file_approvals_no_update()"
+        ),
+    ),
+    PostgresqlAuditDDL(
         table=composer_completion_events_table,
         trigger_name="trg_composer_completion_events_no_delete",
         function_name="elspeth_composer_completion_events_no_delete",
@@ -1863,6 +1884,18 @@ event.listen(
         "BEFORE UPDATE ON composer_completion_events "
         "BEGIN "
         "  SELECT RAISE(ABORT, 'composer_completion_events is append-only; UPDATE is forbidden'); "
+        "END;"
+    ).execute_if(dialect="sqlite"),
+)
+
+event.listen(
+    prompt_file_approvals_table,
+    "after_create",
+    cast(Callable[[str], DDL], DDL)(
+        "CREATE TRIGGER IF NOT EXISTS trg_prompt_file_approvals_no_update "
+        "BEFORE UPDATE ON prompt_file_approvals "
+        "BEGIN "
+        "  SELECT RAISE(ABORT, 'prompt_file_approvals is append-only; UPDATE is forbidden'); "
         "END;"
     ).execute_if(dialect="sqlite"),
 )

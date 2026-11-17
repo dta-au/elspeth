@@ -85,3 +85,29 @@ def test_landscape_records_admitted_prompt_identity(blob_env: dict[str, Any], tm
         assert row.field_path == "prompt_template"
         assert row.content_sha256 == record.content_hash
         assert row.review_anchor == snapshot.anchor
+
+
+def test_run_prompt_inputs_update_refused(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from sqlalchemy import insert, update
+    from sqlalchemy.exc import IntegrityError
+
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.core.landscape.schema import run_prompt_inputs_table
+
+    with LandscapeDB(f"sqlite:///{tmp_path / 'landscape.db'}") as db:
+        with db.engine.begin() as conn:
+            conn.execute(
+                insert(run_prompt_inputs_table).values(
+                    run_id="run-1",
+                    node_id="classify",
+                    field_path="prompt_template",
+                    blob_id="b1",
+                    content_sha256="a" * 64,
+                    review_anchor="a" * 64,
+                    admitted_at=datetime.now(UTC),
+                )
+            )
+        with pytest.raises(IntegrityError, match="run_prompt_inputs is append-only"), db.engine.begin() as conn:
+            conn.execute(update(run_prompt_inputs_table).values(content_sha256="b" * 64))

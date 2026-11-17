@@ -36,3 +36,14 @@ it("shows a typed refusal and retains the user's draft", async () => {
   expect(await screen.findByRole("alert")).toHaveTextContent("This file changed; reload it.");
   expect(editor).toHaveValue("my draft");
 });
+
+it("explains why a node with two prompt files needs agent review", async () => {
+  vi.mocked(savePromptFile).mockRejectedValue({ error_type: "prompt_file_node_multi_binding" });
+  render(<PromptFileEditors options={{ prompt_template: { mode: "inline_content", blob_ref: "blob-1" } }} />);
+  const editor = await screen.findByRole("textbox", { name: /Edit bound prompt file/ });
+  await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
+  fireEvent.change(editor, { target: { value: "my draft" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Re-point it through the agent and approve the review card.");
+  expect(editor).toHaveValue("my draft");
+});

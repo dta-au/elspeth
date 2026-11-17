@@ -376,6 +376,9 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     # Epoch 79 adds optional full-text prompt review snapshots and approval evidence.
     assert SESSION_SCHEMA_EPOCH == 79
     assert {"prompt_review_snapshots", "prompt_file_approvals"} <= set(inspector.get_table_names())
+    approval_columns = {column["name"]: column for column in inspector.get_columns("prompt_file_approvals")}
+    assert approval_columns["blob_id"]["nullable"] is False
+    assert all("blob_id" not in fk["constrained_columns"] for fk in inspector.get_foreign_keys("prompt_file_approvals"))
     assert "composition_graph_parks" in inspector.get_table_names()
     assert "creator_operation_id" in {column["name"] for column in inspector.get_columns("composition_states")}
     expected_tables = frozenset(
@@ -649,6 +652,7 @@ def test_postgres_schema_emits_native_audit_trigger_ddl() -> None:
         "trg_interpretation_events_immutable_resolved",
         "trg_interpretation_events_no_delete_resolved",
         "trg_composer_completion_events_no_update",
+        "trg_prompt_file_approvals_no_update",
         "trg_composer_completion_events_no_delete",
         "trg_chat_messages_immutable_content",
         "trg_chat_messages_no_delete",

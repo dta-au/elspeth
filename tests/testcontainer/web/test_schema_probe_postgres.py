@@ -35,7 +35,7 @@ from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.landscape.database import _REQUIRED_TRIGGERS, LandscapeDB, SchemaCompatibilityError
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction, fenced_member_transaction
-from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH, audit_export_snapshot_chunks_table
+from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH, audit_export_snapshot_chunks_table, run_prompt_inputs_table
 from elspeth.core.landscape.schema import metadata as landscape_metadata
 from elspeth.core.landscape.schema import schema_identity_table as landscape_schema_identity_table
 from elspeth.core.schema_identity import SCHEMA_IDENTITY_APPLICATION_ID
@@ -57,6 +57,7 @@ from elspeth.web.sessions.models import (
     blob_inline_resolutions_table,
     blob_replacement_cleanups_table,
     chat_messages_table,
+    prompt_file_approvals_table,
     session_operation_receipts_table,
     skill_markdown_history_table,
     user_preferences_table,
@@ -92,6 +93,64 @@ def postgres_engine(postgres_url: str) -> Iterator[Engine]:
         with admin.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
             conn.exec_driver_sql(f'DROP DATABASE "{identifier}" WITH (FORCE)')
         admin.dispose()
+
+
+def test_postgres_prompt_approval_update_refused_and_blob_deletable(postgres_engine: Engine) -> None:
+    init_session_schema(postgres_engine)
+    now = datetime.now(UTC)
+    with postgres_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="prompt-owner")
+        conn.execute(
+            text(
+                "INSERT INTO sessions (id, user_id, auth_provider_type, title, created_at, updated_at) "
+                "VALUES ('prompt-session', 'prompt-owner', 'local', 'prompt', :now, :now)"
+            ),
+            {"now": now},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO blobs (id, session_id, filename, mime_type, size_bytes, content_hash, storage_path, created_at, created_by, status) "
+                "VALUES ('prompt-blob', 'prompt-session', 'prompt.txt', 'text/plain', 1, :hash, '/x/prompt.txt', :now, 'user', 'ready')"
+            ),
+            {"hash": "a" * 64, "now": now},
+        )
+        conn.execute(
+            insert(prompt_file_approvals_table).values(
+                id="approval",
+                session_id="prompt-session",
+                node_id="classify",
+                field_path="prompt_template",
+                blob_id="prompt-blob",
+                content_sha256="a" * 64,
+                review_anchor="a" * 64,
+                actor_user_id="prompt-owner",
+                trigger="editor_save",
+                approved_at=now,
+            )
+        )
+    with pytest.raises(IntegrityError, match="prompt_file_approvals is append-only"), postgres_engine.begin() as conn:
+        conn.execute(update(prompt_file_approvals_table).values(content_sha256="b" * 64))
+    with postgres_engine.begin() as conn:
+        conn.execute(text("DELETE FROM blobs WHERE id = 'prompt-blob'"))
+        assert conn.execute(select(prompt_file_approvals_table.c.blob_id)).scalar_one() == "prompt-blob"
+
+
+def test_postgres_run_prompt_inputs_update_refused(postgres_engine: Engine) -> None:
+    init_landscape_schema(postgres_engine)
+    with postgres_engine.begin() as conn:
+        conn.execute(
+            insert(run_prompt_inputs_table).values(
+                run_id="orphan-run",
+                node_id="classify",
+                field_path="prompt_template",
+                blob_id="prompt-blob",
+                content_sha256="a" * 64,
+                review_anchor="a" * 64,
+                admitted_at=datetime.now(UTC),
+            )
+        )
+    with pytest.raises(IntegrityError, match="run_prompt_inputs is append-only"), postgres_engine.begin() as conn:
+        conn.execute(update(run_prompt_inputs_table).values(content_sha256="b" * 64))
 
 
 @pytest.mark.parametrize("kind", ["session", "landscape"])
@@ -674,6 +733,7 @@ def test_postgres_session_audit_triggers_are_installed_and_enforced(postgres_eng
         "trg_interpretation_events_immutable_resolved",
         "trg_interpretation_events_no_delete_resolved",
         "trg_composer_completion_events_no_update",
+        "trg_prompt_file_approvals_no_update",
         "trg_composer_completion_events_no_delete",
         "trg_chat_messages_immutable_content",
         "trg_chat_messages_no_delete",

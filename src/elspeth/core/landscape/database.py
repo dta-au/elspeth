@@ -871,6 +871,7 @@ _REQUIRED_POSTGRES_TRIGGERS: Mapping[str, tuple[str, str, int]] = MappingProxyTy
         "trg_audit_export_snapshot_immutable_delete": ("audit_export_snapshots", "fn_audit_export_snapshot_immutable", 11),
         "trg_audit_export_chunk_immutable": ("audit_export_snapshot_chunks", "fn_audit_export_chunk_immutable", 19),
         "trg_audit_export_chunk_immutable_delete": ("audit_export_snapshot_chunks", "fn_audit_export_chunk_immutable", 11),
+        "trg_run_prompt_inputs_no_update": ("run_prompt_inputs", "elspeth_run_prompt_inputs_no_update", 19),
     }
 )
 _REQUIRED_TRIGGERS: tuple[str, ...] = tuple(_REQUIRED_POSTGRES_TRIGGERS)

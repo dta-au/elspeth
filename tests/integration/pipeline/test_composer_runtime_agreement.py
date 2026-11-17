@@ -3963,6 +3963,7 @@ class TestComposerRuntimeFileSinkCollisionAgreement:
 class _RuntimeSettingsFake:
     data_dir: str
     payload_store_path: Path
+    deployment_target: str = "local"
     landscape_passphrase: str | None = None
     # Secret wiring is deny-by-default (elspeth-f3c1aafd25); these tests
     # exercise blob custody, not wired secrets.

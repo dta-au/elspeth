@@ -4,7 +4,9 @@ Uses SQLAlchemy Core (not ORM) for explicit control over queries
 and compatibility with multiple database backends.
 """
 
+from collections.abc import Callable
 from enum import StrEnum
+from typing import cast
 
 from sqlalchemy import (
     DDL,
@@ -603,6 +605,8 @@ runs_table = Table(
 )
 Index("uq_runs_export_witness", runs_table.c.run_id, runs_table.c.status, runs_table.c.completed_at, unique=True)
 
+# Written before the run row, so this has no FK to runs: failure before
+# begin_run can leave an orphan row. The run FK is planned for .16.
 run_prompt_inputs_table = Table(
     "run_prompt_inputs",
     metadata,
@@ -618,6 +622,35 @@ run_prompt_inputs_table = Table(
     CheckConstraint(_LowerHex64Check("content_sha256"), name="ck_run_prompt_inputs_content_sha256"),
     CheckConstraint(_LowerHex64Check("review_anchor"), name="ck_run_prompt_inputs_review_anchor"),
     CheckConstraint(_OptionalLowerHex64Check("effective_artifact_hash"), name="ck_run_prompt_inputs_artifact_hash"),
+)
+_prompt_input_ddl = cast(Callable[[str], DDL], DDL)
+event.listen(
+    run_prompt_inputs_table,
+    "after_create",
+    _prompt_input_ddl(
+        "CREATE TRIGGER IF NOT EXISTS trg_run_prompt_inputs_no_update "
+        "BEFORE UPDATE ON run_prompt_inputs "
+        "BEGIN "
+        "  SELECT RAISE(ABORT, 'run_prompt_inputs is append-only; UPDATE is forbidden'); "
+        "END;"
+    ).execute_if(dialect="sqlite"),
+)
+event.listen(
+    run_prompt_inputs_table,
+    "after_create",
+    _prompt_input_ddl(
+        "CREATE FUNCTION elspeth_run_prompt_inputs_no_update() RETURNS trigger LANGUAGE plpgsql AS $$ "
+        "BEGIN RAISE EXCEPTION 'run_prompt_inputs is append-only; UPDATE is forbidden' USING ERRCODE = '23000'; "
+        "END; $$"
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    run_prompt_inputs_table,
+    "after_create",
+    _prompt_input_ddl(
+        "CREATE TRIGGER trg_run_prompt_inputs_no_update BEFORE UPDATE ON run_prompt_inputs "
+        "FOR EACH ROW EXECUTE FUNCTION elspeth_run_prompt_inputs_no_update()"
+    ).execute_if(dialect="postgresql"),
 )
 
 run_start_admissions_table = Table(

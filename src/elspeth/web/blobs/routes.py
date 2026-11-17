@@ -54,13 +54,18 @@ from elspeth.web.blobs.sniff import detect_mime_type
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.credential_guard import require_no_credential_material
-from elspeth.web.sessions.models import composition_states_table
+from elspeth.web.interpretation_state import prompt_review_draft_from_options
+from elspeth.web.sessions.models import composition_states_table, interpretation_events_table
+from elspeth.web.sessions.pending_interpretation import _resolve_prompt_template_review, _surfacing_prompt_structure_hash
 from elspeth.web.sessions.prompt_file_approval import (
     PromptApprovalTrigger,
     PromptFileApprovalRequest,
     PromptFileApprovalStale,
+    _current_node_options,
+    _current_snapshot,
     record_prompt_file_approval,
 )
+from elspeth.web.sessions.prompt_file_review import prompt_file_binding_paths
 from elspeth.web.sessions.protocol import CompositionStateData, SessionCompositionStateCreation, SessionOperationMutationTransaction
 
 _MAX_PROMPT_FILE_BYTES = 256 * 1024
@@ -80,7 +85,7 @@ class SavePromptFileResponse(BaseModel):
     content_sha256: str
 
 
-_EDITOR_SAVE_ENCODINGS: frozenset[str] = frozenset({"utf-8", "utf-8-sig"})
+_EDITOR_SAVE_ENCODINGS: frozenset[str] = frozenset({"utf-8"})
 
 
 def _prompt_save_refusal(status: int, code: str, message: str) -> HTTPException:
@@ -234,6 +239,13 @@ def create_blobs_router() -> APIRouter:
                     "prompt_file_shared_binding",
                     "This file backs more than one prompt; give each prompt its own file before editing it here.",
                 )
+            node = next(node for node in state.nodes or () if node["id"] == bindings[0].node_id)
+            if len(prompt_file_binding_paths(node["options"])) > 1:
+                raise _prompt_save_refusal(
+                    409,
+                    "prompt_file_node_multi_binding",
+                    "This node uses more than one prompt file; re-point it through the agent and approve the review card.",
+                )
             if any(binding.encoding not in _EDITOR_SAVE_ENCODINGS for binding in bindings):
                 # The editor saves UTF-8; a prompt that decodes this file another way would run
                 # different text from what the user saved.
@@ -294,19 +306,76 @@ def create_blobs_router() -> APIRouter:
                     )
                 )
                 for binding in bindings:
+                    approval_request = PromptFileApprovalRequest(
+                        session_id=session_id,
+                        node_id=binding.node_id,
+                        field_path=binding.field_path,
+                        blob_id=blob_id,
+                        content_sha256=stored_hash,
+                        actor_user_id=user.user_id,
+                        trigger=PromptApprovalTrigger.EDITOR_SAVE,
+                    )
+                    pending_event = conn.execute(
+                        select(interpretation_events_table.c.id, interpretation_events_table.c.user_term)
+                        .where(
+                            interpretation_events_table.c.session_id == str(session_id),
+                            interpretation_events_table.c.affected_node_id == binding.node_id,
+                            interpretation_events_table.c.kind == "llm_prompt_template",
+                            interpretation_events_table.c.choice == "pending",
+                        )
+                        .order_by(interpretation_events_table.c.created_at.desc())
+                        .limit(1)
+                    ).one_or_none()
                     record_prompt_file_approval(
                         conn,
-                        PromptFileApprovalRequest(
-                            session_id=session_id,
-                            node_id=binding.node_id,
-                            field_path=binding.field_path,
-                            blob_id=blob_id,
-                            content_sha256=stored_hash,
-                            actor_user_id=user.user_id,
-                            trigger=PromptApprovalTrigger.EDITOR_SAVE,
-                        ),
+                        approval_request,
                         now=now,
                     )
+                    if pending_event is not None:
+                        latest_row = conn.execute(
+                            select(composition_states_table)
+                            .where(composition_states_table.c.session_id == str(session_id))
+                            .order_by(desc(composition_states_table.c.version))
+                            .limit(1)
+                        ).one()
+                        latest_state = session_service._row_to_state_record(latest_row)
+                        options = _current_node_options(conn, approval_request)
+                        choice = conn.execute(
+                            select(interpretation_events_table.c.choice).where(interpretation_events_table.c.id == pending_event.id)
+                        ).scalar_one()
+                        if choice == "pending":
+                            # The save covers the file, but a separate inline part still needs the card.
+                            continue
+                        snapshot = _current_snapshot(conn, approval_request, options)
+                        accepted_value = prompt_review_draft_from_options(options)
+                        if accepted_value is None:
+                            raise PromptFileApprovalStale()
+                        sources, nodes, _ = _resolve_prompt_template_review(
+                            latest_state,
+                            event_id=pending_event.id,
+                            affected_node_id=binding.node_id,
+                            user_term=pending_event.user_term,
+                            accepted_value=accepted_value,
+                            surfacing_structure_hash=_surfacing_prompt_structure_hash(latest_state, affected_node_id=binding.node_id),
+                            file_snapshot=snapshot,
+                        )
+                        transaction.composition_states.append_state(
+                            SessionCompositionStateCreation(
+                                id=uuid4(),
+                                data=CompositionStateData(
+                                    sources=sources,
+                                    nodes=nodes,
+                                    edges=latest_state.edges,
+                                    outputs=latest_state.outputs,
+                                    metadata_=latest_state.metadata_,
+                                    is_valid=False,
+                                    composer_meta=latest_state.composer_meta,
+                                ),
+                                provenance="interpretation_resolve",
+                                created_at=now,
+                                derived_from_state_id=latest_state.id,
+                            )
+                        )
 
             try:
                 await run_sync_in_worker(
