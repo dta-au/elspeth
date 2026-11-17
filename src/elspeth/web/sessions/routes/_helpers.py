@@ -32,6 +32,7 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyPoolTimeoutError
 from starlette.applications import Starlette
 
 import elspeth.contracts.errors as contract_errors
+from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.chargeable_admission import AdmissionRefusalReason, ChargeableAdmissionRefused
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.composer_interpretation import (
@@ -1948,7 +1949,17 @@ async def _runtime_preflight_for_state(
     plugin_snapshot: PluginAvailabilitySnapshot,
     profile_registry: OperatorProfileRegistry,
     catalog: CatalogServiceProtocol,
+    blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
 ) -> ValidationResult:
+    def blob_get_metadata(blob_id: UUID) -> BlobRecord | None:
+        if blob_get_content is None:
+            return None
+        try:
+            record, _content = blob_get_content(blob_id)
+        except KeyError:
+            return None
+        return record
+
     return await asyncio.wait_for(
         run_sync_in_worker(
             validate_pipeline,
@@ -1962,6 +1973,8 @@ async def _runtime_preflight_for_state(
             plugin_snapshot=plugin_snapshot,
             profile_registry=profile_registry,
             catalog=catalog,
+            blob_get_metadata=blob_get_metadata if blob_get_content is not None else None,
+            blob_get_content=blob_get_content,
         ),
         timeout=settings.composer_runtime_preflight_timeout_seconds,
     )

@@ -68,6 +68,7 @@ from elspeth.web.paths import (
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
+from elspeth.web.sessions.inline_blob_preflight import InlinePreflightState, prepare_session_inline_blob_snapshot
 from elspeth.web.sessions.operation_receipts import operation_receipt_response_hash
 from elspeth.web.sessions.protocol import (
     CompositionStateRecord,
@@ -108,6 +109,7 @@ from .._helpers import (
     SessionsTelemetry,
     UpdateComposerPreferencesRequest,
     UserIdentity,
+    ValidationResult,
     _composer_preferences_response,
     _get_composer_progress_registry,
     _get_session_compose_lock_registry,
@@ -1633,10 +1635,40 @@ async def _require_yaml_export_preflight(
     request: Request,
     session_id: UUID,
     plugin_snapshot: PluginAvailabilitySnapshot,
+    session_operation_context: SessionOperationContext,
 ) -> None:
-    """Keep the existing export preflight for currently available states."""
-    try:
-        runtime_validation = await _runtime_preflight_for_state(
+    """Validate with verified inline bytes under the export's existing lease."""
+
+    def metadata_hint(blob_id: UUID) -> tuple[str, str | None, int] | None:
+        blob_service: BlobServiceProtocol = request.app.state.blob_service
+        try:
+            record = blob_service.get_blob_sync(blob_id, session_operation_context)
+        except BlobNotFoundError:
+            return None
+        if type(record) is not BlobRecord:
+            raise TypeError("BlobServiceProtocol.get_blob_sync() must return BlobRecord")
+        if record.id != blob_id or record.session_id != session_id:
+            raise AuditIntegrityError("YAML export inline blob metadata crossed a custody boundary")
+        return record.status, record.content_hash, record.size_bytes
+
+    def read_blob(blob_id: UUID) -> tuple[BlobRecord, bytes]:
+        blob_service: BlobServiceProtocol = request.app.state.blob_service
+        record, content = blob_service.read_blob_content_sync(blob_id, session_operation_context)
+        if type(record) is not BlobRecord or type(content) is not bytes:
+            raise TypeError("BlobServiceProtocol.read_blob_content_sync() must return BlobRecord and bytes")
+        if record.id != blob_id:
+            raise AuditIntegrityError("YAML export inline blob read returned a different identity")
+        return record, content
+
+    async def preflight() -> ValidationResult:
+        snapshot = await run_sync_in_worker(
+            prepare_session_inline_blob_snapshot,
+            InlinePreflightState.from_composition_state(state),
+            session_id=session_id,
+            read_blob=read_blob,
+            metadata_hint=metadata_hint,
+        )
+        return await _runtime_preflight_for_state(
             state,
             settings=request.app.state.settings,
             secret_service=None,
@@ -1645,6 +1677,13 @@ async def _require_yaml_export_preflight(
             plugin_snapshot=plugin_snapshot,
             profile_registry=request.app.state.operator_profile_registry,
             catalog=request.app.state.catalog_service,
+            blob_get_content=snapshot.content if snapshot is not None else None,
+        )
+
+    try:
+        runtime_validation = await asyncio.wait_for(
+            preflight(),
+            timeout=request.app.state.settings.composer_runtime_preflight_timeout_seconds,
         )
     except (
         TimeoutError,
@@ -1771,6 +1810,7 @@ async def get_state_yaml(
                 request=request,
                 session_id=session.id,
                 plugin_snapshot=plugin_snapshot,
+                session_operation_context=lease.context,
             )
         source_blob_ids = await _verified_yaml_export_blob_ids(
             state,

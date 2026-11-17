@@ -20,7 +20,7 @@
         {
           "type": "string_too_long",
           "loc": ["yaml"],
-          "msg": "String should have at most 262144 characters"
+          "msg": "String should have at most 524288 characters"
         }
       ]
     }

@@ -1245,7 +1245,7 @@ export async function fetchYaml(
 
 /** Request body for POST /api/sessions/{id}/state/yaml. */
 export interface ImportCompositionYamlRequest {
-  /** Raw YAML text, 1..262144 chars (backend-enforced). */
+  /** Raw YAML text, 1..524288 chars (backend-enforced). */
   yaml: string;
   /**
    * Optional source-name -> blob-UUID map, only needed when the YAML's

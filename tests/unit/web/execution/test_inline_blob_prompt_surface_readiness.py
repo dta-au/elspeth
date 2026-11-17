@@ -27,6 +27,7 @@ import yaml
 import tests.integration.pipeline.test_composer_runtime_agreement as agreement
 from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer import yaml_generator as composer_yaml_generator
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
@@ -54,7 +55,7 @@ _SESSION_ID = UUID(agreement._AGREEMENT_SESSION_ID)
 
 # Every guarded option path the shared predicate names. ``queries`` and
 # ``queries.q`` are whole values that would carry a query template.
-_GUARDED_FIELDS = ("prompt_template", "system_prompt", "model", "queries.q.template", "queries.q", "queries")
+_GUARDED_FIELDS = ("prompt_template", "system_prompt", "model", "queries.q.template", "queries.0.template", "queries.q", "queries")
 _LLM_AUTHORED_MODALITIES = tuple(modality for modality in CreationModality if modality.requires_llm_provenance())
 _USER_MODALITIES = tuple(modality for modality in CreationModality if not modality.requires_llm_provenance())
 
@@ -91,6 +92,9 @@ def _llm_options(field: str) -> dict[str, Any]:
         options[field] = _marker()
     elif field == "queries.q.template":
         options["queries"] = {"q": {"input_fields": {"text": "text"}, "template": _marker()}}
+    elif field == "queries.0.template":
+        # The list form, addressed by canonical position (staging hotfix list-index paths).
+        options["queries"] = [{"name": "q", "input_fields": {"text": "text"}, "template": _marker()}]
     elif field == "queries.q":
         options["queries"] = {"q": _marker()}
     elif field == "queries":
@@ -226,6 +230,46 @@ def test_validate_admits_user_uploaded_blob_in_llm_prompt_surface(tmp_path: Path
     check = _blob_check(result)
     assert check.passed is True, check.detail
     assert all(error.error_code != "llm_authored_inline_blob_content" for error in result.errors)
+
+
+@pytest.mark.parametrize("field", ["prompt_template", "queries.0.template"])
+def test_deferred_prompt_validation_does_not_admit_a_binary_blob(tmp_path: Path, field: str) -> None:
+    """Authoring defers file-backed prompt text; materialization must still refuse non-text bytes.
+
+    Investigation defect 7: an ASCII-decodable PDF reaches ``ResolvedBlobContent``,
+    whose MIME allowlist raises ``ValueError`` that validation does not catch.
+    Neither outcome may admit the blob; a typed refusal is the open repair.
+    """
+    content = b"%PDF-1.4\n%%EOF\n"
+    record = replace(
+        _record(CreationModality.VERBATIM, content=content),
+        mime_type="application/pdf",
+        content_hash=hashlib.sha256(content).hexdigest(),
+        size_bytes=len(content),
+    )
+    state = _state(tmp_path, field)
+    node = state.nodes[0]
+    options = cast(dict[str, Any], deep_thaw(node.options))
+    marker = {"blob_ref": str(_BLOB_ID), "mode": "inline_content", "sha256": record.content_hash}
+    if field == "prompt_template":
+        options["prompt_template"] = marker
+    else:
+        options["queries"][0]["template"] = marker
+    state = replace(state, nodes=(replace(node, options=options),))
+    try:
+        result = validate_pipeline_for_trained_operator(
+            state,
+            SimpleNamespace(data_dir=tmp_path),
+            composer_yaml_generator,
+            blob_get_metadata=lambda blob_id: record if blob_id == _BLOB_ID else None,
+            blob_get_content=lambda _blob_id: (record, content),
+            session_id=str(_SESSION_ID),
+        )
+    except ValueError as exc:
+        assert "mime_type must be one of" in str(exc)
+        return
+    assert result.is_valid is False
+    assert _blob_check(result).passed is False
 
 
 def test_validate_admits_llm_authored_blob_outside_the_prompt_surface(tmp_path: Path) -> None:

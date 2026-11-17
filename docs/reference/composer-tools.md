@@ -512,11 +512,11 @@ Wire a ready blob into a plugin option as audited inline content.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `field_path` | string | **Yes** | Canonical target path such as `source.options.<field>`, `node:<node_id>.options.<field>` for a transform, aggregation, or collector, or `output:<name>.options.<field>` |
+| `field_path` | string | **Yes** | Canonical target path such as `source.options.<field>`, `node:<node_id>.options.<field>` for a transform, aggregation, or collector, or `output:<name>.options.<field>`. An existing list item is addressed by its 0-based position, such as `node:<node_id>.options.queries.0.template`; a position never creates an item or a mapping key |
 | `blob_id` | string | **Yes** | Ready blob ID to wire |
 | `encoding` | string | No | One of `utf-8`, `utf-8-sig`, `utf-16`, or `latin-1`; defaults to `utf-8` |
 
-**When to use:** When a long-form config field, such as an LLM prompt template or SQL query, should be supplied from a blob without exposing the bytes to the composer LLM. The tool pins `sha256` from blob metadata.
+**When to use:** When a long-form config field, such as an LLM prompt template or SQL query, should be supplied from a blob without exposing the bytes to the composer LLM. The tool pins `sha256` from blob metadata. Wiring does not read the file: its text is checked when the pipeline is validated or run.
 
 ---
 

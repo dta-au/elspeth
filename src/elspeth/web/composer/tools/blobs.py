@@ -718,6 +718,11 @@ def _set_nested_option(
 ) -> dict[str, Any]:
     if not keys:
         raise ValueError("field_path must include at least one .options.<field> segment")
+    if keys[0].isascii() and keys[0].isdecimal():
+        # A numeric segment is a list position. It never names, or creates,
+        # a mapping key: an option name such as a file_inject entry 'v1.2'
+        # must stay unaddressable rather than become entry 'v1' with key '2'.
+        raise ValueError(f"field_path segment {keys[0]!r} is a list position, but the value there is not a list")
     if len(keys) == 1:
         if not replace_existing and keys[0] in container:
             raise ValueError(f"field_path leaf {keys[0]!r} already holds a value")
@@ -726,6 +731,20 @@ def _set_nested_option(
     head = keys[0]
     if head in container:
         child = container[head]
+        if type(child) is list:
+            from elspeth.core.blobs_inline import _inline_list_index
+
+            position = _inline_list_index(keys[1], len(child))
+            if len(keys) == 2:
+                if not replace_existing:
+                    raise ValueError(f"field_path leaf {keys[1]!r} already holds a value")
+                child[position] = value
+            else:
+                entry = child[position]
+                if not isinstance(entry, Mapping):
+                    raise ValueError(f"field_path segment {keys[1]!r} already exists and is not an object")
+                child[position] = _set_nested_option(dict(deep_thaw(entry)), keys[2:], value, replace_existing=replace_existing)
+            return container
         if not isinstance(child, Mapping):
             raise ValueError(f"field_path segment {head!r} already exists and is not an object")
         nested = dict(deep_thaw(child))
@@ -942,6 +961,8 @@ def _inline_content_marker_blob_ids(value: object, option_path: str) -> list[tup
     shape = is_widened_blob_ref(value)
     if shape is not None:
         return [(option_path, shape.blob_id)] if shape.mode == "inline_content" else []
+    if type(value) is list:
+        return [marker for index, child in enumerate(value) for marker in _inline_content_marker_blob_ids(child, f"{option_path}.{index}")]
     if type(value) is not dict:
         return []
     found: list[tuple[str, UUID]] = []
@@ -1260,7 +1281,9 @@ _WIRE_BLOB_INLINE_REF_DECLARATION = ToolDeclaration(
                 "description": (
                     "Canonical path: source.options.<field>, source:<name>.options.<field>, "
                     "node:<node_id>.options.<field> for a transform, aggregation, or collector, "
-                    "or output:<name>.options.<field>." + _BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE
+                    "or output:<name>.options.<field>. Address an existing list item by its 0-based position, "
+                    "e.g. node:<node_id>.options.queries.0.template; a position never creates an item or a key."
+                    + _BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE
                 ),
             },
             "blob_id": {"type": "string", "format": "uuid", "description": "Ready blob ID to wire as inline content."},

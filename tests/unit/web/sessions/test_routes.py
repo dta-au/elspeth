@@ -9530,6 +9530,9 @@ async def test_runtime_preflight_for_state_threads_session_id_to_validate_pipeli
             "plugin_snapshot": plugin_snapshot,
             "profile_registry": profile_registry,
             "catalog": catalog,
+            # No blob reader supplied: the validator gets neither callback.
+            "blob_get_metadata": None,
+            "blob_get_content": None,
         }
     ]
 

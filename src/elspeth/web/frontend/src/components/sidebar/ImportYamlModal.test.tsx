@@ -16,6 +16,7 @@ import {
   IMPORT_YAML_SECTION_KEYS,
   IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE,
   IMPORT_YAML_SINGULAR_SOURCE_REMOVED_MESSAGE,
+  MAX_IMPORT_YAML_CHARS,
 } from "./ImportYamlModal";
 import { OPEN_IMPORT_YAML_MODAL_EVENT } from "@/lib/composer-events";
 import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
@@ -698,8 +699,15 @@ describe("ImportYamlModal", () => {
     expect(screen.getByText("Parsed preview")).toBeInTheDocument();
   });
 
+  it("matches the backend import limit and names it in the refusal copy", () => {
+    expect(MAX_IMPORT_YAML_CHARS).toBe(524_288);
+    expect(IMPORT_YAML_422_MESSAGE).toBe(
+      "This paste could not be imported: it is empty, or larger than the 512 KB limit.",
+    );
+  });
+
   it("rejects over-limit input before calling the YAML parser", () => {
-    const analysis = analyseImportYamlDraft("sources: {}\n#" + "x".repeat(262_144));
+    const analysis = analyseImportYamlDraft("sources: {}\n#" + "x".repeat(524_288));
     expect(analysis.canImport).toBe(false);
     expect(analysis.validationMessage).toBe(IMPORT_YAML_422_MESSAGE);
     expect(parseDocument).not.toHaveBeenCalled();
@@ -707,7 +715,7 @@ describe("ImportYamlModal", () => {
 
   it("counts Unicode characters like the backend rather than UTF-16 units", () => {
     const prefix = PIPELINE_YAML + "#";
-    const yaml = prefix + "𐐀".repeat(262_144 - prefix.length);
+    const yaml = prefix + "𐐀".repeat(524_288 - prefix.length);
     expect(analyseImportYamlDraft(yaml).canImport).toBe(true);
     vi.mocked(parseDocument).mockClear();
     expect(analyseImportYamlDraft(yaml + "𐐀").canImport).toBe(false);
@@ -717,7 +725,7 @@ describe("ImportYamlModal", () => {
   it("refuses an impossibly large file before reading its contents", () => {
     render(<ImportYamlModal onClose={onClose} />);
     const read = vi.spyOn(FileReader.prototype, "readAsText");
-    const file = new File(["x".repeat(4 * 262_144 + 1)], "large.yaml", { type: "text/yaml" });
+    const file = new File(["x".repeat(4 * 524_288 + 1)], "large.yaml", { type: "text/yaml" });
     fireEvent.change(screen.getByLabelText(/choose a \.yaml file/i), { target: { files: [file] } });
     expect(read).not.toHaveBeenCalled();
     expect(screen.getByText(IMPORT_YAML_422_MESSAGE)).toBeInTheDocument();
@@ -1352,7 +1360,7 @@ describe("ImportYamlModal", () => {
 
   // ── Error classes ────────────────────────────────────────────────────────
 
-  it("maps a 422 to friendly copy naming the 256 KB limit", async () => {
+  it("maps a 422 to friendly copy naming the 512 KB limit", async () => {
     useSessionStore.setState({ compositionState: emptyState() } as never);
     vi.mocked(api.importCompositionYaml).mockRejectedValue({
       status: 422,

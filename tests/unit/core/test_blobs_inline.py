@@ -183,6 +183,75 @@ class TestDiscoverBlobContentRefs:
 
         assert _discover_blob_content_refs(config) == []
 
+    @pytest.mark.parametrize("source_name", [None, "orders", "orders.options.archive"])
+    def test_source_plugin_encoding_does_not_hide_prompt_refs(self, source_name: str | None) -> None:
+        content = "Original prompt\r\n{{ row.text }}\nEnd é".encode()
+        source_options = {
+            "blob_ref": BLOB1,
+            "mode": "bind_source",
+            "path": "inputs/source.csv",
+            "encoding": "utf-8-sig",
+            "schema": {"mode": "observed"},
+        }
+        source = {"plugin": "csv", "options": source_options}
+        config: dict[str, Any] = {
+            "transforms": [
+                {"name": "assess", "plugin": "llm", "options": {"system_prompt": _marker(BLOB2, hashlib.sha256(content).hexdigest())}}
+            ]
+        }
+        if source_name is None:
+            config["source"] = source
+        else:
+            config["sources"] = {source_name: source}
+        original = deepcopy(config)
+
+        refs = _discover_blob_content_refs(config)
+
+        assert [ref.field_path for ref in refs] == ["node:assess.options.system_prompt"]
+        assert config == original
+        assert (
+            _validate_blob_content_refs_sync(
+                lambda blob_id: _blob_record(blob_id=str(blob_id), content_hash=hashlib.sha256(content).hexdigest()), config
+            )
+            == []
+        )
+        resolved, _audit = _substitute_blob_content_refs(
+            config, {refs[0]: content}, refs=refs, blob_metadata={refs[0].blob_id: ("text/plain", len(content))}
+        )
+        assert resolved["transforms"][0]["options"]["system_prompt"].encode() == content
+        if source_name is None:
+            assert resolved["source"]["options"] == original["source"]["options"]
+        else:
+            assert resolved["sources"][source_name]["options"] == original["sources"][source_name]["options"]
+
+    @pytest.mark.parametrize("extra", [{"encoding": "utf-8"}, {"sha256": VALID_HASH}])
+    @pytest.mark.parametrize("source_name", [None, "orders"])
+    def test_nested_bind_source_marker_still_rejects_inline_fields(self, extra: dict[str, str], source_name: str | None) -> None:
+        marker = {"blob_ref": BLOB1, "mode": "bind_source", **extra}
+        source = {"plugin": "csv", "options": {"payload": {"options": marker}}}
+        config = {"source": source} if source_name is None else {"sources": {source_name: source}}
+        prefix = "source" if source_name is None else f"source:{source_name}"
+
+        with pytest.raises(BlobContentResolutionError) as exc_info:
+            _discover_blob_content_refs(config)
+
+        assert exc_info.value.malformed == ((f"{prefix}.options.payload.options", "bind_source cannot carry sha256 or encoding"),)
+
+    def test_nested_source_options_are_not_treated_as_root_source_options(self) -> None:
+        config = {
+            "sources": {
+                "orders": {
+                    "plugin": "csv",
+                    "options": {"payload": {"options": {"blob_ref": BLOB1, "mode": "bind_source", "template": _marker(BLOB2)}}},
+                }
+            }
+        }
+
+        with pytest.raises(BlobContentResolutionError) as exc_info:
+            _discover_blob_content_refs(config)
+
+        assert exc_info.value.malformed == (("source:orders.options.payload.options", "invalid blob_ref marker"),)
+
     def test_emits_one_ref_per_field_path_even_for_same_blob(self) -> None:
         config = {
             "transforms": [
@@ -222,21 +291,71 @@ class TestDiscoverBlobContentRefs:
 
         assert exc_info.value.malformed == (("source.options.system_prompt", reason),)
 
-    def test_markers_inside_lists_are_malformed_because_paths_would_be_positional(self) -> None:
+    def test_discovers_markers_inside_lists_at_exact_positions(self) -> None:
         config = {"source": {"plugin": "csv", "options": {"prompts": [_marker()]}}}
 
-        with pytest.raises(BlobContentResolutionError) as exc_info:
-            _discover_blob_content_refs(config)
+        assert [ref.field_path for ref in _discover_blob_content_refs(config)] == ["source.options.prompts.0"]
 
-        assert exc_info.value.malformed == (("source.options.prompts", "inline blob refs inside lists are not supported"),)
-
-    def test_nested_markers_inside_lists_are_malformed_because_paths_would_be_positional(self) -> None:
+    def test_discovers_nested_markers_inside_lists_at_exact_positions(self) -> None:
         config = {"source": {"plugin": "csv", "options": {"prompts": [{"prompt": _marker()}]}}}
 
+        assert [ref.field_path for ref in _discover_blob_content_refs(config)] == ["source.options.prompts.0.prompt"]
+
+    def test_malformed_marker_in_list_is_not_skipped(self) -> None:
+        config = {"source": {"plugin": "csv", "options": {"prompts": [{"blob_ref": BLOB1}]}}}
         with pytest.raises(BlobContentResolutionError) as exc_info:
             _discover_blob_content_refs(config)
+        assert exc_info.value.malformed[0][0] == "source.options.prompts.0"
 
-        assert exc_info.value.malformed == (("source.options.prompts", "inline blob refs inside lists are not supported"),)
+    @pytest.mark.parametrize("key", ["0", "2024", "v1.2", "a/b"])
+    def test_marker_under_a_key_that_is_not_a_path_name_is_refused(self, key: str) -> None:
+        """A numeric or dotted mapping key would yield a path naming a different value."""
+        config = {"transforms": [{"name": "n", "plugin": "llm", "options": {"queries": {key: {"template": _marker()}}}}]}
+        with pytest.raises(BlobContentResolutionError) as exc_info:
+            _discover_blob_content_refs(config)
+        assert [path for path, _reason in exc_info.value.malformed] == [f"node:n.options.queries.{key}"]
+
+    def test_key_that_is_not_a_path_name_is_ignored_without_a_marker(self) -> None:
+        config = {"transforms": [{"name": "n", "plugin": "llm", "options": {"queries": {"2024": {"template": "Plain text"}}}}]}
+        assert _discover_blob_content_refs(config) == []
+
+
+@pytest.mark.parametrize("wrong_hash", [False, True])
+def test_list_query_resolution_preserves_text_order_and_checks_hash(wrong_hash: bool) -> None:
+    content = "Original prompt\r\n{{ row.text }}\nEnd é".encode()
+    ref = _ref_with_hash(content, "node:assess.options.queries.1.template")
+    config = {
+        "transforms": [
+            {
+                "name": "assess",
+                "plugin": "llm",
+                "options": {
+                    "queries": [
+                        {"name": "first", "template": "First exact text"},
+                        {"name": "second", "template": {"blob_ref": BLOB1, "mode": "inline_content", "sha256": ref.sha256}},
+                    ]
+                },
+            }
+        ]
+    }
+    original = deepcopy(config)
+    refs = _discover_blob_content_refs(config)
+    assert refs == [ref]
+    if wrong_hash:
+        with pytest.raises(BlobIntegrityError):
+            _substitute_blob_content_refs(
+                config, {ref: b"Changed text"}, refs=refs, blob_metadata={ref.blob_id: ("text/plain", len(content))}
+            )
+        return
+    resolved, audit = _substitute_blob_content_refs(
+        config, {ref: content}, refs=refs, blob_metadata={ref.blob_id: ("text/plain", len(content))}
+    )
+    queries = resolved["transforms"][0]["options"]["queries"]
+    assert [q["name"] for q in queries] == ["first", "second"]
+    assert queries[0]["template"] == "First exact text"
+    assert queries[1]["template"].encode() == content
+    assert audit[0].field_path == ref.field_path
+    assert original["transforms"][0]["options"]["queries"][1]["template"]["sha256"] == ref.sha256
 
 
 class TestResolveBlobContentResults:

@@ -2153,9 +2153,10 @@ sites:
   disposition: unmirrored
   note: elspeth-96e2dd023f (parity residue ticket, 2026-08-17). Authorable and Stage-1 silent. bounded_json
     caps ONE tool call at 1 MiB of text (JSON_MAX_TOTAL_TEXT_CHARS, bounded_json.py:14) and yaml_importer
-    caps an IMPORTED document at 256 KiB (yaml_importer.py:33/487), but nothing bounds the aggregate size
-    of accumulated composer state, so ~3 maximally-sized upsert_node option payloads generate YAML over
-    the 2 MiB limit at config.py:170-171 with no Stage-1 rule to catch it. elspeth-2ed41f0a4a census 2026-08-17.
+    caps an IMPORTED document at 524,288 characters (yaml_importer.py MAX_RUNTIME_YAML_IMPORT_CHARS),
+    but nothing bounds the aggregate size of accumulated composer state, so ~3 maximally-sized upsert_node
+    option payloads generate YAML over the 2 MiB limit at config.py:170-171 with no Stage-1 rule to catch
+    it. elspeth-2ed41f0a4a census 2026-08-17.
 - key: 04d73f291757d487
   path: src/elspeth/core/config.py
   qualname: load_bounded_pipeline_yaml

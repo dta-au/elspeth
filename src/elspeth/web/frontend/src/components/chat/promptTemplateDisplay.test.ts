@@ -317,6 +317,57 @@ function surfaceEvent(): InterpretationEvent {
 }
 
 describe("resolvePromptDisplaySegments — multi-query prompt surface", () => {
+  it.each(["mapping", "list"])(
+    "renders every complete query without a shared template (%s form)",
+    (form) => {
+      const entries = Array.from({ length: 6 }, (_, index) => ({
+        name: `query_${index}`,
+        template: `Complete instruction ${index}: ${"detail ".repeat(250)}end ${index}.`,
+      }));
+      const queries = form === "list"
+        ? entries
+        : Object.fromEntries(entries.map((entry) => [entry.name, { template: entry.template }]));
+      const result = resolvePromptDisplaySegments(
+        makeState([makeNode({ system_prompt: "Shared system instruction.", queries })]),
+        surfaceEvent(),
+      );
+      const text = displayText(result);
+      expect(text.length).toBeGreaterThan(8000);
+      expect(text).toContain("System prompt (sent with every query):\nShared system instruction.");
+      for (const entry of entries) {
+        expect(text).toContain(`Query '${entry.name}':\n${entry.template}\n`);
+      }
+      expect(text).not.toContain("Frozen staging-time text.");
+      expect(result.reviewAvailable).toBe(true);
+      expect(result.usedFallback).toBe(false);
+    },
+  );
+
+  it("accepts a null shared template without rendering unrelated shared parts", () => {
+    const result = resolvePromptDisplaySegments(
+      makeState([makeNode({
+        prompt_template: null,
+        prompt_template_parts: [{ kind: "text", text: "Unused parts." }],
+        interpretation_requirements: [],
+        queries: { own: { template: "Actual query instruction." } },
+      })]),
+      surfaceEvent(),
+    );
+    expect(displayText(result)).toContain("Actual query instruction.");
+    expect(displayText(result)).not.toContain("Unused parts.");
+    expect(result.reviewAvailable).toBe(true);
+  });
+
+  it("keeps review unavailable when a query needs a missing shared template", () => {
+    const result = resolvePromptDisplaySegments(
+      makeState([makeNode({ queries: { own: { template: "Own text." }, shared: {} } })]),
+      surfaceEvent(),
+    );
+    expect(displayText(result)).toContain("Query 'own':\nOwn text.");
+    expect(displayText(result)).toContain("(no node-level prompt_template is set)");
+    expect(result.reviewAvailable).toBe(false);
+  });
+
   it("renders byte-identical to the backend review draft when nothing is bounded or resolved", () => {
     // Expected text produced by the backend on the same options:
     // multi_query_prompt_surface_from_options(opts).render_for_review()
