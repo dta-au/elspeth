@@ -538,9 +538,16 @@ async def test_provider_request_is_refused_before_transport(monkeypatch: pytest.
         # 400 KiB message: the detector scans the whole string, so a credential
         # placed past the default 256 KiB cap is still found by pattern.
         pytest.param(" " * (300 * 1024) + "sk-" + "a" * 24 + " " * (100 * 1024), "token_shape", id="credential_past_256KiB"),
-        # Past the raised 500 KiB cap the string is refused unscanned, never
-        # skipped: the cap bounds work, it does not exempt content.
-        pytest.param(" " * (500 * 1024 + 1), "traversal_limit", id="over_500KiB_cap"),
+        # 2 MiB - 1 bytes, the largest string under the cap: a credential near
+        # the END is still found, so nothing under the cap goes unscanned.
+        pytest.param(" " * (2 * 1024 * 1024 - 1 - 27 - 4) + "sk-" + "a" * 24 + " " * 4, "token_shape", id="credential_at_end_of_2MiB"),
+        # A maximum-size YAML import (524,288 characters), all 4-byte characters
+        # except the credential, fits under the cap: it is scanned, and the
+        # trailing credential is found.
+        pytest.param("\U00010400" * (524_288 - 27) + "sk-" + "a" * 24, "token_shape", id="max_import_of_4_byte_chars"),
+        # Past the 2 MiB cap the string is refused unscanned, never skipped:
+        # the cap bounds work, it does not exempt content.
+        pytest.param(" " * (2 * 1024 * 1024 + 1), "traversal_limit", id="over_2MiB_cap"),
     ],
 )
 async def test_provider_request_scans_large_messages_and_refuses_over_cap(

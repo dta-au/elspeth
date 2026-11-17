@@ -46,10 +46,11 @@ export const IMPORT_YAML_NOT_RUNNABLE_INTRO =
 export const IMPORT_YAML_NOT_RUNNABLE_INTRO_NO_DETAIL =
   "Validation found problems with this pipeline. It has been saved, but is not ready to run.";
 
-export const IMPORT_YAML_422_MESSAGE =
-  "This paste could not be imported: it is empty, or larger than the 256 KB limit.";
+// Mirrors the backend MAX_RUNTIME_YAML_IMPORT_CHARS (web/composer/yaml_importer.py).
+export const MAX_IMPORT_YAML_CHARS = 524_288;
 
-const MAX_IMPORT_YAML_CHARS = 262_144;
+export const IMPORT_YAML_422_MESSAGE =
+  `This paste could not be imported: it is empty, or larger than the ${MAX_IMPORT_YAML_CHARS / 1024} KB limit.`;
 export const IMPORT_YAML_UNSAFE_MESSAGE =
   "Pipeline YAML could not be read safely. Remove aliases or reduce nesting.";
 
