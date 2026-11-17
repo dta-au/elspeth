@@ -961,9 +961,9 @@ files:
     Mapping[str, Any]: 1
     dict[str, Any]: 5
   src/elspeth/web/composer/tools/transforms.py:
-    Mapping[str, Any]: 7
-    dict[str, Any]: 19
-    dict[str, object]: 2
+    Mapping[str, Any]: 10
+    dict[str, Any]: 20
+    dict[str, object]: 4
   src/elspeth/web/composer/tools/wire_projection.py:
     Mapping[str, Any]: 7
     boundary: 1
@@ -1111,10 +1111,10 @@ files:
   src/elspeth/web/shareable_reviews/service.py:
     dict[str, object]: 1
 totals:
-  Mapping[str, Any]: 803
+  Mapping[str, Any]: 806
   Mapping[str, object]: 319
   MutableMapping[str, Any]: 8
   boundary: 69
-  dict[str, Any]: 1124
-  dict[str, object]: 401
-  soft: 2655
+  dict[str, Any]: 1125
+  dict[str, object]: 403
+  soft: 2661

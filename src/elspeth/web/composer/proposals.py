@@ -76,6 +76,25 @@ def build_tool_proposal_summary(
             arguments_redacted_json=redacted_arguments,
         )
 
+    if tool_name == "change_substring":
+        target = redacted_arguments.get("target")
+        label = "selected prompt"
+        if isinstance(target, Mapping):
+            node_id = _string_argument(target, "node_id")
+            blob_id = _string_argument(target, "blob_id")
+            if node_id is not None:
+                label = f'node "{node_id}"'
+            elif blob_id is not None:
+                label = f'session file "{blob_id}"'
+        edits = redacted_arguments.get("edits")
+        count = len(edits) if isinstance(edits, list | tuple) else 0
+        return ToolProposalSummary(
+            summary=f"Edit prompt text on {label} — {_plural(count, 'exact edit')}.",
+            rationale=rationale,
+            affects=affects,
+            arguments_redacted_json=redacted_arguments,
+        )
+
     if tool_name == "patch_source_options":
         return ToolProposalSummary(
             summary="Update source options.",

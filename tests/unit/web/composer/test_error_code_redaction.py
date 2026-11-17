@@ -87,7 +87,7 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("composer/tools/sources.py", "_resolve_source_blobs", "prevalidation_error[1]"),
         ("composer/tools/sources.py", "_execute_patch_source_options", "prevalidation_error[1]"),
         ("composer/tools/transforms.py", "_execute_upsert_node", "prevalidation_error[1]"),
-        ("composer/tools/transforms.py", "_execute_patch_node_options", "prevalidation_error[1]"),
+        ("composer/tools/transforms.py", "_apply_guarded_node_option_patch", "prevalidation_error[1]"),
         ("composer/tools/transforms.py", "_prepare_transform_candidate", "prevalidation_error[1]"),
         ("composer/tools/sessions.py", "build_set_pipeline_candidate", "src_prevalidation[1]"),
         ("composer/tools/sessions.py", "_legacy_source_rejection", "src_prevalidation[1]"),
@@ -103,7 +103,8 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("composer/tools/sessions.py", "_legacy_source_rejection", "header_conflict.error_code"),
         ("composer/tools/transforms.py", "_execute_upsert_node", "error_code"),
         ("composer/tools/transforms.py", "_execute_upsert_edge", "error_code"),
-        ("composer/tools/transforms.py", "_execute_patch_node_options", "error_code"),
+        ("composer/tools/transforms.py", "_apply_guarded_node_option_patch", "error_code"),
+        ("composer/tools/transforms.py", "_substring_refusal", "code"),
         ("composer/tools/transforms.py", "_prepare_transform_candidate", "error_code"),
         ("composer/turn_audit.py", "_state_payload_for_compose_turn", "error.error_code"),
         # The imported ``ADVISOR_SIGNOFF_BLOCKED_CODE`` (pinned below).
@@ -521,6 +522,7 @@ def _persisted_first_error(tool_name: str, error_code: str) -> dict[str, object]
         ("patch_output_options", "plugin_options_invalid"),
         ("patch_node_options", "plugin_options_invalid"),
         ("patch_node_options", "prompt_template_parts_required"),
+        ("inspect_prompt_targets", "inspect_after_uncheckpointed_mutation"),
         # Plugin-policy and execution-validation codes (produced outside
         # web/composer) on option tools.
         ("upsert_node", "profile_alias_used_as_bucket"),

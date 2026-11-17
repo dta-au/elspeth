@@ -276,6 +276,8 @@ _LOCAL_DATA_PAYLOADS: dict[tuple[str, str, str], type | None] = {}
 _SPLAT_KEYS: dict[str, tuple[str, ...]] = {}
 # enclosing function -> tool name, where the ``_handle_`` / ``_execute_`` prefix rule does not apply.
 _FUNCTION_TOOL_OVERRIDES: dict[str, str] = {
+    "_apply_guarded_node_option_patch": "patch_node_options",
+    "_inspect_prompt_targets": "inspect_prompt_targets",
     "build_set_pipeline_candidate": "set_pipeline",
     "_execute_upsert_queue_node": "upsert_node",
     "_execute_delete_blob_locked": "delete_blob",

@@ -54,6 +54,13 @@ _TYPE_DRIVEN_INPUTS: dict[str, dict[str, Any]] = {
     },
     "patch_source_options": {"source_name": "source", "patch": {"nested": [None, False, 1]}},
     "patch_node_options": {"node_id": "node", "patch": {"nested": [None, False, 1]}},
+    "inspect_prompt_targets": {"node_id": "node"},
+    "change_substring": {
+        "target": {"kind": "node_option", "node_id": "node", "option": "prompt_template"},
+        "expected_sha256": "a" * 64,
+        "expected_state_id": "state",
+        "edits": [{"old": "before", "replacement": "after", "replace_all": False}],
+    },
     "patch_output_options": {"sink_name": "output", "patch": {"nested": [None, False, 1]}},
     "get_blob_content": {"blob_id": "blob"},
     "read_attachment": {"blob_id": "blob", "expected_content_hash": "a" * 64},

@@ -66,6 +66,16 @@ function projectEntries(
 }
 
 describe("buildProposalDiff", () => {
+  it("summarizes exact prompt edits without showing fragments or target text", () => {
+    const diff = buildProposalDiff(
+      "change_substring",
+      { target: { kind: "node_option", node_id: "classifier", option: "prompt_template" }, edits: [{ old: "<text length=7>", replacement: "<text length=8>" }] },
+      makeState(),
+    );
+    expect(diff?.entries).toHaveLength(1);
+    expect(JSON.stringify(diff?.entries)).not.toContain("<text length");
+    expect(diff?.entries[0].afterSummary).toContain("1 exact edit");
+  });
   it.each([
     ["set_pipeline", { source: { plugin: "csv" }, nodes: [], edges: [], outputs: [] }, "pipeline"],
     ["set_source", { plugin: "csv" }, "component"],

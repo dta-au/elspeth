@@ -2256,6 +2256,52 @@ class PatchNodeOptionsArgumentsModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class NodeOptionSubstringTarget(BaseModel):
+    kind: Literal["node_option"]
+    node_id: str
+    option: Literal["prompt_template", "system_prompt"]
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class PromptPartSubstringTarget(BaseModel):
+    kind: Literal["prompt_part"]
+    node_id: str
+    part_index: int = Field(ge=0)
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class BlobSubstringTarget(BaseModel):
+    kind: Literal["blob"]
+    blob_id: str
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class SubstringEditModel(BaseModel):
+    old: Annotated[str, Sensitive(summarizer=_summarize_inline_blob_content)]
+    replacement: Annotated[str, Sensitive(summarizer=_summarize_inline_blob_content)]
+    replace_all: bool = False
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class ChangeSubstringArgumentsModel(BaseModel):
+    target: Annotated[NodeOptionSubstringTarget | PromptPartSubstringTarget | BlobSubstringTarget, Field(discriminator="kind")]
+    expected_sha256: str
+    expected_state_id: str | None = None
+    edits: list[SubstringEditModel] = Field(min_length=1, max_length=32)
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class InspectPromptTargetsArgumentsModel(BaseModel):
+    node_id: str
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
 class PatchOutputOptionsArgumentsModel(BaseModel):
     """Redaction-bearing argument model for the ``patch_output_options`` tool.
 
@@ -3751,6 +3797,14 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
         ),
         "patch_node_options": ToolRedaction(
             argument_model=PatchNodeOptionsArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
+        "change_substring": ToolRedaction(
+            argument_model=ChangeSubstringArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
+        "inspect_prompt_targets": ToolRedaction(
+            argument_model=InspectPromptTargetsArgumentsModel,
             response_model=_ToolResultResponseModel,
         ),
         "patch_output_options": ToolRedaction(
