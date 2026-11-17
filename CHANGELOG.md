@@ -50,6 +50,20 @@ Schema and stored data:
   loads, a node is selected or failure routes are toggled. React Flow had been
   re-measuring every node on each rebuild; measured sizes are now carried
   forward, and nodes re-read their handles when their parallel routes change.
+- The composer's context budget now estimates a request's size from the
+  provider's own token count for an earlier call in the same exchange (same
+  model and dialect), plus every byte added since. With no usable count, text
+  ELSPETH ships (the composer skill, tool definitions and labelled plugin
+  schemas) is priced at 3 bytes per token, and everything else at one token
+  per byte; the lower of the two estimates is used. If the provider's count
+  for that earlier call shows the 3-bytes-per-token assumption undercounted
+  it, or the earlier call's authored size is unknown, the provider-anchored
+  estimate is used alone. Requests carrying several large plugin schemas that
+  were refused as over budget are now admitted. Once older history is dropped
+  to fit, it stays dropped until the raw request is back under the configured
+  low mark, so long sessions keep a stable prompt prefix. Composer LLM audit
+  records gain optional anchor and pricing fields; records written by earlier
+  versions still load.
 
 ### Release pipeline
 

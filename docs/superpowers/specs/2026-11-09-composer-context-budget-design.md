@@ -120,22 +120,52 @@ counts; the hatch transcript's gap marker).
 
 ### Token estimate
 
-`estimated_tokens = ceil(request_wire_bytes / ratio)`.
+The v2 policy (0.8.14 correction) anchors on the newest usable
+successful provider call in the same exchange, on the same model and tool
+dialect, when its exact private request capture and usable prompt count exist.
+Historical session ratios remain readable diagnostics, not admission inputs.
 
-- Each budgeted call records the wire bytes of the request it sent
-  (`request_wire_bytes`). `ratio` is that figure divided by the call's stored
-  `prompt_tokens`, taken from the session's newest successful budgeted call
-  on the same model; failing that, from the newest successful budgeted call
-  on any model. Advisor and auto-title calls are not budgeted calls and never
-  supply the ratio.
-- A measured ratio is clamped to 2.0-6.0 bytes per token. The ratio is
-  provider-reported data steering a control decision, so a value outside the
-  range is clamped, not trusted and not rejected. A ratio that is not a
-  finite positive number is a programming error and raises.
-- Before the session has such a call, a fixed fallback ratio of 3.0 bytes per
-  token applies. It is lower than the one measured figure (about 4.3), so it
-  over-estimates tokens and sheds early, never late. This includes the first
-  turn of an existing session after the upgrade.
+`estimated_tokens = min(wire_bytes - authored_bytes + ceil(authored_bytes / fallback_bytes_per_token), anchor_tokens + wire_bytes - shared_bytes)`
+when an anchor is usable; without one, use the authored arm alone.
+
+Shared bytes are entire unchanged protected messages and an unchanged tool
+block, matched with multiplicity. Any message that can be shed, stubbed or
+re-rendered is priced entirely at one token per byte. The whole anchor token
+count is charged even when only part of its content is shared. Thus shedding
+prose never earns average-ratio credit against retained dense content. This
+assumes unchanged independently framed messages/tools on the same provider
+route retain their tokenization and the reported count includes their cost.
+Hidden provider expansion is outside the byte bound.
+
+With or without an anchor, the shipped skill core, owned tool definitions,
+catalogue and producer-labelled nominal schema references in protected compose
+messages are priced at the policy's fallback of 3 wire bytes per token. Their
+producers supply their provenance; no text classifier decides authorship.
+Deployment skill overlays, foreign state, history and user/model data cost one
+token per byte. Unknown authorship receives no discount. Sheddable messages
+remain entirely byte-priced so savings cannot exceed their token charge.
+Counts must be positive exact integers between `ceil(bytes / 8)` and `bytes`;
+rejected counts and unavailable private-capture reasons are recorded. The
+plausibility check can reject valid highly compressible content safely.
+Separately reported cached, cache-read and cache-creation counts are treated
+as breakdowns of the provider prompt total, not added to it. Under-reported
+usage with no separate counters cannot be detected reliably.
+The original skill/tools-only measurement of the default first request was
+291,347 wire bytes, 62,626 o200k tokens and a 145,593-token estimate. Catalogue
+and nominal-schema classification further reduces that estimate. The nominal
+schema region in the real batch/cache regression costs 90,752 tokens versus
+66,429 o200k tokens: 1.4 times that region needs 93,001 tokens, exceeding its
+price by 2,249. A fallback of at most 2.927 bytes/token would cover that measured
+region at 1.4x; the shipped default remains 3. The complete request retains
+1.4x coverage through its other regions. These are measurements of one tokenizer
+family, not universal provider qualification.
+Completion tokens are outside this prompt cap; operators must leave room
+for the configured completion allowance and provider margin.
+
+Release always uses the fixed one-token-per-byte yardstick, so arrival,
+replacement or loss of an anchor cannot restore previously shed history.
+When the protected estimate exceeds the low mark, shedding targets the high
+mark instead, then enforces both hard ceilings.
 
 ### Recorded policy
 
@@ -192,12 +222,15 @@ no recap.
 
 - Cross-turn: a history message shed on an earlier call stays
   shed until the whole unshed request would be at or below the low-water mark
-  and under the byte ceiling. The previously shed set is read from the newest
-  stored call that carries a shedding record, not from memory.
+  on the fixed one-token-per-byte yardstick and under the byte ceiling. The
+  previously shed set is read from the newest stored call that carries a
+  shedding record, not from memory. Reply calls hold that set, and calls
+  without history carry it forward without making a release decision.
 - Whether more must be shed is judged on the request with the already-shed
   set removed, that is, on what would be sent if nothing new were shed. Only
   when that size is over the high-water mark or the byte ceiling does
-  shedding continue, by kind and oldest first, to the low-water mark. A long
+  shedding continues, by kind and oldest first, to the low-water mark when
+  reachable, otherwise to the high mark. A long
   session therefore sheds, holds its shed set while it grows through the
   band between the marks, and sheds again when the reduced request crosses
   the high-water mark.
@@ -209,15 +242,23 @@ no recap.
 
 Shedding alters messages after the fixed prefix, so the call on which
 shedding engages loses the sliding cache marker's benefit on the conversation
-tail. The prefix cache is unaffected. Shedding to the low-water mark in one
-step keeps this to an occasional call.
+tail. The prefix cache is unaffected. Shedding to the low-water mark when
+reachable, or to the high mark otherwise, prevents shed/restore oscillation.
+It does not bound repeated additional shedding when the conservative protected
+price exceeds the low mark: growing foreign content can change the shed set
+on every turn. A provider's aggregate count does not identify the tokens in
+removed prose versus retained dense data; crediting removed bytes at an average
+ratio would undercount. Re-anchoring only the unchanged protected messages
+therefore cannot eliminate this cost. Operators should distinguish stable
+omissions from a promise of a stable cache prefix under continued growth.
 
 ## Components
 
 - **`src/elspeth/web/composer/context_budget.py`** (new). Pure, no I/O.
   - Input: the request's wire size, the labelled segments, the policy, the
-    ratio, the keys shed on an earlier call, and the keys held for the rest
-    of the turn.
+    anchor token count and shared protected bytes, the keys shed on an
+    earlier call, and the keys held for the rest of the turn. Historical
+    byte ratios are not inputs to the decision.
   - Output: which segments to shed and the sizes before and after, or a
     refusal. It knows nothing about message shapes.
   - The same input always yields the same output, so the recorded
@@ -225,8 +266,9 @@ step keeps this to an occasional call.
 - **`context_budget_apply.py`** (new). The message-shape helpers both call
   sites share: the wire measure, the stub, labelling of tool results, the
   previously shed and held keys.
-- **`context_budget_history.py`** (new). Reads the ratio and the previously
-  shed history from the session's stored call records.
+- **`context_budget_history.py`** (new). Reads the diagnostic ratio and the
+  previously shed history from the session's stored call records, and derives
+  anchors from the newest usable live call's private request capture.
 - **Planner call site** (`pipeline_planner.py`, in `call_model_body`,
   immediately before the existing byte check). Labels the conversation
   context, the within-run continuation and the hatch transcript.
@@ -252,7 +294,13 @@ On every budgeted composer call record and in the public call envelope,
 beside `request_byte_split`, a `context_budget` record:
 
 - `policy_hash`;
-- `bytes_per_token`, the ratio the estimate used;
+- `bytes_per_token`, the legacy ratio field (the fallback rate for newly emitted
+  authored-arm records, 1.0 for anchored or conservative growth). Historical
+  authored-arm records may contain `"1.0"` and are not rewritten;
+- `pricing_mode` (`anchored`, `conservative`, or `authored_prefix`), `anchor_status`,
+  `anchor_prompt_tokens`, `anchor_wire_bytes`, `anchor_shared_bytes`, and
+  `decision_wire_bytes` / `decision_wire_bytes_after` (including allowances),
+  sufficient to replay both token estimates without storing prompt content;
 - `estimated_tokens_before`, the estimate of the unshed request;
 - `estimated_tokens_after`, an upper bound on the estimate of the request
   sent (savings are lower bounds and the allowance is included);
@@ -327,7 +375,7 @@ Unit tests on the pure module, over synthetic segments:
 
 - below the high mark nothing is shed;
 - the shed order is exact, oldest first within each segment class;
-- shedding stops at the low mark;
+- shedding stops at the low mark when reachable, otherwise at the high mark;
 - a byte-ceiling overflow sheds even when the token estimate is under the
   high mark;
 - previously shed history stays shed until the low-mark condition holds;
@@ -335,7 +383,7 @@ Unit tests on the pure module, over synthetic segments:
 - identical input yields identical output and hash;
 - protected segments over a ceiling yield a refusal naming the ceiling and
   component;
-- the ratio falls back to 3.0 when the session has no successful call.
+- missing or invalid anchors use authored-prefix pricing and one token per foreign byte.
 
 Integration, one per path: an oversized session sheds, the request sent is
 under both ceilings, and the shedding record matches what was sent. Each has
@@ -358,8 +406,8 @@ estimate is not exact:
   unavailable for that turn. Tracked as dta-au/elspeth#364.
 - Tool-call arguments and thinking blocks count toward the budget but are
   never shed. A turn whose arguments alone cannot fit is refused.
-- Token counts are an estimate from bytes and a measured ratio, not a
-  tokenizer.
+- Token counts use provider-count anchoring and conservative byte growth,
+  without a production tokenizer dependency.
 - There is no retry when the provider rejects a request for context length.
 - Graph recovery, run diagnostics, auto-title and the boot probe are not
   budgeted. Their request sizes were not measured for this design.
@@ -401,8 +449,10 @@ first said:
   thinking, so both ceilings and the ratio moved to the wire bytes of the
   request sent, recorded on each call as `request_wire_bytes` (Rulings 10 and
   13).
-- **The ratio's source.** Budgeted calls only, the same model preferred,
-  clamped; the approved design took it from any successful call (Ruling 11).
+- **Historical ratios.** Earlier versions read measured ratios from budgeted
+  calls. Admission now uses same-exchange provider anchoring; the persisted
+  audit rate remains for replay, but the shed-state reader does not derive a
+  historical ratio.
 - **The reply stage** is fitted from the budgeted loop messages and degrades
   without failing the turn (Ruling 11); its refusal is recorded and has its
   own notice (Ruling 14).

@@ -86,7 +86,7 @@ docker run --rm --name elspeth-web \
 ```
 
 `ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS` is required; `200000` is a
-placeholder. Set it to your model gateway's prompt-token limit.
+placeholder. Set it to your model gateway's prompt-token limit, reserving room for completion tokens and provider overhead. The Composer uses a conservative estimate: the shipped skill and tools use a measured static rate before usage is available, while foreign content costs one token per byte. Large protected content can therefore be refused before the model's actual token limit.
 
 The explicit `0.0.0.0` bind is required for Docker's published port to reach
 the process; the native CLI keeps its safer `127.0.0.1` default. From another
