@@ -4,14 +4,34 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
-## Unreleased (0.8.15)
+## 0.8.15 - 2026-11-17
+
+Executor hot-path fixes, Web Composer fixes and a release-pipeline repair.
+0.8.15 supersedes 0.8.14, which was tagged but never published as a GitHub
+release or version-tagged image: its smoke test could not run on hardened CI
+runners. Everything in the 0.8.14 section below therefore ships for the first
+time in this release, including its upgrade actions. The dated entry and
+package version do not establish qualification, a published tag or an image.
 
 ### Upgrade notes
 
+- **Upgrading from 0.8.13 or earlier: apply the 0.8.14 upgrade notes first.**
+  ELSPETH now requires and runs on Python 3.14 only, startup refuses
+  `JSON_LOGS=true`, and a run checkpointed under 3.13 refuses to resume under
+  3.14. Drain in-flight runs and pending approvals before upgrading.
 - A run interrupted before upgrading cannot be resumed after it: the
   schema-contract module changed, so the runtime manifest recorded at run start
   no longer matches and resume refuses (no data is changed; re-run or finish
   interrupted runs before upgrading).
+
+Schema and stored data:
+
+- No schema epoch changed and no stored data is migrated, reset or rewritten.
+  Session epoch 78 and Landscape epoch 50 are unchanged from the previous
+  release; this release adds no schema-epoch cutover. Existing 0.8.14 session
+  and Landscape stores need no action beyond the drain above, and the 0.8.10
+  cutover guidance below continues to apply to older stores. This authorizes
+  no migration, reset, restamping or downgrade.
 
 ### Engine and runtime
 
@@ -30,6 +50,26 @@ All notable changes to ELSPETH are documented here.
   loads, a node is selected or failure routes are toggled. React Flow had been
   re-measuring every node on each rebuild; measured sizes are now carried
   forward, and nodes re-read their handles when their parallel routes change.
+
+### Release pipeline
+
+- The image smoke test runs on CI runners with a `0077` umask. The image's
+  non-root user (uid 1654) could not read the checked-out example, and the
+  runner could not read the `0600` sink outputs, so the 0.8.14 tag build
+  stopped before release. Only the mounted example directories are opened to
+  the container, and the image user makes its own outputs readable afterwards.
+- The release image scan accepts the four chromadb 1.5.5 advisories that
+  `pip-audit` already accepts (CVE-2026-45829, -45830, -45831, -45833) as
+  version-scoped, expiring exceptions in `.trivyignore.yaml`. They affect the
+  Chroma server, which ELSPETH does not run; the gateway image takes no
+  exceptions.
+
+### Publication and acceptance
+
+Automatic image publication from main remains held. The 0.8.15 tag and
+container publication follow successful required checks and the protected
+merge. Operator signing, live-provider acceptance and deployment remain
+separate steps.
 
 ## 0.8.14 - 2026-11-15
 

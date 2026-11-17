@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.14+](https://img.shields.io/badge/python-3.14+-blue.svg)](https://www.python.org/downloads/)
-![Status: 0.8.14](https://img.shields.io/badge/status-0.8.14-green.svg)
+![Status: 0.8.15](https://img.shields.io/badge/status-0.8.15-green.svg)
 
 ELSPETH builds, validates, runs, and audits data and LLM workflows whose
 outputs need to be reviewed and explained. You can author a pipeline in
@@ -100,10 +100,29 @@ ELSPETH supports audit export and optional signing. The
 [export settings and limits](docs/reference/configuration.md#export-settings)
 describe what is exported and how to configure it.
 
-## What changed in 0.8.14
+## What changed in 0.8.15
 
-0.8.14 moves ELSPETH to Python 3.14. See the [release notes](CHANGELOG.md),
-which also record earlier releases.
+0.8.15 carries executor hot-path fixes, Web Composer fixes and a
+release-pipeline repair. See the [release notes](CHANGELOG.md), which also
+record earlier releases. It supersedes 0.8.14, which was tagged but never
+published as a release or version-tagged image, so the 0.8.14 changes below
+ship for the first time here: upgrading from 0.8.13 or earlier means moving to
+Python 3.14, and the 0.8.14 upgrade actions apply.
+
+A run interrupted before upgrading cannot be resumed after it; finish or re-run
+interrupted runs first. Session epoch 78 and Landscape epoch 50 are unchanged
+from the previous release; this release adds no schema-epoch cutover, so
+existing session and Landscape stores need no action. The 0.8.10 cutover
+guidance below continues to apply to older stores. Backwards compatibility is
+permitted and considered from 0.8.5 within explicitly supported boundaries.
+This release authorizes no in-place migration, reset or downgrade. Package
+metadata is 0.8.15; the package version alone does not establish qualification
+or image publication. Automatic image publication from main is held; verify
+the release tag and image digest before installing a published image.
+
+## Previously in 0.8.14
+
+0.8.14 moves ELSPETH to Python 3.14.
 
 Python 3.14 is now required for `elspeth`, `elspeth-lints` and the LLM gateway;
 3.12 and 3.13 are no longer supported or tested. Locked dependency versions are
@@ -138,15 +157,7 @@ can no longer delete a live share's data: new shares are stored under `shares/`
 in the payload store, links created earlier keep working but remain
 purge-exposed, and `purge --payload-dir` must never point at `shares/`.
 
-Session epoch 78 and Landscape epoch 50 are unchanged from the previous
-release; this release adds no schema-epoch cutover, so existing session and
-Landscape stores need no action. The 0.8.10 cutover guidance below continues to
-apply to older stores. Backwards compatibility is permitted and considered from 0.8.5 within
-explicitly supported boundaries. This release authorizes no in-place migration,
-reset or downgrade. Package metadata is 0.8.14; the package version alone does
-not establish qualification or image publication. Automatic image publication
-from main is held; verify the release tag and image digest before installing a
-published image.
+0.8.14 changed no schema epoch.
 
 ## Previously in 0.8.13
 
