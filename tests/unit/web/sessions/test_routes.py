@@ -4549,6 +4549,10 @@ class TestIDORCoverageDrift:
             "list_interpretations",
             "opt_out_of_interpretations",
             "opt_out_summary",
+            # PFR R2: full file text of a prompt-file review card
+            # (``GET /{session_id}/interpretations/{event_id}/prompt``), owner-gated
+            # like the other interpretation routes.
+            "get_interpretation_prompt_snapshot",
             # Phase 4 hello-world tutorial (commit ca9bc05bd) added the
             # audit-story endpoint at ``GET /api/sessions/{session_id}
             # /runs/{run_id}/audit-story``. Like every other session-scoped
