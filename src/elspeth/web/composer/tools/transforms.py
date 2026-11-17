@@ -98,6 +98,7 @@ from elspeth.web.composer.tools.prompt_target_responses import (
 from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material_for_tool
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
+    PROMPT_TEMPLATE_PARTS_KEY,
     VAGUE_TERM_QUERY_OVERRIDE_PREFIX,
     approved_prompt_artifact_hash_from_options,
     composition_review_contract_error,
