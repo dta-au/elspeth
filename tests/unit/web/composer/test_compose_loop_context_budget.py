@@ -21,6 +21,7 @@ import pytest
 from elspeth.contracts.composer_llm_audit import ComposerContextBudgetRecord, ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json, stable_hash
+from elspeth.web.composer import context_budget_history
 from elspeth.web.composer import service as composer_service
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.audit import BufferingRecorder
@@ -33,7 +34,7 @@ from elspeth.web.composer.context_budget_apply import (
     stubbed_tool_message,
     tool_result_segments,
 )
-from elspeth.web.composer.context_budget_history import ContextBudgetHistory, request_anchor
+from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
 from elspeth.web.composer.prompts import STATE_CONTEXT_PREFIX
 from elspeth.web.composer.protocol import (
@@ -1142,7 +1143,7 @@ async def test_compose_anchor_authored_metadata_fails_closed(monkeypatch: pytest
                     value = None if metadata == "legacy" else 1_000_000
                     call = replace(call, context_budget=replace(call.context_budget, authored_bytes=value))
             calls.append(call)
-        return request_anchor(**{**kwargs, "calls": calls})
+        return context_budget_history.request_anchor(**{**kwargs, "calls": calls})
 
     monkeypatch.setattr(composer_service, "request_anchor", anchor_with_metadata)
     service, session_id = _service(_GENEROUS_TOKENS)

@@ -32,7 +32,7 @@ from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerP
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.prompt_guard import PROMPT_GUARD_CONTENT_PARTS_KEY, detach_prompt_guard_evidence
 from elspeth.core.canonical import canonical_json
-from elspeth.web.composer import pipeline_planner
+from elspeth.web.composer import context_budget_history, pipeline_planner
 from elspeth.web.composer.advisor_transcript import CONTEXT_BUDGET_TRANSCRIPT_OMISSION_GAP, AdvisorVisibleTranscript
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.context_budget import CONTEXT_BUDGET_TOOL_RESULT_STUB, ContextBudgetPolicy
@@ -43,7 +43,7 @@ from elspeth.web.composer.context_budget_apply import (
     message_bytes,
     message_wire_split,
 )
-from elspeth.web.composer.context_budget_history import ContextBudgetHistory, request_anchor
+from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.llm_response_parsing import _hash_and_measure_request, build_llm_call_record
 from elspeth.web.composer.pipeline_planner import (
     _HATCH_TRANSCRIPT_HEADER,
@@ -798,7 +798,7 @@ async def test_planner_anchor_authored_metadata_fails_closed(
                     value = None if metadata == "legacy" else 1_000_000
                     call = replace(call, context_budget=replace(call.context_budget, authored_bytes=value))
             calls.append(call)
-        return request_anchor(**{**kwargs, "calls": calls})
+        return context_budget_history.request_anchor(**{**kwargs, "calls": calls})
 
     monkeypatch.setattr(pipeline_planner, "request_anchor", anchor_with_metadata)
     lookup = _response_with_call_id("schema", "get_plugin_schema", {"plugin_type": "transform", "name": "web_scrape"})

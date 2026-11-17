@@ -10,6 +10,7 @@ from hypothesis import strategies as st
 
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.errors import FrameworkBugError
+from elspeth.web.composer import context_budget_history
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.context_budget import (
     ContextBudgetPolicy,
@@ -20,7 +21,7 @@ from elspeth.web.composer.context_budget import (
     escaped_bytes,
 )
 from elspeth.web.composer.context_budget_apply import request_wire_bytes
-from elspeth.web.composer.context_budget_history import ContextBudgetHistory, request_anchor
+from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.service import _ContextBudgetRefusalScope
@@ -33,7 +34,7 @@ from tests.unit.web.composer.test_planner_context_budget import _earlier_call, _
 def test_invalid_anchor_counts_are_discarded(count):
     messages = [{"role": "system", "content": "normal prose " * 200}]
     call = replace(_earlier_call(()), prompt_tokens=count, private_request=capture_provider_context(messages=messages, tools=None))
-    anchor = request_anchor(
+    anchor = context_budget_history.request_anchor(
         calls=[call], model=call.model_requested, dialect=None, messages=messages, tools=None, mutable_positions=frozenset()
     )
     assert anchor.tokens is None
@@ -44,12 +45,12 @@ def test_anchor_excludes_mutable_content_and_matches_duplicate_messages_once():
     messages = [{"role": "system", "content": "normal prose " * 200}, {"role": "user", "content": "a" * 300}]
     call = replace(_earlier_call(()), prompt_tokens=500, private_request=capture_provider_context(messages=messages, tools=None))
     current = [*messages, messages[0]]
-    anchor = request_anchor(
+    anchor = context_budget_history.request_anchor(
         calls=[call], model=call.model_requested, dialect=None, messages=current, tools=None, mutable_positions=frozenset({1})
     )
     assert anchor.tokens == 500
     assert anchor.shared_bytes == request_wire_bytes(messages[:1], None) - len('{"messages":[],"tools":}')
-    changed = request_anchor(
+    changed = context_budget_history.request_anchor(
         calls=[call],
         model=call.model_requested,
         dialect=ToolContractDialect.NONE,
@@ -172,7 +173,7 @@ def test_dense_growth_after_prose_anchor_is_priced_per_byte():
     messages = [{"role": "system", "content": "Read the input data. " * 100}]
     call = replace(_earlier_call(()), prompt_tokens=500, private_request=capture_provider_context(messages=messages, tools=None))
     current = [*messages, {"role": "user", "content": "0123456789abcdef" * 100}]
-    anchor = request_anchor(
+    anchor = context_budget_history.request_anchor(
         calls=[call], model=call.model_requested, dialect=None, messages=current, tools=None, mutable_positions=frozenset()
     )
     with pytest.raises(ContextBudgetRefusal):
@@ -392,7 +393,7 @@ def test_newest_usable_anchor_survives_interleaved_model_and_failure():
         replace(call, model_requested="another/model"),
         replace(call, status=ComposerLLMCallStatus.API_ERROR, error_class="APIError", error_message="failed"),
     ):
-        anchor = request_anchor(
+        anchor = context_budget_history.request_anchor(
             calls=[call, newer, interleaved],
             model=call.model_requested,
             dialect=None,
@@ -422,7 +423,7 @@ def test_anchor_does_not_double_count_normalized_cached_usage(model, cache_field
         private_request=capture_provider_context(messages=messages, tools=None),
         **{cache_field: 200},
     )
-    anchor = request_anchor(
+    anchor = context_budget_history.request_anchor(
         calls=[call], model=call.model_requested, dialect=None, messages=messages, tools=None, mutable_positions=frozenset()
     )
     assert anchor.tokens == 500
@@ -434,7 +435,7 @@ def test_anchor_plausibility_eight_byte_boundary(numerator, accepted):
     wire = request_wire_bytes(messages, None)
     count = (wire + 7) // 8 + numerator - 2
     call = replace(_earlier_call(()), prompt_tokens=count, private_request=capture_provider_context(messages=messages, tools=None))
-    anchor = request_anchor(
+    anchor = context_budget_history.request_anchor(
         calls=[call], model=call.model_requested, dialect=None, messages=messages, tools=None, mutable_positions=frozenset()
     )
     assert (anchor.tokens is not None) == accepted
@@ -447,7 +448,7 @@ def test_changed_tools_never_receive_anchor_credit():
     old_tools = [{"type": "function", "function": {"name": "set_metadata", "description": "original"}}]
     new_tools = [{"type": "function", "function": {"name": "set_metadata", "description": "changed"}}]
     call = replace(_earlier_call(()), prompt_tokens=500, private_request=capture_provider_context(messages=messages, tools=old_tools))
-    anchor = request_anchor(
+    anchor = context_budget_history.request_anchor(
         calls=[call], model=call.model_requested, dialect=None, messages=messages, tools=new_tools, mutable_positions=frozenset()
     )
     assert anchor.tokens == 500
@@ -663,7 +664,7 @@ def test_planner_and_hatch_anchor_exclude_request_history(hatch):
 def test_unavailable_private_capture_reason_is_recorded(content, reason):
     messages = [{"role": "user", "content": content}]
     call = replace(_earlier_call(()), prompt_tokens=30, private_request=capture_provider_context(messages=messages, tools=None))
-    anchor = request_anchor(
+    anchor = context_budget_history.request_anchor(
         calls=[call], model=call.model_requested, dialect=None, messages=messages, tools=None, mutable_positions=frozenset()
     )
     assert anchor.tokens is None
@@ -713,7 +714,7 @@ def test_non_manifest_tool_disables_anchor_with_capture_reason():
     private = capture_provider_context(messages=messages, tools=tools)
     assert private.canonical is None
     call = replace(_earlier_call(()), prompt_tokens=500, private_request=private)
-    anchor = request_anchor(
+    anchor = context_budget_history.request_anchor(
         calls=[call], model=call.model_requested, dialect=None, messages=messages, tools=tools, mutable_positions=frozenset()
     )
     assert anchor.tokens is None
