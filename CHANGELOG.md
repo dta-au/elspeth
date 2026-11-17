@@ -18,6 +18,11 @@ All notable changes to ELSPETH are documented here.
 - `SchemaContract.version_hash()` is computed once per contract instance.
   Constructing a `SchemaContract` with `fields` that is not a plain tuple now
   raises `TypeError`.
+- Gates reuse the input hash recorded for the node state instead of hashing
+  each row a second time. A row that cannot be canonically hashed (for example
+  one containing NaN) still fails with the same `ValueError` and writes no
+  Landscape row, but now emits one error gate telemetry span where it emitted
+  none before.
 
 ### Web Composer
 
