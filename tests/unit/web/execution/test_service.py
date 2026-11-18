@@ -115,6 +115,7 @@ from elspeth.web.interpretation_state import (
 from elspeth.web.plugin_policy.models import (
     PluginAvailabilitySnapshot,
 )
+from elspeth.web.sessions.prompt_file_review import PromptFileReviewStale
 from elspeth.web.sessions.protocol import (
     CompositionStateRecord,
     RunStartPermitRecord,
@@ -6911,29 +6912,22 @@ def _llm_inline_marker_pipeline_yaml(field_path: str, *, blob_id: UUID, sha256: 
 
 @pytest.mark.usefixtures("mock_pipeline_config_assembly")
 class TestInlineBlobPromptSurfaceModalityAdmission:
-    """An LLM-authored blob must not become an executed LLM prompt or model by substitution.
-
-    The prompt-template and model-choice reviews read those options as strings,
-    so an inline_content marker there opens no review site. Run admission is
-    the gate that holds for every authoring path: it refuses an LLM-authored
-    blob in an ``llm`` transform's prompt surfaces before linking or reading
-    it, as the ``blob_rows`` arm refuses LLM-authored rows.
-    """
+    """Structured positions refuse before I/O; scalar prompts require review."""
 
     @pytest.mark.parametrize(
         "modality",
         [
             pytest.param(CreationModality.LLM_GENERATED, id="llm_generated"),
-            pytest.param(CreationModality.LLM_GENERATED_THEN_AMENDED, id="llm_generated_then_amended"),
+            pytest.param(CreationModality.VERBATIM, id="verbatim"),
         ],
     )
-    @pytest.mark.parametrize("field_path", ["prompt_template", "system_prompt", "queries.q1.template", "model"])
+    @pytest.mark.parametrize("field_path", ["model", "queries"])
     @patch("elspeth.web.execution.service.Orchestrator")
     @patch("elspeth.web.execution.service.build_validated_runtime_graph")
     @patch("elspeth.web.execution.service.load_settings_from_config_dict")
     @patch("elspeth.web.execution.service.open_landscape_db")
     @patch("elspeth.web.execution.service.FilesystemPayloadStore")
-    def test_llm_authored_blob_in_llm_prompt_surface_is_refused_before_link(
+    def test_file_in_model_or_whole_queries_is_refused_before_link(
         self,
         mock_payload_cls: MagicMock,
         mock_landscape_cls: MagicMock,
@@ -6963,7 +6957,7 @@ class TestInlineBlobPromptSurfaceModalityAdmission:
         blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
         cast(Any, service)._blob_service = blob_service
 
-        with pytest.raises(InlineBlobPromptSurfaceAdmissionError, match="LLM-authored") as caught:
+        with pytest.raises(InlineBlobPromptSurfaceAdmissionError, match="unsupported") as caught:
             service._run_pipeline(
                 str(uuid4()),
                 _llm_inline_marker_pipeline_yaml(field_path, blob_id=blob_id, sha256=sha256),
@@ -6979,13 +6973,14 @@ class TestInlineBlobPromptSurfaceModalityAdmission:
         mock_orch_cls.assert_not_called()
         mock_payload_cls.return_value.store.assert_not_called()
 
-    @pytest.mark.parametrize("field_path", ["prompt_template", "queries.q1.template", "model"])
+    @pytest.mark.parametrize("modality", [CreationModality.VERBATIM, CreationModality.LLM_GENERATED])
+    @pytest.mark.parametrize("field_path", ["prompt_template", "system_prompt", "queries.q1.template"])
     @patch("elspeth.web.execution.service.Orchestrator")
     @patch("elspeth.web.execution.service.build_validated_runtime_graph")
     @patch("elspeth.web.execution.service.load_settings_from_config_dict")
     @patch("elspeth.web.execution.service.open_landscape_db")
     @patch("elspeth.web.execution.service.FilesystemPayloadStore")
-    def test_verbatim_blob_in_llm_prompt_surface_passes_modality_admission(
+    def test_scalar_prompt_file_reaches_mandatory_review_after_read(
         self,
         mock_payload_cls: MagicMock,
         mock_landscape_cls: MagicMock,
@@ -6995,12 +6990,10 @@ class TestInlineBlobPromptSurfaceModalityAdmission:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         field_path: str,
+        modality: CreationModality,
+        tmp_path: Path,
     ) -> None:
-        """Control: user-verbatim content is linked, read and substituted as before.
-
-        The audit write is made to fail so the run stops right after
-        substitution; reaching it proves the modality gate admitted the ref.
-        """
+        """Both upload and assistant files bind, but unapproved bytes cannot run."""
         del mock_payload_cls, mock_landscape_cls, mock_runtime_graph
         content = b"You are a user-written prompt."
         blob_id = uuid4()
@@ -7013,15 +7006,38 @@ class TestInlineBlobPromptSurfaceModalityAdmission:
             session_id=owner_session,
             content_hash=sha256,
             size_bytes=len(content),
-            creation_modality=CreationModality.VERBATIM,
+            creation_modality=modality,
         )
         blob_service.link_blob_to_run.return_value = None
         blob_service.read_blob_content.return_value = content
         blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
         cast(Any, service)._blob_service = blob_service
-        mock_session_service.record_blob_inline_resolutions.side_effect = AuditIntegrityError("stop after substitution")
+        marker = {"blob_ref": str(blob_id), "mode": "inline_content", "sha256": sha256}
+        options: dict[str, Any] = {"prompt_template": "Classify {{ row.text }}"}
+        if field_path == "queries.q1.template":
+            options["queries"] = {"q1": {"template": marker}}
+        else:
+            options[field_path] = marker
+        state_record = _composition_state_record(
+            session_id=owner_session,
+            source_path=tmp_path / "input.csv",
+            output_path=tmp_path / "output.jsonl",
+            nodes=[
+                {
+                    "id": "classify",
+                    "node_type": "transform",
+                    "plugin": "llm",
+                    "input": "source_rows",
+                    "on_success": "out",
+                    "on_error": "discard",
+                    "options": options,
+                }
+            ],
+        )
+        mock_session_service.get_state_in_session.return_value = state_record
+        mock_session_service.assert_prompt_file_approvals.side_effect = PromptFileReviewStale()
 
-        with pytest.raises(AuditIntegrityError, match="stop after substitution"):
+        with pytest.raises(PromptFileReviewStale):
             service._run_pipeline(
                 str(uuid4()),
                 _llm_inline_marker_pipeline_yaml(field_path, blob_id=blob_id, sha256=sha256),
@@ -7031,8 +7047,8 @@ class TestInlineBlobPromptSurfaceModalityAdmission:
 
         blob_service.link_blob_to_run.assert_awaited_once()
         blob_service.read_blob_content.assert_awaited_once()
-        resolutions = mock_session_service.record_blob_inline_resolutions.await_args.kwargs["resolutions"]
-        assert [resolution.field_path for resolution in resolutions] == [f"node:classify.options.{field_path}"]
+        mock_session_service.assert_prompt_file_approvals.assert_awaited_once()
+        mock_session_service.record_blob_inline_resolutions.assert_not_awaited()
         mock_load.assert_not_called()
         mock_orch_cls.assert_not_called()
 

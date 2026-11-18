@@ -245,6 +245,7 @@ def test_postgres_blob_effect_receipt_commits_atomically_with_replacement_metada
                 plan=staged,
                 max_storage_per_session=100,
                 accepting_proposal_id=proposal_id,
+                on_metadata_commit=None,
             ),
         )
 
@@ -261,6 +262,7 @@ def test_postgres_blob_effect_receipt_commits_atomically_with_replacement_metada
             plan=staged,
             max_storage_per_session=100,
             accepting_proposal_id=proposal_id,
+            on_metadata_commit=None,
         ),
     )
 

@@ -249,7 +249,7 @@ def _get_blob_content_arguments_strategy(draw: st.DrawFn) -> GetBlobContentArgum
 
 @st.composite
 def _get_blob_content_data_strategy(draw: st.DrawFn) -> GetBlobContentDataModel:
-    remaining = draw(st.integers(min_value=0, max_value=50_000))
+    remaining = draw(st.one_of(st.just(0), st.integers(min_value=1, max_value=50_000)))
     content = draw(st.text(min_size=1 if remaining else 0, max_size=64))
     start = draw(st.integers(min_value=0, max_value=50_000))
     end = start + len(content)

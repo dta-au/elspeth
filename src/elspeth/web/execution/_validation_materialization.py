@@ -239,7 +239,7 @@ def unsupported_llm_prompt_file_refs(refs: list[BlobInlineRef], *, node_plugins:
         ref
         for ref in refs
         if (surface := llm_prompt_surface_field(ref.field_path)) is not None
-        and node_plugins.get(surface[0]) == "llm"
+        and (surface[0] not in node_plugins or node_plugins[surface[0]] == "llm")
         and llm_prompt_file_scalar_field(ref.field_path) is None
     ]
 

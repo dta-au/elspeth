@@ -774,7 +774,9 @@ class TestBuildSystemPrompt:
         assert "Call `list_blobs` or `list_composer_blobs`" in flattened
         assert "For a pipeline input, call `inspect_source` before declaring fields, schema facts, or gate conditions" in flattened
         assert "For a `reference_join` table, use `get_blob_metadata` and wire the existing uploaded blob" in flattened
-        assert "For a user-uploaded LLM prompt, wire the ready user-verbatim blob" in flattened
+        assert "For a file-backed LLM prompt, wire a ready UTF-8 text session blob" in flattened
+        assert "The file may be user-created or agent-authored" in flattened
+        assert "Binding opens a mandatory `llm_prompt_template` card showing the full file text" in flattened
         assert "Do not synthesize a replacement artifact" in flattened
         assert "ask one narrow file-selection question" in flattened
 

@@ -1048,6 +1048,8 @@ class TestStep3BlobDiscoveryTierMigration:
                 "Author a widened blob_ref inline_content marker at a canonical field_path. "
                 "Composer pins sha256 from blob metadata; callers must not pass content bytes. "
                 "Only inline-text MIME is accepted; upload or create a plain-text .txt or .md file for a prompt. "
+                "A user-created or agent-authored UTF-8 prompt file opens a mandatory full-content llm_prompt_template review card; changes require review again. "
+                "Only prompt_template, system_prompt, and individual query templates accept prompt files, never model or whole queries. "
                 "A structured prompt with prompt_template_parts cannot be replaced by a file in this release; edit its text parts with change_substring or patch_node_options on prompt_template_parts, preserving interpretation_ref entries. "
                 "Returns the `field_path` that was wired."
             ),

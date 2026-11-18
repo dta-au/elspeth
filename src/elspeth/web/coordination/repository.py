@@ -2592,7 +2592,7 @@ class _RepositoryBlobMutations:
         plan: BlobReplacementPlan,
         max_storage_per_session: int,
         accepting_proposal_id: UUID | None,
-        on_metadata_commit: Callable[[Connection], None] | None = None,
+        on_metadata_commit: Callable[[Connection], None] | None,
     ) -> BlobReplacementPlan:
         """Atomically replace exact blob metadata and record purge obligation."""
         state = self.__state

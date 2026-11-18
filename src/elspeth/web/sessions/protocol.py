@@ -2214,7 +2214,7 @@ class SessionOperationBlobMutations(Protocol):
         plan: BlobReplacementPlan,
         max_storage_per_session: int,
         accepting_proposal_id: UUID | None,
-        on_metadata_commit: Callable[[Connection], None] | None = None,
+        on_metadata_commit: Callable[[Connection], None] | None,
     ) -> BlobReplacementPlan: ...
 
     def retire_blob_replacement(self, *, plan: BlobReplacementPlan, remaining_output_storage_bytes: int | None = None) -> bool: ...

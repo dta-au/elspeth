@@ -4737,9 +4737,10 @@ class TestIDORCoverageDrift:
         bypass the session IDOR guard entirely — that is the drift
         this inventory exists to catch.
         """
-        from elspeth.web.blobs import routes
+        from elspeth.web.blobs import prompt_text_routes, routes
 
         found = _collect_ownership_call_site_identities(routes, "_verify_session_and_get_blob_service")
+        found.update(_collect_ownership_call_site_identities(prompt_text_routes, "_verify_session_and_get_blob_service"))
         self._assert_inventory(
             "blobs/routes.py",
             "_verify_session_and_get_blob_service",

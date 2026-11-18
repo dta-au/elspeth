@@ -21,6 +21,7 @@ import yaml
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import insert
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.blobs import BlobServiceProtocol
@@ -39,6 +40,7 @@ from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.plugin_policy.models import PluginId
 from elspeth.web.provider_config_policy import AWS_S3_ENDPOINT_URL_POLICY_ERROR
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.models import blobs_table
 from elspeth.web.sessions.protocol import CompositionStateData, CompositionStateRecord
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -3987,6 +3989,34 @@ def _blob_service_for(*blobs: Any) -> SimpleNamespace:
     return SimpleNamespace(get_blob=AsyncMock(spec=BlobServiceProtocol.get_blob, side_effect=_get_blob))
 
 
+def _install_import_prompt_blob_read(service: Any, blob: Any, content: bytes) -> None:
+    """Give the import surfacer a real same-session metadata row and fenced byte read."""
+    with service._engine.begin() as conn:
+        conn.execute(
+            insert(blobs_table).values(
+                id=str(blob.id),
+                session_id=str(blob.session_id),
+                filename=blob.filename,
+                mime_type=blob.mime_type,
+                size_bytes=blob.size_bytes,
+                content_hash=blob.content_hash,
+                storage_path=blob.storage_path,
+                created_at=blob.created_at,
+                created_by=blob.created_by,
+                source_description=blob.source_description,
+                status=blob.status,
+                creation_modality=blob.creation_modality.value,
+            )
+        )
+
+    def read_blob(context: SessionOperationContext, blob_id: uuid.UUID) -> tuple[Any, bytes]:
+        assert context.fence.session_id == str(blob.session_id)
+        assert blob_id == blob.id
+        return blob, content
+
+    service._inline_blob_read = read_blob
+
+
 async def _rebind_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
     return ValidationResult(is_valid=True, checks=[], errors=[])
 
@@ -4025,12 +4055,16 @@ class TestImportRebindsSharedFiles:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         session = await service.create_session("alice", "Rebind", "local")
+        content = b"Review this row.\n"
+        digest = hashlib.sha256(content).hexdigest()
         blob = replace(
-            _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A),
+            _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=digest),
             mime_type=mime_type,
         )
         app.state.blob_service = _blob_service_for(blob)
-        marker_yaml = _unstructured_llm_marker_yaml(blob.id)
+        if mime_type == "text/plain":
+            _install_import_prompt_blob_read(service, blob, content)
+        marker_yaml = _unstructured_llm_marker_yaml(blob.id).replace(_REBIND_DIGEST_A, digest)
 
         resp = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": marker_yaml})
 
@@ -4042,6 +4076,10 @@ class TestImportRebindsSharedFiles:
         else:
             assert record is not None
             assert record.version == 1
+            assert any(
+                requirement["kind"] == "llm_prompt_template" and requirement["status"] == "pending"
+                for requirement in record.nodes[0]["options"]["interpretation_requirements"]
+            )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("mime_type, expected_status", [("application/pdf", 400), ("text/plain", 200)])
@@ -4049,11 +4087,15 @@ class TestImportRebindsSharedFiles:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         session = await service.create_session("alice", "Rebind", "local")
+        content = b"Review this row.\n"
+        digest = hashlib.sha256(content).hexdigest()
         blob = replace(
-            _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A),
+            _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=digest),
             mime_type=mime_type,
         )
         app.state.blob_service = _blob_service_for(blob)
+        if mime_type == "text/plain":
+            _install_import_prompt_blob_read(service, blob, content)
 
         resp = client.post(
             f"/api/sessions/{session.id}/state/yaml",
@@ -4080,6 +4122,10 @@ class TestImportRebindsSharedFiles:
         else:
             assert record is not None
             assert record.version == 1
+            assert any(
+                requirement["kind"] == "llm_prompt_template" and requirement["status"] == "pending"
+                for requirement in record.nodes[0]["options"]["interpretation_requirements"]
+            )
 
     def test_legacy_structured_marker_refused_before_execution_materialization(self) -> None:
         from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml

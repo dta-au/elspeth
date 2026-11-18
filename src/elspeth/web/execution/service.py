@@ -43,6 +43,7 @@ from elspeth.config_loading import load_settings_from_config_dict, load_settings
 from elspeth.contracts.audit import SecretResolutionInput
 from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities
 from elspeth.contracts.aws_textract import TextractProfiledAuditIdentities
+from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionDecision, ChargeableAdmissionRefused, ChargeableOperation
 from elspeth.contracts.cli import ProgressEvent
@@ -212,6 +213,7 @@ from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.prompt_file_review import (
     PromptFileReviewStale,
     PromptReviewSnapshot,
+    _surface_slots,
     prompt_file_binding_paths,
     resolve_prompt_review_snapshot,
 )
@@ -1260,28 +1262,31 @@ class ExecutionServiceImpl:
             return ()
         cached: dict[UUID, tuple[BlobRecord, bytes]] = {}
 
-        def read_blob(blob_id: UUID) -> tuple[BlobRecord, bytes]:
-            if blob_id not in cached:
-                if admitted_contents is not None and admitted_records is not None:
-                    if blob_id not in admitted_contents or blob_id not in admitted_records:
-                        raise PromptFileReviewStale()
-                    cached[blob_id] = admitted_records[blob_id], admitted_contents[blob_id]
-                else:
-                    record = self._call_async(blob_service.get_blob(blob_id, session_operation_context=session_operation_context))
-                    content = self._call_async(blob_service.read_blob_content(blob_id, session_operation_context=session_operation_context))
-                    cached[blob_id] = record, content
-            return cached[blob_id]
-
         snapshots: list[PromptReviewSnapshot] = []
         for node in state.nodes:
             if node.plugin != "llm" or not prompt_file_binding_paths(node.options):
                 continue
             try:
+                for _path, value in _surface_slots(node.options):
+                    marker = is_widened_blob_ref(deep_thaw(value))
+                    if marker is None or marker.mode != "inline_content" or marker.blob_id in cached:
+                        continue
+                    blob_id = marker.blob_id
+                    if admitted_contents is not None and admitted_records is not None:
+                        if blob_id not in admitted_contents or blob_id not in admitted_records:
+                            raise PromptFileReviewStale()
+                        cached[blob_id] = admitted_records[blob_id], admitted_contents[blob_id]
+                    else:
+                        record = self._call_async(blob_service.get_blob(blob_id, session_operation_context=session_operation_context))
+                        content = self._call_async(
+                            blob_service.read_blob_content(blob_id, session_operation_context=session_operation_context)
+                        )
+                        cached[blob_id] = record, content
                 snapshot = resolve_prompt_review_snapshot(
                     session_id=session_id,
                     node_id=node.id,
                     options=node.options,
-                    read_blob=read_blob,
+                    read_blob=cached.__getitem__,
                 )
                 if snapshot is None:
                     raise PromptFileReviewStale()
@@ -4048,17 +4053,25 @@ class ExecutionServiceImpl:
 
                         fetched = self._call_async(_read_inline_blob_contents())
                         admitted_by_blob = {ref.blob_id: fetched[ref] for ref in inline_refs}
-                        admitted_run = self._call_async(self._session_service.get_run(run_uuid))
-                        admitted_state = self._call_async(
-                            self._session_service.get_state_in_session(admitted_run.state_id, admitted_run.session_id)
+                        # A prompt-file review exists only for an LLM scalar
+                        # prompt slot. Unknown node identities still read the
+                        # state so an incomplete config cannot skip admission.
+                        prompt_state_needed = bool(prompt_blob_ids) or any(
+                            (surface := llm_prompt_file_scalar_field(ref.field_path)) is not None and surface[0] not in node_plugins
+                            for ref in inline_refs
                         )
-                        prompt_snapshots = self._assert_state_prompt_file_approvals(
-                            state_from_record(admitted_state),
-                            session_id=admitted_run.session_id,
-                            session_operation_context=session_operation_context,
-                            admitted_contents=admitted_by_blob,
-                            admitted_records=records_by_blob_id,
-                        )
+                        if prompt_state_needed:
+                            admitted_run = self._call_async(self._session_service.get_run(run_uuid))
+                            admitted_state = self._call_async(
+                                self._session_service.get_state_in_session(admitted_run.state_id, admitted_run.session_id)
+                            )
+                            prompt_snapshots = self._assert_state_prompt_file_approvals(
+                                state_from_record(admitted_state),
+                                session_id=admitted_run.session_id,
+                                session_operation_context=session_operation_context,
+                                admitted_contents=admitted_by_blob,
+                                admitted_records=records_by_blob_id,
+                            )
                         blob_metadata: dict[UUID, tuple[AllowedMimeType, int]] = {
                             blob_id: (cast(AllowedMimeType, record.mime_type), record.size_bytes)
                             for blob_id, record in zip(unique_blob_ids, metadata_records, strict=True)

@@ -738,7 +738,7 @@ from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.transforms.llm.provider import FinishReason, LLMProvider, LLMQueryResult
 from elspeth.plugins.transforms.llm.transform import LLMTransform
 from elspeth.testing import make_pipeline_row
-from elspeth.web.blobs.protocol import BlobFinalizationResult, BlobIntegrityError, BlobRecord
+from elspeth.web.blobs.protocol import BlobFinalizationResult, BlobRecord
 from elspeth.web.composer import yaml_generator as composer_yaml_generator
 from elspeth.web.composer.state import (
     CompositionState,
@@ -755,6 +755,7 @@ from elspeth.web.execution.schemas import CompletedData
 from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.execution.validation import validate_pipeline_for_trained_operator
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
+from elspeth.web.sessions.prompt_file_review import PromptFileReviewStale
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.base_classes import _TestSchema, as_sink, as_source, as_transform
 from tests.fixtures.factories import make_context
@@ -3979,6 +3980,7 @@ class _RuntimeSettingsFake:
 @dataclass(slots=True)
 class _RunSnapshot:
     session_id: UUID
+    state_id: UUID | None = None
     status: str = "running"
     error: str | None = None
 
@@ -4078,6 +4080,7 @@ def _fake_settlement_authority() -> Mock:
 @dataclass(slots=True)
 class _FakeSessionService:
     run: _RunSnapshot
+    prompt_approval_service: Any = None
     session_operation_authority: Mock = field(default_factory=_fake_settlement_authority)
     update_run_status_calls: list[tuple[UUID, str, dict[str, Any]]] = field(default_factory=list)
     appended_run_events: list[dict[str, Any]] = field(default_factory=list)
@@ -4108,6 +4111,14 @@ class _FakeSessionService:
 
     async def get_run(self, _run_id: UUID) -> _RunSnapshot:
         return self.run
+
+    async def get_state_in_session(self, state_id: UUID, session_id: UUID) -> Any:
+        assert self.prompt_approval_service is not None
+        return await self.prompt_approval_service.get_state_in_session(state_id, session_id)
+
+    async def assert_prompt_file_approvals(self, snapshot: Any) -> None:
+        assert self.prompt_approval_service is not None
+        await self.prompt_approval_service.assert_prompt_file_approvals(snapshot)
 
     async def append_run_event(
         self,
@@ -4442,7 +4453,7 @@ sinks:
         lease: SessionOperationLease | None = None
         try:
             lease = _execute_lease(loop, _session_service.run.session_id, service=service, execution_fixture=execution_fixture)
-            with pytest.raises(BlobIntegrityError):
+            with pytest.raises(PromptFileReviewStale):
                 service._run_pipeline(
                     str(run_id),
                     self._pipeline_yaml(blob_id, "b" * 64),
@@ -4463,18 +4474,25 @@ sinks:
     ) -> None:
         del mock_payload_cls, mock_landscape_cls
         service, session_service, loop = self._execution_service(tmp_path, execution_fixture=execution_fixture)
-        content = b"You are an audited prompt."
-        sha256 = hashlib.sha256(content).hexdigest()
-        blob_id = uuid4()
+        from tests.unit.web.blobs.test_prompt_editor import _approve_card, _live_prompt_setup
+
+        _client, approval_service, approval_blob_service, session_id, uploaded, _second, events = _live_prompt_setup(tmp_path / "approval")
+        _approve_card(approval_service, approval_blob_service, session_id, events["first"])
+        approved_state = loop.run_until_complete(approval_service.get_current_state(UUID(session_id)))
+        assert approved_state is not None
+        session_service.run.session_id = UUID(session_id)
+        session_service.run.state_id = approved_state.id
+        session_service.prompt_approval_service = approval_service
+        content = b"first before"
+        sha256 = uploaded["content_hash"]
+        blob_id = UUID(uploaded["id"])
         run_id = uuid4()
         order: list[str] = []
 
-        blob_record = _ready_inline_blob_record(
-            blob_id=blob_id,
-            session_id=session_service.run.session_id,
-            content=content,
-            content_hash=sha256,
-        )
+        from elspeth.web.sessions.prompt_file_approval import _blob_record
+
+        with approval_blob_service._engine.connect() as conn:
+            blob_record = _blob_record(conn, UUID(session_id), blob_id)
         blob_service = _FakeBlobService(blob_record=blob_record, content=content)
         cast(Any, service)._blob_service = blob_service
         provider = Mock(spec=LLMProvider)
@@ -4501,7 +4519,7 @@ sinks:
             # Web-authored YAML must never expand host ${VAR} placeholders.
             assert expand_env_vars is False
             prompt_template = config_dict["transforms"][0]["options"]["prompt_template"]
-            assert prompt_template == "You are an audited prompt."
+            assert prompt_template == "first before"
             transform = LLMTransform(
                 {
                     "provider": "openrouter",

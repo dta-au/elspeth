@@ -17,7 +17,7 @@ import tests.integration.pipeline.test_composer_runtime_agreement as agreement
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import run_prompt_inputs_table
-from elspeth.web.blobs import routes
+from elspeth.web.blobs import prompt_text_routes
 from elspeth.web.blobs.service import content_hash
 from elspeth.web.composer.tools._common import _options_with_default_model_choice_review, _options_with_default_prompt_template_review
 from elspeth.web.execution.service import ExecutionServiceImpl
@@ -53,9 +53,9 @@ def _bound(
     marker: dict[str, str] = {"mode": "inline_content", "blob_ref": blob_id, "sha256": content_sha256}
     if encoding is not None:
         marker["encoding"] = encoding
-    nodes = [{"id": "first", "plugin": "llm", "options": {"prompt_template": marker}}]
+    nodes = [{"id": "first", "node_type": "transform", "plugin": "llm", "options": {"prompt_template": marker}}]
     if shared:
-        nodes.append({"id": "second", "plugin": "llm", "options": {"system_prompt": marker}})
+        nodes.append({"id": "second", "node_type": "transform", "plugin": "llm", "options": {"system_prompt": marker}})
     data = CompositionStateData(
         nodes=nodes,
         sources={"source": {"options": {"blob_ref": blob_id}}} if mixed else None,
@@ -204,7 +204,7 @@ def test_failed_approval_rolls_back_bytes_and_approval_row(tmp_path, monkeypatch
         raise RuntimeError("approval failed")
 
     # Fault injection proves the byte write and approval share one rollback boundary.
-    monkeypatch.setattr(routes, "record_prompt_file_approval", fail_after_write, raising=False)
+    monkeypatch.setattr(prompt_text_routes, "record_prompt_file_approval", fail_after_write)
     with pytest.raises(RuntimeError, match="approval failed"):
         _save(client, session_id, blob["id"], "after", blob["content_hash"])
     with blob_service._engine.begin() as conn:
