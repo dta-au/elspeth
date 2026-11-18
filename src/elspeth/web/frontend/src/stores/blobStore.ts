@@ -18,6 +18,16 @@ interface BlobState {
   activeSessionId: string | null;
   /** Monotonic generation for session-bound async completion fences. */
   activationEpoch: number;
+  fileManagerOpen: boolean;
+  revealRequest: { sessionId: string; blobId: string; seq: number; filename: string } | null;
+  focusedBlobId: string | null;
+  editRequest: { nodeId: string; fieldPath: string; seq: number } | null;
+  revealBlob: (sessionId: string, blobId: string, filename: string, trigger?: HTMLElement) => void;
+  consumeRevealRequest: (seq: number) => void;
+  setFileManagerOpen: (open: boolean) => void;
+  requestPromptEdit: (nodeId: string, fieldPath: string) => void;
+  consumePromptEdit: (seq: number) => void;
+  returnToRevealTrigger: () => void;
 
   activateSession: (sessionId: string | null) => void;
   invalidateBlobForEpoch: (
@@ -43,9 +53,16 @@ const initialState = {
   error: null as string | null,
   activeSessionId: null as string | null,
   activationEpoch: 0,
+  fileManagerOpen: false,
+  revealRequest: null as BlobState["revealRequest"],
+  focusedBlobId: null as string | null,
+  editRequest: null as BlobState["editRequest"],
 };
 
 let blobLoadRequestSeq = 0;
+let revealSeq = 0;
+let editSeq = 0;
+let revealTrigger: HTMLElement | null = null;
 
 interface BlobMutationOwnership {
   sessionId: string;
@@ -55,6 +72,29 @@ interface BlobMutationOwnership {
 
 export const useBlobStore = create<BlobState>((set, get) => ({
   ...initialState,
+
+  revealBlob(sessionId, blobId, filename, trigger) {
+    if (get().activeSessionId !== sessionId) return;
+    revealTrigger = trigger ?? null;
+    set({ fileManagerOpen: true, focusedBlobId: blobId, revealRequest: { sessionId, blobId, filename, seq: ++revealSeq } });
+  },
+  consumeRevealRequest(seq) {
+    if (get().revealRequest?.seq === seq) set({ revealRequest: null });
+  },
+  setFileManagerOpen(open) {
+    if (!open) set({ fileManagerOpen: false, focusedBlobId: null, revealRequest: null });
+    else set({ fileManagerOpen: true });
+  },
+  requestPromptEdit(nodeId, fieldPath) {
+    set({ editRequest: { nodeId, fieldPath, seq: ++editSeq } });
+  },
+  consumePromptEdit(seq) {
+    if (get().editRequest?.seq === seq) set({ editRequest: null });
+  },
+  returnToRevealTrigger() {
+    if (revealTrigger?.isConnected) revealTrigger.focus({ preventScroll: true });
+    revealTrigger = null;
+  },
 
   activateSession(sessionId: string | null) {
     const state = get();
@@ -66,7 +106,12 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       error: null,
       activeSessionId: sessionId,
       activationEpoch: state.activationEpoch + 1,
+      fileManagerOpen: false,
+      revealRequest: null,
+      focusedBlobId: null,
+      editRequest: null,
     });
+    revealTrigger = null;
   },
 
   invalidateBlobForEpoch(
@@ -239,7 +284,12 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       error: null,
       activeSessionId: null,
       activationEpoch: state.activationEpoch + 1,
+      fileManagerOpen: false,
+      revealRequest: null,
+      focusedBlobId: null,
+      editRequest: null,
     }));
+    revealTrigger = null;
   },
 
   reset() {
@@ -248,5 +298,6 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       ...initialState,
       activationEpoch: state.activationEpoch + 1,
     }));
+    revealTrigger = null;
   },
 }));

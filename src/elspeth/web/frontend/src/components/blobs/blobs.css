@@ -60,6 +60,17 @@
   background-color: var(--color-highlight);
 }
 
+.blob-row-item--focused {
+  outline: 2px solid var(--color-selected-ring);
+  outline-offset: -2px;
+}
+
+.blob-row-edit-refusal {
+  margin: 0;
+  padding: var(--space-xs) var(--space-md);
+  color: var(--color-text-muted);
+}
+
 .blob-row-attached-chip {
   order: 1;
   flex-basis: 100%;
@@ -252,6 +263,8 @@
   background-color: var(--color-highlight);
   font-size: var(--font-size-xs);
 }
+
+.blob-manager-attached-summary:empty { display: none; }
 
 .blob-manager-list {
   flex: 1;

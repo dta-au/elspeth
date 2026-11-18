@@ -671,8 +671,8 @@ describe("GraphView", () => {
 
   it("names a bound prompt file in the inspector without exposing its marker", async () => {
     const blobId = "f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0";
-    useBlobStore.setState({ blobs: [{ id: blobId, filename: "prompt.md", content_hash: "a".repeat(64) } as BlobMetadata] });
-    useSessionStore.setState({ compositionState: makeState({ nodes: [makeNode({
+    useBlobStore.setState({ activeSessionId: "session-1", blobs: [{ id: blobId, filename: "prompt.md", content_hash: "a".repeat(64), status: "ready", mime_type: "text/plain" } as BlobMetadata] });
+    useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeState({ nodes: [makeNode({
       id: "classify", plugin: "llm", options: { prompt_template: { blob_ref: blobId, mode: "inline_content", sha256: "a".repeat(64) } },
     })] }) });
     render(<GraphView />);
@@ -680,6 +680,8 @@ describe("GraphView", () => {
     const panel = screen.getByRole("complementary", { name: /classify configuration/i });
     expect(within(panel).getAllByText(/prompt\.md/).length).toBeGreaterThanOrEqual(1);
     expect(panel.textContent).not.toMatch(/blob_ref|inline_content|f976fd8b-4432|a{64}/);
+    expect(within(panel).getByRole("button", { name: "Show prompt.md (User prompt) in files" })).toBeInTheDocument();
+    expect(within(panel).getByRole("button", { name: "Edit prompt.md (User prompt)" })).toBeInTheDocument();
   });
 
   it("exposes every collector scope binding from the keyboard inspector", async () => {

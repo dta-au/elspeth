@@ -5,7 +5,7 @@ import { usePreferencesStore } from "@/stores/preferencesStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
-import type { BlobMetadata } from "@/types/api";
+import type { BlobMetadata, CompositionState } from "@/types/api";
 import { resetStore } from "@/test/store-helpers";
 import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 import { OptionRows } from "./OptionRows";
@@ -30,7 +30,7 @@ beforeEach(() => {
   resetStore(usePreferencesStore);
   resetStore(usePluginCatalogStore);
   resetStore(useBlobStore);
-  useSessionStore.setState({ activeSessionId: "session-1" });
+  useSessionStore.setState({ activeSessionId: "session-1", compositionState: null });
 });
 
 const FILE_ID = "f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0";
@@ -51,6 +51,57 @@ function seedFile(overrides: Partial<BlobMetadata> = {}) {
 }
 
 describe("file-backed option values", () => {
+  it("adds file and slot named navigation actions only in the inspector", () => {
+    seedFile({ filename: "summarise.txt" });
+    const marker = { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH };
+    const options = { system_prompt: marker, prompt_template: marker, queries: { classify: { template: marker } } };
+    const { rerender } = render(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
+    expect(screen.getByRole("button", { name: "Show summarise.txt (System prompt) in files" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit summarise.txt (System prompt)" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Show summarise.txt (User prompt, query classify) in files" })).toBeInTheDocument();
+    act(() => screen.getByRole("button", { name: "Show summarise.txt (System prompt) in files" }).click());
+    expect(useBlobStore.getState().revealRequest?.blobId).toBe(FILE_ID);
+    rerender(<OptionRows options={options} ariaLabel="spec options" plugin={{ kind: "transform", name: "llm" }} />);
+    expect(screen.queryByRole("button", { name: /Show .* in files/ })).not.toBeInTheDocument();
+  });
+
+  it("keeps a missing file action focusable and describes its refusal", () => {
+    const marker = { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH };
+    useBlobStore.setState({ activeSessionId: "session-1", blobs: [], isLoading: false });
+    render(<OptionRows options={{ prompt_template: marker }} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
+    const show = screen.getByRole("button", { name: /Show .*User prompt.* in files/ });
+    expect(show).toHaveAttribute("aria-disabled", "true");
+    expect(show).toHaveAccessibleDescription("This file is not in this session.");
+    expect(show).not.toBeDisabled();
+    act(() => show.click());
+    expect(useBlobStore.getState().revealRequest).toBeNull();
+  });
+
+  it("describes an in-flight file lookup without prematurely claiming the file is missing", () => {
+    useBlobStore.setState({ activeSessionId: "session-1", blobs: [], isLoading: true });
+    render(<OptionRows options={{ prompt_template: { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH } }}
+      ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
+    const show = screen.getByRole("button", { name: "Show Loading file name… (User prompt) in files" });
+    const edit = screen.getByRole("button", { name: "Edit Loading file name… (User prompt)" });
+    expect(show).toHaveAccessibleDescription("Checking files in this session.");
+    expect(edit).toHaveAccessibleDescription("Checking files in this session.");
+    expect(screen.queryByText("This file is not in this session.")).not.toBeInTheDocument();
+  });
+
+  it("disables Edit with the multi-file reason while Show in files stays available", () => {
+    seedFile();
+    const options = { prompt_template: { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH },
+      system_prompt: { blob_ref: "other", mode: "inline_content", sha256: FILE_HASH } };
+    useSessionStore.setState({ compositionState: { sources: {}, outputs: [], nodes: [{ id: "llm", plugin: "llm", options }] } as unknown as CompositionState });
+    render(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
+    const edit = screen.getByRole("button", { name: "Edit prompt.md (User prompt)" });
+    expect(edit).toHaveAttribute("aria-disabled", "true");
+    expect(edit).toHaveAccessibleDescription("This node uses more than one prompt file. Re-point it through the agent and approve the review card.");
+    expect(screen.getByRole("button", { name: "Show prompt.md (User prompt) in files" })).toHaveAttribute("aria-disabled", "false");
+    act(() => edit.click());
+    expect(useBlobStore.getState().editRequest).toBeNull();
+  });
+
   it("shows the filename for LLM prompt roles and nested markers without exposing marker fields", () => {
     seedFile();
     const marker = { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH };

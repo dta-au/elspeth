@@ -883,3 +883,15 @@
   /* The rows already stack at every width now, so the old narrow-viewport
      grid-template override here became redundant and was removed. */
 }
+.prompt-slot-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-xs);
+  margin-inline-start: var(--space-sm);
+}
+
+.prompt-slot-actions > span {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-xs);
+}

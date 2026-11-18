@@ -31,6 +31,10 @@ interface BlobRowProps {
   useAsInputDisabled?: boolean;
   attachedFields?: readonly string[];
   selectedNodeLabel?: string | null;
+  focused?: boolean;
+  onEditPrompt?: () => void;
+  editRefusal?: string;
+  onSelect?: () => void;
 }
 
 function attachedFieldLabel(fieldPath: string): string {
@@ -99,6 +103,10 @@ export function BlobRow({
   useAsInputDisabled = false,
   attachedFields,
   selectedNodeLabel,
+  focused = false,
+  onEditPrompt,
+  editRefusal,
+  onSelect,
 }: BlobRowProps) {
   const chipId = useId();
   const attached = selectedNodeLabel !== null && selectedNodeLabel !== undefined && (attachedFields?.length ?? 0) > 0;
@@ -176,8 +184,12 @@ export function BlobRow({
     // JSX at all, because a row cannot know it is last. The open/closed state
     // is published as a class so blobs.css can own both cases.
     <div
-      className={["blob-row-item", previewOpen && "blob-row-item--preview-open", attached && "blob-row-item--attached"].filter(Boolean).join(" ")}
+      className={["blob-row-item", previewOpen && "blob-row-item--preview-open", attached && "blob-row-item--attached", focused && "blob-row-item--focused"].filter(Boolean).join(" ")}
       data-blob-id={blob.id}
+      role="group"
+      aria-label={blob.filename}
+      tabIndex={-1}
+      onClick={onSelect}
     >
       <div className="blob-row blob-row-container">
         {/* Status indicator: shape icon (non-colour cue) + accessible name. */}
@@ -213,8 +225,8 @@ export function BlobRow({
         </span>
 
         {attached && (
-          <span className="blob-row-attached-chip" id={chipId} title={attachedFields?.join(", ")}>
-            Used by {selectedNodeLabel}: {attachedFields?.map(attachedFieldLabel).join(", ")}
+          <span className="blob-row-attached-chip" id={chipId} title={editRefusal ?? attachedFields?.join(", ")}>
+            {focused && "Selected · "}Used by {selectedNodeLabel}: {attachedFields?.map(attachedFieldLabel).join(", ")}
           </span>
         )}
 
@@ -225,6 +237,8 @@ export function BlobRow({
 
         {/* Actions */}
         <div className="blob-row-actions">
+          {onEditPrompt && <Button type="button" variant="bare" onClick={onEditPrompt}
+            aria-label={`Edit prompt ${blob.filename}`} aria-describedby={attached ? chipId : undefined}>Edit prompt</Button>}
           {canPreview && blob.status === "ready" && (
             <Button
               variant="bare"
@@ -279,6 +293,8 @@ export function BlobRow({
           </Button>
         </div>
       </div>
+
+      {editRefusal && previewOpen && <p className="blob-row-edit-refusal">{editRefusal}</p>}
 
       {/* Preview panel */}
       {previewOpen && (

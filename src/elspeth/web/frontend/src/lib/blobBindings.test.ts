@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { componentOptionsById, inlineContentMarker, optionBlobReferences } from "./blobBindings";
-import type { CompositionState } from "@/types/api";
+import { componentOptionsById, inlineContentMarker, optionBlobReferences, promptFileEditability } from "./blobBindings";
+import type { BlobMetadata, CompositionState } from "@/types/api";
+import type { InterpretationEvent } from "@/types/interpretation";
 
 const ID = "F976FD8B-4432-4F8F-BBC3-2D8A9F2114E0";
 
@@ -53,5 +54,38 @@ describe("blob bindings", () => {
     expect(componentOptionsById(state, "step")).toEqual({ c: 3 });
     expect(componentOptionsById(state, "out")).toEqual({ d: 4 });
     expect(componentOptionsById(state, "removed")).toBeNull();
+  });
+});
+
+describe("prompt file editability display mirror", () => {
+  const marker = { blob_ref: "file", mode: "inline_content", sha256: "hash", encoding: "utf-8" };
+  const blob = { id: "file", status: "ready", mime_type: "text/plain" } as BlobMetadata;
+  const stateFor = (options: Record<string, unknown>, otherNodes: Array<{ id: string; plugin: string; options: Record<string, unknown> }> = []) => ({
+    sources: {}, outputs: [], nodes: [{ id: "llm", plugin: "llm", options }, ...otherNodes],
+  }) as unknown as CompositionState;
+  const check = (overrides: { state?: CompositionState; blobs?: BlobMetadata[]; pendingEvents?: InterpretationEvent[] } = {}) =>
+    promptFileEditability({ state: overrides.state ?? stateFor({ prompt_template: marker }), blobs: overrides.blobs ?? [blob],
+      pendingEvents: overrides.pendingEvents ?? [], nodeId: "llm", fieldPath: "prompt_template", blobId: "file" });
+
+  it("allows one ready UTF-8 prompt file, including an unrelated pending card", () => {
+    expect(check()).toEqual({ editable: true });
+    expect(check({ pendingEvents: [{ choice: "pending", kind: "llm_prompt_template", affected_node_id: "other" } as InterpretationEvent] })).toEqual({ editable: true });
+    expect(check({ state: stateFor({ prompt_template: marker }), pendingEvents: [{ choice: "pending", kind: "llm_prompt_template", affected_node_id: "llm" } as InterpretationEvent] })).toEqual({ editable: true });
+    expect(check({ pendingEvents: [{ choice: "amended", kind: "llm_prompt_template", affected_node_id: "llm" } as InterpretationEvent] })).toEqual({ editable: true });
+  });
+
+  it.each([
+    ["prompt_file_not_found", { blobs: [] }],
+    ["prompt_file_not_ready", { blobs: [{ ...blob, status: "pending" as const }] }],
+    ["prompt_file_not_text", { blobs: [{ ...blob, mime_type: "application/pdf" }] }],
+    ["prompt_file_mixed_use", { state: { ...stateFor({ prompt_template: marker }), sources: { input: { plugin: "csv", options: { blob_ref: "file" } } } as CompositionState["sources"] } }],
+    ["prompt_file_mixed_use", { state: stateFor({ prompt_template: marker, queries: { one: { reference_blob_id: "file" } } }) }],
+    ["prompt_file_shared_binding", { state: stateFor({ prompt_template: marker }, [{ id: "llm-2", plugin: "llm", options: { prompt_template: marker } }]) }],
+    ["prompt_file_shared_binding", { state: stateFor({ prompt_template: marker, system_prompt: marker }) }],
+    ["prompt_file_node_multi_binding", { state: stateFor({ prompt_template: marker, system_prompt: { ...marker, blob_ref: "other" } }) }],
+    ["prompt_file_encoding_unsupported", { state: stateFor({ prompt_template: { ...marker, encoding: "latin-1" } }) }],
+    ["prompt_file_review_pending_inline", { state: stateFor({ prompt_template: marker, system_prompt: "You are helpful." }), pendingEvents: [{ choice: "pending", kind: "llm_prompt_template", affected_node_id: "llm" } as InterpretationEvent] }],
+  ])("returns %s for a pre-checkable refusal", (code, overrides) => {
+    expect(check(overrides)).toMatchObject({ editable: false, code });
   });
 });

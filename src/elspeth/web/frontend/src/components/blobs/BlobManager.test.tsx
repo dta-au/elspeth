@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, within, act } from "@testing-library/react";
+import { render, screen, within, act, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
@@ -89,7 +89,7 @@ describe("BlobManager selected-node highlighting", () => {
     expect(screen.getByRole("status")).toHaveTextContent("1 file used by inject");
     act(() => useSessionStore.setState({ selectedNodeId: null }));
     expect(attached()).toHaveLength(0);
-    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toBeEmptyDOMElement();
   });
 
   it("highlights source bindings too and reports missing files only after load", () => {
@@ -117,7 +117,20 @@ describe("BlobManager selected-node highlighting", () => {
     useBlobStore.setState({ activeSessionId: "session-2" });
     const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
     expect(container.querySelector(".blob-row-item--attached")).not.toBeInTheDocument();
-    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toBeEmptyDOMElement();
+  });
+
+  it("keeps the same live status element mounted while selection changes", () => {
+    act(() => useSessionStore.setState({ selectedNodeId: null }));
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    const status = screen.getByRole("status");
+    expect(status).toBeEmptyDOMElement();
+    act(() => useSessionStore.setState({ selectedNodeId: "llm" }));
+    expect(screen.getByRole("status")).toBe(status);
+    expect(status).toHaveTextContent("2 files used by llm");
+    act(() => useSessionStore.setState({ selectedNodeId: null }));
+    expect(screen.getByRole("status")).toBe(status);
+    expect(status).toBeEmptyDOMElement();
   });
 
   it("scrolls the first matching row only when selection changes, without moving focus", () => {
@@ -136,6 +149,92 @@ describe("BlobManager selected-node highlighting", () => {
     } finally {
       Element.prototype.scrollIntoView = original;
     }
+  });
+});
+
+describe("BlobManager reveal request", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useBlobStore.getState().reset();
+    useSessionStore.setState({ activeSessionId: "session-1", selectedNodeId: "llm",
+      compositionState: selectedState({ prompt_template: { blob_ref: "two", mode: "inline_content", sha256: "hash" },
+        system_prompt: { blob_ref: "one", mode: "inline_content", sha256: "hash" } }) });
+    setBlobState([makeBlob({ id: "one", filename: "system.txt", mime_type: "text/plain" }),
+      makeBlob({ id: "two", filename: "user.txt", mime_type: "text/plain" }), makeBlob({ id: "three" })]);
+  });
+
+  it("focuses and scrolls the requested row while sibling files remain highlighted", () => {
+    const scroll = vi.fn();
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = scroll;
+    try {
+      useBlobStore.getState().revealBlob("session-1", "two", "user.txt");
+      const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+      const focused = container.querySelector(".blob-row-item--focused");
+      expect(focused).toHaveAttribute("data-blob-id", "two");
+      expect(document.activeElement).toBe(focused);
+      expect(scroll).toHaveBeenCalledWith({ block: "nearest" });
+      expect(container.querySelector('[data-blob-id="one"]')).toHaveClass("blob-row-item--attached");
+      expect(container.querySelector('[data-blob-id="one"]')).not.toHaveClass("blob-row-item--focused");
+      expect(useBlobStore.getState().revealRequest).toBeNull();
+      expect(screen.getByRole("status")).toHaveTextContent("Showing user.txt.");
+    } finally { Element.prototype.scrollIntoView = original; }
+  });
+
+  it("waits for loading and focuses the status when the requested file has disappeared", () => {
+    useBlobStore.setState({ isLoading: true });
+    useBlobStore.getState().revealBlob("session-1", "missing", "missing.txt");
+    const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+    expect(useBlobStore.getState().revealRequest).not.toBeNull();
+    act(() => useBlobStore.setState({ isLoading: false }));
+    expect(container.querySelector(".blob-row-item--focused")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("missing.txt is no longer in this session");
+    expect(screen.getByRole("status")).toHaveFocus();
+  });
+
+  it("waits for a pending list before focusing an arriving file", () => {
+    useBlobStore.setState({ blobs: [], isLoading: true });
+    useBlobStore.getState().revealBlob("session-1", "two", "user.txt");
+    const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+    expect(useBlobStore.getState().revealRequest).not.toBeNull();
+    act(() => useBlobStore.setState({ blobs: [makeBlob({ id: "two", filename: "user.txt" })], isLoading: false }));
+    expect(container.querySelector('[data-blob-id="two"]')).toHaveFocus();
+    expect(useBlobStore.getState().revealRequest).toBeNull();
+  });
+
+  it("waits for a hidden authoring pane to reveal before focusing its row", async () => {
+    useBlobStore.getState().revealBlob("session-1", "two", "user.txt");
+    const contents = <BlobManager onUseAsInput={vi.fn()} />;
+    const { container, rerender } = render(<div hidden>{contents}</div>);
+    expect(container.querySelector('[data-blob-id="two"]')).not.toHaveFocus();
+    expect(useBlobStore.getState().revealRequest).not.toBeNull();
+    rerender(<div>{contents}</div>);
+    await waitFor(() => expect(container.querySelector('[data-blob-id="two"]')).toHaveFocus());
+    expect(useBlobStore.getState().revealRequest).toBeNull();
+  });
+
+  it("returns focus to the Show in files trigger on Escape", () => {
+    const trigger = document.createElement("button");
+    document.body.appendChild(trigger);
+    useBlobStore.getState().revealBlob("session-1", "two", "user.txt", trigger);
+    const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+    expect(container.querySelector('[data-blob-id="two"]')).toHaveFocus();
+    fireEvent.keyDown(container.querySelector(".blob-manager") as HTMLElement, { key: "Escape" });
+    expect(useBlobStore.getState().fileManagerOpen).toBe(false);
+    expect(trigger).toHaveFocus();
+    trigger.remove();
+  });
+
+  it("offers Edit prompt only for an editable, uniquely bound file", () => {
+    useSessionStore.setState({ compositionState: selectedState({ prompt_template: { blob_ref: "two", mode: "inline_content", sha256: "hash" } }) });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    const edit = screen.getByRole("button", { name: "Edit prompt user.txt" });
+    act(() => edit.click());
+    expect(useSessionStore.getState().selectedNodeId).toBe("llm");
+    expect(useBlobStore.getState().editRequest).toMatchObject({ nodeId: "llm", fieldPath: "prompt_template" });
+    act(() => useSessionStore.setState({ compositionState: selectedState({ prompt_template: { blob_ref: "two", mode: "inline_content", sha256: "hash" },
+      system_prompt: { blob_ref: "two", mode: "inline_content", sha256: "hash" } }) }));
+    expect(screen.queryByRole("button", { name: "Edit prompt user.txt" })).not.toBeInTheDocument();
   });
 });
 

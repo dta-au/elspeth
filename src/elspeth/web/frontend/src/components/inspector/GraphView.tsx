@@ -840,6 +840,7 @@ function NodeConfigPanel({
           options={config.options}
           ariaLabel={`${config.id} settings`}
           plugin={config.plugin === null ? null : { kind: config.pluginKind, name: config.plugin }}
+          slotActions={config.plugin === "llm" ? { nodeId: config.id } : undefined}
         />
         {config.plugin === "llm" && <PromptFileEditors nodeId={config.id} options={config.options} />}
       </section>

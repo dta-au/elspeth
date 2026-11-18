@@ -1,5 +1,5 @@
 // src/components/blobs/BlobManager.tsx
-import { useEffect, useRef, useCallback, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useCallback, useMemo, useState } from "react";
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { Button, Input } from "@/components/ui";
@@ -7,7 +7,8 @@ import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { BlobRow } from "./BlobRow";
 import { IdentityStorageTotal } from "./IdentityStorageTotal";
 import type { BlobMetadata, BlobCategory } from "@/types/api";
-import { componentOptionsById, optionBlobReferences } from "@/lib/blobBindings";
+import { componentOptionsById, optionBlobReferences, promptFileBindings, promptFileEditability } from "@/lib/blobBindings";
+import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 
 interface BlobManagerProps {
   onUseAsInput: (blob: BlobMetadata) => void;
@@ -46,8 +47,14 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   // compose is in flight (elspeth-3f38ebb1b5) so the manager cannot offer a
   // second compose the store admission gate would refuse.
   const isComposing = useSessionStore((s) => s.isComposing);
+  const pending = useInterpretationEventsStore((s) => activeSessionId ? s.pendingBySession[activeSessionId] : undefined);
   const { blobs, isLoading, error, activeSessionId: blobSessionId, loadBlobs, uploadBlob, deleteBlob, downloadBlob } =
     useBlobStore();
+  const revealRequest = useBlobStore((s) => s.revealRequest);
+  const focusedBlobId = useBlobStore((s) => s.focusedBlobId);
+  const [missingRevealName, setMissingRevealName] = useState<string | null>(null);
+  const statusRef = useRef<HTMLParagraphElement>(null);
+  const previousSelectedNode = useRef(selectedNodeId);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const lastScrolledSelection = useRef<string | null>(null);
@@ -70,6 +77,47 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
     [attached, blobs],
   );
   const missingCount = !isLoading && listBelongsToSession ? attached.size - matchedIds.size : 0;
+  const promptBindings = useMemo(() => promptFileBindings(compositionState), [compositionState]);
+
+  useEffect(() => {
+    if (previousSelectedNode.current !== selectedNodeId) {
+      previousSelectedNode.current = selectedNodeId;
+      useBlobStore.setState({ focusedBlobId: null });
+      setMissingRevealName(null);
+    }
+  }, [selectedNodeId]);
+
+  useLayoutEffect(() => {
+    if (activeSessionId) void loadBlobs(activeSessionId);
+  }, [activeSessionId, loadBlobs]);
+
+  useLayoutEffect(() => {
+    if (!revealRequest || revealRequest.sessionId !== activeSessionId || isLoading || !listBelongsToSession) return;
+    const hiddenPane = listRef.current?.closest("[hidden], [inert]");
+    if (hiddenPane) {
+      const observer = new MutationObserver(() => {
+        if (!hiddenPane.hasAttribute("hidden") && !hiddenPane.hasAttribute("inert")) {
+          observer.disconnect();
+          const current = useBlobStore.getState().revealRequest;
+          if (current?.seq === revealRequest.seq) useBlobStore.setState({ revealRequest: { ...current } });
+        }
+      });
+      observer.observe(hiddenPane, { attributes: true, attributeFilter: ["hidden", "inert"] });
+      return () => observer.disconnect();
+    }
+    const row = Array.from(listRef.current?.querySelectorAll<HTMLElement>(".blob-row-item") ?? [])
+      .find((item) => item.dataset.blobId?.toLowerCase() === revealRequest.blobId.toLowerCase());
+    if (row) {
+      setMissingRevealName(null);
+      row.scrollIntoView?.({ block: "nearest" });
+      row.focus({ preventScroll: true });
+    } else {
+      setMissingRevealName(revealRequest.filename);
+      useBlobStore.setState({ focusedBlobId: null });
+      statusRef.current?.focus({ preventScroll: true });
+    }
+    useBlobStore.getState().consumeRevealRequest(revealRequest.seq);
+  }, [revealRequest, activeSessionId, isLoading, listBelongsToSession, blobs]);
 
   useEffect(() => {
     if (selectedNodeId === null) {
@@ -89,12 +137,6 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   // shortcut), the delete must still target the originating session, not
   // whichever session happens to be active at confirmation time.
   const [pendingDelete, setPendingDelete] = useState<{ blob: BlobMetadata; sessionId: string } | null>(null);
-
-  useEffect(() => {
-    if (activeSessionId) {
-      loadBlobs(activeSessionId);
-    }
-  }, [activeSessionId, loadBlobs]);
 
   const grouped = useMemo(() => {
     const groups: Record<BlobCategory, BlobMetadata[]> = {
@@ -153,17 +195,24 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
     [activeSessionId, downloadBlob],
   );
 
+  const close = () => {
+    useBlobStore.getState().setFileManagerOpen(false);
+    useBlobStore.getState().returnToRevealTrigger();
+  };
+
   if (!activeSessionId) return null;
 
   return (
     <div
       className="blob-manager blob-manager-container"
+      onKeyDown={(event) => { if (event.key === "Escape") { event.stopPropagation(); close(); } }}
     >
       {/* Header */}
       <div className="blob-manager-header">
         <span className="blob-manager-title">
           Files ({blobs.length})
         </span>
+        <Button type="button" variant="bare" onClick={close}>Close file manager</Button>
         <IdentityStorageTotal refreshKey={`${activeSessionId}:${blobs.map((blob) => `${blob.id}:${blob.size_bytes}`).join(",")}`} />
         {/* Label-only, and its accessible name IS its visible text
             (elspeth-29eef452a8). The label used to read "+ Upload" against an
@@ -190,12 +239,13 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
         />
       </div>
 
-      {selectedNodeId && attached.size > 0 && listBelongsToSession && (
-        <p className="blob-manager-attached-summary" role="status" aria-live="polite">
+      <p ref={statusRef} tabIndex={-1} className="blob-manager-attached-summary" role="status" aria-live="polite">
+        {missingRevealName ? `${missingRevealName} is no longer in this session` : selectedNodeId && attached.size > 0 && listBelongsToSession ? <>
           {isLoading ? `Checking files used by ${selectedNodeId}` : `${matchedIds.size} ${matchedIds.size === 1 ? "file" : "files"} used by ${selectedNodeId}`}
           {missingCount > 0 && ` · ${missingCount} attached ${missingCount === 1 ? "file is" : "files are"} not in this session`}
-        </p>
-      )}
+          {focusedBlobId && blobs.find((blob) => blob.id.toLowerCase() === focusedBlobId.toLowerCase()) && ` · Showing ${blobs.find((blob) => blob.id.toLowerCase() === focusedBlobId.toLowerCase())?.filename}.`}
+        </> : ""}
+      </p>
 
       {/* Error */}
       {error && (
@@ -226,8 +276,12 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
                 <div className="blob-manager-category-header">
                   {CATEGORY_LABELS[category]}
                 </div>
-                {categoryBlobs.map((blob) => (
-                  <BlobRow
+                {categoryBlobs.map((blob) => {
+                  const bindings = promptBindings.filter((binding) => binding.blobId === blob.id.toLowerCase());
+                  const binding = bindings.length === 1 ? bindings[0] : undefined;
+                  const editability = binding ? promptFileEditability({ state: compositionState, blobs, pendingEvents: Object.values(pending ?? {}),
+                    nodeId: binding.nodeId, fieldPath: binding.fieldPath, blobId: blob.id }) : null;
+                  return <BlobRow
                     key={blob.id}
                     blob={blob}
                     sessionId={activeSessionId}
@@ -237,8 +291,15 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
                     useAsInputDisabled={isComposing}
                     attachedFields={listBelongsToSession ? attached.get(blob.id.toLowerCase()) : undefined}
                     selectedNodeLabel={selectedNodeId}
+                    focused={focusedBlobId?.toLowerCase() === blob.id.toLowerCase()}
+                    onSelect={() => useBlobStore.setState({ focusedBlobId: blob.id })}
+                    editRefusal={editability?.editable === false ? editability.reason : undefined}
+                    onEditPrompt={binding && editability?.editable === true ? () => {
+                      useSessionStore.getState().selectNode(binding.nodeId);
+                      useBlobStore.getState().requestPromptEdit(binding.nodeId, binding.fieldPath);
+                    } : undefined}
                   />
-                ))}
+                })}
               </div>
             );
           })

@@ -194,6 +194,10 @@
     outline-offset: -2px;
   }
 
+  .blob-row-item--focused {
+    outline: 2px solid Highlight;
+  }
+
   /* Chat input: well, icon buttons and the send button (border: none). */
   .chat-input-row,
   .chat-input-icon-btn,

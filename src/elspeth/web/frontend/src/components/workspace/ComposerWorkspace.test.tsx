@@ -18,6 +18,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useSessionStore } from "@/stores/sessionStore";
+import { useBlobStore } from "@/stores/blobStore";
 import {
   claimWorkspaceViewIntent,
   isCurrentWorkspaceViewIntent,
@@ -105,6 +106,8 @@ function emitWidth(width: number): HTMLElement {
 
 describe("ComposerWorkspace", () => {
   beforeEach(() => {
+    vi.clearAllMocks();
+    useBlobStore.getState().reset();
     localStorage.clear();
     ControllableResizeObserver.instances = [];
     vi.stubGlobal("ResizeObserver", ControllableResizeObserver);
@@ -112,6 +115,31 @@ describe("ComposerWorkspace", () => {
       activeSessionId: null,
       compositionState: null,
     });
+  });
+
+  it("reveals a collapsed authoring pane for files without focusing chat input", () => {
+    localStorage.setItem(WORKSPACE_LAYOUT_STORAGE_KEY, JSON.stringify({ version: 1, preferredAuthoringWidth: 420, authoringCollapsed: true }));
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    useBlobStore.getState().activateSession("session-1");
+    renderWorkspace({ authoring: <button type="button" data-chat-input>Chat input</button> });
+    emitWidth(1280);
+    expect(screen.getByRole("button", { name: "Restore authoring pane" })).toBeInTheDocument();
+    act(() => useBlobStore.getState().revealBlob("session-1", "file-1", "prompt.txt"));
+    expect(screen.queryByRole("button", { name: "Restore authoring pane" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Chat input" })).not.toHaveFocus();
+  });
+
+  it("switches from narrow pipeline to compose when a file is revealed", async () => {
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    useBlobStore.getState().activateSession("session-1");
+    renderWorkspace();
+    emitWidth(800);
+    await userEvent.setup().click(screen.getByRole("tab", { name: "Pipeline" }));
+    expect(screen.getByRole("tab", { name: "Pipeline" })).toHaveAttribute("aria-selected", "true");
+    act(() => useBlobStore.getState().revealBlob("session-1", "file-1", "prompt.txt"));
+    expect(screen.getByRole("tab", { name: "Compose" })).toHaveAttribute("aria-selected", "true");
+    act(() => useBlobStore.getState().requestPromptEdit("llm", "prompt_template"));
+    expect(screen.getByRole("tab", { name: "Pipeline" })).toHaveAttribute("aria-selected", "true");
   });
 
   afterEach(() => {
