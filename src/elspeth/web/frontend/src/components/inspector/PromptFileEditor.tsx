@@ -1,13 +1,18 @@
 import { useEffect, useState } from "react";
 import { fetchCompositionState, readPromptFileText, savePromptFile } from "@/api/client";
 import { Button } from "@/components/ui";
+import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
 
 interface PromptFileEditorProps {
   nodeId: string;
   blobId: string;
   fieldPath: string;
+  /** Why the server will refuse every save for this binding; Save stays disabled while set. */
+  saveRefusal?: string | null;
 }
+
+const MULTI_BINDING_REFUSAL = "This node uses more than one prompt file. Re-point it through the agent and approve the review card.";
 
 function blobId(value: unknown): string | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
@@ -32,10 +37,13 @@ export function PromptFileEditors({ nodeId, options }: { nodeId: string; options
     const id = blobId((query as Record<string, unknown>).template);
     if (id) bindings.push({ fieldPath: `queries.${name}.template`, blobId: id });
   }
-  return <>{bindings.map((binding) => <PromptFileEditor key={`${nodeId}:${binding.fieldPath}:${binding.blobId}`} nodeId={nodeId} {...binding} />)}</>;
+  // Mirrors the server rule (prompt_file_binding_paths > 1 refuses every save
+  // with prompt_file_node_multi_binding), so the user is told before saving.
+  const saveRefusal = bindings.length > 1 ? MULTI_BINDING_REFUSAL : null;
+  return <>{bindings.map((binding) => <PromptFileEditor key={`${nodeId}:${binding.fieldPath}:${binding.blobId}`} nodeId={nodeId} saveRefusal={saveRefusal} {...binding} />)}</>;
 }
 
-export function PromptFileEditor({ nodeId, blobId, fieldPath }: PromptFileEditorProps) {
+export function PromptFileEditor({ nodeId, blobId, fieldPath, saveRefusal = null }: PromptFileEditorProps) {
   const sessionId = useSessionStore((state) => state.activeSessionId);
   const isComposing = useSessionStore((state) => state.isComposing);
   const [text, setText] = useState<string | null>(null);
@@ -74,6 +82,8 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath }: PromptFileEditor
       if (useSessionStore.getState().activeSessionId !== sessionId) return;
       setSavedText(text);
       setExpectedSha256(result.content_sha256);
+      // The save rewrote the blob, so the file manager's hash and size are stale.
+      void useBlobStore.getState().loadBlobs(sessionId);
       try {
         const state = await fetchCompositionState(sessionId);
         if (useSessionStore.getState().activeSessionId === sessionId) {
@@ -86,7 +96,7 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath }: PromptFileEditor
       if (useSessionStore.getState().activeSessionId === sessionId) {
         const typed = failure as { detail?: unknown; error_type?: unknown };
         setError(typed.error_type === "prompt_file_node_multi_binding"
-          ? "This node uses more than one prompt file. Re-point it through the agent and approve the review card."
+          ? MULTI_BINDING_REFUSAL
           : typed.error_type === "prompt_file_review_pending_inline"
             ? "Approve the review card first, then edit the file."
             : typed.error_type === "prompt_file_binding_changed"
@@ -109,8 +119,14 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath }: PromptFileEditor
         rows={12}
         style={{ width: "100%", whiteSpace: "pre-wrap" }}
       />
+      {saveRefusal && <p id={`prompt-file-${blobId}-${fieldPath}-refusal`}>{saveRefusal}</p>}
       {error && <p role="alert">{error}</p>}
-      <Button type="button" onClick={save} disabled={saving || isComposing || text === null || text === savedText || expectedSha256 === null}>
+      <Button
+        type="button"
+        onClick={save}
+        disabled={saveRefusal !== null || saving || isComposing || text === null || text === savedText || expectedSha256 === null}
+        aria-describedby={saveRefusal ? `prompt-file-${blobId}-${fieldPath}-refusal` : undefined}
+      >
         Save and approve
       </Button>
       <Button type="button" variant="bare" onClick={() => { setText(savedText); setError(null); }} disabled={saving || savedText === null}>
