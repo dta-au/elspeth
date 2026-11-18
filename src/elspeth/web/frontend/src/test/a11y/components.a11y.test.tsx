@@ -19,7 +19,7 @@
 // ============================================================================
 
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRef, type ButtonHTMLAttributes, type ReactNode } from "react";
 
@@ -177,6 +177,7 @@ vi.mock("@/api/client", async (importOriginal) => {
     resolveInterpretation: vi.fn(),
     optOutOfInterpretations: vi.fn(),
     getInterpretationOptOutSummary: vi.fn(),
+    getPromptReviewSnapshot: vi.fn(),
   };
 });
 
@@ -1005,6 +1006,11 @@ describe("AcknowledgementCard", () => {
   });
 
   it("has no axe violations (llm_prompt_template with the View/Approve controls, pre- and post-view)", async () => {
+    vi.mocked(apiClient.getPromptReviewSnapshot).mockResolvedValue({
+      version: 1, session_id: "sess-a11y", node_id: "node-1", event_id: "evt-2",
+      authored_surface: { system_prompt: "Reply briefly.", prompt_template: "Summarise {{ body }} in one paragraph for {{ audience }}." },
+      bindings: [], anchor: "a".repeat(64), effective_artifact_hash: null, is_live_review: true,
+    });
     const { container } = render(
       <AcknowledgementCard
         event={makeInterpretationEvent("evt-2", {
@@ -1019,67 +1025,66 @@ describe("AcknowledgementCard", () => {
     expect(await axe(container)).toHaveNoViolations();
     // Post-view: revealed prompt region + enabled Approve.
     await userEvent.click(screen.getByRole("button", { name: "View prompt" }));
+    // Guard against a vacuous pass: the loaded snapshot is in the audited DOM.
+    await waitFor(() => expect(screen.getByRole("region", { name: /prompt template review/i }))
+      .toHaveTextContent("Reply briefly."));
     expect(await axe(container)).toHaveNoViolations();
   });
 
-  it("has no axe violations on the resolved prompt with marked substitution slots", async () => {
-    // Without a composition state the prompt renders as one flat text
-    // segment, so the <mark> slots — and the visually-hidden
-    // "accepted value: " / "pending value: " status prefixes inside them —
-    // escape the audit entirely.  Supply the structured parts so both slot
-    // kinds and the pending note are actually in the audited DOM.
-    const state = makeFullCompositionState();
+  it("has no axe violations on a snapshot with marked slots in both statuses", async () => {
+    // The slots, their visually-hidden status prefixes and the status legend
+    // render only for a snapshot carrying the frozen parts skeleton, with
+    // one slot's review pending and one accepted, so both are audited.
+    useInterpretationEventsStore.setState({
+      pendingBySession: { "sess-a11y": { "evt-tone": makeInterpretationEvent("evt-tone") } },
+      resolvedBySession: { "sess-a11y": [makeInterpretationEvent("evt-topic", { choice: "accepted_as_drafted" })] },
+    });
+    vi.mocked(apiClient.getPromptReviewSnapshot).mockResolvedValue({
+      version: 1, session_id: "sess-a11y", node_id: "node-1", event_id: "evt-3",
+      authored_surface: {
+        prompt_template: "Summarise pending interpretation for pending interpretation.",
+        prompt_template_parts: [
+          { kind: "text", text: "Summarise " },
+          { kind: "interpretation_ref", requirement_id: "req-1" },
+          { kind: "text", text: " for " },
+          { kind: "interpretation_ref", requirement_id: "req-2" },
+          { kind: "text", text: "." },
+        ],
+        interpretation_requirements: [
+          { id: "req-1", event_id: "evt-topic", user_term: "briefly" },
+          { id: "req-2", event_id: "evt-tone", user_term: "an auditor" },
+        ],
+      },
+      bindings: [], anchor: "c".repeat(64), effective_artifact_hash: null, is_live_review: true,
+    });
     const { container } = render(
       <AcknowledgementCard
-        event={makeInterpretationEvent("evt-3", {
-          kind: "llm_prompt_template",
-          llm_draft: "Summarise pending interpretation for pending interpretation.",
-        })}
+        event={makeInterpretationEvent("evt-3", { kind: "llm_prompt_template", llm_draft: "Summarise the row." })}
         sessionId="sess-a11y"
         stepLabel="Summarise"
-        compositionState={{
-          ...state,
-          nodes: [
-            {
-              ...state.nodes[0],
-              options: {
-                prompt_template_parts: [
-                  { kind: "text", text: "Summarise " },
-                  { kind: "interpretation_ref", requirement_id: "req-1" },
-                  { kind: "text", text: " for " },
-                  { kind: "interpretation_ref", requirement_id: "req-2" },
-                  { kind: "text", text: "." },
-                ],
-                interpretation_requirements: [
-                  {
-                    id: "req-1",
-                    status: "resolved",
-                    draft: "briefly",
-                    accepted_value: "concise and neutral",
-                  },
-                  {
-                    id: "req-2",
-                    status: "pending",
-                    draft: "an auditor",
-                    accepted_value: null,
-                  },
-                ],
-              },
-            },
-          ],
-        }}
       />,
     );
     await userEvent.click(screen.getByRole("button", { name: "View prompt" }));
-    // Guard against a vacuous pass: both slot kinds must be mounted, each
-    // carrying its visually-hidden status prefix.
     const region = screen.getByRole("region", { name: /prompt template review/i });
-    expect(
-      region.querySelector("mark.ack-card-prompt-slot--resolved")?.textContent,
-    ).toBe("accepted value: concise and neutral");
-    expect(
-      region.querySelector("mark.ack-card-prompt-slot--pending")?.textContent,
-    ).toBe("pending value: an auditor");
+    await waitFor(() => expect(region.querySelectorAll("mark.ack-card-prompt-slot")).toHaveLength(2));
+    expect(region.querySelector(".ack-card-prompt-slot--accepted")).not.toBeNull();
+    expect(region.querySelector(".ack-card-prompt-slot--pending")).not.toBeNull();
+    expect(region.querySelector(".ack-card-prompt-legend")).not.toBeNull();
+    expect(await axe(container)).toHaveNoViolations();
+  });
+
+  it("has no axe violations when the prompt review snapshot cannot load", async () => {
+    vi.mocked(apiClient.getPromptReviewSnapshot).mockRejectedValue({ status: 404, detail: "", error_type: "prompt_review_snapshot_not_found" });
+    const { container } = render(
+      <AcknowledgementCard
+        event={makeInterpretationEvent("evt-3", { kind: "llm_prompt_template", llm_draft: "Summarise the row." })}
+        sessionId="sess-a11y"
+        stepLabel="Summarise"
+      />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "View prompt" }));
+    // The gated Approve's described-by reason is mounted before the audit.
+    expect(await screen.findByText(/could not be loaded/i)).toBeInTheDocument();
     expect(await axe(container)).toHaveNoViolations();
   });
 });

@@ -1,8 +1,9 @@
 // src/components/blobs/BlobRow.tsx
-import { useMemo, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import { previewBlobContentSnippet } from "@/api/client";
 import { Button, Icon, StructuredJsonPreview, type IconName } from "@/components/ui";
 import { useShowAdvanced } from "@/stores/preferencesStore";
+import { optionLabel } from "@/components/inspector/OptionRows";
 import type { BlobMetadata } from "@/types/api";
 import {
   describeStructuralSummary,
@@ -28,6 +29,20 @@ interface BlobRowProps {
   /** Disables the Use-as-input compose entry point while a freeform compose
    *  is in flight (elspeth-3f38ebb1b5). Preview/download/delete stay live. */
   useAsInputDisabled?: boolean;
+  attachedFields?: readonly string[];
+  selectedNodeLabel?: string | null;
+  focused?: boolean;
+  onEditPrompt?: () => void;
+  editRefusal?: string;
+  onSelect?: () => void;
+}
+
+function attachedFieldLabel(fieldPath: string): string {
+  const parts = fieldPath.split(".");
+  if (parts[0] === "queries" && parts[2] === "template") {
+    return `${optionLabel("prompt_template")}, query ${parts[1]}`;
+  }
+  return optionLabel(parts[0]);
 }
 
 function formatBytes(bytes: number): string {
@@ -86,7 +101,15 @@ export function BlobRow({
   onDelete,
   onUseAsInput,
   useAsInputDisabled = false,
+  attachedFields,
+  selectedNodeLabel,
+  focused = false,
+  onEditPrompt,
+  editRefusal,
+  onSelect,
 }: BlobRowProps) {
+  const chipId = useId();
+  const attached = selectedNodeLabel !== null && selectedNodeLabel !== undefined && (attachedFields?.length ?? 0) > 0;
   const status = statusIndicator(blob.status);
   const creatorLabel = creatorBadgeLabel(blob.created_by);
   const normalizedMimeType = normalizeMimeType(blob.mime_type);
@@ -161,9 +184,12 @@ export function BlobRow({
     // JSX at all, because a row cannot know it is last. The open/closed state
     // is published as a class so blobs.css can own both cases.
     <div
-      className={
-        previewOpen ? "blob-row-item blob-row-item--preview-open" : "blob-row-item"
-      }
+      className={["blob-row-item", previewOpen && "blob-row-item--preview-open", attached && "blob-row-item--attached", focused && "blob-row-item--focused"].filter(Boolean).join(" ")}
+      data-blob-id={blob.id}
+      role="group"
+      aria-label={blob.filename}
+      tabIndex={-1}
+      onClick={onSelect}
     >
       <div className="blob-row blob-row-container">
         {/* Status indicator: shape icon (non-colour cue) + accessible name. */}
@@ -193,9 +219,16 @@ export function BlobRow({
         <span
           className="blob-row-filename"
           title={blob.filename}
+          aria-describedby={attached ? chipId : undefined}
         >
           {blob.filename}
         </span>
+
+        {attached && (
+          <span className="blob-row-attached-chip" id={chipId} title={editRefusal ?? attachedFields?.join(", ")}>
+            {focused && "Selected · "}Used by {selectedNodeLabel}: {attachedFields?.map(attachedFieldLabel).join(", ")}
+          </span>
+        )}
 
         {/* Size */}
         <span className="blob-row-size">
@@ -204,6 +237,8 @@ export function BlobRow({
 
         {/* Actions */}
         <div className="blob-row-actions">
+          {onEditPrompt && <Button type="button" variant="bare" onClick={onEditPrompt}
+            aria-label={`Edit prompt ${blob.filename}`} aria-describedby={attached ? chipId : undefined}>Edit prompt</Button>}
           {canPreview && blob.status === "ready" && (
             <Button
               variant="bare"
@@ -212,6 +247,7 @@ export function BlobRow({
               aria-label={`${previewOpen ? "Hide" : "Preview"} ${blob.filename}`}
               aria-expanded={previewOpen}
               className="blob-action-btn"
+              aria-describedby={attached ? chipId : undefined}
             >
               <Icon name="eye" />
             </Button>
@@ -224,6 +260,7 @@ export function BlobRow({
                 title="Use as pipeline input"
                 aria-label={`Use ${blob.filename} as input`}
                 className="blob-action-btn"
+                aria-describedby={attached ? chipId : undefined}
                 disabled={useAsInputDisabled}
               >
                 <Icon name="play" />
@@ -234,6 +271,7 @@ export function BlobRow({
                 title="Download"
                 aria-label={`Download ${blob.filename}`}
                 className="blob-action-btn"
+                aria-describedby={attached ? chipId : undefined}
               >
                 <Icon name="download" />
               </Button>
@@ -249,11 +287,14 @@ export function BlobRow({
             title="Delete"
             aria-label={`Delete ${blob.filename}`}
             className="blob-action-btn"
+            aria-describedby={attached ? chipId : undefined}
           >
             <Icon name="trash" />
           </Button>
         </div>
       </div>
+
+      {editRefusal && previewOpen && <p className="blob-row-edit-refusal">{editRefusal}</p>}
 
       {/* Preview panel */}
       {previewOpen && (

@@ -250,6 +250,13 @@ export interface ListInterpretationEventsResponse {
 export interface InterpretationResolveRequest {
   choice: "accepted_as_drafted" | "amended";
   amended_value?: string;
+  /**
+   * The `anchor` of the prompt review snapshot the card displayed. Required
+   * for `llm_prompt_template` and refused (422) for every other kind; a
+   * different anchor than the event's stored snapshot is 409
+   * `prompt_review_stale`.
+   */
+  reviewed_anchor?: string;
 }
 
 /**
@@ -303,7 +310,10 @@ export interface OptOutSummaryResponse {
   events: InterpretationEvent[];
 }
 
-/** Immutable full-text evidence for a file-backed prompt card. */
+/**
+ * Immutable review evidence for a prompt card, inline (`bindings: []`) or
+ * file-backed. The card renders from it and approves its `anchor`.
+ */
 export interface PromptReviewSnapshotResponse {
   version: 1;
   session_id: string;

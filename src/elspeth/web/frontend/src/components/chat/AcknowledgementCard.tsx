@@ -28,7 +28,15 @@ import type { InterpretationEvent, PromptReviewSnapshotResponse } from "@/types/
 import { getPromptReviewSnapshot } from "@/api/client";
 import { Button } from "@/components/ui";
 import { CodeBlock } from "./CodeBlock";
-import { hasFilePromptBinding, resolvePromptDisplaySegments } from "./promptTemplateDisplay";
+import {
+  PENDING_INTERPRETATION_DISPLAY_TEXT,
+  promptReviewDisplay,
+  promptSlotLabel,
+  promptSlotStatus,
+  type PromptDisplayResult,
+  type PromptSlotStatus,
+} from "./promptTemplateDisplay";
+import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import {
   ACKNOWLEDGEMENT_ACCEPT_LABEL,
   ACKNOWLEDGEMENT_AMEND_LABEL,
@@ -45,6 +53,42 @@ const PROMPT_TEMPLATE_STYLE: CSSProperties = {
   maxHeight: "16rem",
   overflow: "auto",
 };
+
+/** The prompt card's stored review snapshot, kept with the display built from it. */
+type PromptReviewState =
+  | { status: "loading" }
+  | { status: "ready"; snapshot: PromptReviewSnapshotResponse; display: PromptDisplayResult }
+  | { status: "error"; reason: string };
+
+const PROMPT_CHANGED_NOTICE =
+  "This prompt changed since you opened it. The card now shows the current version; view it again before approving.";
+
+/** Why Approve is unavailable when the snapshot request failed. */
+/** The prompt region's content while there is no snapshot to approve. */
+function placeholderDisplay(message: string): PromptDisplayResult {
+  return { reviewAvailable: false, segments: [{ kind: "text", text: message }], text: message };
+}
+
+/** A slot's status as words: the visible suffix, the legend and the sr-only prefix agree. */
+const SLOT_STATUS_WORDS: Record<PromptSlotStatus, string> = {
+  pending: "pending",
+  accepted: "accepted",
+  unknown: "status not shown here",
+};
+
+const LEGEND_TEXT: Record<PromptSlotStatus, string> = {
+  accepted: "Accepted — its own review is approved",
+  pending: "Pending — awaiting its own review",
+  unknown: "Status not shown here — see its own card",
+};
+
+function snapshotLoadReason(err: unknown): string {
+  const code = typeof err === "object" && err !== null && "error_type" in err ? (err as { error_type?: unknown }).error_type : undefined;
+  if (code === "prompt_review_snapshot_not_found") {
+    return "The reviewed prompt could not be loaded: this review has no stored text, so it cannot be approved. Ask the composer to surface it again.";
+  }
+  return "The reviewed prompt could not be loaded, so it cannot be approved. Reload the session to try again.";
+}
 
 /**
  * Stable DOM id for a card's labelled <section>. The wire-stage named-blocker
@@ -315,16 +359,6 @@ export interface AcknowledgementCardProps {
    *  `${stepLabel} step`, which is what every caller rendered before a
    *  removed step needed disambiguating. */
   stepTitle?: string;
-  /**
-   * The session's live composition state (threaded from the stack's existing
-   * store subscription — the card itself stays store-free and testable).
-   * Prompt-template cards use it to render the prompt with accepted
-   * interpretation values substituted (elspeth-990f5ea562); the event's
-   * `llm_draft` is frozen at staging time with every slot masked as
-   * "pending interpretation".  Optional: without it the card falls back to
-   * the frozen draft.
-   */
-  compositionState?: CompositionState | null;
   /** Render the inline amend affordance when the parent allows amendments. */
   showAmend?: boolean;
   /**
@@ -353,12 +387,50 @@ export function AcknowledgementCard({
   sessionId,
   stepLabel,
   stepTitle,
-  compositionState = null,
   showAmend = false,
   onResolved,
   acceptButtonRef,
   sectionRef,
 }: AcknowledgementCardProps) {
+  const requiresPromptView = event.kind === "llm_prompt_template";
+  // A prompt card renders ONLY from the server's stored review snapshot, and
+  // Approve sends THAT snapshot's anchor. Snapshot and display live in one
+  // state object, so what is shown and what is approved cannot diverge; the
+  // browser's compositionState is deliberately not an input (a second tab or
+  // a failed state read can leave it behind the server).
+  const [promptReview, setPromptReview] = useState<PromptReviewState>({ status: "loading" });
+  const [promptFetchSeq, setPromptFetchSeq] = useState(0);
+  const [promptChangedNotice, setPromptChangedNotice] = useState<string | null>(null);
+  // Two-control design for prompt cards (elspeth-3a4a65530f, audit
+  // ux-review-2026-08-13): the small "View prompt" disclosure toggle is the
+  // ONLY reveal, and the primary button is always "Approve" — disabled until
+  // the prompt has been viewed.  This deliberately REVERSES the 2026-07-03
+  // operator ask (one morphing button: click 1 reveals, click 2 approves),
+  // because a control whose meaning changes under the pointer commits an
+  // approval a double-clicking user never intended.  The old rationale —
+  // a disabled Approve beside a View button "read as a dead end" — is
+  // mitigated by the visible gate note naming the unlock condition.  Once
+  // viewed, always viewed — collapsing the prompt afterwards does not
+  // re-disable Approve.  A changed snapshot resets it: the new text has not
+  // been viewed.
+  const [promptViewed, setPromptViewed] = useState(!requiresPromptView);
+  const [expanded, setExpanded] = useState(false);
+  useEffect(() => {
+    if (!requiresPromptView) return;
+    const controller = new AbortController();
+    setPromptReview({ status: "loading" });
+    getPromptReviewSnapshot(sessionId, event.id, controller.signal)
+      .then((snapshot) => {
+        if (!controller.signal.aborted) {
+          setPromptReview({ status: "ready", snapshot, display: promptReviewDisplay(event.id, snapshot) });
+        }
+      })
+      .catch((err: unknown) => {
+        if (!controller.signal.aborted) setPromptReview({ status: "error", reason: snapshotLoadReason(err) });
+      });
+    return () => controller.abort();
+  }, [requiresPromptView, sessionId, event.id, promptFetchSeq]);
+
   const {
     mode,
     amendText,
@@ -373,7 +445,20 @@ export function AcknowledgementCard({
     handleOpenAmend,
     handleCancelAmend,
     handleSubmitAmend,
-  } = useInterpretationResolver({ event, sessionId, onResolved });
+  } = useInterpretationResolver({
+    event,
+    sessionId,
+    onResolved,
+    reviewedAnchor: promptReview.status === "ready" ? promptReview.snapshot.anchor : null,
+    onPromptReviewChanged: () => {
+      // Never auto-approve the replacement: re-fetch, re-gate on viewing it,
+      // and say why in the live region.
+      setPromptChangedNotice(PROMPT_CHANGED_NOTICE);
+      setPromptViewed(false);
+      setExpanded(false);
+      setPromptFetchSeq((seq) => seq + 1);
+    },
+  });
 
   const reactId = useId();
   const titleId = `${reactId}-title`;
@@ -385,25 +470,21 @@ export function AcknowledgementCard({
   const llmDraft = event.llm_draft ?? "";
   const userTerm = event.user_term ?? "this term";
 
-  const requiresPromptView = event.kind === "llm_prompt_template";
-  const [promptSnapshot, setPromptSnapshot] = useState<PromptReviewSnapshotResponse | null>(null);
-  const filePromptBinding = requiresPromptView && hasFilePromptBinding(compositionState, event);
-  useEffect(() => {
-    if (!filePromptBinding) return;
-    const controller = new AbortController();
-    setPromptSnapshot(null);
-    getPromptReviewSnapshot(sessionId, event.id, controller.signal)
-      .then((snapshot) => {
-        if (!controller.signal.aborted) setPromptSnapshot(snapshot);
-      })
-      .catch(() => {
-        if (!controller.signal.aborted) setPromptSnapshot(null);
-      });
-    return () => controller.abort();
-  }, [filePromptBinding, sessionId, event.id]);
-  const promptDisplay = requiresPromptView
-    ? resolvePromptDisplaySegments(compositionState, event, promptSnapshot)
-    : null;
+  const promptDisplay: PromptDisplayResult | null = !requiresPromptView
+    ? null
+    : promptReview.status === "ready"
+      ? promptReview.display
+      : placeholderDisplay(
+          promptReview.status === "loading" ? "Loading the reviewed prompt…" : "The reviewed prompt is unavailable.",
+        );
+  // Slot STATUS only: the live interpretation events say whether each slot's
+  // own review is pending or accepted. The slot's text never comes from here.
+  const pendingEvents = useInterpretationEventsStore((s) => s.pendingBySession[sessionId]);
+  const resolvedEvents = useInterpretationEventsStore((s) => s.resolvedBySession[sessionId]);
+  const slotStatuses: PromptSlotStatus[] = (promptDisplay?.segments ?? []).flatMap((segment) =>
+    segment.kind === "slot" ? [promptSlotStatus(segment, event.affected_node_id, pendingEvents, resolvedEvents)] : [],
+  );
+  const promptHasSlot = slotStatuses.length > 0;
   const promptReviewAvailable = promptDisplay?.reviewAvailable === true;
   const valueIsLong =
     llmDraft.length > 140 || llmDraft.split("\n").length > 4;
@@ -414,20 +495,6 @@ export function AcknowledgementCard({
     requiresPromptView ||
     (event.kind === "invented_source" && valueIsLong);
   const hasInlineValue = event.kind === "invented_source" && !valueIsLong;
-
-  const [expanded, setExpanded] = useState(false);
-  // Two-control design for prompt cards (elspeth-3a4a65530f, audit
-  // ux-review-2026-08-13): the small "View prompt" disclosure toggle is the
-  // ONLY reveal, and the primary button is always "Approve" — disabled until
-  // the prompt has been viewed.  This deliberately REVERSES the 2026-07-03
-  // operator ask (one morphing button: click 1 reveals, click 2 approves),
-  // because a control whose meaning changes under the pointer commits an
-  // approval a double-clicking user never intended.  The old rationale —
-  // a disabled Approve beside a View button "read as a dead end" — is
-  // mitigated by the visible gate note naming the unlock condition.  Once
-  // viewed, always viewed — collapsing the prompt afterwards does not
-  // re-disable Approve.
-  const [promptViewed, setPromptViewed] = useState(!requiresPromptView);
 
   const acceptDisabled = primaryButtonsDisabled;
   // An open disclosure shows the complete prompt as soon as loading finishes.
@@ -527,27 +594,18 @@ export function AcknowledgementCard({
       )
     ) : null;
 
-  // Resolved-prompt rendering (elspeth-990f5ea562): re-render the prompt
-  // from the live composition state so accepted interpretation values appear
-  // in place of the staging-time "pending interpretation" masks.  The frozen
-  // event.llm_draft is demoted to a secondary "View original template"
-  // disclosure, shown only when it differs from the resolved render.
-  const promptDisplayText =
-    promptDisplay === null
-      ? ""
-      : promptDisplay.segments.map((segment) => segment.text).join("");
+  // The event's bounded llm_draft stays reachable behind a secondary "View
+  // original template" disclosure, shown only when it differs from the
+  // snapshot render.
   const reviewedDisplayText = promptDisplay?.systemPrompt !== undefined && promptDisplay.systemPrompt !== null
-    ? `System prompt:\n${promptDisplay.systemPrompt}\n\nPrompt template:\n${promptDisplayText}`
-    : promptDisplayText;
-  const promptHasPendingSlot =
-    promptDisplay !== null &&
-    promptDisplay.segments.some((segment) => segment.kind === "pending");
+    ? `System prompt:\n${promptDisplay.systemPrompt}\n\nPrompt template:\n${promptDisplay.text}`
+    : (promptDisplay?.text ?? "");
   const showOriginalTemplate =
-    promptDisplay !== null && llmDraft !== "" && reviewedDisplayText !== llmDraft;
-
-  const promptHasResolvedSlot =
-    promptDisplay !== null &&
-    promptDisplay.segments.some((segment) => segment.kind === "resolved");
+    promptReview.status === "ready" && promptDisplay !== null && llmDraft !== "" && reviewedDisplayText !== llmDraft;
+  const promptGateReason =
+    promptReview.status === "error"
+      ? promptReview.reason
+      : "The complete prompt is not available yet. Reload the session if it does not load; the preview cannot be approved.";
 
   const spinner = (
     <>
@@ -604,38 +662,24 @@ export function AcknowledgementCard({
             className="ack-card-prompt-template"
             style={PROMPT_TEMPLATE_STYLE}
           >
-            {/* Visible key for the two slot tints (ux-review 2026-08-13).
-                Both resolved and pending slots render as <mark> and differ
-                only by CSS, so a sighted operator on an ATTESTATION surface
-                had no way to tell an already-attested value from a sibling
-                review's draft — while the sr-only per-slot prefixes below
-                DID disambiguate, leaving AT users better served than sighted
-                ones.  The distinction is carried by the TEXT, not the
-                swatch: under forced-colors the swatch backgrounds are
-                stripped and two identical squares would key nothing.  Each
-                item renders only when a slot of that kind is present — the
-                same one-way invariant as "never name a control the card does
-                not render", applied to tints. */}
-            {(promptHasResolvedSlot || promptHasPendingSlot) && (
+            {/* Visible key for the slot tints (ux-review 2026-08-13), now
+                keyed to each slot's review STATUS. The distinction is carried
+                by the TEXT, not the swatch: under forced colors the swatch
+                backgrounds are stripped. Each item renders only when a slot
+                in that state is present. */}
+            {promptHasSlot && (
               <ul className="ack-card-prompt-legend">
-                {promptHasResolvedSlot && (
-                  <li>
-                    <span
-                      className="ack-card-prompt-legend-swatch ack-card-prompt-slot--resolved"
-                      aria-hidden="true"
-                    />
-                    Accepted value
-                  </li>
-                )}
-                {promptHasPendingSlot && (
-                  <li>
-                    <span
-                      className="ack-card-prompt-legend-swatch ack-card-prompt-slot--pending"
-                      aria-hidden="true"
-                    />
-                    Pending value — awaiting its own review
-                  </li>
-                )}
+                {(["accepted", "pending", "unknown"] as const)
+                  .filter((status) => slotStatuses.includes(status))
+                  .map((status) => (
+                    <li key={status}>
+                      <span
+                        className={`ack-card-prompt-legend-swatch ack-card-prompt-slot--${status}`}
+                        aria-hidden="true"
+                      />
+                      {LEGEND_TEXT[status]}
+                    </li>
+                  ))}
               </ul>
             )}
             {promptDisplay.systemPrompt !== undefined && (
@@ -650,52 +694,34 @@ export function AcknowledgementCard({
               </>
             )}
             <pre className="ack-card-prompt-pre">
-              {promptDisplay.segments.map((segment, index) =>
-                segment.kind === "text" ? (
-                  <span key={index}>{segment.text}</span>
-                ) : (
-                  <mark
-                    key={index}
-                    className={`ack-card-prompt-slot ack-card-prompt-slot--${segment.kind}`}
-                  >
-                    {/* The resolved/pending distinction is otherwise
-                        CSS-only (background/border on <mark>), which is
-                        invisible non-visually, so an SR user needs a
-                        per-slot cue to audit which parts are still drafts
-                        (WCAG 1.3.1).  Same two words the visible legend
-                        uses, so the encodings agree. */}
-                    <span className="visually-hidden">
-                      {segment.kind === "pending"
-                        ? "pending value: "
-                        : "accepted value: "}
-                    </span>
-                    {segment.text}
-                  </mark>
-                ),
-              )}
+              {(() => {
+                let slotIndex = 0;
+                return promptDisplay.segments.map((segment, index) => {
+                  if (segment.kind === "text") return <span key={index}>{segment.text}</span>;
+                  const status = slotStatuses[slotIndex++];
+                  return (
+                    <mark key={index} className={`ack-card-prompt-slot ack-card-prompt-slot--${status}`}>
+                      {/* The tint is CSS-only, so the status is also in the
+                          span's text (forced colors strip the tint) and in
+                          an sr-only prefix (WCAG 1.3.1). Same words as the
+                          legend, so the encodings agree. */}
+                      <span className="visually-hidden">{`interpretation slot, ${SLOT_STATUS_WORDS[status]}: `}</span>
+                      {`[${promptSlotLabel(segment.userTerm)}: ${SLOT_STATUS_WORDS[status]}]`}
+                    </mark>
+                  );
+                });
+              })()}
             </pre>
-            {promptHasPendingSlot && (
+            {promptHasSlot && (
               <p className="ack-card-prompt-pending-note">
-                {/* Scoped to the PENDING tint only.  The previous wording
-                    ("Highlighted values await their own interpretation
-                    reviews") was false for every resolved slot, because
-                    resolved slots are highlighted too — on a mixed prompt
-                    it told the operator a value they had already attested
-                    was still a draft. */}
-                Pending values are drafts from their own reviews; the prompt
-                runs with whatever you accept there.
+                A marked term is reviewed in its own card, which approves its
+                value; this card approves the prompt around it.
               </p>
             )}
-            {promptDisplay.usedFallback && promptDisplay.reviewAvailable && (
+            {promptDisplay.hasPendingSlot === true && (
               <p className="ack-card-prompt-pending-note">
-                {/* Audit honesty (code-review 2026-08-13): the structured
-                    parts could not be rendered, so this is the node's stored
-                    template verbatim with no slots broken out.  A card whose
-                    entire purpose is showing what actually runs must say so
-                    rather than let the degraded render pass as the resolved
-                    one. */}
-                Showing the stored prompt template as-is — the interpretation
-                slots could not be broken out for this card.
+                “{PENDING_INTERPRETATION_DISPLAY_TEXT}” marks a term you review
+                in its own card; the prompt runs with the value you accept there.
               </p>
             )}
             {showOriginalTemplate && (
@@ -733,6 +759,13 @@ export function AcknowledgementCard({
 
       <div className="ack-card-main">
         <p className="ack-card-line">{presentation.line}</p>
+        {/* Always mounted for a prompt card so a changed-snapshot notice is
+            announced when it appears (a live region inserted with its text
+            already inside is not reliably read). The replacement text is
+            never swapped in silently, and never approved for the user. */}
+        {requiresPromptView && (
+          <p role="status" className="ack-card-review-notice">{promptChangedNotice}</p>
+        )}
         {dataContractBody}
         {/* Gate note: says WHY Approve is disabled and names the unlock
             condition, so the gated primary is never an unexplained dead
@@ -742,7 +775,7 @@ export function AcknowledgementCard({
         {chooseMode && approveGated && (
           <p id={promptGateId} className="ack-card-gate-note">
             {!promptReviewAvailable ? (
-              <>The complete prompt is not available yet. Reload the session if it does not load; the preview cannot be approved.</>
+              promptGateReason
             ) : (
               <>
             <strong>{ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL}</strong> shows the

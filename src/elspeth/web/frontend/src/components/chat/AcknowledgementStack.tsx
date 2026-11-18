@@ -194,10 +194,6 @@ export function AcknowledgementStack({
               sessionId={sessionId}
               stepLabel={humaniseStepLabel(compositionState, event.affected_node_id)}
               stepTitle={humaniseStepTitle(compositionState, event.affected_node_id)}
-              // Live state for the card's resolved-prompt rendering
-              // (elspeth-990f5ea562): refreshed on every sibling resolve, so an
-              // open prompt card re-renders with fresh substitutions.
-              compositionState={compositionState}
               showAmend={allowAmend && supportsAmendment(event.kind)}
               acceptButtonRef={(el) => {
                 if (el != null) acceptRefs.current.set(event.id, el);

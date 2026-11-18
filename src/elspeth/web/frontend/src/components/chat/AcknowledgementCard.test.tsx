@@ -9,7 +9,7 @@
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import type { ComponentProps } from "react";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import {
   AcknowledgementCard,
@@ -21,6 +21,7 @@ import {
   ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL,
 } from "./acknowledgementLabels";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
+import { useSessionStore } from "@/stores/sessionStore";
 import { resetStore } from "@/test/store-helpers";
 import type {
   InterpretationEvent,
@@ -116,20 +117,39 @@ function makeApiError(status: number, detail = ""): ApiError {
   };
 }
 
+const DEFAULT_ANCHOR = "d".repeat(64);
+
+/** A stored inline review snapshot for evt-1, as GET .../prompt returns it. */
+function promptSnapshot(
+  authoredSurface: Record<string, unknown>,
+  anchor = DEFAULT_ANCHOR,
+): Awaited<ReturnType<typeof api.getPromptReviewSnapshot>> {
+  return {
+    version: 1, session_id: "sess-1", node_id: "node-1", event_id: "evt-1",
+    authored_surface: authoredSurface, bindings: [], anchor,
+    effective_artifact_hash: null, is_live_review: true,
+  };
+}
+
+/**
+ * Render a card. A prompt card loads its stored review snapshot; unless the
+ * test configured the mock itself, the snapshot's surface is `promptSurface`
+ * (default: the event's draft as the template).
+ */
 function renderCard(
   event: InterpretationEvent,
-  props: Partial<ComponentProps<typeof AcknowledgementCard>> = {},
+  props: Partial<ComponentProps<typeof AcknowledgementCard>> & { promptSurface?: Record<string, unknown> } = {},
 ) {
+  if (event.kind === "llm_prompt_template" && vi.mocked(api.getPromptReviewSnapshot).getMockImplementation() === undefined) {
+    vi.mocked(api.getPromptReviewSnapshot).mockResolvedValue(
+      promptSnapshot(props.promptSurface ?? { prompt_template: event.llm_draft ?? "" }),
+    );
+  }
   return render(
     <AcknowledgementCard
       event={event}
       sessionId="sess-1"
       stepLabel={props.stepLabel ?? "Summarise"}
-      compositionState={props.compositionState === undefined && event.kind === "llm_prompt_template" ? {
-        ...makeCompositionState(),
-        nodes: [{ id: "node-1", node_type: "transform", plugin: "llm", input: "rows", on_success: null, on_error: null,
-          options: { prompt_template: event.llm_draft ?? "" } }],
-      } : props.compositionState}
       showAmend={props.showAmend ?? event.kind === "vague_term"}
       onResolved={props.onResolved}
     />,
@@ -138,6 +158,7 @@ function renderCard(
 
 beforeEach(() => {
   resetStore(useInterpretationEventsStore);
+  useSessionStore.setState({ compositionState: null });
   vi.mocked(api.resolveInterpretation).mockReset();
   vi.mocked(api.optOutOfInterpretations).mockReset();
   vi.mocked(api.listInterpretationEvents).mockReset();
@@ -653,11 +674,7 @@ describe("AcknowledgementCard — prompt-template View/Approve controls", () => 
         created_by: "assistant", provenance: {}, text }],
       anchor: "b".repeat(64), effective_artifact_hash: "c".repeat(64), is_live_review: true,
     });
-    renderCard(event, { compositionState: {
-      ...makeCompositionState(),
-      nodes: [{ id: "node-1", node_type: "transform", plugin: "llm", input: "rows", on_success: null,
-        on_error: null, options: { prompt_template: marker } }],
-    } });
+    renderCard(event);
     const approve = screen.getByRole("button", { name: /approve the llm prompt template/i });
     expect(approve).toHaveAttribute("aria-disabled", "true");
     await user.click(screen.getByRole("button", { name: "View prompt" }));
@@ -677,23 +694,15 @@ describe("AcknowledgementCard — prompt-template View/Approve controls", () => 
       name: `query_${index}`,
       template: `Instruction ${index}: ${"detail ".repeat(250)}end ${index}.`,
     }));
-    renderCard(event, {
-      compositionState: {
-        ...makeCompositionState(),
-        nodes: [{
-          id: "node-1", node_type: "transform", plugin: "llm", input: "rows",
-          on_success: null, on_error: null,
-          options: { system_prompt: "Shared system instruction.", queries },
-        }],
-      },
-    });
+    renderCard(event, { promptSurface: { system_prompt: "Shared system instruction.", queries } });
     const approve = screen.getByRole("button", { name: /approve the llm prompt template/i });
     expect(approve).toHaveAttribute("aria-disabled", "true");
     await user.click(approve);
     expect(api.resolveInterpretation).not.toHaveBeenCalled();
     await user.click(screen.getByRole("button", { name: "View prompt" }));
-    const text = screen.getByRole("region", { name: /prompt template review/i })
-      .querySelector("pre.ack-card-prompt-pre")?.textContent ?? "";
+    const region = screen.getByRole("region", { name: /prompt template review/i });
+    await waitFor(() => expect(region).toHaveTextContent("Shared system instruction."));
+    const text = region.querySelector("pre.ack-card-prompt-pre")?.textContent ?? "";
     expect(text.length).toBeGreaterThan(8000);
     expect(text).toContain("System prompt (sent with every query):\nShared system instruction.");
     for (const query of queries) {
@@ -706,29 +715,34 @@ describe("AcknowledgementCard — prompt-template View/Approve controls", () => 
     expect(api.resolveInterpretation).toHaveBeenCalledTimes(1);
   });
 
-  it("does not approve a bounded draft while full prompt state is unavailable", async () => {
+  /** Hold the snapshot request open until the test releases it. */
+  function deferSnapshot(surface: Record<string, unknown>): () => Promise<void> {
+    let release!: () => void;
+    vi.mocked(api.getPromptReviewSnapshot).mockReturnValue(
+      new Promise((resolve) => { release = () => resolve(promptSnapshot(surface)); }),
+    );
+    return async () => { await act(async () => { release(); }); };
+  }
+
+  it("does not approve a bounded draft while the reviewed snapshot is loading", async () => {
     const user = userEvent.setup();
-    renderCard(makeEvent({ kind: "llm_prompt_template", llm_draft: "Shortened preview" }), {
-      compositionState: null,
-    });
+    deferSnapshot({ prompt_template: "Complete instruction" });
+    renderCard(makeEvent({ kind: "llm_prompt_template", llm_draft: "Shortened preview" }));
     await user.click(screen.getByRole("button", { name: "View prompt" }));
     await user.click(screen.getByRole("button", { name: /approve the llm prompt template/i }));
     expect(api.resolveInterpretation).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: /approve the llm prompt template/i })).toHaveAttribute("aria-disabled", "true");
+    expect(screen.queryByText("Shortened preview")).toBeNull();
   });
 
   it("requires viewing the full prompt after a collapsed preview loads", async () => {
     const user = userEvent.setup();
     const event = makeEvent({ kind: "llm_prompt_template", llm_draft: "Shortened preview" });
-    const { rerender } = renderCard(event, { compositionState: null });
+    const release = deferSnapshot({ prompt_template: "Complete instruction previously omitted" });
+    renderCard(event);
     await user.click(screen.getByRole("button", { name: "View prompt" }));
     await user.click(screen.getByRole("button", { name: "Hide prompt" }));
-    const state: CompositionState = {
-      ...makeCompositionState(),
-      nodes: [{ id: "node-1", node_type: "transform", plugin: "llm", input: "rows", on_success: null, on_error: null,
-        options: { prompt_template: "Complete instruction previously omitted" } }],
-    };
-    rerender(<AcknowledgementCard event={event} sessionId="sess-1" stepLabel="Summarise" compositionState={state} />);
+    await release();
     const approve = screen.getByRole("button", { name: /approve the llm prompt template/i });
     expect(approve).toHaveAttribute("aria-disabled", "true");
     expect(screen.queryByText("Complete instruction previously omitted")).toBeNull();
@@ -743,16 +757,12 @@ describe("AcknowledgementCard — prompt-template View/Approve controls", () => 
   it("unlocks when the full prompt loads into an open disclosure and stays unlocked after collapse", async () => {
     const user = userEvent.setup();
     const event = makeEvent({ kind: "llm_prompt_template", llm_draft: "Shortened preview" });
-    const { rerender } = renderCard(event, { compositionState: null });
+    const release = deferSnapshot({ prompt_template: "Complete instruction previously omitted" });
+    renderCard(event);
     await user.click(screen.getByRole("button", { name: "View prompt" }));
     const approve = screen.getByRole("button", { name: /approve the llm prompt template/i });
     expect(approve).toHaveAttribute("aria-disabled", "true");
-    const state: CompositionState = {
-      ...makeCompositionState(),
-      nodes: [{ id: "node-1", node_type: "transform", plugin: "llm", input: "rows", on_success: null, on_error: null,
-        options: { prompt_template: "Complete instruction previously omitted" } }],
-    };
-    rerender(<AcknowledgementCard event={event} sessionId="sess-1" stepLabel="Summarise" compositionState={state} />);
+    await release();
     expect(screen.getByText("Complete instruction previously omitted")).toBeVisible();
     expect(approve).not.toHaveAttribute("aria-disabled");
     await user.click(screen.getByRole("button", { name: "Hide prompt" }));
@@ -761,27 +771,16 @@ describe("AcknowledgementCard — prompt-template View/Approve controls", () => 
 
   it("shows both prompt roles before approval of a single-prompt LLM node", async () => {
     const user = userEvent.setup();
-    const state: CompositionState = {
-      ...makeCompositionState(7),
-      nodes: [{
-        id: "node-1", node_type: "transform", plugin: "llm",
-        input: "rows", on_success: null, on_error: null,
-        options: {
-          system_prompt: "You are a careful reviewer.",
-          prompt_template: "Summarise {{ row.text }}.",
-        },
-      }],
-    };
     renderCard(
       makeEvent({
         kind: "llm_prompt_template",
         llm_draft: "System prompt:\nYou are a careful reviewer.\n\nPrompt template:\nSummarise {{ row.text }}.",
       }),
-      { showAmend: false, compositionState: state },
+      { showAmend: false, promptSurface: { system_prompt: "You are a careful reviewer.", prompt_template: "Summarise {{ row.text }}." } },
     );
     await user.click(screen.getByRole("button", { name: "View prompt" }));
     const region = screen.getByRole("region", { name: /prompt template review/i });
-    expect(region).toHaveTextContent("System prompt");
+    await waitFor(() => expect(region).toHaveTextContent("System prompt"));
     expect(region).toHaveTextContent("You are a careful reviewer.");
     expect(region).toHaveTextContent("User prompt");
     expect(region).toHaveTextContent("Summarise {{ row.text }}.");
@@ -959,7 +958,7 @@ describe("AcknowledgementCard — prompt-template View/Approve controls", () => 
       { showAmend: false },
     );
 
-    const note = screen.getByText(/approve unlocks once you have viewed it/i);
+    const note = await screen.findByText(/approve unlocks once you have viewed it/i);
     expect(note.classList.contains("visually-hidden")).toBe(false);
     const approve = screen.getByRole("button", {
       name: /approve the llm prompt template/i,
@@ -982,287 +981,12 @@ describe("AcknowledgementCard — prompt-template View/Approve controls", () => 
   });
 });
 
-// ── Resolved-prompt rendering (elspeth-990f5ea562) ───────────────────────────
+// ── Snapshot rendering ───────────────────────────────────────────────────────
 
-/** Composition state whose node-1 carries structured prompt parts. */
-function makePromptPartsState(
-  requirement: Record<string, unknown>,
-  version = 5,
-): CompositionState {
-  return {
-    ...makeCompositionState(version),
-    nodes: [
-      {
-        id: "node-1",
-        node_type: "transform",
-        plugin: "llm",
-        input: "rows",
-        on_success: null,
-        on_error: null,
-        options: {
-          prompt_template_parts: [
-            { kind: "text", text: "Summarise " },
-            { kind: "interpretation_ref", requirement_id: "req-1" },
-            { kind: "text", text: " for an auditor." },
-          ],
-          interpretation_requirements: [requirement],
-        },
-      },
-    ],
-  };
-}
-
-const RESOLVED_REQUIREMENT = {
-  id: "req-1",
-  kind: "vague_term",
-  user_term: "punchy",
-  status: "resolved",
-  draft: "short and direct",
-  event_id: "evt-vague-1",
-  accepted_value: "concise and neutral",
-  accepted_artifact_hash: null,
-  resolved_prompt_template_hash: null,
-};
-
-const PENDING_REQUIREMENT = {
-  ...RESOLVED_REQUIREMENT,
-  status: "pending",
-  accepted_value: null,
-};
-
-/** The staging-time frozen draft: slot masked as 'pending interpretation'. */
+/** The staging-time bounded draft. */
 const MASKED_DRAFT = "Summarise pending interpretation for an auditor.";
 
-describe("AcknowledgementCard — resolved-prompt rendering", () => {
-  it("shows the accepted sibling value (not the frozen 'pending interpretation' mask)", async () => {
-    const user = userEvent.setup();
-    renderCard(
-      makeEvent({ kind: "llm_prompt_template", llm_draft: MASKED_DRAFT }),
-      {
-        showAmend: false,
-        compositionState: makePromptPartsState(RESOLVED_REQUIREMENT),
-      },
-    );
-    await user.click(screen.getByRole("button", { name: "View prompt" }));
-
-    const region = screen.getByRole("region", {
-      name: /prompt template review/i,
-    });
-    const mark = region.querySelector("mark.ack-card-prompt-slot--resolved");
-    // The slot carries a visually-hidden "accepted value: " prefix so the
-    // resolved/pending distinction is not CSS-only (WCAG 1.3.1); textContent
-    // therefore includes it even though only the value is visible.
-    expect(mark?.textContent).toBe("accepted value: concise and neutral");
-    // The PRIMARY render carries the substitution; the frozen mask survives
-    // only inside the secondary 'View original template' disclosure.
-    const primaryPre = region.querySelector("pre.ack-card-prompt-pre");
-    expect(primaryPre?.textContent).toBe(
-      "Summarise accepted value: concise and neutral for an auditor.",
-    );
-    expect(primaryPre?.textContent).not.toContain("pending interpretation");
-    // Fully resolved: no pending note, and the legend keys only the tint
-    // that is actually on screen.
-    expect(screen.queryByText(/pending values are drafts/i)).toBeNull();
-    expect(screen.getByText("Accepted value")).toBeTruthy();
-    expect(
-      screen.queryByText(/pending value — awaiting its own review/i),
-    ).toBeNull();
-  });
-
-  it("highlights a still-pending slot with its draft and the pending note", async () => {
-    const user = userEvent.setup();
-    renderCard(
-      makeEvent({ kind: "llm_prompt_template", llm_draft: MASKED_DRAFT }),
-      {
-        showAmend: false,
-        compositionState: makePromptPartsState(PENDING_REQUIREMENT),
-      },
-    );
-    await user.click(screen.getByRole("button", { name: "View prompt" }));
-
-    const region = screen.getByRole("region", {
-      name: /prompt template review/i,
-    });
-    const mark = region.querySelector("mark.ack-card-prompt-slot--pending");
-    // Visually-hidden "pending value: " prefix — see the resolved-slot test.
-    expect(mark?.textContent).toBe("pending value: short and direct");
-    expect(screen.getByText(/pending values are drafts/i)).toBeTruthy();
-    // All-pending: only the pending tint is keyed.
-    expect(
-      screen.getByText("Pending value — awaiting its own review"),
-    ).toBeTruthy();
-    expect(screen.queryByText("Accepted value")).toBeNull();
-  });
-
-  // ── Mixed prompt: the case the old caption got wrong ──────────────────────
-  //
-  // ux-review 2026-08-13 (UX-2): resolved AND pending slots both render as
-  // <mark>, differing only by CSS class, and the note said "Highlighted
-  // values await their own interpretation reviews" — false for every resolved
-  // slot.  On a mixed prompt (one accepted slot, one still pending: the
-  // normal state part-way through a review queue) an operator either
-  // discounted a value they had already attested or read a draft as settled.
-  // The visible legend now matches the sr-only per-slot prefixes, which had
-  // this right all along.
-  it("keys BOTH tints and scopes the note to pending on a mixed prompt", async () => {
-    const user = userEvent.setup();
-    const mixedState: CompositionState = {
-      ...makeCompositionState(5),
-      nodes: [
-        {
-          id: "node-1",
-          node_type: "transform",
-          plugin: "llm",
-          input: "rows",
-          on_success: null,
-          on_error: null,
-          options: {
-            prompt_template_parts: [
-              { kind: "text", text: "Summarise " },
-              { kind: "interpretation_ref", requirement_id: "req-1" },
-              { kind: "text", text: " complaints at " },
-              { kind: "interpretation_ref", requirement_id: "req-2" },
-              { kind: "text", text: " severity." },
-            ],
-            interpretation_requirements: [
-              RESOLVED_REQUIREMENT,
-              { ...PENDING_REQUIREMENT, id: "req-2", draft: "high" },
-            ],
-          },
-        },
-      ],
-    };
-    renderCard(
-      makeEvent({ kind: "llm_prompt_template", llm_draft: MASKED_DRAFT }),
-      { showAmend: false, compositionState: mixedState },
-    );
-    await user.click(screen.getByRole("button", { name: "View prompt" }));
-
-    const region = screen.getByRole("region", {
-      name: /prompt template review/i,
-    });
-    // Both tints are on screen…
-    expect(
-      region.querySelectorAll("mark.ack-card-prompt-slot--resolved"),
-    ).toHaveLength(1);
-    expect(
-      region.querySelectorAll("mark.ack-card-prompt-slot--pending"),
-    ).toHaveLength(1);
-    // …so BOTH legend items render, and the distinction is carried by TEXT
-    // (the swatches are aria-hidden decoration, stripped under forced-colors).
-    expect(screen.getByText("Accepted value")).toBeTruthy();
-    expect(
-      screen.getByText("Pending value — awaiting its own review"),
-    ).toBeTruthy();
-    // The note's subject is the PENDING tint alone — never "Highlighted
-    // values", which was true of the resolved slot too.
-    const note = screen.getByText(/drafts from their own reviews/i);
-    expect(note.textContent).toContain("Pending values");
-    expect(note.textContent).not.toContain("Highlighted values");
-  });
-
-  it("keys nothing when the prompt has no interpretation slots at all", async () => {
-    // A legend for tints that are not on screen would be noise, and the
-    // one-way invariant runs the same direction as the control naming:
-    // never key a distinction the render does not make.
-    const user = userEvent.setup();
-    renderCard(
-      makeEvent({
-        kind: "llm_prompt_template",
-        llm_draft: "Summarise the row for an auditor.",
-      }),
-      { showAmend: false, compositionState: null },
-    );
-    await user.click(screen.getByRole("button", { name: "View prompt" }));
-
-    expect(screen.queryByText("Accepted value")).toBeNull();
-    expect(
-      screen.queryByText("Pending value — awaiting its own review"),
-    ).toBeNull();
-    expect(screen.queryByText(/pending values are drafts/i)).toBeNull();
-  });
-
-  // ── Fallback visibility (code-review 2026-08-13) ──────────────────────────
-  //
-  // promptTemplateDisplay's `usedFallback` was computed on every return path
-  // and read by nothing.  On a card whose entire purpose is showing what
-  // actually runs, a degraded render that looks identical to the resolved one
-  // is the wrong silence — so the flag now drives a visible note.
-  it("says so when the structured parts could not be rendered", async () => {
-    const user = userEvent.setup();
-    const malformedState: CompositionState = {
-      ...makeCompositionState(5),
-      nodes: [
-        {
-          id: "node-1",
-          node_type: "transform",
-          plugin: "llm",
-          input: "rows",
-          on_success: null,
-          on_error: null,
-          options: {
-            // Malformed parts → the resolver falls back to prompt_template.
-            prompt_template_parts: "not-a-list",
-            interpretation_requirements: [],
-            prompt_template: "Summarise the row for an auditor.",
-          },
-        },
-      ],
-    };
-    renderCard(
-      makeEvent({ kind: "llm_prompt_template", llm_draft: MASKED_DRAFT }),
-      { showAmend: false, compositionState: malformedState },
-    );
-    await user.click(screen.getByRole("button", { name: "View prompt" }));
-
-    expect(
-      screen.getByText(/showing the stored prompt template as-is/i),
-    ).toBeTruthy();
-  });
-
-  it("shows no fallback note when the structured parts DID render", async () => {
-    const user = userEvent.setup();
-    renderCard(
-      makeEvent({ kind: "llm_prompt_template", llm_draft: MASKED_DRAFT }),
-      {
-        showAmend: false,
-        compositionState: makePromptPartsState(RESOLVED_REQUIREMENT),
-      },
-    );
-    await user.click(screen.getByRole("button", { name: "View prompt" }));
-
-    expect(
-      screen.queryByText(/showing the stored prompt template as-is/i),
-    ).toBeNull();
-  });
-
-  it("names each slot's review status in visually-hidden text (not CSS-only)", async () => {
-    // The resolved-vs-pending distinction is a status fact on an approval
-    // surface; background/border on <mark> alone is imperceivable to a
-    // screen-reader user, so each slot carries a .visually-hidden prefix
-    // ("accepted value: " / "pending value: ") inside the mark.
-    const user = userEvent.setup();
-    for (const [requirement, slotKind, prefix] of [
-      [RESOLVED_REQUIREMENT, "resolved", "accepted value: "],
-      [PENDING_REQUIREMENT, "pending", "pending value: "],
-    ] as const) {
-      const { unmount } = renderCard(
-        makeEvent({ kind: "llm_prompt_template", llm_draft: MASKED_DRAFT }),
-        {
-          showAmend: false,
-          compositionState: makePromptPartsState(requirement),
-        },
-      );
-      await user.click(screen.getByRole("button", { name: "View prompt" }));
-      const mark = document.querySelector(
-        `mark.ack-card-prompt-slot--${slotKind}`,
-      );
-      const hidden = mark?.querySelector("span.visually-hidden");
-      expect(hidden?.textContent).toBe(prefix);
-      unmount();
-    }
-  });
-
+describe("AcknowledgementCard — snapshot rendering", () => {
   it("offers 'View original template' with the frozen draft only when it differs", async () => {
     const user = userEvent.setup();
     const event = makeEvent({
@@ -1271,63 +995,23 @@ describe("AcknowledgementCard — resolved-prompt rendering", () => {
     });
     const { unmount } = renderCard(event, {
       showAmend: false,
-      compositionState: makePromptPartsState(RESOLVED_REQUIREMENT),
+      promptSurface: { prompt_template: "Summarise concise and neutral for an auditor." },
     });
     await user.click(screen.getByRole("button", { name: "View prompt" }));
 
-    const disclosure = screen.getByText("View original template");
+    const disclosure = await screen.findByText("View original template");
     expect(disclosure.closest("details")?.textContent).toContain(MASKED_DRAFT);
     unmount();
 
-    // Fallback path (no composition state): the render IS the frozen draft,
-    // so no secondary disclosure appears.
+    // The snapshot text equals the draft: no secondary disclosure.
+    vi.mocked(api.getPromptReviewSnapshot).mockResolvedValue(promptSnapshot({ prompt_template: MASKED_DRAFT }));
     renderCard(event, { showAmend: false });
     await user.click(screen.getByRole("button", { name: "View prompt" }));
-    expect(screen.getByText(MASKED_DRAFT)).toBeTruthy();
+    expect(await screen.findByText(MASKED_DRAFT)).toBeTruthy();
     expect(screen.queryByText("View original template")).toBeNull();
   });
 
-  it("re-renders with fresh substitutions when a sibling resolve updates the state prop", async () => {
-    const user = userEvent.setup();
-    const event = makeEvent({
-      kind: "llm_prompt_template",
-      llm_draft: MASKED_DRAFT,
-    });
-    const { rerender } = render(
-      <AcknowledgementCard
-        event={event}
-        sessionId="sess-1"
-        stepLabel="Summarise"
-        compositionState={makePromptPartsState(PENDING_REQUIREMENT, 5)}
-        showAmend={false}
-      />,
-    );
-    await user.click(screen.getByRole("button", { name: "View prompt" }));
-    // Read the slot through its class + textContent, NOT getByText: the
-    // visually-hidden prefix is a child <span>, and testing-library's text
-    // matcher only joins an element's DIRECT text nodes, so no single element
-    // ever "has" the combined string.
-    function slotText(kind: "pending" | "resolved"): string | null {
-      const mark = document.querySelector(`mark.ack-card-prompt-slot--${kind}`);
-      return mark === null ? null : mark.textContent;
-    }
-    expect(slotText("pending")).toBe("pending value: short and direct");
-    expect(slotText("resolved")).toBeNull();
-
-    rerender(
-      <AcknowledgementCard
-        event={event}
-        sessionId="sess-1"
-        stepLabel="Summarise"
-        compositionState={makePromptPartsState(RESOLVED_REQUIREMENT, 6)}
-        showAmend={false}
-      />,
-    );
-    expect(slotText("resolved")).toBe("accepted value: concise and neutral");
-    expect(slotText("pending")).toBeNull();
-  });
-
-  it("multi-query card: renders every query and the live node-level template, in a scrolling region", async () => {
+  it("multi-query card: renders every query and the node-level template, in a scrolling region", async () => {
     // The bounded staging-time draft omits queries the review anchor covers;
     // the card must show the live, complete surface instead.
     const user = userEvent.setup();
@@ -1340,39 +1024,19 @@ describe("AcknowledgementCard — resolved-prompt rendering", () => {
     queries.shared = {};
     const frozenDraft =
       "Multi-query LLM node: for every row the model receives one call per query below.\n\nQueries not listed in this draft: the last 18 of 41; the review attests their names and templates in full.";
-    const state: CompositionState = {
-      ...makeCompositionState(7),
-      nodes: [
-        {
-          id: "node-1",
-          node_type: "transform",
-          plugin: "llm",
-          input: "rows",
-          on_success: null,
-          on_error: null,
-          options: {
-            prompt_template: "Summarise concise and neutral.",
-            prompt_template_parts: [
-              { kind: "text", text: "Summarise " },
-              { kind: "interpretation_ref", requirement_id: "req-1" },
-              { kind: "text", text: "." },
-            ],
-            interpretation_requirements: [RESOLVED_REQUIREMENT],
-            system_prompt: "Reply briefly.",
-            queries,
-          },
-        },
-      ],
-    };
     renderCard(
       makeEvent({ kind: "llm_prompt_template", llm_draft: frozenDraft }),
-      { showAmend: false, compositionState: state },
+      {
+        showAmend: false,
+        promptSurface: { prompt_template: "Summarise concise and neutral.", system_prompt: "Reply briefly.", queries },
+      },
     );
     await user.click(screen.getByRole("button", { name: "View prompt" }));
 
     const region = screen.getByRole("region", {
       name: /prompt template review/i,
     });
+    await waitFor(() => expect(region).toHaveTextContent("Reply briefly."));
     // A long surface scrolls inside the region rather than growing the card.
     expect(region.style.maxHeight).toBe("16rem");
     expect(region.style.overflow).toBe("auto");
@@ -1388,15 +1052,9 @@ describe("AcknowledgementCard — resolved-prompt rendering", () => {
       "Query 'shared': uses the node-level prompt_template (below).",
     );
     expect(text).toContain(
-      "Node-level prompt_template, used by queries without their own template: shared\nSummarise accepted value: concise and neutral.",
+      "Node-level prompt_template, used by queries without their own template: shared\nSummarise concise and neutral.",
     );
     expect(text).not.toContain("not listed");
-    // Slot highlighting still works inside the node-level template.
-    const mark = region.querySelector("mark.ack-card-prompt-slot--resolved");
-    expect(mark?.textContent).toBe("accepted value: concise and neutral");
-    expect(screen.getByText("Accepted value")).toBeTruthy();
-    // Every part rendered from live options: no stored-template notice.
-    expect(screen.queryByText(/showing the stored prompt template/i)).toBeNull();
     // The frozen draft stays reachable only behind the secondary disclosure.
     const disclosure = screen.getByText("View original template");
     expect(disclosure.closest("details")?.textContent).toContain(
@@ -1409,21 +1067,8 @@ describe("AcknowledgementCard — multi-query prompt without a shared template",
   // Staging report 2026-11-16: every query supplies its own template and the
   // optional node-level prompt_template is omitted. The card must render the
   // live surface and let the user approve after viewing it.
-  function multiQueryState(queries: unknown[]): CompositionState {
-    return {
-      ...makeCompositionState(7),
-      nodes: [
-        {
-          id: "node-1",
-          node_type: "transform",
-          plugin: "llm",
-          input: "rows",
-          on_success: null,
-          on_error: null,
-          options: { system_prompt: "Reply briefly.", queries },
-        },
-      ],
-    };
+  function multiQuerySurface(queries: unknown[]): Record<string, unknown> {
+    return { system_prompt: "Reply briefly.", queries };
   }
 
   it("shows every per-query template and unlocks Approve after View prompt", async () => {
@@ -1432,7 +1077,7 @@ describe("AcknowledgementCard — multi-query prompt without a shared template",
     vi.mocked(api.resolveInterpretation).mockResolvedValue(makeResolveResponse(event));
     renderCard(event, {
       showAmend: false,
-      compositionState: multiQueryState([
+      promptSurface: multiQuerySurface([
         { name: "first", template: "Summarise {{ row.text }}." },
         { name: "second", template: "List themes in {{ row.text }}." },
       ]),
@@ -1443,6 +1088,7 @@ describe("AcknowledgementCard — multi-query prompt without a shared template",
     await user.click(screen.getByRole("button", { name: "View prompt" }));
 
     const region = screen.getByRole("region", { name: /prompt template review/i });
+    await waitFor(() => expect(region).toHaveTextContent("Reply briefly."));
     const text = region.querySelector("pre.ack-card-prompt-pre")?.textContent ?? "";
     expect(text).toContain("System prompt (sent with every query):\nReply briefly.\n");
     expect(text).toContain("Query 'first':\nSummarise {{ row.text }}.\n");
@@ -1459,14 +1105,376 @@ describe("AcknowledgementCard — multi-query prompt without a shared template",
     const user = userEvent.setup();
     renderCard(makeEvent({ kind: "llm_prompt_template", llm_draft: "Bounded staging-time preview." }), {
       showAmend: false,
-      compositionState: multiQueryState([{ name: "first", template: "A." }, { name: "second" }]),
+      promptSurface: multiQuerySurface([{ name: "first", template: "A." }, { name: "second" }]),
     });
     await user.click(screen.getByRole("button", { name: "View prompt" }));
+    await waitFor(() => expect(screen.getByRole("region", { name: /prompt template review/i })).toHaveTextContent("Query 'second'"));
     const approve = screen.getByRole("button", { name: /approve the llm prompt template/i });
     expect(approve.getAttribute("aria-disabled")).toBe("true");
     expect(screen.getByText(/the complete prompt is not available/i)).toBeTruthy();
     await user.click(approve);
     expect(api.resolveInterpretation).not.toHaveBeenCalled();
+  });
+});
+
+// ── Reviewed snapshot binding ────────────────────────────────────────────────
+//
+// The card shows the server's stored review snapshot and approves THAT
+// snapshot's anchor; the browser's compositionState can be stale (a second
+// tab, a failed state read) and must never decide what the user approves.
+
+const ANCHOR_1 = "1".repeat(64);
+const ANCHOR_2 = "2".repeat(64);
+
+function inlineSnapshot(
+  authoredSurface: Record<string, unknown>,
+  anchor: string,
+  eventId = "evt-1",
+): Awaited<ReturnType<typeof api.getPromptReviewSnapshot>> {
+  return {
+    version: 1, session_id: "sess-1", node_id: "node-1", event_id: eventId,
+    authored_surface: authoredSurface, bindings: [], anchor,
+    effective_artifact_hash: null, is_live_review: true,
+  };
+}
+
+function staleBrowserState(): CompositionState {
+  return {
+    ...makeCompositionState(5),
+    nodes: [{ id: "node-1", node_type: "transform", plugin: "llm", input: "rows", on_success: null, on_error: null,
+      options: { system_prompt: "STALE TAB SYSTEM", prompt_template: "STALE TAB TEMPLATE" } }],
+  };
+}
+
+describe("AcknowledgementCard — reviewed snapshot binding", () => {
+  it("shows the stored snapshot, not a stale browser state, and approves that snapshot's anchor", async () => {
+    const user = userEvent.setup();
+    const event = makeEvent({ kind: "llm_prompt_template", llm_draft: "Bounded preview" });
+    vi.mocked(api.getPromptReviewSnapshot).mockResolvedValue(
+      inlineSnapshot({ system_prompt: "SERVER SYSTEM", prompt_template: "SERVER TEMPLATE" }, ANCHOR_1),
+    );
+    vi.mocked(api.resolveInterpretation).mockResolvedValue(makeResolveResponse(event));
+    // The stale tab's state sits where any browser-state read would find it.
+    useSessionStore.setState({ compositionState: staleBrowserState() });
+    renderCard(event, { showAmend: false });
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    const region = screen.getByRole("region", { name: /prompt template review/i });
+    await waitFor(() => expect(region).toHaveTextContent("SERVER TEMPLATE"));
+    expect(region).toHaveTextContent("SERVER SYSTEM");
+    expect(region).not.toHaveTextContent("STALE TAB");
+    await user.click(screen.getByRole("button", { name: /approve the llm prompt template/i }));
+    await waitFor(() => expect(api.resolveInterpretation).toHaveBeenCalledTimes(1));
+    expect(api.resolveInterpretation).toHaveBeenCalledWith(
+      "sess-1", event.id, { choice: "accepted_as_drafted", reviewed_anchor: ANCHOR_1 },
+    );
+  });
+
+  it("renders an inline card from its snapshot even with no browser state", async () => {
+    const user = userEvent.setup();
+    const event = makeEvent({ kind: "llm_prompt_template", llm_draft: "Bounded preview" });
+    vi.mocked(api.getPromptReviewSnapshot).mockResolvedValue(
+      inlineSnapshot({ prompt_template: "Inline snapshot instruction." }, ANCHOR_1),
+    );
+    useSessionStore.setState({ compositionState: null });
+    renderCard(event, { showAmend: false });
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    await waitFor(() => expect(screen.getByRole("region", { name: /prompt template review/i }))
+      .toHaveTextContent("Inline snapshot instruction."));
+    expect(screen.getByRole("button", { name: /approve the llm prompt template/i })).not.toHaveAttribute("aria-disabled");
+  });
+
+  it.each(["prompt_review_stale", "prompt_review_snapshot_missing"])(
+    "on a 409 %s re-fetches, re-renders, announces the change and does not approve",
+    async (code) => {
+      const user = userEvent.setup();
+      const event = makeEvent({ kind: "llm_prompt_template", llm_draft: "Bounded preview" });
+      vi.mocked(api.getPromptReviewSnapshot)
+        .mockResolvedValueOnce(inlineSnapshot({ prompt_template: "FIRST TEXT" }, ANCHOR_1))
+        .mockResolvedValueOnce(inlineSnapshot({ prompt_template: "SECOND TEXT" }, ANCHOR_2));
+      vi.mocked(api.resolveInterpretation).mockRejectedValue({ ...makeApiError(409, "changed"), error_type: code });
+      renderCard(event, { showAmend: false });
+      await user.click(screen.getByRole("button", { name: "View prompt" }));
+      await waitFor(() => expect(screen.getByRole("region", { name: /prompt template review/i })).toHaveTextContent("FIRST TEXT"));
+      await user.click(screen.getByRole("button", { name: /approve the llm prompt template/i }));
+      await waitFor(() => expect(api.getPromptReviewSnapshot).toHaveBeenCalledTimes(2));
+      expect(await screen.findByText(/this prompt changed since you opened it/i)).toBeInTheDocument();
+      expect(screen.getByText(/this prompt changed since you opened it/i).closest("[role='status']")).not.toBeNull();
+      // The new text is shown only once the user opens it again: approval
+      // re-gates, and nothing is approved on the user's behalf.
+      const approve = screen.getByRole("button", { name: /approve the llm prompt template/i });
+      expect(approve).toHaveAttribute("aria-disabled", "true");
+      await user.click(screen.getByRole("button", { name: "View prompt" }));
+      await waitFor(() => expect(screen.getByRole("region", { name: /prompt template review/i })).toHaveTextContent("SECOND TEXT"));
+      expect(api.resolveInterpretation).toHaveBeenCalledTimes(1);
+      expect(useInterpretationEventsStore.getState().resolvedBySession["sess-1"] ?? []).toHaveLength(0);
+    },
+  );
+
+  it.each([
+    ["a structured prompt (stored with the slot wording)", "Summarise pending interpretation for an auditor."],
+    ["a legacy placeholder", "Summarise {{interpretation:punchy}} for an auditor."],
+  ])("shows readable text at an interpretation slot in %s, and explains it", async (_case, template) => {
+    const user = userEvent.setup();
+    vi.mocked(api.getPromptReviewSnapshot).mockResolvedValue(inlineSnapshot({ prompt_template: template }, ANCHOR_1));
+    renderCard(makeEvent({ kind: "llm_prompt_template", llm_draft: "Bounded preview" }), { showAmend: false });
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    const region = screen.getByRole("region", { name: /prompt template review/i });
+    await waitFor(() => expect(region.querySelector("pre.ack-card-prompt-pre")?.textContent)
+      .toBe("Summarise pending interpretation for an auditor."));
+    expect(region).not.toHaveTextContent("{{");
+    expect(region).toHaveTextContent(
+      "“pending interpretation” marks a term you review in its own card; the prompt runs with the value you accept there.",
+    );
+    // A snapshot without the frozen parts skeleton has no slots to mark: no
+    // legend, no marks, no crash.
+    expect(region.querySelector("mark")).toBeNull();
+    expect(region.querySelector(".ack-card-prompt-legend")).toBeNull();
+  });
+
+  it("disables Approve with a reason when the snapshot cannot load", async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.getPromptReviewSnapshot).mockRejectedValue(makeApiError(404, "not found"));
+    useSessionStore.setState({ compositionState: staleBrowserState() });
+    renderCard(makeEvent({ kind: "llm_prompt_template", llm_draft: "Bounded preview" }), { showAmend: false });
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    const approve = screen.getByRole("button", { name: /approve the llm prompt template/i });
+    const reason = await screen.findByText(/could not be loaded/i);
+    expect(approve).toHaveAttribute("aria-disabled", "true");
+    expect(approve.getAttribute("aria-describedby")).toBe(reason.id);
+    expect(screen.queryByText("STALE TAB TEMPLATE")).toBeNull();
+    await user.click(approve);
+    expect(api.resolveInterpretation).not.toHaveBeenCalled();
+  });
+});
+
+// ── Slot status from the interpretation events (option d) ────────────────────
+//
+// A structured prompt's slots come from the snapshot's frozen
+// prompt_template_parts. Each renders as a span saying it is reviewed in its
+// own card, tinted and labelled with that review's live STATUS from the
+// interpretation events store. The slot's live TEXT (accepted value, or the
+// value in compositionState) is never shown.
+
+const SLOTTED_SURFACE = {
+  prompt_template: "Summarise pending interpretation in a pending interpretation tone.",
+  prompt_template_parts: [
+    { kind: "text", text: "Summarise " },
+    { kind: "interpretation_ref", requirement_id: "req-topic" },
+    { kind: "text", text: " in a " },
+    { kind: "interpretation_ref", requirement_id: "req-tone" },
+    { kind: "text", text: " tone." },
+  ],
+  interpretation_requirements: [
+    { id: "req-topic", event_id: "evt-topic", user_term: "the key points" },
+    { id: "req-tone", event_id: "evt-tone", user_term: "punchy" },
+  ],
+};
+
+function vagueEvent(id: string, term: string, overrides: Partial<InterpretationEvent> = {}): InterpretationEvent {
+  return makeEvent({ id, kind: "vague_term", user_term: term, llm_draft: `DRAFT FOR ${term}`, ...overrides });
+}
+
+function setSlotEvents(pending: InterpretationEvent[], resolved: InterpretationEvent[]) {
+  useInterpretationEventsStore.setState({
+    pendingBySession: { "sess-1": Object.fromEntries(pending.map((event) => [event.id, event])) },
+    resolvedBySession: { "sess-1": resolved },
+  });
+}
+
+/** The visible text of each slot span (the sr-only prefix removed). */
+function visibleSlotTexts(region: HTMLElement): string[] {
+  return Array.from(region.querySelectorAll("mark.ack-card-prompt-slot")).map((mark) => {
+    const clone = mark.cloneNode(true) as HTMLElement;
+    clone.querySelectorAll(".visually-hidden").forEach((hidden) => hidden.remove());
+    return clone.textContent ?? "";
+  });
+}
+
+async function openSlottedCard() {
+  const user = userEvent.setup();
+  vi.mocked(api.getPromptReviewSnapshot).mockResolvedValue(inlineSnapshot(SLOTTED_SURFACE, ANCHOR_1));
+  renderCard(makeEvent({ kind: "llm_prompt_template", llm_draft: "Bounded preview" }), { showAmend: false });
+  await user.click(screen.getByRole("button", { name: "View prompt" }));
+  const region = screen.getByRole("region", { name: /prompt template review/i });
+  await waitFor(() => expect(region.querySelectorAll("mark.ack-card-prompt-slot")).toHaveLength(2));
+  return region;
+}
+
+describe("AcknowledgementCard — slot status from the interpretation events", () => {
+  it("after a vague-term accept, the slot's status changes and the prompt text does not", async () => {
+    const tone = vagueEvent("evt-tone", "punchy");
+    const topic = vagueEvent("evt-topic", "the key points");
+    setSlotEvents([topic, tone], []);
+    const region = await openSlottedCard();
+    expect(visibleSlotTexts(region)).toEqual([
+      "[“the key points”, reviewed in its own card: pending]",
+      "[“punchy”, reviewed in its own card: pending]",
+    ]);
+    const textPieces = () =>
+      Array.from(region.querySelectorAll("pre.ack-card-prompt-pre > span")).map((span) => span.textContent);
+    const before = textPieces();
+    expect(before).toEqual(["Summarise ", " in a ", " tone."]);
+
+    // The tone review is accepted (amended to a new value), and the live
+    // composition state now carries that value in the prompt.
+    act(() => {
+      setSlotEvents([topic], [{ ...tone, choice: "amended", accepted_value: "LIVE VALUE vivid and short" }]);
+      useSessionStore.setState({
+        compositionState: {
+          ...makeCompositionState(6),
+          nodes: [{ id: "node-1", node_type: "transform", plugin: "llm", input: "rows", on_success: null, on_error: null,
+            options: { prompt_template: "Summarise pending interpretation in a LIVE VALUE vivid and short tone." } }],
+        },
+      });
+    });
+
+    expect(visibleSlotTexts(region)).toEqual([
+      "[“the key points”, reviewed in its own card: pending]",
+      "[“punchy”, reviewed in its own card: accepted]",
+    ]);
+    expect(textPieces()).toEqual(before);
+    expect(region).not.toHaveTextContent("LIVE VALUE");
+    expect(region).not.toHaveTextContent("DRAFT FOR");
+    expect(api.getPromptReviewSnapshot).toHaveBeenCalledTimes(1);
+  });
+
+  // At surfacing the server freezes event_id: null for a slot whose vague
+  // term has not resolved yet (the usual case). The status is then found by
+  // the card's node and the slot's user_term, and only from EXACTLY one
+  // vague_term event; anything else is "status not shown here".
+  const UNLINKED_SURFACE = {
+    ...SLOTTED_SURFACE,
+    interpretation_requirements: [
+      { id: "req-topic", event_id: null, user_term: "the key points" },
+      { id: "req-tone", event_id: null, user_term: "punchy" },
+    ],
+  };
+
+  async function openUnlinkedCard() {
+    const user = userEvent.setup();
+    vi.mocked(api.getPromptReviewSnapshot).mockResolvedValue(inlineSnapshot(UNLINKED_SURFACE, ANCHOR_1));
+    renderCard(makeEvent({ kind: "llm_prompt_template", llm_draft: "Bounded preview" }), { showAmend: false });
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    const region = screen.getByRole("region", { name: /prompt template review/i });
+    await waitFor(() => expect(region.querySelectorAll("mark.ack-card-prompt-slot")).toHaveLength(2));
+    return region;
+  }
+
+  it("finds an unlinked slot's status by node and term: pending, then accepted once its card resolves", async () => {
+    const topic = vagueEvent("evt-topic", "the key points");
+    const tone = vagueEvent("evt-tone", "punchy");
+    setSlotEvents([topic, tone], []);
+    const region = await openUnlinkedCard();
+    expect(visibleSlotTexts(region)).toEqual([
+      "[“the key points”, reviewed in its own card: pending]",
+      "[“punchy”, reviewed in its own card: pending]",
+    ]);
+    act(() => setSlotEvents([topic], [{ ...tone, choice: "amended", accepted_value: "LIVE VALUE vivid" }]));
+    expect(visibleSlotTexts(region)).toEqual([
+      "[“the key points”, reviewed in its own card: pending]",
+      "[“punchy”, reviewed in its own card: accepted]",
+    ]);
+    expect(region).not.toHaveTextContent("LIVE VALUE");
+  });
+
+  it("does not show an unlinked slot as accepted when two vague reviews on the node share its term", async () => {
+    setSlotEvents(
+      [vagueEvent("evt-tone-2", "punchy")],
+      [vagueEvent("evt-tone-1", "punchy", { choice: "accepted_as_drafted" })],
+    );
+    const region = await openUnlinkedCard();
+    expect(visibleSlotTexts(region)[1]).toBe("[“punchy”, reviewed in its own card: status not shown here]");
+  });
+
+  it("does not match an unlinked slot to another node's review of the same term", async () => {
+    setSlotEvents([], [vagueEvent("evt-tone", "punchy", { choice: "accepted_as_drafted", affected_node_id: "node-2" })]);
+    const region = await openUnlinkedCard();
+    expect(visibleSlotTexts(region)[1]).toBe("[“punchy”, reviewed in its own card: status not shown here]");
+  });
+
+  it("does not match an unlinked slot to a review that is not a vague term", async () => {
+    setSlotEvents([], [makeEvent({ id: "evt-x", kind: "llm_model_choice", user_term: "punchy", choice: "accepted_as_drafted" })]);
+    const region = await openUnlinkedCard();
+    expect(visibleSlotTexts(region)[1]).toBe("[“punchy”, reviewed in its own card: status not shown here]");
+  });
+
+  it("keeps an inline card approvable, with its anchor, after a sibling vague term resolved first", async () => {
+    // The server re-renders the live prompt_template when a sibling slot is
+    // resolved, so the inline snapshot reports is_live_review: false, while
+    // the skeleton (and the anchor the resolve checks) is unchanged and the
+    // server accepts the approval.
+    const user = userEvent.setup();
+    const event = makeEvent({ kind: "llm_prompt_template", llm_draft: "Bounded preview" });
+    setSlotEvents([vagueEvent("evt-topic", "the key points")], [vagueEvent("evt-tone", "punchy", { choice: "accepted_as_drafted" })]);
+    vi.mocked(api.getPromptReviewSnapshot).mockResolvedValue({
+      ...inlineSnapshot(SLOTTED_SURFACE, ANCHOR_1),
+      is_live_review: false,
+    });
+    vi.mocked(api.resolveInterpretation).mockResolvedValue(makeResolveResponse(event));
+    renderCard(event, { showAmend: false });
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    const region = screen.getByRole("region", { name: /prompt template review/i });
+    await waitFor(() => expect(visibleSlotTexts(region)).toContain("[“punchy”, reviewed in its own card: accepted]"));
+    const approve = screen.getByRole("button", { name: /approve the llm prompt template/i });
+    expect(approve).not.toHaveAttribute("aria-disabled");
+    await user.click(approve);
+    await waitFor(() => expect(api.resolveInterpretation).toHaveBeenCalledTimes(1));
+    expect(api.resolveInterpretation).toHaveBeenCalledWith(
+      "sess-1", event.id, { choice: "accepted_as_drafted", reviewed_anchor: ANCHOR_1 },
+    );
+  });
+
+  it("keys exactly the statuses on screen in the legend, in words", async () => {
+    setSlotEvents([vagueEvent("evt-topic", "the key points")], [vagueEvent("evt-tone", "punchy", { choice: "accepted_as_drafted" })]);
+    const region = await openSlottedCard();
+    const legend = region.querySelector(".ack-card-prompt-legend");
+    expect(Array.from(legend?.querySelectorAll("li") ?? []).map((item) => item.textContent)).toEqual([
+      "Accepted — its own review is approved",
+      "Pending — awaiting its own review",
+    ]);
+    expect(region.querySelector("mark.ack-card-prompt-slot--accepted")).not.toBeNull();
+    expect(region.querySelector("mark.ack-card-prompt-slot--pending")).not.toBeNull();
+  });
+
+  it("keys only the pending status when every slot is pending", async () => {
+    setSlotEvents([vagueEvent("evt-topic", "the key points"), vagueEvent("evt-tone", "punchy")], []);
+    const region = await openSlottedCard();
+    expect(Array.from(region.querySelectorAll(".ack-card-prompt-legend li")).map((item) => item.textContent)).toEqual([
+      "Pending — awaiting its own review",
+    ]);
+  });
+
+  it("shows a slot whose review is not loaded as status unknown, never as accepted", async () => {
+    setSlotEvents([], [vagueEvent("evt-tone", "punchy", { choice: "superseded" })]);
+    const region = await openSlottedCard();
+    expect(visibleSlotTexts(region)).toEqual([
+      "[“the key points”, reviewed in its own card: status not shown here]",
+      "[“punchy”, reviewed in its own card: status not shown here]",
+    ]);
+    expect(Array.from(region.querySelectorAll(".ack-card-prompt-legend li")).map((item) => item.textContent)).toEqual([
+      "Status not shown here — see its own card",
+    ]);
+  });
+
+  it("gives each slot a screen-reader status prefix in the legend's words", async () => {
+    setSlotEvents([vagueEvent("evt-topic", "the key points")], [vagueEvent("evt-tone", "punchy", { choice: "accepted_as_drafted" })]);
+    const region = await openSlottedCard();
+    expect(Array.from(region.querySelectorAll("mark .visually-hidden")).map((hidden) => hidden.textContent)).toEqual([
+      "interpretation slot, pending: ",
+      "interpretation slot, accepted: ",
+    ]);
+  });
+
+  it("keys nothing for a prompt with no slots", async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.getPromptReviewSnapshot).mockResolvedValue(inlineSnapshot({ prompt_template: "No slots here." }, ANCHOR_1));
+    renderCard(makeEvent({ kind: "llm_prompt_template", llm_draft: "Bounded preview" }), { showAmend: false });
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    const region = screen.getByRole("region", { name: /prompt template review/i });
+    await waitFor(() => expect(region).toHaveTextContent("No slots here."));
+    expect(region.querySelector(".ack-card-prompt-legend")).toBeNull();
+    expect(region.querySelector("mark")).toBeNull();
+    expect(region).not.toHaveTextContent(/reviewed in its own card/);
   });
 });
 

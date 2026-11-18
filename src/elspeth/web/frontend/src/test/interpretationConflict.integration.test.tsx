@@ -43,6 +43,33 @@ function response(body: unknown, status: number): Response {
   });
 }
 
+const REVIEWED_ANCHOR = "e".repeat(64);
+
+/** The prompt card's stored review snapshot, as the backend serves it. */
+function snapshotResponse(): Response {
+  return response({
+    version: 1, session_id: "session-1", node_id: "variant_a", event_id: event.id,
+    authored_surface: { system_prompt: "Summarise precisely.", prompt_template: "Summarise {{ row.text }}." },
+    bindings: [], anchor: REVIEWED_ANCHOR, effective_artifact_hash: null, is_live_review: true,
+  }, 200);
+}
+
+/**
+ * Transport stub: the snapshot GET always answers with the stored snapshot;
+ * every other request takes the next queued response. `writes` records only
+ * the non-snapshot calls.
+ */
+function routedFetch(next: () => Response) {
+  const writes = vi.fn<typeof fetch>((async () => next()) as typeof fetch);
+  const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (url.endsWith(`/interpretations/${event.id}/prompt`)) return snapshotResponse();
+    return writes(input, init);
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return writes;
+}
+
 beforeEach(() => {
   resetStore(useInterpretationEventsStore);
   resetStore(useSessionStore);
@@ -65,9 +92,9 @@ describe("interpretation approval HTTP conflicts", () => {
     { detail: "Session operation is already active" },
     { detail: { code: "another_conflict", message: "The session changed. Review the current draft." } },
   ])("preserves an unapproved card and permits retry after $detail", async (body) => {
-    const fetchMock = vi.fn<typeof fetch>()
-      .mockResolvedValueOnce(response(body, 409))
-      .mockResolvedValueOnce(response({
+    const queued = [
+      () => response(body, 409),
+      () => response({
         event: {
           ...event,
           choice: "accepted_as_drafted",
@@ -84,11 +111,18 @@ describe("interpretation approval HTTP conflicts", () => {
           outputs: [],
           metadata: { name: null, description: null },
         },
-      }, 200));
-    vi.stubGlobal("fetch", fetchMock);
+      }, 200),
+    ];
+    const fetchMock = routedFetch(() => {
+      const next = queued.shift();
+      if (next === undefined) throw new Error("unexpected request");
+      return next();
+    });
     const user = userEvent.setup();
     render(<AcknowledgementStack sessionId="session-1" />);
     await user.click(screen.getByRole("button", { name: /view prompt/i }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /approve the llm prompt template/i }))
+      .not.toHaveAttribute("aria-disabled"));
     await user.click(screen.getByRole("button", { name: /approve the llm prompt template/i }));
 
     const alert = await screen.findByRole("alert");
@@ -104,19 +138,21 @@ describe("interpretation approval HTTP conflicts", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     for (const [url, options] of fetchMock.mock.calls) {
       expect(url).toBe("/api/sessions/session-1/interpretations/event-a/resolve");
-      expect(options?.body).toBe(JSON.stringify({ choice: "accepted_as_drafted" }));
+      expect(options?.body).toBe(JSON.stringify({ choice: "accepted_as_drafted", reviewed_anchor: REVIEWED_ANCHOR }));
     }
     expect(useInterpretationEventsStore.getState().pendingBySession["session-1"]).toEqual({});
     expect(useInterpretationEventsStore.getState().resolvedCountBySession["session-1"].accepted_as_drafted).toBe(1);
   });
 
   it("recognises a coded resolved response without inventing who resolved it", async () => {
-    vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockResolvedValue(response({
+    routedFetch(() => response({
       detail: { code: "interpretation_already_resolved", message: "Interpretation event is already resolved." },
-    }, 409)));
+    }, 409));
     const user = userEvent.setup();
     render(<AcknowledgementStack sessionId="session-1" />);
     await user.click(screen.getByRole("button", { name: /view prompt/i }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /approve the llm prompt template/i }))
+      .not.toHaveAttribute("aria-disabled"));
     await user.click(screen.getByRole("button", { name: /approve the llm prompt template/i }));
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("Already resolved");
@@ -126,9 +162,9 @@ describe("interpretation approval HTTP conflicts", () => {
   });
 
   it("preserves an opt-out conflict without claiming a decision was resolved", async () => {
-    vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockResolvedValue(response({
+    routedFetch(() => response({
       detail: "Session operation is already active",
-    }, 409)));
+    }, 409));
     const user = userEvent.setup();
     render(<AcknowledgementStack sessionId="session-1" />);
     await user.click(screen.getByRole("button", { name: "Stop reviewing interpretations this session" }));

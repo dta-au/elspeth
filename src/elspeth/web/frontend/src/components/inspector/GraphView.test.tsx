@@ -5,12 +5,13 @@ import userEvent from "@testing-library/user-event";
 import dagre from "@dagrejs/dagre";
 import { GraphView } from "./GraphView";
 import { useSessionStore } from "@/stores/sessionStore";
+import { useBlobStore } from "@/stores/blobStore";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { resetStore } from "@/test/store-helpers";
-import type { CompositionProposal, CompositionState, NodeSpec, EdgeSpec } from "@/types/index";
+import type { CompositionProposal, CompositionState, NodeSpec, EdgeSpec, BlobMetadata } from "@/types/index";
 import type { InterpretationEvent } from "@/types/interpretation";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 import { projectValidationWorkspaceStatus } from "@/components/workspace/workspaceStatus";
@@ -434,6 +435,8 @@ function makeProposal(
 
 describe("GraphView", () => {
   beforeEach(() => {
+    vi.clearAllMocks();
+    useBlobStore.getState().reset();
     useSessionStore.setState({
       activeSessionId: null,
       compositionState: null,
@@ -664,6 +667,34 @@ describe("GraphView", () => {
       settings.compareDocumentPosition(connections) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).not.toBe(0);
     expect(connections.closest("details")).not.toHaveAttribute("open");
+  });
+
+  it("names a bound prompt file in the inspector without exposing its marker", async () => {
+    const blobId = "f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0";
+    useBlobStore.setState({ activeSessionId: "session-1", fileManagerHosts: 1, blobs: [{ id: blobId, filename: "prompt.md", content_hash: "a".repeat(64), status: "ready", mime_type: "text/plain" } as BlobMetadata] });
+    useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeState({ nodes: [makeNode({
+      id: "classify", plugin: "llm", options: { prompt_template: { blob_ref: blobId, mode: "inline_content", sha256: "a".repeat(64) } },
+    })] }) });
+    render(<GraphView />);
+    await userEvent.setup().click(screen.getByTestId("node-classify"));
+    const panel = screen.getByRole("complementary", { name: /classify configuration/i });
+    expect(within(panel).getAllByText(/prompt\.md/).length).toBeGreaterThanOrEqual(1);
+    expect(panel.textContent).not.toMatch(/blob_ref|inline_content|f976fd8b-4432|a{64}/);
+    expect(within(panel).getByRole("button", { name: "Show in files: prompt.md (User prompt)" })).toBeInTheDocument();
+    expect(within(panel).getByRole("button", { name: "Edit prompt.md (User prompt)" })).toBeInTheDocument();
+  });
+
+  it("omits Show in files in the modal graph, whose focus trap hides the file manager", async () => {
+    const blobId = "f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0";
+    useBlobStore.setState({ activeSessionId: "session-1", fileManagerHosts: 1, blobs: [{ id: blobId, filename: "prompt.md", content_hash: "a".repeat(64), status: "ready", mime_type: "text/plain" } as BlobMetadata] });
+    useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeState({ nodes: [makeNode({
+      id: "classify", plugin: "llm", options: { prompt_template: { blob_ref: blobId, mode: "inline_content", sha256: "a".repeat(64) } },
+    })] }) });
+    render(<GraphView inModal />);
+    await userEvent.setup().click(screen.getByTestId("node-classify"));
+    const panel = screen.getByRole("complementary", { name: /classify configuration/i });
+    expect(within(panel).queryByText("Show in files")).not.toBeInTheDocument();
+    expect(within(panel).getByRole("button", { name: "Edit prompt.md (User prompt)" })).toBeInTheDocument();
   });
 
   it("exposes every collector scope binding from the keyboard inspector", async () => {

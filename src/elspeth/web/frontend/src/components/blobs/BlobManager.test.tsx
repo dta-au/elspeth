@@ -1,10 +1,10 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, within, act } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { render, screen, within, act, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { BlobManager } from "./BlobManager";
-import type { BlobMetadata } from "@/types/api";
+import type { BlobMetadata, CompositionState } from "@/types/api";
 
 vi.mock("@/api/workflow", () => ({ fetchMyQuota: vi.fn().mockReturnValue(new Promise(() => {})) }));
 
@@ -36,11 +36,207 @@ function makeBlob(overrides: Partial<BlobMetadata> = {}): BlobMetadata {
 function setBlobState(blobs: BlobMetadata[]) {
   useBlobStore.setState({
     blobs,
+    activeSessionId: "session-1",
     isLoading: false,
     error: null,
     loadBlobs: vi.fn().mockResolvedValue(undefined),
   });
 }
+
+function selectedState(options: Record<string, unknown>): CompositionState {
+  return {
+    id: "state-1", session_id: "session-1", version: 1,
+    sources: { main: { plugin: "csv", options: { blob_ref: "upload", mode: "bind_source" } } },
+    nodes: [
+      { id: "llm", node_type: "transform", plugin: "llm", options, input: "rows", on_success: "out", on_error: null },
+      { id: "inject", node_type: "transform", plugin: "file_inject", options: { files: { notes: { content: { blob_ref: "other", mode: "inline_content", sha256: "hash" } } } }, input: "rows", on_success: "out", on_error: null },
+    ],
+    edges: [], outputs: [{ name: "out", plugin: "json", options: {} }],
+    metadata: { name: "test", description: "" }, is_valid: true,
+    validation_errors: null, validation_warnings: null, validation_suggestions: null,
+    derived_from_state_id: null, created_at: "2026-01-01T00:00:00Z",
+    composer_meta: null, plugin_policy_findings: [],
+  };
+}
+
+describe("BlobManager selected-node highlighting", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useSessionStore.setState({ activeSessionId: "session-1", selectedNodeId: "llm", compositionState: selectedState({
+      system_prompt: { blob_ref: "ONE", mode: "inline_content", sha256: "hash" },
+      prompt_template: { blob_ref: "two", mode: "inline_content", sha256: "hash" },
+    }) });
+    setBlobState([
+      makeBlob({ id: "one", filename: "system.txt" }),
+      makeBlob({ id: "two", filename: "user.txt" }),
+      makeBlob({ id: "other", filename: "notes.txt" }),
+      makeBlob({ id: "upload", filename: "input.csv" }),
+    ]);
+  });
+
+  afterEach(() => {
+    useSessionStore.setState({ selectedNodeId: null, compositionState: null });
+  });
+
+  it("highlights only the selected node's files and moves with selection", () => {
+    const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+    const attached = () => Array.from(container.querySelectorAll(".blob-row-item--attached"));
+    expect(attached().map((row) => row.getAttribute("data-blob-id"))).toEqual(["one", "two"]);
+    expect(screen.getByRole("status")).toHaveTextContent("2 files used by llm");
+    expect(screen.getAllByText(/Used by llm/)).toHaveLength(2);
+    act(() => useSessionStore.setState({ selectedNodeId: "inject" }));
+    expect(attached().map((row) => row.getAttribute("data-blob-id"))).toEqual(["other"]);
+    expect(screen.getByRole("status")).toHaveTextContent("1 file used by inject");
+    act(() => useSessionStore.setState({ selectedNodeId: null }));
+    expect(attached()).toHaveLength(0);
+    expect(screen.getByRole("status")).toBeEmptyDOMElement();
+  });
+
+  it("highlights source bindings too and reports missing files only after load", () => {
+    const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+    act(() => useSessionStore.setState({ selectedNodeId: "source:main" }));
+    expect(container.querySelector(".blob-row-item--attached")?.getAttribute("data-blob-id")).toBe("upload");
+    act(() => useSessionStore.setState({ selectedNodeId: "llm", compositionState: selectedState({ prompt_template: { blob_ref: "missing", mode: "inline_content", sha256: "hash" } }) }));
+    expect(screen.getByRole("status")).toHaveTextContent("1 attached file is not in this session");
+    act(() => useBlobStore.setState({ isLoading: true }));
+    expect(screen.queryByText(/attached file is not in this session/)).not.toBeInTheDocument();
+  });
+
+  it("counts a file used by two slots once and lists both slots", () => {
+    useSessionStore.setState({ compositionState: selectedState({
+      system_prompt: { blob_ref: "one", mode: "inline_content", sha256: "hash" },
+      prompt_template: { blob_ref: "one", mode: "inline_content", sha256: "hash" },
+    }) });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    expect(screen.getByRole("status")).toHaveTextContent("1 file used by llm");
+    expect(screen.getByText(/Used by llm/)).toHaveTextContent("System prompt");
+    expect(screen.getByText(/Used by llm/)).toHaveTextContent("User prompt");
+  });
+
+  it("does not associate a stale session's rows with the selected node", () => {
+    useBlobStore.setState({ activeSessionId: "session-2" });
+    const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+    expect(container.querySelector(".blob-row-item--attached")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toBeEmptyDOMElement();
+  });
+
+  it("keeps the same live status element mounted while selection changes", () => {
+    act(() => useSessionStore.setState({ selectedNodeId: null }));
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    const status = screen.getByRole("status");
+    expect(status).toBeEmptyDOMElement();
+    act(() => useSessionStore.setState({ selectedNodeId: "llm" }));
+    expect(screen.getByRole("status")).toBe(status);
+    expect(status).toHaveTextContent("2 files used by llm");
+    act(() => useSessionStore.setState({ selectedNodeId: null }));
+    expect(screen.getByRole("status")).toBe(status);
+    expect(status).toBeEmptyDOMElement();
+  });
+
+  it("scrolls the first matching row only when selection changes, without moving focus", () => {
+    const scroll = vi.fn();
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = scroll;
+    try {
+      render(<BlobManager onUseAsInput={vi.fn()} />);
+      expect(scroll).toHaveBeenCalledWith({ block: "nearest", behavior: "auto" });
+      const calls = scroll.mock.calls.length;
+      act(() => useBlobStore.setState({ blobs: [...useBlobStore.getState().blobs] }));
+      expect(scroll).toHaveBeenCalledTimes(calls);
+      act(() => useSessionStore.setState({ selectedNodeId: "inject" }));
+      expect(scroll).toHaveBeenCalledTimes(calls + 1);
+      expect(document.activeElement).toBe(document.body);
+    } finally {
+      Element.prototype.scrollIntoView = original;
+    }
+  });
+});
+
+describe("BlobManager reveal request", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useBlobStore.getState().reset();
+    useSessionStore.setState({ activeSessionId: "session-1", selectedNodeId: "llm",
+      compositionState: selectedState({ prompt_template: { blob_ref: "two", mode: "inline_content", sha256: "hash" },
+        system_prompt: { blob_ref: "one", mode: "inline_content", sha256: "hash" } }) });
+    setBlobState([makeBlob({ id: "one", filename: "system.txt", mime_type: "text/plain" }),
+      makeBlob({ id: "two", filename: "user.txt", mime_type: "text/plain" }), makeBlob({ id: "three" })]);
+  });
+
+  it("focuses and scrolls the requested row while sibling files remain highlighted", () => {
+    const scroll = vi.fn();
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = scroll;
+    try {
+      useBlobStore.getState().revealBlob("session-1", "two", "user.txt");
+      const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+      const focused = container.querySelector(".blob-row-item--focused");
+      expect(focused).toHaveAttribute("data-blob-id", "two");
+      expect(document.activeElement).toBe(focused);
+      expect(scroll).toHaveBeenCalledWith({ block: "nearest" });
+      expect(container.querySelector('[data-blob-id="one"]')).toHaveClass("blob-row-item--attached");
+      expect(container.querySelector('[data-blob-id="one"]')).not.toHaveClass("blob-row-item--focused");
+      expect(useBlobStore.getState().revealRequest).toBeNull();
+      expect(screen.getByRole("status")).toHaveTextContent("Showing user.txt.");
+    } finally { Element.prototype.scrollIntoView = original; }
+  });
+
+  it("waits for loading and focuses the status when the requested file has disappeared", () => {
+    useBlobStore.setState({ isLoading: true });
+    useBlobStore.getState().revealBlob("session-1", "missing", "missing.txt");
+    const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+    expect(useBlobStore.getState().revealRequest).not.toBeNull();
+    act(() => useBlobStore.setState({ isLoading: false }));
+    expect(container.querySelector(".blob-row-item--focused")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("missing.txt is no longer in this session");
+    expect(screen.getByRole("status")).toHaveFocus();
+  });
+
+  it("waits for a pending list before focusing an arriving file", () => {
+    useBlobStore.setState({ blobs: [], isLoading: true });
+    useBlobStore.getState().revealBlob("session-1", "two", "user.txt");
+    const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+    expect(useBlobStore.getState().revealRequest).not.toBeNull();
+    act(() => useBlobStore.setState({ blobs: [makeBlob({ id: "two", filename: "user.txt" })], isLoading: false }));
+    expect(container.querySelector('[data-blob-id="two"]')).toHaveFocus();
+    expect(useBlobStore.getState().revealRequest).toBeNull();
+  });
+
+  it("waits for a hidden authoring pane to reveal before focusing its row", async () => {
+    useBlobStore.getState().revealBlob("session-1", "two", "user.txt");
+    const contents = <BlobManager onUseAsInput={vi.fn()} />;
+    const { container, rerender } = render(<div hidden>{contents}</div>);
+    expect(container.querySelector('[data-blob-id="two"]')).not.toHaveFocus();
+    expect(useBlobStore.getState().revealRequest).not.toBeNull();
+    rerender(<div>{contents}</div>);
+    await waitFor(() => expect(container.querySelector('[data-blob-id="two"]')).toHaveFocus());
+    expect(useBlobStore.getState().revealRequest).toBeNull();
+  });
+
+  it("returns focus to the Show in files trigger on Escape", () => {
+    const trigger = document.createElement("button");
+    document.body.appendChild(trigger);
+    useBlobStore.getState().revealBlob("session-1", "two", "user.txt", trigger);
+    const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+    expect(container.querySelector('[data-blob-id="two"]')).toHaveFocus();
+    fireEvent.keyDown(container.querySelector(".blob-manager") as HTMLElement, { key: "Escape" });
+    expect(useBlobStore.getState().fileManagerOpen).toBe(false);
+    expect(trigger).toHaveFocus();
+    trigger.remove();
+  });
+
+  it("offers Edit prompt only for an editable, uniquely bound file", () => {
+    useSessionStore.setState({ compositionState: selectedState({ prompt_template: { blob_ref: "two", mode: "inline_content", sha256: "hash" } }) });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    const edit = screen.getByRole("button", { name: "Edit prompt user.txt" });
+    act(() => edit.click());
+    expect(useSessionStore.getState().selectedNodeId).toBe("llm");
+    expect(useBlobStore.getState().editRequest).toMatchObject({ nodeId: "llm", fieldPath: "prompt_template" });
+    act(() => useSessionStore.setState({ compositionState: selectedState({ prompt_template: { blob_ref: "two", mode: "inline_content", sha256: "hash" },
+      system_prompt: { blob_ref: "two", mode: "inline_content", sha256: "hash" } }) }));
+    expect(screen.queryByRole("button", { name: "Edit prompt user.txt" })).not.toBeInTheDocument();
+  });
+});
 
 describe("BlobManager categorized folders", () => {
   beforeEach(() => {

@@ -10,6 +10,8 @@ import type { JSX } from "react";
 // from this module, so importing OptionRows back here would be a cycle.
 // `titleCaseLabel` has no such dependency (leaf module).
 import { titleCaseLabel } from "@/components/catalog/pluginDisplayName";
+import { BlobFileName } from "@/components/blobs/BlobFileName";
+import { inlineContentMarker } from "@/lib/blobBindings";
 
 // Option keys whose value is a STRUCTURE ELSPETH defines (a schema
 // descriptor), never reader-authored data. Grepped across every plugin's
@@ -58,6 +60,8 @@ export function ConfigValue({
    *  schema vocabulary, not reader data. */
   humaniseKeys?: boolean;
 }): JSX.Element {
+  const marker = inlineContentMarker(value);
+  if (marker !== null) return <BlobFileName blobId={marker.blobId} sha256={marker.sha256} />;
   if (value === null) {
     return <span className="graph-config-empty-value">not set</span>;
   }

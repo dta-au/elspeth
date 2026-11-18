@@ -3,6 +3,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
+import { useBlobStore } from "@/stores/blobStore";
+import { useSessionStore } from "@/stores/sessionStore";
+import type { BlobMetadata, CompositionState } from "@/types/api";
 import { resetStore } from "@/test/store-helpers";
 import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 import { OptionRows } from "./OptionRows";
@@ -23,8 +26,162 @@ const OPTIONS = {
 // scoped only to that inner describe would not reach it and state would leak
 // across the file's two describe blocks.
 beforeEach(() => {
+  vi.clearAllMocks();
   resetStore(usePreferencesStore);
   resetStore(usePluginCatalogStore);
+  resetStore(useBlobStore);
+  useSessionStore.setState({ activeSessionId: "session-1", compositionState: null });
+});
+
+const FILE_ID = "f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0";
+const FILE_HASH = "a".repeat(64);
+function seedFile(overrides: Partial<BlobMetadata> = {}) {
+  useBlobStore.setState({
+    activeSessionId: "session-1",
+    blobs: [{
+      id: FILE_ID, session_id: "session-1", filename: "prompt.md", mime_type: "text/plain",
+      size_bytes: 12, content_hash: FILE_HASH, created_at: "2026-11-18T00:00:00Z",
+      created_by: "assistant", source_description: null, status: "ready",
+      creation_modality: "verbatim", created_from_message_id: null,
+      creating_model_identifier: null, creating_model_version: null,
+      creating_provider: null, creating_composer_skill_hash: null,
+      creating_arguments_hash: null, ...overrides,
+    }],
+  });
+}
+
+describe("file-backed option values", () => {
+  beforeEach(() => {
+    // A file-manager host (ChatPanel outside script mode) is mounted.
+    useBlobStore.setState({ fileManagerHosts: 1 });
+  });
+
+  it("keys a list-form query's Edit by its index, matching the editor and the server", () => {
+    seedFile();
+    const marker = { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH };
+    const options = { system_prompt: "You are a classifier.", queries: [{ name: "classify", template: marker }] };
+    useSessionStore.setState({ compositionState: { sources: {}, outputs: [], nodes: [{ id: "llm", plugin: "llm", options }] } as unknown as CompositionState });
+    render(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
+    const edit = screen.getByRole("button", { name: "Edit prompt.md (User prompt, query classify)" });
+    expect(edit).toHaveAttribute("aria-disabled", "false");
+    act(() => edit.click());
+    expect(useBlobStore.getState().editRequest).toMatchObject({ nodeId: "llm", fieldPath: "queries.0.template" });
+  });
+
+  it("names Show in files with its visible label first (WCAG 2.5.3)", () => {
+    seedFile();
+    render(<OptionRows options={{ prompt_template: { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH } }}
+      ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
+    const show = screen.getByRole("button", { name: "Show in files: prompt.md (User prompt)" });
+    expect(show.textContent).toBe("Show in files");
+    expect(show.getAttribute("aria-label")?.startsWith(show.textContent ?? "\u0000")).toBe(true);
+  });
+
+  it("offers Show in files only while a file manager host is mounted and the surface allows it", () => {
+    seedFile();
+    const options = { prompt_template: { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH } };
+    useBlobStore.setState({ fileManagerHosts: 0 });
+    const { rerender } = render(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
+    expect(screen.queryByText("Show in files")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit prompt.md (User prompt)" })).toBeInTheDocument();
+    let unregister = () => {};
+    act(() => { unregister = useBlobStore.getState().registerFileManagerHost(); });
+    expect(screen.getByText("Show in files")).toBeInTheDocument();
+    rerender(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm", showInFiles: false }} />);
+    expect(screen.queryByText("Show in files")).not.toBeInTheDocument();
+    rerender(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
+    act(() => unregister());
+    expect(screen.queryByText("Show in files")).not.toBeInTheDocument();
+  });
+
+  it("adds file and slot named navigation actions only in the inspector", () => {
+    seedFile({ filename: "summarise.txt" });
+    const marker = { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH };
+    const options = { system_prompt: marker, prompt_template: marker, queries: { classify: { template: marker } } };
+    const { rerender } = render(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
+    expect(screen.getByRole("button", { name: "Show in files: summarise.txt (System prompt)" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit summarise.txt (System prompt)" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Show in files: summarise.txt (User prompt, query classify)" })).toBeInTheDocument();
+    act(() => screen.getByRole("button", { name: "Show in files: summarise.txt (System prompt)" }).click());
+    expect(useBlobStore.getState().revealRequest?.blobId).toBe(FILE_ID);
+    rerender(<OptionRows options={options} ariaLabel="spec options" plugin={{ kind: "transform", name: "llm" }} />);
+    expect(screen.queryByRole("button", { name: /^Show in files/ })).not.toBeInTheDocument();
+  });
+
+  it("keeps a missing file action focusable and describes its refusal", () => {
+    const marker = { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH };
+    useBlobStore.setState({ activeSessionId: "session-1", blobs: [], isLoading: false });
+    render(<OptionRows options={{ prompt_template: marker }} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
+    const show = screen.getByRole("button", { name: /^Show in files: .*User prompt/ });
+    expect(show).toHaveAttribute("aria-disabled", "true");
+    expect(show).toHaveAccessibleDescription("This file is not in this session.");
+    expect(show).not.toBeDisabled();
+    act(() => show.click());
+    expect(useBlobStore.getState().revealRequest).toBeNull();
+  });
+
+  it("describes an in-flight file lookup without prematurely claiming the file is missing", () => {
+    useBlobStore.setState({ activeSessionId: "session-1", blobs: [], isLoading: true });
+    render(<OptionRows options={{ prompt_template: { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH } }}
+      ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
+    const show = screen.getByRole("button", { name: "Show in files: Loading file name… (User prompt)" });
+    const edit = screen.getByRole("button", { name: "Edit Loading file name… (User prompt)" });
+    expect(show).toHaveAccessibleDescription("Checking files in this session.");
+    expect(edit).toHaveAccessibleDescription("Checking files in this session.");
+    expect(screen.queryByText("This file is not in this session.")).not.toBeInTheDocument();
+  });
+
+  it("disables Edit with the multi-file reason while Show in files stays available", () => {
+    seedFile();
+    const options = { prompt_template: { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH },
+      system_prompt: { blob_ref: "other", mode: "inline_content", sha256: FILE_HASH } };
+    useSessionStore.setState({ compositionState: { sources: {}, outputs: [], nodes: [{ id: "llm", plugin: "llm", options }] } as unknown as CompositionState });
+    render(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
+    const edit = screen.getByRole("button", { name: "Edit prompt.md (User prompt)" });
+    expect(edit).toHaveAttribute("aria-disabled", "true");
+    expect(edit).toHaveAccessibleDescription("This node uses more than one prompt file. Re-point it through the agent and approve the review card.");
+    expect(screen.getByRole("button", { name: "Show in files: prompt.md (User prompt)" })).toHaveAttribute("aria-disabled", "false");
+    act(() => edit.click());
+    expect(useBlobStore.getState().editRequest).toBeNull();
+  });
+
+  it("shows the filename for LLM prompt roles and nested markers without exposing marker fields", () => {
+    seedFile();
+    const marker = { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH };
+    render(<OptionRows
+      options={{ system_prompt: marker, prompt_template: marker, queries: [{ template: marker }] }}
+      ariaLabel="LLM options" plugin={{ kind: "transform", name: "llm" }}
+    />);
+    const region = screen.getByRole("region", { name: "LLM options" });
+    expect(within(region).getAllByText(/prompt\.md/).length).toBeGreaterThanOrEqual(2);
+    expect(region.textContent).not.toMatch(/blob_ref|inline_content|sha256|f976fd8b-4432|a{64}/);
+  });
+
+  it("shows a changed-since-attached hint only for a known mismatched hash", () => {
+    seedFile({ content_hash: "b".repeat(64) });
+    const marker = { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH };
+    const { rerender } = render(<OptionRows options={{ prompt_template: marker }} ariaLabel="LLM options" plugin={{ kind: "transform", name: "llm" }} />);
+    expect(screen.getByText(/changed since attached/)).toBeInTheDocument();
+    seedFile({ content_hash: null });
+    rerender(<OptionRows options={{ prompt_template: marker }} ariaLabel="LLM options" plugin={{ kind: "transform", name: "llm" }} />);
+    expect(screen.queryByText(/changed since attached/)).not.toBeInTheDocument();
+  });
+
+  it("shows the filename for a nested file-inject marker", () => {
+    seedFile();
+    render(<OptionRows options={{ files: { notes: { content: { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH } } } }} ariaLabel="file inject options" />);
+    expect(screen.getByText(/prompt\.md/)).toBeInTheDocument();
+  });
+
+  it("uses the friendly path fallback while the file list loads or the file is missing", () => {
+    useBlobStore.setState({ activeSessionId: "session-1", isLoading: true, blobs: [] });
+    const options = { path: `blob:${FILE_ID}` };
+    const { rerender } = render(<OptionRows options={options} ariaLabel="source options" />);
+    expect(screen.getByText("Uploaded sample data")).toBeInTheDocument();
+    useBlobStore.setState({ isLoading: false });
+    rerender(<OptionRows options={options} ariaLabel="source options" />);
+    expect(screen.getByText("Uploaded sample data")).toBeInTheDocument();
+  });
 });
 
 describe("OptionRows", () => {
@@ -70,16 +227,17 @@ describe("OptionRows", () => {
   // absence, via PipelineSpecView's integration test). GraphView's node
   // inspector renders `options.path` through this same component, so the
   // fix (and its test) live here rather than in either consumer.
-  it("masks a blob-backed path sentinel: friendly text visible, raw sentinel only in the title attribute", () => {
+  it("shows a blob-backed path sentinel's filename without its id", () => {
+    seedFile();
     const options = { path: "blob:f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0" };
     render(<OptionRows options={options} ariaLabel="source options" />);
     const region = screen.getByRole("region", { name: "source options" });
 
-    const masked = within(region).getByText("Uploaded sample data");
+    const masked = within(region).getByText(/prompt\.md/);
     expect(masked).toBeInTheDocument();
     expect(masked).toHaveAttribute(
       "title",
-      "blob:f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0",
+      `File id ${FILE_ID}`,
     );
     expect(region.textContent).not.toMatch(/f976fd8b-4432/);
   });
@@ -344,6 +502,7 @@ describe("catalog-tier ordering (elspeth-a6ea581e8a follow-up)", () => {
   });
 
   it("masks a blob:<ref> path even when the catalog tiers `path` advanced (masking binds to the value, not the partition)", () => {
+    seedFile();
     seedCatalog({
       "source:csv": { ...LLM_SCHEMA, name: "csv", plugin_type: "source", knob_schema: { fields: [{ name: "path", tier: "advanced" }] } },
     });
@@ -356,7 +515,7 @@ describe("catalog-tier ordering (elspeth-a6ea581e8a follow-up)", () => {
     );
     const region = screen.getByRole("region", { name: "source options" });
     const advanced = within(region).getByText("Advanced settings (1)").closest("details") as HTMLElement;
-    expect(within(advanced).getByText("Uploaded sample data")).toHaveAttribute("title", "blob:f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0");
+    expect(within(advanced).getByText(/prompt\.md/)).toHaveAttribute("title", `File id ${FILE_ID}`);
     expect(region.textContent).not.toMatch(/f976fd8b-4432/);
   });
 });

@@ -54,6 +54,28 @@ describe("blobStore", () => {
   beforeEach(() => {
     useBlobStore.getState().reset();
     vi.restoreAllMocks();
+    vi.clearAllMocks();
+  });
+
+  it("opens a requested file and consumes only the matching reveal sequence", () => {
+    useBlobStore.getState().activateSession("session-1");
+    useBlobStore.getState().revealBlob("session-1", "file-1", "prompt.txt");
+    const request = useBlobStore.getState().revealRequest;
+    expect(request).toMatchObject({ sessionId: "session-1", blobId: "file-1", filename: "prompt.txt" });
+    expect(useBlobStore.getState()).toMatchObject({ fileManagerOpen: true, focusedBlobId: "file-1" });
+    useBlobStore.getState().consumeRevealRequest((request?.seq ?? 0) + 1);
+    expect(useBlobStore.getState().revealRequest).toBe(request);
+    useBlobStore.getState().consumeRevealRequest(request?.seq ?? 0);
+    expect(useBlobStore.getState().revealRequest).toBeNull();
+    expect(useBlobStore.getState().focusedBlobId).toBe("file-1");
+  });
+
+  it("clears open, focused, reveal and edit requests on a session switch", () => {
+    useBlobStore.getState().activateSession("session-1");
+    useBlobStore.getState().revealBlob("session-1", "file-1", "prompt.txt");
+    useBlobStore.getState().requestPromptEdit("llm", "prompt_template");
+    useBlobStore.getState().activateSession("session-2");
+    expect(useBlobStore.getState()).toMatchObject({ fileManagerOpen: false, focusedBlobId: null, revealRequest: null, editRequest: null });
   });
 
   it("publishes a monotonic activation epoch for exact session fences", () => {

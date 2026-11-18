@@ -39,6 +39,7 @@ import {
 } from "./ChatInput";
 import { FreeformIntroduction } from "./FreeformIntroduction";
 import { BlobManager } from "@/components/blobs/BlobManager";
+import { useBlobStore } from "@/stores/blobStore";
 import { actionableProposals } from "./actionableProposals";
 import { useCompletionOutcome } from "./completionOutcome";
 import { makePhraseFor } from "@/lib/validationHumaniser";
@@ -339,7 +340,16 @@ export function ChatPanelContent({
   // because attachDock assigns it from a callback ref.
   const dockRef = useRef<HTMLDivElement | null>(null);
   const [showScrollButton, setShowScrollButton] = useState(false);
-  const [showBlobManager, setShowBlobManager] = useState(false);
+  const showBlobManager = useBlobStore((state) => state.fileManagerOpen);
+  const setFileManagerOpen = useBlobStore((state) => state.setFileManagerOpen);
+  // Register as a file-manager host whenever this panel can render
+  // BlobManager (the same condition as the drawer below). Show in files is
+  // offered only while some host is mounted, so a surface with no file
+  // manager never offers a reveal that cannot land.
+  useEffect(() => {
+    if (scriptMode) return undefined;
+    return useBlobStore.getState().registerFileManagerHost();
+  }, [scriptMode]);
   const [freeformDraftsBySession, setFreeformDraftsBySession] = useState<
     ReadonlyMap<string, string>
   >(new Map());
@@ -942,9 +952,9 @@ export function ChatPanelContent({
       // The assistant/composer will use blob tools to wire it as source.
       const prompt = `Please use the file "${blob.filename}" as the pipeline input.`;
       sendMessage(prompt);
-      setShowBlobManager(false);
+      setFileManagerOpen(false);
     },
-    [sendMessage],
+    [sendMessage, setFileManagerOpen],
   );
 
   // No active session: show prompt to select or create one
@@ -1336,7 +1346,7 @@ export function ChatPanelContent({
         disabled={isComposing}
         onCancel={isComposing ? cancelComposition : undefined}
         inputRef={inputRef}
-        onToggleBlobManager={() => setShowBlobManager((v) => !v)}
+        onToggleBlobManager={() => setFileManagerOpen(!showBlobManager)}
         showBlobManager={showBlobManager}
         onOpenSecrets={onOpenSecrets}
         value={inputText}

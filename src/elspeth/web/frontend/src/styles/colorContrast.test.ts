@@ -741,6 +741,20 @@ describe("row_union badge tokens", () => {
   });
 });
 
+describe("attached file selection bar", () => {
+  it("keeps the gold selection ring at non-text contrast on file-panel surfaces", () => {
+    for (const theme of ["dark", "light"] as const) {
+      const ring = resolveHex(theme, "--color-selected-ring");
+      for (const surface of ["--color-surface", "--color-surface-elevated"]) {
+        expect(contrastRatio(ring, resolveTintOver(theme, "--color-highlight", surface))).toBeGreaterThanOrEqual(3);
+      }
+    }
+    const rowRule = extractCssRule(".blob-row-item--attached > .blob-row-container");
+    expect(rowRule).toContain("var(--color-selected-ring)");
+    expect(rowRule).toContain("background-color: var(--color-highlight)");
+  });
+});
+
 describe("forced-colors accessibility fallbacks", () => {
   it("defines system-color fallbacks for stateful high-contrast surfaces", () => {
     const forcedColorsBlock = extractForcedColorsBlock();

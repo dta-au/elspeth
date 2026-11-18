@@ -1,8 +1,10 @@
 import { render, screen, within } from "@testing-library/react";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { pluginDisplayName } from "@/components/catalog/pluginDisplayName";
 import { useSessionStore } from "@/stores/sessionStore";
+import { useBlobStore } from "@/stores/blobStore";
+import type { BlobMetadata } from "@/types/api";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { resetStore } from "@/test/store-helpers";
@@ -12,6 +14,8 @@ import { PipelineSpecView } from "./PipelineSpecView";
 
 describe("PipelineSpecView", () => {
   beforeEach(() => {
+    vi.clearAllMocks();
+    useBlobStore.getState().reset();
     useSessionStore.setState({
       activeSessionId: "session-1",
       compositionState: null,
@@ -662,6 +666,19 @@ describe("PipelineSpecView", () => {
     expect(within(card).queryByText("None")).not.toBeInTheDocument();
     expect(within(card).getByText("Rows failing validation")).toBeInTheDocument();
     expect(within(card).getByText("dropped (recorded in the audit trail)")).toBeInTheDocument();
+  });
+
+  it("renders a bound prompt filename through the shared Spec options renderer", () => {
+    const blobId = "f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0";
+    useBlobStore.setState({ activeSessionId: "session-1", blobs: [{ id: blobId, filename: "prompt.md", content_hash: "a".repeat(64) } as BlobMetadata] });
+    useSessionStore.setState({ compositionState: makeComposition(7, { nodes: [{
+      id: "classify", node_type: "transform", plugin: "llm", input: "raw", on_success: "out", on_error: null,
+      options: { prompt_template: { blob_ref: blobId, mode: "inline_content", sha256: "a".repeat(64) } },
+    }] }) });
+    render(<PipelineSpecView />);
+    const card = screen.getByRole("article", { name: "Node classify" });
+    expect(within(card).getByText(/prompt\.md/)).toBeInTheDocument();
+    expect(card.textContent).not.toMatch(/blob_ref|inline_content|f976fd8b-4432|a{64}/);
   });
 
   // Round-3 review finding, Spec-tab side: OptionRows' nested-key

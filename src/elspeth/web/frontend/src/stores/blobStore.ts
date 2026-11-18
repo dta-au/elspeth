@@ -18,6 +18,27 @@ interface BlobState {
   activeSessionId: string | null;
   /** Monotonic generation for session-bound async completion fences. */
   activationEpoch: number;
+  fileManagerOpen: boolean;
+  revealRequest: { sessionId: string; blobId: string; seq: number; filename: string } | null;
+  focusedBlobId: string | null;
+  editRequest: { nodeId: string; fieldPath: string; seq: number } | null;
+  /** Mounted components that can render the file manager. Show in files is offered only while one exists. */
+  fileManagerHosts: number;
+  /**
+   * Closing the file manager could not focus the Show in files trigger
+   * because it sits in a hidden or inert pane (the narrow workspace swapped
+   * it out). The workspace consumes this by showing the pane that holds
+   * `trigger`; focus follows once the pane is no longer hidden.
+   */
+  returnRequest: { trigger: HTMLElement; seq: number } | null;
+  registerFileManagerHost: () => () => void;
+  consumeReturnRequest: (seq: number) => void;
+  revealBlob: (sessionId: string, blobId: string, filename: string, trigger?: HTMLElement) => void;
+  consumeRevealRequest: (seq: number) => void;
+  setFileManagerOpen: (open: boolean) => void;
+  requestPromptEdit: (nodeId: string, fieldPath: string) => void;
+  consumePromptEdit: (seq: number) => void;
+  returnToRevealTrigger: () => void;
 
   activateSession: (sessionId: string | null) => void;
   invalidateBlobForEpoch: (
@@ -43,9 +64,48 @@ const initialState = {
   error: null as string | null,
   activeSessionId: null as string | null,
   activationEpoch: 0,
+  fileManagerOpen: false,
+  revealRequest: null as BlobState["revealRequest"],
+  focusedBlobId: null as string | null,
+  editRequest: null as BlobState["editRequest"],
+  returnRequest: null as BlobState["returnRequest"],
 };
 
 let blobLoadRequestSeq = 0;
+let revealSeq = 0;
+let editSeq = 0;
+let revealTrigger: HTMLElement | null = null;
+let returnSeq = 0;
+let returnObserver: MutationObserver | null = null;
+
+function stopReturnObserver(): void {
+  returnObserver?.disconnect();
+  returnObserver = null;
+}
+
+const HIDDEN_ANCESTOR = "[hidden], [inert]";
+
+/** Focus `trigger` once no ancestor hides it or makes it inert. */
+function focusWhenShown(trigger: HTMLElement): void {
+  stopReturnObserver();
+  const hidden = trigger.closest(HIDDEN_ANCESTOR);
+  if (hidden === null) {
+    trigger.focus({ preventScroll: true });
+    return;
+  }
+  const observer = new MutationObserver(() => {
+    if (!trigger.isConnected) {
+      stopReturnObserver();
+      return;
+    }
+    // A nested chain of hidden containers clears one attribute at a time:
+    // re-arm on whichever ancestor is still hiding the trigger.
+    if (hidden.hasAttribute("hidden") || hidden.hasAttribute("inert")) return;
+    focusWhenShown(trigger);
+  });
+  observer.observe(hidden, { attributes: true, attributeFilter: ["hidden", "inert"] });
+  returnObserver = observer;
+}
 
 interface BlobMutationOwnership {
   sessionId: string;
@@ -55,6 +115,52 @@ interface BlobMutationOwnership {
 
 export const useBlobStore = create<BlobState>((set, get) => ({
   ...initialState,
+  // Not part of initialState: hosts are mounted components, so reset() on
+  // logout must not forget one that is still on screen.
+  fileManagerHosts: 0,
+
+  registerFileManagerHost() {
+    set((state) => ({ fileManagerHosts: state.fileManagerHosts + 1 }));
+    let registered = true;
+    return () => {
+      if (!registered) return;
+      registered = false;
+      set((state) => ({ fileManagerHosts: Math.max(0, state.fileManagerHosts - 1) }));
+    };
+  },
+  consumeReturnRequest(seq) {
+    if (get().returnRequest?.seq === seq) set({ returnRequest: null });
+  },
+
+  revealBlob(sessionId, blobId, filename, trigger) {
+    if (get().activeSessionId !== sessionId) return;
+    revealTrigger = trigger ?? null;
+    stopReturnObserver();
+    set({ returnRequest: null, fileManagerOpen: true, focusedBlobId: blobId, revealRequest: { sessionId, blobId, filename, seq: ++revealSeq } });
+  },
+  consumeRevealRequest(seq) {
+    if (get().revealRequest?.seq === seq) set({ revealRequest: null });
+  },
+  setFileManagerOpen(open) {
+    if (!open) set({ fileManagerOpen: false, focusedBlobId: null, revealRequest: null });
+    else set({ fileManagerOpen: true });
+  },
+  requestPromptEdit(nodeId, fieldPath) {
+    set({ editRequest: { nodeId, fieldPath, seq: ++editSeq } });
+  },
+  consumePromptEdit(seq) {
+    if (get().editRequest?.seq === seq) set({ editRequest: null });
+  },
+  returnToRevealTrigger() {
+    const trigger = revealTrigger;
+    revealTrigger = null;
+    if (!trigger?.isConnected) return;
+    // A hidden or inert trigger is not focusable (HTML focusing steps), so
+    // focus() would silently drop to <body>. Ask the workspace to show the
+    // view that holds it, and focus it when it is shown.
+    if (trigger.closest(HIDDEN_ANCESTOR) !== null) set({ returnRequest: { trigger, seq: ++returnSeq } });
+    focusWhenShown(trigger);
+  },
 
   activateSession(sessionId: string | null) {
     const state = get();
@@ -66,7 +172,14 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       error: null,
       activeSessionId: sessionId,
       activationEpoch: state.activationEpoch + 1,
+      fileManagerOpen: false,
+      revealRequest: null,
+      focusedBlobId: null,
+      editRequest: null,
+      returnRequest: null,
     });
+    revealTrigger = null;
+    stopReturnObserver();
   },
 
   invalidateBlobForEpoch(
@@ -239,7 +352,14 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       error: null,
       activeSessionId: null,
       activationEpoch: state.activationEpoch + 1,
+      fileManagerOpen: false,
+      revealRequest: null,
+      focusedBlobId: null,
+      editRequest: null,
+      returnRequest: null,
     }));
+    revealTrigger = null;
+    stopReturnObserver();
   },
 
   reset() {
@@ -248,5 +368,7 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       ...initialState,
       activationEpoch: state.activationEpoch + 1,
     }));
+    revealTrigger = null;
+    stopReturnObserver();
   },
 }));
