@@ -2438,6 +2438,205 @@ sinks:
         mock_load.assert_not_called()
         mock_orch_cls.assert_not_called()
 
+    def _run_prompt_custody_integrity_failure(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        reread: str | Exception,
+    ) -> tuple[pytest.ExceptionInfo[Exception], MagicMock, Any, BlobIntegrityError]:
+        """Admit a prompt blob's record, then fail its custody byte read with an integrity error.
+
+        ``reread`` is the content hash the second, session-scoped record read
+        returns, or the exception it raises, once the byte read has failed.
+        """
+        from elspeth.web.execution import service as service_module
+
+        content = b"You are an audited prompt."
+        admitted_sha = hashlib.sha256(content).hexdigest()
+        blob_id = uuid4()
+        run_id = uuid4()
+        owner_session = uuid4()
+        mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=owner_session)
+        hash_counter = MagicMock(spec=["add"])
+        monkeypatch.setattr(service_module, "_BLOB_INLINE_HASH_MISMATCH_TOTAL", hash_counter)
+        admitted_record = _blob_record_stub(blob_id=blob_id, session_id=owner_session, content_hash=admitted_sha, size_bytes=len(content))
+        reread_result: BlobRecord | Exception = (
+            _blob_record_stub(blob_id=blob_id, session_id=owner_session, content_hash=reread, size_bytes=len(content))
+            if isinstance(reread, str)
+            else reread
+        )
+        custody_error = BlobIntegrityError(str(blob_id), expected=admitted_sha, actual="c" * 64)
+
+        blob_service = _blob_service_stub()
+        blob_service.link_blob_to_run.return_value = None
+        blob_service.get_blob.side_effect = [admitted_record, reread_result]
+        blob_service.read_blob_content.side_effect = custody_error
+        cast(Any, service)._blob_service = blob_service
+
+        pipeline_yaml = f"""
+source:
+  plugin: csv
+  options:
+    path: input.csv
+transforms:
+  - name: classify
+    plugin: llm
+    options:
+      system_prompt:
+        blob_ref: {blob_id}
+        mode: inline_content
+        sha256: {admitted_sha}
+sinks:
+  primary:
+    plugin: json
+    options:
+      path: output.jsonl
+"""
+        with pytest.raises(Exception) as exc_info:
+            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
+
+        mock_session_service.record_blob_inline_resolutions.assert_not_called()
+        return exc_info, hash_counter, blob_service, custody_error
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_prompt_save_racing_admission_is_stale_review_without_integrity_alert(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Record admitted at hash X, user saved Y before the byte read: stale, not corruption."""
+        del mock_payload_cls, mock_landscape_cls, mock_runtime_graph
+        exc_info, hash_counter, blob_service, custody_error = self._run_prompt_custody_integrity_failure(
+            service, mock_session_service, monkeypatch, reread="d" * 64
+        )
+
+        assert type(exc_info.value) is PromptFileReviewStale
+        assert exc_info.value.__cause__ is custody_error
+        hash_counter.add.assert_not_called()
+        mock_load.assert_not_called()
+        mock_orch_cls.assert_not_called()
+        # Stale is decided by the re-read record, not assumed: admission read it
+        # once, then it was re-read through the same session-scoped call.
+        assert blob_service.get_blob.await_count == 2
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_prompt_custody_corruption_with_unchanged_record_fires_integrity_alert(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Record unchanged since admission but the stored bytes differ: corruption, counted once."""
+        del mock_payload_cls, mock_landscape_cls, mock_runtime_graph
+        unchanged_sha = hashlib.sha256(b"You are an audited prompt.").hexdigest()
+
+        exc_info, hash_counter, blob_service, custody_error = self._run_prompt_custody_integrity_failure(
+            service, mock_session_service, monkeypatch, reread=unchanged_sha
+        )
+
+        assert exc_info.value is custody_error
+        hash_counter.add.assert_called_once_with(1)
+        mock_load.assert_not_called()
+        mock_orch_cls.assert_not_called()
+        assert blob_service.get_blob.await_count == 2
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_prompt_custody_failure_with_failed_record_reread_fires_integrity_alert(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A re-read that cannot answer never downgrades an integrity failure to stale review."""
+        del mock_payload_cls, mock_landscape_cls, mock_runtime_graph
+        reread_failure = SQLAlchemyError("sessions database unavailable")
+
+        exc_info, hash_counter, blob_service, custody_error = self._run_prompt_custody_integrity_failure(
+            service, mock_session_service, monkeypatch, reread=reread_failure
+        )
+
+        assert exc_info.value is custody_error
+        assert exc_info.value.__cause__ is reread_failure
+        hash_counter.add.assert_called_once_with(1)
+        mock_load.assert_not_called()
+        mock_orch_cls.assert_not_called()
+        assert blob_service.get_blob.await_count == 2
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_prompt_custody_reread_fence_loss_propagates_unchanged_without_integrity_alert(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Losing the session fence during the re-read is authority loss, not corruption.
+
+        It must reach ``_run_pipeline``'s dedicated fence-loss handler unchanged:
+        translated into ``BlobIntegrityError`` it would finalize the run as failed
+        while a successor owns the session.
+        """
+        from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
+
+        del mock_payload_cls, mock_landscape_cls, mock_runtime_graph
+        fence_lost = SessionOperationFenceLost(FenceLossReason.OWNER_INACTIVE)
+        # The fixture bridge swallows RuntimeError (fence loss is one) and returns
+        # None; this test needs the exception exactly as production raises it.
+        strict_call_async, strict_loop = _make_strict_call_async()
+        cast(Any, service)._call_async = strict_call_async
+
+        try:
+            exc_info, hash_counter, blob_service, _ = self._run_prompt_custody_integrity_failure(
+                service, mock_session_service, monkeypatch, reread=fence_lost
+            )
+        finally:
+            strict_loop.close()
+
+        assert exc_info.value is fence_lost
+        hash_counter.add.assert_not_called()
+        blob_service.finalize_run_output_blobs.assert_not_called()
+        mock_load.assert_not_called()
+        mock_orch_cls.assert_not_called()
+        assert blob_service.get_blob.await_count == 2
+
     @pytest.mark.parametrize(
         "case",
         ["missing", "cross_session_ready_hash_match", "cross_session_ready_hash_mismatch"],

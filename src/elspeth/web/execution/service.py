@@ -4011,7 +4011,24 @@ class ExecutionServiceImpl:
                                         blob_id, session_operation_context=session_operation_context
                                     )
                                 except BlobIntegrityError as exc:
-                                    if blob_id in prompt_blob_ids:
+                                    if blob_id not in prompt_blob_ids:
+                                        raise
+                                    # A prompt save racing admission (record read at
+                                    # hash X, bytes already Y) is stale review; bytes
+                                    # disagreeing with an unchanged record are
+                                    # corruption. Re-read the record through the same
+                                    # session-scoped read to tell them apart. Both
+                                    # refuse; only corruption reaches the outer
+                                    # zero-threshold counter (it counts exactly once).
+                                    try:
+                                        current = await _get_blob_scoped(blob_id)
+                                    except SessionOperationFenceLost:
+                                        # Authority loss is not corruption: it keeps
+                                        # its dedicated handler (no finalization).
+                                        raise
+                                    except Exception as reread_exc:
+                                        raise exc from reread_exc
+                                    if current.content_hash != records_by_blob_id[blob_id].content_hash:
                                         raise PromptFileReviewStale() from exc
                                     raise
 
