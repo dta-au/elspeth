@@ -100,6 +100,8 @@ export function ComposerWorkspace({
   const [authoringFocusRequest, setAuthoringFocusRequest] = useState(0);
   const revealRequest = useBlobStore((state) => state.revealRequest);
   const editRequest = useBlobStore((state) => state.editRequest);
+  const returnRequest = useBlobStore((state) => state.returnRequest);
+  const consumeReturnRequest = useBlobStore((state) => state.consumeReturnRequest);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const composeTabRef = useRef<HTMLButtonElement | null>(null);
   const pipelineTabRef = useRef<HTMLButtonElement | null>(null);
@@ -205,6 +207,23 @@ export function ComposerWorkspace({
     setNarrowView("compose");
     setAuthoringCollapsed(false);
   }, [revealRequest, activeSessionId, setAuthoringCollapsed]);
+
+  // Closing the file manager returns focus to its Show in files trigger. In
+  // the narrow layout that trigger's pane may be the hidden one, so show the
+  // view that holds it; blobStore focuses it once the pane is unhidden.
+  useLayoutEffect(() => {
+    if (!returnRequest) return;
+    const { trigger, seq } = returnRequest;
+    if (artifactSlotRef.current?.contains(trigger)) {
+      claimWorkspaceViewIntent();
+      setNarrowView("pipeline");
+    } else if (authoringSlotRef.current?.contains(trigger)) {
+      claimWorkspaceViewIntent();
+      setNarrowView("compose");
+      setAuthoringCollapsed(false);
+    }
+    consumeReturnRequest(seq);
+  }, [returnRequest, consumeReturnRequest, setAuthoringCollapsed]);
 
   useLayoutEffect(() => {
     if (!editRequest) return;

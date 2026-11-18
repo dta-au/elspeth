@@ -6,6 +6,7 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -140,6 +141,25 @@ describe("ComposerWorkspace", () => {
     expect(screen.getByRole("tab", { name: "Compose" })).toHaveAttribute("aria-selected", "true");
     act(() => useBlobStore.getState().requestPromptEdit("llm", "prompt_template"));
     expect(screen.getByRole("tab", { name: "Pipeline" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("returns to the narrow Pipeline view before restoring focus to a Show in files trigger", async () => {
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    useBlobStore.getState().activateSession("session-1");
+    renderWorkspace({ artifact: <button type="button">Show in files</button> });
+    emitWidth(800);
+    await userEvent.setup().click(screen.getByRole("tab", { name: "Pipeline" }));
+    const trigger = screen.getByRole("button", { name: "Show in files" });
+    act(() => useBlobStore.getState().revealBlob("session-1", "file-1", "prompt.txt", trigger));
+    expect(screen.getByRole("tab", { name: "Compose" })).toHaveAttribute("aria-selected", "true");
+    expect(trigger.closest("[hidden], [inert]")).not.toBeNull();
+    act(() => {
+      useBlobStore.getState().setFileManagerOpen(false);
+      useBlobStore.getState().returnToRevealTrigger();
+    });
+    expect(screen.getByRole("tab", { name: "Pipeline" })).toHaveAttribute("aria-selected", "true");
+    await waitFor(() => expect(trigger).toHaveFocus());
+    expect(trigger.closest("[hidden], [inert]")).toBeNull();
   });
 
   afterEach(() => {
