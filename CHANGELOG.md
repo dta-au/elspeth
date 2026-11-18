@@ -33,9 +33,10 @@ Schema and stored data:
   store adds `prompt_review_snapshots` (the reviewed file text and its
   identity, kept with the review event) and `prompt_file_approvals`
   (append-only approvals, whose latest row per binding is the admission
-  authority); the Landscape store adds `run_prompt_inputs` (the approved prompt-file identity and content hash
-  admitted for a Web run before its first provider call). The new tables are
-  additive.
+  authority); the Landscape store adds `run_prompt_inputs` (the approved
+  prompt-file identity and content hash a Web run admitted, recorded when the
+  run starts, in the same transaction as its run row and before any LLM call,
+  with a foreign key to the run). The new tables are additive.
 - Configure an explicitly new epoch-79 session target and an explicitly new
   epoch-51 Landscape target. Preserve epoch-78 session stores and epoch-50
   Landscape stores with compatible prior application access; 0.8.15 startup
@@ -105,8 +106,30 @@ Schema and stored data:
   length in tool results, proposal cards and audit records, and is checked
   for credentials. Changing a prompt reopens its prompt review. A one-line
   edit now sends a few hundred bytes of tool arguments instead of the whole
-  prompt. Editing text inside a session file is not yet supported. The
-  composer now offers 45 tools by default (was 43).
+  prompt. The composer cannot yet edit text inside a session file; use the
+  prompt editor below. The composer now offers 47 tools by default (was 45).
+- An LLM prompt can be backed by a session file. Pointing the prompt at a
+  different file, or a change to the file's content, reopens the prompt review
+  ("Re-approve first"), and the run is blocked until the new text is approved.
+  Each run uses exactly the approved bytes and records their hash.
+- The inspector's new prompt editor edits a prompt file in place. Saving is
+  your approval of the new text, so no new review card appears. A save is
+  refused when the file backs more than one prompt
+  (`prompt_file_shared_binding`), is not UTF-8
+  (`prompt_file_encoding_unsupported`), changed since you opened it or its
+  binding moved (`prompt_file_stale`, `prompt_file_binding_changed`; the
+  request must carry `expected_sha256`), or while the node's review card is
+  still waiting (`prompt_file_review_pending_inline`, 409: approve the card
+  first, then edit). Approvals are kept append-only, whether from the card or
+  an editor save.
+- The inspector shows a prompt file by name, with a "changed since attached"
+  hint, instead of its blob ID and hash, and each prompt slot has Edit and
+  "Show in files" buttons. The editor starts collapsed, and Edit and Save are
+  disabled with the reason shown when the server would refuse. With the file
+  manager open, the selected node's files are highlighted and labelled "Used
+  by <node>". Uploaded source files show their filename in the pipeline view.
+- Selecting a source or sink in the graph no longer clears on every composer
+  turn.
 - A prompt that points at a session file now gets a clear, typed refusal
   instead of an internal error or a silent change when the file is not
   plain text (`inline_blob_not_text`) or the prompt is a structured prompt

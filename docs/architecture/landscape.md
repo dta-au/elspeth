@@ -19,8 +19,9 @@ metadata, constraints, indexes, and `SQLITE_SCHEMA_EPOCH`. The current release
 requires Landscape epoch 51 and Sessions epoch 79. Startup accepts an empty
 store or the exact current schema; it does not migrate or relabel earlier
 evidence. Epoch 51 adds `run_prompt_inputs`, which records the approved prompt
-file identity and content hash a Web run admitted before its first provider
-call; epoch 50 added durable provider-attempt identity on run calls.
+file identity and content hash a Web run admitted, written in the same
+transaction as the run's `runs` row (with a foreign key to it) and before any
+provider call; epoch 50 added durable provider-attempt identity on run calls.
 The [schema compatibility runbook](../runbooks/staging-session-db-recreation.md)
 requires preserving incompatible stores and provisioning explicitly new compatible
 targets. It also retains earlier cutovers as historical reference and covers

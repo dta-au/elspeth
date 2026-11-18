@@ -2872,8 +2872,10 @@ Concurrent drains for one path are serialized across processes.
 
 ### Landscape schema epoch 51
 
-Epoch 51 adds `run_prompt_inputs`. Before a Web run's first provider call, it
-records each approved prompt file the run admitted: the node and option path,
+Epoch 51 adds `run_prompt_inputs`. When a Web run starts, in the same
+transaction that creates its `runs` row and before any provider call, it
+records each approved prompt file the run admitted (each row references its
+run through a foreign key to `runs`): the node and option path,
 the session file's blob ID, the SHA-256 of the bytes the run read, the review
 anchor and the effective artifact hash. The run reads each file once and is
 admitted only when those bytes equal the approved review snapshot. The table is
