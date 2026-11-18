@@ -21,6 +21,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import threading
+import time
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from itertools import count
@@ -92,6 +93,7 @@ class _RecordedReplicas:
         self.owner: str | None = None
         self.run_counter = 0
         self.operation_id: str | None = None
+        self.admitted_operation_ids: set[str] = set()
         self.pending_polls = pending_polls
         self.terminal_reads = 0
 
@@ -106,9 +108,13 @@ class _RecordedReplicas:
             return httpx.Response(200, json={"instance_id": instance}, headers=headers)
         with self._lock:
             if "/operations/" in request.url.path:
-                assert self.operation_id is not None
+                # Answer for the operation the URL names, as the service does; with
+                # both_win the last-arriving request owns self.operation_id, so
+                # echoing that would make the probe's identity check race thread order.
+                polled_operation_id = request.url.path.rsplit("/", 1)[-1]
+                assert polled_operation_id in self.admitted_operation_ids
                 self.terminal_reads += 1
-                body = operation_document(self.operation_id, "session-1")
+                body = operation_document(polled_operation_id, "session-1")
                 if self.pending_polls:
                     self.pending_polls -= 1
                     body.update(status="running", result=None, deadline_remaining_ms=1000)
@@ -121,6 +127,7 @@ class _RecordedReplicas:
                     self.owner = instance
                     self.operation_id = operation_id
                 if operation_id == self.operation_id or self._both_win:
+                    self.admitted_operation_ids.add(operation_id)
                     return httpx.Response(202, json={"operation_id": operation_id}, headers=headers)
                 return httpx.Response(
                     409,
@@ -253,6 +260,20 @@ def _driver(replicas: _RecordedReplicas) -> tuple[ReplicaProbeDriver, _FakeReade
 # --------------------------------------------------------------------------- P1 / P2 against recorded transports
 
 
+class _OrderedReplicas(_RecordedReplicas):
+    """Both replicas win, and ``last_arrival``'s message reaches the fence last."""
+
+    def __init__(self, *, last_arrival: str) -> None:
+        super().__init__(both_win=True)
+        self._last_arrival = last_arrival
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        arriving = self.instances[f"{request.url.scheme}://{request.url.host}"]
+        if request.url.path.endswith("/messages") and arriving == self._last_arrival:
+            time.sleep(0.05)
+        return super().handle(request)
+
+
 class TestFenceConflictRecorded:
     def test_reads_receipt_only_after_exact_operation_reaches_terminal(self) -> None:
         replicas = _RecordedReplicas(pending_polls=2)
@@ -302,8 +323,11 @@ class TestFenceConflictRecorded:
         assert result.mechanism == "session_operation_fence"
         EXEC_RECEIPT_DESCRIPTOR.detail_validators["replica-fence-conflict"](result.to_receipt_details())
 
-    def test_a_double_dispatch_fails_the_probe(self) -> None:
-        replicas = _RecordedReplicas(both_win=True)
+    @pytest.mark.parametrize("last_arrival", [RA, RB], ids=["original_last", "second_last"])
+    def test_a_double_dispatch_fails_the_probe(self, last_arrival: str) -> None:
+        # Both arrival orders are forced: the fake once echoed the last-arriving
+        # operation on every poll, so this probe passed or failed on thread order.
+        replicas = _OrderedReplicas(last_arrival=last_arrival)
         driver, _reader = _driver(replicas)
         trial = driver.fence_conflict_trial(
             "session-1",
