@@ -1216,6 +1216,27 @@ def _refresh_prompt_review_evidence(
     return file_snapshot.effective_artifact_hash if file_snapshot is not None else approved_prompt_artifact_hash_from_options(options)
 
 
+def resolved_prompt_review_matches_anchor(state_record: CompositionStateRecord, *, affected_node_id: str) -> bool:
+    """Whether every resolved prompt-template review on the node still attests its options.
+
+    The same derivation the execution drift guard applies and the editor-save
+    refresh writes. A save must not re-anchor a review that already drifted:
+    that would turn unseen text into approved text.
+    """
+    options = next(node["options"] for node in state_record.nodes or () if node["id"] == affected_node_id)
+    resolved = [
+        item
+        for item in parse_interpretation_requirements(options) or ()
+        if item["kind"] == InterpretationKind.LLM_PROMPT_TEMPLATE.value and item["status"] == "resolved"
+    ]
+    if not resolved:
+        return True
+    anchor = prompt_review_anchor_hash_from_options(options)
+    prompt = options["prompt_template"] if "prompt_template" in options else None
+    expected = anchor if anchor is not None else stable_hash(prompt)
+    return all(item["resolved_prompt_template_hash"] == expected for item in resolved)
+
+
 def _refresh_resolved_prompt_template_review(
     state_record: CompositionStateRecord, *, affected_node_id: str, file_snapshot: PromptReviewSnapshot
 ) -> list[Mapping[str, Any]]:

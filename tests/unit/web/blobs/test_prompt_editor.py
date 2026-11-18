@@ -22,6 +22,7 @@ from elspeth.web.blobs.service import content_hash
 from elspeth.web.composer.tools._common import _options_with_default_model_choice_review, _options_with_default_prompt_template_review
 from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.interpretation_state import (
+    InterpretationReviewIntegrityError,
     InterpretationReviewPending,
     materialize_state_for_execution,
     prompt_review_draft_from_options,
@@ -593,6 +594,57 @@ def test_agent_patch_of_prompt_text_on_approved_file_node_requires_review(tmp_pa
     with pytest.raises(PromptFileReviewStale) as refusal:
         _admit(service, blob_service, session_id)
     assert refusal.value.error_code == "prompt_file_review_stale"
+
+
+def test_save_refuses_to_reanchor_a_drifted_resolved_review(tmp_path: Path) -> None:
+    """An editor save never turns drifted, unreviewed prompt text into approved text."""
+    client, service, blob_service, session_id, first, _second, events = _live_prompt_setup(
+        tmp_path, field_path="prompt_template", inline_slot="system_prompt"
+    )
+    _approve_card(service, blob_service, session_id, events["first"])
+    assert [snapshot.node_id for snapshot in _admit(service, blob_service, session_id)] == ["first"]
+
+    # The inline system prompt changes outside any review while its card stays resolved.
+    record = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert record is not None
+    drifted = state_from_record(record).to_dict()
+    drifted["nodes"][0]["options"]["system_prompt"] = "Drifted system text nobody reviewed."
+    with fenced_operation_context(blob_service._engine, session_id) as operation:
+        asyncio.run(
+            service.save_composition_state(
+                UUID(session_id),
+                CompositionStateData(
+                    sources=drifted["sources"],
+                    nodes=drifted["nodes"],
+                    edges=drifted["edges"],
+                    outputs=drifted["outputs"],
+                    metadata_=drifted["metadata"],
+                    is_valid=True,
+                ),
+                provenance="tool_call",
+                session_operation_context=operation,
+            )
+        )
+    drifted_head = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert drifted_head is not None
+    with pytest.raises(InterpretationReviewIntegrityError, match="prompt-template review hash drifted"):
+        materialize_state_for_execution(state_from_record(drifted_head))
+    with blob_service._engine.connect() as conn:
+        approvals_before = conn.execute(select(prompt_file_approvals_table.c.id)).all()
+
+    refused = _save(client, session_id, first["id"], "user edited file", first["content_hash"])
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["error_code"] == "prompt_file_stale"
+    after = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert after is not None
+    assert after.id == drifted_head.id
+    with blob_service._engine.connect() as conn:
+        assert conn.execute(select(prompt_file_approvals_table.c.id)).all() == approvals_before
+        stored_hash = conn.execute(select(blobs_table.c.content_hash).where(blobs_table.c.id == first["id"])).scalar_one()
+    assert stored_hash == first["content_hash"]
+    with pytest.raises(InterpretationReviewIntegrityError, match="prompt-template review hash drifted"):
+        _admit(service, blob_service, session_id)
 
 
 def test_approved_unbound_blob_can_be_deleted_with_evidence_retained(tmp_path: Path) -> None:
