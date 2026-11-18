@@ -56,7 +56,7 @@ from elspeth.web.sessions.interpretation_validation import (
     SessionInterpretationValidationInputs,
     validate_composition_state_with_interpretation_inputs,
 )
-from elspeth.web.sessions.prompt_file_review import PromptReviewSnapshot
+from elspeth.web.sessions.prompt_file_review import PromptReviewSnapshot, prompt_file_binding_paths
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateRecord,
@@ -972,6 +972,41 @@ def _patch_llm_transform_prompt(
     return patched_nodes
 
 
+def _repended_file_prompt_requirements(
+    raw_requirements: Sequence[Any], parsed: Sequence[InterpretationRequirement], *, draft: str
+) -> list[Any]:
+    """Requirements with any RESOLVED ``llm_prompt_template`` review returned to pending on ``draft``.
+
+    Used only for a node with a prompt FILE after a vague-term resolve
+    re-renders its ``prompt_template``. The prompt requirement attests the
+    prompt SKELETON, so a vague-term resolve keeps it resolved
+    (elspeth-e51216d305), and that rule stands for inline-only nodes. A file
+    approval instead binds the rendered surface its card showed, so after the
+    re-render that approval no longer attests what runs: admission refuses and
+    no card is pending. Re-pending in the resolve's own transaction lets the
+    next surfacing pass issue a fresh card and snapshot of the rendered surface.
+    ``parsed`` is the owned parse of ``raw_requirements`` (same order); every
+    other row is carried through unchanged.
+    """
+    if len(raw_requirements) != len(parsed):
+        raise AuditIntegrityError("interpretation requirements parse disagrees with the stored rows")
+    repended: list[Any] = []
+    for raw, requirement in zip(raw_requirements, parsed, strict=True):
+        if requirement["kind"] == InterpretationKind.LLM_PROMPT_TEMPLATE.value and requirement["status"] == "resolved":
+            pending = dict(raw)
+            pending["status"] = "pending"
+            pending["draft"] = draft
+            pending["event_id"] = None
+            pending["accepted_value"] = None
+            pending["resolved_prompt_template_hash"] = None
+            if "accepted_artifact_hash" in pending:
+                pending["accepted_artifact_hash"] = None
+            repended.append(pending)
+        else:
+            repended.append(raw)
+    return repended
+
+
 def _resolve_vague_term(
     state_record: CompositionStateRecord,
     *,
@@ -1033,6 +1068,14 @@ def _resolve_vague_term(
             node_with_hash = dict(n)
             options_with_hash = dict(n["options"])
             options_with_hash["approved_prompt_artifact_hash"] = artifact_hash
+            if prompt_file_binding_paths(options_with_hash):
+                # A prompt file's approval binds the rendered surface: re-review it.
+                parsed = parse_interpretation_requirements(options_with_hash)
+                draft_after = prompt_review_draft_from_options(options_with_hash)
+                if parsed is not None and draft_after is not None:
+                    options_with_hash[INTERPRETATION_REQUIREMENTS_KEY] = _repended_file_prompt_requirements(
+                        options_with_hash[INTERPRETATION_REQUIREMENTS_KEY], parsed, draft=draft_after
+                    )
             node_with_hash["options"] = options_with_hash
             final_nodes.append(node_with_hash)
         else:
@@ -2031,6 +2074,9 @@ class _SessionPendingInterpretationPlanner:
                 and not snapshot.review_disabled
                 and matching_event_id is None
                 and pending_identity == current_identity
+                # Same requirement anchor, but the card's stored file snapshot
+                # shows a surface that no longer runs: superseded and re-issued.
+                and not site.file_snapshot_stale
             ):
                 matching_event_id = site.event.id
             else:

@@ -1210,12 +1210,19 @@ class SessionPendingInterpretationSiteSnapshot:
 
     event: InterpretationEventRecord
     surfacing_state: CompositionStateRecord | None
+    #: True when this pending prompt card's stored file snapshot no longer
+    #: matches the snapshot the live state derives (for example, a resolved
+    #: vague term re-rendered the inline prompt beside a file). Such a card can
+    #: never be approved, so the planner must not reuse it.
+    file_snapshot_stale: bool = False
 
     def __post_init__(self) -> None:
         if type(self.event) is not InterpretationEventRecord:
             raise AuditIntegrityError("pending interpretation snapshot event must be exact")
         if self.surfacing_state is not None and type(self.surfacing_state) is not CompositionStateRecord:
             raise AuditIntegrityError("pending interpretation surfacing state must be exact or None")
+        if type(self.file_snapshot_stale) is not bool:
+            raise AuditIntegrityError("pending interpretation file snapshot staleness must be an exact boolean")
 
 
 @final

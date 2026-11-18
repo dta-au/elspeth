@@ -11,7 +11,7 @@ import json
 import secrets
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from threading import RLock
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, final, get_args
@@ -192,6 +192,7 @@ if TYPE_CHECKING:
     from contextlib import AbstractContextManager
 
     from elspeth.web.execution.envelope import RunExecutionInput
+    from elspeth.web.sessions.inline_blob_preflight import SessionInlineBlobSnapshot
 
 _MAX_SESSION_ID_COLLISION_ATTEMPTS = 8
 _MUTATION_CONNECTION_REGISTRY = _mutation_connection_registry._MUTATION_CONNECTION_REGISTRY
@@ -1083,6 +1084,61 @@ class _RepositoryInterpretationMutations:
     ) -> PendingInterpretationCreationResult:
         return self._create_pending(command, validator, policy=PendingInterpretationPolicy.PIPELINE_CANDIDATE)
 
+    def _mark_stale_prompt_file_snapshots(
+        self,
+        pending_sites: list[SessionPendingInterpretationSiteSnapshot],
+        *,
+        live_state: CompositionStateRecord,
+        affected_node_id: str,
+        inline_blob_snapshot: SessionInlineBlobSnapshot | None,
+    ) -> list[SessionPendingInterpretationSiteSnapshot]:
+        """Flag pending prompt cards whose stored file snapshot no longer matches the live surface.
+
+        The requirement anchor attests the prompt SKELETON, so resolving a
+        vague-term slot keeps it while re-rendering the inline
+        ``prompt_template``. A file card's stored snapshot binds the rendered
+        surface, so after that resolve the card could never be approved (and
+        an editor save is refused beside the inline text). Flagging the card
+        here makes the planner supersede it and issue a fresh card and
+        snapshot in this same transaction. The live snapshot uses the reader
+        the insert path uses; a custody failure raises as it would there.
+        """
+        from elspeth.web.sessions.prompt_file_review import (
+            PromptFileReviewStale,
+            prompt_file_binding_paths,
+            resolve_prompt_review_snapshot,
+        )
+
+        connection = _resolve_mutation_connection(self.__state._connection_token)
+        session_id = self.__state._session_id
+        stored = {
+            row.event_id: row.anchor
+            for row in connection.execute(
+                select(prompt_review_snapshots_table.c.event_id, prompt_review_snapshots_table.c.anchor).where(
+                    prompt_review_snapshots_table.c.session_id == session_id,
+                    prompt_review_snapshots_table.c.event_id.in_(str(site.event.id) for site in pending_sites),
+                )
+            )
+        }
+        if not stored:
+            return pending_sites
+        node = next((item for item in live_state.nodes or () if item["id"] == affected_node_id), None)
+        live_anchor: str | None = None
+        if node is not None and prompt_file_binding_paths(node["options"]):
+            if inline_blob_snapshot is None:
+                raise PromptFileReviewStale()
+            live_snapshot = resolve_prompt_review_snapshot(
+                session_id=UUID(session_id),
+                node_id=affected_node_id,
+                options=node["options"],
+                read_blob=inline_blob_snapshot.content,
+            )
+            live_anchor = live_snapshot.anchor if live_snapshot is not None else None
+        return [
+            replace(site, file_snapshot_stale=True) if str(site.event.id) in stored and stored[str(site.event.id)] != live_anchor else site
+            for site in pending_sites
+        ]
+
     def _create_pending(
         self,
         command: SessionPendingInterpretationCommand,
@@ -1178,6 +1234,13 @@ class _RepositoryInterpretationMutations:
             ).scalar_one_or_none()
             is not None
         )
+        inline_blob_snapshot = validator.inline_blob_snapshot
+        if inline_blob_snapshot is not None:
+            inline_blob_snapshot.assert_current_rows(connection, session_id=UUID(state._session_id))
+        if command.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
+            pending_sites = self._mark_stale_prompt_file_snapshots(
+                pending_sites, live_state=live_state, affected_node_id=command.affected_node_id, inline_blob_snapshot=inline_blob_snapshot
+            )
         snapshot = SessionPendingInterpretationSnapshot(
             anchor_state=anchor_state,
             live_state=live_state,
@@ -1186,9 +1249,6 @@ class _RepositoryInterpretationMutations:
             opt_out_marker_exists=marker_exists,
             superseded_events=tuple(self._event_record(row) for row in superseded_rows),
         )
-        inline_blob_snapshot = validator.inline_blob_snapshot
-        if inline_blob_snapshot is not None:
-            inline_blob_snapshot.assert_current_rows(connection, session_id=UUID(state._session_id))
         if policy is PendingInterpretationPolicy.PIPELINE_CANDIDATE:
             candidate_terms = (
                 connection.execute(

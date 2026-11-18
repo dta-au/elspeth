@@ -1289,3 +1289,195 @@ def test_latest_prompt_file_approvals_attest_surface(tmp_path: Path, queries_for
     assert drifted_head is not None
     with pytest.raises(PromptFileApprovalStale):
         check(drifted_head)
+
+
+# --- C3: a resolved vague-term slot beside a file-backed system prompt ---
+#
+# The prompt-template requirement anchors the prompt SKELETON, so resolving a
+# vague-term slot keeps it; the file card's stored snapshot binds the rendered
+# prompt_template, so the slot resolve leaves that card unapprovable. The
+# reconciling surfacer must supersede it and issue a fresh card and snapshot.
+
+_VAGUE_TERM = "cool"
+_VAGUE_DRAFT = "well-designed and useful"
+
+
+def _vague_beside_file_setup(tmp_path: Path, *, file_backed: bool = True) -> tuple[Any, Any, Any, str, dict[str, Any], UUID, UUID]:
+    """Structured inline prompt with a pending vague slot, system_prompt bound to a file; both cards pending.
+
+    ``file_backed=False`` is the inline-only control: the same node with an inline system prompt.
+    """
+    app, service, blob_service = _make_app(tmp_path)
+    client = SyncASGITestClient(app)
+    session_id = _create_session(client)
+    system_file = _upload_blob(client, session_id, b"system prompt from a file", "system.txt", "text/plain")
+    engine = blob_service._engine
+
+    def read_blob(_context: Any, blob_id: UUID) -> tuple[Any, bytes]:
+        with engine.connect() as conn:
+            record = _blob_record(conn, UUID(session_id), blob_id)
+        return record, _read_custody_bytes(record)
+
+    service._inline_blob_read = read_blob
+    state = blob_tools._inline_ref_state().to_dict()
+    node = state["nodes"][0]
+    node["id"] = "first"
+    options = dict(node["options"])
+    options["system_prompt"] = (
+        {"blob_ref": system_file["id"], "mode": "inline_content", "sha256": system_file["content_hash"]}
+        if file_backed
+        else "inline system prompt"
+    )
+    options["prompt_template"] = "Rate pending interpretation this is."
+    options["prompt_template_parts"] = [
+        {"kind": "text", "text": "Rate "},
+        {"kind": "interpretation_ref", "requirement_id": _VAGUE_TERM},
+        {"kind": "text", "text": " this is."},
+    ]
+    options["interpretation_requirements"] = [
+        {
+            "id": _VAGUE_TERM,
+            "user_term": _VAGUE_TERM,
+            "status": "pending",
+            "draft": _VAGUE_DRAFT,
+            "event_id": None,
+            "accepted_value": None,
+            "resolved_prompt_template_hash": None,
+        }
+    ]
+    options = _options_with_default_model_choice_review(node_id="first", plugin="llm", options=options)
+    node["options"] = _options_with_default_prompt_template_review(node_id="first", plugin="llm", options=options)
+    with fenced_operation_context(engine, session_id) as operation:
+        saved = asyncio.run(
+            service.save_composition_state(
+                UUID(session_id),
+                CompositionStateData(
+                    sources=state["sources"],
+                    nodes=state["nodes"],
+                    edges=state["edges"],
+                    outputs=state["outputs"],
+                    metadata_=state["metadata"],
+                    is_valid=True,
+                ),
+                provenance="tool_call",
+                session_operation_context=operation,
+            )
+        )
+        events: dict[str, UUID] = {}
+        for term, kind, draft in (
+            ("llm_model_choice:first", InterpretationKind.LLM_MODEL_CHOICE, node["options"]["model"]),
+            (_VAGUE_TERM, InterpretationKind.VAGUE_TERM, _VAGUE_DRAFT),
+        ):
+            events[term] = asyncio.run(
+                service.create_pending_interpretation_event(
+                    session_id=UUID(session_id),
+                    composition_state_id=saved.id,
+                    affected_node_id="first",
+                    tool_call_id=f"setup-{kind.value}",
+                    user_term=term,
+                    kind=kind,
+                    llm_draft=draft,
+                    model_identifier="test-model",
+                    model_version="1",
+                    provider="test-provider",
+                    composer_skill_hash="a" * 64,
+                    session_operation_context=operation,
+                )
+            ).id
+        asyncio.run(
+            service.resolve_interpretation_event(
+                session_id=UUID(session_id),
+                event_id=events["llm_model_choice:first"],
+                choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+                amended_value=None,
+                actor="user:alice",
+                session_operation_context=operation,
+            )
+        )
+    prompt_card = _raise_prompt_card(service, blob_service, session_id, tool_call_id="setup-prompt")
+    return client, service, blob_service, session_id, system_file, prompt_card, events[_VAGUE_TERM]
+
+
+def _prompt_requirement_status(service: Any, session_id: str) -> str:
+    head = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert head is not None
+    return next(
+        requirement["status"]
+        for requirement in state_from_record(head).nodes[0].options["interpretation_requirements"]
+        if "kind" in requirement and requirement["kind"] == "llm_prompt_template"
+    )
+
+
+def _event_choice(blob_service: Any, event_id: UUID) -> str:
+    with blob_service._engine.connect() as conn:
+        return conn.execute(
+            select(interpretation_events_table.c.choice).where(interpretation_events_table.c.id == str(event_id))
+        ).scalar_one()
+
+
+def test_resolving_vague_term_first_reissues_an_approvable_file_card(tmp_path: Path) -> None:
+    _client, service, blob_service, session_id, _system_file, prompt_card, vague_card = _vague_beside_file_setup(tmp_path)
+
+    _approve_card(service, blob_service, session_id, vague_card)
+    head = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert head is not None
+    assert _VAGUE_DRAFT in state_from_record(head).nodes[0].options["prompt_template"]
+
+    # The surfacer reconciles the prompt card against the re-rendered head.
+    reissued = _raise_prompt_card(service, blob_service, session_id, tool_call_id="after-vague")
+    assert reissued != prompt_card
+    assert _event_choice(blob_service, prompt_card) == "superseded"
+    assert _event_choice(blob_service, reissued) == "pending"
+    with blob_service._engine.connect() as conn:
+        shown = conn.execute(
+            select(prompt_review_snapshots_table.c.snapshot_json).where(prompt_review_snapshots_table.c.event_id == str(reissued))
+        ).scalar_one()
+    assert _VAGUE_DRAFT in shown["authored_surface"]["prompt_template"]
+
+    _approve_card(service, blob_service, session_id, reissued)
+    admitted = _admit(service, blob_service, session_id)
+    assert [snapshot.node_id for snapshot in admitted] == ["first"]
+    assert _VAGUE_DRAFT in admitted[0].authored_surface["prompt_template"]
+
+
+def test_approving_file_card_then_resolving_vague_term_reopens_an_approvable_card(tmp_path: Path) -> None:
+    _client, service, blob_service, session_id, _system_file, prompt_card, vague_card = _vague_beside_file_setup(tmp_path)
+
+    _approve_card(service, blob_service, session_id, prompt_card)
+    _approve_card(service, blob_service, session_id, vague_card)
+    head = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert head is not None
+    assert _VAGUE_DRAFT in state_from_record(head).nodes[0].options["prompt_template"]
+
+    # The file approval bound the pre-render surface: the resolve re-opened the review.
+    assert _prompt_requirement_status(service, session_id) == "pending"
+    with pytest.raises(PromptFileReviewStale):
+        _admit(service, blob_service, session_id)
+
+    fresh = _raise_prompt_card(service, blob_service, session_id, tool_call_id="after-vague")
+    assert fresh != prompt_card
+    assert _event_choice(blob_service, prompt_card) == "accepted_as_drafted"
+    assert _event_choice(blob_service, fresh) == "pending"
+    with blob_service._engine.connect() as conn:
+        shown = conn.execute(
+            select(prompt_review_snapshots_table.c.snapshot_json).where(prompt_review_snapshots_table.c.event_id == str(fresh))
+        ).scalar_one()
+    assert _VAGUE_DRAFT in shown["authored_surface"]["prompt_template"]
+
+    _approve_card(service, blob_service, session_id, fresh)
+    admitted = _admit(service, blob_service, session_id)
+    assert [snapshot.node_id for snapshot in admitted] == ["first"]
+    assert _VAGUE_DRAFT in admitted[0].authored_surface["prompt_template"]
+
+
+def test_vague_resolve_keeps_an_inline_only_prompt_review_resolved(tmp_path: Path) -> None:
+    """Control: without a prompt file the skeleton rule stands; a vague resolve re-opens nothing."""
+    _client, service, blob_service, session_id, _system_file, prompt_card, vague_card = _vague_beside_file_setup(
+        tmp_path, file_backed=False
+    )
+
+    _approve_card(service, blob_service, session_id, prompt_card)
+    _approve_card(service, blob_service, session_id, vague_card)
+
+    assert _prompt_requirement_status(service, session_id) == "resolved"
+    assert _admit(service, blob_service, session_id) == ()
