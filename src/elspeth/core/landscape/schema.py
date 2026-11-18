@@ -612,7 +612,10 @@ run_prompt_inputs_table = Table(
     metadata,
     Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
     Column("node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
-    Column("field_path", String(256), nullable=False),
+    # Unbounded, like the session store's prompt_file_approvals.field_path:
+    # a mapping-form multi-query name is uncapped, so queries.<name>.template
+    # has no fixed width and a VARCHAR(n) would refuse a valid run at start.
+    Column("field_path", String, nullable=False),
     Column("blob_id", String(36), nullable=False),
     Column("content_sha256", String(64), nullable=False),
     Column("review_anchor", String(64), nullable=False),
