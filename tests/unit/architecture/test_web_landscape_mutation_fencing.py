@@ -344,12 +344,17 @@ _FRESH_EPOCH_ONE_EXCEPTION = AuthorityEstablishmentException(
     caller_symbol="RunLifecycleRepository.begin_run",
     callee_path="src/elspeth/core/landscape/run_coordination_repository.py",
     callee_symbol="RunCoordinationRepository.register_run_leader_on",
+    # PFR option 1 (maintainer ruling 2026-11-18): begin_run appends the
+    # admitted run_prompt_inputs evidence in this same runs-row transaction,
+    # beside run_start_admissions and the web plugin policy evidence, so the
+    # rows exist with their run FK before any provider call.
     write_counts=(
         ("run_attributions", "insert", 1),
         ("run_start_admissions", "insert", 1),
         ("run_coordination", "insert", 1),
         ("run_coordination", "update", 1),
         ("run_coordination_events", "insert", 2),
+        ("run_prompt_inputs", "insert", 1),
         ("run_web_plugin_policy", "insert", 1),
         ("run_workers", "insert", 1),
         ("run_workers", "update", 1),
@@ -17649,7 +17654,7 @@ def acquire_reconciliation_leadership(self, *, run_id: str, worker_id: str, wind
 _COORDINATION_FINALIZATION_RECIPES[
     ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository._observe_permitted_run_on")
 ] = """
-def _observe_permitted_run_on(self, conn: Connection, binding: RunStartPermitBinding, *, config_hash: str, canonical_version: str, openrouter_catalog_sha256: str, openrouter_catalog_source: str, initiated_by_user_id: str | None, auth_provider_type: str | None, source_schema_json: str | None, runtime_val_manifest_json: str | None, web_plugin_policy_evidence: WebPluginPolicyEvidence | None, run_prompt_inputs: tuple[RunPromptInputEvidence, ...]=()) -> Run | None:
+def _observe_permitted_run_on(self, conn: Connection, binding: RunStartPermitBinding, *, config_hash: str, canonical_version: str, openrouter_catalog_sha256: str, openrouter_catalog_source: str, initiated_by_user_id: str | None, auth_provider_type: str | None, source_schema_json: str | None, runtime_val_manifest_json: str | None, web_plugin_policy_evidence: WebPluginPolicyEvidence | None, run_prompt_inputs: tuple[RunPromptInputEvidence, ...] | None) -> Run | None:
     row = conn.execute(select(runs_table).where(runs_table.c.run_id == binding.run_id)).one_or_none()
     if row is None:
         return None
@@ -17677,12 +17682,8 @@ def _observe_permitted_run_on(self, conn: Connection, binding: RunStartPermitBin
             raise AuditIntegrityError('Permit retry found corrupt admission evidence') from exc
         if (policy.schema_version, policy.policy_hash, policy.snapshot_hash, policy.authorized_plugin_ids_json, policy.available_plugin_ids_json, policy.control_modes_json, policy.selected_implementations_json, policy.selected_profile_aliases_json, policy.plugin_code_identities_json, policy.binding_generation_fingerprint, policy.decision_codes_json, admission_decision) != (evidence.schema_version, evidence.policy_hash, evidence.snapshot_hash, canonical_json(evidence.authorized_plugin_ids), canonical_json(evidence.available_plugin_ids), canonical_json(evidence.control_modes), canonical_json(evidence.selected_implementations), canonical_json(evidence.selected_profile_aliases), canonical_json(evidence.plugin_code_identities), evidence.binding_generation_fingerprint, canonical_json(evidence.decision_codes), evidence.admission_decision):
             raise AuditIntegrityError('Permit retry changed web plugin policy evidence')
-    stored_inputs = conn.execute(select(run_prompt_inputs_table).where(run_prompt_inputs_table.c.run_id == binding.run_id)).all()
-    try:
-        stored = {RunPromptInputEvidence(node_id=item.node_id, field_path=item.field_path, blob_id=item.blob_id, content_sha256=item.content_sha256, review_anchor=item.review_anchor, effective_artifact_hash=item.effective_artifact_hash) for item in stored_inputs}
-    except ValueError as exc:
-        raise AuditIntegrityError('Permit retry found corrupt run prompt input evidence') from exc
-    if stored != set(run_prompt_inputs):
+    stored = _stored_run_prompt_inputs_on(conn, binding.run_id)
+    if run_prompt_inputs is not None and stored != frozenset(run_prompt_inputs):
         raise AuditIntegrityError('Permit retry changed run prompt input evidence')
     return self._run_loader.load(row)
 """
@@ -17732,9 +17733,28 @@ _COORDINATION_FINALIZATION_DEPENDENCIES[
     "runs_table": "elspeth.core.landscape.schema.runs_table",
     "run_attributions_table": "elspeth.core.landscape.schema.run_attributions_table",
     "run_web_plugin_policy_table": "elspeth.core.landscape.schema.run_web_plugin_policy_table",
-    "run_prompt_inputs_table": "elspeth.core.landscape.schema.run_prompt_inputs_table",
+    "_stored_run_prompt_inputs_on": "elspeth.core.landscape.run_lifecycle_repository._stored_run_prompt_inputs_on",
     "canonical_json": "elspeth.core.canonical.canonical_json",
     "decode_admission_decision": "elspeth.contracts.plugin_policy_audit.decode_admission_decision",
+}
+# The stored prompt-evidence read moved out of _observe_permitted_run_on into
+# this module helper (73d844a2c), shared with the resume check (db303fc21).
+# It is pinned here exactly as it was inline: one select of the run's rows on
+# the caller's connection, decoded into evidence, corrupt rows refused.
+_COORDINATION_FINALIZATION_RECIPES[("src/elspeth/core/landscape/run_lifecycle_repository.py", "_stored_run_prompt_inputs_on")] = """
+def _stored_run_prompt_inputs_on(conn: Connection, run_id: str) -> frozenset[RunPromptInputEvidence]:
+    rows = conn.execute(select(run_prompt_inputs_table).where(run_prompt_inputs_table.c.run_id == run_id)).all()
+    try:
+        return frozenset((RunPromptInputEvidence(node_id=item.node_id, field_path=item.field_path, blob_id=item.blob_id, content_sha256=item.content_sha256, review_anchor=item.review_anchor, effective_artifact_hash=item.effective_artifact_hash) for item in rows))
+    except ValueError as exc:
+        raise AuditIntegrityError('Stored run prompt input evidence is corrupt') from exc
+"""
+_COORDINATION_FINALIZATION_DEPENDENCIES[("src/elspeth/core/landscape/run_lifecycle_repository.py", "_stored_run_prompt_inputs_on")] = {
+    "Connection": "sqlalchemy.engine.Connection",
+    "RunPromptInputEvidence": "elspeth.contracts.run_prompt_input.RunPromptInputEvidence",
+    "AuditIntegrityError": "elspeth.contracts.errors.AuditIntegrityError",
+    "select": "sqlalchemy.select",
+    "run_prompt_inputs_table": "elspeth.core.landscape.schema.run_prompt_inputs_table",
 }
 _COORDINATION_FINALIZATION_DEPENDENCIES[("src/elspeth/core/landscape/run_start_admission.py", "RunStartAdmissionRepository.observe_on")] = {
     "Connection": "sqlalchemy.Connection",
@@ -17759,7 +17779,7 @@ def materialize_cancelled_permit(self, binding: RunStartPermitBinding, config: M
     worker_id = mint_worker_id(binding.run_id)
     with self._db.engine.connect() as conn:
         header = conn.execute(select(runs_table).where(runs_table.c.run_id == binding.run_id)).one_or_none()
-        run = None if header is None else self._observe_permitted_run_on(conn, binding, config_hash=stable_hash(config), canonical_version=canonical_version, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type, source_schema_json=header.source_schema_json, runtime_val_manifest_json=header.runtime_val_manifest_json, web_plugin_policy_evidence=web_plugin_policy_evidence)
+        run = None if header is None else self._observe_permitted_run_on(conn, binding, config_hash=stable_hash(config), canonical_version=canonical_version, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type, source_schema_json=header.source_schema_json, runtime_val_manifest_json=header.runtime_val_manifest_json, web_plugin_policy_evidence=web_plugin_policy_evidence, run_prompt_inputs=None)
     if run is None:
         run = self.begin_run(config, canonical_version, run_id=binding.run_id, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type, web_plugin_policy_evidence=web_plugin_policy_evidence, leader_worker_id=worker_id, run_start_permit=binding)
     if run.status in _TERMINAL_RUN_STATUSES:
@@ -25227,6 +25247,7 @@ def test_authority_establishment_exception_is_exact_and_non_release() -> None:
         ("run_coordination", "insert", 1),
         ("run_coordination", "update", 1),
         ("run_coordination_events", "insert", 2),
+        ("run_prompt_inputs", "insert", 1),
         ("run_web_plugin_policy", "insert", 1),
         ("run_workers", "insert", 1),
         ("run_workers", "update", 1),

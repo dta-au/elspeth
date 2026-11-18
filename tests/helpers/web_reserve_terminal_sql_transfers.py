@@ -22,9 +22,11 @@ GRAMMARS = {
     COMPLETE: "4947b18fec56b611b18c552727355de19b281da98f24f27f207e109f27cddd0a",
     FAIL: "722ac4ab6f9aee7a02e7750b20ca7fe9ef5e2113799beb1891fbeac045dc2644",
 }
-# SessionServiceImpl adds owned prompt-review/approval methods; the three
-# terminal SQL bodies and their supplier grammars remain unchanged above.
-NAMESPACE_GRAMMAR = "566c51e0ddccecbcce767d4c941b4cf64655a0b91d217defb4b66a3841d71d08"
+# SessionServiceImpl adds owned prompt-review/approval methods, and
+# resolve_interpretation_event gains the keyword-only ``reviewed_anchor``
+# (16e9add9d); the three terminal SQL bodies and their supplier grammars
+# remain unchanged above.
+NAMESPACE_GRAMMAR = "8fe0ab50cf5edc4d90679ed63297de7bc92abcfa6fa13e685cea747688d039db"
 MASK = inspect.CO_GENERATOR | inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR | inspect.CO_ITERABLE_COROUTINE
 SUPPLIERS = (
     ("RequiredWorkCoordinator", "elspeth.web.required_work", REQUIRED),
