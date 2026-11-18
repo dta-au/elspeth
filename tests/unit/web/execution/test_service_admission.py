@@ -74,6 +74,25 @@ real_loop = _service_tests.real_loop
 service = _service_tests.service
 
 
+def _frozen_state(service: ExecutionServiceImpl, session_id: UUID, nodes: list[dict[str, Any]]) -> UUID:
+    """Stage the revision a frozen config was compiled from; its approvals are what admission asserts."""
+    record = _composition_state_record(session_id=session_id, source_path=Path("input.csv"), output_path=Path("output.jsonl"), nodes=nodes)
+    cast(MagicMock, service._session_service).get_state_in_session.return_value = record
+    return record.id
+
+
+def _llm_prompt_node(node_id: str, marker: dict[str, str]) -> dict[str, Any]:
+    return {
+        "id": node_id,
+        "node_type": "transform",
+        "plugin": "llm",
+        "input": "source_rows",
+        "on_success": "out",
+        "on_error": "discard",
+        "options": {"prompt_template": marker},
+    }
+
+
 class TestAuthoritativeProofDiagnostics:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1639,9 +1658,8 @@ class TestGovernedExecutionAdmission:
             env_ref_names=(),
             blob_inputs=[SimpleNamespace(reference=SimpleNamespace(blob_id=blob_id), retained=object())],
         )
-        mock_session_service.get_run.return_value = _run_record_stub(
-            id=run_id, session_id=owner_session, status="running", landscape_run_id=str(run_id)
-        )
+        run_record = _run_record_stub(id=run_id, session_id=owner_session, status="running", landscape_run_id=str(run_id))
+        mock_session_service.get_run.return_value = run_record
         mock_session_service.assess_run_start_admission.side_effect = [
             SimpleNamespace(state=StartPermitState.PENDING, execution_refusal=None),
             SimpleNamespace(state=StartPermitState.REFUSED, execution_refusal=AdmissionRefusalReason.APPROVAL_BINDING_MISMATCH),
@@ -1657,7 +1675,7 @@ class TestGovernedExecutionAdmission:
         )
 
         with (
-            patch.object(service, "_approval_inputs_from_frozen", return_value=_governed_approval_inputs(service)),
+            patch.object(service, "_approval_inputs_from_frozen", return_value=_governed_approval_inputs(service)) as approval_inputs,
             patch.object(service, "_require_current_binding_generation"),
             patch.object(service, "_settle_admission_refusal", new_callable=AsyncMock) as settle,
             patch("elspeth.core.landscape.run_start_admission.RunStartAdmissionRepository.observe", return_value=None),
@@ -1683,12 +1701,13 @@ class TestGovernedExecutionAdmission:
             )
 
         assert outcome is None
+        # Governed worker start asserts approvals on the run's own revision, not the head.
+        assert approval_inputs.call_args.kwargs["state_id"] == run_record.state_id
         assert mock_session_service.assess_run_start_admission.await_count == 2
         settle.assert_awaited_once()
         payload_store.return_value.store.assert_not_called()
 
     def test_inline_content_is_compiled_from_verified_bytes(self, service: ExecutionServiceImpl, mock_session_service: MagicMock) -> None:
-        del mock_session_service
         content = b"Verified user prompt"
         blob_id = uuid4()
         session_id = uuid4()
@@ -1732,13 +1751,23 @@ class TestGovernedExecutionAdmission:
         ):
             inputs = service._approval_inputs_from_frozen(
                 frozen,
+                state_id=_frozen_state(service, session_id, [_llm_prompt_node("classify", marker)]),
                 user_id="author",
                 session_id=session_id,
                 session_operation_context=_execute_lease().context,
             )
 
-        assert loaded[0]["transforms"][0]["options"]["prompt_template"] == content.decode()
+        from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
+
+        options = loaded[0]["transforms"][0]["options"]
+        assert options["prompt_template"] == content.decode()
+        # The frozen revision's admitted snapshot binds the hash the worker binds too.
+        assert options["approved_prompt_artifact_hash"] == approved_prompt_artifact_hash(
+            prompt_template=content.decode(), system_prompt=None
+        )
         assert inputs.config_hash == stable_hash(loaded[0])
+        (snapshot,) = [call.args[0] for call in mock_session_service.assert_prompt_file_approvals.call_args_list]
+        assert snapshot.node_id == "classify"
         blob_service.get_blob.assert_awaited_once()
         blob_service.read_blob_content.assert_awaited_once()
 
@@ -1775,6 +1804,11 @@ class TestGovernedExecutionAdmission:
         with pytest.raises(BlobIntegrityError):
             service._approval_inputs_from_frozen(
                 frozen,
+                state_id=_frozen_state(
+                    service,
+                    session_id,
+                    [_llm_prompt_node("classify", {"blob_ref": str(blob_id), "mode": "inline_content", "sha256": digest})],
+                ),
                 user_id="author",
                 session_id=session_id,
                 session_operation_context=_execute_lease().context,
@@ -1833,6 +1867,7 @@ class TestGovernedExecutionAdmission:
         ):
             inputs = service._approval_inputs_from_frozen(
                 frozen,
+                state_id=_frozen_state(service, session_id, []),
                 user_id="author",
                 session_id=session_id,
                 session_operation_context=_execute_lease().context,

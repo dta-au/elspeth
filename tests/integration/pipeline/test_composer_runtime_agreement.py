@@ -4341,7 +4341,7 @@ class TestComposerRuntimeBlobInlineAgreement:
         )
 
     @staticmethod
-    def _pipeline_yaml(blob_id: UUID, sha256: str) -> str:
+    def _pipeline_yaml(blob_id: UUID, sha256: str, *, node_name: str = "classify") -> str:
         return f"""
 sources:
   source:
@@ -4350,7 +4350,7 @@ sources:
     options:
       path: input.csv
 transforms:
-  - name: classify
+  - name: {node_name}
     plugin: llm
     input: classify_in
     on_success: results
@@ -4548,7 +4548,9 @@ sinks:
             with pytest.raises(RuntimeError, match="stop after inline audit"):
                 service._run_pipeline(
                     str(run_id),
-                    self._pipeline_yaml(blob_id, sha256),
+                    # The approved state's node is "first"; a real run's YAML is
+                    # generated from that state, so the runtime node carries its id.
+                    self._pipeline_yaml(blob_id, sha256, node_name="first"),
                     threading.Event(),
                     session_operation_lease=lease,
                 )
@@ -4559,7 +4561,7 @@ sinks:
         recorded_call = session_service.recorded_blob_inline_resolutions[0]
         resolutions = recorded_call["resolutions"]
         assert len(resolutions) == 1
-        assert resolutions[0].field_path == "node:classify.options.prompt_template"
+        assert resolutions[0].field_path == "node:first.options.prompt_template"
         assert resolutions[0].content_hash == sha256
         provider.execute_query.assert_called_once()
         assert provider.execute_query.call_args.args[0] == [ChatMessage(role="user", content=content.decode("utf-8"))]

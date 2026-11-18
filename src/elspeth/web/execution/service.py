@@ -122,6 +122,8 @@ from elspeth.web.credential_guard import require_no_credential_material_in_state
 from elspeth.web.execution._semantic_helpers import semantic_affected_component_id
 from elspeth.web.execution._validation_materialization import (
     FILE_INJECT_PLUGIN,
+    _runtime_config_plugin_nodes,
+    _RuntimePluginNode,
     file_inject_admission_message,
     file_inject_blob_refusals,
     file_inject_runtime_config_refusals,
@@ -1106,6 +1108,30 @@ def _run_prompt_input_evidence(snapshots: tuple[PromptReviewSnapshot, ...]) -> t
     )
 
 
+def _bind_admitted_prompt_artifact_hashes(runtime_nodes: Sequence[_RuntimePluginNode], snapshots: tuple[PromptReviewSnapshot, ...]) -> None:
+    """Put each admitted snapshot's effective artifact hash on its LLM node, after substitution.
+
+    Materialization drops ``approved_prompt_artifact_hash`` for a file-backed
+    prompt (the option-only derivation cannot read a blob marker), and blob
+    substitution only inlines text, so without this the provider-call audit
+    rows record NULL. The value comes only from the admitted snapshot, never
+    from storage; ``LLMConfig`` re-derives it from the substituted text and
+    refuses a mismatch. ``runtime_nodes`` is ``_runtime_config_plugin_nodes``
+    of the substituted config: each carries the config's own option mapping,
+    so this binds in place.
+    """
+    for snapshot in snapshots:
+        if snapshot.effective_artifact_hash is None:
+            continue
+        nodes = [node for node in runtime_nodes if node.name == snapshot.node_id]
+        options = nodes[0].options if len(nodes) == 1 and nodes[0].plugin == "llm" else None
+        if type(options) is not dict:
+            raise AuditIntegrityError(f"admitted prompt node {snapshot.node_id!r} is not exactly one runtime llm node")
+        if "approved_prompt_artifact_hash" in options and options["approved_prompt_artifact_hash"] != snapshot.effective_artifact_hash:
+            raise AuditIntegrityError(f"runtime approved prompt artifact hash for {snapshot.node_id!r} differs from admitted evidence")
+        options["approved_prompt_artifact_hash"] = snapshot.effective_artifact_hash
+
+
 # B1 fix: RunAlreadyActiveError is NOT defined here — imported from
 # sessions.protocol where the canonical definition lives. Defining a
 # second class with the same name would prevent app.py's global
@@ -1320,12 +1346,18 @@ class ExecutionServiceImpl:
         user_id: str,
         session_id: UUID,
         session_operation_context: SessionOperationContext,
+        state_id: UUID,
     ) -> ApprovalGateInputs:
         """Compile the approval tuple from the same frozen inputs used by a run.
 
         This path deliberately applies the operator's telemetry and export
         settings before hashing. Those settings also enter the Landscape run
         config; the authored settings alone are not the run's config.
+
+        ``state_id`` names the revision ``frozen`` was compiled from (never the
+        session head): prompt-file approvals are asserted on it, with the bytes
+        read here, and its admitted snapshots supply the approved prompt
+        artifact hashes the worker binds the same way, so the config hashes agree.
         """
         from elspeth.core.secrets import resolve_secret_refs
         from elspeth.web.execution.export_marking import apply_operator_export_marking, operator_marked_config_dict
@@ -1334,14 +1366,7 @@ class ExecutionServiceImpl:
         catalog_sha = self._openrouter_catalog_sha256
         if catalog_sha is None:
             raise RuntimeError("ExecutionServiceImpl has no OpenRouter catalog snapshot")
-        state_record = self._call_async(self._session_service.get_current_state(session_id))
-        if state_record is None:
-            raise PromptFileReviewStale()
-        self._assert_state_prompt_file_approvals(
-            state_from_record(state_record),
-            session_id=session_id,
-            session_operation_context=session_operation_context,
-        )
+        state = state_from_record(self._call_async(self._session_service.get_state_in_session(state_id, session_id)))
         executable_config = cast(dict[str, Any], deep_thaw(frozen.executable_config))
         # Durable execution replaces path sources with content-addressed retained
         # paths. Predict that exact path without creating a retained copy while
@@ -1374,11 +1399,12 @@ class ExecutionServiceImpl:
         if file_inject_refusals:
             raise InlineBlobPromptSurfaceAdmissionError(file_inject_admission_message(file_inject_refusals))
         inline_refs = _discover_blob_content_refs(executable_config)
+        records_by_id: dict[UUID, BlobRecord] = {}
+        contents: dict[UUID, bytes] = {}
         if inline_refs:
             blob_service = self._blob_service
             if blob_service is None:
                 raise RuntimeError("Inline blob approval compilation requires the blob service")
-            records_by_id: dict[UUID, BlobRecord] = {}
             for ref in inline_refs:
                 if ref.blob_id in records_by_id:
                     continue
@@ -1407,7 +1433,6 @@ class ExecutionServiceImpl:
             file_inject_blob_refs = file_inject_blob_refusals(inline_refs, records_by_id, node_plugins=node_plugins)
             if file_inject_blob_refs:
                 raise InlineBlobPromptSurfaceAdmissionError(file_inject_admission_message(file_inject_blob_refs))
-            contents: dict[UUID, bytes] = {}
             for blob_id in records_by_id:
                 try:
                     contents[blob_id] = self._call_async(
@@ -1425,6 +1450,16 @@ class ExecutionServiceImpl:
                     blob_id: (cast(AllowedMimeType, record.mime_type), record.size_bytes) for blob_id, record in records_by_id.items()
                 },
             )
+        # Approvals of the frozen revision, over exactly the bytes read above (a
+        # prompt file this config does not reference refuses as stale).
+        prompt_snapshots = self._assert_state_prompt_file_approvals(
+            state,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+            admitted_contents=contents,
+            admitted_records=records_by_id,
+        )
+        _bind_admitted_prompt_artifact_hashes(_runtime_config_plugin_nodes(executable_config), prompt_snapshots)
         settings = load_settings_from_config_dict(operator_marked_config_dict(executable_config, self._settings), expand_env_vars=False)
         settings = apply_operator_pipeline_telemetry(settings, self._settings)
         effective_export = apply_operator_export_marking(settings.landscape.export, self._settings)
@@ -1525,6 +1560,7 @@ class ExecutionServiceImpl:
             user_id=user_id,
             session_id=session_id,
             session_operation_context=session_operation_context,
+            state_id=record.id,
         )
         return inputs.binding
 
@@ -2812,6 +2848,7 @@ class ExecutionServiceImpl:
                 user_id=user_id,
                 session_id=session_id,
                 session_operation_context=session_operation_context,
+                state_id=state_record.id,
             )
             reason = await self._session_service.check_approval_binding(
                 session_id,
@@ -2835,6 +2872,7 @@ class ExecutionServiceImpl:
                 user_id=user_id,
                 session_id=session_id,
                 session_operation_context=session_operation_context,
+                state_id=state_record.id,
             )
             reason = await self._session_service.check_approval_binding(
                 session_id,
@@ -2985,6 +3023,7 @@ class ExecutionServiceImpl:
                 user_id=session.user_id,
                 session_id=run.session_id,
                 session_operation_context=session_operation_lease.context,
+                state_id=run.state_id,
             )
         if approval_inputs is None:
             permit = await self._session_service.assess_run_start_admission(
@@ -3652,6 +3691,7 @@ class ExecutionServiceImpl:
                     user_id=user_id,
                     session_id=approval_run.session_id,
                     session_operation_context=session_operation_context,
+                    state_id=approval_run.state_id,
                 )
             if durable_admission and restored_envelope is None:
                 admitted_run = self._call_async(self._session_service.get_run(run_uuid))
@@ -4069,6 +4109,7 @@ class ExecutionServiceImpl:
                             refs=inline_refs,
                             blob_metadata=blob_metadata,
                         )
+                        _bind_admitted_prompt_artifact_hashes(_runtime_config_plugin_nodes(resolved_dict), prompt_snapshots)
                     except BlobIntegrityError:
                         _BLOB_INLINE_HASH_MISMATCH_TOTAL.add(1)
                         raise
