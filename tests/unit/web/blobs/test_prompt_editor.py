@@ -524,6 +524,77 @@ def test_save_admits_then_agent_edit_requires_review(tmp_path: Path) -> None:
     assert [snapshot.node_id for snapshot in _admit(service, blob_service, session_id)] == ["first"]
 
 
+def _patch_and_save(service: Any, blob_service: Any, session_id: str, tmp_path: Path, patch: dict[str, Any]) -> Any:
+    """Run the agent's patch_node_options on node 'first' and persist the result as the agent would."""
+    from tests.unit.web.composer.test_blob_inline_tools import _catalog, execute_tool
+
+    record = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert record is not None
+    with fenced_operation_context(blob_service._engine, session_id) as operation:
+        patched = execute_tool(
+            "patch_node_options",
+            {"node_id": "first", "patch": patch},
+            state_from_record(record),
+            _catalog(),
+            data_dir=str(tmp_path),
+            session_engine=blob_service._engine,
+            session_id=session_id,
+            session_operation_context=operation,
+            session_operation_authority=service.session_operation_authority,
+        )
+        assert patched.success, patched.to_dict()
+        next_state = patched.updated_state.to_dict()
+        asyncio.run(
+            service.save_composition_state(
+                UUID(session_id),
+                CompositionStateData(
+                    sources=next_state["sources"],
+                    nodes=next_state["nodes"],
+                    edges=next_state["edges"],
+                    outputs=next_state["outputs"],
+                    metadata_=next_state["metadata"],
+                    is_valid=True,
+                ),
+                provenance="tool_call",
+                session_operation_context=operation,
+            )
+        )
+    return patched.updated_state
+
+
+@pytest.mark.parametrize("approval", ["card", "editor_save"])
+def test_agent_patch_of_unrelated_option_keeps_approved_file_prompt_admitted(tmp_path: Path, approval: str) -> None:
+    """An approved file-backed node stays patchable: an unrelated option change keeps its approval."""
+    client, service, blob_service, session_id, first, _second, events = _live_prompt_setup(tmp_path)
+    if approval == "card":
+        _approve_card(service, blob_service, session_id, events["first"])
+    else:
+        saved = _save(client, session_id, first["id"], "owner-edited prompt", first["content_hash"])
+        assert saved.status_code == 200, saved.text
+    assert [snapshot.node_id for snapshot in _admit(service, blob_service, session_id)] == ["first"]
+
+    updated = _patch_and_save(service, blob_service, session_id, tmp_path, {"temperature": 0.3})
+
+    node = next(node for node in updated.nodes if node.id == "first")
+    assert node.options["temperature"] == 0.3
+    assert _review_state(service, session_id)[0]["first"] == "resolved"
+    assert [snapshot.node_id for snapshot in _admit(service, blob_service, session_id)] == ["first"]
+
+
+def test_agent_patch_of_prompt_text_on_approved_file_node_requires_review(tmp_path: Path) -> None:
+    """Control: a patch that changes the reviewed prompt surface does not inherit the file approval."""
+    _client, service, blob_service, session_id, _first, _second, events = _live_prompt_setup(tmp_path)
+    _approve_card(service, blob_service, session_id, events["first"])
+    assert [snapshot.node_id for snapshot in _admit(service, blob_service, session_id)] == ["first"]
+
+    _patch_and_save(service, blob_service, session_id, tmp_path, {"system_prompt": "Agent-written system prompt."})
+
+    assert _review_state(service, session_id)[0]["first"] == "pending"
+    with pytest.raises(PromptFileReviewStale) as refusal:
+        _admit(service, blob_service, session_id)
+    assert refusal.value.error_code == "prompt_file_review_stale"
+
+
 def test_approved_unbound_blob_can_be_deleted_with_evidence_retained(tmp_path: Path) -> None:
     client, service, blob_service, session_id, first, _second, _events = _live_prompt_setup(tmp_path)
     assert _save(client, session_id, first["id"], "approved edit", first["content_hash"]).status_code == 200
