@@ -187,7 +187,9 @@ function BoundPromptActions({ blobId, nodeId, fieldPath, label, sessionId, state
   const reasonId = `prompt-slot-${nodeId}-${fieldPath}-reason`;
   const missingReasonId = `prompt-slot-${nodeId}-${fieldPath}-missing`;
   return <span className="prompt-slot-actions">
-    <Button type="button" variant="bare" aria-label={`Show ${filename} (${label}) in files`}
+    {/* The accessible name STARTS with the visible label (WCAG 2.5.3), so
+        "click Show in files" matches for voice-control users. */}
+    <Button type="button" variant="bare" aria-label={`Show in files: ${filename} (${label})`}
       aria-disabled={!present} aria-describedby={!present ? missingReasonId : undefined}
       onClick={(event) => { if (present) useBlobStore.getState().revealBlob(sessionId, blobId, filename, event.currentTarget); }}>
       Show in files

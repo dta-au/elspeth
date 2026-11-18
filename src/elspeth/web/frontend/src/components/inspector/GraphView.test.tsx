@@ -680,7 +680,7 @@ describe("GraphView", () => {
     const panel = screen.getByRole("complementary", { name: /classify configuration/i });
     expect(within(panel).getAllByText(/prompt\.md/).length).toBeGreaterThanOrEqual(1);
     expect(panel.textContent).not.toMatch(/blob_ref|inline_content|f976fd8b-4432|a{64}/);
-    expect(within(panel).getByRole("button", { name: "Show prompt.md (User prompt) in files" })).toBeInTheDocument();
+    expect(within(panel).getByRole("button", { name: "Show in files: prompt.md (User prompt)" })).toBeInTheDocument();
     expect(within(panel).getByRole("button", { name: "Edit prompt.md (User prompt)" })).toBeInTheDocument();
   });
 

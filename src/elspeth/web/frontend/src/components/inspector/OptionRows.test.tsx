@@ -63,25 +63,34 @@ describe("file-backed option values", () => {
     expect(useBlobStore.getState().editRequest).toMatchObject({ nodeId: "llm", fieldPath: "queries.0.template" });
   });
 
+  it("names Show in files with its visible label first (WCAG 2.5.3)", () => {
+    seedFile();
+    render(<OptionRows options={{ prompt_template: { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH } }}
+      ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
+    const show = screen.getByRole("button", { name: "Show in files: prompt.md (User prompt)" });
+    expect(show.textContent).toBe("Show in files");
+    expect(show.getAttribute("aria-label")?.startsWith(show.textContent ?? "\u0000")).toBe(true);
+  });
+
   it("adds file and slot named navigation actions only in the inspector", () => {
     seedFile({ filename: "summarise.txt" });
     const marker = { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH };
     const options = { system_prompt: marker, prompt_template: marker, queries: { classify: { template: marker } } };
     const { rerender } = render(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
-    expect(screen.getByRole("button", { name: "Show summarise.txt (System prompt) in files" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Show in files: summarise.txt (System prompt)" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Edit summarise.txt (System prompt)" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Show summarise.txt (User prompt, query classify) in files" })).toBeInTheDocument();
-    act(() => screen.getByRole("button", { name: "Show summarise.txt (System prompt) in files" }).click());
+    expect(screen.getByRole("button", { name: "Show in files: summarise.txt (User prompt, query classify)" })).toBeInTheDocument();
+    act(() => screen.getByRole("button", { name: "Show in files: summarise.txt (System prompt)" }).click());
     expect(useBlobStore.getState().revealRequest?.blobId).toBe(FILE_ID);
     rerender(<OptionRows options={options} ariaLabel="spec options" plugin={{ kind: "transform", name: "llm" }} />);
-    expect(screen.queryByRole("button", { name: /Show .* in files/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Show in files/ })).not.toBeInTheDocument();
   });
 
   it("keeps a missing file action focusable and describes its refusal", () => {
     const marker = { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH };
     useBlobStore.setState({ activeSessionId: "session-1", blobs: [], isLoading: false });
     render(<OptionRows options={{ prompt_template: marker }} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
-    const show = screen.getByRole("button", { name: /Show .*User prompt.* in files/ });
+    const show = screen.getByRole("button", { name: /^Show in files: .*User prompt/ });
     expect(show).toHaveAttribute("aria-disabled", "true");
     expect(show).toHaveAccessibleDescription("This file is not in this session.");
     expect(show).not.toBeDisabled();
@@ -93,7 +102,7 @@ describe("file-backed option values", () => {
     useBlobStore.setState({ activeSessionId: "session-1", blobs: [], isLoading: true });
     render(<OptionRows options={{ prompt_template: { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH } }}
       ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
-    const show = screen.getByRole("button", { name: "Show Loading file name… (User prompt) in files" });
+    const show = screen.getByRole("button", { name: "Show in files: Loading file name… (User prompt)" });
     const edit = screen.getByRole("button", { name: "Edit Loading file name… (User prompt)" });
     expect(show).toHaveAccessibleDescription("Checking files in this session.");
     expect(edit).toHaveAccessibleDescription("Checking files in this session.");
@@ -109,7 +118,7 @@ describe("file-backed option values", () => {
     const edit = screen.getByRole("button", { name: "Edit prompt.md (User prompt)" });
     expect(edit).toHaveAttribute("aria-disabled", "true");
     expect(edit).toHaveAccessibleDescription("This node uses more than one prompt file. Re-point it through the agent and approve the review card.");
-    expect(screen.getByRole("button", { name: "Show prompt.md (User prompt) in files" })).toHaveAttribute("aria-disabled", "false");
+    expect(screen.getByRole("button", { name: "Show in files: prompt.md (User prompt)" })).toHaveAttribute("aria-disabled", "false");
     act(() => edit.click());
     expect(useBlobStore.getState().editRequest).toBeNull();
   });
