@@ -12,6 +12,7 @@ from elspeth.contracts import NodeType, RunStatus
 from elspeth.contracts.audit import DISCARD_SINK_NAME, TokenRef
 from elspeth.contracts.enums import BatchStatus, NodeStateStatus, RoutingMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, GracefulShutdownError
+from elspeth.contracts.run_prompt_input import RunPromptInputEvidence
 from elspeth.contracts.run_start import RunStartPermitBinding
 from elspeth.contracts.runtime_val_manifest import build_runtime_val_manifest
 from elspeth.contracts.schema import SchemaConfig
@@ -193,6 +194,7 @@ def test_fresh_run_sweep_crash_finalizes_failed_and_preserves_evidence(
         openrouter_catalog_sha256: str = "0" * 64,
         openrouter_catalog_source: str = "bundled",
         web_plugin_policy_evidence=None,
+        run_prompt_inputs: tuple[RunPromptInputEvidence, ...] = (),
         run_start_permit: RunStartPermitBinding | None = None,
         pre_effect_guard: Callable[[], None] | None = None,
     ):
@@ -209,6 +211,7 @@ def test_fresh_run_sweep_crash_finalizes_failed_and_preserves_evidence(
             openrouter_catalog_sha256=openrouter_catalog_sha256,
             openrouter_catalog_source=openrouter_catalog_source,
             web_plugin_policy_evidence=web_plugin_policy_evidence,
+            run_prompt_inputs=run_prompt_inputs,
             run_start_permit=run_start_permit,
             pre_effect_guard=pre_effect_guard,
         )

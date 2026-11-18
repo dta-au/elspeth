@@ -41,7 +41,8 @@ def _pipeline(provider: Mock) -> PipelineConfig:
         }
     )
     transform.on_success = "default"
-    transform._create_provider = Mock(return_value=provider)
+    # Specced from the bound factory, so the engine's call must match its signature.
+    transform._create_provider = Mock(spec=transform._create_provider, return_value=provider)
     return PipelineConfig(
         sources={"primary": as_source(source)},
         transforms=[as_transform(transform)],
