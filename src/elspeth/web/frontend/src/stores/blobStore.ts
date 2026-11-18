@@ -22,6 +22,9 @@ interface BlobState {
   revealRequest: { sessionId: string; blobId: string; seq: number; filename: string } | null;
   focusedBlobId: string | null;
   editRequest: { nodeId: string; fieldPath: string; seq: number } | null;
+  /** Mounted components that can render the file manager. Show in files is offered only while one exists. */
+  fileManagerHosts: number;
+  registerFileManagerHost: () => () => void;
   revealBlob: (sessionId: string, blobId: string, filename: string, trigger?: HTMLElement) => void;
   consumeRevealRequest: (seq: number) => void;
   setFileManagerOpen: (open: boolean) => void;
@@ -72,6 +75,19 @@ interface BlobMutationOwnership {
 
 export const useBlobStore = create<BlobState>((set, get) => ({
   ...initialState,
+  // Not part of initialState: hosts are mounted components, so reset() on
+  // logout must not forget one that is still on screen.
+  fileManagerHosts: 0,
+
+  registerFileManagerHost() {
+    set((state) => ({ fileManagerHosts: state.fileManagerHosts + 1 }));
+    let registered = true;
+    return () => {
+      if (!registered) return;
+      registered = false;
+      set((state) => ({ fileManagerHosts: Math.max(0, state.fileManagerHosts - 1) }));
+    };
+  },
 
   revealBlob(sessionId, blobId, filename, trigger) {
     if (get().activeSessionId !== sessionId) return;

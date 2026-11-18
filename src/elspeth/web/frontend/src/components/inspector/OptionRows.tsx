@@ -160,21 +160,28 @@ function PromptRoleValue({ label, value, notSet }: { label: string; value: unkno
   return <OptionValue label={label} value={value} />;
 }
 
-function PromptSlotActions({ value, nodeId, fieldPath, label }: { value: unknown; nodeId: string; fieldPath: string; label: string }): JSX.Element | null {
+function PromptSlotActions({ value, nodeId, fieldPath, label, showInFiles }: {
+  value: unknown; nodeId: string; fieldPath: string; label: string; showInFiles: boolean;
+}): JSX.Element | null {
   const sessionId = useSessionStore((state) => state.activeSessionId);
   const compositionState = useSessionStore((state) => state.compositionState);
   const blobs = useBlobStore((state) => state.blobs);
   const blobSessionId = useBlobStore((state) => state.activeSessionId);
   const isLoading = useBlobStore((state) => state.isLoading);
   const pending = useInterpretationEventsStore((state) => sessionId ? state.pendingBySession[sessionId] : undefined);
+  // Show in files needs a mounted file manager to reveal into: a host
+  // registers itself (ChatPanel, wherever it can render BlobManager). The
+  // surface can also opt out (the modal graph, whose focus trap hides it).
+  const fileManagerReachable = useBlobStore((state) => state.fileManagerHosts > 0);
   if (!isRecord(value) || value.mode !== "inline_content" || typeof value.blob_ref !== "string" || sessionId === null) return null;
   return <BoundPromptActions blobId={value.blob_ref} nodeId={nodeId} fieldPath={fieldPath} label={label}
     sessionId={sessionId} state={compositionState} blobs={blobSessionId === sessionId ? blobs : []}
-    loading={blobSessionId !== sessionId || isLoading} pendingEvents={Object.values(pending ?? {})} />;
+    loading={blobSessionId !== sessionId || isLoading} pendingEvents={Object.values(pending ?? {})}
+    showInFiles={showInFiles && fileManagerReachable} />;
 }
 
-function BoundPromptActions({ blobId, nodeId, fieldPath, label, sessionId, state, blobs, loading, pendingEvents }: {
-  blobId: string; nodeId: string; fieldPath: string; label: string; sessionId: string;
+function BoundPromptActions({ blobId, nodeId, fieldPath, label, sessionId, state, blobs, loading, pendingEvents, showInFiles }: {
+  blobId: string; nodeId: string; fieldPath: string; label: string; sessionId: string; showInFiles: boolean;
   state: ReturnType<typeof useSessionStore.getState>["compositionState"];
   blobs: ReturnType<typeof useBlobStore.getState>["blobs"];
   loading: boolean;
@@ -187,14 +194,16 @@ function BoundPromptActions({ blobId, nodeId, fieldPath, label, sessionId, state
   const reasonId = `prompt-slot-${nodeId}-${fieldPath}-reason`;
   const missingReasonId = `prompt-slot-${nodeId}-${fieldPath}-missing`;
   return <span className="prompt-slot-actions">
-    {/* The accessible name STARTS with the visible label (WCAG 2.5.3), so
-        "click Show in files" matches for voice-control users. */}
-    <Button type="button" variant="bare" aria-label={`Show in files: ${filename} (${label})`}
-      aria-disabled={!present} aria-describedby={!present ? missingReasonId : undefined}
-      onClick={(event) => { if (present) useBlobStore.getState().revealBlob(sessionId, blobId, filename, event.currentTarget); }}>
-      Show in files
-    </Button>
-    {!present && <span id={missingReasonId}>{loading ? "Checking files in this session." : "This file is not in this session."}</span>}
+    {showInFiles && <>
+      {/* The accessible name STARTS with the visible label (WCAG 2.5.3), so
+          "click Show in files" matches for voice-control users. */}
+      <Button type="button" variant="bare" aria-label={`Show in files: ${filename} (${label})`}
+        aria-disabled={!present} aria-describedby={!present ? missingReasonId : undefined}
+        onClick={(event) => { if (present) useBlobStore.getState().revealBlob(sessionId, blobId, filename, event.currentTarget); }}>
+        Show in files
+      </Button>
+      {!present && <span id={missingReasonId}>{loading ? "Checking files in this session." : "This file is not in this session."}</span>}
+    </>}
     <Button type="button" variant="bare" aria-label={`Edit ${filename} (${label})`}
       aria-disabled={editReason !== null} aria-describedby={editReason !== null ? reasonId : undefined}
       onClick={() => { if (editReason === null) useBlobStore.getState().requestPromptEdit(nodeId, fieldPath); }}>
@@ -204,7 +213,7 @@ function BoundPromptActions({ blobId, nodeId, fieldPath, label, sessionId, state
   </span>;
 }
 
-function LlmPromptRoles({ options, slotActions }: { options: Record<string, unknown>; slotActions?: { nodeId: string } }): JSX.Element {
+function LlmPromptRoles({ options, slotActions }: { options: Record<string, unknown>; slotActions?: { nodeId: string; showInFiles?: boolean } }): JSX.Element {
   const systemLabel = optionLabel("system_prompt");
   const userLabel = optionLabel("prompt_template");
   // A multi-query step has ONE system prompt and one user prompt PER QUERY.
@@ -219,13 +228,13 @@ function LlmPromptRoles({ options, slotActions }: { options: Record<string, unkn
       <div>
         <dt>{systemLabel}</dt>
         <dd><PromptRoleValue label={systemLabel} value={options.system_prompt} notSet={SYSTEM_PROMPT_NOT_SET} />
-          {slotActions && <PromptSlotActions value={options.system_prompt} nodeId={slotActions.nodeId} fieldPath="system_prompt" label={systemLabel} />}</dd>
+          {slotActions && <PromptSlotActions value={options.system_prompt} nodeId={slotActions.nodeId} fieldPath="system_prompt" label={systemLabel} showInFiles={slotActions.showInFiles ?? true} />}</dd>
       </div>
       {queries.length === 0 ? (
         <div>
           <dt>{userLabel}</dt>
           <dd><PromptRoleValue label={userLabel} value={options.prompt_template} notSet={USER_PROMPT_NOT_SET} />
-            {slotActions && <PromptSlotActions value={options.prompt_template} nodeId={slotActions.nodeId} fieldPath="prompt_template" label={userLabel} />}</dd>
+            {slotActions && <PromptSlotActions value={options.prompt_template} nodeId={slotActions.nodeId} fieldPath="prompt_template" label={userLabel} showInFiles={slotActions.showInFiles ?? true} />}</dd>
         </div>
       ) : (
         // The user prompt a query actually sends: its own template, else the
@@ -244,7 +253,7 @@ function LlmPromptRoles({ options, slotActions }: { options: Record<string, unkn
               />
               {slotActions && <PromptSlotActions value={isUnsuppliedPrompt(entry.template) ? options.prompt_template : entry.template}
                 nodeId={slotActions.nodeId} fieldPath={isUnsuppliedPrompt(entry.template) ? "prompt_template" : promptQueryTemplatePath(selector)}
-                label={`${userLabel}, query ${name}`} />}
+                label={`${userLabel}, query ${name}`} showInFiles={slotActions.showInFiles ?? true} />}
             </dd>
           </div>
         ))
@@ -262,7 +271,7 @@ export function OptionRows({
   options: Record<string, unknown>;
   ariaLabel: string;
   plugin?: { kind: "source" | "transform" | "sink"; name: string } | null;
-  slotActions?: { nodeId: string };
+  slotActions?: { nodeId: string; showInFiles?: boolean };
 }): JSX.Element {
   const showAdvanced = useShowAdvanced();
   const catalogKey = usePluginCatalogStore((s) => s.key);

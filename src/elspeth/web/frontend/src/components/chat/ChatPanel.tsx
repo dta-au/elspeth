@@ -342,6 +342,14 @@ export function ChatPanelContent({
   const [showScrollButton, setShowScrollButton] = useState(false);
   const showBlobManager = useBlobStore((state) => state.fileManagerOpen);
   const setFileManagerOpen = useBlobStore((state) => state.setFileManagerOpen);
+  // Register as a file-manager host whenever this panel can render
+  // BlobManager (the same condition as the drawer below). Show in files is
+  // offered only while some host is mounted, so a surface with no file
+  // manager never offers a reveal that cannot land.
+  useEffect(() => {
+    if (scriptMode) return undefined;
+    return useBlobStore.getState().registerFileManagerHost();
+  }, [scriptMode]);
   const [freeformDraftsBySession, setFreeformDraftsBySession] = useState<
     ReadonlyMap<string, string>
   >(new Map());

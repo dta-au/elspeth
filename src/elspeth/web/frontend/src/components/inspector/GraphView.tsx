@@ -786,10 +786,12 @@ function NodeConfigPanel({
   config,
   onClose,
   panelRef,
+  showInFiles,
 }: {
   config: SelectedComponentConfig;
   onClose: () => void;
   panelRef?: React.Ref<HTMLElement>;
+  showInFiles: boolean;
 }): JSX.Element {
   return (
     <aside
@@ -840,7 +842,7 @@ function NodeConfigPanel({
           options={config.options}
           ariaLabel={`${config.id} settings`}
           plugin={config.plugin === null ? null : { kind: config.pluginKind, name: config.plugin }}
-          slotActions={config.plugin === "llm" ? { nodeId: config.id } : undefined}
+          slotActions={config.plugin === "llm" ? { nodeId: config.id, showInFiles } : undefined}
         />
         {config.plugin === "llm" && <PromptFileEditors nodeId={config.id} options={config.options} />}
       </section>
@@ -899,9 +901,12 @@ export interface GraphViewProps {
   /** Opens the full-screen graph. Passed by the Workflow tab only; GraphModal
    *  renders this same component and must not offer to open itself. */
   onFullscreen?: () => void;
+  /** Rendered inside GraphModal's focus-trapped dialog: the file manager sits
+   *  behind the modal there, so the inspector omits Show in files. */
+  inModal?: boolean;
 }
 
-export function GraphView({ onFullscreen }: GraphViewProps = {}) {
+export function GraphView({ onFullscreen, inModal = false }: GraphViewProps = {}) {
   const compositionState = useSessionStore((s) => s.compositionState);
   const pendingProposalCount = useSessionStore(
     (s) =>
@@ -2423,6 +2428,7 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
             config={selectedConfig}
             onClose={() => selectNode(null)}
             panelRef={configPanelRef}
+            showInFiles={!inModal}
           />
         )}
       </div>

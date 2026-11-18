@@ -63,7 +63,7 @@ export function GraphModal(): JSX.Element | null {
           </Button>
         </header>
         <div className="graph-modal-body">
-          <GraphView />
+          <GraphView inModal />
         </div>
       </div>
     </>

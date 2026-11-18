@@ -51,6 +51,11 @@ function seedFile(overrides: Partial<BlobMetadata> = {}) {
 }
 
 describe("file-backed option values", () => {
+  beforeEach(() => {
+    // A file-manager host (ChatPanel outside script mode) is mounted.
+    useBlobStore.setState({ fileManagerHosts: 1 });
+  });
+
   it("keys a list-form query's Edit by its index, matching the editor and the server", () => {
     seedFile();
     const marker = { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH };
@@ -70,6 +75,23 @@ describe("file-backed option values", () => {
     const show = screen.getByRole("button", { name: "Show in files: prompt.md (User prompt)" });
     expect(show.textContent).toBe("Show in files");
     expect(show.getAttribute("aria-label")?.startsWith(show.textContent ?? "\u0000")).toBe(true);
+  });
+
+  it("offers Show in files only while a file manager host is mounted and the surface allows it", () => {
+    seedFile();
+    const options = { prompt_template: { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH } };
+    useBlobStore.setState({ fileManagerHosts: 0 });
+    const { rerender } = render(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
+    expect(screen.queryByText("Show in files")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit prompt.md (User prompt)" })).toBeInTheDocument();
+    let unregister = () => {};
+    act(() => { unregister = useBlobStore.getState().registerFileManagerHost(); });
+    expect(screen.getByText("Show in files")).toBeInTheDocument();
+    rerender(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm", showInFiles: false }} />);
+    expect(screen.queryByText("Show in files")).not.toBeInTheDocument();
+    rerender(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
+    act(() => unregister());
+    expect(screen.queryByText("Show in files")).not.toBeInTheDocument();
   });
 
   it("adds file and slot named navigation actions only in the inspector", () => {
