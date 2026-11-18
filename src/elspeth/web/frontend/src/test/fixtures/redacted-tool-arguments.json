@@ -13,6 +13,7 @@
     "set_metadata",
     "patch_source_options",
     "patch_node_options",
+    "change_substring",
     "patch_output_options",
     "set_pipeline"
   ],
@@ -257,6 +258,122 @@
         "patch": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}"
       },
       "proposal_summary": "Update options for node \"ghost\"."
+    },
+    "change_substring_node_option": {
+      "tool": "change_substring",
+      "arguments": {
+        "target": {
+          "kind": "node_option",
+          "node_id": "classify",
+          "option": "prompt_template"
+        },
+        "expected_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "expected_state_id": "00000000-0000-4000-8000-000000000001",
+        "edits": [
+          {
+            "old": "Summarize",
+            "replacement": "Classify",
+            "replace_all": false
+          }
+        ]
+      },
+      "redacted": {
+        "target": {
+          "kind": "node_option",
+          "node_id": "classify",
+          "option": "prompt_template"
+        },
+        "expected_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "expected_state_id": "00000000-0000-4000-8000-000000000001",
+        "edits": [
+          {
+            "old": "<inline-blob:9-bytes>",
+            "replacement": "<inline-blob:8-bytes>",
+            "replace_all": false
+          }
+        ]
+      },
+      "proposal_summary": "Edit prompt text on node \"classify\" \u2014 1 exact edit."
+    },
+    "change_substring_prompt_part": {
+      "tool": "change_substring",
+      "arguments": {
+        "target": {
+          "kind": "prompt_part",
+          "node_id": "classify",
+          "part_index": 0
+        },
+        "expected_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "expected_state_id": "00000000-0000-4000-8000-000000000001",
+        "edits": [
+          {
+            "old": "row",
+            "replacement": "record",
+            "replace_all": true
+          },
+          {
+            "old": "terse",
+            "replacement": "brief",
+            "replace_all": false
+          }
+        ]
+      },
+      "redacted": {
+        "target": {
+          "kind": "prompt_part",
+          "node_id": "classify",
+          "part_index": 0
+        },
+        "expected_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "expected_state_id": "00000000-0000-4000-8000-000000000001",
+        "edits": [
+          {
+            "old": "<inline-blob:3-bytes>",
+            "replacement": "<inline-blob:6-bytes>",
+            "replace_all": true
+          },
+          {
+            "old": "<inline-blob:5-bytes>",
+            "replacement": "<inline-blob:5-bytes>",
+            "replace_all": false
+          }
+        ]
+      },
+      "proposal_summary": "Edit prompt text on node \"classify\" \u2014 2 exact edits."
+    },
+    "change_substring_blob_target": {
+      "tool": "change_substring",
+      "arguments": {
+        "target": {
+          "kind": "blob",
+          "blob_id": "11111111-2222-4333-8444-555555555555"
+        },
+        "expected_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "expected_state_id": null,
+        "edits": [
+          {
+            "old": "v1",
+            "replacement": "v2",
+            "replace_all": false
+          }
+        ]
+      },
+      "redacted": {
+        "target": {
+          "kind": "blob",
+          "blob_id": "11111111-2222-4333-8444-555555555555"
+        },
+        "expected_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "expected_state_id": null,
+        "edits": [
+          {
+            "old": "<inline-blob:2-bytes>",
+            "replacement": "<inline-blob:2-bytes>",
+            "replace_all": false
+          }
+        ]
+      },
+      "proposal_summary": "Edit prompt text on session file \"11111111-2222-4333-8444-555555555555\" \u2014 1 exact edit."
     },
     "patch_output_options_one_scalar": {
       "tool": "patch_output_options",

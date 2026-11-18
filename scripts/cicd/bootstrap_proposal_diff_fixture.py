@@ -190,6 +190,40 @@ CASES: tuple[tuple[str, str, dict[str, Any]], ...] = (
         "patch_node_options",
         {"node_id": "ghost", "patch": {"threshold": 0.5}},
     ),
+    # --- change_substring: edit text is summarized, never echoed ------------
+    (
+        "change_substring_node_option",
+        "change_substring",
+        {
+            "target": {"kind": "node_option", "node_id": "classify", "option": "prompt_template"},
+            "expected_sha256": "a" * 64,
+            "expected_state_id": "00000000-0000-4000-8000-000000000001",
+            "edits": [{"old": "Summarize", "replacement": "Classify", "replace_all": False}],
+        },
+    ),
+    (
+        "change_substring_prompt_part",
+        "change_substring",
+        {
+            "target": {"kind": "prompt_part", "node_id": "classify", "part_index": 0},
+            "expected_sha256": "b" * 64,
+            "expected_state_id": "00000000-0000-4000-8000-000000000001",
+            "edits": [
+                {"old": "row", "replacement": "record", "replace_all": True},
+                {"old": "terse", "replacement": "brief", "replace_all": False},
+            ],
+        },
+    ),
+    (
+        "change_substring_blob_target",
+        "change_substring",
+        {
+            "target": {"kind": "blob", "blob_id": "11111111-2222-4333-8444-555555555555"},
+            "expected_sha256": "c" * 64,
+            "expected_state_id": None,
+            "edits": [{"old": "v1", "replacement": "v2", "replace_all": False}],
+        },
+    ),
     (
         "patch_output_options_one_scalar",
         "patch_output_options",
