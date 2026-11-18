@@ -1,6 +1,6 @@
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { axe, toHaveNoViolations } from "jest-axe";
 import { AcknowledgementStack } from "./AcknowledgementStack";
@@ -318,6 +318,105 @@ describe("AcknowledgementStack — prompt card from the stored snapshot", () => 
     await waitFor(() => expect(api.resolveInterpretation).toHaveBeenCalledWith(
       SID, "e1", { choice: "accepted_as_drafted", reviewed_anchor: anchor },
     ));
+  });
+
+  // A pending inline prompt card whose rendered text changes (a sibling
+  // vague term resolved) is superseded server-side, and a NEW card is issued
+  // with its own snapshot. That snapshot's frozen skeleton carries the
+  // resolved slot's event_id; the still-open slot's event_id stays null.
+  it("renders a re-issued prompt card from its own snapshot, with the resolved slot accepted by its frozen event_id", async () => {
+    const user = userEvent.setup();
+    const oldAnchor = "0".repeat(64);
+    const newAnchor = "9".repeat(64);
+    const parts = [
+      { kind: "text", text: "Summarise " },
+      { kind: "interpretation_ref", requirement_id: "req-topic" },
+      { kind: "text", text: " in a " },
+      { kind: "interpretation_ref", requirement_id: "req-tone" },
+      { kind: "text", text: " tone." },
+    ];
+    const snapshots: Record<string, Awaited<ReturnType<typeof api.getPromptReviewSnapshot>>> = {
+      "p-old": {
+        version: 1, session_id: SID, node_id: "node-1", event_id: "p-old",
+        authored_surface: {
+          prompt_template: "Summarise OLD RENDER pending interpretation in a pending interpretation tone.",
+          prompt_template_parts: parts,
+          interpretation_requirements: [
+            { id: "req-topic", event_id: null, user_term: "the key points" },
+            { id: "req-tone", event_id: null, user_term: "punchy" },
+          ],
+        },
+        bindings: [], anchor: oldAnchor, effective_artifact_hash: null, is_live_review: true,
+      },
+      "p-new": {
+        version: 1, session_id: SID, node_id: "node-1", event_id: "p-new",
+        authored_surface: {
+          // The server's re-rendered text carries the accepted value; the
+          // card must render from the parts, never from this or live state.
+          prompt_template: "Summarise pending interpretation in a RE-RENDERED VALUE tone.",
+          prompt_template_parts: parts,
+          interpretation_requirements: [
+            { id: "req-topic", event_id: null, user_term: "the key points" },
+            { id: "req-tone", event_id: "v-tone", user_term: "punchy" },
+          ],
+        },
+        bindings: [], anchor: newAnchor, effective_artifact_hash: null, is_live_review: true,
+      },
+    };
+    vi.mocked(api.getPromptReviewSnapshot).mockImplementation((_sid, eventId) => Promise.resolve(snapshots[eventId]));
+    const oldCard = makeEvent("p-old", { kind: "llm_prompt_template", user_term: null, llm_draft: "Old preview." });
+    const newCard = makeEvent("p-new", { kind: "llm_prompt_template", user_term: null, llm_draft: "New preview." });
+    const topic = makeEvent("v-topic", { user_term: "the key points" });
+    const tone = makeEvent("v-tone", { user_term: "punchy" });
+    // An earlier review of the same term on the same node, retired before.
+    // It makes the node-and-term lookup ambiguous, so "accepted" below can
+    // only come from the frozen event_id.
+    const retiredTone = makeEvent("v-tone-old", { user_term: "punchy", choice: "superseded" });
+    vi.mocked(api.resolveInterpretation).mockResolvedValue({
+      event: { ...newCard, choice: "accepted_as_drafted", accepted_value: newCard.llm_draft, resolved_at: "2026-06-22T02:00:00Z" },
+      new_state: makeCompositionState([]),
+    });
+    seedPending([oldCard, topic, tone]);
+    useInterpretationEventsStore.setState({ resolvedBySession: { [SID]: [retiredTone] } });
+    render(<AcknowledgementStack sessionId={SID} />);
+
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    await waitFor(() => expect(screen.getByRole("region", { name: /prompt template review/i })).toHaveTextContent("Summarise"));
+
+    // The tone review is accepted; the server supersedes the old prompt card
+    // and issues a new one.
+    act(() => {
+      seedPending([newCard, topic]);
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [SID]: [retiredTone, { ...tone, choice: "amended", accepted_value: "LIVE VALUE" }, { ...oldCard, choice: "superseded" }],
+        },
+      });
+    });
+
+    expect(screen.queryAllByRole("button", { name: "View prompt" })).toHaveLength(1);
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    const region = screen.getByRole("region", { name: /prompt template review/i });
+    await waitFor(() => expect(region.querySelectorAll("mark.ack-card-prompt-slot")).toHaveLength(2));
+    expect(api.getPromptReviewSnapshot).toHaveBeenLastCalledWith(SID, "p-new", expect.anything());
+    const slots = Array.from(region.querySelectorAll("mark.ack-card-prompt-slot")).map((mark) => {
+      const clone = mark.cloneNode(true) as HTMLElement;
+      clone.querySelectorAll(".visually-hidden").forEach((hidden) => hidden.remove());
+      return clone.textContent;
+    });
+    expect(slots).toEqual([
+      "[“the key points”, reviewed in its own card: pending]",
+      "[“punchy”, reviewed in its own card: accepted]",
+    ]);
+    expect(region).not.toHaveTextContent("RE-RENDERED VALUE");
+    expect(region).not.toHaveTextContent("LIVE VALUE");
+    expect(region).not.toHaveTextContent("OLD RENDER");
+
+    await user.click(screen.getByRole("button", { name: /approve the llm prompt template/i }));
+    await waitFor(() => expect(api.resolveInterpretation).toHaveBeenCalledTimes(1));
+    expect(api.resolveInterpretation).toHaveBeenCalledWith(
+      SID, "p-new", { choice: "accepted_as_drafted", reviewed_anchor: newAnchor },
+    );
   });
 });
 
