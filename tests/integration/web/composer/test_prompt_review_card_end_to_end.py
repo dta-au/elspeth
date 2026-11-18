@@ -23,15 +23,15 @@ Two shapes:
 * a 9000-char single-prompt node, whose card draft is bounded to
   ``PROMPT_SURFACE_REVIEW_MAX_CHARS`` while the anchor covers the full text.
 
-Out of scope here: inline blob markers in prompt fields. Those create no
-review site when no review exists (user-uploaded blob prompts, ADR-034), and
-LLM-authored blobs are refused at the wire tool and at run admission; their
-coverage lives with those lanes.
+The blob-backed system-prompt case uses real same-session custody bytes and
+pins the effective artifact hash retained by the resolved review event.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+from hashlib import sha256
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -47,6 +47,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSurfaceOrigin,
 )
 from elspeth.contracts.hashing import stable_hash
+from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.composer.interpretation_surfacing import surface_pending_interpretation_reviews_for_state
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata
 from elspeth.web.composer.tools._common import _options_with_default_prompt_template_review
@@ -391,19 +392,38 @@ async def test_long_single_prompt_card_is_bounded_and_resolves_to_an_executable_
 
 
 @pytest.mark.asyncio
-async def test_review_acceptance_keeps_no_full_artifact_for_blob_backed_system(sessions_service: SessionServiceImpl) -> None:
+async def test_review_acceptance_keeps_no_full_artifact_for_blob_backed_system(
+    sessions_service: SessionServiceImpl, engine: Engine, tmp_path: Path
+) -> None:
+    session_id = await _new_session(sessions_service)
+    content = b"A reviewed system prompt"
+    lease = await SessionOperationLease.acquire(
+        sessions_service.session_operation_authority,
+        session_id=session_id,
+        operation_kind=SessionOperationKind.CREATE,
+        owner_instance_id=sessions_service.session_operation_owner_instance_id,
+        lease_seconds=sessions_service.session_operation_lease_seconds,
+    )
+    blob_service = BlobServiceImpl(engine, tmp_path)
+    async with lease:
+        blob = await blob_service.create_blob(session_id, "system.txt", content, "text/plain", session_operation_context=lease.context)
+    sessions_service._inline_blob_read = lambda context, blob_id: blob_service.read_blob_content_sync(blob_id, context)
     options = _multi_query_options()
-    options["system_prompt"] = {"blob_ref": "5b7a4e0e-9e4a-4f0b-8d3e-2c0e1f0d3a4b", "mode": "inline_content", "sha256": "a" * 64}
+    options["system_prompt"] = {"blob_ref": str(blob.id), "mode": "inline_content", "sha256": sha256(content).hexdigest()}
     options["approved_prompt_artifact_hash"] = "b" * 64
     staged = _options_with_default_prompt_template_review(node_id=_NODE_ID, plugin="llm", options=options)
-    session_id = await _new_session(sessions_service)
     record = await _persist(sessions_service, session_id, _state_with_node_options(staged))
     await _run_surfacer(sessions_service, session_id, record)
     event = await _single_pending_prompt_card(sessions_service, session_id, record)
     resolved, state = await _accept_as_drafted(sessions_service, session_id, event)
-    assert resolved.approved_prompt_artifact_hash is None
-    assert _node_options(state)["approved_prompt_artifact_hash"] is None
+    expected_surface = _multi_query_options()
+    expected_surface["system_prompt"] = content.decode("utf-8")
+    effective_hash = approved_prompt_artifact_hash_from_options(expected_surface)
+    assert resolved.approved_prompt_artifact_hash == effective_hash
+    assert _node_options(state)["approved_prompt_artifact_hash"] == effective_hash
     assert _prompt_requirement(_node_options(state))["status"] == "resolved"
     materialized = materialize_state_for_execution(state)
     assert isinstance(materialized, CompositionState)
+    # The authored marker remains deferred in the execution view; the
+    # effective-text hash stays in the event and resolved-state evidence.
     assert "approved_prompt_artifact_hash" not in _node_options(materialized)

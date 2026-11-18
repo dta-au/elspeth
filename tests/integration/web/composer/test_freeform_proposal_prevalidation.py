@@ -2101,9 +2101,11 @@ async def test_blob_marker_admission_checks_real_metadata_and_modality(tmp_path:
     assert result.state is state
     assert len(result.tool_invocations) == 1
     proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
-    assert len(proposals) == int(blob_kind == "user")
+    # LLM-authored scalar prompt files now enter the same pending full-content
+    # review path as uploaded files; metadata and modality are still checked.
+    assert len(proposals) == int(blob_kind in {"user", "llm"})
     assert metadata_lookup.call_count == 1
-    assert batches[0][0].response.success is (blob_kind in {"user", "same-marker"})
+    assert batches[0][0].response.success is (blob_kind in {"user", "same-marker", "llm"})
     assert _count_rows(harness.engine, blobs_table) == int(blob_kind != "missing")
 
 

@@ -88,6 +88,7 @@ _INVENTORY: dict[tuple[str, str], dict[str, str]] = {
     },
     ("sessions", "library_entries"): {"payload_digest": "hex64"},
     ("sessions", "proposal_blob_effect_receipts"): {"arguments_hash": "hex64", "result_blob_snapshot_hash": "hex64"},
+    ("sessions", "prompt_file_approvals"): {"content_sha256": "hex64", "effective_artifact_hash": "hex64"},
     ("sessions", "rate_limit_buckets"): {"subject_digest": "hex64"},
     ("sessions", "rate_limit_events"): {"subject_digest": "hex64"},
     ("sessions", "review_attestations"): {"payload_digest": "prefixed64"},
@@ -140,6 +141,7 @@ _INVENTORY: dict[tuple[str, str], dict[str, str]] = {
     ("landscape", "routing_events"): {"reason_hash": "hex64"},
     ("landscape", "rows"): {"source_data_hash": "hex64"},
     ("landscape", "run_sources"): {"config_hash": "hex64", "schema_contract_hash": "hex32"},
+    ("landscape", "run_prompt_inputs"): {"content_sha256": "hex64", "effective_artifact_hash": "hex64"},
     ("landscape", "run_start_admissions"): {"subject_hash": "hex64"},
     ("landscape", "run_web_plugin_policy"): {
         "policy_hash": "hex64",

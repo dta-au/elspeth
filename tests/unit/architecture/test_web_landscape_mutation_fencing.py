@@ -14388,10 +14388,11 @@ def _raw_attribute_collector(unit: SourceUnit, units: tuple[SourceUnit, ...]) ->
 # callback, EMPTY-only admission, and its shared occupancy implementation.
 # These are source bindings, not permissions granted by a filename alone.
 # Landscape creation now serializes and restores SQLAlchemy's transient DDL
-# rules. The EMPTY-only admission, locked callback and stamp are unchanged.
+# rules and creates append-only run_prompt_inputs with run-owned evidence.
+# The EMPTY-only admission, locked callback and stamp are unchanged.
 _NEW_LANDSCAPE_STAMP_SOURCES = {
     "src/elspeth/web/schema_probe.py": "0e4ba641686cba00c9b459e3cc241ce686847211197c2563a4991f5a5d31c4cd",
-    "src/elspeth/core/landscape/database.py": "099a5bff4fa162b87119cadbd5fc10109938cff4d6c4d2a1e8ac2e5d3f31f1ed",
+    "src/elspeth/core/landscape/database.py": "39e9a510defefdc59656abda19b3863727288435ccc60ed1459f955d2773bccf",
     "src/elspeth/core/schema_shape.py": "5b32f7faf09a03a7c482b48a092eb0f7cf5811eb927302ad72820fde81ceccb0",
 }
 
@@ -16039,7 +16040,9 @@ _REVIEWED_REGISTRY_MODULES = {
     # sites: all three install_deadline_guard calls, journal attachment before
     # the guard, and guard installation before table creation are unchanged,
     # and nothing in the journal, guard or clock modules calls the helper.
-    "src/elspeth/core/landscape/database.py": "032c18d341b47fc96ea110e88b222201ea98ab12754cc1527220e71c2b2c661f",
+    # Epoch 51 adds the append-only run_prompt_inputs table and required
+    # trigger; constructor and deadline-guard ordering stay as before.
+    "src/elspeth/core/landscape/database.py": "63edf0d3b00f02f3572b3d02cf9af02e38e947bc3003c8cce01de6f25ddcd2d6",
 }
 
 

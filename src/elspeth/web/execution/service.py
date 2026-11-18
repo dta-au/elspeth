@@ -1089,6 +1089,53 @@ def _load_most_recent_failed_node_id(landscape_db: LandscapeDB, *, run_id: str) 
     return None
 
 
+def _record_run_prompt_inputs(
+    landscape_db: LandscapeDB,
+    *,
+    run_id: str,
+    snapshots: tuple[PromptReviewSnapshot, ...],
+) -> None:
+    """Append exact admitted file identities before any provider call."""
+    if not snapshots:
+        return
+    with landscape_db.write_connection() as conn:
+        for snapshot in snapshots:
+            for binding in snapshot.bindings:
+                key = (
+                    run_prompt_inputs_table.c.run_id == run_id,
+                    run_prompt_inputs_table.c.node_id == snapshot.node_id,
+                    run_prompt_inputs_table.c.field_path == binding.field_path,
+                )
+                existing = conn.execute(select(run_prompt_inputs_table).where(*key)).one_or_none()
+                evidence = (
+                    str(binding.blob_id),
+                    binding.content_sha256,
+                    snapshot.anchor,
+                    snapshot.effective_artifact_hash,
+                )
+                if existing is not None:
+                    if (
+                        existing.blob_id,
+                        existing.content_sha256,
+                        existing.review_anchor,
+                        existing.effective_artifact_hash,
+                    ) != evidence:
+                        raise AuditIntegrityError("resumed run prompt input differs from admitted evidence")
+                    continue
+                conn.execute(
+                    insert(run_prompt_inputs_table).values(
+                        run_id=run_id,
+                        node_id=snapshot.node_id,
+                        field_path=binding.field_path,
+                        blob_id=str(binding.blob_id),
+                        content_sha256=binding.content_sha256,
+                        review_anchor=snapshot.anchor,
+                        effective_artifact_hash=snapshot.effective_artifact_hash,
+                        admitted_at=datetime.now(tz=UTC),
+                    )
+                )
+
+
 # B1 fix: RunAlreadyActiveError is NOT defined here — imported from
 # sessions.protocol where the canonical definition lives. Defining a
 # second class with the same name would prevent app.py's global
@@ -1295,53 +1342,6 @@ class ExecutionServiceImpl:
                 raise PromptFileReviewStale(node_id=node.id) from exc
             snapshots.append(snapshot)
         return tuple(snapshots)
-
-    @staticmethod
-    def _record_run_prompt_inputs(
-        landscape_db: LandscapeDB,
-        *,
-        run_id: str,
-        snapshots: tuple[PromptReviewSnapshot, ...],
-    ) -> None:
-        """Append exact admitted file identities before any provider call."""
-        if not snapshots:
-            return
-        with landscape_db.write_connection() as conn:
-            for snapshot in snapshots:
-                for binding in snapshot.bindings:
-                    key = (
-                        run_prompt_inputs_table.c.run_id == run_id,
-                        run_prompt_inputs_table.c.node_id == snapshot.node_id,
-                        run_prompt_inputs_table.c.field_path == binding.field_path,
-                    )
-                    existing = conn.execute(select(run_prompt_inputs_table).where(*key)).one_or_none()
-                    evidence = (
-                        str(binding.blob_id),
-                        binding.content_sha256,
-                        snapshot.anchor,
-                        snapshot.effective_artifact_hash,
-                    )
-                    if existing is not None:
-                        if (
-                            existing.blob_id,
-                            existing.content_sha256,
-                            existing.review_anchor,
-                            existing.effective_artifact_hash,
-                        ) != evidence:
-                            raise AuditIntegrityError("resumed run prompt input differs from admitted evidence")
-                        continue
-                    conn.execute(
-                        insert(run_prompt_inputs_table).values(
-                            run_id=run_id,
-                            node_id=snapshot.node_id,
-                            field_path=binding.field_path,
-                            blob_id=str(binding.blob_id),
-                            content_sha256=binding.content_sha256,
-                            review_anchor=snapshot.anchor,
-                            effective_artifact_hash=snapshot.effective_artifact_hash,
-                            admitted_at=datetime.now(tz=UTC),
-                        )
-                    )
 
     def _approval_inputs_from_frozen(
         self,
@@ -4319,7 +4319,7 @@ class ExecutionServiceImpl:
             session_operation_lease.guard_external_effect()
             if landscape_db is None:
                 landscape_db = open_landscape_db(self._settings)
-            self._record_run_prompt_inputs(landscape_db, run_id=run_id, snapshots=prompt_snapshots)
+            _record_run_prompt_inputs(landscape_db, run_id=run_id, snapshots=prompt_snapshots)
             if resume_existing:
                 # Replay committed outcomes before the resumed executor can
                 # request another admission. This is independent of whether

@@ -1806,6 +1806,29 @@ class TestB3Construction:
 
 
 @pytest.mark.usefixtures("mock_pipeline_config_assembly")
+def _mock_inline_prompt_state(mock_session_service: MagicMock, *, session_id: UUID, blob_id: UUID, sha256: str, tmp_path: Path) -> None:
+    """Model the persisted state now read for scalar prompt-file admission."""
+    mock_session_service.get_state_in_session.return_value = _composition_state_record(
+        session_id=session_id,
+        source_path=tmp_path / "input.csv",
+        output_path=tmp_path / "output.jsonl",
+        nodes=[
+            {
+                "id": "classify",
+                "node_type": "transform",
+                "plugin": "llm",
+                "input": "source_rows",
+                "on_success": "out",
+                "on_error": "discard",
+                "options": {
+                    "prompt_template": "Summarize {{ row.body }}",
+                    "system_prompt": {"blob_ref": str(blob_id), "mode": "inline_content", "sha256": sha256},
+                },
+            }
+        ],
+    )
+
+
 class TestInlineBlobRuntimePreflight:
     """Inline-content blob refs resolve before plugin construction.
 
@@ -1829,7 +1852,10 @@ class TestInlineBlobRuntimePreflight:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        mock_pipeline_config_assembly: MagicMock,
     ) -> None:
+        del mock_pipeline_config_assembly
         # Blob bytes are attacker-controllable. A ${VAR} smuggled inside them is
         # invisible to preflight (the blob is an opaque ref at validation time),
         # so it must NOT be expanded against the host environment at execution.
@@ -1839,6 +1865,7 @@ class TestInlineBlobRuntimePreflight:
         run_id = uuid4()
         owner_session = uuid4()
         sha256 = hashlib.sha256(content).hexdigest()
+        _mock_inline_prompt_state(mock_session_service, session_id=owner_session, blob_id=blob_id, sha256=sha256, tmp_path=tmp_path)
         order: list[str] = []
         # The valid same-session path: run and blob share an owning session, so
         # the cross-session guard added for elspeth-195ecb1d58 passes through.
@@ -1898,6 +1925,8 @@ class TestInlineBlobRuntimePreflight:
             )
         )
         mock_orch_cls.return_value = mock_orch
+        # The new run-owned prompt evidence table starts empty for this test.
+        mock_landscape_cls.return_value.write_connection.return_value.__enter__.return_value.execute.return_value.one_or_none.return_value = None
 
         pipeline_yaml = f"""
 source:
@@ -1951,6 +1980,7 @@ sinks:
         mock_orch_cls: MagicMock,
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
+        tmp_path: Path,
     ) -> None:
         del mock_payload_cls, mock_landscape_cls, mock_runtime_graph
         content = b"You are an audited prompt."
@@ -1958,6 +1988,7 @@ sinks:
         run_id = uuid4()
         owner_session = uuid4()
         sha256 = hashlib.sha256(content).hexdigest()
+        _mock_inline_prompt_state(mock_session_service, session_id=owner_session, blob_id=blob_id, sha256=sha256, tmp_path=tmp_path)
         mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=owner_session)
         blob_record = _blob_record_stub(
             blob_id=blob_id,
@@ -2164,7 +2195,6 @@ sinks:
         mock_session_service: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from elspeth.web.blobs.protocol import BlobIntegrityError
         from elspeth.web.execution import service as service_module
 
         del mock_payload_cls, mock_landscape_cls, mock_runtime_graph
@@ -2210,10 +2240,12 @@ sinks:
       path: output.jsonl
 """
 
-        with pytest.raises(BlobIntegrityError):
+        with pytest.raises(PromptFileReviewStale):
             service._run_pipeline(str(run_id), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
 
-        hash_counter.add.assert_called_once_with(1)
+        # Metadata disagrees with the authored prompt marker before a custody
+        # read; this is stale review evidence, not a stored-byte integrity hit.
+        hash_counter.add.assert_not_called()
         mock_load.assert_not_called()
         mock_orch_cls.assert_not_called()
 

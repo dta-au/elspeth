@@ -82,6 +82,7 @@ STATE_ENGINE_TABLES: tuple[str, ...] = (
     "run_attributions",
     "run_coordination",
     "run_coordination_events",
+    "run_prompt_inputs",
     "run_sources",
     "run_start_admissions",
     "run_web_plugin_policy",
