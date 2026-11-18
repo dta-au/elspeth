@@ -30,7 +30,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 
 from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.auth import AuthProviderType
-from elspeth.contracts.blobs import BlobForkPlanEntry, BlobRecord, fork_blob_id
+from elspeth.contracts.blobs import BlobForkPlanEntry, BlobRecord, InlineBlobNotAdmittedError, fork_blob_id
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
 from elspeth.contracts.chargeable_admission import (
     AdmissionRefusalReason,
@@ -303,6 +303,7 @@ from elspeth.web.sessions.prompt_file_approval import (
     record_prompt_file_approval,
 )
 from elspeth.web.sessions.prompt_file_review import (
+    PromptFileReviewStale,
     PromptReviewSnapshot,
     prompt_file_binding_paths,
     resolve_prompt_review_snapshot,
@@ -5423,12 +5424,18 @@ class SessionServiceImpl:
                     if reviewed_node is not None and prompt_file_binding_paths(reviewed_node["options"]):
                         if inline_blob_snapshot is None or principal_user_id is None:
                             raise PromptFileApprovalStale()
-                        file_snapshot = resolve_prompt_review_snapshot(
-                            session_id=session_id,
-                            node_id=event_row.affected_node_id,
-                            options=reviewed_node["options"],
-                            read_blob=inline_blob_snapshot.content,
-                        )
+                        try:
+                            file_snapshot = resolve_prompt_review_snapshot(
+                                session_id=session_id,
+                                node_id=event_row.affected_node_id,
+                                options=reviewed_node["options"],
+                                read_blob=inline_blob_snapshot.content,
+                            )
+                        except InlineBlobNotAdmittedError as exc:
+                            # The reviewed bytes are no longer verifiable
+                            # (status, hash or size moved since the card was
+                            # shown): the card is stale, nothing is written.
+                            raise PromptFileReviewStale(node_id=event_row.affected_node_id) from exc
                         if file_snapshot is None:
                             raise PromptFileApprovalStale()
                         for binding in file_snapshot.bindings:

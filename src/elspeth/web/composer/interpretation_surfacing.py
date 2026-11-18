@@ -204,7 +204,7 @@ async def _auto_surface_prompt_template_reviews_for_state(
     proposal settlement, passing the provenance they actually hold.
     """
 
-    from elspeth.web.sessions.protocol import InterpretationResolveError
+    from elspeth.web.sessions.protocol import InterpretationResolveError, PromptFileTooLargeError
 
     for site in interpretation_sites(state):
         if site.kind is not InterpretationKind.LLM_PROMPT_TEMPLATE:
@@ -235,10 +235,14 @@ async def _auto_surface_prompt_template_reviews_for_state(
                 provider=provider,  # (D2)
                 composer_skill_hash=composer_skill_hash,  # (D2)
             )
-        except InterpretationResolveError:
+        except InterpretationResolveError as exc:
             # Settlement keeps the unguarded raise: a fresh state that cannot
-            # accept its own surfacing IS a Tier-1 anomaly.
-            if not repair_mode:
+            # accept its own surfacing IS a Tier-1 anomaly. A prompt file over
+            # an inline cap is not one: it can never run, so no card is owed
+            # for it in settlement or repair. That site stays fail-closed, and
+            # runtime validation reports the file as blob_inline_refs
+            # "oversized" with the cap, the refusal the planner and user see.
+            if not repair_mode and type(exc) is not PromptFileTooLargeError:
                 raise
             # Repair cannot: the evidence read above is NOT atomic with this
             # write, and the site can be superseded in between — the node

@@ -1881,6 +1881,29 @@ class InterpretationUnsupportedChoiceError(InterpretationResolveError):
     """The requested choice is valid generally but unsupported for this kind."""
 
 
+class PromptFileTooLargeError(InterpretationResolveError):
+    """A file-backed prompt card cannot be created: the file exceeds an inline cap.
+
+    Runtime substitution enforces the same caps
+    (``elspeth.core.blobs_inline``), so a card for this file could never be
+    approved into a run. ``limit_bytes`` is the cap that was exceeded;
+    ``aggregate`` says whether it is the all-files cap rather than the
+    per-file one. Not a stale-review condition: the file did not change.
+    """
+
+    error_code = "prompt_file_too_large"
+
+    def __init__(self, *, node_id: str, limit_bytes: int, aggregate: bool) -> None:
+        self.node_id = node_id
+        self.limit_bytes = limit_bytes
+        self.aggregate = aggregate
+        subject = "The inline files bound to this pipeline together exceed" if aggregate else "A prompt file exceeds"
+        super().__init__(
+            f"Node {node_id}: {subject} the {limit_bytes}-byte ({limit_bytes // 1024} KiB) inline limit, "
+            "so a run could not use it. Shorten the prompt file, then review it."
+        )
+
+
 class AuditAccessLogWriteError(RuntimeError):
     """Required access disclosure could not be recorded.
 

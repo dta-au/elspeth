@@ -12,7 +12,13 @@ from uuid import UUID
 
 from sqlalchemy import Connection, select
 
-from elspeth.contracts.blobs import BlobNotFoundError, BlobRecord, BlobStateError
+from elspeth.contracts.blobs import (
+    BlobNotFoundError,
+    BlobRecord,
+    BlobStateError,
+    InlineBlobNotAdmittedError,
+    InlineBlobNotAdmittedReason,
+)
 from elspeth.contracts.blobs_inline import BlobContentResolutionError, BlobInlineRef
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
@@ -80,18 +86,37 @@ def _inline_discovery_config(state: InlinePreflightState) -> _DiscoveryConfig:
     }
 
 
+_REFUSAL_LIMIT_BYTES: Mapping[InlineBlobNotAdmittedReason, int | None] = MappingProxyType(
+    {
+        "unverified": None,
+        "oversized": BLOB_INLINE_PER_REF_BYTE_CAP,
+        "aggregate_oversized": BLOB_INLINE_AGGREGATE_BYTE_CAP,
+    }
+)
+
+
 @dataclass(frozen=True, slots=True)
 class SessionInlineBlobSnapshot:
-    """Only verified byte pairs and marker identities; no service or DB handle."""
+    """Only verified byte pairs and marker identities; no service or DB handle.
+
+    ``refusals`` records why a discovered blob has no verified bytes, so a
+    reader asking for it gets a typed refusal rather than a lookup failure.
+    """
 
     refs: frozenset[BlobInlineRef]
     records: Mapping[UUID, tuple[BlobRecord, bytes]] = field(repr=False)
+    refusals: Mapping[UUID, InlineBlobNotAdmittedReason] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        freeze_fields(self, "records")
+        freeze_fields(self, "records", "refusals")
 
     def content(self, blob_id: UUID) -> tuple[BlobRecord, bytes]:
-        return self.records[blob_id]
+        """Return the verified pair, or raise :class:`InlineBlobNotAdmittedError`."""
+        if blob_id in self.records:
+            return self.records[blob_id]
+        reason: InlineBlobNotAdmittedReason = self.refusals[blob_id] if blob_id in self.refusals else "unverified"
+        limit_bytes = _REFUSAL_LIMIT_BYTES[reason]
+        raise InlineBlobNotAdmittedError(str(blob_id), reason=reason, limit_bytes=limit_bytes)
 
     def assert_covers(self, config: InlinePreflightState) -> bool:
         """A changed or newly introduced marker must not reuse prior bytes."""
@@ -157,32 +182,56 @@ def prepare_session_inline_blob_snapshot(
     if not refs:
         return None
     records: dict[UUID, tuple[BlobRecord, bytes]] = {}
+    # Why a discovered blob holds no bytes. Validation produces the
+    # field-scoped refusal; this lets a direct reader refuse by type.
+    refusals: dict[UUID, InlineBlobNotAdmittedReason] = {}
     aggregate = 0
     declared_aggregate = 0
+    aggregate_exhausted = False
     for ref in refs:
         if ref.blob_id in records:
             continue
+        if aggregate_exhausted:
+            # Reads stop here, as before; keep any more specific reason
+            # an earlier reference to the same blob recorded.
+            if ref.blob_id not in refusals:
+                refusals[ref.blob_id] = "aggregate_oversized"
+            continue
         if metadata_hint is not None:
             hint = metadata_hint(ref.blob_id)
-            if hint is None or hint[0] != "ready" or hint[1] != ref.sha256 or hint[2] > BLOB_INLINE_PER_REF_BYTE_CAP:
+            if hint is None or hint[0] != "ready" or hint[1] != ref.sha256:
+                refusals[ref.blob_id] = "unverified"
+                continue
+            if hint[2] > BLOB_INLINE_PER_REF_BYTE_CAP:
+                refusals[ref.blob_id] = "oversized"
                 continue
             declared_aggregate += hint[2]
             if declared_aggregate > BLOB_INLINE_AGGREGATE_BYTE_CAP:
-                break
+                refusals[ref.blob_id] = "aggregate_oversized"
+                aggregate_exhausted = True
+                continue
         try:
             record, content = read_blob(ref.blob_id)
         except (BlobNotFoundError, BlobStateError):
             # Metadata admission in validate_pipeline will produce the
             # field-scoped refusal. Integrity/fence failures still propagate.
+            refusals[ref.blob_id] = "unverified"
             continue
         if record.session_id != session_id:
             raise AuditIntegrityError("inline blob snapshot crossed a session boundary")
         if record.size_bytes > BLOB_INLINE_PER_REF_BYTE_CAP or len(content) > BLOB_INLINE_PER_REF_BYTE_CAP:
+            refusals[ref.blob_id] = "oversized"
             continue
         aggregate += len(content)
         if aggregate > BLOB_INLINE_AGGREGATE_BYTE_CAP:
-            break
+            refusals[ref.blob_id] = "aggregate_oversized"
+            aggregate_exhausted = True
+            continue
         if record.content_hash is None or not hmac.compare_digest(hashlib.sha256(content).hexdigest(), record.content_hash):
             raise AuditIntegrityError("inline blob snapshot metadata disagrees with verified bytes")
         records[ref.blob_id] = (record, content)
-    return SessionInlineBlobSnapshot(refs=frozenset(refs), records=MappingProxyType(records))
+        # A later reference with the matching marker admits a blob an
+        # earlier mismatched reference refused; the bytes win.
+        if ref.blob_id in refusals:
+            del refusals[ref.blob_id]
+    return SessionInlineBlobSnapshot(refs=frozenset(refs), records=MappingProxyType(records), refusals=MappingProxyType(refusals))

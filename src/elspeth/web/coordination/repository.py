@@ -1417,11 +1417,13 @@ class _RepositoryInterpretationMutations:
             )
         )
         if command.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
+            from elspeth.contracts.blobs import InlineBlobNotAdmittedError
             from elspeth.web.sessions.prompt_file_review import (
                 PromptFileReviewStale,
                 prompt_file_binding_paths,
                 resolve_prompt_review_snapshot,
             )
+            from elspeth.web.sessions.protocol import PromptFileTooLargeError
 
             node = next((item for item in live_state.nodes or () if item["id"] == command.affected_node_id), None)
             if node is not None:
@@ -1429,12 +1431,25 @@ class _RepositoryInterpretationMutations:
                 if prompt_file_binding_paths(options):
                     if inline_blob_snapshot is None:
                         raise PromptFileReviewStale()
-                    file_snapshot = resolve_prompt_review_snapshot(
-                        session_id=UUID(state._session_id),
-                        node_id=command.affected_node_id,
-                        options=options,
-                        read_blob=inline_blob_snapshot.content,
-                    )
+                    try:
+                        file_snapshot = resolve_prompt_review_snapshot(
+                            session_id=UUID(state._session_id),
+                            node_id=command.affected_node_id,
+                            options=options,
+                            read_blob=inline_blob_snapshot.content,
+                        )
+                    except InlineBlobNotAdmittedError as exc:
+                        # A file over an inline cap can never run, so a card
+                        # for it is refused by size, naming the cap. Anything
+                        # else unverified is the same refusal as a missing
+                        # snapshot above.
+                        if exc.limit_bytes is None:
+                            raise PromptFileReviewStale(node_id=command.affected_node_id) from exc
+                        raise PromptFileTooLargeError(
+                            node_id=command.affected_node_id,
+                            limit_bytes=exc.limit_bytes,
+                            aggregate=exc.reason == "aggregate_oversized",
+                        ) from exc
                     if file_snapshot is None:
                         raise AuditIntegrityError("file prompt event lost its binding during snapshot derivation")
                     connection.execute(

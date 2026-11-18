@@ -18,7 +18,7 @@ from tests.unit.web.sessions.test_routes import (
 )
 from tests.unit.web.sessions.test_routes import _close_app_session_engines as _close_app_session_engines
 
-from elspeth.contracts.blobs import BlobNotFoundError
+from elspeth.contracts.blobs import BlobNotFoundError, InlineBlobNotAdmittedError
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.sessions.protocol import CompositionStateData
@@ -104,7 +104,8 @@ async def test_export_uses_scoped_verified_prompt_snapshot(tmp_path: Path, monke
             return ValidationResult(is_valid=False, checks=[], errors=[])
         try:
             found, data = getter(blob_id)
-        except KeyError:
+        except InlineBlobNotAdmittedError:
+            # The real preflight maps this BlobStateError to a not_ready refusal.
             return ValidationResult(is_valid=False, checks=[], errors=[])
         assert found == record and data == content
         return ValidationResult(is_valid=True, checks=[], errors=[])
