@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
     from elspeth.contracts.preflight import PreflightResult
+    from elspeth.contracts.run_prompt_input import RunPromptInputEvidence
     from elspeth.contracts.run_start import RunStartPermitBinding
     from elspeth.contracts.sink_effects import SinkEffectRuntimeBinding
     from elspeth.core.checkpoint import CheckpointManager
@@ -199,6 +200,7 @@ class Orchestrator:
         openrouter_catalog_sha256: str,
         openrouter_catalog_source: str,
         web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
+        run_prompt_inputs: tuple[RunPromptInputEvidence, ...] = (),
         run_start_permit: RunStartPermitBinding | None = None,
         pre_effect_guard: Callable[[], None] | None = None,
     ) -> tuple[RecorderFactory, Any, CoordinationToken]:
@@ -213,6 +215,7 @@ class Orchestrator:
             openrouter_catalog_sha256=openrouter_catalog_sha256,
             openrouter_catalog_source=openrouter_catalog_source,
             web_plugin_policy_evidence=web_plugin_policy_evidence,
+            run_prompt_inputs=run_prompt_inputs,
             run_start_permit=run_start_permit,
             pre_effect_guard=pre_effect_guard,
         )
@@ -236,6 +239,7 @@ class Orchestrator:
         openrouter_catalog_sha256: str | None = None,
         openrouter_catalog_source: str | None = None,
         web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
+        run_prompt_inputs: tuple[RunPromptInputEvidence, ...] = (),
         check_coordination_latch: Callable[[], None] | None = None,
         pre_effect_guard: Callable[[], None] | None = None,
         run_start_permit: RunStartPermitBinding | None = None,
@@ -303,6 +307,7 @@ class Orchestrator:
             openrouter_catalog_sha256=openrouter_catalog_sha256,
             openrouter_catalog_source=openrouter_catalog_source,
             web_plugin_policy_evidence=web_plugin_policy_evidence,
+            run_prompt_inputs=run_prompt_inputs,
             check_coordination_latch=check_coordination_latch,
             pre_effect_guard=pre_effect_guard,
             run_start_permit=run_start_permit,

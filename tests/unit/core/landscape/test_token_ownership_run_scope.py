@@ -44,7 +44,8 @@ def test_current_epoch_preserves_token_row_run_ownership_for_sqlite_and_postgres
     # Epoch 43 adds digest shape CHECKs, retaining this FK.
     # Epochs 44-49 retain this FK. Epoch 50 adds calls.returned_model and also
     # retains the tokens/rows composite FK.
-    assert SQLITE_SCHEMA_EPOCH == 50
+    # Epoch 51 adds run prompt input evidence and retains this FK.
+    assert SQLITE_SCHEMA_EPOCH == 51
     assert (
         "tokens",
         ("row_id", "run_id"),

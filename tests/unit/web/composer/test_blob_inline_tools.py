@@ -330,6 +330,30 @@ class TestListComposerBlobs:
 
 
 class TestWireBlobInlineRef:
+    def test_assistant_created_text_prompt_wiring_opens_review(self, blob_env: dict[str, Any]) -> None:
+        blob = _create_blob(blob_env, content="Assistant-authored prompt", llm_authored=True)
+        assert blob.success, blob.to_dict()
+        with blob_env["engine"].connect() as conn:
+            row = conn.execute(blobs_table.select().where(blobs_table.c.id == blob.data["blob_id"])).one()
+        assert row.creation_modality == "llm_generated"
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {"field_path": "node:classify.options.prompt_template", "blob_id": blob.data["blob_id"]},
+            _inline_ref_state(),
+            _catalog(),
+            data_dir=blob_env["data_dir"],
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
+        )
+
+        assert result.success, result.to_dict()
+        assert result.updated_state.nodes[0].options["prompt_template"]["blob_ref"] == blob.data["blob_id"]
+        requirements = result.updated_state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY]
+        assert any(item["kind"] == "llm_prompt_template" and item["status"] == "pending" for item in requirements)
+
     @pytest.mark.parametrize("field", ["prompt_template", "system_prompt", "queries.0.template", "queries.q.template"])
     def test_binary_mime_refuses_before_writing_marker(self, blob_env: dict[str, Any], field: str) -> None:
         blob = _create_blob(blob_env, content="PDF shaped bytes")

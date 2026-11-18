@@ -462,6 +462,7 @@ def test_blob_replacement_ledger_commits_exact_metadata_and_retires(engine: Engi
             plan=staged,
             max_storage_per_session=100,
             accepting_proposal_id=None,
+            on_metadata_commit=None,
         ),
     )
     assert committed.phase == "purge_pending"

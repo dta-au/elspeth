@@ -13,6 +13,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast, final
 from uuid import UUID
 
+from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.composer_interpretation import (
     INTERPRETATION_HASH_DOMAIN_V2,
     InterpretationChoice,
@@ -36,6 +37,7 @@ from elspeth.web.interpretation_state import (
     PROMPT_TEMPLATE_PARTS_KEY,
     SOURCE_AUTHORING_KEY,
     SOURCE_COMPONENT_ID,
+    InterpretationRequirement,
     approved_prompt_artifact_hash_from_options,
     current_source_data_contract_demand,
     model_choice_artifact_hash,
@@ -54,6 +56,7 @@ from elspeth.web.sessions.interpretation_validation import (
     SessionInterpretationValidationInputs,
     validate_composition_state_with_interpretation_inputs,
 )
+from elspeth.web.sessions.prompt_file_review import PromptReviewSnapshot, node_binds_prompt_file, prompt_file_binding_paths
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateRecord,
@@ -187,10 +190,11 @@ def _find_llm_transform_node(
         if multi_query_prompt_surface_from_options(options) is not None:
             approved_prompt_artifact_hash_from_options(options)
             return node
-        if "prompt_template" not in options or type(options["prompt_template"]) is not str:
+        prompt_value = options["prompt_template"] if "prompt_template" in options else None
+        prompt_marker = is_widened_blob_ref(deep_thaw(prompt_value))
+        if type(prompt_value) is not str and (prompt_marker is None or prompt_marker.mode != "inline_content"):
             raise InterpretationPlaceholderConsumedError(f"{context}: node {affected_node_id!r} options.prompt_template is not a string")
-        prompt_template = options["prompt_template"]
-        if not prompt_template:
+        if not prompt_value:
             raise InterpretationPlaceholderConsumedError(
                 f"{context}: node {affected_node_id!r} must declare non-empty options.prompt_template"
             )
@@ -555,7 +559,8 @@ def _reviewed_content_identity(
         structure_hash = prompt_review_anchor_hash_from_options(options)
         if structure_hash is None:
             prompt_template = options["prompt_template"] if "prompt_template" in options else None
-            if type(prompt_template) is not str:
+            marker = is_widened_blob_ref(deep_thaw(prompt_template))
+            if type(prompt_template) is not str and (marker is None or marker.mode != "inline_content"):
                 raise InterpretationPlaceholderConsumedError(f"{context}: llm_prompt_template review requires options.prompt_template")
             structure_hash = stable_hash(prompt_template)
         domain["artifact_hash"] = structure_hash
@@ -967,6 +972,41 @@ def _patch_llm_transform_prompt(
     return patched_nodes
 
 
+def _repended_file_prompt_requirements(
+    raw_requirements: Sequence[Any], parsed: Sequence[InterpretationRequirement], *, draft: str
+) -> list[Any]:
+    """Requirements with any RESOLVED ``llm_prompt_template`` review returned to pending on ``draft``.
+
+    Used only for a node with a prompt FILE after a vague-term resolve
+    re-renders its ``prompt_template``. The prompt requirement attests the
+    prompt SKELETON, so a vague-term resolve keeps it resolved
+    (elspeth-e51216d305), and that rule stands for inline-only nodes. A file
+    approval instead binds the rendered surface its card showed, so after the
+    re-render that approval no longer attests what runs: admission refuses and
+    no card is pending. Re-pending in the resolve's own transaction lets the
+    next surfacing pass issue a fresh card and snapshot of the rendered surface.
+    ``parsed`` is the owned parse of ``raw_requirements`` (same order); every
+    other row is carried through unchanged.
+    """
+    if len(raw_requirements) != len(parsed):
+        raise AuditIntegrityError("interpretation requirements parse disagrees with the stored rows")
+    repended: list[Any] = []
+    for raw, requirement in zip(raw_requirements, parsed, strict=True):
+        if requirement["kind"] == InterpretationKind.LLM_PROMPT_TEMPLATE.value and requirement["status"] == "resolved":
+            pending = dict(raw)
+            pending["status"] = "pending"
+            pending["draft"] = draft
+            pending["event_id"] = None
+            pending["accepted_value"] = None
+            pending["resolved_prompt_template_hash"] = None
+            if "accepted_artifact_hash" in pending:
+                pending["accepted_artifact_hash"] = None
+            repended.append(pending)
+        else:
+            repended.append(raw)
+    return repended
+
+
 def _resolve_vague_term(
     state_record: CompositionStateRecord,
     *,
@@ -1028,6 +1068,14 @@ def _resolve_vague_term(
             node_with_hash = dict(n)
             options_with_hash = dict(n["options"])
             options_with_hash["approved_prompt_artifact_hash"] = artifact_hash
+            if prompt_file_binding_paths(options_with_hash):
+                # A prompt file's approval binds the rendered surface: re-review it.
+                parsed = parse_interpretation_requirements(options_with_hash)
+                draft_after = prompt_review_draft_from_options(options_with_hash)
+                if parsed is not None and draft_after is not None:
+                    options_with_hash[INTERPRETATION_REQUIREMENTS_KEY] = _repended_file_prompt_requirements(
+                        options_with_hash[INTERPRETATION_REQUIREMENTS_KEY], parsed, draft=draft_after
+                    )
             node_with_hash["options"] = options_with_hash
             final_nodes.append(node_with_hash)
         else:
@@ -1122,6 +1170,7 @@ def _resolve_prompt_template_review(
     user_term: str,
     accepted_value: str,
     surfacing_structure_hash: str | None,
+    file_snapshot: PromptReviewSnapshot | None = None,
 ) -> tuple[Mapping[str, Mapping[str, Any]] | None, list[Mapping[str, Any]], str | None]:
     node = _find_llm_transform_node(
         state_record,
@@ -1133,7 +1182,12 @@ def _resolve_prompt_template_review(
         message=f"resolve_interpretation_event: node {affected_node_id!r} options is not a mapping",
     )
     prompt_template = options["prompt_template"] if "prompt_template" in options else None
-    if type(prompt_template) is not str and multi_query_prompt_surface_from_options(options) is None:
+    marker = is_widened_blob_ref(deep_thaw(prompt_template))
+    if (
+        type(prompt_template) is not str
+        and multi_query_prompt_surface_from_options(options) is None
+        and (marker is None or marker.mode != "inline_content")
+    ):
         raise InterpretationPlaceholderConsumedError(
             f"resolve_interpretation_event: node {affected_node_id!r} options.prompt_template is not a string"
         )
@@ -1172,14 +1226,11 @@ def _resolve_prompt_template_review(
     # The event and runtime node share the effective artifact identity. The
     # requirement separately attests the authored surface/skeleton, so resolving
     # a vague-term slot does not invalidate the approval of that skeleton.
-    artifact_hash = approved_prompt_artifact_hash_from_options(options)
-    structure_hash = prompt_review_anchor_hash_from_options(options)
-    requirement_anchor_hash = structure_hash if structure_hash is not None else stable_hash(prompt_template)
     requirement = dict(requirements[matching_index])
     requirement["status"] = "resolved"
     requirement["event_id"] = event_id
     requirement["accepted_value"] = accepted_value
-    requirement["resolved_prompt_template_hash"] = requirement_anchor_hash
+    artifact_hash = _refresh_prompt_review_evidence(options, cast(InterpretationRequirement, requirement), file_snapshot=file_snapshot)
     requirements[matching_index] = requirement
 
     final_nodes: list[Mapping[str, Any]] = []
@@ -1196,6 +1247,59 @@ def _resolve_prompt_template_review(
     # Prompt-template review patches only node review metadata; the sources map
     # is carried forward unchanged. The legacy singular ``source`` column is dead.
     return state_record.sources, final_nodes, artifact_hash
+
+
+def _refresh_prompt_review_evidence(
+    options: Mapping[str, Any], requirement: InterpretationRequirement, *, file_snapshot: PromptReviewSnapshot | None
+) -> str | None:
+    """Use the same authored anchor and effective artifact for card and editor approvals."""
+    anchor = prompt_review_anchor_hash_from_options(options)
+    prompt = options["prompt_template"] if "prompt_template" in options else None
+    requirement["resolved_prompt_template_hash"] = anchor if anchor is not None else stable_hash(prompt)
+    return file_snapshot.effective_artifact_hash if file_snapshot is not None else approved_prompt_artifact_hash_from_options(options)
+
+
+def resolved_prompt_review_matches_anchor(state_record: CompositionStateRecord, *, affected_node_id: str) -> bool:
+    """Whether every resolved prompt-template review on the node still attests its options.
+
+    The same derivation the execution drift guard applies and the editor-save
+    refresh writes. A save must not re-anchor a review that already drifted:
+    that would turn unseen text into approved text.
+    """
+    options = next(node["options"] for node in state_record.nodes or () if node["id"] == affected_node_id)
+    resolved = [
+        item
+        for item in parse_interpretation_requirements(options) or ()
+        if item["kind"] == InterpretationKind.LLM_PROMPT_TEMPLATE.value and item["status"] == "resolved"
+    ]
+    if not resolved:
+        return True
+    anchor = prompt_review_anchor_hash_from_options(options)
+    prompt = options["prompt_template"] if "prompt_template" in options else None
+    expected = anchor if anchor is not None else stable_hash(prompt)
+    return all(item["resolved_prompt_template_hash"] == expected for item in resolved)
+
+
+def _refresh_resolved_prompt_template_review(
+    state_record: CompositionStateRecord, *, affected_node_id: str, file_snapshot: PromptReviewSnapshot
+) -> list[Mapping[str, Any]]:
+    """Refresh a previously accepted card after the owner saves its sole file."""
+    nodes: list[Mapping[str, Any]] = []
+    for node in state_record.nodes or ():
+        if node["id"] != affected_node_id:
+            nodes.append(node)
+            continue
+        options = dict(node["options"])
+        requirements: list[InterpretationRequirement] = list(parse_interpretation_requirements(options) or ())
+        matching = [
+            item for item in requirements if item["kind"] == InterpretationKind.LLM_PROMPT_TEMPLATE.value and item["status"] == "resolved"
+        ]
+        if len(matching) != 1:
+            raise InterpretationPlaceholderConsumedError("editor save requires one resolved prompt review")
+        options["approved_prompt_artifact_hash"] = _refresh_prompt_review_evidence(options, matching[0], file_snapshot=file_snapshot)
+        options[INTERPRETATION_REQUIREMENTS_KEY] = requirements
+        nodes.append({**node, "options": options})
+    return nodes
 
 
 def _resolve_invented_source(
@@ -1861,7 +1965,12 @@ class _SessionPendingInterpretationPlanner:
                         )
             elif kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
                 prompt_template = options["prompt_template"] if "prompt_template" in options else None
-                if type(prompt_template) is not str and multi_query_prompt_surface_from_options(options) is None:
+                marker = is_widened_blob_ref(deep_thaw(prompt_template))
+                if (
+                    type(prompt_template) is not str
+                    and multi_query_prompt_surface_from_options(options) is None
+                    and (marker is None or marker.mode != "inline_content")
+                ):
                     raise ValueError(
                         f"create_pending_interpretation_event: node {affected_node_id!r} options.prompt_template is not a string"
                     )
@@ -1928,6 +2037,12 @@ class _SessionPendingInterpretationPlanner:
                 superseded_event_ids=stale,
             )
 
+        # A file-backed prompt card ignores the session's review opt-out: it
+        # stays pending until a person approves the file's bytes. Other kinds,
+        # including a vague term on the same node, follow the opt-out.
+        review_disabled = snapshot.review_disabled and not (
+            kind is InterpretationKind.LLM_PROMPT_TEMPLATE and node_binds_prompt_file(live_state, affected_node_id)
+        )
         matching_event_id: UUID | None = None
         rows_to_supersede: list[UUID] = []
         for site in snapshot.pending_sites:
@@ -1962,9 +2077,12 @@ class _SessionPendingInterpretationPlanner:
                     )
             if (
                 policy is PendingInterpretationPolicy.RECONCILE
-                and not snapshot.review_disabled
+                and not review_disabled
                 and matching_event_id is None
                 and pending_identity == current_identity
+                # Same requirement anchor, but the card's stored file snapshot
+                # shows a surface that no longer runs: superseded and re-issued.
+                and not site.file_snapshot_stale
             ):
                 matching_event_id = site.event.id
             else:
@@ -1979,7 +2097,7 @@ class _SessionPendingInterpretationPlanner:
                 superseded_event_ids=tuple(rows_to_supersede),
             )
 
-        if not snapshot.review_disabled:
+        if not review_disabled:
             return SessionPendingInterpretationDecision(
                 result_event_id=event_id,
                 superseded_event_ids=tuple(rows_to_supersede),

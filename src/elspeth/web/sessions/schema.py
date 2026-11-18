@@ -48,7 +48,7 @@ _SESSION_METADATA_CREATE_LOCK = Lock()
 # identity allowances, and fixes the active container policy singleton across
 # actors. Neither distinct epoch-76 predecessor is this combined contract.
 # Incompatible stores require a separately reviewed compatibility disposition.
-_COORDINATION_HARD_CUT_EPOCH = 78
+_COORDINATION_HARD_CUT_EPOCH = 79
 _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
     "auth_session_families": "ix_auth_session_families_expires_at",
     "web_instances": "ix_web_instances_lease_expires_at",
@@ -107,6 +107,8 @@ _REQUIRED_AUDIT_TRIGGERS: frozenset[str] = frozenset(
         "trg_interpretation_events_immutable_resolved",
         "trg_interpretation_events_no_delete_resolved",
         "trg_composer_completion_events_no_update",
+        "trg_prompt_file_approvals_no_update",
+        "trg_prompt_review_snapshots_no_update",
         "trg_composer_completion_events_no_delete",
         "trg_chat_messages_immutable_content",
         "trg_chat_messages_no_delete",
@@ -402,6 +404,12 @@ class SessionSchemaAuthority:
                     OR (relation.relname = 'composer_completion_events' AND trigger.tgname IN (
                       'trg_composer_completion_events_no_update',
                       'trg_composer_completion_events_no_delete'
+                    ))
+                    OR (relation.relname = 'prompt_file_approvals' AND trigger.tgname IN (
+                      'trg_prompt_file_approvals_no_update'
+                    ))
+                    OR (relation.relname = 'prompt_review_snapshots' AND trigger.tgname IN (
+                      'trg_prompt_review_snapshots_no_update'
                     ))
                     OR (relation.relname = 'chat_messages' AND trigger.tgname IN (
                       'trg_chat_messages_immutable_content',

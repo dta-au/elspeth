@@ -1,4 +1,4 @@
-"""Epoch-78 admission preserves/refuses its distinct predecessors.
+"""Epoch-79 admission preserves/refuses its distinct predecessors.
 
 Fixtures are isolated synthetic stores. Historical epochs emulate declared
 reader identities; they do not execute old binaries or establish conversion.
@@ -178,15 +178,15 @@ def _assert_live_wal_preserved(path: Path, before: Snapshot, after: Snapshot) ->
 
 @pytest.mark.parametrize(
     ("epoch", "shape"),
-    [(75, "predecessor"), (76, "predecessor"), (76, "current"), (77, "current")],
-    ids=["main75", "graph-review76", "quota-only76", "integrated77"],
+    [(75, "predecessor"), (76, "predecessor"), (76, "current"), (77, "current"), (78, "current")],
+    ids=["main75", "graph-review76", "quota-only76", "integrated77", "quota-custody78"],
 )
 @pytest.mark.parametrize("identity_only", [False, True], ids=["sqlite-header", "identity-row"])
 @pytest.mark.parametrize("entry", ["factory", "initializer", "probe"])
 def test_current_epoch_refuses_predecessor_contracts_without_any_store_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, epoch: int, shape: Shape, identity_only: bool, entry: str
 ) -> None:
-    assert SESSION_SCHEMA_EPOCH == schema._COORDINATION_HARD_CUT_EPOCH == 78
+    assert SESSION_SCHEMA_EPOCH == schema._COORDINATION_HARD_CUT_EPOCH == 79
     path = tmp_path / "predecessor.db"
     _source_store(path, epoch=epoch, shape=shape, identity_only=identity_only, monkeypatch=monkeypatch)
     before = _snapshot(path)

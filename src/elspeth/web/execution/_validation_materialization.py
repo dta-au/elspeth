@@ -201,10 +201,7 @@ _LLM_PROMPT_SURFACE_OPTION_ROOTS: Final[frozenset[str]] = frozenset({"prompt_tem
 def llm_prompt_surface_field(field_path: str) -> tuple[str, str] | None:
     """Return ``(node_name, option_path)`` when an inline-ref path is an ``llm`` prompt surface or model.
 
-    The one definition of the domain every LLM-authored inline-blob refusal
-    guards: ``wire_blob_inline_ref`` and the node-option authoring tools, the
-    /validate materialization phase, and run admission. ``field_path`` is the
-    canonical ``node:<name>.options.<key>[.<key>...]`` form
+    ``field_path`` is the canonical ``node:<name>.options.<key>[.<key>...]`` form
     ``_discover_blob_content_refs`` produces. The guarded options are
     ``prompt_template``, ``system_prompt`` and ``model`` (and anything beneath
     them), and ``queries`` as a whole value, a whole ``queries.<name>`` value,
@@ -222,6 +219,29 @@ def llm_prompt_surface_field(field_path: str) -> tuple[str, str] | None:
     if root not in _LLM_PROMPT_SURFACE_OPTION_ROOTS and not is_query_prompt:
         return None
     return prefix.removeprefix("node:"), option_path
+
+
+def llm_prompt_file_scalar_field(field_path: str) -> tuple[str, str] | None:
+    """A scalar prompt position where a reviewed UTF-8 file may bind."""
+    surface = llm_prompt_surface_field(field_path)
+    if surface is None:
+        return None
+    node_name, option_path = surface
+    parts = option_path.split(".")
+    if option_path in {"prompt_template", "system_prompt"} or (len(parts) == 3 and parts[0] == "queries" and parts[2] == "template"):
+        return node_name, option_path
+    return None
+
+
+def unsupported_llm_prompt_file_refs(refs: list[BlobInlineRef], *, node_plugins: Mapping[str, str]) -> list[BlobInlineRef]:
+    """Markers at model or aggregate prompt positions have no reviewable scalar binding."""
+    return [
+        ref
+        for ref in refs
+        if (surface := llm_prompt_surface_field(ref.field_path)) is not None
+        and (surface[0] not in node_plugins or node_plugins[surface[0]] == "llm")
+        and llm_prompt_file_scalar_field(ref.field_path) is None
+    ]
 
 
 FILE_INJECT_PLUGIN: Final = "file_inject"
@@ -352,19 +372,18 @@ def is_llm_authored_prompt_surface_binding(
     node_plugins: Mapping[str, str],
     creation_modality: CreationModality,
 ) -> bool:
-    """Whether binding a blob of ``creation_modality`` at an ``llm`` node's ``field_path`` is refused.
+    """Whether an LLM-authored file reaches a prompt position with no scalar review.
 
-    ADR-034 admits ``inline_content`` markers in prompt fields so a USER-uploaded
-    prompt artifact can back an ``llm`` node. The ``llm_prompt_template`` and
-    ``llm_model_choice`` reviews read those options as strings, and the run
-    substitutes blob bytes afterwards, so an LLM-authored blob there would become
-    the executed prompt or model with no operator review. Only user-verbatim blob
-    content may stand in for that text. The rule is modality-only and covers
-    ``llm`` nodes only; ``file_inject`` has its own, stricter rule
-    (``file_inject_blob_refusal``).
+    Supported scalar prompt positions use the mandatory file review instead.
+    ``file_inject`` retains its separate upload-only rule.
     """
     surface = guarded_inline_surface_field(field_path, node_plugins=node_plugins)
-    return surface is not None and surface[2] == "llm" and is_llm_authored_creation_modality(creation_modality)
+    return (
+        surface is not None
+        and surface[2] == "llm"
+        and llm_prompt_file_scalar_field(field_path) is None
+        and is_llm_authored_creation_modality(creation_modality)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -796,19 +815,13 @@ def materialize_validation_yaml(
                 readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
                 semantic_contracts=interpretation.authored.semantic_contracts,
             )
-        # Readiness parity with run admission (InlineBlobPromptSurfaceAdmissionError):
-        # the same predicates refuse an LLM-authored blob in an llm prompt surface
-        # or model, and a blob the user did not upload in a file_inject node's
-        # files, here, so /validate is not ready for exactly the pipelines whose
-        # run would be refused after creation. Node names and plugins are read from the runtime config the
-        # refs were discovered in, as run admission reads them.
+        # File-backed prompt surfaces are reviewed through the session-owned
+        # snapshot and approval gate. This phase retains file_inject's distinct
+        # user-upload rule; ExecutionService checks prompt approvals afterward.
         node_plugins = runtime_config_node_plugins(config_dict)
-        file_inject_blob_refs = file_inject_blob_refusals(refs, resolved_records, node_plugins=node_plugins)
-        if file_inject_blob_refs:
-            return _file_inject_validation_failure(file_inject_blob_refs, interpretation)
-        llm_authored_refs = _llm_authored_prompt_surface_refs(refs, resolved_records, node_plugins=node_plugins)
-        if llm_authored_refs:
-            detail = "; ".join(f"{ref.field_path}: llm_authored" for ref in llm_authored_refs)
+        unsupported_prompt_refs = unsupported_llm_prompt_file_refs(refs, node_plugins=node_plugins)
+        if unsupported_prompt_refs:
+            detail = "; ".join(f"{ref.field_path}: unsupported file-backed prompt position" for ref in unsupported_prompt_refs)
             return PhaseFailure(
                 passed_checks=(),
                 failed_check=ValidationCheck(
@@ -818,10 +831,22 @@ def materialize_validation_yaml(
                     affected_nodes=(),
                     outcome_code=None,
                 ),
-                errors=tuple(_llm_authored_prompt_surface_error(ref) for ref in llm_authored_refs),
+                errors=tuple(
+                    ValidationError(
+                        component_id=_blob_inline_component_id(ref.field_path),
+                        component_type=_blob_inline_component_type(ref.field_path),
+                        message=f"File-backed prompt binding is unsupported at {ref.field_path}.",
+                        suggestion="Bind a UTF-8 text file to prompt_template, system_prompt, or a query template.",
+                        error_code="inline_blob_field_path_invalid",
+                    )
+                    for ref in unsupported_prompt_refs
+                ),
                 readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
                 semantic_contracts=interpretation.authored.semantic_contracts,
             )
+        file_inject_blob_refs = file_inject_blob_refusals(refs, resolved_records, node_plugins=node_plugins)
+        if file_inject_blob_refs:
+            return _file_inject_validation_failure(file_inject_blob_refs, interpretation)
         if blob_get_content is None:
             unavailable = [
                 BlobInlineValidationViolation(

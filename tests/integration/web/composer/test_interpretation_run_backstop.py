@@ -44,6 +44,7 @@ from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers import execution_custody
 from tests.helpers.execution_custody import ExecutionTestCustody
+from tests.helpers.prompt_review import reviewed_anchor_kwargs
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -381,13 +382,17 @@ async def test_unresolved_card_blocks_run_resolving_permits(
         # 3. resolve BOTH pending cards as accepted-as-drafted (the prompt_template
         # and the model_choice). Resolving only one leaves a pending site and the
         # gate keeps raising; both must clear for the state to reach PERMIT.
-        for event_id in (pt_event_id, mc_event_id):
+        for event_id, kind in (
+            (pt_event_id, InterpretationKind.LLM_PROMPT_TEMPLATE),
+            (mc_event_id, InterpretationKind.LLM_MODEL_CHOICE),
+        ):
             await sessions_service.resolve_interpretation_event(
                 session_id=session_id,
                 event_id=event_id,
                 choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
                 amended_value=None,
                 actor="user:alice",
+                **await reviewed_anchor_kwargs(sessions_service, session_id, event_id, kind),
             )
 
         # 4. with BOTH reviews resolved, the interpretation gate PERMITS. The gate

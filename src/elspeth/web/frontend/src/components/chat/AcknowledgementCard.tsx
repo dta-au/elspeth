@@ -24,10 +24,11 @@ import {
   type ReactNode,
 } from "react";
 import type { CompositionState } from "@/types/index";
-import type { InterpretationEvent } from "@/types/interpretation";
+import type { InterpretationEvent, PromptReviewSnapshotResponse } from "@/types/interpretation";
+import { getPromptReviewSnapshot } from "@/api/client";
 import { Button } from "@/components/ui";
 import { CodeBlock } from "./CodeBlock";
-import { resolvePromptDisplaySegments } from "./promptTemplateDisplay";
+import { hasFilePromptBinding, resolvePromptDisplaySegments } from "./promptTemplateDisplay";
 import {
   ACKNOWLEDGEMENT_ACCEPT_LABEL,
   ACKNOWLEDGEMENT_AMEND_LABEL,
@@ -385,8 +386,23 @@ export function AcknowledgementCard({
   const userTerm = event.user_term ?? "this term";
 
   const requiresPromptView = event.kind === "llm_prompt_template";
+  const [promptSnapshot, setPromptSnapshot] = useState<PromptReviewSnapshotResponse | null>(null);
+  const filePromptBinding = requiresPromptView && hasFilePromptBinding(compositionState, event);
+  useEffect(() => {
+    if (!filePromptBinding) return;
+    const controller = new AbortController();
+    setPromptSnapshot(null);
+    getPromptReviewSnapshot(sessionId, event.id, controller.signal)
+      .then((snapshot) => {
+        if (!controller.signal.aborted) setPromptSnapshot(snapshot);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setPromptSnapshot(null);
+      });
+    return () => controller.abort();
+  }, [filePromptBinding, sessionId, event.id]);
   const promptDisplay = requiresPromptView
-    ? resolvePromptDisplaySegments(compositionState, event)
+    ? resolvePromptDisplaySegments(compositionState, event, promptSnapshot)
     : null;
   const promptReviewAvailable = promptDisplay?.reviewAvailable === true;
   const valueIsLong =

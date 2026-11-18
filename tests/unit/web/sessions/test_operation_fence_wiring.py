@@ -13,12 +13,13 @@ import json
 import textwrap
 import types
 import typing
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import Connection
 
 from elspeth.contracts.blobs import (
     BlobAtomicDeletionObligation,
@@ -1026,6 +1027,7 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
                         ("plan", inspect.Parameter.KEYWORD_ONLY, BlobReplacementPlan),
                         ("max_storage_per_session", inspect.Parameter.KEYWORD_ONLY, int),
                         ("accepting_proposal_id", inspect.Parameter.KEYWORD_ONLY, UUID | None),
+                        ("on_metadata_commit", inspect.Parameter.KEYWORD_ONLY, Callable[[Connection], None] | None),
                     ),
                     BlobReplacementPlan,
                 ),

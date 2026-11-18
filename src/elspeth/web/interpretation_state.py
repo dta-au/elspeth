@@ -1083,13 +1083,8 @@ def _node_option_is_non_text(node: NodeSpec, key: str) -> bool:
 def _refuse_resolved_review_over_non_text(node: NodeSpec, *, option_key: str, kind: InterpretationKind) -> None:
     """Drift backstop: a RESOLVED prompt/model review over a non-text value.
 
-    A resolved ``llm_prompt_template`` / ``llm_model_choice`` review attested a
-    concrete string. A non-text value in that field (an ``inline_content`` blob
-    marker, substituted only at run time) is not what was reviewed, and the
-    string drift guards never run because there is no string to hash. This is
-    drift, not debt: no card can attest a marker (the surfacer, event writer
-    and resolver all read the option as text), so it is refused here rather
-    than enumerated as a pending site nothing can clear.
+    A resolved model review attests text. A prompt review may instead attest
+    a deferred scalar file marker, whose authored anchor is checked here.
 
     A marker with NO resolved review is not refused: LLM-authored blobs are
     refused in these fields at wire time and at run admission, so what remains
@@ -1099,12 +1094,46 @@ def _refuse_resolved_review_over_non_text(node: NodeSpec, *, option_key: str, ki
         return
     if _resolved_requirement_for_kind(_requirements(node.options), kind) is None:
         return
+    if kind is InterpretationKind.LLM_PROMPT_TEMPLATE and option_key == "prompt_template":
+        marker = is_widened_blob_ref(deep_thaw(node.options[option_key]))
+        if marker is not None and marker.mode == "inline_content":
+            _validate_prompt_template_review(node, None)
+            return
     raise InterpretationReviewIntegrityError(
         f"llm node {node.id!r} {kind.value} review is resolved but options.{option_key} is no longer text",
         component_id=node.id,
         component_type="transform",
         kind=kind,
     )
+
+
+def _validate_resolved_prompt_surface_markers(node: NodeSpec) -> None:
+    """A resolved review may cover only valid deferred scalar file markers."""
+    if _resolved_requirement_for_kind(_requirements(node.options), InterpretationKind.LLM_PROMPT_TEMPLATE) is None:
+        return
+    slots: list[tuple[str, object]] = [(key, node.options[key]) for key in ("prompt_template", "system_prompt") if key in node.options]
+    queries = node.options["queries"] if "queries" in node.options else None
+    entries: list[tuple[object, object]] = []
+    if isinstance(queries, Mapping):
+        entries.extend(queries.items())
+    elif isinstance(queries, (list, tuple)):
+        entries.extend(enumerate(queries))
+    for name, entry in entries:
+        if isinstance(entry, Mapping) and "template" in entry:
+            slots.append((f"queries.{name}.template", entry["template"]))
+    for path, value in slots:
+        if value is None or isinstance(value, str):
+            continue
+        marker = is_widened_blob_ref(deep_thaw(value))
+        if marker is None or marker.mode != "inline_content":
+            raise InterpretationReviewIntegrityError(
+                f"llm node {node.id!r} resolved prompt review covers invalid {path} value",
+                component_id=node.id,
+                component_type="transform",
+                kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
+            )
+    if any(value is not None and not isinstance(value, str) for _path, value in slots):
+        _validate_prompt_template_review(node, _node_str_option(node, "prompt_template"))
 
 
 def _raw_html_cleanup_requirement(requirements: Sequence[InterpretationRequirement] | None) -> InterpretationRequirement | None:
@@ -1293,12 +1322,17 @@ def _materialize_node_for_execution(
         _validate_model_choice_review(node, model)
     parts = _prompt_parts(node.options)
     if parts is None:
+        _validate_resolved_prompt_surface_markers(node)
         # Structured nodes render prompt_template from their parts, so only a
         # parts-free node can execute a non-text prompt_template.
         if multi_query_prompt_surface_from_options(node.options) is None:
             _refuse_resolved_review_over_non_text(node, option_key="prompt_template", kind=InterpretationKind.LLM_PROMPT_TEMPLATE)
         prompt_template = _node_str_option(node, "prompt_template")
-        if prompt_template or multi_query_prompt_surface_from_options(node.options) is not None:
+        if (
+            prompt_template
+            or multi_query_prompt_surface_from_options(node.options) is not None
+            or _node_option_is_non_text(node, "prompt_template")
+        ):
             requirement = _prompt_template_review_requirement(node.options)
             if requirement is not None:
                 _validate_prompt_template_review(node, prompt_template)
@@ -1691,7 +1725,10 @@ def _missing_prompt_template_review_sites(node: NodeSpec) -> tuple[Interpretatio
     if node.plugin != "llm":
         return ()
     prompt_template = _node_str_option(node, "prompt_template")
-    if not prompt_template and multi_query_prompt_surface_from_options(node.options) is None:
+    surface = multi_query_prompt_surface_from_options(node.options)
+    # A query falling back to a node-level file is the non-text case above:
+    # the surface exists only so the anchor covers it, not to stage a site.
+    if not prompt_template and (surface is None or surface.node_prompt_file is not None):
         return ()
     requirement = _prompt_template_review_requirement(node.options)
     if requirement is None:
@@ -2418,6 +2455,23 @@ class InvalidQueryTemplate:
 
 
 @dataclass(frozen=True, slots=True)
+class InheritedPromptFile:
+    """Identity of a node-level prompt file that at least one query falls back to.
+
+    The node-level ``prompt_template`` is an ``inline_content`` file marker,
+    so its text is not in the options; the surface carries the marker
+    identity instead (the bytes are bound by ``sha256``). Without it a
+    multi-query node whose fallback is a file had no surface at all, its
+    review anchor ignored every query, and an edit to another query's inline
+    template left the review resolved.
+    """
+
+    blob_id: str
+    sha256: str
+    encoding: str
+
+
+@dataclass(frozen=True, slots=True)
 class MultiQueryPromptSurface:
     """The complete prompt surface a multi-query LLM node sends the model.
 
@@ -2438,6 +2492,9 @@ class MultiQueryPromptSurface:
     node_prompt_structure_hash: str | None
     system_prompt: str | None
     queries: tuple[tuple[str, str | InvalidQueryTemplate | None], ...]
+    # Set only when the node-level template is a file marker that some query
+    # falls back to; ``node_prompt_template`` is then ``None``.
+    node_prompt_file: InheritedPromptFile | None = None
 
     @property
     def node_template_users(self) -> tuple[str, ...]:
@@ -2465,21 +2522,33 @@ class MultiQueryPromptSurface:
         and its text otherwise. A query's string template or ``None`` fallback
         is hashed as itself (so every well-formed surface keeps its anchor);
         an :class:`InvalidQueryTemplate` is hashed as a mapping, which no
-        string or ``None`` can equal, so repairing it moves the anchor.
+        string or ``None`` can equal, so repairing it moves the anchor. An
+        inherited node-level prompt file adds its marker identity under its
+        own key; a surface without one keeps its existing anchor.
         """
+        surface = {
+            "domain": PROMPT_SURFACE_HASH_DOMAIN,
+            "node_prompt": self.node_prompt_structure_hash
+            if self.node_prompt_structure_hash is not None
+            else stable_hash(self.node_prompt_template),
+            "system_prompt": self.system_prompt,
+            "queries": [
+                [name, {"invalid_template": override.reason} if isinstance(override, InvalidQueryTemplate) else override]
+                for name, override in self.queries
+            ],
+        }
+        if self.node_prompt_file is None:
+            return stable_hash(surface)
+        node_file = self.node_prompt_file
         return stable_hash(
-            {
-                "domain": PROMPT_SURFACE_HASH_DOMAIN,
-                "node_prompt": self.node_prompt_structure_hash
-                if self.node_prompt_structure_hash is not None
-                else stable_hash(self.node_prompt_template),
-                "system_prompt": self.system_prompt,
-                "queries": [
-                    [name, {"invalid_template": override.reason} if isinstance(override, InvalidQueryTemplate) else override]
-                    for name, override in self.queries
-                ],
-            }
+            {**surface, "node_prompt_file": {"blob_id": node_file.blob_id, "sha256": node_file.sha256, "encoding": node_file.encoding}}
         )
+
+    def _node_template_display(self) -> str | None:
+        """The node-level template as the draft shows it: its text, or a file label."""
+        if self.node_prompt_file is not None:
+            return f"(file {self.node_prompt_file.blob_id}, SHA-256 {self.node_prompt_file.sha256})"
+        return self.node_prompt_template
 
     def render_for_review(self, *, max_chars: int = PROMPT_SURFACE_REVIEW_MAX_CHARS) -> str:
         """Human-readable draft of the surface for the review card.
@@ -2513,7 +2582,7 @@ class MultiQueryPromptSurface:
             *(override if isinstance(override, str) else None for _name, override in self.queries),
         ]
         if self.node_template_users:
-            texts.append(self.node_prompt_template)
+            texts.append(self._node_template_display())
         budget = max_chars - self._frame_chars()
         display = self._bounded_texts(texts, budget)
         rendered = "\n".join(self._review_lines(display, omitted=frozenset(), listed=len(self.queries)))
@@ -2720,8 +2789,9 @@ def _appended_lines_chars(lines: list[str]) -> int:
     source_param="options",
     suppresses=("R1", "R5"),
     invariant=(
-        "returns None unless a string prompt_template sits beside a queries value with at least one "
-        "well-formed entry; otherwise constructs an owned MultiQueryPromptSurface from string values only, "
+        "returns None unless a string or inline_content file-marker prompt_template (or none) sits beside a "
+        "queries value with at least one well-formed entry; otherwise constructs an owned "
+        "MultiQueryPromptSurface from string values and the file marker's identity only, "
         "reading a non-string system_prompt as absent, an absent query template as a fallback to the "
         "node-level template, and a present non-string query template as an InvalidQueryTemplate that "
         "is neither a template nor a fallback; raises only the TypeError, ValueError or KeyError that "
@@ -2742,6 +2812,11 @@ def multi_query_prompt_surface_from_options(options: Mapping[str, Any]) -> Multi
     (``state._validate_multi_query_template_variable_bindings``), which skips
     such a query whole without counting it as a node-level-template user, and
     the advisor evidence walk (``service._advisor_query_option_values``).
+    A node-level ``prompt_template`` that is an ``inline_content`` file marker
+    is not text: the surface carries ``node_prompt_template=None`` and, when
+    any query falls back to it, its marker identity as
+    :class:`InheritedPromptFile`, so the review anchor covers the file and
+    every inline query template together.
     Malformed ``prompt_template_parts`` propagate the TypeError, ValueError
     or KeyError of :func:`prompt_structure_hash_from_options`, exactly as on a
     single-prompt node; every other shape never raises.
@@ -2753,14 +2828,15 @@ def multi_query_prompt_surface_from_options(options: Mapping[str, Any]) -> Multi
     entries = _well_formed_query_entries(raw_queries)
     if not entries:
         return None
+    node_prompt_file: InheritedPromptFile | None = None
     if prompt_template is not None and not isinstance(prompt_template, str):
         marker = is_widened_blob_ref(deep_thaw(prompt_template))
-        if (
-            marker is None
-            or marker.mode != "inline_content"
-            or any("template" not in entry or entry["template"] is None for _, entry in entries)
-        ):
+        if marker is None or marker.mode != "inline_content" or type(marker.sha256) is not str:
             return None
+        if any("template" not in entry or entry["template"] is None for _, entry in entries):
+            # Some query falls back to the node-level file: the surface carries
+            # its identity so the anchor still covers every other query's text.
+            node_prompt_file = InheritedPromptFile(blob_id=str(marker.blob_id), sha256=marker.sha256, encoding=marker.encoding)
         prompt_template = None
     raw_system_prompt = options["system_prompt"] if "system_prompt" in options else None
     queries: list[tuple[str, str | InvalidQueryTemplate | None]] = []
@@ -2775,6 +2851,7 @@ def multi_query_prompt_surface_from_options(options: Mapping[str, Any]) -> Multi
         node_prompt_structure_hash=prompt_structure_hash_from_options(options),
         system_prompt=raw_system_prompt if isinstance(raw_system_prompt, str) else None,
         queries=tuple(queries),
+        node_prompt_file=node_prompt_file,
     )
 
 
@@ -2791,21 +2868,52 @@ def prompt_review_anchor_hash_from_options(options: Mapping[str, Any]) -> str | 
     * unstructured single-prompt node → ``None``; callers use
       ``stable_hash(prompt_template)``.
     """
+    base_anchor: str | None
     surface = multi_query_prompt_surface_from_options(options)
     if surface is not None:
-        return surface.anchor_hash()
-    structure = prompt_structure_hash_from_options(options)
-    system = options["system_prompt"] if "system_prompt" in options else None
-    if system is None:
-        return structure
-    prompt = options["prompt_template"] if "prompt_template" in options else None
-    return stable_hash(
-        {
-            "domain": "elspeth.single-prompt-review.v1",
-            "node_prompt": structure if structure is not None else stable_hash(prompt),
-            "system_prompt": system,
-        }
-    )
+        base_anchor = surface.anchor_hash()
+    else:
+        structure = prompt_structure_hash_from_options(options)
+        system = options["system_prompt"] if "system_prompt" in options else None
+        if system is None:
+            base_anchor = structure
+        else:
+            prompt = options["prompt_template"] if "prompt_template" in options else None
+            base_anchor = stable_hash(
+                {
+                    "domain": "elspeth.single-prompt-review.v1",
+                    "node_prompt": structure if structure is not None else stable_hash(prompt),
+                    "system_prompt": system,
+                }
+            )
+
+    # The existing inline domains stay intact. File-backed requirements add
+    # the marker identity so a re-point to equal bytes cannot reuse a card.
+    file_bindings: list[dict[str, str]] = []
+
+    def add_binding(path: str, value: object) -> None:
+        marker = is_widened_blob_ref(deep_thaw(value))
+        if marker is not None and marker.mode == "inline_content":
+            if type(marker.sha256) is not str:
+                raise ValueError("file-backed prompt marker requires a SHA-256 hash")
+            file_bindings.append({"field_path": path, "blob_id": str(marker.blob_id), "sha256": marker.sha256, "encoding": marker.encoding})
+
+    for key in ("prompt_template", "system_prompt"):
+        if key in options:
+            add_binding(key, options[key])
+    queries = options["queries"] if "queries" in options else None
+    if isinstance(queries, Mapping):
+        for name, entry in queries.items():
+            if isinstance(entry, Mapping) and "template" in entry:
+                add_binding(f"queries.{name}.template", entry["template"])
+    elif isinstance(queries, (list, tuple)):
+        for index, entry in enumerate(queries):
+            if isinstance(entry, Mapping) and "template" in entry:
+                add_binding(f"queries.{index}.template", entry["template"])
+    if not file_bindings:
+        return base_anchor
+    file_bindings.sort(key=lambda binding: binding["field_path"])
+    return stable_hash({"domain": "elspeth.file-prompt-requirement.v1", "base_anchor": base_anchor, "bindings": file_bindings})
 
 
 @trust_boundary(
@@ -2818,11 +2926,10 @@ def prompt_review_anchor_hash_from_options(options: Mapping[str, Any]) -> str | 
     test_fingerprint="8fa66b482b95e4f28e3a87d6a002972ad57a000eadbd54b167f5d793a436cbbf",
 )
 def approved_prompt_artifact_hash_from_options(options: Mapping[str, Any]) -> str | None:
-    """Hash resolved text, or return no approval link for unresolved blob sources.
+    """Hash effective text after resolution, or return None for deferred files.
 
-    Uploaded content is verified through blob identity, hash and resolution
-    records. It does not acquire full-text approval merely by substituting
-    after a review. Per-site review evidence remains independently enforced.
+    File-backed review evidence binds the blob identity and bytes separately;
+    this existing hash domain continues to describe the effective prompt text.
     """
     prompt = options["prompt_template"] if "prompt_template" in options else None
     system = options["system_prompt"] if "system_prompt" in options else None
@@ -2882,8 +2989,8 @@ def prompt_review_draft_from_options(options: Mapping[str, Any]) -> str | None:
     """The text the operator reviews for an LLM node's prompt-template review.
 
     Multi-query nodes review the rendered prompt surface; every other shape
-    keeps reviewing ``prompt_template`` itself. ``None`` when the node carries
-    no string ``prompt_template`` (nothing to review yet).
+    keeps reviewing ``prompt_template`` itself. A deferred file marker gets a
+    bounded label; the full text lives in the event-bound snapshot read.
 
     Both shapes stay within ``PROMPT_SURFACE_REVIEW_MAX_CHARS`` so the draft
     always fits the bounded ``llm_draft`` wire field. A single-prompt template
@@ -2892,6 +2999,29 @@ def prompt_review_draft_from_options(options: Mapping[str, Any]) -> str | None:
     bounded: the review anchor and the node-level
     ``resolved_prompt_template_hash`` cover the complete template.
     """
+    # A file marker is a deferred text source.  Its bounded event draft is a
+    # label only; the complete, custody-read text is supplied by the prompt
+    # review snapshot endpoint before the card can be approved.
+    file_labels: list[str] = []
+    for key in ("prompt_template", "system_prompt"):
+        marker = is_widened_blob_ref(deep_thaw(options[key])) if key in options else None
+        if marker is not None and marker.mode == "inline_content":
+            file_labels.append(f"{key}: file {marker.blob_id} (SHA-256 {marker.sha256})")
+    queries = options["queries"] if "queries" in options else None
+    if isinstance(queries, Mapping):
+        query_entries = [(str(name), entry) for name, entry in queries.items()]
+    elif isinstance(queries, (list, tuple)):
+        query_entries = [(str(index), entry) for index, entry in enumerate(queries)]
+    else:
+        query_entries = []
+    for name, entry in query_entries:
+        if not isinstance(entry, Mapping) or "template" not in entry:
+            continue
+        marker = is_widened_blob_ref(deep_thaw(entry["template"]))
+        if marker is not None and marker.mode == "inline_content":
+            file_labels.append(f"queries.{name}.template: file {marker.blob_id} (SHA-256 {marker.sha256})")
+    if file_labels:
+        return "File-backed prompt pending full-content review:\n" + "\n".join(sorted(file_labels))
     surface = multi_query_prompt_surface_from_options(options)
     if surface is not None:
         return surface.render_for_review()

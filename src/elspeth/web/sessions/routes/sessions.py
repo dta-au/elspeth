@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.blobs import BLOB_REF_PATH_PREFIX, StorageAccountingUnavailableError
+from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.web.blobs.protocol import (
     BlobContentMissingError,
     BlobError,
@@ -22,6 +23,7 @@ from elspeth.web.blobs.protocol import (
 )
 from elspeth.web.composer.implicit_decisions import merge_implicit_decisions_meta
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.composer.tools._common import _options_with_default_prompt_template_review
 from elspeth.web.coordination.composer_progress_authority import ComposerProgressIdentityInactive
 from elspeth.web.coordination.contracts import (
     FenceLossReason,
@@ -31,10 +33,12 @@ from elspeth.web.coordination.contracts import (
 )
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material
+from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
 from elspeth.web.paths import locate_in_session_folder, session_folder_path
 from elspeth.web.session_operation_handlers import record_session_operation_fence_loss
 from elspeth.web.sessions.fork_custody import _free_text_embeds_parent_blob, _value_references_parent_blob
 from elspeth.web.sessions.operation_receipts import operation_receipt_response_hash
+from elspeth.web.sessions.prompt_file_review import prompt_file_binding_paths
 from elspeth.web.sessions.protocol import (
     OperationReceiptFailureCode,
     OperationReceiptFence,
@@ -230,6 +234,54 @@ def _rewrite_inline_content_blob_refs(
         return rewritten
 
     return False
+
+
+def _reopen_rebased_prompt_file_reviews(nodes: Any) -> None:
+    """Return each rebased file-prompt node's prompt review to PENDING, in place.
+
+    A prompt-file review is anchored on the file marker's blob id, and the fork
+    has just rebased every such marker onto the child's copy. A review copied
+    RESOLVED would therefore drift in the child and refuse every run with no
+    card to approve, while the parent's approval rows are deliberately not
+    copied (they name the parent's events and blobs). The child gets a fresh
+    pending requirement drafted from its own rebased options, with no event, so
+    the ordinary surfacer mints the child's own card and snapshot.
+
+    Only nodes with a file-backed prompt are reopened: an all-inline prompt
+    review names no blob, so it carries over unchanged.
+    """
+    if nodes is None:
+        return
+    if type(nodes) is not list:
+        raise AuditIntegrityError("Tier 1 audit anomaly: forked composition nodes must be an exact list")
+    for index, node in enumerate(nodes):
+        if type(node) is not dict:
+            raise AuditIntegrityError(f"Tier 1 audit anomaly: nodes[{index}] must be an exact dict")
+        options = node["options"]
+        if node["plugin"] != "llm" or options is None or not prompt_file_binding_paths(options):
+            continue
+        requirements = options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in options else None
+        cleared = dict(options)
+        if type(requirements) is list:
+            # Drop the copied prompt review outright so the stager appends a
+            # pending one; its id is kept through ``existing_options``.
+            cleared[INTERPRETATION_REQUIREMENTS_KEY] = [
+                requirement
+                for requirement in requirements
+                if not (
+                    type(requirement) is dict
+                    and "kind" in requirement
+                    and requirement["kind"] == InterpretationKind.LLM_PROMPT_TEMPLATE.value
+                )
+            ]
+        node["options"] = dict(
+            _options_with_default_prompt_template_review(
+                node_id=node["id"],
+                plugin=node["plugin"],
+                options=cleared,
+                existing_options=options,
+            )
+        )
 
 
 def _rewrite_source_blob_options(
@@ -506,6 +558,8 @@ def _rewrite_fork_state_blob_custody(
             )
             or rewritten
         )
+    # Runs after the rebase so each reopened draft names the child's blobs.
+    _reopen_rebased_prompt_file_reviews(nodes)
     # ``implicit_decisions`` is not authored state: it is a pure PROJECTION of the
     # composition state, regenerated unconditionally on every save via
     # ``merge_implicit_decisions_meta``. A fork mints a NEW state row, so carrying

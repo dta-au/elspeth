@@ -286,12 +286,18 @@ def test_only_a_user_created_non_llm_authored_blob_is_an_upload(created_by: Blob
 
 
 def test_llm_prompt_surface_rule_stays_modality_only() -> None:
-    """Unchanged in this change: an assistant-created VERBATIM blob may still back an llm prompt."""
+    """The llm prompt rule reads modality only, never the creator.
+
+    A scalar prompt position is never refused here: every file there goes to the
+    mandatory full-content review. A model position still refuses LLM-authored files.
+    """
     for modality in CreationModality:
-        refused = guard.is_llm_authored_prompt_surface_binding(
+        scalar = guard.is_llm_authored_prompt_surface_binding(
             "node:c.options.prompt_template", node_plugins={"c": "llm"}, creation_modality=modality
         )
-        assert refused is modality.requires_llm_provenance()
+        model = guard.is_llm_authored_prompt_surface_binding("node:c.options.model", node_plugins={"c": "llm"}, creation_modality=modality)
+        assert scalar is False
+        assert model is modality.requires_llm_provenance()
 
 
 def test_refusal_names_the_entry_and_the_path_to_attach_at() -> None:

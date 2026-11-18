@@ -302,3 +302,27 @@ export interface InterpretationOptOutResponse {
 export interface OptOutSummaryResponse {
   events: InterpretationEvent[];
 }
+
+/** Immutable full-text evidence for a file-backed prompt card. */
+export interface PromptReviewSnapshotResponse {
+  version: 1;
+  session_id: string;
+  node_id: string;
+  event_id: string;
+  authored_surface: Record<string, unknown>;
+  bindings: Array<{
+    field_path: string;
+    blob_id: string;
+    content_sha256: string;
+    encoding: "utf-8";
+    byte_length: number;
+    filename: string;
+    creation_modality: string;
+    created_by: string;
+    provenance: Record<string, string | null>;
+    text: string;
+  }>;
+  anchor: string;
+  effective_artifact_hash: string | null;
+  is_live_review: boolean;
+}

@@ -4,7 +4,9 @@ Uses SQLAlchemy Core (not ORM) for explicit control over queries
 and compatibility with multiple database backends.
 """
 
+from collections.abc import Callable
 from enum import StrEnum
+from typing import cast
 
 from sqlalchemy import (
     DDL,
@@ -479,7 +481,10 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        item that the new resume refuses as corruption, so only a bump — not
 #        a fold — keeps such a store from opening. Populated epoch-47 stores
 #        require delete/recreate.
-SQLITE_SCHEMA_EPOCH = 50
+#   51 → run_prompt_inputs records the exact approved prompt-file identities
+#        and bytes admitted for a Web run in the runs-row transaction, with
+#        a run foreign key, before its first provider call.
+SQLITE_SCHEMA_EPOCH = 51
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -600,6 +605,56 @@ runs_table = Table(
     CheckConstraint(_LowerHex64Check("openrouter_catalog_sha256"), name="ck_runs_openrouter_catalog_sha256_hex"),
 )
 Index("uq_runs_export_witness", runs_table.c.run_id, runs_table.c.status, runs_table.c.completed_at, unique=True)
+
+# Written with the run row by begin_run in the same transaction.
+run_prompt_inputs_table = Table(
+    "run_prompt_inputs",
+    metadata,
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
+    # Unbounded, like the session store's prompt_file_approvals.field_path:
+    # a mapping-form multi-query name is uncapped, so queries.<name>.template
+    # has no fixed width and a VARCHAR(n) would refuse a valid run at start.
+    Column("field_path", String, nullable=False),
+    Column("blob_id", String(36), nullable=False),
+    Column("content_sha256", String(64), nullable=False),
+    Column("review_anchor", String(64), nullable=False),
+    Column("effective_artifact_hash", String(64), nullable=True),
+    Column("admitted_at", DateTime(timezone=True), nullable=False),
+    PrimaryKeyConstraint("run_id", "node_id", "field_path", name="pk_run_prompt_inputs"),
+    CheckConstraint(_LowerHex64Check("content_sha256"), name="ck_run_prompt_inputs_content_sha256"),
+    CheckConstraint(_LowerHex64Check("review_anchor"), name="ck_run_prompt_inputs_review_anchor"),
+    CheckConstraint(_OptionalLowerHex64Check("effective_artifact_hash"), name="ck_run_prompt_inputs_artifact_hash"),
+)
+_prompt_input_ddl = cast(Callable[[str], DDL], DDL)
+event.listen(
+    run_prompt_inputs_table,
+    "after_create",
+    _prompt_input_ddl(
+        "CREATE TRIGGER IF NOT EXISTS trg_run_prompt_inputs_no_update "
+        "BEFORE UPDATE ON run_prompt_inputs "
+        "BEGIN "
+        "  SELECT RAISE(ABORT, 'run_prompt_inputs is append-only; UPDATE is forbidden'); "
+        "END;"
+    ).execute_if(dialect="sqlite"),
+)
+# The single source of the PostgreSQL append-only guard: the listener below
+# emits it, and the MCP audit profile admits the function only when its stored
+# body equals this one (mcp/postgres_profile.py::_trigger_body), so the
+# canonical "RETURNS trigger AS $$ ... $$ LANGUAGE plpgsql" form is required.
+_POSTGRES_RUN_PROMPT_INPUT_TRIGGER_DDL: tuple[str, ...] = (
+    "CREATE FUNCTION elspeth_run_prompt_inputs_no_update() RETURNS trigger AS $$ "
+    "BEGIN RAISE EXCEPTION 'run_prompt_inputs is append-only; UPDATE is forbidden' USING ERRCODE = '23000'; "
+    "END; $$ LANGUAGE plpgsql",
+    "CREATE TRIGGER trg_run_prompt_inputs_no_update BEFORE UPDATE ON run_prompt_inputs "
+    "FOR EACH ROW EXECUTE FUNCTION elspeth_run_prompt_inputs_no_update()",
+)
+for _prompt_input_pg_ddl in _POSTGRES_RUN_PROMPT_INPUT_TRIGGER_DDL:
+    event.listen(
+        run_prompt_inputs_table,
+        "after_create",
+        _prompt_input_ddl(_prompt_input_pg_ddl).execute_if(dialect="postgresql"),
+    )
 
 run_start_admissions_table = Table(
     "run_start_admissions",
@@ -2275,6 +2330,10 @@ for _trigger_ddl in _POSTGRES_AUDIT_EXPORT_TRIGGER_DDL:
         "after_create",
         DDL(_trigger_ddl).execute_if(dialect="postgresql"),  # type: ignore[no-untyped-call]
     )
+
+# Every PostgreSQL plpgsql trigger DDL the Landscape emits. The MCP audit
+# profile derives each admitted trigger function's canonical body from here.
+POSTGRES_LANDSCAPE_TRIGGER_DDL: tuple[str, ...] = _POSTGRES_RUN_PROMPT_INPUT_TRIGGER_DDL + _POSTGRES_AUDIT_EXPORT_TRIGGER_DDL
 
 # === Operations (Source/Sink I/O) ===
 # Operations are the source/sink equivalent of node_states - they provide

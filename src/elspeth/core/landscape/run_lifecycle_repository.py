@@ -40,6 +40,7 @@ from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariant
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence, decode_admission_decision
 from elspeth.contracts.preflight import PreflightResult
+from elspeth.contracts.run_prompt_input import RunPromptInputEvidence
 from elspeth.contracts.run_start import RunStartPermitBinding
 from elspeth.contracts.runtime_val_manifest import cached_frozen_runtime_val_manifest_json
 from elspeth.contracts.scheduler import TokenWorkStatus
@@ -72,6 +73,7 @@ from elspeth.core.landscape.schema import (
     operations_table,
     preflight_results_table,
     run_attributions_table,
+    run_prompt_inputs_table,
     run_sources_table,
     run_start_admissions_table,
     run_web_plugin_policy_table,
@@ -213,6 +215,24 @@ def _already_terminal_error(run_id: str, existing_status: str) -> AuditIntegrity
     )
 
 
+def _stored_run_prompt_inputs_on(conn: Connection, run_id: str) -> frozenset[RunPromptInputEvidence]:
+    rows = conn.execute(select(run_prompt_inputs_table).where(run_prompt_inputs_table.c.run_id == run_id)).all()
+    try:
+        return frozenset(
+            RunPromptInputEvidence(
+                node_id=item.node_id,
+                field_path=item.field_path,
+                blob_id=item.blob_id,
+                content_sha256=item.content_sha256,
+                review_anchor=item.review_anchor,
+                effective_artifact_hash=item.effective_artifact_hash,
+            )
+            for item in rows
+        )
+    except ValueError as exc:
+        raise AuditIntegrityError("Stored run prompt input evidence is corrupt") from exc
+
+
 class RunLifecycleRepository:
     """Run lifecycle operations for the Landscape audit trail.
 
@@ -280,6 +300,7 @@ class RunLifecycleRepository:
         openrouter_catalog_source: str,
         leader_worker_id: str | None = None,
         web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
+        run_prompt_inputs: tuple[RunPromptInputEvidence, ...] = (),
         run_start_permit: RunStartPermitBinding | None = None,
         run_mode: RunMode = RunMode.LIVE,
         replay_from_run_id: str | None = None,
@@ -345,6 +366,11 @@ class RunLifecycleRepository:
         )
         if web_plugin_policy_evidence is not None and not isinstance(web_plugin_policy_evidence, WebPluginPolicyEvidence):
             raise AuditIntegrityError("web_plugin_policy_evidence must be a WebPluginPolicyEvidence value")
+        if type(run_prompt_inputs) is not tuple or any(type(item) is not RunPromptInputEvidence for item in run_prompt_inputs):
+            raise AuditIntegrityError("run_prompt_inputs must be a tuple of RunPromptInputEvidence values")
+        keys = [(item.node_id, item.field_path) for item in run_prompt_inputs]
+        if len(keys) != len(set(keys)):
+            raise AuditIntegrityError("run_prompt_inputs contains duplicate prompt fields")
 
         run_id = run_id or generate_id()
         if replay_from_run_id == run_id:
@@ -403,6 +429,7 @@ class RunLifecycleRepository:
                         source_schema_json=source_schema_json,
                         runtime_val_manifest_json=runtime_val_manifest_json,
                         web_plugin_policy_evidence=web_plugin_policy_evidence,
+                        run_prompt_inputs=run_prompt_inputs,
                     )
                     if existing is not None:
                         return existing
@@ -451,6 +478,19 @@ class RunLifecycleRepository:
                         run_id=run.run_id,
                         evidence=web_plugin_policy_evidence,
                     )
+                for evidence in run_prompt_inputs:
+                    conn.execute(
+                        run_prompt_inputs_table.insert().values(
+                            run_id=run.run_id,
+                            node_id=evidence.node_id,
+                            field_path=evidence.field_path,
+                            blob_id=evidence.blob_id,
+                            content_sha256=evidence.content_sha256,
+                            review_anchor=evidence.review_anchor,
+                            effective_artifact_hash=evidence.effective_artifact_hash,
+                            admitted_at=now(),
+                        )
+                    )
                 # Composes into THIS transaction (connection-accepting form):
                 # the runs row above satisfies the run_coordination FK. The
                 # seat's deadline is Landscape database time (ADR-047); the
@@ -481,6 +521,7 @@ class RunLifecycleRepository:
                         source_schema_json=source_schema_json,
                         runtime_val_manifest_json=runtime_val_manifest_json,
                         web_plugin_policy_evidence=web_plugin_policy_evidence,
+                        run_prompt_inputs=run_prompt_inputs,
                     )
                     if existing is not None:
                         return existing
@@ -505,7 +546,14 @@ class RunLifecycleRepository:
         source_schema_json: str | None,
         runtime_val_manifest_json: str | None,
         web_plugin_policy_evidence: WebPluginPolicyEvidence | None,
+        run_prompt_inputs: tuple[RunPromptInputEvidence, ...] | None,
     ) -> Run | None:
+        """Return the existing permit-bound run, or None when no header exists.
+
+        ``run_prompt_inputs=None`` is reserved for cancellation, which records
+        no prompt evidence of its own and preserves whatever the header's
+        transaction stored; every start or retry passes its exact evidence.
+        """
         row = conn.execute(select(runs_table).where(runs_table.c.run_id == binding.run_id)).one_or_none()
         if row is None:
             return None
@@ -566,7 +614,21 @@ class RunLifecycleRepository:
                 evidence.admission_decision,
             ):
                 raise AuditIntegrityError("Permit retry changed web plugin policy evidence")
+        stored = _stored_run_prompt_inputs_on(conn, binding.run_id)
+        if run_prompt_inputs is not None and stored != frozenset(run_prompt_inputs):
+            raise AuditIntegrityError("Permit retry changed run prompt input evidence")
         return self._run_loader.load(row)
+
+    def assert_resumed_run_prompt_inputs(self, run_id: str, run_prompt_inputs: tuple[RunPromptInputEvidence, ...]) -> None:
+        """Refuse a resume whose re-admitted prompt files differ from the run's start evidence.
+
+        The rows were written with the run header, before any provider call;
+        a resume may continue only on exactly those approved bytes.
+        """
+        with self._db.engine.connect() as conn:
+            stored = _stored_run_prompt_inputs_on(conn, run_id)
+        if stored != frozenset(run_prompt_inputs):
+            raise AuditIntegrityError("Resumed run prompt input differs from the run's start evidence")
 
     def materialize_cancelled_permit(
         self,
@@ -608,6 +670,9 @@ class RunLifecycleRepository:
                     source_schema_json=header.source_schema_json,
                     runtime_val_manifest_json=header.runtime_val_manifest_json,
                     web_plugin_policy_evidence=web_plugin_policy_evidence,
+                    # Cancellation writes no prompt evidence and keeps any the
+                    # prepared header committed; there is nothing to compare.
+                    run_prompt_inputs=None,
                 )
             )
         if run is None:

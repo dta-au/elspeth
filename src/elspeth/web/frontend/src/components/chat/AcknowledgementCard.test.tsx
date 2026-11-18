@@ -35,6 +35,7 @@ vi.mock("@/api/client", () => ({
   resolveInterpretation: vi.fn(),
   optOutOfInterpretations: vi.fn(),
   getInterpretationOptOutSummary: vi.fn(),
+  getPromptReviewSnapshot: vi.fn(),
 }));
 
 import * as api from "@/api/client";
@@ -140,6 +141,7 @@ beforeEach(() => {
   vi.mocked(api.resolveInterpretation).mockReset();
   vi.mocked(api.optOutOfInterpretations).mockReset();
   vi.mocked(api.listInterpretationEvents).mockReset();
+  vi.mocked(api.getPromptReviewSnapshot).mockReset();
 });
 
 // ── Copy & title ─────────────────────────────────────────────────────────────
@@ -638,6 +640,36 @@ describe("AcknowledgementCard — error mapping", () => {
 // Approve button that stays disabled until the prompt has been viewed.
 
 describe("AcknowledgementCard — prompt-template View/Approve controls", () => {
+  it("loads and shows the full escaped file text before allowing approval", async () => {
+    const user = userEvent.setup();
+    const event = makeEvent({ kind: "llm_prompt_template", llm_draft: "File-backed prompt pending review" });
+    const marker = { blob_ref: "blob-1", mode: "inline_content", sha256: "a".repeat(64) };
+    const text = "  <script> & literal\n\nsecond line  ";
+    vi.mocked(api.getPromptReviewSnapshot).mockResolvedValue({
+      version: 1, session_id: "sess-1", node_id: "node-1", event_id: event.id,
+      authored_surface: { prompt_template: marker },
+      bindings: [{ field_path: "prompt_template", blob_id: "blob-1", content_sha256: "a".repeat(64),
+        encoding: "utf-8", byte_length: text.length, filename: "prompt.txt", creation_modality: "llm_generated",
+        created_by: "assistant", provenance: {}, text }],
+      anchor: "b".repeat(64), effective_artifact_hash: "c".repeat(64), is_live_review: true,
+    });
+    renderCard(event, { compositionState: {
+      ...makeCompositionState(),
+      nodes: [{ id: "node-1", node_type: "transform", plugin: "llm", input: "rows", on_success: null,
+        on_error: null, options: { prompt_template: marker } }],
+    } });
+    const approve = screen.getByRole("button", { name: /approve the llm prompt template/i });
+    expect(approve).toHaveAttribute("aria-disabled", "true");
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    const region = screen.getByRole("region", { name: /prompt template review/i });
+    await waitFor(() => expect(region.querySelector("pre.ack-card-prompt-pre")?.textContent)
+      .toBe(`File: prompt.txt (prompt_template)\n\n${text}`));
+    expect(region).toHaveTextContent("File: prompt.txt (prompt_template)");
+    expect(region.innerHTML).not.toContain("<script>");
+    expect(region).not.toHaveTextContent("not text");
+    expect(approve).not.toHaveAttribute("aria-disabled");
+    expect(api.getPromptReviewSnapshot).toHaveBeenCalledWith("sess-1", event.id, expect.any(AbortSignal));
+  });
   it("unlocks approval after viewing all query templates when no shared template exists", async () => {
     const user = userEvent.setup();
     const event = makeEvent({ kind: "llm_prompt_template", llm_draft: "Shortened preview" });

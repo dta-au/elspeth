@@ -37,7 +37,13 @@ _PIPELINE_USER_ROUTES: dict[str, frozenset[str]] = {
     "src/elspeth/web/sessions/routes/runs.py": frozenset({"list_session_runs", "get_run_audit_story"}),
     "src/elspeth/web/sessions/routes/messages.py": frozenset({"send_message", "get_messages"}),
     "src/elspeth/web/sessions/routes/interpretation.py": frozenset(
-        {"resolve_interpretation", "list_interpretations", "opt_out_of_interpretations", "opt_out_summary"}
+        {
+            "resolve_interpretation",
+            "list_interpretations",
+            "opt_out_of_interpretations",
+            "opt_out_summary",
+            "get_interpretation_prompt_snapshot",
+        }
     ),
     "src/elspeth/web/sessions/routes/composer/compose.py": frozenset({"recompose"}),
     "src/elspeth/web/sessions/routes/composer/operations.py": frozenset(
@@ -91,6 +97,7 @@ _PIPELINE_USER_ROUTES: dict[str, frozenset[str]] = {
             "delete_blob",
         }
     ),
+    "src/elspeth/web/blobs/prompt_text_routes.py": frozenset({"save_prompt_text"}),
     "src/elspeth/web/secrets/routes.py": frozenset({"list_secrets", "create_secret", "delete_secret", "validate_secret"}),
     "src/elspeth/web/preferences/routes.py": frozenset({"get_preferences", "update_preferences"}),
     "src/elspeth/web/shareable_reviews/routes.py": frozenset(

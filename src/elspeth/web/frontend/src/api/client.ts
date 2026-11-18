@@ -61,6 +61,7 @@ import type {
   InterpretationResolveResponse,
   ListInterpretationEventsResponse,
   OptOutSummaryResponse,
+  PromptReviewSnapshotResponse,
 } from "@/types/interpretation";
 import type { RecoveryTranscriptRow } from "@/types/recovery";
 import type {
@@ -1645,6 +1646,23 @@ export async function getBlobMetadata(
   return parseResponse<BlobMetadata>(response);
 }
 
+/** Saving bound prompt text is also the owner's approval of the stored bytes. */
+export async function savePromptFile(
+  sessionId: string,
+  blobId: string,
+  content: string,
+  expectedSha256: string,
+  nodeId: string,
+  fieldPath: string,
+): Promise<{ changed: boolean; content_sha256: string }> {
+  const response = await authFetch(`/api/sessions/${sessionId}/blobs/${blobId}/prompt-text`, {
+    method: "PUT",
+    headers: authHeaders("application/json"),
+    body: JSON.stringify({ content, expected_sha256: expectedSha256, node_id: nodeId, field_path: fieldPath }),
+  });
+  return parseResponse<{ changed: boolean; content_sha256: string }>(response);
+}
+
 /** Download blob content as a Blob (browser Blob, not ELSPETH Blob). */
 export async function downloadBlobContent(
   sessionId: string,
@@ -1678,6 +1696,20 @@ export async function previewBlobContent(
     await parseResponse<never>(response);
   }
   return response.text();
+}
+
+/** Read the text and its server-observed hash from one verified blob response. */
+export async function readPromptFileText(
+  sessionId: string,
+  blobId: string,
+): Promise<{ text: string; sha256: string }> {
+  const response = await authFetch(`/api/sessions/${sessionId}/blobs/${blobId}/content`, {
+    headers: authHeaders(),
+  });
+  if (!response.ok) await parseResponse<never>(response);
+  const sha256 = response.headers.get("X-Content-SHA256");
+  if (!sha256 || !/^[0-9a-f]{64}$/.test(sha256)) throw new Error("Prompt file hash is unavailable. Reload and retry.");
+  return { text: await response.text(), sha256 };
 }
 
 export interface BlobContentPreview {
@@ -1816,6 +1848,18 @@ export async function listInterpretationEvents(
   );
   const body = await parseResponse<ListInterpretationEventsResponse>(response);
   return body.events;
+}
+
+export async function getPromptReviewSnapshot(
+  sessionId: string,
+  eventId: string,
+  signal?: AbortSignal,
+): Promise<PromptReviewSnapshotResponse> {
+  const response = await authFetch(
+    `/api/sessions/${sessionId}/interpretations/${eventId}/prompt`,
+    { method: "GET", headers: authHeaders(), signal },
+  );
+  return parseResponse<PromptReviewSnapshotResponse>(response);
 }
 
 /**

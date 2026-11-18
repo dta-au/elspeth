@@ -21,6 +21,7 @@ import yaml
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import insert
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.blobs import BlobServiceProtocol
@@ -39,11 +40,13 @@ from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.plugin_policy.models import PluginId
 from elspeth.web.provider_config_policy import AWS_S3_ENDPOINT_URL_POLICY_ERROR
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.models import blobs_table
 from elspeth.web.sessions.protocol import CompositionStateData, CompositionStateRecord
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
+from tests.helpers.prompt_review import accept_body
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.composer import test_file_inject_upload_only_tool_parity as _file_inject_tool_parity
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
@@ -363,7 +366,7 @@ sinks:
         for event in original_events:
             resolved = client.post(
                 f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
-                json={"choice": "accepted_as_drafted"},
+                json=accept_body(client, session.id, event),
             )
             assert resolved.status_code == 200, resolved.text
         assert await service.list_interpretation_events(session.id, status="pending") == []
@@ -386,7 +389,7 @@ sinks:
         for event in fresh_events:
             resolved = client.post(
                 f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
-                json={"choice": "accepted_as_drafted"},
+                json=accept_body(client, session.id, event),
             )
             assert resolved.status_code == 200, resolved.text
         head = await service.get_current_state(session.id)
@@ -416,7 +419,7 @@ transforms:
         for event in await service.list_interpretation_events(session.id, status="pending"):
             resolved = client.post(
                 f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
-                json={"choice": "accepted_as_drafted"},
+                json=accept_body(client, session.id, event),
             )
             assert resolved.status_code == 200, resolved.text
         operation_id = str(uuid.uuid4())
@@ -508,7 +511,7 @@ transforms:
         for event in await service.list_interpretation_events(session.id, status="pending"):
             resolved = client.post(
                 f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
-                json={"choice": "accepted_as_drafted"},
+                json=accept_body(client, session.id, event),
             )
             assert resolved.status_code == 200, resolved.text
         # Import a DIFFERENT pipeline for the same node, and leave ITS cards
@@ -775,7 +778,7 @@ transforms:
         for event in originals:
             resolved = client.post(
                 f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
-                json={"choice": "accepted_as_drafted"},
+                json=accept_body(client, session.id, event),
             )
             assert resolved.status_code == 200, resolved.text
         body = {"operation_id": str(uuid.uuid4()), "state_id": imported.json()["id"]}
@@ -867,7 +870,7 @@ transforms:
             for event in events:
                 response = client.post(
                     f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
-                    json={"choice": "accepted_as_drafted"},
+                    json=accept_body(client, session.id, event),
                 )
                 assert response.status_code == 200, response.text
         elif evidence_status == "superseded":
@@ -954,7 +957,7 @@ transforms:
         for event in events:
             response = client.post(
                 f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
-                json={"choice": "accepted_as_drafted"},
+                json=accept_body(client, session.id, event),
             )
             assert response.status_code == 200, response.text
 
@@ -2261,7 +2264,7 @@ sinks:
         for event in events:
             resolve_resp = client.post(
                 f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
-                json={"choice": "accepted_as_drafted"},
+                json=accept_body(client, session.id, event),
             )
             assert resolve_resp.status_code == 200, resolve_resp.text
 
@@ -2327,7 +2330,7 @@ sinks:
         for event in events:
             resolve_resp = client.post(
                 f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
-                json={"choice": "accepted_as_drafted"},
+                json=accept_body(client, session.id, event),
             )
             assert resolve_resp.status_code == 200, resolve_resp.text
 
@@ -3987,6 +3990,34 @@ def _blob_service_for(*blobs: Any) -> SimpleNamespace:
     return SimpleNamespace(get_blob=AsyncMock(spec=BlobServiceProtocol.get_blob, side_effect=_get_blob))
 
 
+def _install_import_prompt_blob_read(service: Any, blob: Any, content: bytes) -> None:
+    """Give the import surfacer a real same-session metadata row and fenced byte read."""
+    with service._engine.begin() as conn:
+        conn.execute(
+            insert(blobs_table).values(
+                id=str(blob.id),
+                session_id=str(blob.session_id),
+                filename=blob.filename,
+                mime_type=blob.mime_type,
+                size_bytes=blob.size_bytes,
+                content_hash=blob.content_hash,
+                storage_path=blob.storage_path,
+                created_at=blob.created_at,
+                created_by=blob.created_by,
+                source_description=blob.source_description,
+                status=blob.status,
+                creation_modality=blob.creation_modality.value,
+            )
+        )
+
+    def read_blob(context: SessionOperationContext, blob_id: uuid.UUID) -> tuple[Any, bytes]:
+        assert context.fence.session_id == str(blob.session_id)
+        assert blob_id == blob.id
+        return blob, content
+
+    service._inline_blob_read = read_blob
+
+
 async def _rebind_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
     return ValidationResult(is_valid=True, checks=[], errors=[])
 
@@ -4025,12 +4056,16 @@ class TestImportRebindsSharedFiles:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         session = await service.create_session("alice", "Rebind", "local")
+        content = b"Review this row.\n"
+        digest = hashlib.sha256(content).hexdigest()
         blob = replace(
-            _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A),
+            _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=digest),
             mime_type=mime_type,
         )
         app.state.blob_service = _blob_service_for(blob)
-        marker_yaml = _unstructured_llm_marker_yaml(blob.id)
+        if mime_type == "text/plain":
+            _install_import_prompt_blob_read(service, blob, content)
+        marker_yaml = _unstructured_llm_marker_yaml(blob.id).replace(_REBIND_DIGEST_A, digest)
 
         resp = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": marker_yaml})
 
@@ -4042,6 +4077,10 @@ class TestImportRebindsSharedFiles:
         else:
             assert record is not None
             assert record.version == 1
+            assert any(
+                requirement["kind"] == "llm_prompt_template" and requirement["status"] == "pending"
+                for requirement in record.nodes[0]["options"]["interpretation_requirements"]
+            )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("mime_type, expected_status", [("application/pdf", 400), ("text/plain", 200)])
@@ -4049,11 +4088,15 @@ class TestImportRebindsSharedFiles:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         session = await service.create_session("alice", "Rebind", "local")
+        content = b"Review this row.\n"
+        digest = hashlib.sha256(content).hexdigest()
         blob = replace(
-            _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A),
+            _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=digest),
             mime_type=mime_type,
         )
         app.state.blob_service = _blob_service_for(blob)
+        if mime_type == "text/plain":
+            _install_import_prompt_blob_read(service, blob, content)
 
         resp = client.post(
             f"/api/sessions/{session.id}/state/yaml",
@@ -4080,6 +4123,10 @@ class TestImportRebindsSharedFiles:
         else:
             assert record is not None
             assert record.version == 1
+            assert any(
+                requirement["kind"] == "llm_prompt_template" and requirement["status"] == "pending"
+                for requirement in record.nodes[0]["options"]["interpretation_requirements"]
+            )
 
     def test_legacy_structured_marker_refused_before_execution_materialization(self) -> None:
         from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
@@ -4546,33 +4593,39 @@ class TestImportRebindsSharedFiles:
         assert await service.get_current_state(session.id) is None
 
     @pytest.mark.asyncio
-    async def test_import_inline_binding_refuses_llm_authored_blob_on_prompt_surface(self, tmp_path: Path) -> None:
+    async def test_import_inline_binding_stages_llm_authored_prompt_review(self, tmp_path: Path) -> None:
         from dataclasses import replace as dataclass_replace
 
+        from fastapi import HTTPException
+
         from elspeth.contracts.enums import CreationModality
+        from elspeth.contracts.freeze import deep_thaw
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+        from elspeth.web.sessions.routes.composer.state import InlineBlobBindingRequest, _state_with_imported_inline_blobs
 
         app, service = _make_app(tmp_path)
-        client = TestClient(app)
         session = await service.create_session("alice", "Rebind", "local")
         blob = dataclass_replace(
             _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A),
             creation_modality=CreationModality.LLM_GENERATED,
         )
         app.state.blob_service = _blob_service_for(blob)
-
-        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_rebind_preflight):
-            resp = client.post(
-                f"/api/sessions/{session.id}/state/yaml",
-                json={
-                    "yaml": _REBIND_LLM_YAML,
-                    "inline_blob_bindings": {"node:score.options.prompt_template": {"blob_id": str(blob.id)}},
-                },
+        imported = composition_state_from_runtime_yaml(_REBIND_LLM_YAML)
+        try:
+            rebound = await _state_with_imported_inline_blobs(
+                imported,
+                inline_blob_bindings={"node:score.options.prompt_template": InlineBlobBindingRequest(blob_id=str(blob.id))},
+                request=SimpleNamespace(app=app),
+                session_id=session.id,
+                session_operation_context=None,
             )
-
-        assert resp.status_code == 400, resp.text
-        assert resp.json()["detail"].startswith(
-            f"wire_blob_inline_ref cannot wire LLM-authored blob '{blob.id}' into LLM node 'score' option 'prompt_template'"
-        )
+        except HTTPException:
+            rebound = None
+        assert rebound is not None
+        options = deep_thaw(rebound.nodes[0].options)
+        [review] = [item for item in options["interpretation_requirements"] if item["kind"] == "llm_prompt_template"]
+        assert review["status"] == "pending"
+        assert str(blob.id) in review["draft"]
         assert await service.get_current_state(session.id) is None
 
     @staticmethod

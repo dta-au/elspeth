@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import inspect, select, text
+from sqlalchemy import String, inspect, select, text
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.schema import CreateIndex, CreateTable
 
@@ -30,6 +30,7 @@ from elspeth.core.landscape.schema import (
     node_states_table,
     nodes_table,
     routing_events_table,
+    run_prompt_inputs_table,
     run_web_plugin_policy_table,
     token_parents_table,
     token_work_items_table,
@@ -58,12 +59,27 @@ def test_epoch_is_forty_seven() -> None:
     # source-row replay, and admits the resume_refused coordination event.
     # Epoch 49 adds the pending-identity purge event to the closed auth trail.
     # Epoch 50 retains provider-returned model attribution with call outcomes.
-    assert SQLITE_SCHEMA_EPOCH == 50
+    # Epoch 51 adds exact admitted file prompt inputs.
+    assert SQLITE_SCHEMA_EPOCH == 51
+    assert ("run_prompt_inputs", "content_sha256") in set(_REQUIRED_COLUMNS)
     assert ("calls", "returned_model") in set(_REQUIRED_COLUMNS)
     assert ("rows", "source_contract_json") in set(_REQUIRED_COLUMNS)
     assert ("node_states", "ix_node_states_run") in set(_REQUIRED_INDEXES)
     index = next(index for index in call_verifications_table.indexes if index.name == "ix_call_verifications_run")
     assert [column.name for column in index.columns] == ["current_run_id", "recorded_at", "current_call_id"]
+
+
+def test_run_prompt_input_field_path_is_unbounded_like_the_session_store() -> None:
+    """A mapping-form query name has no length cap, so neither may the path.
+
+    ``queries.<name>.template`` for a name over 239 characters exceeded the
+    former VARCHAR(256) and PostgreSQL refused begin_run; the session store's
+    ``prompt_file_approvals.field_path`` already accepted it.
+    """
+    column_type = run_prompt_inputs_table.c.field_path.type
+    assert type(column_type) is String
+    assert column_type.length is None
+    assert "field_path VARCHAR NOT NULL" in str(CreateTable(run_prompt_inputs_table).compile(dialect=postgresql.dialect()))
 
 
 def test_epoch_45_collector_group_failure_reason_is_the_closed_vocabulary() -> None:

@@ -10,7 +10,7 @@ import {
   resolvePromptDisplaySegments,
 } from "./promptTemplateDisplay";
 import type { CompositionState, NodeSpec } from "@/types/index";
-import type { InterpretationEvent } from "@/types/interpretation";
+import type { InterpretationEvent, PromptReviewSnapshotResponse } from "@/types/interpretation";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 
 function makeEvent(
@@ -74,6 +74,41 @@ const STRUCTURED_PARTS = [
   { kind: "interpretation_ref", requirement_id: "req-1" },
   { kind: "text", text: " for an auditor." },
 ];
+
+describe("file-backed prompt review", () => {
+  it("shows complete escaped file text and its label for a deferred marker", () => {
+    const marker = { blob_ref: "blob-1", mode: "inline_content", sha256: "a".repeat(64) };
+    const state = makeState([makeNode({ prompt_template: marker })]);
+    const snapshot: PromptReviewSnapshotResponse = {
+      version: 1,
+      session_id: "sess-1",
+      node_id: "node-1",
+      event_id: "evt-1",
+      authored_surface: { prompt_template: marker },
+      bindings: [{
+        field_path: "prompt_template",
+        blob_id: "blob-1",
+        content_sha256: "a".repeat(64),
+        encoding: "utf-8",
+        byte_length: 24,
+        filename: "review.txt",
+        creation_modality: "LLM_GENERATED",
+        created_by: "assistant",
+        provenance: {},
+        text: "  <unsafe> & exact\n\nline  ",
+      }],
+      anchor: "b".repeat(64),
+      effective_artifact_hash: "c".repeat(64),
+      is_live_review: true,
+    };
+    const result = resolvePromptDisplaySegments(state, makeEvent(), snapshot);
+    expect(result.reviewAvailable).toBe(true);
+    expect(result.segments.map((segment) => segment.text).join(""))
+      .toContain("File: review.txt (prompt_template)\n\n  <unsafe> & exact\n\nline  ");
+    expect(result.segments.map((segment) => segment.text).join(""))
+      .not.toContain("not text");
+  });
+});
 
 function makeRequirement(
   overrides: Record<string, unknown> = {},

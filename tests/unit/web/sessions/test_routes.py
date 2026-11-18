@@ -4549,6 +4549,10 @@ class TestIDORCoverageDrift:
             "list_interpretations",
             "opt_out_of_interpretations",
             "opt_out_summary",
+            # PFR R2: full file text of a prompt-file review card
+            # (``GET /{session_id}/interpretations/{event_id}/prompt``), owner-gated
+            # like the other interpretation routes.
+            "get_interpretation_prompt_snapshot",
             # Phase 4 hello-world tutorial (commit ca9bc05bd) added the
             # audit-story endpoint at ``GET /api/sessions/{session_id}
             # /runs/{run_id}/audit-story``. Like every other session-scoped
@@ -4604,6 +4608,7 @@ class TestIDORCoverageDrift:
             # cross-session 404 assertion lives in
             # ``tests/unit/web/blobs/test_routes.py::TestIDORProtection``.
             "preview_blob_content",
+            "save_prompt_text",
             "delete_blob",
         }
     )
@@ -4732,9 +4737,10 @@ class TestIDORCoverageDrift:
         bypass the session IDOR guard entirely — that is the drift
         this inventory exists to catch.
         """
-        from elspeth.web.blobs import routes
+        from elspeth.web.blobs import prompt_text_routes, routes
 
         found = _collect_ownership_call_site_identities(routes, "_verify_session_and_get_blob_service")
+        found.update(_collect_ownership_call_site_identities(prompt_text_routes, "_verify_session_and_get_blob_service"))
         self._assert_inventory(
             "blobs/routes.py",
             "_verify_session_and_get_blob_service",

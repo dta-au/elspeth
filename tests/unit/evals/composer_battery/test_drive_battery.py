@@ -367,6 +367,25 @@ def test_review_loop_is_bounded_and_captured(tmp_path: Path) -> None:
     assert json.loads((tmp_path / "runs/r1/x/2/meta.json").read_text())["instrument"]["review_rounds_exhausted"] is False
 
 
+def test_prompt_review_is_resolved_with_the_anchor_of_its_snapshot(tmp_path: Path) -> None:
+    r = happy_responders(tg.ideal_thread(ARGS), state=copy.deepcopy(ARGS))
+    seen = {"n": 0}
+
+    def drains(c):
+        seen["n"] += 1
+        return ok({"events": [{"id": "e1", "kind": "llm_prompt_template", "status": "pending"}]}) if seen["n"] == 1 else ok({"events": []})
+
+    r["GET /api/sessions/s1/interpretations"] = drains
+    # Prefix routing takes the first match, so the snapshot read goes ahead of the list.
+    r = {"GET /api/sessions/s1/interpretations/e1/prompt": lambda c: ok({"anchor": "c" * 64}), **r}
+    client = FakeClient(r)
+    _battery(tmp_path, client).run_prompt(label="l", prompt="p", run_dir=tmp_path / "runs/r1/x/1", case="x", repeat=1)
+    resolves = [c for c in client.calls if c.method == "POST" and c.path == "/api/sessions/s1/interpretations/e1/resolve"]
+    assert [c.json for c in resolves] == [{"choice": "accepted_as_drafted", "reviewed_anchor": "c" * 64}]
+    steps = client.steps()
+    assert steps.index("GET /api/sessions/s1/interpretations/e1/prompt") < steps.index("POST /api/sessions/s1/interpretations/e1/resolve")
+
+
 def test_fire_order_abort_and_case_flags(tmp_path: Path) -> None:
     client = FakeClient(happy_responders(tg.ideal_thread(ARGS), state=copy.deepcopy(ARGS)))
     b = _battery(tmp_path, client, repeats=2)

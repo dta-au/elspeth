@@ -30,7 +30,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 
 from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.auth import AuthProviderType
-from elspeth.contracts.blobs import BlobForkPlanEntry, BlobRecord, fork_blob_id
+from elspeth.contracts.blobs import BlobForkPlanEntry, BlobRecord, InlineBlobNotAdmittedError, fork_blob_id
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
 from elspeth.contracts.chargeable_admission import (
     AdmissionRefusalReason,
@@ -225,6 +225,7 @@ from elspeth.web.sessions.models import (
     composition_states_table,
     interpretation_events_table,
     message_ingress_receipts_table,
+    prompt_review_snapshots_table,
     proposal_events_table,
     run_events_table,
     run_execution_inputs_table,
@@ -294,6 +295,20 @@ from elspeth.web.sessions.pipeline_settlement_payloads import (
     ReviewCohortMember,
     TransitionAssistantBinding,
 )
+from elspeth.web.sessions.prompt_file_approval import (
+    PromptApprovalTrigger,
+    PromptFileApprovalRequest,
+    PromptFileApprovalStale,
+    assert_prompt_file_approvals,
+    record_prompt_file_approval,
+)
+from elspeth.web.sessions.prompt_file_review import (
+    PromptFileReviewStale,
+    PromptReviewSnapshot,
+    prompt_file_binding_paths,
+    resolve_prompt_review_snapshot,
+    verify_prompt_review_snapshot_payload,
+)
 from elspeth.web.sessions.proposal_authority import (
     _assert_assistant_row_has_audit_content,
     _assert_parent_assistant_message,
@@ -358,6 +373,10 @@ from elspeth.web.sessions.protocol import (
     PipelineProposalRejectionReason,
     PipelineProposalSettlementResult,
     PreparedInterpretationEventDraft,
+    PromptReviewAnchorRequiredError,
+    PromptReviewAnchorUnexpectedError,
+    PromptReviewSnapshotMissingError,
+    PromptReviewStaleError,
     ProposalEventRecord,
     ProposalLifecycleStatus,
     ProposalStateConflictError,
@@ -5143,6 +5162,7 @@ class SessionServiceImpl:
         resolved_at: datetime | None = None,
         runtime_model_identifier: str | None = None,
         runtime_model_version: str | None = None,
+        reviewed_anchor: str | None = None,
         session_operation_context: SessionOperationContext,
     ) -> tuple[InterpretationEventRecord, CompositionStateRecord]:
         """Commit a resolution AND patch the affected LLM transform's prompt template.
@@ -5164,6 +5184,12 @@ class SessionServiceImpl:
                (F-7: session_id in WHERE prevents cross-session IDOR;
                choice='pending' is the TOCTOU guard against double-resolve).
                Raise ValueError if no matching row.
+            1a. Bind a prompt review to what the user saw: for
+                ``llm_prompt_template`` the caller's ``reviewed_anchor`` must
+                equal the anchor of the event's stored review snapshot, read
+                on this connection. Missing anchor, missing snapshot, or a
+                different anchor refuses before any write; any other kind
+                refuses a supplied anchor, since it would bind nothing.
             2. Compute ``accepted_value`` per F-14.
             3. Validate ``accepted_value`` via ``_validate_accepted_value_content``
                (defence-in-depth against future callers that bypass the route).
@@ -5297,6 +5323,31 @@ class SessionServiceImpl:
                     raise InterpretationUnsupportedChoiceError(
                         f"resolve_interpretation_event: {kind.value} does not support inline amendment in this release"
                     )
+                # Step 1a: the approval is of the snapshot the card displayed.
+                # Read under the same session write lock and fence as every
+                # write below, so nothing can move between check and write.
+                if kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
+                    if reviewed_anchor is None:
+                        raise PromptReviewAnchorRequiredError(
+                            f"resolve_interpretation_event: prompt review {eid!r} must name the snapshot anchor it displayed"
+                        )
+                    stored_anchor = conn.execute(
+                        select(prompt_review_snapshots_table.c.anchor)
+                        .where(prompt_review_snapshots_table.c.event_id == eid)
+                        .where(prompt_review_snapshots_table.c.session_id == sid)
+                    ).scalar_one_or_none()
+                    if stored_anchor is None:
+                        raise PromptReviewSnapshotMissingError(
+                            f"resolve_interpretation_event: prompt review {eid!r} has no stored snapshot to approve against"
+                        )
+                    if stored_anchor != reviewed_anchor:
+                        raise PromptReviewStaleError(
+                            f"resolve_interpretation_event: prompt review {eid!r} was approved against a different snapshot"
+                        )
+                elif reviewed_anchor is not None:
+                    raise PromptReviewAnchorUnexpectedError(
+                        f"resolve_interpretation_event: {kind.value} has no review snapshot; reviewed_anchor must be omitted"
+                    )
                 if kind in {
                     InterpretationKind.VAGUE_TERM,
                     InterpretationKind.INVENTED_SOURCE,
@@ -5404,6 +5455,41 @@ class SessionServiceImpl:
                         accepted_value=accepted_value,
                     )
                 elif kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
+                    file_snapshot = None
+                    reviewed_node = next((node for node in state_record.nodes or () if node["id"] == event_row.affected_node_id), None)
+                    if reviewed_node is not None and prompt_file_binding_paths(reviewed_node["options"]):
+                        if inline_blob_snapshot is None or principal_user_id is None:
+                            raise PromptFileApprovalStale()
+                        try:
+                            file_snapshot = resolve_prompt_review_snapshot(
+                                session_id=session_id,
+                                node_id=event_row.affected_node_id,
+                                options=reviewed_node["options"],
+                                read_blob=inline_blob_snapshot.content,
+                            )
+                        except InlineBlobNotAdmittedError as exc:
+                            # The reviewed bytes are no longer verifiable
+                            # (status, hash or size moved since the card was
+                            # shown): the card is stale, nothing is written.
+                            raise PromptFileReviewStale(node_id=event_row.affected_node_id) from exc
+                        if file_snapshot is None:
+                            raise PromptFileApprovalStale()
+                        for binding in file_snapshot.bindings:
+                            approval = record_prompt_file_approval(
+                                conn,
+                                PromptFileApprovalRequest(
+                                    session_id=session_id,
+                                    node_id=event_row.affected_node_id,
+                                    field_path=binding.field_path,
+                                    blob_id=binding.blob_id,
+                                    content_sha256=binding.content_sha256,
+                                    actor_user_id=principal_user_id,
+                                    trigger=PromptApprovalTrigger.CARD,
+                                ),
+                                now=now,
+                            )
+                            if approval.event_id != event_id:
+                                raise PromptFileApprovalStale()
                     # Skeleton the user actually reviewed (the surfacing state's
                     # node). The acceptance gate compares this to the live
                     # skeleton so a sibling vague_term baked between surfacing and
@@ -5419,6 +5505,7 @@ class SessionServiceImpl:
                         user_term=event_row.user_term,
                         accepted_value=accepted_value,
                         surfacing_structure_hash=surfacing_structure_hash,
+                        file_snapshot=file_snapshot,
                     )
                 elif kind is InterpretationKind.INVENTED_SOURCE:
                     final_sources, final_nodes, approved_prompt_artifact_hash = _resolve_invented_source(
@@ -5637,6 +5724,83 @@ class SessionServiceImpl:
                 return [_interpretation_event_record_from_row(row) for row in rows]
 
         return cast(list[InterpretationEventRecord], await self._run_sync(_sync))
+
+    async def get_prompt_review_snapshot(self, session_id: UUID, event_id: UUID) -> Mapping[str, Any] | None:
+        """Read an event-bound full prompt snapshot under its session identity."""
+
+        def _sync() -> Mapping[str, Any] | None:
+            with self._engine.connect() as conn:
+                event = conn.execute(
+                    select(interpretation_events_table).where(
+                        interpretation_events_table.c.id == str(event_id),
+                        interpretation_events_table.c.session_id == str(session_id),
+                        interpretation_events_table.c.kind == InterpretationKind.LLM_PROMPT_TEMPLATE.value,
+                    )
+                ).one_or_none()
+                if event is None or event.affected_node_id is None or event.composition_state_id is None:
+                    return None
+                stored = conn.execute(
+                    select(prompt_review_snapshots_table).where(
+                        prompt_review_snapshots_table.c.event_id == str(event_id),
+                        prompt_review_snapshots_table.c.session_id == str(session_id),
+                    )
+                ).one_or_none()
+                if stored is None:
+                    return None
+                snapshot = verify_prompt_review_snapshot_payload(stored.snapshot_json)
+                if snapshot.session_id != session_id or snapshot.node_id != event.affected_node_id or snapshot.anchor != stored.anchor:
+                    raise AuditIntegrityError("prompt review snapshot escaped its event identity")
+                anchor_state = conn.execute(
+                    select(composition_states_table.c.nodes).where(
+                        composition_states_table.c.id == event.composition_state_id,
+                        composition_states_table.c.session_id == str(session_id),
+                    )
+                ).one_or_none()
+                if anchor_state is None or not any(
+                    node["id"] == snapshot.node_id and node["plugin"] == "llm" for node in unwrap_state_column(anchor_state.nodes)
+                ):
+                    raise AuditIntegrityError("prompt review event has no matching LLM node")
+                current = conn.execute(
+                    select(composition_states_table.c.nodes)
+                    .where(composition_states_table.c.session_id == str(session_id))
+                    .order_by(composition_states_table.c.version.desc())
+                    .limit(1)
+                ).one()
+                current_node = next((node for node in unwrap_state_column(current.nodes) if node["id"] == snapshot.node_id), None)
+                current_surface = (
+                    {
+                        key: current_node["options"][key]
+                        for key in ("prompt_template", "system_prompt", "queries")
+                        if key in current_node["options"]
+                    }
+                    if current_node is not None
+                    else None
+                )
+                return {
+                    **snapshot.payload(),
+                    "event_id": str(event_id),
+                    # Liveness compares the prompt text only: a slot's event
+                    # linkage moves as sibling cards surface, without making
+                    # this prompt a different one.
+                    "is_live_review": event.choice == InterpretationChoice.PENDING.value
+                    and current_surface
+                    == {
+                        key: snapshot.authored_surface[key]
+                        for key in ("prompt_template", "system_prompt", "queries")
+                        if key in snapshot.authored_surface
+                    },
+                }
+
+        return cast(Mapping[str, Any] | None, await self._run_sync(_sync))
+
+    async def assert_prompt_file_approvals(self, snapshot: PromptReviewSnapshot) -> None:
+        """Compare a freshly read snapshot with current approval rows."""
+
+        def _sync() -> None:
+            with self._engine.connect() as conn:
+                assert_prompt_file_approvals(conn, snapshot)
+
+        await self._run_sync(_sync)
 
     async def record_session_interpretation_opt_out(
         self,

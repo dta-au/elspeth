@@ -42,6 +42,7 @@ from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_SURFACE_REVIEW_MAX_CHARS,
     approved_prompt_artifact_hash_from_options,
+    materialize_state_for_execution,
     prompt_review_anchor_hash_from_options,
     prompt_review_draft_from_options,
 )
@@ -51,6 +52,7 @@ from elspeth.web.sessions.routes._helpers import _interpretation_event_response
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.prompt_review import reviewed_anchor_for
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 from tests.unit.web.sessions.test_interpretation_events_service import _seed_state_with_llm_node
 
@@ -261,6 +263,7 @@ async def test_resolve_accepted_as_drafted_succeeds_for_a_multi_query_node(sessi
         choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
         amended_value=None,
         actor="user:alice",
+        reviewed_anchor=await reviewed_anchor_for(session_service, session_id, event.id),
     )
 
     assert resolved.accepted_value == surface_draft
@@ -288,6 +291,7 @@ async def test_resolve_accepted_as_drafted_succeeds_for_a_long_single_prompt_nod
         choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
         amended_value=None,
         actor="user:alice",
+        reviewed_anchor=await reviewed_anchor_for(session_service, session_id, event.id),
     )
 
     assert resolved.accepted_value == bounded_draft
@@ -323,6 +327,7 @@ async def test_interpretation_event_response_builds_for_a_long_single_prompt_nod
         choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
         amended_value=None,
         actor="user:alice",
+        reviewed_anchor=await reviewed_anchor_for(session_service, session_id, event.id),
     )
     resolved_response = _interpretation_event_response(resolved)
     assert resolved_response.accepted_value == review_draft
@@ -339,6 +344,57 @@ def test_single_prompt_draft_within_the_bound_is_the_template_byte_for_byte() ->
     at_bound = "x" * PROMPT_SURFACE_REVIEW_MAX_CHARS
     assert prompt_review_draft_from_options({"prompt_template": at_bound}) == at_bound
     assert PROMPT_SURFACE_REVIEW_MAX_CHARS == 8000
+
+
+def test_resolved_file_prompt_with_inline_system_prompt_materializes_against_stored_anchor() -> None:
+    marker = {"blob_ref": str(uuid4()), "mode": "inline_content", "sha256": "a" * 64}
+    options: dict[str, Any] = {"prompt_template": marker, "system_prompt": "Answer briefly."}
+    stored_hash = prompt_review_anchor_hash_from_options(options)
+    assert stored_hash is not None
+    options[INTERPRETATION_REQUIREMENTS_KEY] = [
+        {
+            "id": "prompt_template_review",
+            "kind": InterpretationKind.LLM_PROMPT_TEMPLATE.value,
+            "user_term": _USER_TERM,
+            "status": "resolved",
+            "draft": "Reviewed full file text",
+            "event_id": str(uuid4()),
+            "accepted_value": "Reviewed full file text",
+            "accepted_artifact_hash": None,
+            "resolved_prompt_template_hash": stored_hash,
+        }
+    ]
+    state = CompositionState(
+        source=None,
+        nodes=(
+            NodeSpec(
+                id=_NODE_ID,
+                node_type="transform",
+                plugin="llm",
+                input="rows",
+                on_success="out",
+                on_error="quarantine",
+                options=options,
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(name="File prompt review", description=""),
+        version=1,
+    )
+
+    materialized = materialize_state_for_execution(state)
+
+    assert isinstance(materialized, CompositionState)
+    requirement = materialized.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert prompt_review_anchor_hash_from_options(materialized.nodes[0].options) == requirement["resolved_prompt_template_hash"]
+    assert requirement["resolved_prompt_template_hash"] == stored_hash
 
 
 def test_single_prompt_draft_over_the_bound_is_shortened_with_the_inline_marker() -> None:

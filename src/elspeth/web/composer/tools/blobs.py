@@ -98,6 +98,7 @@ from elspeth.web.composer.tools._common import (
     _discovery_result,
     _failure_result,
     _mutation_result,
+    _options_with_default_prompt_template_review,
     _validate_mutation_arguments,
     review_reconciliation_failure_message,
 )
@@ -112,6 +113,7 @@ from elspeth.web.execution._validation_materialization import (
     file_inject_blob_refusal,
     file_inject_option_refusals,
     is_llm_authored_prompt_surface_binding,
+    llm_prompt_file_scalar_field,
     llm_prompt_surface_field,
 )
 from elspeth.web.interpretation_state import (
@@ -934,17 +936,7 @@ def _llm_authored_prompt_surface_error(
     blob_id: UUID,
     creation_modality: CreationModality,
 ) -> str | None:
-    """Refuse an LLM-authored blob as an ``llm`` node's prompt surface or model.
-
-    ADR-034 admits ``inline_content`` markers in prompt fields so a USER-uploaded
-    prompt artifact can back an LLM node. The ``llm_prompt_template`` and
-    ``llm_model_choice`` reviews read those options as strings, so a marker
-    there carries no reviewable text, and the run substitutes the blob bytes
-    afterwards. The guarded domain and the modality rule are
-    ``is_llm_authored_prompt_surface_binding``, the predicate /validate and run
-    admission apply too. An unknown or non-``llm`` node returns ``None`` so the
-    marker writer reports the missing node.
-    """
+    """Refuse an LLM-authored marker at an unsupported LLM prompt position."""
     surface = llm_prompt_surface_field(field_path)
     node_plugins = {node.id: node.plugin for node in state.nodes if node.plugin is not None}
     if surface is None or not is_llm_authored_prompt_surface_binding(
@@ -1000,21 +992,18 @@ def _llm_authored_inline_prompt_surface_error(
     plugin: str | None,
     options: Mapping[str, Any],
 ) -> str | None:
-    """Refuse a node-option write that binds an LLM-authored blob into an ``llm`` prompt surface or model.
+    """Refuse unsupported LLM prompt markers in a node-option write.
 
     ``wire_blob_inline_ref`` is not the only way an ``inline_content`` marker
     reaches node options: ``upsert_node``, ``patch_node_options``,
     ``splice_transform`` and ``set_pipeline`` accept a hand-authored widened
     marker, and plugin prevalidation withholds a top-level one as a deferred
-    value. Each marker in the guarded domain
-    (``is_llm_authored_prompt_surface_binding``) is looked up
-    in this session, and an LLM-authored blob refuses with the wire tool's
-    repairable text, so the planner cannot route around the wire tool.
+    value. Supported scalar markers get a prompt review; unsupported prompt
+    positions refuse here, including manually authored markers.
 
     A marker is not judged here when no session engine is attached (no blob can
     be looked up) or when its blob is not in this session: /validate reports it
-    as missing, and both /validate and run admission apply the same modality
-    rule to every blob they resolve.
+    as missing.
     """
     session_engine = context.session_engine
     session_id = context.session_id
@@ -1026,6 +1015,8 @@ def _llm_authored_inline_prompt_surface_error(
             field_path = f"node:{node_id}.options.{option_path}"
             if llm_prompt_surface_field(field_path) is None:
                 continue
+            if llm_prompt_file_scalar_field(field_path) is None:
+                return "File-backed LLM prompts bind only to prompt_template, system_prompt, or a query template."
             blob = _sync_get_blob(session_engine, str(blob_id), session_id)
             if blob is None:
                 continue
@@ -1230,6 +1221,18 @@ def _execute_wire_blob_inline_ref(
     if ref.field_path.startswith("node:"):
         node = next((item for item in state.nodes if item.id == node_id), None)
         if node is not None and node.plugin == "llm":
+            if llm_prompt_file_scalar_field(ref.field_path) is not None and encoding != "utf-8":
+                return _failure_result(
+                    state,
+                    "File-backed LLM prompts require UTF-8 text.",
+                    error_code="inline_blob_field_path_invalid",
+                )
+            if llm_prompt_surface_field(ref.field_path) is not None and llm_prompt_file_scalar_field(ref.field_path) is None:
+                return _failure_result(
+                    state,
+                    "File-backed LLM prompts bind only to prompt_template, system_prompt, or a query template.",
+                    error_code="inline_blob_field_path_invalid",
+                )
             structured_error = (
                 _structured_prompt_template_refusal(
                     node_id, node.options, {"prompt_template": {"blob_ref": str(blob_id), "mode": "inline_content", "sha256": pinned_hash}}
@@ -1270,6 +1273,24 @@ def _execute_wire_blob_inline_ref(
         new_state = _apply_inline_blob_marker(state, ref.field_path, marker)
     except ValueError as exc:
         return _failure_result(state, str(exc), error_code="inline_blob_field_path_invalid")
+    if llm_prompt_file_scalar_field(ref.field_path) is not None:
+        new_state = replace(
+            new_state,
+            nodes=tuple(
+                replace(
+                    item,
+                    options=_options_with_default_prompt_template_review(
+                        node_id=item.id,
+                        plugin=item.plugin,
+                        options=item.options,
+                        existing_options=next((old.options for old in state.nodes if old.id == item.id), None),
+                    ),
+                )
+                if item.id == node_id and item.plugin == "llm"
+                else item
+                for item in new_state.nodes
+            ),
+        )
     file_inject_error = _file_inject_wired_marker_error(new_state, ref.field_path)
     if file_inject_error is not None:
         return _failure_result(state, file_inject_error, error_code="file_inject_content_not_uploaded")
@@ -1320,6 +1341,8 @@ _WIRE_BLOB_INLINE_REF_DECLARATION = ToolDeclaration(
         "Author a widened blob_ref inline_content marker at a canonical field_path. "
         "Composer pins sha256 from blob metadata; callers must not pass content bytes. "
         "Only inline-text MIME is accepted; upload or create a plain-text .txt or .md file for a prompt. "
+        "A user-created or agent-authored UTF-8 prompt file opens a mandatory full-content llm_prompt_template review card; changes require review again. "
+        "Only prompt_template, system_prompt, and individual query templates accept prompt files, never model or whole queries. "
         "A structured prompt with prompt_template_parts cannot be replaced by a file in this release; edit its text parts with change_substring or patch_node_options on prompt_template_parts, preserving interpretation_ref entries. "
         "Returns the `field_path` that was wired."
     ),

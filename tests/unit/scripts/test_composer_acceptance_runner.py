@@ -20,9 +20,10 @@ from tests.unit.scripts.test_composer_convergence_checks import CASES, _evidence
 
 
 class ScenarioApi(ApiClient):
-    def __init__(self, case: dict):
+    def __init__(self, case: dict, review_kind: str | None = None):
         super().__init__("http://127.0.0.1:18473")
         self.case = case
+        self.review_kind = review_kind if review_kind is not None else case["review_policy"]["allowed_types"][0]
         self.state, self.run, self.outputs = _positive(case)
         self.state.update(session_id="session-test", version=1, edges=[])
         self.sent: list[tuple[str, dict | None]] = []
@@ -42,15 +43,21 @@ class ScenarioApi(ApiClient):
                 "events": [
                     {
                         "id": "review-test",
-                        "kind": self.case["review_policy"]["allowed_types"][0],
+                        "kind": self.review_kind,
                         "llm_draft": "Review the synthetic fixture",
                     }
                 ]
                 if self.pending
                 else []
             }
+        if path.endswith("/interpretations/review-test/prompt"):
+            assert body is None
+            return {"anchor": "b" * 64}
         if path.endswith("/interpretations/review-test/resolve"):
-            assert body == {"choice": "accepted_as_drafted"}
+            expected = {"choice": "accepted_as_drafted"}
+            if self.review_kind == "llm_prompt_template":
+                expected["reviewed_anchor"] = "b" * 64
+            assert body == expected
             self.pending = False
             self.approved = True
             return {"resolved": True}
@@ -125,6 +132,19 @@ def test_review_requires_exact_explicit_acceptance_and_resume_preserves_turns(tm
     assert all("/state" not in path or body is None for path, body in api.sent)
     checkpoint = json.loads((tmp_path / "cases" / case["id"] / "checkpoint.json").read_text())
     assert checkpoint["status"] == "passed"
+
+
+def test_prompt_review_is_resolved_with_the_anchor_of_its_snapshot(tmp_path: Path) -> None:
+    case = next(case for case in CASES if case["id"] == "01_cleanup_edit")
+    api = ScenarioApi(case, review_kind="llm_prompt_template")
+    _session_store(tmp_path)
+    assert run_case(api, case, tmp_path, set())["status"] == "needs_review"
+    final = run_case(api, case, tmp_path, {"review-test"})
+    assert final["status"] == "passed"
+    assert api.approved
+    sent_paths = [path for path, _body in api.sent]
+    prompt_read = sent_paths.index("/api/sessions/session-test/interpretations/review-test/prompt")
+    assert prompt_read < sent_paths.index("/api/sessions/session-test/interpretations/review-test/resolve")
 
 
 @pytest.mark.parametrize(

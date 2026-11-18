@@ -11,7 +11,7 @@ import json
 import secrets
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from threading import RLock
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, final, get_args
@@ -123,6 +123,7 @@ from elspeth.web.sessions.models import (
     interpretation_events_table,
     library_entries_table,
     output_storage_reservations_table,
+    prompt_review_snapshots_table,
     proposal_blob_effect_receipts_table,
     proposal_events_table,
     quota_provider_attempts_table,
@@ -191,6 +192,8 @@ if TYPE_CHECKING:
     from contextlib import AbstractContextManager
 
     from elspeth.web.execution.envelope import RunExecutionInput
+    from elspeth.web.sessions.inline_blob_preflight import SessionInlineBlobSnapshot
+    from elspeth.web.sessions.prompt_file_review import PromptReviewSnapshot
 
 _MAX_SESSION_ID_COLLISION_ATTEMPTS = 8
 _MUTATION_CONNECTION_REGISTRY = _mutation_connection_registry._MUTATION_CONNECTION_REGISTRY
@@ -1082,6 +1085,94 @@ class _RepositoryInterpretationMutations:
     ) -> PendingInterpretationCreationResult:
         return self._create_pending(command, validator, policy=PendingInterpretationPolicy.PIPELINE_CANDIDATE)
 
+    def _live_prompt_review_snapshot(
+        self,
+        live_state: CompositionStateRecord,
+        *,
+        affected_node_id: str,
+        inline_blob_snapshot: SessionInlineBlobSnapshot | None,
+    ) -> tuple[bool, PromptReviewSnapshot | None]:
+        """Derive the review snapshot the live node shows, file-bound or inline.
+
+        Returns ``(node_present, snapshot)``. The one derivation both the stale
+        check and the insert use, so the anchor compared with a stored card is
+        the anchor a fresh card stores, and both meet the same typed refusals:
+        a file with no verified inline bytes is stale, and a file over an
+        inline cap is refused by size, naming the cap (it can never run).
+        """
+        from elspeth.contracts.blobs import InlineBlobNotAdmittedError
+        from elspeth.web.sessions.prompt_file_review import (
+            PromptFileReviewStale,
+            prompt_file_binding_paths,
+            resolve_prompt_review_snapshot,
+        )
+        from elspeth.web.sessions.protocol import PromptFileTooLargeError
+
+        node = next((item for item in live_state.nodes or () if item["id"] == affected_node_id), None)
+        if node is None:
+            return False, None
+        options = node["options"]
+        if prompt_file_binding_paths(options) and inline_blob_snapshot is None:
+            raise PromptFileReviewStale()
+        try:
+            return True, resolve_prompt_review_snapshot(
+                session_id=UUID(self.__state._session_id),
+                node_id=affected_node_id,
+                options=options,
+                read_blob=inline_blob_snapshot.content if inline_blob_snapshot is not None else None,
+                inline_when_unbound=True,
+            )
+        except InlineBlobNotAdmittedError as exc:
+            if exc.limit_bytes is None:
+                raise PromptFileReviewStale(node_id=affected_node_id) from exc
+            raise PromptFileTooLargeError(
+                node_id=affected_node_id,
+                limit_bytes=exc.limit_bytes,
+                aggregate=exc.reason == "aggregate_oversized",
+            ) from exc
+
+    def _mark_stale_prompt_review_snapshots(
+        self,
+        pending_sites: list[SessionPendingInterpretationSiteSnapshot],
+        *,
+        live_state: CompositionStateRecord,
+        affected_node_id: str,
+        inline_blob_snapshot: SessionInlineBlobSnapshot | None,
+    ) -> list[SessionPendingInterpretationSiteSnapshot]:
+        """Flag pending prompt cards whose stored snapshot no longer matches the live surface.
+
+        The requirement anchor attests the prompt SKELETON, so resolving a
+        vague-term slot keeps it while re-rendering the inline
+        ``prompt_template``. Every card's stored snapshot binds the surface it
+        showed (file-bound or inline), so after that resolve the card could
+        never be approved for what runs (and a file card's editor save is
+        refused beside the inline text). Flagging the card here makes the
+        planner supersede it and issue a fresh card and snapshot in this same
+        transaction. The live snapshot uses the derivation the insert path
+        uses; a custody failure raises as it would there.
+        """
+        connection = _resolve_mutation_connection(self.__state._connection_token)
+        session_id = self.__state._session_id
+        stored = {
+            row.event_id: row.anchor
+            for row in connection.execute(
+                select(prompt_review_snapshots_table.c.event_id, prompt_review_snapshots_table.c.anchor).where(
+                    prompt_review_snapshots_table.c.session_id == session_id,
+                    prompt_review_snapshots_table.c.event_id.in_(str(site.event.id) for site in pending_sites),
+                )
+            )
+        }
+        if not stored:
+            return pending_sites
+        _node_present, live_snapshot = self._live_prompt_review_snapshot(
+            live_state, affected_node_id=affected_node_id, inline_blob_snapshot=inline_blob_snapshot
+        )
+        live_anchor = live_snapshot.anchor if live_snapshot is not None else None
+        return [
+            replace(site, file_snapshot_stale=True) if str(site.event.id) in stored and stored[str(site.event.id)] != live_anchor else site
+            for site in pending_sites
+        ]
+
     def _create_pending(
         self,
         command: SessionPendingInterpretationCommand,
@@ -1177,6 +1268,13 @@ class _RepositoryInterpretationMutations:
             ).scalar_one_or_none()
             is not None
         )
+        inline_blob_snapshot = validator.inline_blob_snapshot
+        if inline_blob_snapshot is not None:
+            inline_blob_snapshot.assert_current_rows(connection, session_id=UUID(state._session_id))
+        if command.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
+            pending_sites = self._mark_stale_prompt_review_snapshots(
+                pending_sites, live_state=live_state, affected_node_id=command.affected_node_id, inline_blob_snapshot=inline_blob_snapshot
+            )
         snapshot = SessionPendingInterpretationSnapshot(
             anchor_state=anchor_state,
             live_state=live_state,
@@ -1185,9 +1283,6 @@ class _RepositoryInterpretationMutations:
             opt_out_marker_exists=marker_exists,
             superseded_events=tuple(self._event_record(row) for row in superseded_rows),
         )
-        inline_blob_snapshot = validator.inline_blob_snapshot
-        if inline_blob_snapshot is not None:
-            inline_blob_snapshot.assert_current_rows(connection, session_id=UUID(state._session_id))
         if policy is PendingInterpretationPolicy.PIPELINE_CANDIDATE:
             candidate_terms = (
                 connection.execute(
@@ -1221,6 +1316,20 @@ class _RepositoryInterpretationMutations:
         }
         if not set(decision.superseded_event_ids).issubset(matching_term_ids):
             raise SessionDerivedCustodyError
+        # Every prompt card stores the surface it shows (an inline one with no
+        # bindings), so the resolve can require the approval to name this
+        # snapshot's anchor. Derive it before this method's first write (the
+        # supersede below): a prompt event the live state cannot snapshot is
+        # refused with nothing written.
+        review_snapshot: PromptReviewSnapshot | None = None
+        if decision.insert_event and command.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
+            node_present, review_snapshot = self._live_prompt_review_snapshot(
+                live_state, affected_node_id=command.affected_node_id, inline_blob_snapshot=inline_blob_snapshot
+            )
+            if not node_present:
+                raise AuditIntegrityError("prompt review event has no live node to snapshot")
+            if review_snapshot is None:
+                raise AuditIntegrityError("prompt review event lost its surface during snapshot derivation")
         if decision.superseded_event_ids:
             superseded = connection.execute(
                 update(interpretation_events_table)
@@ -1256,8 +1365,16 @@ class _RepositoryInterpretationMutations:
         if decision.choice is None or decision.interpretation_source is None:
             raise SessionDerivedCustodyError
         appended_state = decision.appended_state
+        from elspeth.web.sessions.prompt_file_review import node_binds_prompt_file
+
+        # Re-derived here, not trusted from the planner: a file-backed prompt
+        # card ignores the opt-out and must stay pending for a person, while
+        # a vague term on that node still follows the opt-out.
+        node_reads_file = node_binds_prompt_file(snapshot.live_state, command.affected_node_id)
+        file_card = command.kind is InterpretationKind.LLM_PROMPT_TEMPLATE and node_reads_file
+        opt_out_applies = snapshot.review_disabled and not file_card
         if decision.choice is InterpretationChoice.PENDING:
-            if snapshot.review_disabled or decision.interpretation_source is not InterpretationSource.USER_APPROVED:
+            if opt_out_applies or decision.interpretation_source is not InterpretationSource.USER_APPROVED:
                 raise SessionDerivedCustodyError
             if (
                 decision.accepted_value is not None
@@ -1271,7 +1388,7 @@ class _RepositoryInterpretationMutations:
                 raise SessionDerivedCustodyError
         elif decision.choice is InterpretationChoice.OPTED_OUT:
             if (
-                not snapshot.review_disabled
+                not opt_out_applies
                 or decision.interpretation_source is not InterpretationSource.AUTO_INTERPRETED_OPT_OUT
                 or decision.accepted_value != command.llm_draft
                 or decision.resolved_at != command.created_at
@@ -1281,7 +1398,12 @@ class _RepositoryInterpretationMutations:
                 or appended_state is None
             ):
                 raise SessionDerivedCustodyError
-            if command.kind in {InterpretationKind.LLM_PROMPT_TEMPLATE, InterpretationKind.VAGUE_TERM}:
+            if command.kind is InterpretationKind.VAGUE_TERM and node_reads_file:
+                # No inline artifact hash covers a file-read prompt; the file
+                # card's approval is what admits those bytes to a run.
+                if decision.approved_prompt_artifact_hash is not None:
+                    raise SessionDerivedCustodyError
+            elif command.kind in {InterpretationKind.LLM_PROMPT_TEMPLATE, InterpretationKind.VAGUE_TERM}:
                 if not is_lower_sha256_hex(decision.approved_prompt_artifact_hash):
                     raise SessionDerivedCustodyError
             elif decision.approved_prompt_artifact_hash is not None:
@@ -1355,6 +1477,16 @@ class _RepositoryInterpretationMutations:
                 surface_origin=command.surface_origin.value,
             )
         )
+        if review_snapshot is not None:
+            connection.execute(
+                insert(prompt_review_snapshots_table).values(
+                    event_id=str(command.event_id),
+                    session_id=state._session_id,
+                    anchor=review_snapshot.anchor,
+                    snapshot_json=review_snapshot.payload(),
+                    created_at=command.created_at,
+                )
+            )
         appended_record = None
         if appended_state is not None:
             predecessor = connection.execute(
@@ -2561,6 +2693,7 @@ class _RepositoryBlobMutations:
         plan: BlobReplacementPlan,
         max_storage_per_session: int,
         accepting_proposal_id: UUID | None,
+        on_metadata_commit: Callable[[Connection], None] | None,
     ) -> BlobReplacementPlan:
         """Atomically replace exact blob metadata and record purge obligation."""
         state = self.__state
@@ -2643,6 +2776,8 @@ class _RepositoryBlobMutations:
             raise AuditIntegrityError("blob replacement commit ledger postcondition failed")
         if self._blob_record(state._require_blob(exact.blob_id)) != replacement:
             raise AuditIntegrityError("blob replacement commit metadata postcondition failed")
+        if on_metadata_commit is not None:
+            on_metadata_commit(connection)
         return committed
 
     def retire_blob_replacement(self, *, plan: BlobReplacementPlan, remaining_output_storage_bytes: int | None = None) -> bool:

@@ -61,6 +61,7 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
     {
         # Parameter forwarding inside the rejection builders.
         ("composer/tools/_common.py", "_failure_result", "error_code"),
+        ("blobs/prompt_text_routes.py", "_prompt_save_refusal", "code"),
         ("composer/tools/_common.py", "reject", "error_code"),
         ("composer/tools/_common.py", "_build_rejection_result", "error_code"),
         ("composer/tools/_common.py", "_candidate_rejection_result", "error_code"),
@@ -162,6 +163,7 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("sessions/routes/composer/state.py", "_state_with_imported_inline_blobs", "INLINE_BLOB_NOT_TEXT_CODE"),
         ("sessions/routes/composer/state.py", "_reject_pasted_inline_prompt_blob_mime", "INLINE_BLOB_NOT_TEXT_CODE"),
         ("execution/service.py", "_merge_authoritative_proof_diagnostics", "code"),
+        ("execution/service.py", "_authoritative_state_preflight_sync", "exc.error_code"),
         # Route projections and persistence of codes produced (and censused)
         # elsewhere; none of them authors a code.
         # The execute route and the tutorial run share this one projection.

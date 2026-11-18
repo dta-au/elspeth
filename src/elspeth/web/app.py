@@ -83,6 +83,7 @@ from elspeth.web.auth.session_token import (
     session_token_audience,
 )
 from elspeth.web.auth.sso import SsoAuthProvider, SsoDiscoveryFailed
+from elspeth.web.blobs.prompt_text_routes import create_prompt_text_router
 from elspeth.web.blobs.routes import create_blobs_router
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.catalog.routes import catalog_router
@@ -2420,6 +2421,7 @@ def _create_app(
     app.include_router(create_tutorial_run_router())
     app.include_router(create_tutorial_abandon_router())
     app.include_router(create_blobs_router())
+    app.include_router(create_prompt_text_router())
     app.include_router(create_secrets_router())
     app.include_router(create_execution_router())
     app.include_router(create_audit_readiness_router())

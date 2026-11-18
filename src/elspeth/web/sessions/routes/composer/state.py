@@ -30,6 +30,7 @@ from elspeth.web.catalog.schemas import PluginKind
 from elspeth.web.compartments import compartment_ingress_record, compartment_marking_header
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.state import CompositionState, SourceSpec
+from elspeth.web.composer.tools._common import _options_with_default_prompt_template_review
 from elspeth.web.composer.tools.blobs import (
     _apply_inline_blob_marker,
     _file_inject_blob_binding_error,
@@ -53,7 +54,12 @@ from elspeth.web.coordination.composer_progress_authority import (
 )
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.credential_guard import require_no_credential_material_in_state
-from elspeth.web.execution._validation_materialization import FILE_INJECT_ENTRY_RENAME_CONSEQUENCE, file_inject_state_refusals
+from elspeth.web.execution._validation_materialization import (
+    FILE_INJECT_ENTRY_RENAME_CONSEQUENCE,
+    file_inject_state_refusals,
+    llm_prompt_file_scalar_field,
+    llm_prompt_surface_field,
+)
 from elspeth.web.interpretation_state import (
     InterpretationReviewCapacityError,
     InterpretationReviewIntegrityError,
@@ -767,16 +773,33 @@ async def _state_with_imported_inline_blobs(
                 ),
             ) from None
         node_id = ref.field_path.partition(".options.")[0].removeprefix("node:")
-        if ref.field_path == f"node:{node_id}.options.prompt_template":
-            node = next((item for item in state.nodes if item.id == node_id), None)
-            if node is not None and node.plugin == "llm":
-                marker: dict[str, JsonValue] = {"blob_ref": str(blob.id), "mode": "inline_content", "sha256": content_hash}
-                structured_error = _structured_prompt_template_refusal(node_id, node.options, {"prompt_template": marker})
-                if structured_error is not None:
-                    raise HTTPException(
-                        status_code=400,
-                        detail={"error_code": "prompt_template_parts_required", "message": structured_error},
-                    )
+        node = next((item for item in state.nodes if item.id == node_id), None)
+        if node is not None and node.plugin == "llm" and llm_prompt_file_scalar_field(ref.field_path) is not None and encoding != "utf-8":
+            raise HTTPException(
+                status_code=400,
+                detail={"error_code": "inline_blob_field_path_invalid", "message": "File-backed LLM prompts require UTF-8 text."},
+            )
+        if (
+            node is not None
+            and node.plugin == "llm"
+            and llm_prompt_surface_field(ref.field_path) is not None
+            and llm_prompt_file_scalar_field(ref.field_path) is None
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error_code": "inline_blob_field_path_invalid",
+                    "message": "File-backed LLM prompts bind only to prompt_template, system_prompt, or a query template.",
+                },
+            )
+        if ref.field_path == f"node:{node_id}.options.prompt_template" and node is not None and node.plugin == "llm":
+            marker: dict[str, JsonValue] = {"blob_ref": str(blob.id), "mode": "inline_content", "sha256": content_hash}
+            structured_error = _structured_prompt_template_refusal(node_id, node.options, {"prompt_template": marker})
+            if structured_error is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error_code": "prompt_template_parts_required", "message": structured_error},
+                )
         prompt_surface_error = _llm_authored_prompt_surface_error(
             state,
             ref.field_path,
@@ -801,6 +824,24 @@ async def _state_with_imported_inline_blobs(
             rebound = _apply_inline_blob_marker(state, ref.field_path, marker, replace_existing=False)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=f"inline_blob_bindings path '{field_path}': {exc}") from None
+        if node is not None and node.plugin == "llm" and llm_prompt_file_scalar_field(ref.field_path) is not None:
+            rebound = replace(
+                rebound,
+                nodes=tuple(
+                    replace(
+                        item,
+                        options=_options_with_default_prompt_template_review(
+                            node_id=item.id,
+                            plugin=item.plugin,
+                            options=item.options,
+                            existing_options=node.options,
+                        ),
+                    )
+                    if item.id == node_id
+                    else item
+                    for item in rebound.nodes
+                ),
+            )
         state = replace(rebound, version=state.version)
     return state
 

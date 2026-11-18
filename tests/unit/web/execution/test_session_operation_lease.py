@@ -1964,8 +1964,12 @@ def _is_exact_worker_delegation_edge(call: ast.Call, callback: ast.AST) -> bool:
 
 
 def _is_exact_approval_binding_worker_edge(call: ast.Call, callback: ast.AST) -> bool:
-    """The pre-create approval compiler runs on a worker with the transferred context."""
-    expected_keywords = {"user_id", "session_id", "session_operation_context"}
+    """The pre-create approval compiler runs on a worker with the transferred context.
+
+    ``state_id`` names the frozen revision; its one reviewed value is the
+    state record the governed execute path loaded, never an alias.
+    """
+    expected_keywords = {"user_id", "session_id", "session_operation_context", "state_id"}
     keywords = {keyword.arg: keyword.value for keyword in call.keywords}
     return (
         isinstance(call.func, ast.Name)
@@ -1980,7 +1984,8 @@ def _is_exact_approval_binding_worker_edge(call: ast.Call, callback: ast.AST) ->
         and callback.attr == "_approval_inputs_from_frozen"
         and len(call.keywords) == len(expected_keywords)
         and set(keywords) == expected_keywords
-        and all(isinstance(value, ast.Name) and value.id == name for name, value in keywords.items())
+        and all(isinstance(value, ast.Name) and value.id == name for name, value in keywords.items() if name != "state_id")
+        and ast.unparse(keywords["state_id"]) == "state_record.id"
     )
 
 
@@ -3230,7 +3235,7 @@ def _exact_recovery_lease_owner_edges(member: _FunctionNode) -> frozenset[int]:
             node.id = alpha_roles[node.id]
         elif isinstance(node, ast.ExceptHandler) and node.name in alpha_roles:
             node.name = alpha_roles[node.name]
-    reviewed_shape = "4bc769cd586408eead0c595fa8225cca0f0013bd981e8c1dd52b50cc6a9e73ea"
+    reviewed_shape = "62ef866a864fe68cb8158187e2902f2b39c2b995d5c1e65fe60cbfe819a7d067"
     if hashlib.sha256(_stable_ast_bytes(canonical)).hexdigest() != reviewed_shape:
         return frozenset()
     return frozenset(
@@ -4043,7 +4048,18 @@ def test_worker_delegation_edge_admits_only_the_sole_local_callable(case_id: str
 
 @pytest.mark.parametrize(
     "mutation",
-    ["none", "other_worker", "rebound_worker", "other_helper", "missing_context", "wrong_context", "extra_argument"],
+    [
+        "none",
+        "other_worker",
+        "rebound_worker",
+        "other_helper",
+        "missing_context",
+        "wrong_context",
+        "extra_argument",
+        "missing_state_id",
+        "wrong_state_id",
+        "aliased_state_id",
+    ],
 )
 def test_approval_binding_worker_edge_admits_only_exact_transferred_context(mutation: str) -> None:
     owner = _class_node(ExecutionServiceImpl)
@@ -4073,6 +4089,14 @@ def test_approval_binding_worker_edge_admits_only_exact_transferred_context(muta
         context.value = ast.Name(id="other_context", ctx=ast.Load())
     elif mutation == "extra_argument":
         target.args.append(ast.Name(id="unreviewed_argument", ctx=ast.Load()))
+    elif mutation == "missing_state_id":
+        target.keywords = [keyword for keyword in target.keywords if keyword.arg != "state_id"]
+    elif mutation == "wrong_state_id":
+        state_id = next(keyword for keyword in target.keywords if keyword.arg == "state_id")
+        state_id.value = ast.parse("other_record.id", mode="eval").body
+    elif mutation == "aliased_state_id":
+        state_id = next(keyword for keyword in target.keywords if keyword.arg == "state_id")
+        state_id.value = ast.Name(id="state_id", ctx=ast.Load())
 
     findings = _execution_effect_findings(owner)
     if mutation == "none":
