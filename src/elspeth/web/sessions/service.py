@@ -5785,7 +5785,7 @@ class SessionServiceImpl:
                     "is_live_review": event.choice == InterpretationChoice.PENDING.value
                     and current_surface
                     == {
-                        key: snapshot.authored_surface[key]
+                        key: deep_thaw(snapshot.authored_surface[key])
                         for key in ("prompt_template", "system_prompt", "queries")
                         if key in snapshot.authored_surface
                     },

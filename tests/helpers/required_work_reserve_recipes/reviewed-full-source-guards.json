@@ -62,6 +62,6 @@
   },
   "src/elspeth/web/sessions/service.py": {
     "protected_exports": [],
-    "sha256": "84c27b4d6fcba8cc2d5720aa0ba50c914a99062500d6feb0c540d6fe69bf23d6"
+    "sha256": "d967b7f3aca0128dbf0b2b018510316bdc5bf6426f17bb68a1967357a4291620"
   }
 }

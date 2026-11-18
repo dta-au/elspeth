@@ -17,7 +17,7 @@ from uuid import UUID
 from elspeth.contracts.blobs import ALLOWED_MIME_TYPES, BlobRecord
 from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -66,6 +66,9 @@ class PromptFileBinding:
     provenance: Mapping[str, str | None]
     text: str
 
+    def __post_init__(self) -> None:
+        freeze_fields(self, "provenance")
+
     def anchor_payload(self) -> dict[str, object]:
         return {
             "field_path": self.field_path,
@@ -76,7 +79,7 @@ class PromptFileBinding:
             "filename": self.filename,
             "creation_modality": self.creation_modality,
             "created_by": self.created_by,
-            "provenance": dict(self.provenance),
+            "provenance": deep_thaw(self.provenance),
         }
 
     def payload(self) -> dict[str, object]:
@@ -93,12 +96,15 @@ class PromptReviewSnapshot:
     effective_artifact_hash: str | None
     version: int = 1
 
+    def __post_init__(self) -> None:
+        freeze_fields(self, "authored_surface")
+
     def payload(self) -> dict[str, object]:
         return {
             "version": self.version,
             "session_id": str(self.session_id),
             "node_id": self.node_id,
-            "authored_surface": dict(self.authored_surface),
+            "authored_surface": deep_thaw(self.authored_surface),
             "bindings": [binding.payload() for binding in self.bindings],
             "anchor": self.anchor,
             "effective_artifact_hash": self.effective_artifact_hash,

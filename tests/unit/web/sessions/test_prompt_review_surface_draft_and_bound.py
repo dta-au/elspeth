@@ -110,6 +110,12 @@ def _multi_query_options() -> dict[str, Any]:
     }
 
 
+def _list_form_multi_query_options() -> dict[str, Any]:
+    options = _multi_query_options()
+    options["queries"] = [{"name": name, **query} for name, query in options["queries"].items()]
+    return options
+
+
 def _long_single_prompt_options() -> dict[str, Any]:
     head = "Classify the sentiment of {{ row.text }} as positive, negative or neutral. "
     body = "Consider tone, context and intent carefully before answering. "
@@ -241,6 +247,27 @@ async def test_writer_rejects_a_long_single_prompt_event_carrying_the_unbounded_
 # --------------------------------------------------------------------------- #
 # (2) accepted_as_drafted resolves; the runtime contract is untouched
 # --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("options_factory", [_multi_query_options, _list_form_multi_query_options], ids=["mapping", "list"])
+async def test_multi_query_card_is_live_while_its_text_is_unchanged(session_service, options_factory) -> None:
+    """The snapshot's frozen surface still matches the node read back from JSON.
+
+    ``PromptReviewSnapshot`` freezes ``authored_surface`` (a list becomes a
+    tuple) while the current node comes back from JSON with plain lists, so
+    liveness must compare thawed values or a list-form card reads as stale.
+    """
+    options = options_factory()
+    surface_draft = prompt_review_draft_from_options(options)
+    assert surface_draft is not None
+    session_id, event = await _create_event(session_service, options=options, llm_draft=surface_draft)
+
+    snapshot = await session_service.get_prompt_review_snapshot(session_id, event.id)
+
+    assert snapshot is not None
+    assert type(snapshot["authored_surface"]["queries"]) is type(options["queries"])
+    assert snapshot["is_live_review"] is True
 
 
 def _resolved_node(nodes: Any) -> Mapping[str, Any]:
