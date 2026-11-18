@@ -92,7 +92,11 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   }, [activeSessionId, loadBlobs]);
 
   useLayoutEffect(() => {
-    if (!revealRequest || revealRequest.sessionId !== activeSessionId || isLoading || !listBelongsToSession) return;
+    // Read loading from the store, not this render's closure: the mount-time
+    // loadBlobs above runs first in this same commit and flips isLoading
+    // synchronously. Acting on the stale `false` would focus a cached row the
+    // "Loading..." render then unmounts, and consume the request with it.
+    if (!revealRequest || revealRequest.sessionId !== activeSessionId || useBlobStore.getState().isLoading || !listBelongsToSession) return;
     const hiddenPane = listRef.current?.closest("[hidden], [inert]");
     if (hiddenPane) {
       const observer = new MutationObserver(() => {
