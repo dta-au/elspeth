@@ -1805,7 +1805,6 @@ class TestB3Construction:
         assert mock_from_settings.call_args.args[0] is not mock_load.return_value.rate_limit
 
 
-@pytest.mark.usefixtures("mock_pipeline_config_assembly")
 def _mock_inline_prompt_state(mock_session_service: MagicMock, *, session_id: UUID, blob_id: UUID, sha256: str, tmp_path: Path) -> None:
     """Model the persisted state now read for scalar prompt-file admission."""
     mock_session_service.get_state_in_session.return_value = _composition_state_record(
@@ -1829,6 +1828,7 @@ def _mock_inline_prompt_state(mock_session_service: MagicMock, *, session_id: UU
     )
 
 
+@pytest.mark.usefixtures("mock_pipeline_config_assembly")
 class TestInlineBlobRuntimePreflight:
     """Inline-content blob refs resolve before plugin construction.
 
@@ -1853,9 +1853,7 @@ class TestInlineBlobRuntimePreflight:
         mock_session_service: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
-        mock_pipeline_config_assembly: MagicMock,
     ) -> None:
-        del mock_pipeline_config_assembly
         # Blob bytes are attacker-controllable. A ${VAR} smuggled inside them is
         # invisible to preflight (the blob is an opaque ref at validation time),
         # so it must NOT be expanded against the host environment at execution.
@@ -1965,6 +1963,114 @@ sinks:
         assert len(resolutions) == 1
         assert resolutions[0].field_path == "node:classify.options.system_prompt"
         assert resolutions[0].content_hash == sha256
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_fresh_run_carries_admitted_prompt_evidence_into_orchestrator_run(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """The snapshot final admission returns is the evidence ``begin_run`` records.
+
+        ``Orchestrator.run`` is the only web call that carries admitted prompt
+        evidence into run creation; an empty or dropped ``run_prompt_inputs``
+        would start a provider-calling run with no prompt-input rows.
+        """
+        from elspeth.contracts.run_prompt_input import RunPromptInputEvidence
+        from elspeth.web.sessions.prompt_file_review import PromptReviewSnapshot
+
+        del mock_payload_cls
+        content = b"You are an audited prompt."
+        blob_id = uuid4()
+        run_id = uuid4()
+        owner_session = uuid4()
+        sha256 = hashlib.sha256(content).hexdigest()
+        _mock_inline_prompt_state(mock_session_service, session_id=owner_session, blob_id=blob_id, sha256=sha256, tmp_path=tmp_path)
+        mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=owner_session)
+        blob_service = _blob_service_stub()
+        blob_service.link_blob_to_run.return_value = None
+        blob_service.read_blob_content.return_value = content
+        blob_service.get_blob.return_value = _blob_record_stub(
+            blob_id=blob_id,
+            session_id=owner_session,
+            content_hash=sha256,
+            size_bytes=len(content),
+        )
+        blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
+        cast(Any, service)._blob_service = blob_service
+
+        # Spy on the real admission so the expected evidence is the snapshot it
+        # actually returned, not one the test fabricates.
+        real_admission = ExecutionServiceImpl._assert_state_prompt_file_approvals
+        admitted: list[tuple[PromptReviewSnapshot, ...]] = []
+
+        def admission_spy(self_: ExecutionServiceImpl, *args: Any, **kwargs: Any) -> tuple[PromptReviewSnapshot, ...]:
+            snapshots = real_admission(self_, *args, **kwargs)
+            admitted.append(snapshots)
+            return snapshots
+
+        monkeypatch.setattr(ExecutionServiceImpl, "_assert_state_prompt_file_approvals", admission_spy)
+
+        mock_load.return_value = _mock_pipeline_settings()
+        mock_runtime_graph.return_value = SimpleNamespace(plugin_bundle=_plugin_bundle_stub(), graph=_execution_graph_stub())
+        mock_orch = _orchestrator_stub(_orchestrator_result_stub(run_id=str(run_id), rows_processed=1, rows_succeeded=1))
+        mock_orch_cls.return_value = mock_orch
+        mock_landscape_cls.return_value.write_connection.return_value.__enter__.return_value.execute.return_value.one_or_none.return_value = None
+
+        pipeline_yaml = f"""
+source:
+  plugin: csv
+  options:
+    path: input.csv
+transforms:
+  - name: classify
+    plugin: llm
+    options:
+      prompt_template: "Summarize {{{{ row.body }}}}"
+      system_prompt:
+        blob_ref: {blob_id}
+        mode: inline_content
+        sha256: {sha256}
+sinks:
+  primary:
+    plugin: json
+    options:
+      path: output.jsonl
+"""
+
+        with patch(
+            "elspeth.web.execution.service.load_run_accounting_from_db",
+            return_value=_run_accounting_for_status(RunStatus.COMPLETED),
+        ):
+            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
+
+        assert len(admitted) == 1
+        (snapshot,) = admitted[0]
+        assert snapshot.node_id == "classify"
+        mock_session_service.assert_prompt_file_approvals.assert_called_once_with(snapshot)
+        mock_orch.run.assert_called_once()
+        assert mock_orch.run.call_args.kwargs["run_id"] == str(run_id)
+        assert mock_orch.run.call_args.kwargs["run_prompt_inputs"] == (
+            RunPromptInputEvidence(
+                node_id="classify",
+                field_path="system_prompt",
+                blob_id=str(blob_id),
+                content_sha256=sha256,
+                review_anchor=snapshot.anchor,
+                effective_artifact_hash=snapshot.effective_artifact_hash,
+            ),
+        )
 
     @patch("elspeth.web.execution.service.Orchestrator")
     @patch("elspeth.web.execution.service.build_validated_runtime_graph")
@@ -2184,7 +2290,7 @@ sinks:
     @patch("elspeth.web.execution.service.load_settings_from_yaml_string")
     @patch("elspeth.web.execution.service.open_landscape_db")
     @patch("elspeth.web.execution.service.FilesystemPayloadStore")
-    def test_hash_mismatch_increments_zero_threshold_counter_without_run_id_label(
+    def test_prompt_marker_hash_mismatch_is_stale_review_without_integrity_alert(
         self,
         mock_payload_cls: MagicMock,
         mock_landscape_cls: MagicMock,
@@ -2246,6 +2352,89 @@ sinks:
         # Metadata disagrees with the authored prompt marker before a custody
         # read; this is stale review evidence, not a stored-byte integrity hit.
         hash_counter.add.assert_not_called()
+        mock_load.assert_not_called()
+        mock_orch_cls.assert_not_called()
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_hash_mismatch_increments_zero_threshold_counter_without_run_id_label(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A non-prompt inline ref whose marker disagrees with the stored hash is an integrity hit.
+
+        Prompt-file slots turn the same disagreement into ``PromptFileReviewStale``
+        (see the test above); a ``file_inject`` upload has no review, so the
+        mismatch stays ``BlobIntegrityError`` and fires the zero-threshold alert.
+        """
+        from elspeth.web.blobs.protocol import BlobIntegrityError
+        from elspeth.web.execution import service as service_module
+
+        del mock_payload_cls, mock_landscape_cls, mock_runtime_graph
+        content = b"Check the totals.\n"
+        blob_id = uuid4()
+        run_id = uuid4()
+        owner_session = uuid4()
+        mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=owner_session)
+        hash_counter = MagicMock(spec=["add"])
+        monkeypatch.setattr(service_module, "_BLOB_INLINE_HASH_MISMATCH_TOTAL", hash_counter)
+
+        # A user upload, so the file_inject upload-only refusal admits it and the
+        # metadata check is what refuses the run.
+        blob_record = _blob_record_stub(
+            blob_id=blob_id,
+            session_id=owner_session,
+            content_hash=hashlib.sha256(content).hexdigest(),
+            size_bytes=len(content),
+        )
+
+        blob_service = _blob_service_stub()
+        blob_service.link_blob_to_run.return_value = None
+        blob_service.read_blob_content.return_value = content
+        blob_service.get_blob.return_value = blob_record
+        blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
+        cast(Any, service)._blob_service = blob_service
+
+        pipeline_yaml = f"""
+source:
+  plugin: csv
+  options:
+    path: input.csv
+transforms:
+  - name: inject
+    plugin: file_inject
+    options:
+      files:
+        invoice:
+          format: text
+          content:
+            blob_ref: {blob_id}
+            mode: inline_content
+            sha256: {"b" * 64}
+sinks:
+  primary:
+    plugin: json
+    options:
+      path: output.jsonl
+"""
+
+        with pytest.raises(BlobIntegrityError):
+            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
+
+        # Zero-threshold alert: one increment, no attributes, so no run_id label.
+        hash_counter.add.assert_called_once_with(1)
+        blob_service.read_blob_content.assert_not_awaited()
+        mock_session_service.record_blob_inline_resolutions.assert_not_called()
         mock_load.assert_not_called()
         mock_orch_cls.assert_not_called()
 
