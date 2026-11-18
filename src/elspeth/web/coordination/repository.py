@@ -1316,6 +1316,20 @@ class _RepositoryInterpretationMutations:
         }
         if not set(decision.superseded_event_ids).issubset(matching_term_ids):
             raise SessionDerivedCustodyError
+        # Every prompt card stores the surface it shows (an inline one with no
+        # bindings), so the resolve can require the approval to name this
+        # snapshot's anchor. Derive it before this method's first write (the
+        # supersede below): a prompt event the live state cannot snapshot is
+        # refused with nothing written.
+        review_snapshot: PromptReviewSnapshot | None = None
+        if decision.insert_event and command.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
+            node_present, review_snapshot = self._live_prompt_review_snapshot(
+                live_state, affected_node_id=command.affected_node_id, inline_blob_snapshot=inline_blob_snapshot
+            )
+            if not node_present:
+                raise AuditIntegrityError("prompt review event has no live node to snapshot")
+            if review_snapshot is None:
+                raise AuditIntegrityError("prompt review event lost its surface during snapshot derivation")
         if decision.superseded_event_ids:
             superseded = connection.execute(
                 update(interpretation_events_table)
@@ -1463,25 +1477,16 @@ class _RepositoryInterpretationMutations:
                 surface_origin=command.surface_origin.value,
             )
         )
-        if command.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
-            # Every prompt card stores the surface it shows (an inline one with
-            # no bindings), so the resolve can require the approval to name
-            # this snapshot's anchor.
-            node_present, review_snapshot = self._live_prompt_review_snapshot(
-                live_state, affected_node_id=command.affected_node_id, inline_blob_snapshot=inline_blob_snapshot
-            )
-            if node_present:
-                if review_snapshot is None:
-                    raise AuditIntegrityError("prompt review event lost its surface during snapshot derivation")
-                connection.execute(
-                    insert(prompt_review_snapshots_table).values(
-                        event_id=str(command.event_id),
-                        session_id=state._session_id,
-                        anchor=review_snapshot.anchor,
-                        snapshot_json=review_snapshot.payload(),
-                        created_at=command.created_at,
-                    )
+        if review_snapshot is not None:
+            connection.execute(
+                insert(prompt_review_snapshots_table).values(
+                    event_id=str(command.event_id),
+                    session_id=state._session_id,
+                    anchor=review_snapshot.anchor,
+                    snapshot_json=review_snapshot.payload(),
+                    created_at=command.created_at,
                 )
+            )
         appended_record = None
         if appended_state is not None:
             predecessor = connection.execute(

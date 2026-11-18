@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -81,11 +82,13 @@ from elspeth.web.sessions.models import (
     session_operation_fences_table,
     sessions_table,
 )
+from elspeth.web.sessions.pending_interpretation import _SessionPendingInterpretationPlanner
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateProvenance,
     CompositionStateRecord,
     CompositionValidationError,
+    InterpretationNodeMissingError,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import (
@@ -741,6 +744,66 @@ async def test_02_create_pending_rejects_unknown_node_id(service) -> None:
             select(interpretation_events_table).where(interpretation_events_table.c.session_id == str(session_id))
         ).fetchall()
     assert count == [], "interpretation_events must be empty after writer-boundary raise"
+
+
+async def _create_prompt_card_after_node_removed(service: SessionServiceImpl) -> UUID:
+    """Surface a prompt card for a node a newer head no longer has."""
+    session_id = uuid4()
+    anchor = await _seed_state_with_llm_node(service, session_id=session_id, node=_prompt_template_review_node())
+    await _save_composition_state(
+        service,
+        session_id,
+        CompositionStateData(nodes=[], metadata_={"name": "Phase 5b Test", "description": ""}, is_valid=True),
+        provenance="tool_call",
+    )
+    await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=anchor.id,
+        affected_node_id="identify_colour",
+        tool_call_id="call_prompt_template",
+        user_term="llm_prompt_template:identify_colour",
+        kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
+        llm_draft="Read {{ row.html }} and return JSON.",
+        model_identifier="anthropic/claude-opus-4-7",
+        model_version="2026-05-01",
+        provider="anthropic",
+        composer_skill_hash="a" * 64,
+    )
+    return session_id
+
+
+def _prompt_review_rows(service: SessionServiceImpl) -> tuple[list[Any], list[Any]]:
+    with service._engine.begin() as conn:
+        events = conn.execute(select(interpretation_events_table)).fetchall()
+        snapshots = conn.execute(select(prompt_review_snapshots_table)).fetchall()
+    return events, snapshots
+
+
+@pytest.mark.asyncio
+async def test_planner_refuses_prompt_card_whose_node_left_the_live_state(service) -> None:
+    """The planner is the first refusal: its live identity lookup cannot find
+    the node, and with no pending card to reconcile it re-raises."""
+    with pytest.raises(InterpretationNodeMissingError):
+        await _create_prompt_card_after_node_removed(service)
+    assert _prompt_review_rows(service) == ([], [])
+
+
+@pytest.mark.asyncio
+async def test_writer_refuses_prompt_card_it_cannot_snapshot_even_if_planner_admits_it(service, monkeypatch) -> None:
+    """Every stored prompt card has a snapshot, independently of the planner.
+
+    A planner regression is simulated by planning against the anchor state as
+    though it were live; the writer still finds no live node to snapshot and
+    refuses before any write, so no event exists without its snapshot."""
+    real_plan = _SessionPendingInterpretationPlanner.plan
+
+    def _plan_against_anchor(command: Any, snapshot: Any, validator: Any, *, policy: Any) -> Any:
+        return real_plan(command, replace(snapshot, live_state=snapshot.anchor_state), validator, policy=policy)
+
+    monkeypatch.setattr(_SessionPendingInterpretationPlanner, "plan", staticmethod(_plan_against_anchor))
+    with pytest.raises(AuditIntegrityError, match="no live node to snapshot"):
+        await _create_prompt_card_after_node_removed(service)
+    assert _prompt_review_rows(service) == ([], [])
 
 
 @pytest.mark.asyncio
