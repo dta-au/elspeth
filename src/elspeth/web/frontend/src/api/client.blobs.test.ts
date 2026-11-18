@@ -56,4 +56,27 @@ describe("api/client blob preview", () => {
       }),
     );
   });
+
+  it("surfaces the server's prompt-save refusal code and message from the nested detail object", async () => {
+    fetchSpy.mockResolvedValue({
+      ok: false,
+      status: 409,
+      statusText: "Conflict",
+      headers: { get: () => null },
+      json: async () => ({
+        detail: {
+          error_code: "prompt_file_shared",
+          message: "This file is also used by another prompt. Ask the assistant to give this step its own copy.",
+        },
+      }),
+    } as unknown as Response);
+
+    await expect(
+      savePromptFile("session-1", "blob-1", "text", "a".repeat(64), "first", "prompt_template"),
+    ).rejects.toMatchObject({
+      status: 409,
+      error_type: "prompt_file_shared",
+      detail: "This file is also used by another prompt. Ask the assistant to give this step its own copy.",
+    });
+  });
 });
