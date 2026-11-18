@@ -22,6 +22,13 @@ vi.mock("@/api/client", () => ({
   resolveInterpretation: vi.fn(),
   optOutOfInterpretations: vi.fn(),
   getInterpretationOptOutSummary: vi.fn(),
+  // Each prompt card loads its stored review snapshot; default to one whose
+  // template is the card's own preview text.
+  getPromptReviewSnapshot: vi.fn((sessionId: string, eventId: string) => Promise.resolve({
+    version: 1, session_id: sessionId, node_id: "node-1", event_id: eventId,
+    authored_surface: { prompt_template: "Stored snapshot template." }, bindings: [],
+    anchor: "a".repeat(64), effective_artifact_hash: null, is_live_review: true,
+  })),
 }));
 
 import * as api from "@/api/client";
@@ -274,57 +281,43 @@ describe("AcknowledgementStack — foot-of-stack opt-out", () => {
   });
 });
 
-describe("AcknowledgementStack — compositionState threading", () => {
-  // Truth test, not an existence test: the card can only render the accepted
-  // sibling value if the stack actually passes its subscribed
-  // compositionState down (elspeth-990f5ea562).
-  it("threads the live compositionState into each card so resolved slot values render", async () => {
+describe("AcknowledgementStack — prompt card from the stored snapshot", () => {
+  // The verifier's two-tab sequence (verify-A A1): this tab still holds v5,
+  // where system_prompt is "A"; another tab moved the server to v6 ("B") and
+  // surfaced the card. The card must show and approve the server's snapshot,
+  // never this tab's stale compositionState.
+  it("shows the snapshot surfaced by the other tab and approves its anchor", async () => {
     const user = userEvent.setup();
-    const promptNode: NodeSpec = {
-      ...makeNode("llm", "llm"),
-      options: {
-        prompt_template_parts: [
-          { kind: "text", text: "Summarise " },
-          { kind: "interpretation_ref", requirement_id: "req-1" },
-          { kind: "text", text: " for an auditor." },
-        ],
-        interpretation_requirements: [
-          {
-            id: "req-1",
-            kind: "vague_term",
-            user_term: "punchy",
-            status: "resolved",
-            draft: "short and direct",
-            event_id: "evt-vague-1",
-            accepted_value: "concise and neutral",
-            accepted_artifact_hash: null,
-            approved_prompt_artifact_hash: null,
-          },
-        ],
-      },
-    };
+    const anchor = "6".repeat(64);
     useSessionStore.setState({
-      compositionState: makeCompositionState([promptNode]),
+      compositionState: makeCompositionState([{
+        ...makeNode("llm", "llm"),
+        options: { system_prompt: "A (stale tab)", prompt_template: "Stale tab template." },
+      }]),
     });
-    seedPending([
-      makeEvent("e1", {
-        kind: "llm_prompt_template",
-        affected_node_id: "llm",
-        user_term: null,
-        llm_draft: "Summarise pending interpretation for an auditor.",
-      }),
-    ]);
+    vi.mocked(api.getPromptReviewSnapshot).mockResolvedValueOnce({
+      version: 1, session_id: SID, node_id: "llm", event_id: "e1",
+      authored_surface: { system_prompt: "B (server)", prompt_template: "Server template." }, bindings: [],
+      anchor, effective_artifact_hash: null, is_live_review: true,
+    });
+    const event = makeEvent("e1", { kind: "llm_prompt_template", affected_node_id: "llm", user_term: null, llm_draft: "Bounded preview." });
+    seedPending([event]);
+    vi.mocked(api.resolveInterpretation).mockResolvedValue({
+      event: { ...event, choice: "accepted_as_drafted", accepted_value: event.llm_draft, resolved_at: "2026-06-22T01:00:00Z" },
+      new_state: makeCompositionState([]),
+    });
     render(<AcknowledgementStack sessionId={SID} />);
 
     await user.click(screen.getByRole("button", { name: "View prompt" }));
-    const region = screen.getByRole("region", {
-      name: /prompt template review/i,
-    });
-    // The PRIMARY render (first pre) carries the substitution; the frozen
-    // mask survives only inside the 'View original template' disclosure.
-    const primaryPre = region.querySelector("pre.ack-card-prompt-pre");
-    expect(primaryPre?.textContent).toContain("concise and neutral");
-    expect(primaryPre?.textContent).not.toContain("pending interpretation");
+    const region = screen.getByRole("region", { name: /prompt template review/i });
+    await waitFor(() => expect(region).toHaveTextContent("B (server)"));
+    expect(region).toHaveTextContent("Server template.");
+    expect(region).not.toHaveTextContent("stale tab");
+    expect(region).not.toHaveTextContent("Stale tab template.");
+    await user.click(screen.getByRole("button", { name: /approve the llm prompt template/i }));
+    await waitFor(() => expect(api.resolveInterpretation).toHaveBeenCalledWith(
+      SID, "e1", { choice: "accepted_as_drafted", reviewed_anchor: anchor },
+    ));
   });
 });
 

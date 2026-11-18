@@ -104,6 +104,8 @@ Schema and stored data:
   tutorial run), and when pipeline YAML is imported. Each refusal says how to
   fix it; switching a structured prompt to a file is not supported in this
   release.
+- The prompt review card shows exactly the reviewed snapshot; each
+  interpretation slot shows whether its own review is pending or accepted.
 
 ### Release pipeline
 

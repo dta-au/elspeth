@@ -2672,17 +2672,31 @@
   color: var(--color-text);
 }
 
-/* Interpretation slots substituted into the displayed prompt
-   (elspeth-990f5ea562).  Resolved slots carry the accepted value; pending
-   slots carry the sibling review's draft.  <mark> keeps the UA's
-   forced-colors treatment for free — no forced-colors block here. */
+/* The prompt card's changed-snapshot live region. Always mounted so the
+   notice is announced when it appears; it takes no space while empty. */
+.ack-card-review-notice {
+  margin: 0 0 var(--space-2xs);
+  color: var(--color-text);
+  font-size: var(--font-size-sm);
+  line-height: 1.45;
+}
+
+.ack-card-review-notice:empty {
+  margin: 0;
+}
+
+/* Interpretation slots in the displayed prompt (elspeth-990f5ea562, then
+   PFR #1-resolve): each span says the term is reviewed in its own card and
+   is tinted by that review's live status. It never shows the slot's value.
+   <mark> keeps the UA's forced-colors treatment for free, and the status is
+   in the span's text too, so no forced-colors block belongs here. */
 .ack-card-prompt-slot {
   padding: 0 var(--space-2xs);
   border-radius: var(--radius-sm);
   color: var(--color-text);
 }
 
-.ack-card-prompt-slot--resolved {
+.ack-card-prompt-slot--accepted {
   background-color: var(--color-highlight);
 }
 
@@ -2691,11 +2705,15 @@
   border: 1px solid var(--color-warning-border);
 }
 
-/* Visible key for the two slot tints (ux-review 2026-08-13).  The swatches
-   reuse the slot modifier classes so a tint change can never desynchronise
-   the key from the thing it keys.  They are decoration only — under
-   forced-colors the backgrounds are stripped, so the DISTINCTION lives in
-   each item's text, which is why no forced-colors block belongs here. */
+.ack-card-prompt-slot--unknown {
+  background-color: transparent;
+  border: 1px dashed var(--color-border);
+}
+
+/* Visible key for the slot tints (ux-review 2026-08-13).  The swatches reuse
+   the slot modifier classes so a tint change can never desynchronise the key
+   from the thing it keys.  They are decoration only; the DISTINCTION lives in
+   each item's text. */
 .ack-card-prompt-legend {
   display: flex;
   flex-wrap: wrap;

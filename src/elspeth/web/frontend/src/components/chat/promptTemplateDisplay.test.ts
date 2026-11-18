@@ -1,313 +1,157 @@
 // ============================================================================
-// promptTemplateDisplay — pure-helper coverage for the resolved-prompt
-// rendering chain (elspeth-990f5ea562): structured parts → node
-// prompt_template → event llm_draft.
+// promptTemplateDisplay — pure-helper coverage for rendering a prompt review
+// card from the server's stored review snapshot (never browser state).
 // ============================================================================
 
 import { describe, it, expect } from "vitest";
-import {
-  PENDING_INTERPRETATION_DISPLAY_TEXT,
-  resolvePromptDisplaySegments,
-} from "./promptTemplateDisplay";
-import type { CompositionState, NodeSpec } from "@/types/index";
-import type { InterpretationEvent, PromptReviewSnapshotResponse } from "@/types/interpretation";
-import { compositionStateAuthorityFields } from "@/test/composerFixtures";
+import { promptReviewDisplay, promptSlotStatus } from "./promptTemplateDisplay";
+import type { InterpretationEvent } from "@/types/interpretation";
+import type { PromptReviewSnapshotResponse } from "@/types/interpretation";
 
-function makeEvent(
-  overrides: Partial<InterpretationEvent> = {},
-): InterpretationEvent {
+type Binding = PromptReviewSnapshotResponse["bindings"][number];
+
+function snapshot(
+  authoredSurface: Record<string, unknown>,
+  overrides: Partial<PromptReviewSnapshotResponse> = {},
+): PromptReviewSnapshotResponse {
   return {
-    id: "evt-1",
+    version: 1,
     session_id: "sess-1",
-    composition_state_id: "state-1",
-    affected_node_id: "node-1",
-    tool_call_id: "tool-1",
-    user_term: null,
-    kind: "llm_prompt_template",
-    llm_draft: "Summarise pending interpretation for an auditor.",
-    accepted_value: null,
-    choice: "pending",
-    created_at: "2026-05-18T00:00:00Z",
-    resolved_at: null,
-    actor: "user:owner:u-1",
-    interpretation_source: "user_approved",
-    model_identifier: "anthropic/claude-opus-4-7",
-    model_version: "20260518",
-    provider: "anthropic",
-    composer_skill_hash: "deadbeef",
-    arguments_hash: null,
-    hash_domain_version: null,
-    runtime_model_identifier_at_resolve: null,
-    runtime_model_version_at_resolve: null,
-    approved_prompt_artifact_hash: null,
+    node_id: "node-1",
+    event_id: "evt-1",
+    authored_surface: authoredSurface,
+    bindings: [],
+    anchor: "b".repeat(64),
+    effective_artifact_hash: null,
+    is_live_review: true,
     ...overrides,
   };
 }
 
-function makeNode(options: Record<string, unknown>): NodeSpec {
+function binding(fieldPath: string, text: string, filename = "review.txt"): Binding {
   return {
-    id: "node-1",
-    node_type: "transform",
-    plugin: "llm",
-    input: "rows",
-    on_success: null,
-    on_error: null,
-    options,
+    field_path: fieldPath,
+    blob_id: "blob-1",
+    content_sha256: "a".repeat(64),
+    encoding: "utf-8",
+    byte_length: text.length,
+    filename,
+    creation_modality: "LLM_GENERATED",
+    created_by: "assistant",
+    provenance: {},
+    text,
   };
 }
 
-function makeState(nodes: NodeSpec[]): CompositionState {
-  return {
-    id: "state-1",
-    ...compositionStateAuthorityFields,
-    version: 2,
-    sources: {},
-    nodes,
-    edges: [],
-    outputs: [],
-    metadata: { name: null, description: null },
-  };
+const MARKER = { blob_ref: "blob-1", mode: "inline_content", sha256: "a".repeat(64) };
+
+function display(authoredSurface: Record<string, unknown>) {
+  return promptReviewDisplay("evt-1", snapshot(authoredSurface));
 }
 
-const STRUCTURED_PARTS = [
-  { kind: "text", text: "Summarise " },
-  { kind: "interpretation_ref", requirement_id: "req-1" },
-  { kind: "text", text: " for an auditor." },
-];
+describe("promptReviewDisplay — single prompt", () => {
+  it("shows the snapshot's template and system prompt", () => {
+    const result = display({ system_prompt: "You are a careful reviewer.", prompt_template: "Summarise {{ row.text }}." });
+    expect(result).toEqual({
+      reviewAvailable: true,
+      segments: [{ kind: "text", text: "Summarise {{ row.text }}." }],
+      text: "Summarise {{ row.text }}.",
+      systemPrompt: "You are a careful reviewer.",
+      hasPendingSlot: false,
+    });
+  });
 
-describe("file-backed prompt review", () => {
-  it("shows complete escaped file text and its label for a deferred marker", () => {
-    const marker = { blob_ref: "blob-1", mode: "inline_content", sha256: "a".repeat(64) };
-    const state = makeState([makeNode({ prompt_template: marker })]);
-    const snapshot: PromptReviewSnapshotResponse = {
-      version: 1,
-      session_id: "sess-1",
-      node_id: "node-1",
-      event_id: "evt-1",
-      authored_surface: { prompt_template: marker },
-      bindings: [{
-        field_path: "prompt_template",
-        blob_id: "blob-1",
-        content_sha256: "a".repeat(64),
-        encoding: "utf-8",
-        byte_length: 24,
-        filename: "review.txt",
-        creation_modality: "LLM_GENERATED",
-        created_by: "assistant",
-        provenance: {},
-        text: "  <unsafe> & exact\n\nline  ",
-      }],
-      anchor: "b".repeat(64),
-      effective_artifact_hash: "c".repeat(64),
-      is_live_review: true,
-    };
-    const result = resolvePromptDisplaySegments(state, makeEvent(), snapshot);
+  it("shows a structured prompt's unresolved slot in the backend's own wording, flagged", () => {
+    // A structured prompt is stored with PENDING_INTERPRETATION_AUTHORING_TEXT
+    // at each unresolved slot (interpretation_state.py _render_prompt_parts).
+    const result = display({ prompt_template: "Summarise pending interpretation for an auditor." });
+    expect(result.text).toBe("Summarise pending interpretation for an auditor.");
+    expect(result.hasPendingSlot).toBe(true);
+  });
+
+  it("never shows a raw {{interpretation: term}} placeholder: it reads as the pending-slot wording", () => {
+    const result = display({
+      prompt_template: "Rate how {{interpretation:cool}} this is, then {{ interpretation : punchy }} it.",
+    });
+    expect(result.text).toBe("Rate how pending interpretation this is, then pending interpretation it.");
+    expect(result.text).not.toContain("{{");
+    expect(result.hasPendingSlot).toBe(true);
+    const multi = display({ prompt_template: "Shared.", queries: [{ name: "q", template: "Use {{interpretation:tone}}." }] });
+    expect(multi.text).toContain("Query 'q':\nUse pending interpretation.\n");
+  });
+
+  it("leaves a bound file's text verbatim, placeholder-like text included", () => {
+    const result = promptReviewDisplay("evt-1", snapshot(
+      { prompt_template: MARKER },
+      { bindings: [binding("prompt_template", "Literal {{interpretation:x}} in a file.")] },
+    ));
+    expect(result.text).toContain("Literal {{interpretation:x}} in a file.");
+  });
+
+  it("reports no system prompt as null", () => {
+    expect(display({ prompt_template: "T." }).systemPrompt).toBeNull();
+    expect(display({ prompt_template: "T.", system_prompt: 42 }).systemPrompt).toBeNull();
+  });
+
+  it("is not approvable without a text template", () => {
+    for (const surface of [{}, { prompt_template: 7 }, { prompt_template: null }]) {
+      expect(display(surface).reviewAvailable).toBe(false);
+    }
+  });
+
+  it("is not approvable for a snapshot of another event", () => {
+    const result = promptReviewDisplay("evt-other", snapshot({ prompt_template: "T." }));
+    expect(result.reviewAvailable).toBe(false);
+    expect(result.text).not.toContain("T.");
+  });
+
+  it("does not gate an inline snapshot on is_live_review (a slot resolve rewrites the live text)", () => {
+    const result = promptReviewDisplay("evt-1", snapshot({ prompt_template: "T." }, { is_live_review: false }));
     expect(result.reviewAvailable).toBe(true);
-    expect(result.segments.map((segment) => segment.text).join(""))
-      .toContain("File: review.txt (prompt_template)\n\n  <unsafe> & exact\n\nline  ");
-    expect(result.segments.map((segment) => segment.text).join(""))
-      .not.toContain("not text");
   });
 });
 
-function makeRequirement(
-  overrides: Record<string, unknown> = {},
-): Record<string, unknown> {
-  return {
-    id: "req-1",
-    kind: "vague_term",
-    user_term: "punchy",
-    status: "pending",
-    draft: "short and direct",
-    event_id: "evt-vague-1",
-    accepted_value: null,
-    accepted_artifact_hash: null,
-    resolved_prompt_template_hash: null,
-    ...overrides,
-  };
-}
-
-describe("resolvePromptDisplaySegments — structured parts", () => {
-  it("substitutes a resolved requirement's accepted_value as a 'resolved' segment", () => {
-    const state = makeState([
-      makeNode({
-        prompt_template_parts: STRUCTURED_PARTS,
-        interpretation_requirements: [
-          makeRequirement({ status: "resolved", accepted_value: "concise and neutral" }),
-        ],
-      }),
-    ]);
-    const result = resolvePromptDisplaySegments(state, makeEvent());
-    expect(result.usedFallback).toBe(false);
-    expect(result.segments).toEqual([
-      { kind: "text", text: "Summarise " },
-      { kind: "resolved", text: "concise and neutral" },
-      { kind: "text", text: " for an auditor." },
-    ]);
+describe("promptReviewDisplay — file-backed", () => {
+  it("shows complete escaped file text and its label in the bound slot", () => {
+    const text = "  <unsafe> & exact\n\nline  ";
+    const result = promptReviewDisplay("evt-1", snapshot(
+      { prompt_template: MARKER, system_prompt: "Inline system." },
+      { bindings: [binding("prompt_template", text)] },
+    ));
+    expect(result.reviewAvailable).toBe(true);
+    expect(result.text).toBe(`File: review.txt (prompt_template)\n\n${text}`);
+    expect(result.systemPrompt).toBe("Inline system.");
   });
 
-  it("renders a pending requirement's draft as a 'pending' segment", () => {
-    const state = makeState([
-      makeNode({
-        prompt_template_parts: STRUCTURED_PARTS,
-        interpretation_requirements: [makeRequirement()],
-      }),
-    ]);
-    const result = resolvePromptDisplaySegments(state, makeEvent());
-    expect(result.usedFallback).toBe(false);
-    expect(result.segments[1]).toEqual({
-      kind: "pending",
-      text: "short and direct",
-    });
+  it("places a bound system prompt's text", () => {
+    const result = promptReviewDisplay("evt-1", snapshot(
+      { prompt_template: "User.", system_prompt: MARKER },
+      { bindings: [binding("system_prompt", "Bound system.", "system.md")] },
+    ));
+    expect(result.systemPrompt).toBe("Bound system.");
+    expect(result.text).toBe("File: system.md (system_prompt)\n\nUser.");
   });
 
-  it("falls back to the pending-interpretation literal when the draft is missing", () => {
-    const state = makeState([
-      makeNode({
-        prompt_template_parts: STRUCTURED_PARTS,
-        interpretation_requirements: [makeRequirement({ draft: null })],
-      }),
-    ]);
-    const result = resolvePromptDisplaySegments(state, makeEvent());
-    expect(result.segments[1]).toEqual({
-      kind: "pending",
-      text: PENDING_INTERPRETATION_DISPLAY_TEXT,
-    });
-  });
-});
-
-describe("resolvePromptDisplaySegments — fallback chain", () => {
-  it("exposes the system prompt beside the user template for a single-prompt node", () => {
-    const state = makeState([
-      makeNode({
-        system_prompt: "You are a careful reviewer.",
-        prompt_template: "Summarise {{ row.text }}.",
-      }),
-    ]);
-    const result = resolvePromptDisplaySegments(state, makeEvent());
-    expect(result.systemPrompt).toBe("You are a careful reviewer.");
-    expect(result.segments).toEqual([
-      { kind: "text", text: "Summarise {{ row.text }}." },
-    ]);
+  it.each([
+    ["list", [{ name: "classify", template: MARKER }], "queries.0.template"],
+    ["mapping", { classify: { template: MARKER } }, "queries.classify.template"],
+  ])("places a %s-form query's bound text by the server's slot path", (_form, queries, fieldPath) => {
+    const result = promptReviewDisplay("evt-1", snapshot(
+      { system_prompt: "S.", queries },
+      { bindings: [binding(fieldPath, "Bound query text.")] },
+    ));
+    expect(result.reviewAvailable).toBe(true);
+    expect(result.text).toContain(`File: review.txt (${fieldPath})\n\n`);
+    expect(result.text).toContain("Query 'classify':\nBound query text.\n");
   });
 
-  it("falls back to the node's prompt_template on malformed parts", () => {
-    const state = makeState([
-      makeNode({
-        prompt_template: "Summarise short and direct for an auditor.",
-        prompt_template_parts: [{ kind: "mystery" }],
-        interpretation_requirements: [makeRequirement()],
-      }),
-    ]);
-    const result = resolvePromptDisplaySegments(state, makeEvent());
-    expect(result.usedFallback).toBe(true);
-    expect(result.segments).toEqual([
-      { kind: "text", text: "Summarise short and direct for an auditor." },
-    ]);
-  });
-
-  it("refuses to render a 'resolved' requirement that carries no accepted value", () => {
-    // The safety arm of the chain (TQ-7): a payload claiming status
-    // "resolved" while accepted_value is null is malformed, and it is
-    // precisely the shape that must NOT reach an approval surface as an
-    // authoritative substituted value. Without this the resolver would push
-    // a "resolved" segment with empty text, showing the approver a prompt
-    // with a SILENTLY BLANKED slot — worse than the honest fallback, because
-    // the card's entire purpose is showing what actually runs.
-    const state = makeState([
-      makeNode({
-        prompt_template: "Summarise short and direct for an auditor.",
-        prompt_template_parts: STRUCTURED_PARTS,
-        interpretation_requirements: [
-          makeRequirement({ status: "resolved", accepted_value: null }),
-        ],
-      }),
-    ]);
-    const result = resolvePromptDisplaySegments(state, makeEvent());
-    expect(result.usedFallback).toBe(true);
-    expect(result.segments).toEqual([
-      { kind: "text", text: "Summarise short and direct for an auditor." },
-    ]);
-    // No slot segment of any kind survived into the render.
-    expect(result.segments.every((s) => s.kind === "text")).toBe(true);
-  });
-
-  it("falls back to prompt_template on malformed requirements (non-list)", () => {
-    const state = makeState([
-      makeNode({
-        prompt_template: "Current rendered template.",
-        prompt_template_parts: STRUCTURED_PARTS,
-        interpretation_requirements: { "req-1": makeRequirement() },
-      }),
-    ]);
-    const result = resolvePromptDisplaySegments(state, makeEvent());
-    expect(result.usedFallback).toBe(true);
-    expect(result.segments).toEqual([
-      { kind: "text", text: "Current rendered template." },
-    ]);
-  });
-
-  it("falls back when a part references an unknown requirement", () => {
-    const state = makeState([
-      makeNode({
-        prompt_template: "Current rendered template.",
-        prompt_template_parts: [
-          { kind: "interpretation_ref", requirement_id: "req-unknown" },
-        ],
-        interpretation_requirements: [makeRequirement()],
-      }),
-    ]);
-    const result = resolvePromptDisplaySegments(state, makeEvent());
-    expect(result.usedFallback).toBe(true);
-    expect(result.segments[0]?.text).toBe("Current rendered template.");
-  });
-
-  it("legacy no-parts node: falls back to its prompt_template string", () => {
-    const state = makeState([
-      makeNode({ prompt_template: "Legacy rendered template." }),
-    ]);
-    const result = resolvePromptDisplaySegments(state, makeEvent());
-    expect(result.usedFallback).toBe(true);
-    expect(result.segments).toEqual([
-      { kind: "text", text: "Legacy rendered template." },
-    ]);
-  });
-
-  it("node absent from the state: falls back to event.llm_draft", () => {
-    const state = makeState([]);
-    const event = makeEvent();
-    const result = resolvePromptDisplaySegments(state, event);
-    expect(result.usedFallback).toBe(true);
-    expect(result.segments).toEqual([
-      { kind: "text", text: event.llm_draft },
-    ]);
-  });
-
-  it("null state: falls back to event.llm_draft ('' when null)", () => {
-    const withDraft = resolvePromptDisplaySegments(null, makeEvent());
-    expect(withDraft.usedFallback).toBe(true);
-    expect(withDraft.segments[0]?.text).toBe(
-      "Summarise pending interpretation for an auditor.",
-    );
-
-    const noDraft = resolvePromptDisplaySegments(
-      null,
-      makeEvent({ llm_draft: null }),
-    );
-    expect(noDraft.segments).toEqual([{ kind: "text", text: "" }]);
-  });
-
-  it("null affected_node_id never matches a node", () => {
-    const state = makeState([
-      makeNode({ prompt_template: "Should not be used." }),
-    ]);
-    const result = resolvePromptDisplaySegments(
-      state,
-      makeEvent({ affected_node_id: null }),
-    );
-    expect(result.segments[0]?.text).toBe(
-      "Summarise pending interpretation for an auditor.",
-    );
+  it("is not approvable once the bound files no longer match the live node", () => {
+    const result = promptReviewDisplay("evt-1", snapshot(
+      { prompt_template: MARKER },
+      { bindings: [binding("prompt_template", "Old file text.")], is_live_review: false },
+    ));
+    expect(result.reviewAvailable).toBe(false);
+    expect(result.text).not.toContain("Old file text.");
   });
 });
 
@@ -315,43 +159,11 @@ describe("resolvePromptDisplaySegments — fallback chain", () => {
 //
 // A multi-query node's review anchor (interpretation_state.py
 // MultiQueryPromptSurface.anchor_hash) covers the system prompt, every
-// well-formed query's name + template override, and the node-level template
-// skeleton. The event's llm_draft is bounded to 8000 chars and frozen at
-// staging, so the card renders the COMPLETE surface from live node options.
+// well-formed query's name + template override, and the node-level template.
+// The event's llm_draft is bounded to 8000 chars, so the card renders the
+// COMPLETE surface from the snapshot.
 
-const SURFACE_HEAD = [
-  "Multi-query LLM node: for every row the model receives one call per query below.",
-  "",
-  "System prompt (sent with every query):",
-];
-
-/** Frozen staging-time draft: different from every live render below. */
-const FROZEN_SURFACE_DRAFT = [
-  ...SURFACE_HEAD,
-  "(none)",
-  "",
-  "Query 'frozen':",
-  "Frozen staging-time text.",
-  "",
-  "Node-level prompt_template, used by queries without their own template: frozen",
-  "Summarise pending interpretation.",
-].join("\n");
-
-const SLOT_PARTS = [
-  { kind: "text", text: "Summarise " },
-  { kind: "interpretation_ref", requirement_id: "req-1" },
-  { kind: "text", text: "." },
-];
-
-function displayText(result: { segments: { text: string }[] }): string {
-  return result.segments.map((segment) => segment.text).join("");
-}
-
-function surfaceEvent(): InterpretationEvent {
-  return makeEvent({ llm_draft: FROZEN_SURFACE_DRAFT });
-}
-
-describe("resolvePromptDisplaySegments — multi-query prompt surface", () => {
+describe("promptReviewDisplay — multi-query prompt surface", () => {
   it.each(["mapping", "list"])(
     "renders every complete query without a shared template (%s form)",
     (form) => {
@@ -362,109 +174,35 @@ describe("resolvePromptDisplaySegments — multi-query prompt surface", () => {
       const queries = form === "list"
         ? entries
         : Object.fromEntries(entries.map((entry) => [entry.name, { template: entry.template }]));
-      const result = resolvePromptDisplaySegments(
-        makeState([makeNode({ system_prompt: "Shared system instruction.", queries })]),
-        surfaceEvent(),
-      );
-      const text = displayText(result);
-      expect(text.length).toBeGreaterThan(8000);
-      expect(text).toContain("System prompt (sent with every query):\nShared system instruction.");
+      const result = display({ system_prompt: "Shared system instruction.", queries });
+      expect(result.text.length).toBeGreaterThan(8000);
+      expect(result.text).toContain("System prompt (sent with every query):\nShared system instruction.");
       for (const entry of entries) {
-        expect(text).toContain(`Query '${entry.name}':\n${entry.template}\n`);
+        expect(result.text).toContain(`Query '${entry.name}':\n${entry.template}\n`);
       }
-      expect(text).not.toContain("Frozen staging-time text.");
       expect(result.reviewAvailable).toBe(true);
-      expect(result.usedFallback).toBe(false);
+      expect(result.systemPrompt).toBeUndefined();
     },
   );
 
-  it("accepts a null shared template without rendering unrelated shared parts", () => {
-    const result = resolvePromptDisplaySegments(
-      makeState([makeNode({
-        prompt_template: null,
-        prompt_template_parts: [{ kind: "text", text: "Unused parts." }],
-        interpretation_requirements: [],
-        queries: { own: { template: "Actual query instruction." } },
-      })]),
-      surfaceEvent(),
-    );
-    expect(displayText(result)).toContain("Actual query instruction.");
-    expect(displayText(result)).not.toContain("Unused parts.");
-    expect(result.reviewAvailable).toBe(true);
-  });
-
-  it("keeps review unavailable when a query needs a missing shared template", () => {
-    const result = resolvePromptDisplaySegments(
-      makeState([makeNode({ queries: { own: { template: "Own text." }, shared: {} } })]),
-      surfaceEvent(),
-    );
-    expect(displayText(result)).toContain("Query 'own':\nOwn text.");
-    expect(displayText(result)).toContain("(no node-level prompt_template is set)");
-    expect(result.reviewAvailable).toBe(false);
-  });
-
-  it("renders byte-identical to the backend review draft when nothing is bounded or resolved", () => {
+  it("renders byte-identical to the backend review draft when nothing is bounded", () => {
     // Expected text produced by the backend on the same options:
     // multi_query_prompt_surface_from_options(opts).render_for_review()
     // (list-form queries; the third entry is an object without a name, so it
-    // is labelled by its list index '#2'). The pending slot has no draft, so
-    // it shows the same "pending interpretation" literal the backend masks.
+    // is labelled by its list index '#2').
     const backendDraft =
       "Multi-query LLM node: for every row the model receives one call per query below.\n\nSystem prompt (sent with every query):\nReply briefly.\n\nQuery 'a':\nTell me {{ row.x }}.\n\nQuery 'b': uses the node-level prompt_template (below).\n\nQuery '#2': (template value is not text; plugin validation rejects this node)\n\nNode-level prompt_template, used by queries without their own template: b\nSummarise pending interpretation.";
-    const state = makeState([
-      makeNode({
-        prompt_template: "Summarise pending interpretation.",
-        prompt_template_parts: SLOT_PARTS,
-        interpretation_requirements: [makeRequirement({ draft: null })],
-        system_prompt: "Reply briefly.",
-        queries: [
-          { name: "a", template: "Tell me {{ row.x }}." },
-          { name: "b" },
-          { bad: 1, template: 5 },
-        ],
-      }),
-    ]);
-    const result = resolvePromptDisplaySegments(state, surfaceEvent());
-    expect(result.usedFallback).toBe(false);
-    expect(displayText(result)).toBe(backendDraft);
-  });
-
-  it("shows a resolved slot's accepted value inside the node-level template (not the frozen draft)", () => {
-    const state = makeState([
-      makeNode({
-        prompt_template: "Summarise concise and neutral.",
-        prompt_template_parts: SLOT_PARTS,
-        interpretation_requirements: [
-          makeRequirement({ status: "resolved", accepted_value: "concise and neutral" }),
-        ],
-        queries: { summary: {} },
-      }),
-    ]);
-    const result = resolvePromptDisplaySegments(state, surfaceEvent());
-    expect(result.usedFallback).toBe(false);
-    const text = displayText(result);
-    expect(text).toContain("Summarise concise and neutral.");
-    expect(text).not.toContain("pending interpretation");
-    expect(result.segments).toContainEqual({
-      kind: "resolved",
-      text: "concise and neutral",
+    const result = display({
+      prompt_template: "Summarise pending interpretation.",
+      system_prompt: "Reply briefly.",
+      queries: [
+        { name: "a", template: "Tell me {{ row.x }}." },
+        { name: "b" },
+        { bad: 1, template: 5 },
+      ],
     });
-  });
-
-  it("keeps a pending slot marked inside the node-level template", () => {
-    const state = makeState([
-      makeNode({
-        prompt_template: "Summarise pending interpretation.",
-        prompt_template_parts: SLOT_PARTS,
-        interpretation_requirements: [makeRequirement()],
-        queries: { summary: {} },
-      }),
-    ]);
-    const result = resolvePromptDisplaySegments(state, surfaceEvent());
-    expect(result.segments).toContainEqual({
-      kind: "pending",
-      text: "short and direct",
-    });
+    expect(result.text).toBe(backendDraft);
+    expect(result.reviewAvailable).toBe(true);
   });
 
   it("shows all 40 queries, in order, each with its complete template", () => {
@@ -475,193 +213,79 @@ describe("resolvePromptDisplaySegments — multi-query prompt surface", () => {
       templates.push(template);
       queries[`q_${index}`] = { template };
     }
-    const state = makeState([
-      makeNode({
-        prompt_template: "Unused node-level text.",
-        prompt_template_parts: [{ kind: "text", text: "Unused node-level text." }],
-        interpretation_requirements: [],
-        queries,
-      }),
-    ]);
-    const result = resolvePromptDisplaySegments(state, surfaceEvent());
-    const text = displayText(result);
-    expect(templates[0].length).toBeGreaterThan(300);
+    const { text } = display({ prompt_template: "Unused node-level text.", queries });
     let previous = -1;
     templates.forEach((template, index) => {
       const at = text.indexOf(`Query 'q_${index}':\n${template}\n`);
       expect(at).toBeGreaterThan(previous);
       previous = at;
     });
-    expect(text).not.toContain("not shown");
     expect(text).not.toContain("not listed");
   });
 
-  it("shows an unused node-level template's text, and the text follows an edit", () => {
-    const stateWith = (nodeText: string) =>
-      makeState([
-        makeNode({
-          prompt_template: nodeText,
-          prompt_template_parts: [{ kind: "text", text: nodeText }],
-          interpretation_requirements: [],
-          queries: { a: { template: "Query A text." } },
-        }),
-      ]);
-    const before = displayText(
-      resolvePromptDisplaySegments(stateWith("Original dead text."), surfaceEvent()),
+  it("shows an unused node-level template's text", () => {
+    const { text } = display({ prompt_template: "Dead text.", queries: { a: { template: "Query A text." } } });
+    expect(text).toContain(
+      "Node-level prompt_template: not used (every query supplies its own template).\nDead text.",
     );
-    const after = displayText(
-      resolvePromptDisplaySegments(stateWith("Edited dead text."), surfaceEvent()),
-    );
-    expect(before).toContain(
-      "Node-level prompt_template: not used (every query supplies its own template).\nOriginal dead text.",
-    );
-    expect(after).toContain("\nEdited dead text.");
-    expect(after).not.toContain("Original dead text.");
   });
 
   it("labels an unused node-level template beside a non-text query template", () => {
-    const state = makeState([
-      makeNode({
-        prompt_template: "Dead text.",
-        prompt_template_parts: [{ kind: "text", text: "Dead text." }],
-        interpretation_requirements: [],
-        queries: { a: { template: "A." }, b: { template: 5 } },
-      }),
-    ]);
-    const text = displayText(resolvePromptDisplaySegments(state, surfaceEvent()));
-    expect(text).toContain(
-      "Query 'b': (template value is not text; plugin validation rejects this node)",
-    );
-    expect(text).toContain(
-      "Node-level prompt_template: not used (no query falls back to it).\nDead text.",
-    );
+    const { text } = display({ prompt_template: "Dead text.", queries: { a: { template: "A." }, b: { template: 5 } } });
+    expect(text).toContain("Query 'b': (template value is not text; plugin validation rejects this node)");
+    expect(text).toContain("Node-level prompt_template: not used (no query falls back to it).\nDead text.");
   });
 
   it("shows the system prompt, and '(none)' when it is absent or not text", () => {
-    const stateWith = (systemPrompt: unknown) =>
-      makeState([
-        makeNode({
-          prompt_template: "Node text.",
-          prompt_template_parts: [{ kind: "text", text: "Node text." }],
-          interpretation_requirements: [],
-          system_prompt: systemPrompt,
-          queries: { a: { template: "A." } },
-        }),
-      ]);
-    expect(
-      displayText(resolvePromptDisplaySegments(stateWith("Answer in French."), surfaceEvent())),
-    ).toContain("System prompt (sent with every query):\nAnswer in French.\n");
-    expect(
-      displayText(resolvePromptDisplaySegments(stateWith(42), surfaceEvent())),
-    ).toContain("System prompt (sent with every query):\n(none)\n");
+    const surface = (systemPrompt: unknown) => ({ prompt_template: "Node text.", system_prompt: systemPrompt, queries: { a: { template: "A." } } });
+    expect(display(surface("Answer in French.")).text).toContain("System prompt (sent with every query):\nAnswer in French.\n");
+    expect(display(surface(42)).text).toContain("System prompt (sent with every query):\n(none)\n");
   });
 
   it("labels a query that uses the node-level template and names it in the node-level label", () => {
-    const state = makeState([
-      makeNode({
-        prompt_template: "Shared text.",
-        prompt_template_parts: [{ kind: "text", text: "Shared text." }],
-        interpretation_requirements: [],
-        queries: {
-          own: { template: "Own text." },
-          shared_one: { template: null },
-          shared_two: {},
-        },
-      }),
-    ]);
-    const text = displayText(resolvePromptDisplaySegments(state, surfaceEvent()));
+    const { text } = display({
+      prompt_template: "Shared text.",
+      queries: { own: { template: "Own text." }, shared_one: { template: null }, shared_two: {} },
+    });
     expect(text).toContain("Query 'own':\nOwn text.\n");
-    expect(text).toContain(
-      "Query 'shared_one': uses the node-level prompt_template (below).",
-    );
-    expect(text).toContain(
-      "Query 'shared_two': uses the node-level prompt_template (below).",
-    );
+    expect(text).toContain("Query 'shared_one': uses the node-level prompt_template (below).");
+    expect(text).toContain("Query 'shared_two': uses the node-level prompt_template (below).");
     expect(text).toContain(
       "Node-level prompt_template, used by queries without their own template: shared_one, shared_two\nShared text.",
     );
   });
 
   it("counts only object query entries and labels unnamed list entries by their list index", () => {
-    const listState = makeState([
-      makeNode({
-        prompt_template: "Node text.",
-        prompt_template_parts: [{ kind: "text", text: "Node text." }],
-        interpretation_requirements: [],
-        queries: ["junk", { name: "", template: "T1." }, ["array"], { name: "q3", template: "T3." }],
-      }),
-    ]);
-    const listText = displayText(resolvePromptDisplaySegments(listState, surfaceEvent()));
+    const listText = display({
+      prompt_template: "Node text.",
+      queries: ["junk", { name: "", template: "T1." }, ["array"], { name: "q3", template: "T3." }],
+    }).text;
     expect(listText).toContain("Query '#1':\nT1.\n\nQuery 'q3':\nT3.\n");
     expect(listText).not.toContain("junk");
     expect(listText).not.toContain("array");
-
-    const mappingState = makeState([
-      makeNode({
-        prompt_template: "Node text.",
-        prompt_template_parts: [{ kind: "text", text: "Node text." }],
-        interpretation_requirements: [],
-        queries: { skipped_array: ["x"], skipped_null: null, kept: { template: "K." } },
-      }),
-    ]);
-    const mappingText = displayText(resolvePromptDisplaySegments(mappingState, surfaceEvent()));
+    const mappingText = display({
+      prompt_template: "Node text.",
+      queries: { skipped_array: ["x"], skipped_null: null, kept: { template: "K." } },
+    }).text;
     expect(mappingText).toContain("Query 'kept':\nK.\n");
     expect(mappingText).not.toContain("skipped_");
   });
 
-  it("renders the node-level prompt_template text, flagged as a fallback, when its parts cannot be broken out", () => {
-    const state = makeState([
-      makeNode({
-        prompt_template: "Stored node text.",
-        prompt_template_parts: [{ kind: "mystery" }],
-        interpretation_requirements: [],
-        queries: { a: { template: "A." } },
-      }),
-    ]);
-    const result = resolvePromptDisplaySegments(state, surfaceEvent());
-    expect(result.usedFallback).toBe(true);
-    const text = displayText(result);
-    expect(text).toContain("Query 'a':\nA.\n");
-    expect(text).toContain("\nStored node text.");
-    expect(text).not.toContain("Frozen staging-time text.");
-  });
-
-  it("falls back to the event's llm_draft when the multi-query options are malformed", () => {
-    // Well-formed queries but no string prompt_template and no parts: the
-    // backend reads no surface, and nothing live can be rendered.
-    const state = makeState([
-      makeNode({ prompt_template: 7, queries: { a: { template: "A." } } }),
-    ]);
-    const result = resolvePromptDisplaySegments(state, surfaceEvent());
-    expect(result.usedFallback).toBe(true);
-    expect(result.segments).toEqual([
-      { kind: "text", text: FROZEN_SURFACE_DRAFT },
-    ]);
+  it("is not approvable when the multi-query surface has a non-text shared template", () => {
+    expect(display({ prompt_template: 7, queries: { a: { template: "A." } } }).reviewAvailable).toBe(false);
   });
 
   it("a queries value with no well-formed entry is a single-prompt node", () => {
-    const state = makeState([
-      makeNode({
-        prompt_template: "Summarise concise and neutral.",
-        prompt_template_parts: SLOT_PARTS,
-        interpretation_requirements: [
-          makeRequirement({ status: "resolved", accepted_value: "concise and neutral" }),
-        ],
-        queries: {},
-      }),
-    ]);
-    const result = resolvePromptDisplaySegments(state, surfaceEvent());
-    expect(result.usedFallback).toBe(false);
-    expect(displayText(result)).toBe("Summarise concise and neutral.");
+    const result = display({ prompt_template: "Summarise concise and neutral.", queries: {} });
+    expect(result.text).toBe("Summarise concise and neutral.");
+    expect(result.reviewAvailable).toBe(true);
   });
 });
 
 // ── Multi-query surface without a shared prompt_template ────────────────────
 //
 // Staging report 2026-11-16: the backend's multi_query_prompt_surface_from_options
-// accepts an absent or null node-level prompt_template, but this recognizer
-// required a string, so every such card fell back to the bounded event draft
-// with reviewAvailable=false and Approve could never unlock.
+// accepts an absent or null node-level prompt_template.
 
 /** Backend render_for_review() of MULTI_QUERY_OWN_TEMPLATES (with or without prompt_template: null). */
 const OWN_TEMPLATES_BACKEND_DRAFT =
@@ -675,50 +299,97 @@ const MULTI_QUERY_OWN_TEMPLATES = {
   ],
 };
 
-describe("resolvePromptDisplaySegments — multi-query surface without a shared template", () => {
-  it("renders the complete surface, reviewable, when prompt_template is omitted", () => {
-    const state = makeState([makeNode({ ...MULTI_QUERY_OWN_TEMPLATES })]);
-    const result = resolvePromptDisplaySegments(state, surfaceEvent());
+describe("promptReviewDisplay — multi-query surface without a shared template", () => {
+  it.each([
+    ["omitted", MULTI_QUERY_OWN_TEMPLATES],
+    ["null", { ...MULTI_QUERY_OWN_TEMPLATES, prompt_template: null }],
+  ])("renders the complete surface, reviewable, when prompt_template is %s", (_case, surface) => {
+    const result = display(surface);
     expect(result.reviewAvailable).toBe(true);
-    expect(result.usedFallback).toBe(false);
-    expect(displayText(result)).toBe(OWN_TEMPLATES_BACKEND_DRAFT);
-  });
-
-  it("renders the complete surface, reviewable, when prompt_template is null", () => {
-    const state = makeState([makeNode({ ...MULTI_QUERY_OWN_TEMPLATES, prompt_template: null })]);
-    const result = resolvePromptDisplaySegments(state, surfaceEvent());
-    expect(result.reviewAvailable).toBe(true);
-    expect(result.usedFallback).toBe(false);
-    expect(displayText(result)).toBe(OWN_TEMPLATES_BACKEND_DRAFT);
-  });
-
-  it("shows every per-query template in full past the event draft's 8000-character budget", () => {
-    const queries = Array.from({ length: 6 }, (_, index) => ({
-      name: `q${index}`,
-      template: `Template ${index}: ${"detail ".repeat(400)}end ${index}.`,
-    }));
-    const state = makeState([makeNode({ system_prompt: "Reply briefly.", queries })]);
-    const result = resolvePromptDisplaySegments(state, surfaceEvent());
-    const text = displayText(result);
-    expect(text.length).toBeGreaterThan(8000);
-    expect(result.reviewAvailable).toBe(true);
-    for (const query of queries) {
-      expect(text).toContain(`Query '${query.name}':\n${query.template}\n`);
-    }
+    expect(result.text).toBe(OWN_TEMPLATES_BACKEND_DRAFT);
   });
 
   it("keeps review unavailable when a query needs the missing shared template", () => {
-    const state = makeState([
-      makeNode({
-        system_prompt: "Reply briefly.",
-        queries: [{ name: "first", template: "A." }, { name: "second" }],
-      }),
-    ]);
-    const result = resolvePromptDisplaySegments(state, surfaceEvent());
+    const result = display({ system_prompt: "Reply briefly.", queries: [{ name: "first", template: "A." }, { name: "second" }] });
     expect(result.reviewAvailable).toBe(false);
-    const text = displayText(result);
-    expect(text).toContain("Query 'second': uses the node-level prompt_template (below).");
-    expect(text).toContain("Node-level prompt_template, used by queries without their own template: second");
-    expect(text).toContain("no node-level prompt_template is set");
+    expect(result.text).toContain("Query 'second': uses the node-level prompt_template (below).");
+    expect(result.text).toContain("Node-level prompt_template, used by queries without their own template: second");
+    expect(result.text).toContain("no node-level prompt_template is set");
+  });
+});
+
+// Option (d): a structured prompt's slots come from the snapshot's frozen
+// `prompt_template_parts` skeleton. The card marks each one as reviewed in its
+// own card; the slot's value is never part of this render.
+const PARTS_SURFACE = {
+  prompt_template: "Summarise pending interpretation for an auditor.",
+  prompt_template_parts: [
+    { kind: "text", text: "Summarise " },
+    { kind: "interpretation_ref", requirement_id: "req-1" },
+    { kind: "text", text: " for an auditor." },
+  ],
+  interpretation_requirements: [{ id: "req-1", event_id: "evt-vague", user_term: "punchy" }],
+};
+
+describe("promptReviewDisplay — frozen slot skeleton", () => {
+  it("breaks a structured prompt into text and slot pieces from the snapshot parts", () => {
+    const result = display(PARTS_SURFACE);
+    expect(result.reviewAvailable).toBe(true);
+    expect(result.segments).toEqual([
+      { kind: "text", text: "Summarise " },
+      { kind: "slot", eventId: "evt-vague", userTerm: "punchy" },
+      { kind: "text", text: " for an auditor." },
+    ]);
+    expect(result.text).toBe("Summarise [“punchy”, reviewed in its own card] for an auditor.");
+    expect(result.hasPendingSlot).toBe(false);
+  });
+
+  it("renders a legacy snapshot without parts as its plain stored text", () => {
+    const { prompt_template_parts: _parts, interpretation_requirements: _reqs, ...legacy } = PARTS_SURFACE;
+    const result = display(legacy);
+    expect(result.reviewAvailable).toBe(true);
+    expect(result.segments).toEqual([{ kind: "text", text: "Summarise pending interpretation for an auditor." }]);
+    expect(result.hasPendingSlot).toBe(true);
+  });
+
+  it.each([
+    ["a part of unknown kind", { prompt_template_parts: [{ kind: "mystery" }] }],
+    ["a ref with no matching requirement", { interpretation_requirements: [] }],
+    ["parts that are not a list", { prompt_template_parts: "Summarise" }],
+    ["requirements that are not a list", { interpretation_requirements: null }],
+  ])("falls back to the plain stored text for %s", (_label, override) => {
+    const result = display({ ...PARTS_SURFACE, ...override });
+    expect(result.reviewAvailable).toBe(true);
+    expect(result.segments).toEqual([{ kind: "text", text: "Summarise pending interpretation for an auditor." }]);
+  });
+
+  it("does not break out slots of a file-bound prompt_template", () => {
+    const result = promptReviewDisplay(
+      "evt-1",
+      snapshot({ ...PARTS_SURFACE, prompt_template: MARKER }, { bindings: [binding("prompt_template", "From the file.")] }),
+    );
+    expect(result.segments.some((segment) => segment.kind === "slot")).toBe(false);
+    expect(result.text).toContain("From the file.");
+  });
+});
+
+describe("promptSlotStatus", () => {
+  const event = (id: string, choice: InterpretationEvent["choice"]) => ({ id, choice }) as InterpretationEvent;
+
+  it("is pending while the slot's own review is outstanding", () => {
+    expect(promptSlotStatus("e1", { e1: event("e1", "pending") }, [])).toBe("pending");
+  });
+
+  it.each(["accepted_as_drafted", "amended"] as const)("is accepted once its review was %s", (choice) => {
+    expect(promptSlotStatus("e1", {}, [event("e1", choice)])).toBe("accepted");
+  });
+
+  it.each(["superseded", "opted_out", "abandoned"] as const)("is unknown when its review ended %s", (choice) => {
+    expect(promptSlotStatus("e1", {}, [event("e1", choice)])).toBe("unknown");
+  });
+
+  it("is unknown with no linked event or nothing loaded", () => {
+    expect(promptSlotStatus(null, { e1: event("e1", "pending") }, [])).toBe("unknown");
+    expect(promptSlotStatus("e1", undefined, undefined)).toBe("unknown");
   });
 });
