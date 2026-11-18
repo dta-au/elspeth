@@ -29,9 +29,16 @@ def test_readme_operational_cutover_states_the_live_schema_epochs() -> None:
     readme = _readme_text()
     text = _section(readme, f"\n## What changed in {version}\n")
 
-    assert f"Session epoch {SESSION_SCHEMA_EPOCH} and Landscape epoch {SQLITE_SCHEMA_EPOCH} are unchanged from the previous release" in text
-    assert "this release adds no schema-epoch cutover" in text
-    assert "existing session and Landscape stores need no action" in text
+    assert f"Session epoch {SESSION_SCHEMA_EPOCH} replaces session epoch 78" in text
+    assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH} replaces epoch 50" in text
+    assert "`prompt_review_snapshots` and `prompt_file_approvals`" in text
+    assert "the Landscape store adds `run_prompt_inputs`" in text
+    assert "Preserve epoch 78 session stores and epoch 50 Landscape stores, which startup refuses" in text
+    assert (
+        f"use a separately provisioned epoch {SESSION_SCHEMA_EPOCH} session store and epoch {SQLITE_SCHEMA_EPOCH} Landscape store" in text
+    )
+    assert "this release adds no schema-epoch cutover" not in text
+    assert "need no action" not in text
     assert "Backwards compatibility is permitted and considered from 0.8.5 within explicitly supported boundaries" in text
     assert "authorizes no in-place migration, reset or downgrade" in text
     assert f"Package metadata is {version};" in text
@@ -85,12 +92,12 @@ def test_readme_keeps_the_0_8_10_cutover_as_a_historical_pin() -> None:
     """The 0.8.10 section keeps its own epoch cutover statements."""
     text = _section(_readme_text(), "\n## Previously in 0.8.10\n")
 
-    assert f"Session epoch {SESSION_SCHEMA_EPOCH} replaces session epoch 77" in text
+    assert "Session epoch 78 replaces session epoch 77" in text
     assert "retains its committed graph-review authority" in text
-    assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH} replaces epoch 49" in text
+    assert "Landscape epoch 50 replaces epoch 49" in text
     assert "Preserve epoch 75, both epoch 76 session-store contracts, epoch 77 session stores and epoch 49 Landscape stores" in text
-    assert f"use a separately provisioned epoch {SESSION_SCHEMA_EPOCH} session store" in text
-    assert f"epoch {SQLITE_SCHEMA_EPOCH} Landscape store" in text
+    assert "use a separately provisioned epoch 78 session store" in text
+    assert "epoch 50 Landscape store" in text
     assert "Keep old workers isolated from the new stores" in text
     assert "Compatible stores still require exact schema admission" in text
     assert "unsupported stores are preserved and refused before incompatible writes" in text
