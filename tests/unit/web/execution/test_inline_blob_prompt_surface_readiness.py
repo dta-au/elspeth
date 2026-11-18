@@ -6,7 +6,9 @@ import hashlib
 import sys
 import threading
 from collections.abc import Callable
-from dataclasses import replace
+from contextlib import ExitStack, nullcontext
+from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -311,11 +313,16 @@ def _run_admission(
     landscape_probe: Any | None = None,
     run_id: UUID | None = None,
     on_final_approval: Callable[[Any], None] | None = None,
+    resume_existing: bool = False,
+    on_orchestrator: Callable[[Any], None] | None = None,
 ) -> tuple[BaseException | None, Any, Any]:
     """Drive ``_run_pipeline`` with the runtime YAML the composer generates for the same state.
 
     Returns what the run raised, the fake blob service and the fake session
     service, so a caller can see how far past inline-blob admission it got.
+    ``resume_existing`` (with ``landscape_probe``) reaches the resume branch
+    with checkpoint recovery stubbed; the patched orchestrator's ``resume``
+    stops the run, and ``on_orchestrator`` receives the orchestrator instance.
     """
     service, session_service, loop = agreement.TestComposerRuntimeBlobInlineAgreement._execution_service(
         tmp_path, execution_fixture=execution_fixture
@@ -338,33 +345,52 @@ def _run_admission(
         derived_from_state_id=None,
     )
 
-    class PromptAwareSessionService:
-        def __getattr__(self, name: str) -> Any:
-            return getattr(session_service, name)
-
-        async def get_run(self, requested_run_id: UUID) -> Any:
-            del requested_run_id
-            return SimpleNamespace(
-                session_id=session_service.run.session_id,
-                state_id=state_id,
-                status=session_service.run.status,
-                error=session_service.run.error,
-            )
+    class PromptApprovals:
+        """The fake session service's prompt-approval seam: the state the run names, and its approval verdict."""
 
         async def get_state_in_session(self, requested_state_id: UUID, requested_session_id: UUID) -> CompositionStateRecord:
             assert requested_state_id == state_id
             assert requested_session_id == session_service.run.session_id
             return state_record
 
-        async def assert_prompt_file_approvals(self, _snapshot: Any) -> None:
+        async def assert_prompt_file_approvals(self, snapshot: Any) -> None:
             if not approved:
                 raise PromptFileReviewStale()
             if on_final_approval is not None:
-                on_final_approval(_snapshot)
+                on_final_approval(snapshot)
 
-    cast(Any, service)._session_service = PromptAwareSessionService()
+    # The run names this state; the fake's get_run returns ``run`` itself.
+    session_service.run.state_id = state_id
+    session_service.prompt_approval_service = PromptApprovals()
+    if resume_existing:
+        from elspeth.core.config import RateLimitSettings
+
+        @dataclass(slots=True)
+        class ResumeRuntimeSettings(agreement._RuntimeSettingsFake):
+            """The orchestrator setup the resume branch reaches reads the operator rate limit."""
+
+            execution_rate_limit: RateLimitSettings = dataclass_field(default_factory=lambda: RateLimitSettings(enabled=False))
+
+        web_settings = cast(agreement._RuntimeSettingsFake, cast(Any, service)._settings)
+        cast(Any, service)._settings = ResumeRuntimeSettings(
+            data_dir=web_settings.data_dir,
+            payload_store_path=web_settings.payload_store_path,
+            deployment_target=web_settings.deployment_target,
+            landscape_passphrase=web_settings.landscape_passphrase,
+            secret_wiring_allowlist=web_settings.secret_wiring_allowlist,
+        )
     record = replace(_record(modality), session_id=session_service.run.session_id, mime_type=mime_type)
     blob_service = agreement._FakeBlobService(blob_record=record, content=_CONTENT)
+    if resume_existing:
+
+        class ResumeBlobService(agreement._FakeBlobService):
+            """The resume branch runs inside the run's output write admission."""
+
+            def run_output_write_admission(self, run_id: UUID, *, session_operation_context: Any) -> nullcontext[None]:
+                del run_id, session_operation_context
+                return nullcontext()
+
+        blob_service = ResumeBlobService(blob_record=record, content=_CONTENT)
     cast(Any, service)._blob_service = blob_service
     pipeline_yaml = resolve_runtime_yaml_paths(
         composer_yaml_generator.generate_yaml(source_state),
@@ -375,7 +401,8 @@ def _run_admission(
     assert type(loaded) is dict
     raised: BaseException | None = None
     with (
-        patch("elspeth.web.execution.service.Orchestrator"),
+        ExitStack() as resume_patches,
+        patch("elspeth.web.execution.service.Orchestrator") as mock_orchestrator,
         patch("elspeth.web.execution.service.load_settings_from_config_dict") as mock_load,
         patch("elspeth.web.execution.service.open_landscape_db") as mock_open_landscape,
         patch("elspeth.web.execution.service.FilesystemPayloadStore"),
@@ -388,7 +415,15 @@ def _run_admission(
             mock_open_landscape.return_value = landscape_probe
             mock_load.return_value = _mock_pipeline_settings()
             mock_runtime_graph.return_value = SimpleNamespace(plugin_bundle=_plugin_bundle_stub(), graph=_execution_graph_stub())
-            mock_assemble.side_effect = RuntimeError("stop after prompt input evidence")
+            if resume_existing:
+                # A checkpointed, resumable run: only the prompt-input check
+                # stands between admission and the orchestrator's resume.
+                resume_patches.enter_context(patch("elspeth.core.checkpoint.CheckpointManager"))
+                resume_patches.enter_context(patch("elspeth.web.execution.service.check_source_lifecycle_resumable"))
+                resume_patches.enter_context(patch("elspeth.web.execution.service.RecoveryManager"))
+                mock_orchestrator.return_value.resume.side_effect = RuntimeError("stop at resume")
+            else:
+                mock_assemble.side_effect = RuntimeError("stop after prompt input evidence")
         if after_substitution is not None:
 
             def inspect_substituted(config_dict: dict[str, Any], *, expand_env_vars: bool) -> None:
@@ -401,11 +436,19 @@ def _run_admission(
         try:
             lease = agreement._execute_lease(loop, session_service.run.session_id, service=service, execution_fixture=execution_fixture)
             try:
-                service._run_pipeline(str(run_id or uuid4()), pipeline_yaml, threading.Event(), session_operation_lease=lease)
+                service._run_pipeline(
+                    str(run_id or uuid4()),
+                    pipeline_yaml,
+                    threading.Event(),
+                    session_operation_lease=lease,
+                    resume_existing=resume_existing,
+                )
             except Exception as exc:
                 raised = exc
         finally:
             agreement._close_direct_runtime_probe(loop, lease, execution_fixture, sys.exc_info()[1] or raised)
+        if on_orchestrator is not None:
+            on_orchestrator(mock_orchestrator.return_value)
     return raised, blob_service, session_service
 
 
@@ -551,6 +594,68 @@ def test_final_admission_records_exact_prompt_input(tmp_path: Path, execution_fi
     assert row.blob_id == str(_BLOB_ID)
     assert row.content_sha256 == hashlib.sha256(_CONTENT).hexdigest()
     assert row.content_sha256 != hashlib.sha256(blob_service.content).hexdigest()
+
+
+@pytest.mark.parametrize("start_bytes_changed", [True, False], ids=["reapproved_after_start", "same_bytes"])
+def test_resume_refuses_prompt_bytes_that_differ_from_run_start_evidence(
+    tmp_path: Path, execution_fixture: ExecutionTestCustody, start_bytes_changed: bool
+) -> None:
+    """A run started on approved bytes V1 cannot resume on re-approved bytes V2.
+
+    The resume's fresh admission approves the current file content (V2); the
+    Landscape holds the evidence ``begin_run`` wrote when the run started.
+    Only identical evidence may reach ``orchestrator.resume``.
+
+    One execution service per test, so the run-start header is seeded from the
+    resume's own final approval, before the resume branch reads it: the control
+    holds exactly the evidence the resume admits, the refusal case the same
+    node, field and blob with V1's hash.
+    """
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.core.landscape.factory import RecorderFactory
+    from elspeth.web.execution.service import _run_prompt_input_evidence
+
+    run_id = uuid4()
+    admitted: list[tuple[Any, ...]] = []
+    orchestrators: list[Any] = []
+    with LandscapeDB(f"sqlite:///{tmp_path / 'landscape.db'}") as db:
+
+        def seed_run_start(snapshot: Any) -> None:
+            current = _run_prompt_input_evidence((snapshot,))
+            admitted.append(current)
+            if start_bytes_changed:
+                started = tuple(replace(item, content_sha256=hashlib.sha256(b"prompt text v1").hexdigest()) for item in current)
+            else:
+                started = current
+            RecorderFactory(db).run_lifecycle.begin_run({}, "v1", run_id=str(run_id), run_prompt_inputs=started)
+
+        raised, _blob_service, _session_service = _run_admission(
+            tmp_path,
+            "prompt_template",
+            CreationModality.LLM_GENERATED,
+            execution_fixture,
+            approved=True,
+            landscape_probe=db,
+            run_id=run_id,
+            on_final_approval=seed_run_start,
+            resume_existing=True,
+            on_orchestrator=orchestrators.append,
+        )
+
+    [current] = admitted
+    assert [(item.node_id, item.field_path, item.blob_id, item.content_sha256) for item in current] == [
+        ("classify", "prompt_template", str(_BLOB_ID), _SHA256)
+    ]
+    [orchestrator] = orchestrators
+    if start_bytes_changed:
+        assert type(raised) is AuditIntegrityError
+        assert str(raised) == "Resumed run prompt input differs from the run's start evidence"
+        orchestrator.resume.assert_not_called()
+    else:
+        assert str(raised) == "stop at resume"
+        orchestrator.resume.assert_called_once()
+    orchestrator.run.assert_not_called()
 
 
 @pytest.mark.parametrize("field", ["prompt_template", "system_prompt", "queries.q.template", "queries.q", "queries"])

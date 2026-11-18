@@ -4484,6 +4484,11 @@ class ExecutionServiceImpl:
                     resume_point = recovery.get_resume_point(run_id, graph)
                     if resume_point is None:
                         raise _RunRecoveryRequired(RecoveryRequiredReason.COMPATIBILITY_MISMATCH)
+                    # The resumed rows must use exactly the prompt files the run
+                    # recorded when it started; a re-approval since then refuses.
+                    RecorderFactory(landscape_db).run_lifecycle.assert_resumed_run_prompt_inputs(
+                        run_id, _run_prompt_input_evidence(prompt_snapshots)
+                    )
                     result = orchestrator.resume(
                         resume_point,
                         pipeline_config,

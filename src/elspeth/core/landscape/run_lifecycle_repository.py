@@ -619,6 +619,17 @@ class RunLifecycleRepository:
             raise AuditIntegrityError("Permit retry changed run prompt input evidence")
         return self._run_loader.load(row)
 
+    def assert_resumed_run_prompt_inputs(self, run_id: str, run_prompt_inputs: tuple[RunPromptInputEvidence, ...]) -> None:
+        """Refuse a resume whose re-admitted prompt files differ from the run's start evidence.
+
+        The rows were written with the run header, before any provider call;
+        a resume may continue only on exactly those approved bytes.
+        """
+        with self._db.engine.connect() as conn:
+            stored = _stored_run_prompt_inputs_on(conn, run_id)
+        if stored != frozenset(run_prompt_inputs):
+            raise AuditIntegrityError("Resumed run prompt input differs from the run's start evidence")
+
     def materialize_cancelled_permit(
         self,
         binding: RunStartPermitBinding,
