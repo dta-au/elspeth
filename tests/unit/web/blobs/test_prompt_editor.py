@@ -1559,3 +1559,109 @@ def test_editor_save_supersedes_only_pending_card_never_a_resolved_one(tmp_path:
     assert pending_after.resolved_at is not None
     assert event_row(accepted_card) == accepted_before
     assert len(approval_rows()) == len(approvals_before) + 1
+
+
+# --- A fork re-opens a file-backed prompt review in the child ---
+
+
+def test_fork_of_approved_file_prompt_reopens_review_in_child_only(tmp_path: Path) -> None:
+    """A fork rebases each prompt-file marker onto the child's blob copy (verify-C § C1).
+
+    The parent's resolved prompt review is anchored on the parent's blob id, so
+    copying it RESOLVED left the child unrunnable with no card to approve. The
+    fork must hand the child a PENDING review under its own custody, which the
+    repair surfacer (the validate route's pass) turns into a card the child's
+    owner can approve; the parent's approval stays exactly as it was.
+    """
+    from elspeth.contracts.composer_interpretation import InterpretationSurfaceOrigin
+    from elspeth.web.composer.interpretation_surfacing import surface_pending_interpretation_reviews_for_state
+
+    client, service, blob_service, session_id, first, _second, events = _live_prompt_setup(tmp_path)
+    _approve_card(service, blob_service, session_id, events["first"])
+    assert [snapshot.node_id for snapshot in _admit(service, blob_service, session_id)] == ["first"]
+    parent_record = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert parent_record is not None
+    with blob_service._engine.connect() as conn:
+        parent_approvals = conn.execute(
+            select(prompt_file_approvals_table).where(prompt_file_approvals_table.c.session_id == session_id)
+        ).all()
+    assert parent_approvals
+
+    with fenced_operation_context(blob_service._engine, session_id) as operation:
+        fork_message = asyncio.run(
+            service.add_message(
+                UUID(session_id),
+                "user",
+                "fork here",
+                composition_state_id=parent_record.id,
+                writer_principal="route_user_message",
+                session_operation_context=operation,
+            )
+        )
+    forked = client.post(
+        f"/api/sessions/{session_id}/fork",
+        json={"operation_id": str(uuid4()), "from_message_id": str(fork_message.id), "new_message_content": "edited"},
+    )
+    assert forked.status_code == 201, forked.text
+    child_id = forked.json()["session_id"]
+
+    child_record = asyncio.run(service.get_current_state(UUID(child_id)))
+    assert child_record is not None
+    child_state = state_from_record(child_record)
+    child_marker = child_state.nodes[0].options["prompt_template"]
+    assert child_marker["blob_ref"] != first["id"]
+    requirements, _materialized = _review_state(service, child_id)
+    assert requirements["first"] == "pending"
+
+    # ``_live_prompt_setup`` pins its custody reader to the parent; production
+    # reads under the caller's own session fence, so follow the fence here.
+    engine = blob_service._engine
+
+    def read_fenced_session_blob(context: Any, blob_id: UUID) -> tuple[Any, bytes]:
+        with engine.connect() as conn:
+            record = _blob_record(conn, UUID(context.fence.session_id), blob_id)
+        return record, _read_custody_bytes(record)
+
+    service._inline_blob_read = read_fenced_session_blob
+
+    # The later step that mints the card: the validate route's repair pass.
+    with fenced_operation_context(blob_service._engine, child_id) as operation:
+        asyncio.run(
+            surface_pending_interpretation_reviews_for_state(
+                child_state,
+                sessions_service=service,
+                session_id=child_id,
+                current_state_id=str(child_record.id),
+                surface_origin=InterpretationSurfaceOrigin.COMPOSER_LLM,
+                model_identifier="test-model",
+                model_version="test-model",
+                provider="test-provider",
+                composer_skill_hash="a" * 64,
+                only_missing_evidence=True,
+                session_operation_context=operation,
+            )
+        )
+    with blob_service._engine.connect() as conn:
+        child_cards = conn.execute(
+            select(interpretation_events_table.c.id, interpretation_events_table.c.choice).where(
+                interpretation_events_table.c.session_id == child_id,
+                interpretation_events_table.c.kind == InterpretationKind.LLM_PROMPT_TEMPLATE.value,
+            )
+        ).all()
+    assert [choice for _id, choice in child_cards] == ["pending"]
+    with pytest.raises(PromptFileReviewStale):
+        _admit(service, blob_service, child_id)
+
+    _approve_card(service, blob_service, child_id, UUID(str(child_cards[0][0])))
+    assert [snapshot.node_id for snapshot in _admit(service, blob_service, child_id)] == ["first"]
+
+    # The parent's approval and admission are untouched by the fork.
+    assert _review_state(service, session_id)[0]["first"] == "resolved"
+    after_parent = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert after_parent is not None and after_parent.id == parent_record.id
+    with blob_service._engine.connect() as conn:
+        assert (
+            conn.execute(select(prompt_file_approvals_table).where(prompt_file_approvals_table.c.session_id == session_id)).all()
+            == parent_approvals
+        )
+    assert [snapshot.node_id for snapshot in _admit(service, blob_service, session_id)] == ["first"]
