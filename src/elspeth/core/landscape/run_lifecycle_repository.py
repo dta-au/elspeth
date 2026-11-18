@@ -215,6 +215,24 @@ def _already_terminal_error(run_id: str, existing_status: str) -> AuditIntegrity
     )
 
 
+def _stored_run_prompt_inputs_on(conn: Connection, run_id: str) -> frozenset[RunPromptInputEvidence]:
+    rows = conn.execute(select(run_prompt_inputs_table).where(run_prompt_inputs_table.c.run_id == run_id)).all()
+    try:
+        return frozenset(
+            RunPromptInputEvidence(
+                node_id=item.node_id,
+                field_path=item.field_path,
+                blob_id=item.blob_id,
+                content_sha256=item.content_sha256,
+                review_anchor=item.review_anchor,
+                effective_artifact_hash=item.effective_artifact_hash,
+            )
+            for item in rows
+        )
+    except ValueError as exc:
+        raise AuditIntegrityError("Stored run prompt input evidence is corrupt") from exc
+
+
 class RunLifecycleRepository:
     """Run lifecycle operations for the Landscape audit trail.
 
@@ -528,8 +546,14 @@ class RunLifecycleRepository:
         source_schema_json: str | None,
         runtime_val_manifest_json: str | None,
         web_plugin_policy_evidence: WebPluginPolicyEvidence | None,
-        run_prompt_inputs: tuple[RunPromptInputEvidence, ...] = (),
+        run_prompt_inputs: tuple[RunPromptInputEvidence, ...] | None,
     ) -> Run | None:
+        """Return the existing permit-bound run, or None when no header exists.
+
+        ``run_prompt_inputs=None`` is reserved for cancellation, which records
+        no prompt evidence of its own and preserves whatever the header's
+        transaction stored; every start or retry passes its exact evidence.
+        """
         row = conn.execute(select(runs_table).where(runs_table.c.run_id == binding.run_id)).one_or_none()
         if row is None:
             return None
@@ -590,22 +614,8 @@ class RunLifecycleRepository:
                 evidence.admission_decision,
             ):
                 raise AuditIntegrityError("Permit retry changed web plugin policy evidence")
-        stored_inputs = conn.execute(select(run_prompt_inputs_table).where(run_prompt_inputs_table.c.run_id == binding.run_id)).all()
-        try:
-            stored = {
-                RunPromptInputEvidence(
-                    node_id=item.node_id,
-                    field_path=item.field_path,
-                    blob_id=item.blob_id,
-                    content_sha256=item.content_sha256,
-                    review_anchor=item.review_anchor,
-                    effective_artifact_hash=item.effective_artifact_hash,
-                )
-                for item in stored_inputs
-            }
-        except ValueError as exc:
-            raise AuditIntegrityError("Permit retry found corrupt run prompt input evidence") from exc
-        if stored != set(run_prompt_inputs):
+        stored = _stored_run_prompt_inputs_on(conn, binding.run_id)
+        if run_prompt_inputs is not None and stored != frozenset(run_prompt_inputs):
             raise AuditIntegrityError("Permit retry changed run prompt input evidence")
         return self._run_loader.load(row)
 
@@ -649,6 +659,9 @@ class RunLifecycleRepository:
                     source_schema_json=header.source_schema_json,
                     runtime_val_manifest_json=header.runtime_val_manifest_json,
                     web_plugin_policy_evidence=web_plugin_policy_evidence,
+                    # Cancellation writes no prompt evidence and keeps any the
+                    # prepared header committed; there is nothing to compare.
+                    run_prompt_inputs=None,
                 )
             )
         if run is None:

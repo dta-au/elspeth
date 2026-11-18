@@ -7,9 +7,10 @@ from sqlalchemy import select
 
 from elspeth.contracts import RunStatus
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.run_prompt_input import RunPromptInputEvidence
 from elspeth.contracts.run_start import RunStartPermitBinding
 from elspeth.core.landscape.run_start_admission import RunStartAdmissionRepository, RunStartAdmissionState
-from elspeth.core.landscape.schema import calls_table, nodes_table, run_coordination_events_table, runs_table
+from elspeth.core.landscape.schema import calls_table, nodes_table, run_coordination_events_table, run_prompt_inputs_table, runs_table
 from tests.fixtures.landscape import leader_token_for, make_factory, make_landscape_db
 
 
@@ -82,6 +83,46 @@ def test_successor_cancels_prepared_baseline_under_new_epoch() -> None:
         with db.engine.connect() as conn:
             epochs = conn.execute(select(run_coordination_events_table.c.leader_epoch)).scalars().all()
         assert max(epoch for epoch in epochs if epoch is not None) > original.leader_epoch
+
+
+def test_cancel_prepared_file_backed_run_keeps_its_prompt_evidence() -> None:
+    """A prepared run that recorded prompt files can still be cancelled, and cancellation writes no prompt evidence."""
+    evidence = RunPromptInputEvidence(
+        node_id="classify",
+        field_path="prompt_template",
+        blob_id="00000000-0000-0000-0000-000000000001",
+        content_sha256="a" * 64,
+        review_anchor="b" * 64,
+        effective_artifact_hash=None,
+    )
+    with make_landscape_db() as db:
+        factory = make_factory(db)
+        binding = RunStartPermitBinding("file-run", "file-permit", 1, "e" * 64)
+        factory.run_lifecycle.begin_run(
+            {},
+            "v1",
+            run_id=binding.run_id,
+            run_start_permit=binding,
+            openrouter_catalog_sha256="a" * 64,
+            openrouter_catalog_source="bundled",
+            run_prompt_inputs=(evidence,),
+        )
+        with db.engine.connect() as conn:
+            before = conn.execute(select(run_prompt_inputs_table)).all()
+        factory.run_coordination.release_seat(token=leader_token_for(db, binding.run_id))
+
+        run = factory.run_lifecycle.materialize_cancelled_permit(
+            binding,
+            {},
+            "v1",
+            openrouter_catalog_sha256="a" * 64,
+            openrouter_catalog_source="bundled",
+        )
+
+        assert run.status is RunStatus.INTERRUPTED
+        with db.engine.connect() as conn:
+            assert conn.execute(select(run_prompt_inputs_table)).all() == before
+        assert len(before) == 1
 
 
 def test_mismatched_permit_and_configuration_refuse_without_mutation() -> None:
