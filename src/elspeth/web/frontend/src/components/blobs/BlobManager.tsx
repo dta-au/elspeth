@@ -7,6 +7,7 @@ import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { BlobRow } from "./BlobRow";
 import { IdentityStorageTotal } from "./IdentityStorageTotal";
 import type { BlobMetadata, BlobCategory } from "@/types/api";
+import { componentOptionsById, optionBlobReferences } from "@/lib/blobBindings";
 
 interface BlobManagerProps {
   onUseAsInput: (blob: BlobMetadata) => void;
@@ -39,13 +40,48 @@ const CATEGORY_ORDER: BlobCategory[] = ["source", "sink", "other"];
  */
 export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
+  const selectedNodeId = useSessionStore((s) => s.selectedNodeId);
+  const compositionState = useSessionStore((s) => s.compositionState);
   // Use-as-input is a compose entry point: disable it while a freeform
   // compose is in flight (elspeth-3f38ebb1b5) so the manager cannot offer a
   // second compose the store admission gate would refuse.
   const isComposing = useSessionStore((s) => s.isComposing);
-  const { blobs, isLoading, error, loadBlobs, uploadBlob, deleteBlob, downloadBlob } =
+  const { blobs, isLoading, error, activeSessionId: blobSessionId, loadBlobs, uploadBlob, deleteBlob, downloadBlob } =
     useBlobStore();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const lastScrolledSelection = useRef<string | null>(null);
+
+  const attached = useMemo(() => {
+    const fieldsByBlob = new Map<string, string[]>();
+    const options = componentOptionsById(compositionState, selectedNodeId);
+    if (options === null) return fieldsByBlob;
+    for (const { blobId, fieldPath } of optionBlobReferences(options)) {
+      const fields = fieldsByBlob.get(blobId) ?? [];
+      if (!fields.includes(fieldPath)) fields.push(fieldPath);
+      fieldsByBlob.set(blobId, fields);
+    }
+    return fieldsByBlob;
+  }, [compositionState, selectedNodeId]);
+
+  const listBelongsToSession = blobSessionId === activeSessionId;
+  const matchedIds = useMemo(
+    () => new Set(blobs.filter((blob) => attached.has(blob.id.toLowerCase())).map((blob) => blob.id.toLowerCase())),
+    [attached, blobs],
+  );
+  const missingCount = !isLoading && listBelongsToSession ? attached.size - matchedIds.size : 0;
+
+  useEffect(() => {
+    if (selectedNodeId === null) {
+      lastScrolledSelection.current = null;
+      return;
+    }
+    if (lastScrolledSelection.current === selectedNodeId || isLoading || !listBelongsToSession) return;
+    const firstRow = Array.from(listRef.current?.querySelectorAll<HTMLElement>(".blob-row-item") ?? [])
+      .find((row) => attached.has(row.dataset.blobId?.toLowerCase() ?? ""));
+    if (firstRow) firstRow.scrollIntoView?.({ block: "nearest", behavior: "auto" });
+    lastScrolledSelection.current = selectedNodeId;
+  }, [selectedNodeId, attached, isLoading, listBelongsToSession, blobs]);
   // Blob queued for deletion, awaiting confirmation. Blobs are pipeline
   // inputs/outputs, so deletion is irreversible data loss (WCAG 3.3.4). We
   // capture the session the blob belongs to alongside the blob: if the active
@@ -154,6 +190,13 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
         />
       </div>
 
+      {selectedNodeId && attached.size > 0 && listBelongsToSession && (
+        <p className="blob-manager-attached-summary" role="status" aria-live="polite">
+          {isLoading ? `Checking files used by ${selectedNodeId}` : `${matchedIds.size} ${matchedIds.size === 1 ? "file" : "files"} used by ${selectedNodeId}`}
+          {missingCount > 0 && ` · ${missingCount} attached ${missingCount === 1 ? "file is" : "files are"} not in this session`}
+        </p>
+      )}
+
       {/* Error */}
       {error && (
         <div
@@ -165,7 +208,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
       )}
 
       {/* Categorized file list */}
-      <div className="blob-manager-list">
+      <div className="blob-manager-list" ref={listRef}>
         {isLoading ? (
           <div className="blob-manager-loading">
             Loading...
@@ -192,6 +235,8 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
                     onDelete={handleRequestDelete}
                     onUseAsInput={onUseAsInput}
                     useAsInputDisabled={isComposing}
+                    attachedFields={listBelongsToSession ? attached.get(blob.id.toLowerCase()) : undefined}
+                    selectedNodeLabel={selectedNodeId}
                   />
                 ))}
               </div>
