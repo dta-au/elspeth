@@ -228,6 +228,30 @@ it("opens a list-form query's editor from the inspector Edit control, labelled b
   expect(await screen.findByRole("textbox", { name: "Edit prompt file prompt.md (User prompt, query classify)" })).toHaveFocus();
 });
 
+it("does not let a post-save refetch from an earlier activation replace a newer graph", async () => {
+  const marker = { mode: "inline_content", blob_ref: "blob-1", sha256: "a".repeat(64) };
+  const options = { prompt_template: marker };
+  const stateAt = (version: number) => ({ version, nodes: [{ id: "first", plugin: "llm", options }], sources: {}, outputs: [] }) as unknown as CompositionState;
+  useSessionStore.setState({ compositionState: stateAt(1) });
+  useBlobStore.setState({ activeSessionId: "session-1", isLoading: false,
+    blobs: [{ id: "blob-1", filename: "prompt.md", status: "ready", mime_type: "text/plain", content_hash: null } as BlobMetadata] });
+  let resolveFetch!: (state: CompositionState) => void;
+  vi.mocked(fetchCompositionState).mockReturnValue(new Promise((resolve) => { resolveFetch = resolve; }));
+  vi.spyOn(useBlobStore.getState(), "loadBlobs").mockResolvedValue();
+  render(<PromptFileEditors nodeId="first" options={options} />);
+  const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
+  await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
+  fireEvent.change(editor, { target: { value: "new text" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
+  await waitFor(() => expect(fetchCompositionState).toHaveBeenCalled());
+  // Away and back: each activation advances the session publication generation.
+  act(() => useSessionStore.getState().resetForTutorialSession("session-2"));
+  act(() => useSessionStore.getState().resetForTutorialSession("session-1"));
+  act(() => useSessionStore.setState({ compositionState: stateAt(7) }));
+  await act(async () => { resolveFetch(stateAt(2)); });
+  expect(useSessionStore.getState().compositionState?.version).toBe(7);
+});
+
 it.each([
   ["ordered list form", { query_input_mode: "ordered", queries: [{ name: "classify", template: { mode: "inline_content", blob_ref: "blob-1", sha256: "a".repeat(64) } }] }, "queries.0.template"],
   ["mapping form (control)", { queries: { classify: { template: { mode: "inline_content", blob_ref: "blob-1", sha256: "a".repeat(64) } } } }, "queries.classify.template"],

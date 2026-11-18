@@ -3,7 +3,7 @@ import { fetchCompositionState, readPromptFileText, savePromptFile } from "@/api
 import { Button } from "@/components/ui";
 import { useBlobFilename } from "@/components/blobs/BlobFileName";
 import { useBlobStore } from "@/stores/blobStore";
-import { useSessionStore } from "@/stores/sessionStore";
+import { captureSessionPublicationGuard, useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { promptFileEditability, promptFileSlots } from "@/lib/blobBindings";
 import { optionLabel } from "./OptionRows";
@@ -116,23 +116,27 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, saveRefusal = null
     if (!sessionId || text === null || expectedSha256 === null || refusal !== null) return;
     setSaving(true);
     setError(null);
+    // Bound to THIS activation, not only the session id: switching away and
+    // back advances the publication generation, so a slow post-save refetch
+    // cannot overwrite a newer graph published since.
+    const isCurrent = captureSessionPublicationGuard(sessionId);
     try {
       const result = await savePromptFile(sessionId, blobId, text, expectedSha256, nodeId, fieldPath);
-      if (useSessionStore.getState().activeSessionId !== sessionId) return;
+      if (!isCurrent()) return;
       setSavedText(text);
       setExpectedSha256(result.content_sha256);
       // The save rewrote the blob, so the file manager's hash and size are stale.
       void useBlobStore.getState().loadBlobs(sessionId);
       try {
         const state = await fetchCompositionState(sessionId);
-        if (useSessionStore.getState().activeSessionId === sessionId) {
+        if (isCurrent()) {
           useSessionStore.setState({ compositionState: state });
         }
       } catch {
-        setError("Saved and approved. Reload the session to see the updated prompt status.");
+        if (isCurrent()) setError("Saved and approved. Reload the session to see the updated prompt status.");
       }
     } catch (failure: unknown) {
-      if (useSessionStore.getState().activeSessionId === sessionId) {
+      if (isCurrent()) {
         const typed = failure as { detail?: unknown; error_type?: unknown };
         setError(typed.error_type === "prompt_file_node_multi_binding"
           ? MULTI_BINDING_REFUSAL
