@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 from sqlalchemy import Connection, text
 
-from elspeth.core.landscape.schema import _POSTGRES_AUDIT_EXPORT_TRIGGER_DDL, metadata
+from elspeth.core.landscape.schema import POSTGRES_LANDSCAPE_TRIGGER_DDL, metadata
 from elspeth.mcp.sql_policy import AGGREGATES, SCALAR_FUNCTIONS, SCALAR_TYPES, SQLPolicyError, admit_stored_expression
 
 # These are trusted transaction controls, never derived from caller SQL. Naming
@@ -280,6 +280,8 @@ _TRIGGER_ATTACHMENTS = {
         "trg_audit_export_chunk_immutable:audit_export_snapshot_chunks:19",
         "trg_audit_export_chunk_immutable_delete:audit_export_snapshot_chunks:11",
     ),
+    # tgtype 19 = ROW(1) | BEFORE(2) | UPDATE(16), as for the siblings above.
+    "elspeth_run_prompt_inputs_no_update": ("trg_run_prompt_inputs_no_update:run_prompt_inputs:19",),
 }
 
 
@@ -288,7 +290,7 @@ def _trigger_body(name: str) -> str:
     suffix = "$$ LANGUAGE plpgsql"
     bodies = [
         ddl.strip()[len(prefix) : -len(suffix)]
-        for ddl in _POSTGRES_AUDIT_EXPORT_TRIGGER_DDL
+        for ddl in POSTGRES_LANDSCAPE_TRIGGER_DDL
         if ddl.strip().startswith(prefix) and ddl.strip().endswith(suffix)
     ]
     if len(bodies) != 1:

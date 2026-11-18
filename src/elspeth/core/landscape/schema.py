@@ -638,23 +638,23 @@ event.listen(
         "END;"
     ).execute_if(dialect="sqlite"),
 )
-event.listen(
-    run_prompt_inputs_table,
-    "after_create",
-    _prompt_input_ddl(
-        "CREATE FUNCTION elspeth_run_prompt_inputs_no_update() RETURNS trigger LANGUAGE plpgsql AS $$ "
-        "BEGIN RAISE EXCEPTION 'run_prompt_inputs is append-only; UPDATE is forbidden' USING ERRCODE = '23000'; "
-        "END; $$"
-    ).execute_if(dialect="postgresql"),
+# The single source of the PostgreSQL append-only guard: the listener below
+# emits it, and the MCP audit profile admits the function only when its stored
+# body equals this one (mcp/postgres_profile.py::_trigger_body), so the
+# canonical "RETURNS trigger AS $$ ... $$ LANGUAGE plpgsql" form is required.
+_POSTGRES_RUN_PROMPT_INPUT_TRIGGER_DDL: tuple[str, ...] = (
+    "CREATE FUNCTION elspeth_run_prompt_inputs_no_update() RETURNS trigger AS $$ "
+    "BEGIN RAISE EXCEPTION 'run_prompt_inputs is append-only; UPDATE is forbidden' USING ERRCODE = '23000'; "
+    "END; $$ LANGUAGE plpgsql",
+    "CREATE TRIGGER trg_run_prompt_inputs_no_update BEFORE UPDATE ON run_prompt_inputs "
+    "FOR EACH ROW EXECUTE FUNCTION elspeth_run_prompt_inputs_no_update()",
 )
-event.listen(
-    run_prompt_inputs_table,
-    "after_create",
-    _prompt_input_ddl(
-        "CREATE TRIGGER trg_run_prompt_inputs_no_update BEFORE UPDATE ON run_prompt_inputs "
-        "FOR EACH ROW EXECUTE FUNCTION elspeth_run_prompt_inputs_no_update()"
-    ).execute_if(dialect="postgresql"),
-)
+for _prompt_input_pg_ddl in _POSTGRES_RUN_PROMPT_INPUT_TRIGGER_DDL:
+    event.listen(
+        run_prompt_inputs_table,
+        "after_create",
+        _prompt_input_ddl(_prompt_input_pg_ddl).execute_if(dialect="postgresql"),
+    )
 
 run_start_admissions_table = Table(
     "run_start_admissions",
@@ -2330,6 +2330,10 @@ for _trigger_ddl in _POSTGRES_AUDIT_EXPORT_TRIGGER_DDL:
         "after_create",
         DDL(_trigger_ddl).execute_if(dialect="postgresql"),  # type: ignore[no-untyped-call]
     )
+
+# Every PostgreSQL plpgsql trigger DDL the Landscape emits. The MCP audit
+# profile derives each admitted trigger function's canonical body from here.
+POSTGRES_LANDSCAPE_TRIGGER_DDL: tuple[str, ...] = _POSTGRES_RUN_PROMPT_INPUT_TRIGGER_DDL + _POSTGRES_AUDIT_EXPORT_TRIGGER_DDL
 
 # === Operations (Source/Sink I/O) ===
 # Operations are the source/sink equivalent of node_states - they provide
