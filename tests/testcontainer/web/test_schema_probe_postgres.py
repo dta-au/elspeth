@@ -35,7 +35,7 @@ from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.landscape.database import _REQUIRED_TRIGGERS, LandscapeDB, SchemaCompatibilityError
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction, fenced_member_transaction
-from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH, audit_export_snapshot_chunks_table, run_prompt_inputs_table
+from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH, audit_export_snapshot_chunks_table, run_prompt_inputs_table, runs_table
 from elspeth.core.landscape.schema import metadata as landscape_metadata
 from elspeth.core.landscape.schema import schema_identity_table as landscape_schema_identity_table
 from elspeth.core.schema_identity import SCHEMA_IDENTITY_APPLICATION_ID
@@ -138,10 +138,34 @@ def test_postgres_prompt_approval_update_refused_and_blob_deletable(postgres_eng
 
 def test_postgres_run_prompt_inputs_update_refused(postgres_engine: Engine) -> None:
     init_landscape_schema(postgres_engine)
-    with postgres_engine.begin() as conn:
+    with pytest.raises(IntegrityError), postgres_engine.begin() as conn:
         conn.execute(
             insert(run_prompt_inputs_table).values(
                 run_id="orphan-run",
+                node_id="classify",
+                field_path="prompt_template",
+                blob_id="prompt-blob",
+                content_sha256="a" * 64,
+                review_anchor="a" * 64,
+                admitted_at=datetime.now(UTC),
+            )
+        )
+    with postgres_engine.begin() as conn:
+        conn.execute(
+            insert(runs_table).values(
+                run_id="owned-run",
+                started_at=datetime.now(UTC),
+                config_hash="a" * 64,
+                settings_json="{}",
+                canonical_version="v1",
+                status="running",
+                openrouter_catalog_sha256="a" * 64,
+                openrouter_catalog_source="bundled",
+            )
+        )
+        conn.execute(
+            insert(run_prompt_inputs_table).values(
+                run_id="owned-run",
                 node_id="classify",
                 field_path="prompt_template",
                 blob_id="prompt-blob",

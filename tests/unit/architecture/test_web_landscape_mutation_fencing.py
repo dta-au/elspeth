@@ -663,7 +663,10 @@ def _verb_authority_scope(path: str, method: str) -> str:
 # (72/72). Against release a375d7f13: arrived 1 (the QR node_states insert above),
 # departed 0, moved 0. Measured by scripts/fencing_inventory.py --baseline against a
 # git archive of a375d7f13.
-_EXPECTED_DML_COUNT = 165
+# Round 5: 165 -> 166; begin_run inserts one run_prompt_inputs row shape
+# inside its runs-row transaction. The live scanner adds one identity and
+# one write shape; no existing identity changes.
+_EXPECTED_DML_COUNT = 166
 # D8.1 (P4-D8 elspeth-43ddb79074): 6ca139a7… → 504d39e2…. Count 139 and the write set
 # unchanged; twelve construction FINGERPRINTS moved because the constructions
 # themselves were rewritten to fence first / execute once: the eleven
@@ -794,7 +797,7 @@ _EXPECTED_DML_COUNT = 165
 # _EXPECTED_DML_COUNT.
 # QR merged with release/0.8.1: 6a08f651… (release) -> the value below, the one
 # arrival named at _EXPECTED_DML_COUNT.
-_EXPECTED_DML_INVENTORY_SHA256 = "e36c8c4358dc70992a98c6b6209b37c2d958aac25f8bd39ac615e9c2a9d16032"
+_EXPECTED_DML_INVENTORY_SHA256 = "913e9295eafa5185df205e3c5920242d66753d5c21e4ad0eaf8aa9a230ac88b0"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -837,6 +840,7 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
         ("run_coordination", "insert"),
         ("run_coordination", "update"),
         ("run_coordination_events", "insert"),
+        ("run_prompt_inputs", "insert"),
         ("run_sources", "delete"),
         ("run_sources", "insert"),
         ("run_sources", "update"),
@@ -17447,7 +17451,7 @@ def _coordination_repo(self) -> RunCoordinationRepository:
     return self._run_coordination
 """,
     ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.begin_run"): """
-def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id: str | None=None, reproducibility_grade: ReproducibilityGrade | None=None, status: RunStatus=RunStatus.RUNNING, source_schema_json: str | None=None, initiated_by_user_id: str | None=None, auth_provider_type: str | None=None, openrouter_catalog_sha256: str, openrouter_catalog_source: str, leader_worker_id: str | None=None, web_plugin_policy_evidence: WebPluginPolicyEvidence | None=None, run_start_permit: RunStartPermitBinding | None=None, run_mode: RunMode=RunMode.LIVE, replay_from_run_id: str | None=None) -> Run:
+def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id: str | None=None, reproducibility_grade: ReproducibilityGrade | None=None, status: RunStatus=RunStatus.RUNNING, source_schema_json: str | None=None, initiated_by_user_id: str | None=None, auth_provider_type: str | None=None, openrouter_catalog_sha256: str, openrouter_catalog_source: str, leader_worker_id: str | None=None, web_plugin_policy_evidence: WebPluginPolicyEvidence | None=None, run_prompt_inputs: tuple[RunPromptInputEvidence, ...]=(), run_start_permit: RunStartPermitBinding | None=None, run_mode: RunMode=RunMode.LIVE, replay_from_run_id: str | None=None) -> Run:
     if status == RunStatus.COMPLETED:
         raise AuditIntegrityError('begin_run() cannot create a COMPLETED run. Use complete_run() so completed_at is recorded in the audit trail.')
     if type(run_mode) is not RunMode:
@@ -17458,6 +17462,11 @@ def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id
     _validate_openrouter_catalog_snapshot(sha256=openrouter_catalog_sha256, source=openrouter_catalog_source)
     if web_plugin_policy_evidence is not None and (not isinstance(web_plugin_policy_evidence, WebPluginPolicyEvidence)):
         raise AuditIntegrityError('web_plugin_policy_evidence must be a WebPluginPolicyEvidence value')
+    if type(run_prompt_inputs) is not tuple or any(type(item) is not RunPromptInputEvidence for item in run_prompt_inputs):
+        raise AuditIntegrityError('run_prompt_inputs must be a tuple of RunPromptInputEvidence values')
+    keys = [(item.node_id, item.field_path) for item in run_prompt_inputs]
+    if len(keys) != len(set(keys)):
+        raise AuditIntegrityError('run_prompt_inputs contains duplicate prompt fields')
     run_id = run_id or generate_id()
     if replay_from_run_id == run_id:
         raise AuditIntegrityError('a replay/verify run cannot cite itself as its source')
@@ -17473,7 +17482,7 @@ def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id
     try:
         with self._db.write_connection() as conn:
             if run_start_permit is not None:
-                existing = self._observe_permitted_run_on(conn, run_start_permit, config_hash=config_hash, canonical_version=canonical_version, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type, source_schema_json=source_schema_json, runtime_val_manifest_json=runtime_val_manifest_json, web_plugin_policy_evidence=web_plugin_policy_evidence)
+                existing = self._observe_permitted_run_on(conn, run_start_permit, config_hash=config_hash, canonical_version=canonical_version, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type, source_schema_json=source_schema_json, runtime_val_manifest_json=runtime_val_manifest_json, web_plugin_policy_evidence=web_plugin_policy_evidence, run_prompt_inputs=run_prompt_inputs)
                 if existing is not None:
                     return existing
             conn.execute(runs_table.insert().values(run_id=run.run_id, started_at=run.started_at, config_hash=run.config_hash, settings_json=run.settings_json, canonical_version=run.canonical_version, status=run.status.value, run_mode=run.run_mode.value, replay_from_run_id=run.replay_from_run_id, reproducibility_grade=run.reproducibility_grade, source_schema_json=source_schema_json, runtime_val_manifest_json=runtime_val_manifest_json, llm_call_count=None, seeded_from_cache=False, cache_key=None, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source))
@@ -17483,12 +17492,14 @@ def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id
                 conn.execute(run_attributions_table.insert().values(run_id=run.run_id, recorded_at=timestamp, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type))
             if web_plugin_policy_evidence is not None:
                 self._insert_web_plugin_policy_evidence(conn, run_id=run.run_id, evidence=web_plugin_policy_evidence)
+            for evidence in run_prompt_inputs:
+                conn.execute(run_prompt_inputs_table.insert().values(run_id=run.run_id, node_id=evidence.node_id, field_path=evidence.field_path, blob_id=evidence.blob_id, content_sha256=evidence.content_sha256, review_anchor=evidence.review_anchor, effective_artifact_hash=evidence.effective_artifact_hash, admitted_at=now()))
             leader_token = coordination.register_run_leader_on(conn, run_id=run.run_id, worker_id=worker_id, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, entry_point='run')
             coordination._finalize_leader_registration_on(conn, token=leader_token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS)
     except SQLAlchemyError as exc:
         if run_start_permit is not None:
             with self._db.engine.connect() as conn:
-                existing = self._observe_permitted_run_on(conn, run_start_permit, config_hash=config_hash, canonical_version=canonical_version, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type, source_schema_json=source_schema_json, runtime_val_manifest_json=runtime_val_manifest_json, web_plugin_policy_evidence=web_plugin_policy_evidence)
+                existing = self._observe_permitted_run_on(conn, run_start_permit, config_hash=config_hash, canonical_version=canonical_version, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type, source_schema_json=source_schema_json, runtime_val_manifest_json=runtime_val_manifest_json, web_plugin_policy_evidence=web_plugin_policy_evidence, run_prompt_inputs=run_prompt_inputs)
                 if existing is not None:
                     return existing
         raise LandscapeRecordError(f'begin_run — database rejected audit write: {type(exc).__name__}') from exc
@@ -17595,6 +17606,7 @@ _COORDINATION_FINALIZATION_DEPENDENCIES = {
         "SQLAlchemyError": "sqlalchemy.exc.SQLAlchemyError",
         "ReproducibilityGrade": "elspeth.contracts.ReproducibilityGrade",
         "WebPluginPolicyEvidence": "elspeth.contracts.plugin_policy_audit.WebPluginPolicyEvidence",
+        "RunPromptInputEvidence": "elspeth.contracts.run_prompt_input.RunPromptInputEvidence",
         "AuditIntegrityError": "elspeth.contracts.errors.AuditIntegrityError",
         "generate_id": "elspeth.core.ids.generate_id",
         "mint_worker_id": "elspeth.contracts.coordination.mint_worker_id",
@@ -17602,6 +17614,7 @@ _COORDINATION_FINALIZATION_DEPENDENCIES = {
         "DEFAULT_RUN_LIVENESS_WINDOW_SECONDS": "elspeth.contracts.coordination.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS",
         "runs_table": "elspeth.core.landscape.schema.runs_table",
         "run_attributions_table": "elspeth.core.landscape.schema.run_attributions_table",
+        "run_prompt_inputs_table": "elspeth.core.landscape.schema.run_prompt_inputs_table",
     },
 }
 
@@ -17636,7 +17649,7 @@ def acquire_reconciliation_leadership(self, *, run_id: str, worker_id: str, wind
 _COORDINATION_FINALIZATION_RECIPES[
     ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository._observe_permitted_run_on")
 ] = """
-def _observe_permitted_run_on(self, conn: Connection, binding: RunStartPermitBinding, *, config_hash: str, canonical_version: str, openrouter_catalog_sha256: str, openrouter_catalog_source: str, initiated_by_user_id: str | None, auth_provider_type: str | None, source_schema_json: str | None, runtime_val_manifest_json: str | None, web_plugin_policy_evidence: WebPluginPolicyEvidence | None) -> Run | None:
+def _observe_permitted_run_on(self, conn: Connection, binding: RunStartPermitBinding, *, config_hash: str, canonical_version: str, openrouter_catalog_sha256: str, openrouter_catalog_source: str, initiated_by_user_id: str | None, auth_provider_type: str | None, source_schema_json: str | None, runtime_val_manifest_json: str | None, web_plugin_policy_evidence: WebPluginPolicyEvidence | None, run_prompt_inputs: tuple[RunPromptInputEvidence, ...]=()) -> Run | None:
     row = conn.execute(select(runs_table).where(runs_table.c.run_id == binding.run_id)).one_or_none()
     if row is None:
         return None
@@ -17664,6 +17677,13 @@ def _observe_permitted_run_on(self, conn: Connection, binding: RunStartPermitBin
             raise AuditIntegrityError('Permit retry found corrupt admission evidence') from exc
         if (policy.schema_version, policy.policy_hash, policy.snapshot_hash, policy.authorized_plugin_ids_json, policy.available_plugin_ids_json, policy.control_modes_json, policy.selected_implementations_json, policy.selected_profile_aliases_json, policy.plugin_code_identities_json, policy.binding_generation_fingerprint, policy.decision_codes_json, admission_decision) != (evidence.schema_version, evidence.policy_hash, evidence.snapshot_hash, canonical_json(evidence.authorized_plugin_ids), canonical_json(evidence.available_plugin_ids), canonical_json(evidence.control_modes), canonical_json(evidence.selected_implementations), canonical_json(evidence.selected_profile_aliases), canonical_json(evidence.plugin_code_identities), evidence.binding_generation_fingerprint, canonical_json(evidence.decision_codes), evidence.admission_decision):
             raise AuditIntegrityError('Permit retry changed web plugin policy evidence')
+    stored_inputs = conn.execute(select(run_prompt_inputs_table).where(run_prompt_inputs_table.c.run_id == binding.run_id)).all()
+    try:
+        stored = {RunPromptInputEvidence(node_id=item.node_id, field_path=item.field_path, blob_id=item.blob_id, content_sha256=item.content_sha256, review_anchor=item.review_anchor, effective_artifact_hash=item.effective_artifact_hash) for item in stored_inputs}
+    except ValueError as exc:
+        raise AuditIntegrityError('Permit retry found corrupt run prompt input evidence') from exc
+    if stored != set(run_prompt_inputs):
+        raise AuditIntegrityError('Permit retry changed run prompt input evidence')
     return self._run_loader.load(row)
 """
 _COORDINATION_FINALIZATION_RECIPES[("src/elspeth/core/landscape/run_start_admission.py", "RunStartAdmissionRepository.observe_on")] = """
@@ -17707,10 +17727,12 @@ _COORDINATION_FINALIZATION_DEPENDENCIES[
     "RunStartAdmissionRepository": "elspeth.core.landscape.run_start_admission.RunStartAdmissionRepository",
     "AuditIntegrityError": "elspeth.contracts.errors.AuditIntegrityError",
     "WebPluginPolicyEvidence": "elspeth.contracts.plugin_policy_audit.WebPluginPolicyEvidence",
+    "RunPromptInputEvidence": "elspeth.contracts.run_prompt_input.RunPromptInputEvidence",
     "select": "sqlalchemy.select",
     "runs_table": "elspeth.core.landscape.schema.runs_table",
     "run_attributions_table": "elspeth.core.landscape.schema.run_attributions_table",
     "run_web_plugin_policy_table": "elspeth.core.landscape.schema.run_web_plugin_policy_table",
+    "run_prompt_inputs_table": "elspeth.core.landscape.schema.run_prompt_inputs_table",
     "canonical_json": "elspeth.core.canonical.canonical_json",
     "decode_admission_decision": "elspeth.contracts.plugin_policy_audit.decode_admission_decision",
 }

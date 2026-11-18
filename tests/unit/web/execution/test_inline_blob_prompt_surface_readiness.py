@@ -310,6 +310,7 @@ def _run_admission(
     after_substitution: Callable[[dict[str, Any], Any], None] | None = None,
     landscape_probe: Any | None = None,
     run_id: UUID | None = None,
+    on_final_approval: Callable[[Any], None] | None = None,
 ) -> tuple[BaseException | None, Any, Any]:
     """Drive ``_run_pipeline`` with the runtime YAML the composer generates for the same state.
 
@@ -358,6 +359,8 @@ def _run_admission(
         async def assert_prompt_file_approvals(self, _snapshot: Any) -> None:
             if not approved:
                 raise PromptFileReviewStale()
+            if on_final_approval is not None:
+                on_final_approval(_snapshot)
 
     cast(Any, service)._session_service = PromptAwareSessionService()
     record = replace(_record(modality), session_id=session_service.run.session_id, mime_type=mime_type)
@@ -514,10 +517,13 @@ def test_final_admission_records_exact_prompt_input(tmp_path: Path, execution_fi
     from sqlalchemy import select
 
     from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.core.landscape.factory import RecorderFactory
     from elspeth.core.landscape.schema import run_prompt_inputs_table
+    from elspeth.web.execution.service import _run_prompt_input_evidence
 
     landscape_url = f"sqlite:///{tmp_path / 'landscape.db'}"
     run_id = uuid4()
+    admitted: list[Any] = []
     with LandscapeDB(landscape_url) as db:
         raised, blob_service, _session_service = _run_admission(
             tmp_path,
@@ -527,9 +533,16 @@ def test_final_admission_records_exact_prompt_input(tmp_path: Path, execution_fi
             approved=True,
             landscape_probe=db,
             run_id=run_id,
+            on_final_approval=admitted.append,
         )
         assert str(raised) == "stop after prompt input evidence"
         assert blob_service.read_blob_content_calls == [_BLOB_ID]
+        assert len(admitted) == 1
+        blob_service.content = b"changed after final admission"
+    with LandscapeDB.from_url(landscape_url, create_tables=False) as db:
+        RecorderFactory(db).run_lifecycle.begin_run(
+            {}, "v1", run_id=str(run_id), run_prompt_inputs=_run_prompt_input_evidence(tuple(admitted))
+        )
     with LandscapeDB.from_url(landscape_url, create_tables=False) as db, db.read_only_connection() as conn:
         row = conn.execute(select(run_prompt_inputs_table)).one()
     assert row.run_id == str(run_id)
@@ -537,6 +550,7 @@ def test_final_admission_records_exact_prompt_input(tmp_path: Path, execution_fi
     assert row.field_path == "prompt_template"
     assert row.blob_id == str(_BLOB_ID)
     assert row.content_sha256 == hashlib.sha256(_CONTENT).hexdigest()
+    assert row.content_sha256 != hashlib.sha256(blob_service.content).hexdigest()
 
 
 @pytest.mark.parametrize("field", ["prompt_template", "system_prompt", "queries.q.template", "queries.q", "queries"])

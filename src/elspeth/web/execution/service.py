@@ -35,7 +35,7 @@ from uuid import UUID
 import structlog
 from opentelemetry import metrics
 from pydantic import ValidationError as PydanticValidationError
-from sqlalchemy import and_, insert, select
+from sqlalchemy import and_, select
 from sqlalchemy.exc import DBAPIError, DisconnectionError, InterfaceError, OperationalError, SQLAlchemyError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
@@ -54,6 +54,7 @@ from elspeth.contracts.hashing import CANONICAL_VERSION, stable_hash
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.contracts.plugin_semantics import SemanticOutcome, UnknownSemanticPolicy
+from elspeth.contracts.run_prompt_input import RunPromptInputEvidence
 from elspeth.contracts.run_start import RunStartPermitBinding
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
 from elspeth.contracts.secrets import WebSecretResolver
@@ -72,7 +73,7 @@ from elspeth.core.config import load_bounded_pipeline_yaml
 from elspeth.core.events import EventBus
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_lifecycle_repository import is_valid_sha256_hex
-from elspeth.core.landscape.schema import calls_table, node_states_table, nodes_table, operations_table, run_prompt_inputs_table
+from elspeth.core.landscape.schema import calls_table, node_states_table, nodes_table, operations_table
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.core.secrets import SecretResolutionError, collect_secret_ref_marker_sites
 from elspeth.engine.orchestrator.core import Orchestrator
@@ -1089,51 +1090,20 @@ def _load_most_recent_failed_node_id(landscape_db: LandscapeDB, *, run_id: str) 
     return None
 
 
-def _record_run_prompt_inputs(
-    landscape_db: LandscapeDB,
-    *,
-    run_id: str,
-    snapshots: tuple[PromptReviewSnapshot, ...],
-) -> None:
-    """Append exact admitted file identities before any provider call."""
-    if not snapshots:
-        return
-    with landscape_db.write_connection() as conn:
-        for snapshot in snapshots:
-            for binding in snapshot.bindings:
-                key = (
-                    run_prompt_inputs_table.c.run_id == run_id,
-                    run_prompt_inputs_table.c.node_id == snapshot.node_id,
-                    run_prompt_inputs_table.c.field_path == binding.field_path,
-                )
-                existing = conn.execute(select(run_prompt_inputs_table).where(*key)).one_or_none()
-                evidence = (
-                    str(binding.blob_id),
-                    binding.content_sha256,
-                    snapshot.anchor,
-                    snapshot.effective_artifact_hash,
-                )
-                if existing is not None:
-                    if (
-                        existing.blob_id,
-                        existing.content_sha256,
-                        existing.review_anchor,
-                        existing.effective_artifact_hash,
-                    ) != evidence:
-                        raise AuditIntegrityError("resumed run prompt input differs from admitted evidence")
-                    continue
-                conn.execute(
-                    insert(run_prompt_inputs_table).values(
-                        run_id=run_id,
-                        node_id=snapshot.node_id,
-                        field_path=binding.field_path,
-                        blob_id=str(binding.blob_id),
-                        content_sha256=binding.content_sha256,
-                        review_anchor=snapshot.anchor,
-                        effective_artifact_hash=snapshot.effective_artifact_hash,
-                        admitted_at=datetime.now(tz=UTC),
-                    )
-                )
+def _run_prompt_input_evidence(snapshots: tuple[PromptReviewSnapshot, ...]) -> tuple[RunPromptInputEvidence, ...]:
+    """Carry final admitted snapshot identities into run creation."""
+    return tuple(
+        RunPromptInputEvidence(
+            node_id=snapshot.node_id,
+            field_path=binding.field_path,
+            blob_id=str(binding.blob_id),
+            content_sha256=binding.content_sha256,
+            review_anchor=snapshot.anchor,
+            effective_artifact_hash=snapshot.effective_artifact_hash,
+        )
+        for snapshot in snapshots
+        for binding in snapshot.bindings
+    )
 
 
 # B1 fix: RunAlreadyActiveError is NOT defined here — imported from
@@ -4319,7 +4289,6 @@ class ExecutionServiceImpl:
             session_operation_lease.guard_external_effect()
             if landscape_db is None:
                 landscape_db = open_landscape_db(self._settings)
-            _record_run_prompt_inputs(landscape_db, run_id=run_id, snapshots=prompt_snapshots)
             if resume_existing:
                 # Replay committed outcomes before the resumed executor can
                 # request another admission. This is independent of whether
@@ -4550,6 +4519,7 @@ class ExecutionServiceImpl:
                             else _build_web_plugin_policy_evidence(snapshot=plugin_snapshot, policy=self._web_plugin_policy),
                             admission_decision=admission_decision,
                         ),
+                        run_prompt_inputs=_run_prompt_input_evidence(prompt_snapshots),
                         check_coordination_latch=session_operation_lease.guard_external_effect,
                         pre_effect_guard=session_operation_lease.guard_external_effect,
                         run_start_permit=run_start_permit,

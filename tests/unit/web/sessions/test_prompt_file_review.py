@@ -62,8 +62,9 @@ def test_landscape_records_admitted_prompt_identity(blob_env: dict[str, Any], tm
     from sqlalchemy import select
 
     from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.core.landscape.factory import RecorderFactory
     from elspeth.core.landscape.schema import run_prompt_inputs_table
-    from elspeth.web.execution.service import ExecutionServiceImpl
+    from elspeth.web.execution.service import _run_prompt_input_evidence
 
     blob = blob_tools._create_blob(blob_env, content="First row\nSecond row")
     assert blob.success
@@ -77,7 +78,7 @@ def test_landscape_records_admitted_prompt_identity(blob_env: dict[str, Any], tm
     )
     assert snapshot is not None
     with LandscapeDB(f"sqlite:///{tmp_path / 'landscape.db'}") as db:
-        ExecutionServiceImpl._record_run_prompt_inputs(db, run_id="run-1", snapshots=(snapshot,))
+        RecorderFactory(db).run_lifecycle.begin_run({}, "v1", run_id="run-1", run_prompt_inputs=_run_prompt_input_evidence((snapshot,)))
         with db.read_only_connection() as conn:
             row = conn.execute(select(run_prompt_inputs_table)).one()
         assert row.run_id == "run-1"
@@ -85,6 +86,38 @@ def test_landscape_records_admitted_prompt_identity(blob_env: dict[str, Any], tm
         assert row.field_path == "prompt_template"
         assert row.content_sha256 == record.content_hash
         assert row.review_anchor == snapshot.anchor
+
+
+def test_run_start_uses_admitted_hash_after_blob_bytes_change(blob_env: dict[str, Any], tmp_path: Path) -> None:
+    from hashlib import sha256
+
+    from sqlalchemy import select
+
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.core.landscape.factory import RecorderFactory
+    from elspeth.core.landscape.schema import run_prompt_inputs_table
+    from elspeth.web.execution.service import _run_prompt_input_evidence
+
+    blob = blob_tools._create_blob(blob_env, content="Reviewed")
+    assert blob.success
+    blob_id = UUID(blob.data["blob_id"])
+    record, _content = _record_and_bytes(blob_env, blob_id)
+    snapshot = resolve_prompt_review_snapshot(
+        session_id=UUID(blob_env["session_id"]),
+        node_id="classify",
+        options={"prompt_template": {"blob_ref": str(blob_id), "mode": "inline_content", "sha256": record.content_hash}},
+        read_blob=lambda requested: _record_and_bytes(blob_env, requested),
+    )
+    assert snapshot is not None
+    Path(record.storage_path).write_bytes(b"Changed after admission")
+    with LandscapeDB(f"sqlite:///{tmp_path / 'landscape.db'}") as db:
+        RecorderFactory(db).run_lifecycle.begin_run(
+            {}, "v1", run_id="admitted-run", run_prompt_inputs=_run_prompt_input_evidence((snapshot,))
+        )
+        with db.read_only_connection() as conn:
+            row = conn.execute(select(run_prompt_inputs_table)).one()
+    assert row.content_sha256 == record.content_hash
+    assert row.content_sha256 != sha256(b"Changed after admission").hexdigest()
 
 
 def test_run_prompt_inputs_update_refused(tmp_path: Path) -> None:
@@ -97,6 +130,9 @@ def test_run_prompt_inputs_update_refused(tmp_path: Path) -> None:
     from elspeth.core.landscape.schema import run_prompt_inputs_table
 
     with LandscapeDB(f"sqlite:///{tmp_path / 'landscape.db'}") as db:
+        from elspeth.core.landscape.factory import RecorderFactory
+
+        RecorderFactory(db).run_lifecycle.begin_run({}, "v1", run_id="run-1")
         with db.engine.begin() as conn:
             conn.execute(
                 insert(run_prompt_inputs_table).values(

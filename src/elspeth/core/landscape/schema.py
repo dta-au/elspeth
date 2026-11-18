@@ -482,7 +482,8 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        a fold — keeps such a store from opening. Populated epoch-47 stores
 #        require delete/recreate.
 #   51 → run_prompt_inputs records the exact approved prompt-file identities
-#        and bytes admitted for a Web run before its first provider call.
+#        and bytes admitted for a Web run in the runs-row transaction, with
+#        a run foreign key, before its first provider call.
 SQLITE_SCHEMA_EPOCH = 51
 
 schema_identity_table = create_schema_identity_table(metadata)
@@ -605,12 +606,11 @@ runs_table = Table(
 )
 Index("uq_runs_export_witness", runs_table.c.run_id, runs_table.c.status, runs_table.c.completed_at, unique=True)
 
-# Written before the run row, so this has no FK to runs: failure before
-# begin_run can leave an orphan row. The run FK is planned for .16.
+# Written with the run row by begin_run in the same transaction.
 run_prompt_inputs_table = Table(
     "run_prompt_inputs",
     metadata,
-    Column("run_id", String(64), nullable=False),
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
     Column("node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
     Column("field_path", String(256), nullable=False),
     Column("blob_id", String(36), nullable=False),

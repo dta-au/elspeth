@@ -16,11 +16,12 @@ from sqlalchemy import select, text
 import tests.integration.pipeline.test_composer_runtime_agreement as agreement
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import run_prompt_inputs_table
 from elspeth.web.blobs import prompt_text_routes
 from elspeth.web.blobs.service import content_hash
 from elspeth.web.composer.tools._common import _options_with_default_model_choice_review, _options_with_default_prompt_template_review
-from elspeth.web.execution.service import ExecutionServiceImpl
+from elspeth.web.execution.service import ExecutionServiceImpl, _run_prompt_input_evidence
 from elspeth.web.interpretation_state import (
     InterpretationReviewIntegrityError,
     InterpretationReviewPending,
@@ -933,7 +934,7 @@ def test_approved_prompt_bytes_reach_fake_provider_and_run_evidence(tmp_path: Pa
     run_id = str(uuid4())
     landscape_url = f"sqlite:///{tmp_path / 'landscape.db'}"
     with LandscapeDB(landscape_url) as landscape:
-        ExecutionServiceImpl._record_run_prompt_inputs(landscape, run_id=run_id, snapshots=snapshots)
+        RecorderFactory(landscape).run_lifecycle.begin_run({}, "v1", run_id=run_id, run_prompt_inputs=_run_prompt_input_evidence(snapshots))
     with LandscapeDB.from_url(landscape_url, create_tables=False) as landscape, landscape.read_only_connection() as conn:
         row = conn.execute(select(run_prompt_inputs_table)).one()
     assert (row.run_id, row.node_id, row.field_path, row.content_sha256) == (
