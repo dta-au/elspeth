@@ -44,6 +44,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationEventRecord,
     InterpretationKind,
     InterpretationSource,
+    InterpretationSurfaceOrigin,
 )
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
@@ -51,6 +52,7 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
+from elspeth.web.composer.interpretation_surfacing import _auto_surface_prompt_template_reviews_for_state
 from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
@@ -2457,6 +2459,126 @@ async def test_resolve_prompt_template_review_survives_sibling_vague_term_bake(s
     reqs = final_node["options"][INTERPRETATION_REQUIREMENTS_KEY]
     pt_req = next(r for r in reqs if r["id"] == "prompt_template_review")
     assert pt_req["status"] == "resolved"
+
+
+async def _surface_prompt_cards(service: SessionServiceImpl, session_id: UUID) -> None:
+    """One canonical backend surfacing pass over the session's current head."""
+    head = await service.get_current_state(session_id)
+    assert head is not None
+    async with _compose_operation(service, session_id) as context:
+        await _auto_surface_prompt_template_reviews_for_state(
+            state_from_record(head),
+            sessions_service=service,
+            session_id=str(session_id),
+            current_state_id=str(head.id),
+            surface_origin=InterpretationSurfaceOrigin.COMPOSER_LLM,
+            model_identifier="anthropic/claude-opus-4-7",
+            model_version="2026-05-01",
+            provider="anthropic",
+            composer_skill_hash="a" * 64,
+            session_operation_context=context,
+        )
+
+
+def _prompt_cards_and_snapshots(service: SessionServiceImpl, session_id: UUID) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    with service._engine.begin() as conn:
+        cards = conn.execute(
+            select(interpretation_events_table.c.id, interpretation_events_table.c.choice)
+            .where(
+                interpretation_events_table.c.session_id == str(session_id),
+                interpretation_events_table.c.kind == InterpretationKind.LLM_PROMPT_TEMPLATE.value,
+            )
+            .order_by(interpretation_events_table.c.created_at, interpretation_events_table.c.id)
+        ).all()
+        snapshots = conn.execute(
+            select(prompt_review_snapshots_table.c.event_id, prompt_review_snapshots_table.c.anchor).where(
+                prompt_review_snapshots_table.c.session_id == str(session_id)
+            )
+        ).all()
+    return [(row.id, row.choice) for row in cards], sorted((row.event_id, row.anchor) for row in snapshots)
+
+
+@pytest.mark.asyncio
+async def test_inline_card_reissued_once_when_its_rendered_text_changes_then_reused(service) -> None:
+    """No churn: a stale inline card is superseded and re-issued exactly once.
+
+    Resolving a sibling vague term re-renders the inline ``prompt_template``
+    under a pending prompt card, so its stored snapshot no longer shows what
+    runs. The next surfacing pass supersedes it and issues ONE fresh card and
+    snapshot; every later pass over the unchanged text reuses that card.
+    """
+    session_id = uuid4()
+    state = await _seed_state_with_llm_node(
+        service,
+        session_id=session_id,
+        node=_vague_term_and_prompt_template_node(vague_draft="Innovative and creative"),
+    )
+    vague_event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state.id,
+        affected_node_id="llm_transform_1",
+        tool_call_id="call_vague",
+        user_term="cool",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft="Innovative and creative",
+        model_identifier="anthropic/claude-opus-4-7",
+        model_version="2026-05-01",
+        provider="anthropic",
+        composer_skill_hash="a" * 64,
+    )
+    await _surface_prompt_cards(service, session_id)
+    cards, snapshots = _prompt_cards_and_snapshots(service, session_id)
+    assert [choice for _id, choice in cards] == ["pending"]
+    first_card = cards[0][0]
+    first_anchor = await reviewed_anchor_for(service, session_id, UUID(first_card))
+    assert snapshots == [(first_card, first_anchor)]
+
+    # An unchanged pass before the bake already reuses the card.
+    await _surface_prompt_cards(service, session_id)
+    assert _prompt_cards_and_snapshots(service, session_id) == (cards, snapshots)
+
+    _resolved, baked_state = await service.resolve_interpretation_event(
+        session_id=session_id,
+        event_id=vague_event.id,
+        choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+        amended_value=None,
+        actor="user:alice",
+        runtime_model_identifier=None,
+        runtime_model_version=None,
+    )
+    baked_node = next(n for n in baked_state.nodes if n["id"] == "llm_transform_1")
+    assert baked_node["options"]["prompt_template"] == "Rate Innovative and creative this is."
+
+    # Pass 1 after the bake: the stale card is superseded, ONE fresh card + snapshot.
+    await _surface_prompt_cards(service, session_id)
+    reissued_cards, reissued_snapshots = _prompt_cards_and_snapshots(service, session_id)
+    assert dict(reissued_cards)[first_card] == "superseded"
+    fresh = [card_id for card_id, choice in reissued_cards if choice == "pending"]
+    assert len(reissued_cards) == 2 and len(fresh) == 1
+    fresh_anchor = await reviewed_anchor_for(service, session_id, UUID(fresh[0]))
+    assert fresh_anchor != first_anchor
+    assert reissued_snapshots == sorted([(first_card, first_anchor), (fresh[0], fresh_anchor)])
+    fresh_snapshot = await service.get_prompt_review_snapshot(session_id, UUID(fresh[0]))
+    assert fresh_snapshot is not None
+    assert fresh_snapshot["authored_surface"]["prompt_template"] == "Rate Innovative and creative this is."
+
+    # Passes 2 and 3 over the unchanged text: no new event or snapshot, same ids.
+    for _pass in range(2):
+        await _surface_prompt_cards(service, session_id)
+        assert _prompt_cards_and_snapshots(service, session_id) == (reissued_cards, reissued_snapshots)
+
+    # The reused card is the one that approves.
+    approved, _state = await service.resolve_interpretation_event(
+        session_id=session_id,
+        event_id=UUID(fresh[0]),
+        choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+        amended_value=None,
+        actor="user:alice",
+        runtime_model_identifier=None,
+        runtime_model_version=None,
+        reviewed_anchor=fresh_anchor,
+    )
+    assert approved.choice is InterpretationChoice.ACCEPTED_AS_DRAFTED
 
 
 # --------------------------------------------------------------------------- #
