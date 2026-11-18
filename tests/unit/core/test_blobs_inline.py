@@ -22,6 +22,7 @@ from elspeth.contracts.blobs_inline import (
     BlobContentResolutionError,
     BlobInlineRef,
     BlobInlineValidationViolation,
+    InlineBlobNotTextError,
     ResolvedBlobContent,
 )
 from elspeth.contracts.enums import CreationModality
@@ -98,9 +99,9 @@ def test_non_text_metadata_is_a_typed_refusal_before_content_read() -> None:
     assert violations == [
         BlobInlineValidationViolation(category="not_text", field_path=ref.field_path, detail="blob MIME is not inline text")
     ]
-    with pytest.raises(ValueError) as caught:
+    with pytest.raises(InlineBlobNotTextError) as caught:
         _enforce_blob_content_ref_metadata([ref], {ref.blob_id: record})
-    assert getattr(caught.value, "error_code", None) == "inline_blob_not_text"
+    assert caught.value.error_code == "inline_blob_not_text"
 
 
 def test_direct_materialization_refuses_non_text_mime_before_audit_row() -> None:
@@ -108,7 +109,7 @@ def test_direct_materialization_refuses_non_text_mime_before_audit_row() -> None
     ref = _ref_with_hash(content)
     config = {"source": {"options": {"system_prompt": _marker(sha256=ref.sha256)}}}
 
-    with pytest.raises(ValueError) as caught:
+    with pytest.raises(InlineBlobNotTextError) as caught:
         _substitute_blob_content_refs(
             config,
             {ref: content},
@@ -116,7 +117,7 @@ def test_direct_materialization_refuses_non_text_mime_before_audit_row() -> None
             blob_metadata={ref.blob_id: ("application/pdf", len(content))},
         )
 
-    assert getattr(caught.value, "error_code", None) == "inline_blob_not_text"
+    assert caught.value.error_code == "inline_blob_not_text"
     assert config["source"]["options"]["system_prompt"] == _marker(sha256=ref.sha256)
 
 

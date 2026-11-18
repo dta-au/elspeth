@@ -19,6 +19,7 @@ import yaml
 
 import tests.integration.pipeline.test_composer_runtime_agreement as agreement
 from elspeth.contracts.blobs import BlobRecord
+from elspeth.contracts.blobs_inline import InlineBlobNotTextError
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
@@ -410,8 +411,8 @@ def test_run_admission_refuses_non_text_marker_with_typed_code(tmp_path: Path, e
         tmp_path, "prompt_template", CreationModality.VERBATIM, execution_fixture, mime_type="application/pdf"
     )
 
-    assert type(raised).__name__ == "InlineBlobNotTextError"
-    assert getattr(raised, "error_code", None) == "inline_blob_not_text"
+    assert isinstance(raised, InlineBlobNotTextError)
+    assert raised.error_code == "inline_blob_not_text"
     assert ".txt or .md" in str(raised)
     assert blob_service.link_blob_to_run_calls == []
     assert blob_service.read_blob_content_calls == []
