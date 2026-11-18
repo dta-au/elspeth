@@ -26,11 +26,24 @@ from elspeth.web.interpretation_state import (
     InterpretationReviewIntegrityError,
     InterpretationReviewPending,
     materialize_state_for_execution,
+    prompt_review_anchor_hash_from_options,
     prompt_review_draft_from_options,
 )
 from elspeth.web.sessions.converters import state_from_record
-from elspeth.web.sessions.models import blobs_table, composition_states_table, interpretation_events_table, prompt_file_approvals_table
-from elspeth.web.sessions.prompt_file_approval import PromptApprovalTrigger, _blob_record, _read_custody_bytes
+from elspeth.web.sessions.models import (
+    blobs_table,
+    composition_states_table,
+    interpretation_events_table,
+    prompt_file_approvals_table,
+    prompt_review_snapshots_table,
+)
+from elspeth.web.sessions.prompt_file_approval import (
+    PromptApprovalTrigger,
+    PromptFileApprovalStale,
+    _blob_record,
+    _read_custody_bytes,
+    assert_latest_prompt_file_approvals_attest_surface,
+)
 from elspeth.web.sessions.prompt_file_review import PromptFileReviewStale
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.state_envelope import unwrap_state_column
@@ -1021,3 +1034,258 @@ def test_stale_editor_binding_refused_without_writes(tmp_path: Path, move: str) 
     materialize_state_for_execution(state_from_record(after))
     with pytest.raises(PromptFileReviewStale):
         _admit(service, blob_service, session_id)
+
+
+# --- A query's inline template beside an inherited node-level prompt file ---
+#
+# Query "a" falls back to the node-level prompt_template, a file; query "b"
+# carries its own inline template. The review anchor must cover b's text: an
+# agent edit to b reopens the card, and an editor save of the fallback file
+# never extends the old approval to text the user did not see.
+
+_QUERY_B_ORIGINAL = "inline query B original"
+_QUERY_B_AGENT = "AGENT changed query B"
+
+
+def _queries(queries_form: str, b_template: str) -> Any:
+    a = {"input_fields": {"text": "text"}}
+    b = {"input_fields": {"text": "text"}, "template": b_template}
+    return {"a": a, "b": b} if queries_form == "mapping" else [dict(a, name="a"), dict(b, name="b")]
+
+
+def _query_b(options: Any, queries_form: str) -> Any:
+    queries = options["queries"]
+    return queries["b"] if queries_form == "mapping" else queries[1]
+
+
+def _query_fallback_setup(tmp_path: Path, queries_form: str) -> tuple[Any, Any, Any, str, dict[str, Any], UUID]:
+    """A node whose query 'a' inherits a node-level prompt file and whose query 'b' is inline; model review resolved."""
+    app, service, blob_service = _make_app(tmp_path)
+    client = SyncASGITestClient(app)
+    session_id = _create_session(client)
+    fallback = _upload_blob(client, session_id, b"fallback file text {{ row.text }}", "fallback.txt", "text/plain")
+    engine = blob_service._engine
+
+    def read_blob(_context: Any, blob_id: UUID) -> tuple[Any, bytes]:
+        with engine.connect() as conn:
+            record = _blob_record(conn, UUID(session_id), blob_id)
+        return record, _read_custody_bytes(record)
+
+    service._inline_blob_read = read_blob
+    state = blob_tools._inline_ref_state().to_dict()
+    node = state["nodes"][0]
+    node["id"] = "first"
+    options = dict(node["options"])
+    options["prompt_template"] = {"blob_ref": fallback["id"], "mode": "inline_content", "sha256": fallback["content_hash"]}
+    options["max_capacity_retry_seconds"] = 30
+    options["queries"] = _queries(queries_form, _QUERY_B_ORIGINAL)
+    options = _options_with_default_model_choice_review(node_id="first", plugin="llm", options=options)
+    node["options"] = _options_with_default_prompt_template_review(node_id="first", plugin="llm", options=options)
+    with fenced_operation_context(engine, session_id) as operation:
+        saved = asyncio.run(
+            service.save_composition_state(
+                UUID(session_id),
+                CompositionStateData(
+                    sources=state["sources"],
+                    nodes=state["nodes"],
+                    edges=state["edges"],
+                    outputs=state["outputs"],
+                    metadata_=state["metadata"],
+                    is_valid=True,
+                ),
+                provenance="tool_call",
+                session_operation_context=operation,
+            )
+        )
+        model_event = asyncio.run(
+            service.create_pending_interpretation_event(
+                session_id=UUID(session_id),
+                composition_state_id=saved.id,
+                affected_node_id="first",
+                tool_call_id="model-first",
+                user_term="llm_model_choice:first",
+                kind=InterpretationKind.LLM_MODEL_CHOICE,
+                llm_draft=node["options"]["model"],
+                model_identifier="test-model",
+                model_version="1",
+                provider="test-provider",
+                composer_skill_hash="a" * 64,
+                session_operation_context=operation,
+            )
+        )
+        asyncio.run(
+            service.resolve_interpretation_event(
+                session_id=UUID(session_id),
+                event_id=model_event.id,
+                choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+                amended_value=None,
+                actor="user:alice",
+                session_operation_context=operation,
+            )
+        )
+    event_id = _raise_prompt_card(service, blob_service, session_id, tool_call_id="initial")
+    return client, service, blob_service, session_id, fallback, event_id
+
+
+def _raise_prompt_card(service: Any, blob_service: Any, session_id: str, *, tool_call_id: str) -> UUID:
+    """Stage the prompt-template card for the current head, as the composer does after a mutation."""
+    record = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert record is not None
+    options = state_from_record(record).nodes[0].options
+    draft = prompt_review_draft_from_options(options)
+    assert draft is not None
+    with fenced_operation_context(blob_service._engine, session_id) as operation:
+        event = asyncio.run(
+            service.create_pending_interpretation_event(
+                session_id=UUID(session_id),
+                composition_state_id=record.id,
+                affected_node_id="first",
+                tool_call_id=tool_call_id,
+                user_term="llm_prompt_template:first",
+                kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
+                llm_draft=draft,
+                model_identifier="test-model",
+                model_version="1",
+                provider="test-provider",
+                composer_skill_hash="a" * 64,
+                session_operation_context=operation,
+            )
+        )
+    return event.id
+
+
+def _save_editor_state(service: Any, blob_service: Any, session_id: str, data: dict[str, Any]) -> None:
+    with fenced_operation_context(blob_service._engine, session_id) as operation:
+        asyncio.run(
+            service.save_composition_state(
+                UUID(session_id),
+                CompositionStateData(
+                    sources=data["sources"],
+                    nodes=data["nodes"],
+                    edges=data["edges"],
+                    outputs=data["outputs"],
+                    metadata_=data["metadata"],
+                    is_valid=True,
+                ),
+                provenance="tool_call",
+                session_operation_context=operation,
+            )
+        )
+
+
+def _save_side_effects(service: Any, blob_service: Any, session_id: str, blob_id: str) -> tuple[Any, ...]:
+    """Everything a refused save must leave untouched: head, approvals, blob metadata, card choices."""
+    head = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert head is not None
+    with blob_service._engine.connect() as conn:
+        return (
+            (head.id, head.version),
+            conn.execute(select(prompt_file_approvals_table).order_by(prompt_file_approvals_table.c.id)).all(),
+            conn.execute(select(blobs_table.c.content_hash, blobs_table.c.size_bytes).where(blobs_table.c.id == blob_id)).one(),
+            conn.execute(
+                select(interpretation_events_table.c.id, interpretation_events_table.c.choice).order_by(interpretation_events_table.c.id)
+            ).all(),
+        )
+
+
+@pytest.mark.parametrize("queries_form", ["mapping", "list"])
+def test_agent_edit_of_inline_query_beside_inherited_file_reopens_card(tmp_path: Path, queries_form: str) -> None:
+    client, service, blob_service, session_id, fallback, event_id = _query_fallback_setup(tmp_path, queries_form)
+    _approve_card(service, blob_service, session_id, event_id)
+    assert [snapshot.node_id for snapshot in _admit(service, blob_service, session_id)] == ["first"]
+
+    _patch_and_save(service, blob_service, session_id, tmp_path, {"queries": _queries(queries_form, _QUERY_B_AGENT)})
+
+    # The anchor covers query b beside the inherited file: the card reopens.
+    assert _review_state(service, session_id)[0]["first"] == "pending"
+    with pytest.raises(PromptFileReviewStale) as refusal:
+        _admit(service, blob_service, session_id)
+    assert refusal.value.error_code == "prompt_file_review_stale"
+
+    reopened = _raise_prompt_card(service, blob_service, session_id, tool_call_id="agent-edit-b")
+    with blob_service._engine.connect() as conn:
+        shown = conn.execute(
+            select(prompt_review_snapshots_table.c.snapshot_json).where(prompt_review_snapshots_table.c.event_id == str(reopened))
+        ).scalar_one()
+    assert _query_b(shown["authored_surface"], queries_form)["template"] == _QUERY_B_AGENT
+
+    # The editor save of the fallback file cannot approve b's unseen text.
+    before = _save_side_effects(service, blob_service, session_id, fallback["id"])
+    refused = _save(client, session_id, fallback["id"], "user edited fallback {{ row.text }}", fallback["content_hash"])
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["error_code"] == "prompt_file_review_pending_inline"
+    assert client.get(f"/api/sessions/{session_id}/blobs/{fallback['id']}/content").content == b"fallback file text {{ row.text }}"
+    assert _save_side_effects(service, blob_service, session_id, fallback["id"]) == before
+    # The save did not supersede the card that covers b's inline text.
+    with blob_service._engine.connect() as conn:
+        card_choice = conn.execute(
+            select(interpretation_events_table.c.choice).where(interpretation_events_table.c.id == str(reopened))
+        ).scalar_one()
+    assert card_choice == "pending"
+
+    # Approving the card, which showed b's new text, admits exactly that text.
+    _approve_card(service, blob_service, session_id, reopened)
+    admitted = _admit(service, blob_service, session_id)
+    assert [snapshot.node_id for snapshot in admitted] == ["first"]
+    assert _query_b(admitted[0].authored_surface, queries_form)["template"] == _QUERY_B_AGENT
+
+
+@pytest.mark.parametrize("queries_form", ["mapping", "list"])
+def test_editor_save_refuses_when_last_approval_no_longer_attests_the_surface(tmp_path: Path, queries_form: str) -> None:
+    """Defence in depth: a surface drift the anchor does not see still cannot ride an editor save.
+
+    The drift re-stamps the resolved review with the new anchor, standing in
+    for any future gap in the anchor derivation. Only the save-side check
+    against the latest file approval's effective artifact refuses it.
+    """
+    client, service, blob_service, session_id, fallback, event_id = _query_fallback_setup(tmp_path, queries_form)
+    _approve_card(service, blob_service, session_id, event_id)
+    assert [snapshot.node_id for snapshot in _admit(service, blob_service, session_id)] == ["first"]
+
+    record = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert record is not None
+    drifted = state_from_record(record).to_dict()
+    options = drifted["nodes"][0]["options"]
+    _query_b(options, queries_form)["template"] = _QUERY_B_AGENT
+    for requirement in options["interpretation_requirements"]:
+        if requirement["kind"] == "llm_prompt_template":
+            requirement["resolved_prompt_template_hash"] = prompt_review_anchor_hash_from_options(options)
+    _save_editor_state(service, blob_service, session_id, drifted)
+    assert _review_state(service, session_id)[0]["first"] == "resolved"
+    with pytest.raises(PromptFileReviewStale):
+        _admit(service, blob_service, session_id)
+
+    before = _save_side_effects(service, blob_service, session_id, fallback["id"])
+    refused = _save(client, session_id, fallback["id"], "user edited fallback {{ row.text }}", fallback["content_hash"])
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["error_code"] == "prompt_file_stale"
+    assert client.get(f"/api/sessions/{session_id}/blobs/{fallback['id']}/content").content == b"fallback file text {{ row.text }}"
+    assert _save_side_effects(service, blob_service, session_id, fallback["id"]) == before
+    with pytest.raises(PromptFileReviewStale):
+        _admit(service, blob_service, session_id)
+
+
+@pytest.mark.parametrize("queries_form", ["mapping", "list"])
+def test_latest_prompt_file_approvals_attest_surface(tmp_path: Path, queries_form: str) -> None:
+    """Function level: no approval yet is not a refusal; an approval attests only the surface it approved."""
+    _client, service, blob_service, session_id, _fallback, event_id = _query_fallback_setup(tmp_path, queries_form)
+
+    def check(state: Any) -> None:
+        with blob_service._engine.connect() as conn:
+            assert_latest_prompt_file_approvals_attest_surface(conn, state=state, node_id="first")
+
+    unapproved = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert unapproved is not None
+    check(unapproved)
+
+    _approve_card(service, blob_service, session_id, event_id)
+    approved = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert approved is not None
+    check(approved)
+    drifted = state_from_record(approved).to_dict()
+    _query_b(drifted["nodes"][0]["options"], queries_form)["template"] = _QUERY_B_AGENT
+    _save_editor_state(service, blob_service, session_id, drifted)
+    drifted_head = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert drifted_head is not None
+    with pytest.raises(PromptFileApprovalStale):
+        check(drifted_head)

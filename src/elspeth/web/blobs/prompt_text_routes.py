@@ -43,6 +43,7 @@ from elspeth.web.sessions.prompt_file_approval import (
     PromptFileApprovalStale,
     _current_node_options,
     _current_snapshot,
+    assert_latest_prompt_file_approvals_attest_surface,
     record_prompt_file_approval,
 )
 from elspeth.web.sessions.prompt_file_review import _surface_slots, prompt_file_binding_paths
@@ -171,6 +172,24 @@ def create_prompt_text_router() -> APIRouter:
                     "prompt_file_review_pending_inline",
                     "Approve the review card first, then edit the file.",
                 )
+            if pending_card is None:
+                # Defence in depth beside the review anchor: with no card to
+                # settle, a save extends the node's last approval only when
+                # that approval still attests the whole pre-save prompt surface
+                # (its effective artifact, not just this file). Checked under the
+                # session lease; the metadata hook below re-checks the head.
+                def assert_surface_attested() -> None:
+                    with blob_service._engine.connect() as conn:
+                        assert_latest_prompt_file_approvals_attest_surface(conn, state=state, node_id=body.node_id)
+
+                try:
+                    await run_sync_in_worker(assert_surface_attested)
+                except PromptFileApprovalStale as exc:
+                    raise _prompt_save_refusal(
+                        409,
+                        "prompt_file_stale",
+                        "This prompt changed since it was reviewed. Ask the assistant to reopen its review, then edit the file.",
+                    ) from exc
             if new_bytes == old_bytes:
                 return SavePromptFileResponse(changed=False, content_sha256=blob.content_hash)
             replacement = replace(

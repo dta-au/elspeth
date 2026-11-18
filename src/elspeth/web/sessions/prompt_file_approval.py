@@ -34,6 +34,7 @@ from elspeth.web.sessions.prompt_file_review import (
     _surface_slots,
     resolve_prompt_review_snapshot,
 )
+from elspeth.web.sessions.protocol import CompositionStateRecord
 from elspeth.web.sessions.state_envelope import unwrap_state_column
 
 
@@ -328,6 +329,12 @@ def assert_prompt_file_approvals(conn: Connection, snapshot: PromptReviewSnapsho
     ).one_or_none()
     if pending is not None:
         raise PromptFileReviewStale()
+    if not _latest_approvals_attest(conn, snapshot):
+        raise PromptFileReviewStale()
+
+
+def _latest_approvals_attest(conn: Connection, snapshot: PromptReviewSnapshot) -> bool:
+    """Whether every binding's latest approval carries the snapshot's file, bytes, anchor and effective artifact."""
     for binding in snapshot.bindings:
         approval = conn.execute(
             select(prompt_file_approvals_table)
@@ -346,4 +353,41 @@ def assert_prompt_file_approvals(conn: Connection, snapshot: PromptReviewSnapsho
             or approval.review_anchor != snapshot.anchor
             or approval.effective_artifact_hash != snapshot.effective_artifact_hash
         ):
-            raise PromptFileReviewStale()
+            return False
+    return True
+
+
+def assert_latest_prompt_file_approvals_attest_surface(conn: Connection, *, state: CompositionStateRecord, node_id: str) -> None:
+    """Require a node's latest prompt-file approvals to still attest its current prompt surface.
+
+    The editor save checks this on the pre-save head when no review card is
+    pending: a save may extend an approval only to the file on screen, never
+    to other prompt text (an inline query template, a system prompt) that
+    changed after the node was last approved. A node with no file approval
+    yet has nothing to compare, so a first save is not refused here. Raises
+    :class:`PromptFileApprovalStale` when an approval no longer attests the
+    surface or the custody snapshot cannot be read.
+    """
+    session_id = state.session_id
+    options = next(node["options"] for node in state.nodes or () if node["id"] == node_id)
+    approved_before = conn.execute(
+        select(prompt_file_approvals_table.c.id)
+        .where(prompt_file_approvals_table.c.session_id == str(session_id), prompt_file_approvals_table.c.node_id == node_id)
+        .limit(1)
+    ).scalar_one_or_none()
+    if approved_before is None:
+        return
+    records: dict[UUID, tuple[BlobRecord, bytes]] = {}
+
+    def read_blob(blob_id: UUID) -> tuple[BlobRecord, bytes]:
+        if blob_id not in records:
+            record = _blob_record(conn, session_id, blob_id)
+            records[blob_id] = (record, _read_custody_bytes(record))
+        return records[blob_id]
+
+    try:
+        snapshot = resolve_prompt_review_snapshot(session_id=session_id, node_id=node_id, options=options, read_blob=read_blob)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PromptFileApprovalStale() from exc
+    if snapshot is None or not _latest_approvals_attest(conn, snapshot):
+        raise PromptFileApprovalStale()

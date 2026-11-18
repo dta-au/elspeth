@@ -1725,7 +1725,10 @@ def _missing_prompt_template_review_sites(node: NodeSpec) -> tuple[Interpretatio
     if node.plugin != "llm":
         return ()
     prompt_template = _node_str_option(node, "prompt_template")
-    if not prompt_template and multi_query_prompt_surface_from_options(node.options) is None:
+    surface = multi_query_prompt_surface_from_options(node.options)
+    # A query falling back to a node-level file is the non-text case above:
+    # the surface exists only so the anchor covers it, not to stage a site.
+    if not prompt_template and (surface is None or surface.node_prompt_file is not None):
         return ()
     requirement = _prompt_template_review_requirement(node.options)
     if requirement is None:
@@ -2452,6 +2455,23 @@ class InvalidQueryTemplate:
 
 
 @dataclass(frozen=True, slots=True)
+class InheritedPromptFile:
+    """Identity of a node-level prompt file that at least one query falls back to.
+
+    The node-level ``prompt_template`` is an ``inline_content`` file marker,
+    so its text is not in the options; the surface carries the marker
+    identity instead (the bytes are bound by ``sha256``). Without it a
+    multi-query node whose fallback is a file had no surface at all, its
+    review anchor ignored every query, and an edit to another query's inline
+    template left the review resolved.
+    """
+
+    blob_id: str
+    sha256: str
+    encoding: str
+
+
+@dataclass(frozen=True, slots=True)
 class MultiQueryPromptSurface:
     """The complete prompt surface a multi-query LLM node sends the model.
 
@@ -2472,6 +2492,9 @@ class MultiQueryPromptSurface:
     node_prompt_structure_hash: str | None
     system_prompt: str | None
     queries: tuple[tuple[str, str | InvalidQueryTemplate | None], ...]
+    # Set only when the node-level template is a file marker that some query
+    # falls back to; ``node_prompt_template`` is then ``None``.
+    node_prompt_file: InheritedPromptFile | None = None
 
     @property
     def node_template_users(self) -> tuple[str, ...]:
@@ -2499,21 +2522,33 @@ class MultiQueryPromptSurface:
         and its text otherwise. A query's string template or ``None`` fallback
         is hashed as itself (so every well-formed surface keeps its anchor);
         an :class:`InvalidQueryTemplate` is hashed as a mapping, which no
-        string or ``None`` can equal, so repairing it moves the anchor.
+        string or ``None`` can equal, so repairing it moves the anchor. An
+        inherited node-level prompt file adds its marker identity under its
+        own key; a surface without one keeps its existing anchor.
         """
+        surface = {
+            "domain": PROMPT_SURFACE_HASH_DOMAIN,
+            "node_prompt": self.node_prompt_structure_hash
+            if self.node_prompt_structure_hash is not None
+            else stable_hash(self.node_prompt_template),
+            "system_prompt": self.system_prompt,
+            "queries": [
+                [name, {"invalid_template": override.reason} if isinstance(override, InvalidQueryTemplate) else override]
+                for name, override in self.queries
+            ],
+        }
+        if self.node_prompt_file is None:
+            return stable_hash(surface)
+        node_file = self.node_prompt_file
         return stable_hash(
-            {
-                "domain": PROMPT_SURFACE_HASH_DOMAIN,
-                "node_prompt": self.node_prompt_structure_hash
-                if self.node_prompt_structure_hash is not None
-                else stable_hash(self.node_prompt_template),
-                "system_prompt": self.system_prompt,
-                "queries": [
-                    [name, {"invalid_template": override.reason} if isinstance(override, InvalidQueryTemplate) else override]
-                    for name, override in self.queries
-                ],
-            }
+            {**surface, "node_prompt_file": {"blob_id": node_file.blob_id, "sha256": node_file.sha256, "encoding": node_file.encoding}}
         )
+
+    def _node_template_display(self) -> str | None:
+        """The node-level template as the draft shows it: its text, or a file label."""
+        if self.node_prompt_file is not None:
+            return f"(file {self.node_prompt_file.blob_id}, SHA-256 {self.node_prompt_file.sha256})"
+        return self.node_prompt_template
 
     def render_for_review(self, *, max_chars: int = PROMPT_SURFACE_REVIEW_MAX_CHARS) -> str:
         """Human-readable draft of the surface for the review card.
@@ -2547,7 +2582,7 @@ class MultiQueryPromptSurface:
             *(override if isinstance(override, str) else None for _name, override in self.queries),
         ]
         if self.node_template_users:
-            texts.append(self.node_prompt_template)
+            texts.append(self._node_template_display())
         budget = max_chars - self._frame_chars()
         display = self._bounded_texts(texts, budget)
         rendered = "\n".join(self._review_lines(display, omitted=frozenset(), listed=len(self.queries)))
@@ -2754,8 +2789,9 @@ def _appended_lines_chars(lines: list[str]) -> int:
     source_param="options",
     suppresses=("R1", "R5"),
     invariant=(
-        "returns None unless a string prompt_template sits beside a queries value with at least one "
-        "well-formed entry; otherwise constructs an owned MultiQueryPromptSurface from string values only, "
+        "returns None unless a string or inline_content file-marker prompt_template (or none) sits beside a "
+        "queries value with at least one well-formed entry; otherwise constructs an owned "
+        "MultiQueryPromptSurface from string values and the file marker's identity only, "
         "reading a non-string system_prompt as absent, an absent query template as a fallback to the "
         "node-level template, and a present non-string query template as an InvalidQueryTemplate that "
         "is neither a template nor a fallback; raises only the TypeError, ValueError or KeyError that "
@@ -2776,6 +2812,11 @@ def multi_query_prompt_surface_from_options(options: Mapping[str, Any]) -> Multi
     (``state._validate_multi_query_template_variable_bindings``), which skips
     such a query whole without counting it as a node-level-template user, and
     the advisor evidence walk (``service._advisor_query_option_values``).
+    A node-level ``prompt_template`` that is an ``inline_content`` file marker
+    is not text: the surface carries ``node_prompt_template=None`` and, when
+    any query falls back to it, its marker identity as
+    :class:`InheritedPromptFile`, so the review anchor covers the file and
+    every inline query template together.
     Malformed ``prompt_template_parts`` propagate the TypeError, ValueError
     or KeyError of :func:`prompt_structure_hash_from_options`, exactly as on a
     single-prompt node; every other shape never raises.
@@ -2787,14 +2828,15 @@ def multi_query_prompt_surface_from_options(options: Mapping[str, Any]) -> Multi
     entries = _well_formed_query_entries(raw_queries)
     if not entries:
         return None
+    node_prompt_file: InheritedPromptFile | None = None
     if prompt_template is not None and not isinstance(prompt_template, str):
         marker = is_widened_blob_ref(deep_thaw(prompt_template))
-        if (
-            marker is None
-            or marker.mode != "inline_content"
-            or any("template" not in entry or entry["template"] is None for _, entry in entries)
-        ):
+        if marker is None or marker.mode != "inline_content" or type(marker.sha256) is not str:
             return None
+        if any("template" not in entry or entry["template"] is None for _, entry in entries):
+            # Some query falls back to the node-level file: the surface carries
+            # its identity so the anchor still covers every other query's text.
+            node_prompt_file = InheritedPromptFile(blob_id=str(marker.blob_id), sha256=marker.sha256, encoding=marker.encoding)
         prompt_template = None
     raw_system_prompt = options["system_prompt"] if "system_prompt" in options else None
     queries: list[tuple[str, str | InvalidQueryTemplate | None]] = []
@@ -2809,6 +2851,7 @@ def multi_query_prompt_surface_from_options(options: Mapping[str, Any]) -> Multi
         node_prompt_structure_hash=prompt_structure_hash_from_options(options),
         system_prompt=raw_system_prompt if isinstance(raw_system_prompt, str) else None,
         queries=tuple(queries),
+        node_prompt_file=node_prompt_file,
     )
 
 
