@@ -405,18 +405,38 @@ export type PromptSlotStatus = "pending" | "accepted" | "unknown";
 /**
  * A slot's status, read from the interpretation events (never from
  * compositionState, and never its text): pending while its review event is
- * outstanding, accepted once that event was accepted or amended. A slot with
- * no linked event, or whose event ended any other way (superseded, opted out,
- * abandoned) or is not loaded, is "unknown".
+ * outstanding, accepted once that event was accepted or amended.
+ *
+ * The slot's review is the requirement's frozen `event_id` when set. The
+ * server writes it only once the vague term resolves, so at surfacing it is
+ * usually null; the review is then the ONE vague_term event on the card's
+ * node with the slot's user_term. No such event, more than one, or an event
+ * that ended any other way (superseded, opted out, abandoned) is "unknown",
+ * never accepted. This is display only: the anchor is the binding control.
  */
 export function promptSlotStatus(
-  eventId: string | null,
+  slot: { eventId: string | null; userTerm: string | null },
+  nodeId: string | null,
   pending: Readonly<Record<string, InterpretationEvent>> | undefined,
   resolved: readonly InterpretationEvent[] | undefined,
 ): PromptSlotStatus {
-  if (eventId === null) return "unknown";
-  if (pending !== undefined && eventId in pending) return "pending";
-  const event = resolved?.find((candidate) => candidate.id === eventId);
-  if (event !== undefined && (event.choice === "accepted_as_drafted" || event.choice === "amended")) return "accepted";
+  const events = new Map<string, InterpretationEvent>();
+  // Resolution is terminal, so a resolved row wins over a stale pending one.
+  for (const event of Object.values(pending ?? {})) events.set(event.id, event);
+  for (const event of resolved ?? []) events.set(event.id, event);
+  let review: InterpretationEvent | undefined;
+  if (slot.eventId !== null) {
+    review = events.get(slot.eventId);
+  } else {
+    if (nodeId === null || slot.userTerm === null) return "unknown";
+    const matches = [...events.values()].filter(
+      (event) => event.kind === "vague_term" && event.affected_node_id === nodeId && event.user_term === slot.userTerm,
+    );
+    if (matches.length !== 1) return "unknown";
+    review = matches[0];
+  }
+  if (review === undefined) return "unknown";
+  if (review.choice === "pending") return "pending";
+  if (review.choice === "accepted_as_drafted" || review.choice === "amended") return "accepted";
   return "unknown";
 }

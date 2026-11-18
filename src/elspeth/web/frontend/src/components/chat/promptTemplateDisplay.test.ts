@@ -374,22 +374,49 @@ describe("promptReviewDisplay — frozen slot skeleton", () => {
 });
 
 describe("promptSlotStatus", () => {
-  const event = (id: string, choice: InterpretationEvent["choice"]) => ({ id, choice }) as InterpretationEvent;
+  const event = (id: string, choice: InterpretationEvent["choice"], overrides: Partial<InterpretationEvent> = {}) =>
+    ({ id, choice, kind: "vague_term", affected_node_id: "node-1", user_term: "punchy", ...overrides }) as InterpretationEvent;
+  const linked = { eventId: "e1", userTerm: "punchy" };
+  const unlinked = { eventId: null, userTerm: "punchy" };
 
   it("is pending while the slot's own review is outstanding", () => {
-    expect(promptSlotStatus("e1", { e1: event("e1", "pending") }, [])).toBe("pending");
+    expect(promptSlotStatus(linked, "node-1", { e1: event("e1", "pending") }, [])).toBe("pending");
   });
 
   it.each(["accepted_as_drafted", "amended"] as const)("is accepted once its review was %s", (choice) => {
-    expect(promptSlotStatus("e1", {}, [event("e1", choice)])).toBe("accepted");
+    expect(promptSlotStatus(linked, "node-1", {}, [event("e1", choice)])).toBe("accepted");
   });
 
   it.each(["superseded", "opted_out", "abandoned"] as const)("is unknown when its review ended %s", (choice) => {
-    expect(promptSlotStatus("e1", {}, [event("e1", choice)])).toBe("unknown");
+    expect(promptSlotStatus(linked, "node-1", {}, [event("e1", choice)])).toBe("unknown");
   });
 
-  it("is unknown with no linked event or nothing loaded", () => {
-    expect(promptSlotStatus(null, { e1: event("e1", "pending") }, [])).toBe("unknown");
-    expect(promptSlotStatus("e1", undefined, undefined)).toBe("unknown");
+  it("is unknown when the linked review is not loaded", () => {
+    expect(promptSlotStatus(linked, "node-1", undefined, undefined)).toBe("unknown");
+    expect(promptSlotStatus(linked, "node-1", { e2: event("e2", "pending") }, [])).toBe("unknown");
+  });
+
+  it("prefers a resolved row over a stale pending copy of the same event", () => {
+    expect(promptSlotStatus(linked, "node-1", { e1: event("e1", "pending") }, [event("e1", "accepted_as_drafted")])).toBe("accepted");
+  });
+
+  it("finds an unlinked slot's review by the card's node and the slot's term", () => {
+    expect(promptSlotStatus(unlinked, "node-1", { e1: event("e1", "pending") }, [])).toBe("pending");
+    expect(promptSlotStatus(unlinked, "node-1", {}, [event("e1", "amended")])).toBe("accepted");
+  });
+
+  it.each([
+    ["two reviews share the term on the node", [event("e1", "accepted_as_drafted"), event("e2", "accepted_as_drafted")]],
+    ["the only review is on another node", [event("e1", "accepted_as_drafted", { affected_node_id: "node-2" })]],
+    ["the only review is for another term", [event("e1", "accepted_as_drafted", { user_term: "bold" })]],
+    ["the only review is not a vague term", [event("e1", "accepted_as_drafted", { kind: "llm_model_choice" })]],
+    ["the only review was superseded", [event("e1", "superseded")]],
+  ])("never shows an unlinked slot as accepted when %s", (_label, resolved) => {
+    expect(promptSlotStatus(unlinked, "node-1", {}, resolved)).toBe("unknown");
+  });
+
+  it("is unknown for an unlinked slot with no term or no card node", () => {
+    expect(promptSlotStatus({ eventId: null, userTerm: null }, "node-1", {}, [event("e1", "accepted_as_drafted")])).toBe("unknown");
+    expect(promptSlotStatus(unlinked, null, {}, [event("e1", "accepted_as_drafted")])).toBe("unknown");
   });
 });

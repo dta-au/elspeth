@@ -482,7 +482,7 @@ export function AcknowledgementCard({
   const pendingEvents = useInterpretationEventsStore((s) => s.pendingBySession[sessionId]);
   const resolvedEvents = useInterpretationEventsStore((s) => s.resolvedBySession[sessionId]);
   const slotStatuses: PromptSlotStatus[] = (promptDisplay?.segments ?? []).flatMap((segment) =>
-    segment.kind === "slot" ? [promptSlotStatus(segment.eventId, pendingEvents, resolvedEvents)] : [],
+    segment.kind === "slot" ? [promptSlotStatus(segment, event.affected_node_id, pendingEvents, resolvedEvents)] : [],
   );
   const promptHasSlot = slotStatuses.length > 0;
   const promptReviewAvailable = promptDisplay?.reviewAvailable === true;

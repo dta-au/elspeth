@@ -1338,6 +1338,66 @@ describe("AcknowledgementCard — slot status from the interpretation events", (
     expect(api.getPromptReviewSnapshot).toHaveBeenCalledTimes(1);
   });
 
+  // At surfacing the server freezes event_id: null for a slot whose vague
+  // term has not resolved yet (the usual case). The status is then found by
+  // the card's node and the slot's user_term, and only from EXACTLY one
+  // vague_term event; anything else is "status not shown here".
+  const UNLINKED_SURFACE = {
+    ...SLOTTED_SURFACE,
+    interpretation_requirements: [
+      { id: "req-topic", event_id: null, user_term: "the key points" },
+      { id: "req-tone", event_id: null, user_term: "punchy" },
+    ],
+  };
+
+  async function openUnlinkedCard() {
+    const user = userEvent.setup();
+    vi.mocked(api.getPromptReviewSnapshot).mockResolvedValue(inlineSnapshot(UNLINKED_SURFACE, ANCHOR_1));
+    renderCard(makeEvent({ kind: "llm_prompt_template", llm_draft: "Bounded preview" }), { showAmend: false });
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    const region = screen.getByRole("region", { name: /prompt template review/i });
+    await waitFor(() => expect(region.querySelectorAll("mark.ack-card-prompt-slot")).toHaveLength(2));
+    return region;
+  }
+
+  it("finds an unlinked slot's status by node and term: pending, then accepted once its card resolves", async () => {
+    const topic = vagueEvent("evt-topic", "the key points");
+    const tone = vagueEvent("evt-tone", "punchy");
+    setSlotEvents([topic, tone], []);
+    const region = await openUnlinkedCard();
+    expect(visibleSlotTexts(region)).toEqual([
+      "[“the key points”, reviewed in its own card: pending]",
+      "[“punchy”, reviewed in its own card: pending]",
+    ]);
+    act(() => setSlotEvents([topic], [{ ...tone, choice: "amended", accepted_value: "LIVE VALUE vivid" }]));
+    expect(visibleSlotTexts(region)).toEqual([
+      "[“the key points”, reviewed in its own card: pending]",
+      "[“punchy”, reviewed in its own card: accepted]",
+    ]);
+    expect(region).not.toHaveTextContent("LIVE VALUE");
+  });
+
+  it("does not show an unlinked slot as accepted when two vague reviews on the node share its term", async () => {
+    setSlotEvents(
+      [vagueEvent("evt-tone-2", "punchy")],
+      [vagueEvent("evt-tone-1", "punchy", { choice: "accepted_as_drafted" })],
+    );
+    const region = await openUnlinkedCard();
+    expect(visibleSlotTexts(region)[1]).toBe("[“punchy”, reviewed in its own card: status not shown here]");
+  });
+
+  it("does not match an unlinked slot to another node's review of the same term", async () => {
+    setSlotEvents([], [vagueEvent("evt-tone", "punchy", { choice: "accepted_as_drafted", affected_node_id: "node-2" })]);
+    const region = await openUnlinkedCard();
+    expect(visibleSlotTexts(region)[1]).toBe("[“punchy”, reviewed in its own card: status not shown here]");
+  });
+
+  it("does not match an unlinked slot to a review that is not a vague term", async () => {
+    setSlotEvents([], [makeEvent({ id: "evt-x", kind: "llm_model_choice", user_term: "punchy", choice: "accepted_as_drafted" })]);
+    const region = await openUnlinkedCard();
+    expect(visibleSlotTexts(region)[1]).toBe("[“punchy”, reviewed in its own card: status not shown here]");
+  });
+
   it("keeps an inline card approvable, with its anchor, after a sibling vague term resolved first", async () => {
     // The server re-renders the live prompt_template when a sibling slot is
     // resolved, so the inline snapshot reports is_live_review: false, while
