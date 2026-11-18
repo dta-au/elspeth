@@ -35,6 +35,7 @@ from elspeth.web.sessions.pending_interpretation import (
     _refresh_resolved_prompt_template_review,
     _resolve_prompt_template_review,
     _surfacing_prompt_structure_hash,
+    resolved_prompt_review_matches_anchor,
 )
 from elspeth.web.sessions.prompt_file_approval import (
     PromptApprovalTrigger,
@@ -210,6 +211,15 @@ def create_prompt_text_router() -> APIRouter:
                 ):
                     raise _prompt_save_refusal(
                         409, "prompt_file_binding_changed", "This prompt file moved since you opened it. Reload the session."
+                    )
+                # Checked on the exact pre-save head, before any write: a save
+                # approves only the file on screen, never prompt text that
+                # drifted from an earlier review.
+                if not resolved_prompt_review_matches_anchor(current_state, affected_node_id=body.node_id):
+                    raise _prompt_save_refusal(
+                        409,
+                        "prompt_file_stale",
+                        "This prompt changed since it was reviewed. Ask the assistant to reopen its review, then edit the file.",
                     )
                 stored_hash = content_hash(stored_bytes)
                 if stored_hash != replacement.content_hash:
