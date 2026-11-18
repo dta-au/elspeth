@@ -7,9 +7,10 @@ All notable changes to ELSPETH are documented here.
 ## 0.8.15 - 2026-11-17
 
 Executor hot-path fixes, Web Composer fixes and a release-pipeline repair.
-0.8.15 supersedes 0.8.14, which was tagged but never published as a GitHub
-release or version-tagged image: its smoke test could not run on hardened CI
-runners. Everything in the 0.8.14 section below therefore ships for the first
+Session epoch advances from 78 to 79 and Landscape from 50 to 51, so
+deployments need explicitly new session and Landscape stores. 0.8.15
+supersedes 0.8.14, which was tagged but never published as a GitHub release or
+version-tagged image: its smoke test could not run on hardened CI runners. Everything in the 0.8.14 section below therefore ships for the first
 time in this release, including its upgrade actions. The dated entry and
 package version do not establish qualification, a published tag or an image.
 
@@ -26,12 +27,22 @@ package version do not establish qualification, a published tag or an image.
 
 Schema and stored data:
 
-- No schema epoch changed and no stored data is migrated, reset or rewritten.
-  Session epoch 78 and Landscape epoch 50 are unchanged from the previous
-  release; this release adds no schema-epoch cutover. Existing 0.8.14 session
-  and Landscape stores need no action beyond the drain above, and the 0.8.10
-  cutover guidance below continues to apply to older stores. This authorizes
-  no migration, reset, restamping or downgrade.
+- Session epoch advances from 78 to 79; Landscape advances from epoch 50 to
+  51. File-backed LLM prompts are reviewed, admitted only on the approved
+  bytes, and the run records the hash of the prompt file it read. The session
+  store adds `prompt_review_snapshots` (the reviewed file text and its
+  identity, kept with the review event) and `prompt_file_approvals`
+  (append-only approvals, whose latest row per binding is the admission
+  authority); the Landscape store adds `run_prompt_inputs` (the approved prompt-file identity and content hash
+  admitted for a Web run before its first provider call). The new tables are
+  additive.
+- Configure an explicitly new epoch-79 session target and an explicitly new
+  epoch-51 Landscape target. Preserve epoch-78 session stores and epoch-50
+  Landscape stores with compatible prior application access; 0.8.15 startup
+  refuses to open them, and no 0.8.14 data is read across. The 0.8.10
+  cutover guidance below continues to apply to older stores. This authorizes no migration, reset,
+  restamping or downgrade. Drain and isolate old/new deployments; they cannot
+  share session stores or replicas.
 
 ### Engine and runtime
 

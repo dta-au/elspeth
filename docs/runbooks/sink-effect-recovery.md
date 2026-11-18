@@ -2,7 +2,7 @@
 
 Use this runbook when a run has durable sink debt, an effect lease expired, or
 an external call may have completed without its response reaching ELSPETH. It
-applies to Landscape schema epoch 50 and the `sink-effect-v1` protocol. A
+applies to Landscape schema epoch 51 and the `sink-effect-v1` protocol. A
 Landscape store still at epoch 31 or below predates aggregation result
 receipts, any store below epoch 33 predates the composite token-outcome
 access path, any store below epoch 34 predates the unified-lineage
@@ -17,7 +17,9 @@ below epoch 39 also lacks immutable web run-start permit binding and recoverable
 pre-effect admission state. Epoch 40 adds nullable call token measures and
 quota-policy/secret-wiring admission evidence. Epoch 41 replaces the fallback
 prompt digest with the approved prompt artifact anchor. Epoch 50 records durable
-provider-attempt identity on run calls. Older schemas remain incompatible:
+provider-attempt identity on run calls. Epoch 51 records the approved prompt
+file each Web run read and does not change the sink-effect protocol. Older
+schemas remain incompatible:
 preserve the existing store and use its compatible prior application rather than
 running this candidate's recovery against it. Separately provisioned new stores
 do not reconstruct old runs. The current

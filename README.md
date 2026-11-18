@@ -110,11 +110,17 @@ ship for the first time here: upgrading from 0.8.13 or earlier means moving to
 Python 3.14, and the 0.8.14 upgrade actions apply.
 
 A run interrupted before upgrading cannot be resumed after it; finish or re-run
-interrupted runs first. Session epoch 78 and Landscape epoch 50 are unchanged
-from the previous release; this release adds no schema-epoch cutover, so
-existing session and Landscape stores need no action. The 0.8.10 cutover
-guidance below continues to apply to older stores. Backwards compatibility is
-permitted and considered from 0.8.5 within explicitly supported boundaries.
+interrupted runs first. Session epoch 79 replaces session epoch 78 and
+Landscape epoch 51 replaces epoch 50: file-backed LLM prompts are reviewed,
+admitted only on the approved bytes, and the run records the hash of the prompt
+file it read. The session store adds `prompt_review_snapshots` and
+`prompt_file_approvals`, and the Landscape store adds `run_prompt_inputs`; the
+tables are additive. Preserve epoch 78 session stores and epoch 50 Landscape
+stores, which startup refuses to open; use a separately provisioned epoch 79
+session store and epoch 51 Landscape store, and keep old workers isolated from
+the new stores. The 0.8.10 cutover guidance below continues to apply to older
+stores. Backwards compatibility is permitted and considered from 0.8.5 within
+explicitly supported boundaries.
 This release authorizes no in-place migration, reset or downgrade. Package
 metadata is 0.8.15; the package version alone does not establish qualification
 or image publication. Automatic image publication from main is held; verify
