@@ -31,6 +31,7 @@ from elspeth.web.sessions.models import (
 from elspeth.web.sessions.prompt_file_review import (
     PromptFileReviewStale,
     PromptReviewSnapshot,
+    _surface_slots,
     resolve_prompt_review_snapshot,
 )
 from elspeth.web.sessions.state_envelope import unwrap_state_column
@@ -245,6 +246,28 @@ def record_prompt_file_approval(
         ).one_or_none()
         if stored is None or stored.anchor != snapshot.anchor or stable_hash(stored.snapshot_json) != stable_hash(snapshot.payload()):
             raise PromptFileApprovalStale()
+    if request.trigger is PromptApprovalTrigger.EDITOR_SAVE:
+        # A save is approval only of the bytes the editor showed. With a card
+        # pending, any other inline prompt text or a pending vague-term
+        # requirement on this node is unreviewed, so the save must not retire
+        # the card. Checked here, in the caller's transaction, so this writer
+        # fails closed whatever its caller checked beforehand.
+        pending_card = conn.execute(
+            select(interpretation_events_table.c.id)
+            .where(
+                interpretation_events_table.c.session_id == str(request.session_id),
+                interpretation_events_table.c.affected_node_id == request.node_id,
+                interpretation_events_table.c.kind == "llm_prompt_template",
+                interpretation_events_table.c.choice == "pending",
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        if pending_card is not None:
+            requirements = options["interpretation_requirements"] if "interpretation_requirements" in options else ()
+            if any(requirement["status"] == "pending" and requirement["kind"] == "vague_term" for requirement in requirements) or any(
+                path != request.field_path and type(value) is str for path, value in _surface_slots(options)
+            ):
+                raise PromptFileApprovalStale()
     approval_id = uuid4()
     conn.execute(
         insert(prompt_file_approvals_table).values(
@@ -263,8 +286,8 @@ def record_prompt_file_approval(
         )
     )
     if request.trigger is PromptApprovalTrigger.EDITOR_SAVE:
-        # The route refuses a pending card with any unseen inline text before
-        # calling this writer. Its sole file approval can retire that card.
+        # Reached only when the check above found no unseen text, so this
+        # file approval covers the whole pending surface and retires the card.
         conn.execute(
             update(interpretation_events_table)
             .where(

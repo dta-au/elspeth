@@ -9,13 +9,18 @@ from uuid import UUID
 
 import pytest
 import structlog
-from sqlalchemy import delete, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.web.composer.tools._common import _options_with_default_prompt_template_review
 from elspeth.web.interpretation_state import prompt_review_draft_from_options
-from elspeth.web.sessions.models import prompt_file_approvals_table, prompt_review_snapshots_table, sessions_table
+from elspeth.web.sessions.models import (
+    interpretation_events_table,
+    prompt_file_approvals_table,
+    prompt_review_snapshots_table,
+    sessions_table,
+)
 from elspeth.web.sessions.prompt_file_approval import (
     PromptApprovalTrigger,
     PromptFileApprovalRequest,
@@ -32,7 +37,7 @@ from tests.unit.web.composer import test_blob_inline_tools as blob_tools
 blob_env = blob_tools.blob_env
 
 
-async def _pending_file_review(env: dict[str, Any]) -> tuple[SessionServiceImpl, UUID, UUID, UUID]:
+async def _pending_file_review(env: dict[str, Any], *, file_only: bool = False) -> tuple[SessionServiceImpl, UUID, UUID, UUID]:
     blob = blob_tools._create_blob(env, content="  First line\nSecond line  \n")
     assert blob.success
     blob_id = UUID(blob.data["blob_id"])
@@ -61,6 +66,8 @@ async def _pending_file_review(env: dict[str, Any]) -> tuple[SessionServiceImpl,
     marker = {"blob_ref": str(blob_id), "mode": "inline_content", "sha256": record.content_hash}
     options = dict(node["options"])
     options["prompt_template"] = marker
+    if file_only:
+        del options["system_prompt"]
     node["options"] = _options_with_default_prompt_template_review(node_id="classify", plugin="llm", options=options)
     saved = await service.save_composition_state(
         session_id,
@@ -260,7 +267,8 @@ async def test_editor_save_uses_same_approval_evidence(blob_env: dict[str, Any])
 
 @pytest.mark.asyncio
 async def test_editor_save_satisfies_pending_file_card(blob_env: dict[str, Any]) -> None:
-    _service, session_id, event_id, blob_id = await _pending_file_review(blob_env)
+    """A file-only node: the saved file is the whole pending surface, so the save retires the card."""
+    _service, session_id, event_id, blob_id = await _pending_file_review(blob_env, file_only=True)
     record = blob_env["authority"].mutate(blob_env["operation"], lambda tx: tx.blobs.read_blob(blob_id=blob_id))
     with blob_env["engine"].begin() as conn:
         approval = record_prompt_file_approval(
@@ -277,8 +285,42 @@ async def test_editor_save_satisfies_pending_file_card(blob_env: dict[str, Any])
             now=datetime.now(UTC),
         )
         assert approval.event_id is None
+        choice = conn.execute(
+            select(interpretation_events_table.c.choice).where(interpretation_events_table.c.id == str(event_id))
+        ).scalar_one()
+        assert choice == "superseded"
         stored = conn.execute(prompt_review_snapshots_table.select().where(prompt_review_snapshots_table.c.event_id == str(event_id))).one()
         assert_prompt_file_approvals(conn, verify_prompt_review_snapshot_payload(stored.snapshot_json))
+
+
+@pytest.mark.asyncio
+async def test_editor_save_refuses_pending_card_over_unseen_inline_text(blob_env: dict[str, Any]) -> None:
+    """The writer itself refuses, whatever its caller checked: the card also covers an inline system prompt."""
+    _service, session_id, event_id, blob_id = await _pending_file_review(blob_env)
+    record = blob_env["authority"].mutate(blob_env["operation"], lambda tx: tx.blobs.read_blob(blob_id=blob_id))
+    with pytest.raises(PromptFileApprovalStale), blob_env["engine"].begin() as conn:
+        record_prompt_file_approval(
+            conn,
+            PromptFileApprovalRequest(
+                session_id=session_id,
+                node_id="classify",
+                field_path="prompt_template",
+                blob_id=blob_id,
+                content_sha256=record.content_hash,
+                actor_user_id="test-user",
+                trigger=PromptApprovalTrigger.EDITOR_SAVE,
+            ),
+            now=datetime.now(UTC),
+        )
+    with blob_env["engine"].connect() as conn:
+        assert (
+            conn.execute(select(interpretation_events_table.c.choice).where(interpretation_events_table.c.id == str(event_id))).scalar_one()
+            == "pending"
+        )
+        assert (
+            conn.execute(select(prompt_file_approvals_table.c.id).where(prompt_file_approvals_table.c.session_id == str(session_id))).all()
+            == []
+        )
 
 
 @pytest.mark.asyncio
