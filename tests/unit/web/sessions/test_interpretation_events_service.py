@@ -46,6 +46,7 @@ from elspeth.contracts.composer_interpretation import (
 )
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
@@ -75,6 +76,7 @@ from elspeth.web.sessions.models import (
     blobs_table,
     composition_states_table,
     interpretation_events_table,
+    prompt_review_snapshots_table,
     proposal_events_table,
     session_operation_fences_table,
     sessions_table,
@@ -94,6 +96,7 @@ from elspeth.web.sessions.service import (
 )
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.prompt_review import reviewed_anchor_for, reviewed_anchor_kwargs
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 # --------------------------------------------------------------------------- #
@@ -1750,6 +1753,7 @@ async def test_resolve_prompt_template_review_records_hash_without_rewriting_tem
         choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
         amended_value=None,
         actor="user:alice",
+        reviewed_anchor=await reviewed_anchor_for(service, session_id, event.id),
     )
 
     assert resolved.kind is InterpretationKind.LLM_PROMPT_TEMPLATE
@@ -1964,6 +1968,7 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
         choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
         amended_value=None,
         actor="user:alice",
+        reviewed_anchor=await reviewed_anchor_for(policy_service, session_id, event.id),
     )
 
     assert new_state.is_valid is True
@@ -2371,6 +2376,7 @@ async def test_resolve_prompt_template_review_survives_sibling_vague_term_bake(s
         actor="user:alice",
         runtime_model_identifier=None,
         runtime_model_version=None,
+        reviewed_anchor=await reviewed_anchor_for(service, session_id, prompt_event.id),
     )
 
     assert resolved_prompt.choice is InterpretationChoice.ACCEPTED_AS_DRAFTED
@@ -2388,6 +2394,156 @@ async def test_resolve_prompt_template_review_survives_sibling_vague_term_bake(s
     reqs = final_node["options"][INTERPRETATION_REQUIREMENTS_KEY]
     pt_req = next(r for r in reqs if r["id"] == "prompt_template_review")
     assert pt_req["status"] == "resolved"
+
+
+# --------------------------------------------------------------------------- #
+# The prompt review snapshot freezes the parts skeleton, never slot values
+# --------------------------------------------------------------------------- #
+
+
+async def _structured_prompt_card(service: SessionServiceImpl) -> tuple[UUID, InterpretationEventRecord]:
+    session_id = uuid4()
+    state = await _seed_state_with_llm_node(
+        service,
+        session_id=session_id,
+        node=_vague_term_and_prompt_template_node(vague_draft="Innovative and creative"),
+    )
+    prompt_event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state.id,
+        affected_node_id="llm_transform_1",
+        tool_call_id="call_prompt_template",
+        user_term="llm_prompt_template:llm_transform_1",
+        kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
+        llm_draft="Rate pending interpretation this is.",
+        model_identifier="anthropic/claude-opus-4-7",
+        model_version="2026-05-01",
+        provider="anthropic",
+        composer_skill_hash="a" * 64,
+    )
+    return session_id, prompt_event
+
+
+@pytest.mark.asyncio
+async def test_structured_inline_card_snapshot_freezes_parts_skeleton_without_values(service) -> None:
+    session_id, prompt_event = await _structured_prompt_card(service)
+
+    snapshot = await service.get_prompt_review_snapshot(session_id, prompt_event.id)
+
+    assert snapshot is not None
+    surface = snapshot["authored_surface"]
+    assert surface[PROMPT_TEMPLATE_PARTS_KEY] == [
+        {"kind": "text", "text": "Rate "},
+        {"kind": "interpretation_ref", "requirement_id": "cool"},
+        {"kind": "text", "text": " this is."},
+    ]
+    # Only the slot linkage: no status, draft, accepted value or hash.
+    assert surface[INTERPRETATION_REQUIREMENTS_KEY] == [{"id": "cool", "event_id": None, "user_term": "cool"}]
+    assert "Innovative and creative" not in repr(surface[PROMPT_TEMPLATE_PARTS_KEY])
+    assert "Innovative and creative" not in repr(surface[INTERPRETATION_REQUIREMENTS_KEY])
+    assert snapshot["bindings"] == []
+    assert snapshot["is_live_review"] is True
+
+
+def _snapshot_of(options: dict[str, Any]) -> Any:
+    from elspeth.web.sessions.prompt_file_review import resolve_prompt_review_snapshot
+
+    snapshot = resolve_prompt_review_snapshot(
+        session_id=UUID(int=7), node_id="llm_transform_1", options=options, read_blob=None, inline_when_unbound=True
+    )
+    assert snapshot is not None
+    return snapshot
+
+
+def test_review_anchor_binds_the_parts_skeleton_and_slot_linkage() -> None:
+    base = deep_thaw(_vague_term_and_prompt_template_node()["options"])
+    anchor = _snapshot_of(base).anchor
+
+    changed_part = deep_thaw(base)
+    changed_part[PROMPT_TEMPLATE_PARTS_KEY][2]["text"] = " this is, really."
+    assert _snapshot_of(changed_part).anchor != anchor
+
+    relinked = deep_thaw(base)
+    relinked[INTERPRETATION_REQUIREMENTS_KEY][0]["event_id"] = str(uuid4())
+    assert _snapshot_of(relinked).anchor != anchor
+
+    # Slot values are outside the skeleton: a changed vague-term draft alone
+    # does not move the anchor (the rendered prompt_template carries the text).
+    redrafted = deep_thaw(base)
+    redrafted[INTERPRETATION_REQUIREMENTS_KEY][0]["draft"] = "Something else entirely"
+    assert _snapshot_of(redrafted).anchor == anchor
+
+
+@pytest.mark.asyncio
+async def test_legacy_snapshot_without_parts_still_verifies_serves_and_approves(service, engine) -> None:
+    from elspeth.web.sessions.prompt_file_review import PROMPT_REVIEW_DOMAIN
+
+    session_id, prompt_event = await _structured_prompt_card(service)
+    with engine.begin() as conn:
+        stored = conn.execute(
+            select(prompt_review_snapshots_table).where(prompt_review_snapshots_table.c.event_id == str(prompt_event.id))
+        ).one()
+        legacy = dict(stored.snapshot_json)
+        legacy["authored_surface"] = {
+            key: value
+            for key, value in legacy["authored_surface"].items()
+            if key not in (PROMPT_TEMPLATE_PARTS_KEY, INTERPRETATION_REQUIREMENTS_KEY)
+        }
+        legacy["anchor"] = stable_hash(
+            {
+                "domain": PROMPT_REVIEW_DOMAIN,
+                "node_id": legacy["node_id"],
+                "authored_surface": legacy["authored_surface"],
+                "bindings": [],
+            }
+        )
+        conn.execute(prompt_review_snapshots_table.delete().where(prompt_review_snapshots_table.c.event_id == str(prompt_event.id)))
+        conn.execute(
+            insert(prompt_review_snapshots_table).values(
+                event_id=stored.event_id,
+                session_id=stored.session_id,
+                anchor=legacy["anchor"],
+                snapshot_json=legacy,
+                created_at=stored.created_at,
+            )
+        )
+
+    served = await service.get_prompt_review_snapshot(session_id, prompt_event.id)
+    assert served is not None
+    assert PROMPT_TEMPLATE_PARTS_KEY not in served["authored_surface"]
+    assert served["anchor"] == legacy["anchor"]
+    resolved, _state = await service.resolve_interpretation_event(
+        session_id=session_id,
+        event_id=prompt_event.id,
+        choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+        amended_value=None,
+        actor="user:alice",
+        reviewed_anchor=served["anchor"],
+    )
+    assert resolved.choice is InterpretationChoice.ACCEPTED_AS_DRAFTED
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        pytest.param(lambda s: s[PROMPT_TEMPLATE_PARTS_KEY][1].update(value="Innovative"), id="value-on-a-slot"),
+        pytest.param(lambda s: s[INTERPRETATION_REQUIREMENTS_KEY][0].update(accepted_value="Innovative"), id="accepted-value"),
+        pytest.param(lambda s: s.pop(INTERPRETATION_REQUIREMENTS_KEY), id="half-present"),
+        pytest.param(lambda s: s[INTERPRETATION_REQUIREMENTS_KEY][0].update(id="other"), id="unlinked-slot"),
+    ],
+)
+def test_snapshot_skeleton_refuses_any_slot_value_or_mismatch(tamper: Any) -> None:
+    from elspeth.web.sessions.prompt_file_review import PROMPT_REVIEW_DOMAIN, verify_prompt_review_snapshot_payload
+
+    payload = deep_thaw(_snapshot_of(deep_thaw(_vague_term_and_prompt_template_node()["options"])).payload())
+    assert verify_prompt_review_snapshot_payload(deep_thaw(payload)).anchor == payload["anchor"]
+    tamper(payload["authored_surface"])
+    # Re-seal so only the skeleton check, not the anchor check, can refuse it.
+    payload["anchor"] = stable_hash(
+        {"domain": PROMPT_REVIEW_DOMAIN, "node_id": payload["node_id"], "authored_surface": payload["authored_surface"], "bindings": []}
+    )
+    with pytest.raises(AuditIntegrityError):
+        verify_prompt_review_snapshot_payload(payload)
 
 
 @pytest.mark.asyncio
@@ -2445,6 +2601,7 @@ async def test_combined_scoring_criterion_amendment_survives_both_review_orders(
             actor="user:alice",
             runtime_model_identifier=None,
             runtime_model_version=None,
+            **await reviewed_anchor_kwargs(service, session_id, event.id, event.kind),
         )
 
     reloaded = await service.get_current_state(session_id)
@@ -2532,6 +2689,7 @@ async def test_resolve_prompt_template_review_still_rejects_genuine_skeleton_edi
             actor="user:alice",
             runtime_model_identifier=None,
             runtime_model_version=None,
+            reviewed_anchor=await reviewed_anchor_for(service, session_id, prompt_event.id),
         )
 
 

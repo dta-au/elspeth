@@ -42,12 +42,15 @@ from tests.unit.web.composer import test_blob_inline_tools as blob_tools
 def test_resolve_route_refuses_unverifiable_prompt_file_as_stale(tmp_path: Path, column: str, value: str) -> None:
     client, _service, blob_service, session_id, first, _second, events = _live_prompt_setup(tmp_path)
     event_id = events["first"]
+    # The card was shown (its snapshot anchor read) before the file moved.
+    shown = client.get(f"/api/sessions/{session_id}/interpretations/{event_id}/prompt")
+    assert shown.status_code == 200, shown.text
     with blob_service._engine.begin() as conn:
         conn.execute(update(blobs_table).where(blobs_table.c.id == first["id"]).values({column: value}))
 
     response = client.post(
         f"/api/sessions/{session_id}/interpretations/{event_id}/resolve",
-        json={"choice": "accepted_as_drafted"},
+        json={"choice": "accepted_as_drafted", "reviewed_anchor": shown.json()["anchor"]},
     )
 
     assert response.status_code == 409, response.text

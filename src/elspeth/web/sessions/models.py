@@ -1295,7 +1295,9 @@ Index(
 )
 
 # Full text is retained with the event, outside ordinary event-list responses.
-# Legacy events simply have no row here and continue to load unchanged.
+# Every llm_prompt_template event surfaced since the reviewed-anchor binding
+# has a row (inline surfaces with no bindings). Legacy events have none and
+# still load, but cannot be approved: resolve requires this row's anchor.
 prompt_review_snapshots_table = Table(
     "prompt_review_snapshots",
     metadata,

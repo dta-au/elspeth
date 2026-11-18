@@ -1,7 +1,9 @@
-"""Versioned evidence for a file-backed LLM prompt review.
+"""Versioned evidence for an LLM prompt review, file-backed or inline.
 
-The caller supplies a custody-authorized reader.  This module is the single
-derivation of the text shown on the card and the bytes admitted to execution.
+An inline review stores its authored surface with no bindings.  For a
+file-backed review the caller supplies a custody-authorized reader.  This
+module is the single derivation of the text shown on the card and the bytes
+admitted to execution.
 """
 
 from __future__ import annotations
@@ -17,7 +19,15 @@ from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
-from elspeth.web.interpretation_state import approved_prompt_artifact_hash_from_options
+from elspeth.web.interpretation_state import (
+    INTERPRETATION_REQUIREMENTS_KEY,
+    PROMPT_TEMPLATE_PARTS_KEY,
+    InterpretationRequirement,
+    PromptPart,
+    _prompt_parts,
+    approved_prompt_artifact_hash_from_options,
+    parse_interpretation_requirements,
+)
 
 if TYPE_CHECKING:
     # protocol imports this module at runtime; the annotation alone needs it.
@@ -25,6 +35,12 @@ if TYPE_CHECKING:
 
 PROMPT_REVIEW_DOMAIN = "elspeth.file-prompt-review.v1"
 PROMPT_FILE_CHANGED_MESSAGE = "This prompt file changed since it was reviewed; review it again."
+# The prompt text a card shows.  A structured node's surface also carries the
+# frozen parts skeleton and the requirement linkage of each slot (never a slot
+# value, status, draft or accepted value); the anchor covers all of it.
+_TEXT_SURFACE_KEYS = ("prompt_template", "system_prompt", "queries")
+_PART_KEYS = {"text": {"kind", "text"}, "interpretation_ref": {"kind", "requirement_id"}}
+_REQUIREMENT_SKELETON_KEYS = {"id", "event_id", "user_term"}
 
 
 class PromptFileReviewStale(ValueError):
@@ -122,12 +138,12 @@ def verify_prompt_review_snapshot_payload(payload: object) -> PromptReviewSnapsh
                     text=raw["text"],
                 )
             )
-        if (
-            not bindings
-            or len({binding.field_path for binding in bindings}) != len(bindings)
-            or tuple(sorted(binding.field_path for binding in bindings)) != tuple(binding.field_path for binding in bindings)
-        ):
-            raise ValueError("prompt review bindings are absent or unordered")
+        # An inline review has no bindings; the marker-set check below then
+        # proves its authored surface carries no file marker either.
+        if len({binding.field_path for binding in bindings}) != len(bindings) or tuple(
+            sorted(binding.field_path for binding in bindings)
+        ) != tuple(binding.field_path for binding in bindings):
+            raise ValueError("prompt review bindings are duplicated or unordered")
         anchor = stable_hash(
             {
                 "domain": PROMPT_REVIEW_DOMAIN,
@@ -138,7 +154,14 @@ def verify_prompt_review_snapshot_payload(payload: object) -> PromptReviewSnapsh
         )
         if anchor != value["anchor"]:
             raise ValueError("prompt review anchor drifted")
-        resolved_surface = deep_thaw(value["authored_surface"])
+        surface = value["authored_surface"]
+        has_parts = PROMPT_TEMPLATE_PARTS_KEY in surface
+        if has_parts != (INTERPRETATION_REQUIREMENTS_KEY in surface):
+            raise ValueError("prompt review skeleton is half present")
+        # A snapshot from before the skeleton existed has neither key and verifies.
+        if has_parts:
+            _verify_review_skeleton(surface[PROMPT_TEMPLATE_PARTS_KEY], surface[INTERPRETATION_REQUIREMENTS_KEY])
+        resolved_surface = {key: deep_thaw(slot) for key, slot in value["authored_surface"].items() if key in _TEXT_SURFACE_KEYS}
         marker_paths = {path for path, slot in _surface_slots(value["authored_surface"]) if is_widened_blob_ref(slot) is not None}
         if marker_paths != {binding.field_path for binding in bindings}:
             raise ValueError("prompt review binding set does not match authored markers")
@@ -168,6 +191,62 @@ def verify_prompt_review_snapshot_payload(payload: object) -> PromptReviewSnapsh
         return snapshot
     except (KeyError, TypeError, ValueError) as exc:
         raise AuditIntegrityError("prompt review snapshot failed integrity verification") from exc
+
+
+def _review_skeleton(
+    parts: tuple[PromptPart, ...], requirements: tuple[InterpretationRequirement, ...] | None
+) -> tuple[list[dict[str, str]], list[dict[str, str | None]]]:
+    """Freeze the parts skeleton and each referenced requirement's linkage.
+
+    Copies only the part shape (text segments and slot requirement ids) and,
+    per referenced requirement, its id, event id and staged ``user_term``.
+    ``user_term`` is set when the requirement is staged and no resolve
+    rewrites it; status, draft and accepted value are never copied.
+    """
+    part_rows: list[dict[str, str]] = []
+    referenced: list[str] = []
+    for part in parts:
+        if part["kind"] == "text":
+            part_rows.append({"kind": "text", "text": part["text"]})
+        else:
+            requirement_id = part["requirement_id"]
+            part_rows.append({"kind": "interpretation_ref", "requirement_id": requirement_id})
+            if requirement_id not in referenced:
+                referenced.append(requirement_id)
+    by_id = {requirement["id"]: requirement for requirement in requirements or ()}
+    requirement_rows: list[dict[str, str | None]] = []
+    for requirement_id in referenced:
+        requirement = by_id[requirement_id] if requirement_id in by_id else None
+        requirement_rows.append(
+            {
+                "id": requirement_id,
+                "event_id": requirement["event_id"] if requirement is not None else None,
+                "user_term": requirement["user_term"] if requirement is not None else None,
+            }
+        )
+    return part_rows, requirement_rows
+
+
+def _verify_review_skeleton(parts: object, requirements: object) -> None:
+    """A persisted skeleton holds only the frozen shape: no slot value can ride in it."""
+    if type(parts) is not list or type(requirements) is not list:
+        raise ValueError("prompt review skeleton is not a list")
+    referenced: list[str] = []
+    for part in parts:
+        if type(part) is not dict or part["kind"] not in _PART_KEYS or set(part) != _PART_KEYS[part["kind"]]:
+            raise ValueError("prompt review part has an unexpected shape")
+        slot = part["text"] if part["kind"] == "text" else part["requirement_id"]
+        if type(slot) is not str:
+            raise ValueError("prompt review part is not text")
+        if part["kind"] == "interpretation_ref" and slot not in referenced:
+            referenced.append(slot)
+    for row in requirements:
+        if type(row) is not dict or set(row) != _REQUIREMENT_SKELETON_KEYS or type(row["id"]) is not str:
+            raise ValueError("prompt review requirement skeleton has an unexpected shape")
+        if any(row[key] is not None and type(row[key]) is not str for key in ("event_id", "user_term")):
+            raise ValueError("prompt review requirement linkage is not text")
+    if [row["id"] for row in requirements] != referenced:
+        raise ValueError("prompt review requirement skeleton does not match the slots")
 
 
 def _surface_slots(options: Mapping[str, Any]) -> list[tuple[str, object]]:
@@ -222,14 +301,24 @@ def resolve_prompt_review_snapshot(
     session_id: UUID,
     node_id: str,
     options: Mapping[str, Any],
-    read_blob: Callable[[UUID], tuple[BlobRecord, bytes]],
+    read_blob: Callable[[UUID], tuple[BlobRecord, bytes]] | None,
+    inline_when_unbound: bool = False,
 ) -> PromptReviewSnapshot | None:
     """Read each referenced file once and derive the reviewed surface.
 
     The reader must hold this session's blob-custody authority.  A marker,
-    metadata row, or physical content mismatch always refuses.
+    metadata row, or physical content mismatch always refuses, and so does a
+    marker with no reader.  A surface with no file marker returns ``None``,
+    unless ``inline_when_unbound``: surfacing then stores the inline surface
+    with no bindings, so every prompt card has a snapshot whose anchor its
+    approval must name.
     """
-    authored_surface = {key: deep_thaw(options[key]) for key in ("prompt_template", "system_prompt", "queries") if key in options}
+    authored_surface = {key: deep_thaw(options[key]) for key in _TEXT_SURFACE_KEYS if key in options}
+    parts = _prompt_parts(options)
+    if parts is not None:
+        part_rows, requirement_rows = _review_skeleton(parts, parse_interpretation_requirements(options))
+        authored_surface[PROMPT_TEMPLATE_PARTS_KEY] = part_rows
+        authored_surface[INTERPRETATION_REQUIREMENTS_KEY] = requirement_rows
     resolved_options = deep_thaw(dict(options))
     bindings: list[PromptFileBinding] = []
     records: dict[UUID, tuple[BlobRecord, bytes]] = {}
@@ -238,6 +327,8 @@ def resolve_prompt_review_snapshot(
         if marker is None or marker.mode != "inline_content":
             continue
         if marker.encoding != "utf-8":
+            raise PromptFileReviewStale()
+        if read_blob is None:
             raise PromptFileReviewStale()
         if marker.blob_id not in records:
             records[marker.blob_id] = read_blob(marker.blob_id)
@@ -277,7 +368,7 @@ def resolve_prompt_review_snapshot(
         )
         bindings.append(binding)
         _replace_surface_slot(resolved_options, path, decoded)
-    if not bindings:
+    if not bindings and not inline_when_unbound:
         return None
     bindings.sort(key=lambda binding: binding.field_path)
     anchor = stable_hash(

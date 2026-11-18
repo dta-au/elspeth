@@ -621,6 +621,11 @@ class InterpretationResolveRequest(BaseModel):
     # that ``amended`` requires it and ``accepted_as_drafted`` forbids
     # it. ``max_length`` bounds the whole amendment, including long lines.
     amended_value: str | None = Field(default=None, max_length=8192)
+    # The ``anchor`` of the prompt review snapshot the card displayed
+    # (``GET .../interpretations/{event_id}/prompt``). Required by the
+    # service for ``llm_prompt_template`` events and refused for every other
+    # kind; the schema owns only its shape (lowercase SHA-256 hex).
+    reviewed_anchor: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def _amended_value_consistency(self) -> InterpretationResolveRequest:

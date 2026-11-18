@@ -151,7 +151,12 @@ def _file_card(service: Any, engine: Any, session_id: str) -> Any:
 
 
 def _approve_and_admit(client: Any, service: Any, blob_service: Any, session_id: str, event_id: UUID) -> None:
-    resolved = client.post(f"/api/sessions/{session_id}/interpretations/{event_id}/resolve", json={"choice": "accepted_as_drafted"})
+    shown = client.get(f"/api/sessions/{session_id}/interpretations/{event_id}/prompt")
+    assert shown.status_code == 200, shown.text
+    resolved = client.post(
+        f"/api/sessions/{session_id}/interpretations/{event_id}/resolve",
+        json={"choice": "accepted_as_drafted", "reviewed_anchor": shown.json()["anchor"]},
+    )
     assert resolved.status_code == 200, resolved.text
     assert [snapshot.node_id for snapshot in _admit(service, blob_service, session_id)] == ["first"]
 

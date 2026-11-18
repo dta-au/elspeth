@@ -52,6 +52,7 @@ from elspeth.web.sessions.routes._helpers import _interpretation_event_response
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.prompt_review import reviewed_anchor_for
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 from tests.unit.web.sessions.test_interpretation_events_service import _seed_state_with_llm_node
 
@@ -262,6 +263,7 @@ async def test_resolve_accepted_as_drafted_succeeds_for_a_multi_query_node(sessi
         choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
         amended_value=None,
         actor="user:alice",
+        reviewed_anchor=await reviewed_anchor_for(session_service, session_id, event.id),
     )
 
     assert resolved.accepted_value == surface_draft
@@ -289,6 +291,7 @@ async def test_resolve_accepted_as_drafted_succeeds_for_a_long_single_prompt_nod
         choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
         amended_value=None,
         actor="user:alice",
+        reviewed_anchor=await reviewed_anchor_for(session_service, session_id, event.id),
     )
 
     assert resolved.accepted_value == bounded_draft
@@ -324,6 +327,7 @@ async def test_interpretation_event_response_builds_for_a_long_single_prompt_nod
         choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
         amended_value=None,
         actor="user:alice",
+        reviewed_anchor=await reviewed_anchor_for(session_service, session_id, event.id),
     )
     resolved_response = _interpretation_event_response(resolved)
     assert resolved_response.accepted_value == review_draft

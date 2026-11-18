@@ -46,6 +46,7 @@ from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
+from tests.helpers.prompt_review import accept_body
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.composer import test_file_inject_upload_only_tool_parity as _file_inject_tool_parity
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
@@ -365,7 +366,7 @@ sinks:
         for event in original_events:
             resolved = client.post(
                 f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
-                json={"choice": "accepted_as_drafted"},
+                json=accept_body(client, session.id, event),
             )
             assert resolved.status_code == 200, resolved.text
         assert await service.list_interpretation_events(session.id, status="pending") == []
@@ -388,7 +389,7 @@ sinks:
         for event in fresh_events:
             resolved = client.post(
                 f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
-                json={"choice": "accepted_as_drafted"},
+                json=accept_body(client, session.id, event),
             )
             assert resolved.status_code == 200, resolved.text
         head = await service.get_current_state(session.id)
@@ -418,7 +419,7 @@ transforms:
         for event in await service.list_interpretation_events(session.id, status="pending"):
             resolved = client.post(
                 f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
-                json={"choice": "accepted_as_drafted"},
+                json=accept_body(client, session.id, event),
             )
             assert resolved.status_code == 200, resolved.text
         operation_id = str(uuid.uuid4())
@@ -510,7 +511,7 @@ transforms:
         for event in await service.list_interpretation_events(session.id, status="pending"):
             resolved = client.post(
                 f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
-                json={"choice": "accepted_as_drafted"},
+                json=accept_body(client, session.id, event),
             )
             assert resolved.status_code == 200, resolved.text
         # Import a DIFFERENT pipeline for the same node, and leave ITS cards
@@ -777,7 +778,7 @@ transforms:
         for event in originals:
             resolved = client.post(
                 f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
-                json={"choice": "accepted_as_drafted"},
+                json=accept_body(client, session.id, event),
             )
             assert resolved.status_code == 200, resolved.text
         body = {"operation_id": str(uuid.uuid4()), "state_id": imported.json()["id"]}
@@ -869,7 +870,7 @@ transforms:
             for event in events:
                 response = client.post(
                     f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
-                    json={"choice": "accepted_as_drafted"},
+                    json=accept_body(client, session.id, event),
                 )
                 assert response.status_code == 200, response.text
         elif evidence_status == "superseded":
@@ -956,7 +957,7 @@ transforms:
         for event in events:
             response = client.post(
                 f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
-                json={"choice": "accepted_as_drafted"},
+                json=accept_body(client, session.id, event),
             )
             assert response.status_code == 200, response.text
 
@@ -2263,7 +2264,7 @@ sinks:
         for event in events:
             resolve_resp = client.post(
                 f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
-                json={"choice": "accepted_as_drafted"},
+                json=accept_body(client, session.id, event),
             )
             assert resolve_resp.status_code == 200, resolve_resp.text
 
@@ -2329,7 +2330,7 @@ sinks:
         for event in events:
             resolve_resp = client.post(
                 f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
-                json={"choice": "accepted_as_drafted"},
+                json=accept_body(client, session.id, event),
             )
             assert resolve_resp.status_code == 200, resolve_resp.text
 

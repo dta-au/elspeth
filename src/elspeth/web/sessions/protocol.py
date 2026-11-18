@@ -1904,6 +1904,22 @@ class PromptFileTooLargeError(InterpretationResolveError):
         )
 
 
+class PromptReviewAnchorRequiredError(InterpretationResolveError):
+    """A prompt review was resolved without naming the snapshot it showed."""
+
+
+class PromptReviewAnchorUnexpectedError(InterpretationResolveError):
+    """A reviewed anchor was sent for a kind that has no review snapshot."""
+
+
+class PromptReviewSnapshotMissingError(InterpretationResolveError):
+    """The prompt review event has no stored snapshot to approve against."""
+
+
+class PromptReviewStaleError(InterpretationResolveError):
+    """The reviewed anchor is not the anchor of this event's stored snapshot."""
+
+
 class AuditAccessLogWriteError(RuntimeError):
     """Required access disclosure could not be recorded.
 
@@ -2950,6 +2966,7 @@ class SessionServiceProtocol(Protocol):
         resolved_at: datetime | None = None,
         runtime_model_identifier: str | None = None,
         runtime_model_version: str | None = None,
+        reviewed_anchor: str | None = None,
         session_operation_context: SessionOperationContext,
     ) -> tuple[InterpretationEventRecord, CompositionStateRecord]:
         """Commit a resolution and update the affected interpretation surface.
@@ -2958,6 +2975,11 @@ class SessionServiceProtocol(Protocol):
         read ``llm_draft`` from the pending row when ``choice`` is
         ``ACCEPTED_AS_DRAFTED``, and use ``amended_value`` when ``choice``
         is ``AMENDED``.
+
+        ``reviewed_anchor`` is the ``anchor`` of the prompt review snapshot
+        the caller displayed. ``llm_prompt_template`` events require it and
+        it must equal the event's stored snapshot anchor; every other kind
+        refuses it. Each refusal writes nothing.
 
         Single transaction. Raises ``ValueError`` for no pending event
         (TOCTOU / IDOR), missing composition state or affected node,

@@ -87,6 +87,7 @@ _FREE_TEXT_DISPOSITIONS = {
     "src/elspeth/web/sessions/schemas.py:CreateSessionRequest.title": "route_guard",
     "src/elspeth/web/sessions/schemas.py:ForkSessionRequest.new_message_content": "route_guard",
     "src/elspeth/web/sessions/schemas.py:InterpretationResolveRequest.amended_value": "field_guard",
+    "src/elspeth/web/sessions/schemas.py:InterpretationResolveRequest.reviewed_anchor": "structural_identifier",
     "src/elspeth/web/sessions/schemas.py:RejectProposalRequest.reason": "unused_not_persisted",
     "src/elspeth/web/sessions/schemas.py:SendMessageRequest.content": "route_guard",
     "src/elspeth/web/sessions/schemas.py:UpdateSessionRequest.title": "route_guard",

@@ -193,6 +193,7 @@ if TYPE_CHECKING:
 
     from elspeth.web.execution.envelope import RunExecutionInput
     from elspeth.web.sessions.inline_blob_preflight import SessionInlineBlobSnapshot
+    from elspeth.web.sessions.prompt_file_review import PromptReviewSnapshot
 
 _MAX_SESSION_ID_COLLISION_ATTEMPTS = 8
 _MUTATION_CONNECTION_REGISTRY = _mutation_connection_registry._MUTATION_CONNECTION_REGISTRY
@@ -1084,7 +1085,53 @@ class _RepositoryInterpretationMutations:
     ) -> PendingInterpretationCreationResult:
         return self._create_pending(command, validator, policy=PendingInterpretationPolicy.PIPELINE_CANDIDATE)
 
-    def _mark_stale_prompt_file_snapshots(
+    def _live_prompt_review_snapshot(
+        self,
+        live_state: CompositionStateRecord,
+        *,
+        affected_node_id: str,
+        inline_blob_snapshot: SessionInlineBlobSnapshot | None,
+    ) -> tuple[bool, PromptReviewSnapshot | None]:
+        """Derive the review snapshot the live node shows, file-bound or inline.
+
+        Returns ``(node_present, snapshot)``. The one derivation both the stale
+        check and the insert use, so the anchor compared with a stored card is
+        the anchor a fresh card stores, and both meet the same typed refusals:
+        a file with no verified inline bytes is stale, and a file over an
+        inline cap is refused by size, naming the cap (it can never run).
+        """
+        from elspeth.contracts.blobs import InlineBlobNotAdmittedError
+        from elspeth.web.sessions.prompt_file_review import (
+            PromptFileReviewStale,
+            prompt_file_binding_paths,
+            resolve_prompt_review_snapshot,
+        )
+        from elspeth.web.sessions.protocol import PromptFileTooLargeError
+
+        node = next((item for item in live_state.nodes or () if item["id"] == affected_node_id), None)
+        if node is None:
+            return False, None
+        options = node["options"]
+        if prompt_file_binding_paths(options) and inline_blob_snapshot is None:
+            raise PromptFileReviewStale()
+        try:
+            return True, resolve_prompt_review_snapshot(
+                session_id=UUID(self.__state._session_id),
+                node_id=affected_node_id,
+                options=options,
+                read_blob=inline_blob_snapshot.content if inline_blob_snapshot is not None else None,
+                inline_when_unbound=True,
+            )
+        except InlineBlobNotAdmittedError as exc:
+            if exc.limit_bytes is None:
+                raise PromptFileReviewStale(node_id=affected_node_id) from exc
+            raise PromptFileTooLargeError(
+                node_id=affected_node_id,
+                limit_bytes=exc.limit_bytes,
+                aggregate=exc.reason == "aggregate_oversized",
+            ) from exc
+
+    def _mark_stale_prompt_review_snapshots(
         self,
         pending_sites: list[SessionPendingInterpretationSiteSnapshot],
         *,
@@ -1092,23 +1139,18 @@ class _RepositoryInterpretationMutations:
         affected_node_id: str,
         inline_blob_snapshot: SessionInlineBlobSnapshot | None,
     ) -> list[SessionPendingInterpretationSiteSnapshot]:
-        """Flag pending prompt cards whose stored file snapshot no longer matches the live surface.
+        """Flag pending prompt cards whose stored snapshot no longer matches the live surface.
 
         The requirement anchor attests the prompt SKELETON, so resolving a
         vague-term slot keeps it while re-rendering the inline
-        ``prompt_template``. A file card's stored snapshot binds the rendered
-        surface, so after that resolve the card could never be approved (and
-        an editor save is refused beside the inline text). Flagging the card
-        here makes the planner supersede it and issue a fresh card and
-        snapshot in this same transaction. The live snapshot uses the reader
-        the insert path uses; a custody failure raises as it would there.
+        ``prompt_template``. Every card's stored snapshot binds the surface it
+        showed (file-bound or inline), so after that resolve the card could
+        never be approved for what runs (and a file card's editor save is
+        refused beside the inline text). Flagging the card here makes the
+        planner supersede it and issue a fresh card and snapshot in this same
+        transaction. The live snapshot uses the derivation the insert path
+        uses; a custody failure raises as it would there.
         """
-        from elspeth.web.sessions.prompt_file_review import (
-            PromptFileReviewStale,
-            prompt_file_binding_paths,
-            resolve_prompt_review_snapshot,
-        )
-
         connection = _resolve_mutation_connection(self.__state._connection_token)
         session_id = self.__state._session_id
         stored = {
@@ -1122,18 +1164,10 @@ class _RepositoryInterpretationMutations:
         }
         if not stored:
             return pending_sites
-        node = next((item for item in live_state.nodes or () if item["id"] == affected_node_id), None)
-        live_anchor: str | None = None
-        if node is not None and prompt_file_binding_paths(node["options"]):
-            if inline_blob_snapshot is None:
-                raise PromptFileReviewStale()
-            live_snapshot = resolve_prompt_review_snapshot(
-                session_id=UUID(session_id),
-                node_id=affected_node_id,
-                options=node["options"],
-                read_blob=inline_blob_snapshot.content,
-            )
-            live_anchor = live_snapshot.anchor if live_snapshot is not None else None
+        _node_present, live_snapshot = self._live_prompt_review_snapshot(
+            live_state, affected_node_id=affected_node_id, inline_blob_snapshot=inline_blob_snapshot
+        )
+        live_anchor = live_snapshot.anchor if live_snapshot is not None else None
         return [
             replace(site, file_snapshot_stale=True) if str(site.event.id) in stored and stored[str(site.event.id)] != live_anchor else site
             for site in pending_sites
@@ -1238,7 +1272,7 @@ class _RepositoryInterpretationMutations:
         if inline_blob_snapshot is not None:
             inline_blob_snapshot.assert_current_rows(connection, session_id=UUID(state._session_id))
         if command.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
-            pending_sites = self._mark_stale_prompt_file_snapshots(
+            pending_sites = self._mark_stale_prompt_review_snapshots(
                 pending_sites, live_state=live_state, affected_node_id=command.affected_node_id, inline_blob_snapshot=inline_blob_snapshot
             )
         snapshot = SessionPendingInterpretationSnapshot(
@@ -1430,50 +1464,24 @@ class _RepositoryInterpretationMutations:
             )
         )
         if command.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
-            from elspeth.contracts.blobs import InlineBlobNotAdmittedError
-            from elspeth.web.sessions.prompt_file_review import (
-                PromptFileReviewStale,
-                prompt_file_binding_paths,
-                resolve_prompt_review_snapshot,
+            # Every prompt card stores the surface it shows (an inline one with
+            # no bindings), so the resolve can require the approval to name
+            # this snapshot's anchor.
+            node_present, review_snapshot = self._live_prompt_review_snapshot(
+                live_state, affected_node_id=command.affected_node_id, inline_blob_snapshot=inline_blob_snapshot
             )
-            from elspeth.web.sessions.protocol import PromptFileTooLargeError
-
-            node = next((item for item in live_state.nodes or () if item["id"] == command.affected_node_id), None)
-            if node is not None:
-                options = node["options"]
-                if prompt_file_binding_paths(options):
-                    if inline_blob_snapshot is None:
-                        raise PromptFileReviewStale()
-                    try:
-                        file_snapshot = resolve_prompt_review_snapshot(
-                            session_id=UUID(state._session_id),
-                            node_id=command.affected_node_id,
-                            options=options,
-                            read_blob=inline_blob_snapshot.content,
-                        )
-                    except InlineBlobNotAdmittedError as exc:
-                        # A file over an inline cap can never run, so a card
-                        # for it is refused by size, naming the cap. Anything
-                        # else unverified is the same refusal as a missing
-                        # snapshot above.
-                        if exc.limit_bytes is None:
-                            raise PromptFileReviewStale(node_id=command.affected_node_id) from exc
-                        raise PromptFileTooLargeError(
-                            node_id=command.affected_node_id,
-                            limit_bytes=exc.limit_bytes,
-                            aggregate=exc.reason == "aggregate_oversized",
-                        ) from exc
-                    if file_snapshot is None:
-                        raise AuditIntegrityError("file prompt event lost its binding during snapshot derivation")
-                    connection.execute(
-                        insert(prompt_review_snapshots_table).values(
-                            event_id=str(command.event_id),
-                            session_id=state._session_id,
-                            anchor=file_snapshot.anchor,
-                            snapshot_json=file_snapshot.payload(),
-                            created_at=command.created_at,
-                        )
+            if node_present:
+                if review_snapshot is None:
+                    raise AuditIntegrityError("prompt review event lost its surface during snapshot derivation")
+                connection.execute(
+                    insert(prompt_review_snapshots_table).values(
+                        event_id=str(command.event_id),
+                        session_id=state._session_id,
+                        anchor=review_snapshot.anchor,
+                        snapshot_json=review_snapshot.payload(),
+                        created_at=command.created_at,
                     )
+                )
         appended_record = None
         if appended_state is not None:
             predecessor = connection.execute(

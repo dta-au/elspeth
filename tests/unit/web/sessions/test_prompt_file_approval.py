@@ -32,13 +32,14 @@ from elspeth.web.sessions.prompt_file_review import PromptFileReviewStale, verif
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.prompt_review import reviewed_anchor_for
 from tests.unit.web.composer import test_blob_inline_tools as blob_tools
 
 blob_env = blob_tools.blob_env
 
 
 async def _pending_file_review(
-    env: dict[str, Any], *, file_only: bool = False, pending_vague_term: bool = False
+    env: dict[str, Any], *, file_only: bool = False, pending_vague_term: bool = False, structured_system_file: bool = False
 ) -> tuple[SessionServiceImpl, UUID, UUID, UUID]:
     blob = blob_tools._create_blob(env, content="  First line\nSecond line  \n")
     assert blob.success
@@ -67,7 +68,30 @@ async def _pending_file_review(
     record, _bytes = read_blob(env["operation"], blob_id)
     marker = {"blob_ref": str(blob_id), "mode": "inline_content", "sha256": record.content_hash}
     options = dict(node["options"])
-    options["prompt_template"] = marker
+    if structured_system_file:
+        # The file backs the system prompt; the user prompt is structured parts.
+        options["system_prompt"] = marker
+        options["prompt_template"] = "Label each row by a coarse category please."
+        options["prompt_template_parts"] = [
+            {"kind": "text", "text": "Label each row by "},
+            {"kind": "interpretation_ref", "requirement_id": "category_scheme"},
+            {"kind": "text", "text": " please."},
+        ]
+        options["interpretation_requirements"] = [
+            {
+                "id": "category_scheme",
+                "kind": "vague_term",
+                "user_term": "category scheme",
+                "status": "pending",
+                "draft": "a coarse category",
+                "event_id": None,
+                "accepted_value": None,
+                "accepted_artifact_hash": None,
+                "resolved_prompt_template_hash": None,
+            }
+        ]
+    else:
+        options["prompt_template"] = marker
     if file_only:
         del options["system_prompt"]
     node["options"] = _options_with_default_prompt_template_review(node_id="classify", plugin="llm", options=options)
@@ -146,6 +170,32 @@ async def test_card_snapshot_and_shared_approval_match_current_bytes(blob_env: d
         )
         assert approval.event_id == event_id
         assert conn.execute(prompt_file_approvals_table.select()).one().content_sha256 == record.content_hash
+
+
+@pytest.mark.asyncio
+async def test_file_card_snapshot_carries_parts_skeleton_without_values(blob_env: dict[str, Any]) -> None:
+    service, session_id, event_id, _blob_id = await _pending_file_review(blob_env, structured_system_file=True)
+    payload = await service.get_prompt_review_snapshot(session_id, event_id)
+    assert payload is not None
+    assert [binding["field_path"] for binding in payload["bindings"]] == ["system_prompt"]
+    surface = payload["authored_surface"]
+    assert surface["prompt_template_parts"] == [
+        {"kind": "text", "text": "Label each row by "},
+        {"kind": "interpretation_ref", "requirement_id": "category_scheme"},
+        {"kind": "text", "text": " please."},
+    ]
+    assert surface["interpretation_requirements"] == [{"id": "category_scheme", "event_id": None, "user_term": "category scheme"}]
+    assert "a coarse category" not in repr(surface["prompt_template_parts"]) + repr(surface["interpretation_requirements"])
+    resolved, _state = await service.resolve_interpretation_event(
+        session_id=session_id,
+        event_id=event_id,
+        choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+        amended_value=None,
+        actor="user:test-user",
+        reviewed_anchor=payload["anchor"],
+        session_operation_context=blob_env["operation"],
+    )
+    assert resolved.choice is InterpretationChoice.ACCEPTED_AS_DRAFTED
 
 
 @pytest.mark.asyncio
@@ -241,6 +291,7 @@ async def test_card_resolution_approves_file_and_admission_accepts_it(blob_env: 
         choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
         amended_value=None,
         actor="user:test-user",
+        reviewed_anchor=await reviewed_anchor_for(service, session_id, event_id),
         session_operation_context=blob_env["operation"],
     )
     assert resolved.choice is InterpretationChoice.ACCEPTED_AS_DRAFTED
@@ -259,6 +310,7 @@ async def test_editor_save_uses_same_approval_evidence(blob_env: dict[str, Any])
         choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
         amended_value=None,
         actor="user:test-user",
+        reviewed_anchor=await reviewed_anchor_for(service, session_id, event_id),
         session_operation_context=blob_env["operation"],
     )
     record = blob_env["authority"].mutate(blob_env["operation"], lambda tx: tx.blobs.read_blob(blob_id=blob_id))

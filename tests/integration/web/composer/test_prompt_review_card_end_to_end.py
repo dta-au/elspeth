@@ -70,6 +70,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.prompt_review import reviewed_anchor_kwargs
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -257,6 +258,8 @@ async def _accept_as_drafted(
         owner_instance_id=sessions_service.session_operation_owner_instance_id,
         lease_seconds=sessions_service.session_operation_lease_seconds,
     )
+    # The card approves the stored snapshot it displayed, named by its anchor.
+    anchor_kwargs = await reviewed_anchor_kwargs(sessions_service, session_id, event.id, event.kind)
     async with lease:
         resolved, new_record = await sessions_service.resolve_interpretation_event(
             session_id=session_id,
@@ -265,6 +268,7 @@ async def _accept_as_drafted(
             amended_value=None,
             actor="user:alice",
             session_operation_context=lease.context,
+            **anchor_kwargs,
         )
     return resolved, state_from_record(new_record)
 

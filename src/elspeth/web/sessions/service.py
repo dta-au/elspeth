@@ -373,6 +373,10 @@ from elspeth.web.sessions.protocol import (
     PipelineProposalRejectionReason,
     PipelineProposalSettlementResult,
     PreparedInterpretationEventDraft,
+    PromptReviewAnchorRequiredError,
+    PromptReviewAnchorUnexpectedError,
+    PromptReviewSnapshotMissingError,
+    PromptReviewStaleError,
     ProposalEventRecord,
     ProposalLifecycleStatus,
     ProposalStateConflictError,
@@ -5158,6 +5162,7 @@ class SessionServiceImpl:
         resolved_at: datetime | None = None,
         runtime_model_identifier: str | None = None,
         runtime_model_version: str | None = None,
+        reviewed_anchor: str | None = None,
         session_operation_context: SessionOperationContext,
     ) -> tuple[InterpretationEventRecord, CompositionStateRecord]:
         """Commit a resolution AND patch the affected LLM transform's prompt template.
@@ -5179,6 +5184,12 @@ class SessionServiceImpl:
                (F-7: session_id in WHERE prevents cross-session IDOR;
                choice='pending' is the TOCTOU guard against double-resolve).
                Raise ValueError if no matching row.
+            1a. Bind a prompt review to what the user saw: for
+                ``llm_prompt_template`` the caller's ``reviewed_anchor`` must
+                equal the anchor of the event's stored review snapshot, read
+                on this connection. Missing anchor, missing snapshot, or a
+                different anchor refuses before any write; any other kind
+                refuses a supplied anchor, since it would bind nothing.
             2. Compute ``accepted_value`` per F-14.
             3. Validate ``accepted_value`` via ``_validate_accepted_value_content``
                (defence-in-depth against future callers that bypass the route).
@@ -5311,6 +5322,31 @@ class SessionServiceImpl:
                 }:
                     raise InterpretationUnsupportedChoiceError(
                         f"resolve_interpretation_event: {kind.value} does not support inline amendment in this release"
+                    )
+                # Step 1a: the approval is of the snapshot the card displayed.
+                # Read under the same session write lock and fence as every
+                # write below, so nothing can move between check and write.
+                if kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
+                    if reviewed_anchor is None:
+                        raise PromptReviewAnchorRequiredError(
+                            f"resolve_interpretation_event: prompt review {eid!r} must name the snapshot anchor it displayed"
+                        )
+                    stored_anchor = conn.execute(
+                        select(prompt_review_snapshots_table.c.anchor)
+                        .where(prompt_review_snapshots_table.c.event_id == eid)
+                        .where(prompt_review_snapshots_table.c.session_id == sid)
+                    ).scalar_one_or_none()
+                    if stored_anchor is None:
+                        raise PromptReviewSnapshotMissingError(
+                            f"resolve_interpretation_event: prompt review {eid!r} has no stored snapshot to approve against"
+                        )
+                    if stored_anchor != reviewed_anchor:
+                        raise PromptReviewStaleError(
+                            f"resolve_interpretation_event: prompt review {eid!r} was approved against a different snapshot"
+                        )
+                elif reviewed_anchor is not None:
+                    raise PromptReviewAnchorUnexpectedError(
+                        f"resolve_interpretation_event: {kind.value} has no review snapshot; reviewed_anchor must be omitted"
                     )
                 if kind in {
                     InterpretationKind.VAGUE_TERM,
@@ -5743,7 +5779,16 @@ class SessionServiceImpl:
                 return {
                     **snapshot.payload(),
                     "event_id": str(event_id),
-                    "is_live_review": event.choice == InterpretationChoice.PENDING.value and current_surface == snapshot.authored_surface,
+                    # Liveness compares the prompt text only: a slot's event
+                    # linkage moves as sibling cards surface, without making
+                    # this prompt a different one.
+                    "is_live_review": event.choice == InterpretationChoice.PENDING.value
+                    and current_surface
+                    == {
+                        key: snapshot.authored_surface[key]
+                        for key in ("prompt_template", "system_prompt", "queries")
+                        if key in snapshot.authored_surface
+                    },
                 }
 
         return cast(Mapping[str, Any] | None, await self._run_sync(_sync))

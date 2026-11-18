@@ -47,6 +47,7 @@ from elspeth.web.sessions.prompt_file_approval import (
 from elspeth.web.sessions.prompt_file_review import PromptFileReviewStale
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.state_envelope import unwrap_state_column
+from tests.helpers.prompt_review import reviewed_anchor_for
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
 from tests.unit.web.blobs.test_routes import TestIDORProtection as _IDORFixture
@@ -429,7 +430,10 @@ def _review_state(service: Any, session_id: str) -> tuple[dict[str, str], Any]:
     return requirements, materialize_state_for_execution(state)
 
 
-def _approve_card(service: Any, blob_service: Any, session_id: str, event_id: UUID) -> None:
+def _approve_card(service: Any, blob_service: Any, session_id: str, event_id: UUID, *, prompt_card: bool = True) -> None:
+    # A prompt card's approval names the snapshot it showed; any other review
+    # kind must omit the anchor (422 interpretation_review_anchor_unexpected).
+    reviewed_anchor = asyncio.run(reviewed_anchor_for(service, UUID(session_id), event_id)) if prompt_card else None
     with fenced_operation_context(blob_service._engine, session_id) as operation:
         resolved, _state = asyncio.run(
             service.resolve_interpretation_event(
@@ -438,6 +442,7 @@ def _approve_card(service: Any, blob_service: Any, session_id: str, event_id: UU
                 choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
                 amended_value=None,
                 actor="user:alice",
+                reviewed_anchor=reviewed_anchor,
                 session_operation_context=operation,
             )
         )
@@ -1418,7 +1423,7 @@ def _event_choice(blob_service: Any, event_id: UUID) -> str:
 def test_resolving_vague_term_first_reissues_an_approvable_file_card(tmp_path: Path) -> None:
     _client, service, blob_service, session_id, _system_file, prompt_card, vague_card = _vague_beside_file_setup(tmp_path)
 
-    _approve_card(service, blob_service, session_id, vague_card)
+    _approve_card(service, blob_service, session_id, vague_card, prompt_card=False)
     head = asyncio.run(service.get_current_state(UUID(session_id)))
     assert head is not None
     assert _VAGUE_DRAFT in state_from_record(head).nodes[0].options["prompt_template"]
@@ -1444,7 +1449,7 @@ def test_approving_file_card_then_resolving_vague_term_reopens_an_approvable_car
     _client, service, blob_service, session_id, _system_file, prompt_card, vague_card = _vague_beside_file_setup(tmp_path)
 
     _approve_card(service, blob_service, session_id, prompt_card)
-    _approve_card(service, blob_service, session_id, vague_card)
+    _approve_card(service, blob_service, session_id, vague_card, prompt_card=False)
     head = asyncio.run(service.get_current_state(UUID(session_id)))
     assert head is not None
     assert _VAGUE_DRAFT in state_from_record(head).nodes[0].options["prompt_template"]
@@ -1477,7 +1482,7 @@ def test_vague_resolve_keeps_an_inline_only_prompt_review_resolved(tmp_path: Pat
     )
 
     _approve_card(service, blob_service, session_id, prompt_card)
-    _approve_card(service, blob_service, session_id, vague_card)
+    _approve_card(service, blob_service, session_id, vague_card, prompt_card=False)
 
     assert _prompt_requirement_status(service, session_id) == "resolved"
     assert _admit(service, blob_service, session_id) == ()

@@ -518,11 +518,21 @@ class Battery:
                 break
             for ev in events:
                 reviews.append({"round": rnd, "event": ev})
+                body: dict[str, Any] = {"choice": "accepted_as_drafted"}
+                if ev.get("kind") == "llm_prompt_template":
+                    # A prompt card approves the stored snapshot it showed, named by its anchor.
+                    pr = step("get_review_prompt", "GET", f"/api/sessions/{sid}/interpretations/{ev['id']}/prompt", timeout=30)
+                    if pr is None or pr.status_code != 200 or not isinstance(pr.body, dict):
+                        instrument["http_unrecovered"] = instrument["http_unrecovered"] or (
+                            f"get_review_prompt {pr.status_code if pr else 'timeout'}"
+                        )
+                        continue
+                    body["reviewed_anchor"] = pr.body["anchor"]
                 step(
                     "resolve_review",
                     "POST",
                     f"/api/sessions/{sid}/interpretations/{ev['id']}/resolve",
-                    json={"choice": "accepted_as_drafted"},
+                    json=body,
                     timeout=60,
                 )
         instrument["review_rounds_exhausted"] = exhausted

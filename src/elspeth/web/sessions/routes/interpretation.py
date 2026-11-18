@@ -27,6 +27,10 @@ from ._helpers import (
     InterpretationUnsupportedChoiceError,
     ListInterpretationEventsResponse,
     OptOutSummaryResponse,
+    PromptReviewAnchorRequiredError,
+    PromptReviewAnchorUnexpectedError,
+    PromptReviewSnapshotMissingError,
+    PromptReviewStaleError,
     Request,
     SessionServiceProtocol,
     UserIdentity,
@@ -80,8 +84,14 @@ def register_interpretation_routes(router: APIRouter) -> None:
         prompt-template patch must succeed) are enforced inside
         :meth:`SessionServiceProtocol.resolve_interpretation_event`.
 
-        F-14 business-rule split: the route passes only ``choice`` and
-        ``amended_value``; the service computes ``accepted_value`` from
+        Reviewed anchor: a prompt review card sends ``reviewed_anchor``, the
+        ``anchor`` of the snapshot it displayed. Missing for a prompt review
+        or present for any other kind is 422; a different anchor than the
+        event's stored snapshot (or no stored snapshot) is 409. All refuse
+        before any write, inside the same lease as the resolve.
+
+        F-14 business-rule split: the route passes only ``choice``,
+        ``amended_value`` and ``reviewed_anchor``; the service computes ``accepted_value`` from
         the pending row's ``llm_draft`` when
         ``choice == 'accepted_as_drafted'``.  Do NOT compute
         ``accepted_value`` here — a second caller (CLI, admin route)
@@ -146,6 +156,7 @@ def register_interpretation_routes(router: APIRouter) -> None:
                     actor=actor,
                     runtime_model_identifier=runtime_model_identifier,
                     runtime_model_version=runtime_model_version,
+                    reviewed_anchor=body.reviewed_anchor,
                     session_operation_context=compose_operation_lease.context,
                 )
         except InterpretationEventAlreadyResolvedError as exc:
@@ -202,6 +213,38 @@ def register_interpretation_routes(router: APIRouter) -> None:
                 detail={
                     "code": "interpretation_resolution_unsupported",
                     "message": "This interpretation kind does not support inline amendment in this release.",
+                },
+            ) from exc
+        except PromptReviewAnchorRequiredError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "prompt_review_anchor_required",
+                    "message": "A prompt review must name the snapshot anchor it displayed.",
+                },
+            ) from exc
+        except PromptReviewAnchorUnexpectedError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "interpretation_review_anchor_unexpected",
+                    "message": "Only a prompt review takes a reviewed anchor.",
+                },
+            ) from exc
+        except PromptReviewStaleError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "prompt_review_stale",
+                    "message": "This prompt review changed since it was shown. Reload to see the latest.",
+                },
+            ) from exc
+        except PromptReviewSnapshotMissingError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "prompt_review_snapshot_missing",
+                    "message": "This prompt review has no stored text to approve. Ask the composer to surface it again.",
                 },
             ) from exc
         except (PromptFileApprovalStale, PromptFileReviewStale) as exc:

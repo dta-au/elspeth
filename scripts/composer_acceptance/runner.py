@@ -146,7 +146,13 @@ def _pending_reviews(api: ApiClient, prefix: str, out: Path, scenario: dict[str,
             continue
         if event["kind"] not in allowed:
             raise ValueError(f"Review kind {event['kind']} is not authorized by this scenario")
-        result = api.json(prefix + "/interpretations/" + event["id"] + "/resolve", {"choice": "accepted_as_drafted"})
+        body = {"choice": "accepted_as_drafted"}
+        if event["kind"] == "llm_prompt_template":
+            # A prompt card approves the stored snapshot it showed, named by its anchor.
+            snapshot = api.json(prefix + "/interpretations/" + event["id"] + "/prompt")
+            save(out / f"review-{event['id']}.prompt.json", snapshot)
+            body["reviewed_anchor"] = snapshot["anchor"]
+        result = api.json(prefix + "/interpretations/" + event["id"] + "/resolve", body)
         save(out / f"review-{event['id']}.resolved.json", result)
     return remaining
 
