@@ -31,7 +31,6 @@ from elspeth.web.sessions.models import (
 from elspeth.web.sessions.prompt_file_review import (
     PromptFileReviewStale,
     PromptReviewSnapshot,
-    _surface_slots,
     resolve_prompt_review_snapshot,
 )
 from elspeth.web.sessions.state_envelope import unwrap_state_column
@@ -264,45 +263,18 @@ def record_prompt_file_approval(
         )
     )
     if request.trigger is PromptApprovalTrigger.EDITOR_SAVE:
-        # A save is the user's review of the bytes just written. Once every
-        # binding in this prompt surface has current evidence, retire the old
-        # card in the same transaction; a partially saved surface stays pending.
-        all_approved = True
-        for binding in snapshot.bindings:
-            latest = conn.execute(
-                select(prompt_file_approvals_table)
-                .where(
-                    prompt_file_approvals_table.c.session_id == str(request.session_id),
-                    prompt_file_approvals_table.c.node_id == request.node_id,
-                    prompt_file_approvals_table.c.field_path == binding.field_path,
-                )
-                .order_by(prompt_file_approvals_table.c.approved_at.desc(), prompt_file_approvals_table.c.id.desc())
-                .limit(1)
-            ).one_or_none()
-            if (
-                latest is None
-                or latest.blob_id != str(binding.blob_id)
-                or latest.content_sha256 != binding.content_sha256
-                or latest.review_anchor != snapshot.anchor
-            ):
-                all_approved = False
-                break
-        requirements = options["interpretation_requirements"] if "interpretation_requirements" in options else ()
-        inline_pending = any(requirement["status"] == "pending" and requirement["kind"] == "vague_term" for requirement in requirements)
-        inline_pending = inline_pending or any(
-            path != request.field_path and path != "system_prompt" and type(value) is str for path, value in _surface_slots(options)
-        )
-        if all_approved and not inline_pending:
-            conn.execute(
-                update(interpretation_events_table)
-                .where(
-                    interpretation_events_table.c.session_id == str(request.session_id),
-                    interpretation_events_table.c.affected_node_id == request.node_id,
-                    interpretation_events_table.c.kind == "llm_prompt_template",
-                    interpretation_events_table.c.choice == "pending",
-                )
-                .values(choice="superseded", resolved_at=now)
+        # The route refuses a pending card with any unseen inline text before
+        # calling this writer. Its sole file approval can retire that card.
+        conn.execute(
+            update(interpretation_events_table)
+            .where(
+                interpretation_events_table.c.session_id == str(request.session_id),
+                interpretation_events_table.c.affected_node_id == request.node_id,
+                interpretation_events_table.c.kind == "llm_prompt_template",
+                interpretation_events_table.c.choice == "pending",
             )
+            .values(choice="superseded", resolved_at=now)
+        )
     return PromptFileApprovalRecord(
         id=approval_id,
         session_id=request.session_id,

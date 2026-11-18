@@ -46,13 +46,13 @@ describe("api/client blob preview", () => {
       json: async () => ({ changed: true, content_sha256: "b".repeat(64) }),
     } as Response);
 
-    await savePromptFile("session-1", "blob-1", "line one\n  line two\n", "a".repeat(64));
+    await savePromptFile("session-1", "blob-1", "line one\n  line two\n", "a".repeat(64), "first", "prompt_template");
 
     expect(fetchSpy).toHaveBeenCalledWith(
       "/api/sessions/session-1/blobs/blob-1/prompt-text",
       expect.objectContaining({
         method: "PUT",
-        body: JSON.stringify({ content: "line one\n  line two\n", expected_sha256: "a".repeat(64) }),
+        body: JSON.stringify({ content: "line one\n  line two\n", expected_sha256: "a".repeat(64), node_id: "first", field_path: "prompt_template" }),
       }),
     );
   });

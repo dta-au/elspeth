@@ -841,7 +841,7 @@ function NodeConfigPanel({
           ariaLabel={`${config.id} settings`}
           plugin={config.plugin === null ? null : { kind: config.pluginKind, name: config.plugin }}
         />
-        {config.plugin === "llm" && <PromptFileEditors options={config.options} />}
+        {config.plugin === "llm" && <PromptFileEditors nodeId={config.id} options={config.options} />}
       </section>
 
       <details className="graph-config-section graph-config-connections">

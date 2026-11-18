@@ -1652,11 +1652,13 @@ export async function savePromptFile(
   blobId: string,
   content: string,
   expectedSha256: string,
+  nodeId: string,
+  fieldPath: string,
 ): Promise<{ changed: boolean; content_sha256: string }> {
   const response = await authFetch(`/api/sessions/${sessionId}/blobs/${blobId}/prompt-text`, {
     method: "PUT",
     headers: authHeaders("application/json"),
-    body: JSON.stringify({ content, expected_sha256: expectedSha256 }),
+    body: JSON.stringify({ content, expected_sha256: expectedSha256, node_id: nodeId, field_path: fieldPath }),
   });
   return parseResponse<{ changed: boolean; content_sha256: string }>(response);
 }

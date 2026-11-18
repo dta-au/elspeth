@@ -4,6 +4,7 @@ import { Button } from "@/components/ui";
 import { useSessionStore } from "@/stores/sessionStore";
 
 interface PromptFileEditorProps {
+  nodeId: string;
   blobId: string;
   fieldPath: string;
 }
@@ -14,7 +15,7 @@ function blobId(value: unknown): string | null {
   return marker.mode === "inline_content" && typeof marker.blob_ref === "string" ? marker.blob_ref : null;
 }
 
-export function PromptFileEditors({ options }: { options: Record<string, unknown> }) {
+export function PromptFileEditors({ nodeId, options }: { nodeId: string; options: Record<string, unknown> }) {
   const bindings: Array<{ fieldPath: string; blobId: string }> = [];
   for (const fieldPath of ["prompt_template", "system_prompt"]) {
     const id = blobId(options[fieldPath]);
@@ -31,10 +32,10 @@ export function PromptFileEditors({ options }: { options: Record<string, unknown
     const id = blobId((query as Record<string, unknown>).template);
     if (id) bindings.push({ fieldPath: `queries.${name}.template`, blobId: id });
   }
-  return <>{bindings.map((binding) => <PromptFileEditor key={`${binding.fieldPath}:${binding.blobId}`} {...binding} />)}</>;
+  return <>{bindings.map((binding) => <PromptFileEditor key={`${nodeId}:${binding.fieldPath}:${binding.blobId}`} nodeId={nodeId} {...binding} />)}</>;
 }
 
-export function PromptFileEditor({ blobId, fieldPath }: PromptFileEditorProps) {
+export function PromptFileEditor({ nodeId, blobId, fieldPath }: PromptFileEditorProps) {
   const sessionId = useSessionStore((state) => state.activeSessionId);
   const isComposing = useSessionStore((state) => state.isComposing);
   const [text, setText] = useState<string | null>(null);
@@ -62,14 +63,14 @@ export function PromptFileEditor({ blobId, fieldPath }: PromptFileEditorProps) {
         });
     }
     return () => { live = false; };
-  }, [sessionId, blobId]);
+  }, [sessionId, nodeId, fieldPath, blobId]);
 
   const save = async () => {
     if (!sessionId || text === null || expectedSha256 === null) return;
     setSaving(true);
     setError(null);
     try {
-      const result = await savePromptFile(sessionId, blobId, text, expectedSha256);
+      const result = await savePromptFile(sessionId, blobId, text, expectedSha256, nodeId, fieldPath);
       if (useSessionStore.getState().activeSessionId !== sessionId) return;
       setSavedText(text);
       setExpectedSha256(result.content_sha256);
@@ -86,6 +87,10 @@ export function PromptFileEditor({ blobId, fieldPath }: PromptFileEditorProps) {
         const typed = failure as { detail?: unknown; error_type?: unknown };
         setError(typed.error_type === "prompt_file_node_multi_binding"
           ? "This node uses more than one prompt file. Re-point it through the agent and approve the review card."
+          : typed.error_type === "prompt_file_review_pending_inline"
+            ? "Approve the review card first, then edit the file."
+            : typed.error_type === "prompt_file_binding_changed"
+              ? "This prompt file moved since you opened it. Reload the session."
           : typeof typed.detail === "string" ? typed.detail : "Could not save this prompt file. Reload and retry.");
       }
     } finally {

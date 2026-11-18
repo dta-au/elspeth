@@ -18,17 +18,17 @@ beforeEach(() => {
 });
 
 it("renders full file text and saves with the observed hash", async () => {
-  render(<PromptFileEditors options={{ prompt_template: { mode: "inline_content", blob_ref: "blob-1" } }} />);
+  render(<PromptFileEditors nodeId="first" options={{ prompt_template: { mode: "inline_content", blob_ref: "blob-1" } }} />);
   const editor = await screen.findByRole("textbox", { name: /Edit bound prompt file/ });
   await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
   fireEvent.change(editor, { target: { value: "new line\n  indented\n" } });
   fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
-  await waitFor(() => expect(savePromptFile).toHaveBeenCalledWith("session-1", "blob-1", "new line\n  indented\n", "a".repeat(64)));
+  await waitFor(() => expect(savePromptFile).toHaveBeenCalledWith("session-1", "blob-1", "new line\n  indented\n", "a".repeat(64), "first", "prompt_template"));
 });
 
 it("shows a typed refusal and retains the user's draft", async () => {
   vi.mocked(savePromptFile).mockRejectedValue({ error_type: "prompt_file_stale", detail: "This file changed; reload it." });
-  render(<PromptFileEditors options={{ prompt_template: { mode: "inline_content", blob_ref: "blob-1" } }} />);
+  render(<PromptFileEditors nodeId="first" options={{ prompt_template: { mode: "inline_content", blob_ref: "blob-1" } }} />);
   const editor = await screen.findByRole("textbox", { name: /Edit bound prompt file/ });
   await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
   fireEvent.change(editor, { target: { value: "my draft" } });
@@ -39,11 +39,25 @@ it("shows a typed refusal and retains the user's draft", async () => {
 
 it("explains why a node with two prompt files needs agent review", async () => {
   vi.mocked(savePromptFile).mockRejectedValue({ error_type: "prompt_file_node_multi_binding" });
-  render(<PromptFileEditors options={{ prompt_template: { mode: "inline_content", blob_ref: "blob-1" } }} />);
+  render(<PromptFileEditors nodeId="first" options={{ prompt_template: { mode: "inline_content", blob_ref: "blob-1" } }} />);
   const editor = await screen.findByRole("textbox", { name: /Edit bound prompt file/ });
   await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
   fireEvent.change(editor, { target: { value: "my draft" } });
   fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
   expect(await screen.findByRole("alert")).toHaveTextContent("Re-point it through the agent and approve the review card.");
+  expect(editor).toHaveValue("my draft");
+});
+
+it.each([
+  ["prompt_file_review_pending_inline", "Approve the review card first, then edit the file."],
+  ["prompt_file_binding_changed", "This prompt file moved since you opened it. Reload the session."],
+])("shows %s guidance", async (errorType, message) => {
+  vi.mocked(savePromptFile).mockRejectedValue({ error_type: errorType });
+  render(<PromptFileEditors nodeId="first" options={{ prompt_template: { mode: "inline_content", blob_ref: "blob-1" } }} />);
+  const editor = await screen.findByRole("textbox", { name: /Edit bound prompt file/ });
+  await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
+  fireEvent.change(editor, { target: { value: "my draft" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent(message);
   expect(editor).toHaveValue("my draft");
 });

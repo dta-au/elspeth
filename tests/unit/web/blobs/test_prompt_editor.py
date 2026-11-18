@@ -7,15 +7,19 @@ from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from unittest.mock import Mock
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import select, text
 
+import tests.integration.pipeline.test_composer_runtime_agreement as agreement
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
+from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.schema import run_prompt_inputs_table
 from elspeth.web.blobs import routes
 from elspeth.web.blobs.service import content_hash
-from elspeth.web.composer.tools._common import _options_with_default_prompt_template_review
+from elspeth.web.composer.tools._common import _options_with_default_model_choice_review, _options_with_default_prompt_template_review
 from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.interpretation_state import (
     InterpretationReviewPending,
@@ -60,10 +64,19 @@ def _bound(
     asyncio.run(service.save_composition_state(UUID(session_id), data, provenance="session_seed"))
 
 
-def _save(client: SyncASGITestClient, session_id: str, blob_id: str, content: str, expected: str | None):
+def _save(
+    client: SyncASGITestClient,
+    session_id: str,
+    blob_id: str,
+    content: str,
+    expected: str | None,
+    *,
+    node_id: str = "first",
+    field_path: str = "prompt_template",
+):
     return client.put(
         f"/api/sessions/{session_id}/blobs/{blob_id}/prompt-text",
-        json={"content": content, "expected_sha256": expected},
+        json={"content": content, "expected_sha256": expected, "node_id": node_id, "field_path": field_path},
     )
 
 
@@ -263,7 +276,7 @@ def test_non_owner_cannot_save_or_approve(tmp_path) -> None:
 
 
 def _live_prompt_setup(
-    tmp_path: Path, *, two_nodes: bool = False
+    tmp_path: Path, *, two_nodes: bool = False, field_path: str = "prompt_template", inline_slot: str | None = None
 ) -> tuple[Any, Any, Any, str, dict[str, Any], dict[str, Any] | None, dict[str, UUID]]:
     app, service, blob_service = _make_app(tmp_path)
     client = SyncASGITestClient(app)
@@ -289,7 +302,18 @@ def _live_prompt_setup(
         bindings.append((node_b, second))
     for node, blob in bindings:
         options = dict(node["options"])
-        options["prompt_template"] = {"blob_ref": blob["id"], "mode": "inline_content", "sha256": blob["content_hash"]}
+        del options["system_prompt"]
+        del options["prompt_template"]
+        marker = {"blob_ref": blob["id"], "mode": "inline_content", "sha256": blob["content_hash"]}
+        if field_path == "queries.q.template":
+            options["queries"] = {"q": {"input_fields": {}, "template": marker}}
+        else:
+            options[field_path] = marker
+        if inline_slot == "queries.q.template":
+            options["queries"] = {"q": {"input_fields": {}, "template": "inline query"}}
+        elif inline_slot is not None:
+            options[inline_slot] = "inline prompt text"
+        options = _options_with_default_model_choice_review(node_id=node["id"], plugin="llm", options=options)
         node["options"] = _options_with_default_prompt_template_review(node_id=node["id"], plugin="llm", options=options)
     events: dict[str, UUID] = {}
     with fenced_operation_context(engine, session_id) as operation:
@@ -328,6 +352,32 @@ def _live_prompt_setup(
                 )
             )
             events[node["id"]] = event.id
+            model_event = asyncio.run(
+                service.create_pending_interpretation_event(
+                    session_id=UUID(session_id),
+                    composition_state_id=saved.id,
+                    affected_node_id=node["id"],
+                    tool_call_id=f"model-{node['id']}",
+                    user_term=f"llm_model_choice:{node['id']}",
+                    kind=InterpretationKind.LLM_MODEL_CHOICE,
+                    llm_draft=node["options"]["model"],
+                    model_identifier="test-model",
+                    model_version="1",
+                    provider="test-provider",
+                    composer_skill_hash="a" * 64,
+                    session_operation_context=operation,
+                )
+            )
+            asyncio.run(
+                service.resolve_interpretation_event(
+                    session_id=UUID(session_id),
+                    event_id=model_event.id,
+                    choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+                    amended_value=None,
+                    actor="user:alice",
+                    session_operation_context=operation,
+                )
+            )
     return client, service, blob_service, session_id, first, second, events
 
 
@@ -339,10 +389,13 @@ def _admit(service: Any, blob_service: Any, session_id: str) -> tuple[Any, ...]:
     execution._blob_service = blob_service
     execution._session_service = service
     execution._call_async = asyncio.run
+    materialized = materialize_state_for_execution(state_from_record(record))
     with fenced_operation_context(blob_service._engine, session_id) as operation:
-        return execution._assert_state_prompt_file_approvals(
+        snapshots = execution._assert_state_prompt_file_approvals(
             state_from_record(record), session_id=UUID(session_id), session_operation_context=operation
         )
+    assert not isinstance(materialized, InterpretationReviewPending), materialized
+    return snapshots
 
 
 def _review_state(service: Any, session_id: str) -> tuple[dict[str, str], Any]:
@@ -554,39 +607,50 @@ def test_editor_save_resolves_only_its_node_card(tmp_path: Path) -> None:
     assert "first" not in str(refusal.value)
 
 
-def test_editor_save_keeps_card_pending_for_inline_query(tmp_path: Path) -> None:
-    client, service, blob_service, session_id, first, _second, events = _live_prompt_setup(tmp_path)
-    record = asyncio.run(service.get_current_state(UUID(session_id)))
-    assert record is not None
-    data = state_from_record(record).to_dict()
-    data["nodes"][0]["options"]["queries"] = {"q": {"input_fields": {}, "template": "inline query"}}
-    with fenced_operation_context(blob_service._engine, session_id) as operation:
-        asyncio.run(
-            service.save_composition_state(
-                UUID(session_id),
-                CompositionStateData(
-                    sources=data["sources"],
-                    nodes=data["nodes"],
-                    edges=data["edges"],
-                    outputs=data["outputs"],
-                    metadata_=data["metadata"],
-                    is_valid=True,
-                ),
-                provenance="tool_call",
-                session_operation_context=operation,
-            )
-        )
-    response = _save(client, session_id, first["id"], "edited file", first["content_hash"])
-    assert response.status_code == 200, response.text
+@pytest.mark.parametrize(
+    ("field_path", "inline_slot"),
+    [
+        ("queries.q.template", "system_prompt"),
+        ("prompt_template", "system_prompt"),
+        ("prompt_template", "queries.q.template"),
+    ],
+)
+def test_pending_inline_card_refuses_save_then_card_allows_it(tmp_path: Path, field_path: str, inline_slot: str) -> None:
+    client, service, blob_service, session_id, first, _second, events = _live_prompt_setup(
+        tmp_path, field_path=field_path, inline_slot=inline_slot
+    )
+    before = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert before is not None
     with blob_service._engine.connect() as conn:
-        assert conn.execute(select(prompt_file_approvals_table.c.trigger)).scalar_one() == "editor_save"
+        approvals_before = conn.execute(select(prompt_file_approvals_table)).all()
+        metadata_before = conn.execute(
+            select(blobs_table.c.content_hash, blobs_table.c.size_bytes).where(blobs_table.c.id == first["id"])
+        ).one()
+        choice_before = conn.execute(
+            select(interpretation_events_table.c.choice).where(interpretation_events_table.c.id == str(events["first"]))
+        ).scalar_one()
+    response = _save(client, session_id, first["id"], "edited file", first["content_hash"], field_path=field_path)
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["error_code"] == "prompt_file_review_pending_inline"
+    assert client.get(f"/api/sessions/{session_id}/blobs/{first['id']}/content").content == b"first before"
+    after = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert after is not None and (after.id, after.version) == (before.id, before.version)
+    with blob_service._engine.connect() as conn:
+        assert conn.execute(select(prompt_file_approvals_table)).all() == approvals_before
+        assert (
+            conn.execute(select(blobs_table.c.content_hash, blobs_table.c.size_bytes).where(blobs_table.c.id == first["id"])).one()
+            == metadata_before
+        )
         assert (
             conn.execute(
                 select(interpretation_events_table.c.choice).where(interpretation_events_table.c.id == str(events["first"]))
             ).scalar_one()
-            == "pending"
+            == choice_before
         )
-    assert _review_state(service, session_id)[0]["first"] == "pending"
+    _approve_card(service, blob_service, session_id, events["first"])
+    saved = _save(client, session_id, first["id"], "edited file", first["content_hash"], field_path=field_path)
+    assert saved.status_code == 200, saved.text
+    assert [snapshot.node_id for snapshot in _admit(service, blob_service, session_id)] == ["first"]
 
 
 def test_same_id_replacement_refuses_until_new_card_approval(tmp_path: Path) -> None:
@@ -695,3 +759,141 @@ def test_one_approval_query_distinguishes_card_and_editor_save(tmp_path: Path) -
         ("editor_save", saved.json()["content_sha256"], "alice"),
     ]
     assert all(datetime.fromisoformat(str(row.approved_at)) for row in rows)
+
+
+@pytest.mark.parametrize(
+    ("field_path", "first_approval"),
+    [
+        ("prompt_template", "card"),
+        ("prompt_template", "editor_save"),
+        ("system_prompt", "card"),
+        ("queries.q.template", "card"),
+        ("queries.q.template", "editor_save"),
+    ],
+)
+def test_resolved_review_refreshes_after_each_save(tmp_path: Path, field_path: str, first_approval: str) -> None:
+    client, service, blob_service, session_id, blob, _second, events = _live_prompt_setup(
+        tmp_path, field_path=field_path, inline_slot="prompt_template" if field_path == "system_prompt" else None
+    )
+    if first_approval == "card":
+        _approve_card(service, blob_service, session_id, events["first"])
+        assert [snapshot.node_id for snapshot in _admit(service, blob_service, session_id)] == ["first"]
+        first_hash = blob["content_hash"]
+    else:
+        first = _save(client, session_id, blob["id"], "first edit", blob["content_hash"], field_path=field_path)
+        assert first.status_code == 200, first.text
+        assert [snapshot.node_id for snapshot in _admit(service, blob_service, session_id)] == ["first"]
+        first_hash = first.json()["content_sha256"]
+    second = _save(client, session_id, blob["id"], "second edit", first_hash, field_path=field_path)
+    assert second.status_code == 200, second.text
+    assert [snapshot.node_id for snapshot in _admit(service, blob_service, session_id)] == ["first"]
+    if field_path == "system_prompt":
+        third = _save(client, session_id, blob["id"], "third edit", second.json()["content_sha256"], field_path=field_path)
+        assert third.status_code == 200, third.text
+        assert [snapshot.node_id for snapshot in _admit(service, blob_service, session_id)] == ["first"]
+
+
+@pytest.mark.parametrize("approval", ["card", "editor_save"])
+def test_approved_prompt_bytes_reach_fake_provider_and_run_evidence(tmp_path: Path, approval: str) -> None:
+    client, service, blob_service, session_id, blob, _second, events = _live_prompt_setup(tmp_path)
+    text_seen = "first before"
+    if approval == "card":
+        _approve_card(service, blob_service, session_id, events["first"])
+    else:
+        text_seen = "owner edited prompt"
+        saved = _save(client, session_id, blob["id"], text_seen, blob["content_hash"])
+        assert saved.status_code == 200, saved.text
+    snapshots = _admit(service, blob_service, session_id)
+    assert len(snapshots) == 1 and len(snapshots[0].bindings) == 1
+    binding = snapshots[0].bindings[0]
+    assert binding.text == text_seen
+    run_id = str(uuid4())
+    landscape_url = f"sqlite:///{tmp_path / 'landscape.db'}"
+    with LandscapeDB(landscape_url) as landscape:
+        ExecutionServiceImpl._record_run_prompt_inputs(landscape, run_id=run_id, snapshots=snapshots)
+    with LandscapeDB.from_url(landscape_url, create_tables=False) as landscape, landscape.read_only_connection() as conn:
+        row = conn.execute(select(run_prompt_inputs_table)).one()
+    assert (row.run_id, row.node_id, row.field_path, row.content_sha256) == (
+        run_id,
+        "first",
+        "prompt_template",
+        content_hash(text_seen.encode()),
+    )
+    provider = Mock(spec=agreement.LLMProvider)
+    provider.execute_query.return_value = agreement.LLMQueryResult(
+        content="accepted",
+        usage=agreement.TokenUsage.known(4, 1),
+        model="openai/gpt-4o",
+        finish_reason=agreement.FinishReason.STOP,
+    )
+    transform = agreement.LLMTransform(
+        {
+            "provider": "openrouter",
+            "model": "openai/gpt-4o",
+            "api_key": "test-key",
+            "prompt_template": binding.text,
+            "schema": {"mode": "observed"},
+            "required_input_fields": [],
+        }
+    )
+    transform._provider = provider
+    context = agreement.make_context(
+        state_id="state-123",
+        run_id=run_id,
+        token=agreement.TokenInfo(row_id="row-1", token_id="token-1", row_data=agreement.make_pipeline_row({})),
+    )
+    assert transform._process_row(agreement.make_pipeline_row({}), context).status == "success"
+    provider.execute_query.assert_called_once()
+    assert provider.execute_query.call_args.args[0] == [agreement.ChatMessage(role="user", content=text_seen)]
+
+
+@pytest.mark.parametrize("move", ["field", "node"])
+def test_stale_editor_binding_refused_without_writes(tmp_path: Path, move: str) -> None:
+    client, service, blob_service, session_id, blob, _second, _events = _live_prompt_setup(tmp_path)
+    current = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert current is not None
+    data = state_from_record(current).to_dict()
+    if move == "field":
+        options = data["nodes"][0]["options"]
+        marker = options.pop("prompt_template")
+        options["queries"] = {"unseen_query": {"input_fields": {}, "template": marker}}
+    else:
+        data["nodes"][0]["id"] = "unseen_new_node"
+    with fenced_operation_context(blob_service._engine, session_id) as operation:
+        asyncio.run(
+            service.save_composition_state(
+                UUID(session_id),
+                CompositionStateData(
+                    sources=data["sources"],
+                    nodes=data["nodes"],
+                    edges=data["edges"],
+                    outputs=data["outputs"],
+                    metadata_=data["metadata"],
+                    is_valid=True,
+                ),
+                provenance="tool_call",
+                session_operation_context=operation,
+            )
+        )
+    before = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert before is not None
+    with blob_service._engine.connect() as conn:
+        approvals_before = conn.execute(select(prompt_file_approvals_table)).all()
+        metadata_before = conn.execute(
+            select(blobs_table.c.content_hash, blobs_table.c.size_bytes).where(blobs_table.c.id == blob["id"])
+        ).one()
+    response = _save(client, session_id, blob["id"], "stale editor edit", blob["content_hash"])
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["error_code"] == "prompt_file_binding_changed"
+    assert client.get(f"/api/sessions/{session_id}/blobs/{blob['id']}/content").content == b"first before"
+    after = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert after is not None and (after.id, after.version) == (before.id, before.version)
+    with blob_service._engine.connect() as conn:
+        assert conn.execute(select(prompt_file_approvals_table)).all() == approvals_before
+        assert (
+            conn.execute(select(blobs_table.c.content_hash, blobs_table.c.size_bytes).where(blobs_table.c.id == blob["id"])).one()
+            == metadata_before
+        )
+    materialize_state_for_execution(state_from_record(after))
+    with pytest.raises(PromptFileReviewStale):
+        _admit(service, blob_service, session_id)

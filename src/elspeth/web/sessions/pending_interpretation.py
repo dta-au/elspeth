@@ -37,6 +37,7 @@ from elspeth.web.interpretation_state import (
     PROMPT_TEMPLATE_PARTS_KEY,
     SOURCE_AUTHORING_KEY,
     SOURCE_COMPONENT_ID,
+    InterpretationRequirement,
     approved_prompt_artifact_hash_from_options,
     current_source_data_contract_demand,
     model_choice_artifact_hash,
@@ -1182,16 +1183,11 @@ def _resolve_prompt_template_review(
     # The event and runtime node share the effective artifact identity. The
     # requirement separately attests the authored surface/skeleton, so resolving
     # a vague-term slot does not invalidate the approval of that skeleton.
-    artifact_hash = (
-        file_snapshot.effective_artifact_hash if file_snapshot is not None else approved_prompt_artifact_hash_from_options(options)
-    )
-    structure_hash = prompt_review_anchor_hash_from_options(options)
-    requirement_anchor_hash = structure_hash if structure_hash is not None else stable_hash(prompt_template)
     requirement = dict(requirements[matching_index])
     requirement["status"] = "resolved"
     requirement["event_id"] = event_id
     requirement["accepted_value"] = accepted_value
-    requirement["resolved_prompt_template_hash"] = requirement_anchor_hash
+    artifact_hash = _refresh_prompt_review_evidence(options, cast(InterpretationRequirement, requirement), file_snapshot=file_snapshot)
     requirements[matching_index] = requirement
 
     final_nodes: list[Mapping[str, Any]] = []
@@ -1208,6 +1204,38 @@ def _resolve_prompt_template_review(
     # Prompt-template review patches only node review metadata; the sources map
     # is carried forward unchanged. The legacy singular ``source`` column is dead.
     return state_record.sources, final_nodes, artifact_hash
+
+
+def _refresh_prompt_review_evidence(
+    options: Mapping[str, Any], requirement: InterpretationRequirement, *, file_snapshot: PromptReviewSnapshot | None
+) -> str | None:
+    """Use the same authored anchor and effective artifact for card and editor approvals."""
+    anchor = prompt_review_anchor_hash_from_options(options)
+    prompt = options["prompt_template"] if "prompt_template" in options else None
+    requirement["resolved_prompt_template_hash"] = anchor if anchor is not None else stable_hash(prompt)
+    return file_snapshot.effective_artifact_hash if file_snapshot is not None else approved_prompt_artifact_hash_from_options(options)
+
+
+def _refresh_resolved_prompt_template_review(
+    state_record: CompositionStateRecord, *, affected_node_id: str, file_snapshot: PromptReviewSnapshot
+) -> list[Mapping[str, Any]]:
+    """Refresh a previously accepted card after the owner saves its sole file."""
+    nodes: list[Mapping[str, Any]] = []
+    for node in state_record.nodes or ():
+        if node["id"] != affected_node_id:
+            nodes.append(node)
+            continue
+        options = dict(node["options"])
+        requirements: list[InterpretationRequirement] = list(parse_interpretation_requirements(options) or ())
+        matching = [
+            item for item in requirements if item["kind"] == InterpretationKind.LLM_PROMPT_TEMPLATE.value and item["status"] == "resolved"
+        ]
+        if len(matching) != 1:
+            raise InterpretationPlaceholderConsumedError("editor save requires one resolved prompt review")
+        options["approved_prompt_artifact_hash"] = _refresh_prompt_review_evidence(options, matching[0], file_snapshot=file_snapshot)
+        options[INTERPRETATION_REQUIREMENTS_KEY] = requirements
+        nodes.append({**node, "options": options})
+    return nodes
 
 
 def _resolve_invented_source(

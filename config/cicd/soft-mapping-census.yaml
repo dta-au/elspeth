@@ -1080,7 +1080,7 @@ files:
   src/elspeth/web/sessions/operation_receipts.py:
     dict[str, Any]: 1
   src/elspeth/web/sessions/pending_interpretation.py:
-    Mapping[str, Any]: 24
+    Mapping[str, Any]: 27
     boundary: 1
     dict[str, Any]: 6
     dict[str, object]: 1
@@ -1122,10 +1122,10 @@ files:
   src/elspeth/web/shareable_reviews/service.py:
     dict[str, object]: 1
 totals:
-  Mapping[str, Any]: 816
+  Mapping[str, Any]: 819
   Mapping[str, object]: 319
   MutableMapping[str, Any]: 9
   boundary: 69
   dict[str, Any]: 1125
   dict[str, object]: 407
-  soft: 2676
+  soft: 2679

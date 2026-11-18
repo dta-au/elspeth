@@ -1083,13 +1083,8 @@ def _node_option_is_non_text(node: NodeSpec, key: str) -> bool:
 def _refuse_resolved_review_over_non_text(node: NodeSpec, *, option_key: str, kind: InterpretationKind) -> None:
     """Drift backstop: a RESOLVED prompt/model review over a non-text value.
 
-    A resolved ``llm_prompt_template`` / ``llm_model_choice`` review attested a
-    concrete string. A non-text value in that field (an ``inline_content`` blob
-    marker, substituted only at run time) is not what was reviewed, and the
-    string drift guards never run because there is no string to hash. This is
-    drift, not debt: no card can attest a marker (the surfacer, event writer
-    and resolver all read the option as text), so it is refused here rather
-    than enumerated as a pending site nothing can clear.
+    A resolved model review attests text. A prompt review may instead attest
+    a deferred scalar file marker, whose authored anchor is checked here.
 
     A marker with NO resolved review is not refused: LLM-authored blobs are
     refused in these fields at wire time and at run admission, so what remains
@@ -1099,12 +1094,46 @@ def _refuse_resolved_review_over_non_text(node: NodeSpec, *, option_key: str, ki
         return
     if _resolved_requirement_for_kind(_requirements(node.options), kind) is None:
         return
+    if kind is InterpretationKind.LLM_PROMPT_TEMPLATE and option_key == "prompt_template":
+        marker = is_widened_blob_ref(deep_thaw(node.options[option_key]))
+        if marker is not None and marker.mode == "inline_content":
+            _validate_prompt_template_review(node, None)
+            return
     raise InterpretationReviewIntegrityError(
         f"llm node {node.id!r} {kind.value} review is resolved but options.{option_key} is no longer text",
         component_id=node.id,
         component_type="transform",
         kind=kind,
     )
+
+
+def _validate_resolved_prompt_surface_markers(node: NodeSpec) -> None:
+    """A resolved review may cover only valid deferred scalar file markers."""
+    if _resolved_requirement_for_kind(_requirements(node.options), InterpretationKind.LLM_PROMPT_TEMPLATE) is None:
+        return
+    slots: list[tuple[str, object]] = [(key, node.options[key]) for key in ("prompt_template", "system_prompt") if key in node.options]
+    queries = node.options["queries"] if "queries" in node.options else None
+    entries: list[tuple[object, object]] = []
+    if isinstance(queries, Mapping):
+        entries.extend(queries.items())
+    elif isinstance(queries, (list, tuple)):
+        entries.extend(enumerate(queries))
+    for name, entry in entries:
+        if isinstance(entry, Mapping) and "template" in entry:
+            slots.append((f"queries.{name}.template", entry["template"]))
+    for path, value in slots:
+        if value is None or isinstance(value, str):
+            continue
+        marker = is_widened_blob_ref(deep_thaw(value))
+        if marker is None or marker.mode != "inline_content":
+            raise InterpretationReviewIntegrityError(
+                f"llm node {node.id!r} resolved prompt review covers invalid {path} value",
+                component_id=node.id,
+                component_type="transform",
+                kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
+            )
+    if any(value is not None and not isinstance(value, str) for _path, value in slots):
+        _validate_prompt_template_review(node, _node_str_option(node, "prompt_template"))
 
 
 def _raw_html_cleanup_requirement(requirements: Sequence[InterpretationRequirement] | None) -> InterpretationRequirement | None:
@@ -1293,12 +1322,17 @@ def _materialize_node_for_execution(
         _validate_model_choice_review(node, model)
     parts = _prompt_parts(node.options)
     if parts is None:
+        _validate_resolved_prompt_surface_markers(node)
         # Structured nodes render prompt_template from their parts, so only a
         # parts-free node can execute a non-text prompt_template.
         if multi_query_prompt_surface_from_options(node.options) is None:
             _refuse_resolved_review_over_non_text(node, option_key="prompt_template", kind=InterpretationKind.LLM_PROMPT_TEMPLATE)
         prompt_template = _node_str_option(node, "prompt_template")
-        if prompt_template or multi_query_prompt_surface_from_options(node.options) is not None:
+        if (
+            prompt_template
+            or multi_query_prompt_surface_from_options(node.options) is not None
+            or _node_option_is_non_text(node, "prompt_template")
+        ):
             requirement = _prompt_template_review_requirement(node.options)
             if requirement is not None:
                 _validate_prompt_template_review(node, prompt_template)

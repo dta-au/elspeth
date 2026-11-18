@@ -58,6 +58,7 @@ from elspeth.web.sessions.models import (
     blob_replacement_cleanups_table,
     chat_messages_table,
     prompt_file_approvals_table,
+    prompt_review_snapshots_table,
     session_operation_receipts_table,
     skill_markdown_history_table,
     user_preferences_table,
@@ -734,6 +735,7 @@ def test_postgres_session_audit_triggers_are_installed_and_enforced(postgres_eng
         "trg_interpretation_events_no_delete_resolved",
         "trg_composer_completion_events_no_update",
         "trg_prompt_file_approvals_no_update",
+        "trg_prompt_review_snapshots_no_update",
         "trg_composer_completion_events_no_delete",
         "trg_chat_messages_immutable_content",
         "trg_chat_messages_no_delete",
@@ -746,6 +748,16 @@ def test_postgres_session_audit_triggers_are_installed_and_enforced(postgres_eng
 
     protected_session = "trigger-protected"
     _seed_postgres_trigger_rows(postgres_engine, session_id=protected_session, include_completion=True)
+    with postgres_engine.begin() as conn:
+        conn.execute(
+            insert(prompt_review_snapshots_table).values(
+                event_id=f"{protected_session}-interpretation",
+                session_id=protected_session,
+                anchor="a" * 64,
+                snapshot_json={},
+                created_at=datetime.now(UTC),
+            )
+        )
 
     # The first in-progress -> completed settlement is legal. Any later update
     # must be refused by the terminal immutability trigger.
@@ -790,6 +802,7 @@ def test_postgres_session_audit_triggers_are_installed_and_enforced(postgres_eng
 
     blocked_mutations = (
         ("UPDATE interpretation_events SET actor = 'attacker' WHERE id = :row_id", f"{protected_session}-interpretation"),
+        ("UPDATE prompt_review_snapshots SET anchor = :replacement WHERE event_id = :row_id", f"{protected_session}-interpretation"),
         ("DELETE FROM interpretation_events WHERE id = :row_id", f"{protected_session}-interpretation"),
         ("UPDATE composer_completion_events SET actor = 'attacker' WHERE id = :row_id", f"{protected_session}-completion"),
         ("DELETE FROM composer_completion_events WHERE id = :row_id", f"{protected_session}-completion"),
@@ -847,7 +860,22 @@ def test_postgres_session_audit_triggers_are_installed_and_enforced(postgres_eng
     cascade_session = "trigger-cascade"
     _seed_postgres_trigger_rows(postgres_engine, session_id=cascade_session, include_completion=False)
     with postgres_engine.begin() as conn:
+        conn.execute(
+            insert(prompt_review_snapshots_table).values(
+                event_id=f"{cascade_session}-interpretation",
+                session_id=cascade_session,
+                anchor="a" * 64,
+                snapshot_json={},
+                created_at=datetime.now(UTC),
+            )
+        )
         conn.execute(text("DELETE FROM sessions WHERE id = :session_id"), {"session_id": cascade_session})
+        assert (
+            conn.execute(
+                select(prompt_review_snapshots_table.c.event_id).where(prompt_review_snapshots_table.c.session_id == cascade_session)
+            ).all()
+            == []
+        )
         assert (
             conn.execute(
                 text("SELECT count(*) FROM interpretation_events WHERE session_id = :session_id"),

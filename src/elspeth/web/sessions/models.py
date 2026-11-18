@@ -1604,6 +1604,27 @@ POSTGRESQL_AUDIT_DDL_COHORT: tuple[PostgresqlAuditDDL, ...] = (
         ),
     ),
     PostgresqlAuditDDL(
+        table=prompt_review_snapshots_table,
+        trigger_name="trg_prompt_review_snapshots_no_update",
+        function_name="elspeth_prompt_review_snapshots_no_update",
+        function_sql="""
+        CREATE FUNCTION elspeth_prompt_review_snapshots_no_update()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+          RAISE EXCEPTION 'prompt_review_snapshots is append-only; UPDATE is forbidden'
+            USING ERRCODE = '23000';
+        END;
+        $$
+        """,
+        trigger_sql=(
+            "CREATE TRIGGER trg_prompt_review_snapshots_no_update "
+            "BEFORE UPDATE ON prompt_review_snapshots "
+            "FOR EACH ROW EXECUTE FUNCTION elspeth_prompt_review_snapshots_no_update()"
+        ),
+    ),
+    PostgresqlAuditDDL(
         table=prompt_file_approvals_table,
         trigger_name="trg_prompt_file_approvals_no_update",
         function_name="elspeth_prompt_file_approvals_no_update",
@@ -1884,6 +1905,18 @@ event.listen(
         "BEFORE UPDATE ON composer_completion_events "
         "BEGIN "
         "  SELECT RAISE(ABORT, 'composer_completion_events is append-only; UPDATE is forbidden'); "
+        "END;"
+    ).execute_if(dialect="sqlite"),
+)
+
+event.listen(
+    prompt_review_snapshots_table,
+    "after_create",
+    cast(Callable[[str], DDL], DDL)(
+        "CREATE TRIGGER IF NOT EXISTS trg_prompt_review_snapshots_no_update "
+        "BEFORE UPDATE ON prompt_review_snapshots "
+        "BEGIN "
+        "  SELECT RAISE(ABORT, 'prompt_review_snapshots is append-only; UPDATE is forbidden'); "
         "END;"
     ).execute_if(dialect="sqlite"),
 )

@@ -9,13 +9,13 @@ from uuid import UUID
 
 import pytest
 import structlog
-from sqlalchemy import update
+from sqlalchemy import delete, update
 from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.web.composer.tools._common import _options_with_default_prompt_template_review
 from elspeth.web.interpretation_state import prompt_review_draft_from_options
-from elspeth.web.sessions.models import prompt_file_approvals_table, prompt_review_snapshots_table
+from elspeth.web.sessions.models import prompt_file_approvals_table, prompt_review_snapshots_table, sessions_table
 from elspeth.web.sessions.prompt_file_approval import (
     PromptApprovalTrigger,
     PromptFileApprovalRequest,
@@ -145,6 +145,26 @@ async def test_prompt_file_approval_update_refused(blob_env: dict[str, Any]) -> 
     with pytest.raises(IntegrityError, match="prompt_file_approvals is append-only"), blob_env["engine"].begin() as conn:
         conn.execute(
             update(prompt_file_approvals_table).where(prompt_file_approvals_table.c.id == str(approval.id)).values(content_sha256="b" * 64)
+        )
+
+
+@pytest.mark.asyncio
+async def test_prompt_review_snapshot_update_refused_and_session_delete_cascades(blob_env: dict[str, Any]) -> None:
+    _service, session_id, event_id, _blob_id = await _pending_file_review(blob_env)
+    with pytest.raises(IntegrityError, match="prompt_review_snapshots is append-only"), blob_env["engine"].begin() as conn:
+        conn.execute(
+            update(prompt_review_snapshots_table).where(prompt_review_snapshots_table.c.event_id == str(event_id)).values(anchor="b" * 64)
+        )
+    with blob_env["engine"].connect() as conn:
+        assert conn.execute(prompt_review_snapshots_table.select().where(prompt_review_snapshots_table.c.event_id == str(event_id))).one()
+    with blob_env["engine"].begin() as conn:
+        assert conn.execute(delete(sessions_table).where(sessions_table.c.id == str(session_id))).rowcount == 1
+    with blob_env["engine"].connect() as conn:
+        assert (
+            conn.execute(
+                prompt_review_snapshots_table.select().where(prompt_review_snapshots_table.c.event_id == str(event_id))
+            ).one_or_none()
+            is None
         )
 
 

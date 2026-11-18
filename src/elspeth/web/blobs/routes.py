@@ -54,9 +54,13 @@ from elspeth.web.blobs.sniff import detect_mime_type
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.credential_guard import require_no_credential_material
-from elspeth.web.interpretation_state import prompt_review_draft_from_options
+from elspeth.web.interpretation_state import parse_interpretation_requirements, prompt_review_draft_from_options
 from elspeth.web.sessions.models import composition_states_table, interpretation_events_table
-from elspeth.web.sessions.pending_interpretation import _resolve_prompt_template_review, _surfacing_prompt_structure_hash
+from elspeth.web.sessions.pending_interpretation import (
+    _refresh_resolved_prompt_template_review,
+    _resolve_prompt_template_review,
+    _surfacing_prompt_structure_hash,
+)
 from elspeth.web.sessions.prompt_file_approval import (
     PromptApprovalTrigger,
     PromptFileApprovalRequest,
@@ -65,7 +69,7 @@ from elspeth.web.sessions.prompt_file_approval import (
     _current_snapshot,
     record_prompt_file_approval,
 )
-from elspeth.web.sessions.prompt_file_review import prompt_file_binding_paths
+from elspeth.web.sessions.prompt_file_review import _surface_slots, prompt_file_binding_paths
 from elspeth.web.sessions.protocol import CompositionStateData, SessionCompositionStateCreation, SessionOperationMutationTransaction
 
 _MAX_PROMPT_FILE_BYTES = 256 * 1024
@@ -76,6 +80,8 @@ class SavePromptFileRequest(BaseModel):
 
     content: str
     expected_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    node_id: str
+    field_path: str
 
 
 class SavePromptFileResponse(BaseModel):
@@ -239,6 +245,10 @@ def create_blobs_router() -> APIRouter:
                     "prompt_file_shared_binding",
                     "This file backs more than one prompt; give each prompt its own file before editing it here.",
                 )
+            if (bindings[0].node_id, bindings[0].field_path) != (body.node_id, body.field_path):
+                raise _prompt_save_refusal(
+                    409, "prompt_file_binding_changed", "This prompt file moved since you opened it. Reload the session."
+                )
             node = next(node for node in state.nodes or () if node["id"] == bindings[0].node_id)
             if len(prompt_file_binding_paths(node["options"])) > 1:
                 raise _prompt_save_refusal(
@@ -253,6 +263,25 @@ def create_blobs_router() -> APIRouter:
                     409,
                     "prompt_file_encoding_unsupported",
                     "This prompt reads the file with a non-UTF-8 encoding; re-attach it as UTF-8 text before editing it here.",
+                )
+            with blob_service._engine.connect() as conn:
+                pending_card = conn.execute(
+                    select(interpretation_events_table.c.id)
+                    .where(
+                        interpretation_events_table.c.session_id == str(session_id),
+                        interpretation_events_table.c.affected_node_id == body.node_id,
+                        interpretation_events_table.c.kind == "llm_prompt_template",
+                        interpretation_events_table.c.choice == "pending",
+                    )
+                    .limit(1)
+                ).scalar_one_or_none()
+            if pending_card is not None and any(
+                path != body.field_path and type(value) is str for path, value in _surface_slots(node["options"])
+            ):
+                raise _prompt_save_refusal(
+                    409,
+                    "prompt_file_review_pending_inline",
+                    "Approve the review card first, then edit the file.",
                 )
             if new_bytes == old_bytes:
                 return SavePromptFileResponse(changed=False, content_sha256=blob.content_hash)
@@ -284,6 +313,17 @@ def create_blobs_router() -> APIRouter:
                 ).scalar_one_or_none()
                 if state is None or current_head != str(state.id):
                     raise PromptFileApprovalStale()
+                current_row = conn.execute(select(composition_states_table).where(composition_states_table.c.id == current_head)).one()
+                current_state = session_service._row_to_state_record(current_row)
+                current_bindings, current_mixed = prompt_bindings_for_blob(current_state, replacement)
+                if (
+                    current_mixed
+                    or len(current_bindings) != 1
+                    or (current_bindings[0].node_id, current_bindings[0].field_path) != (body.node_id, body.field_path)
+                ):
+                    raise _prompt_save_refusal(
+                        409, "prompt_file_binding_changed", "This prompt file moved since you opened it. Reload the session."
+                    )
                 stored_hash = content_hash(stored_bytes)
                 if stored_hash != replacement.content_hash:
                     raise AuditIntegrityError("stored prompt bytes differ from replacement metadata")
@@ -344,8 +384,7 @@ def create_blobs_router() -> APIRouter:
                             select(interpretation_events_table.c.choice).where(interpretation_events_table.c.id == pending_event.id)
                         ).scalar_one()
                         if choice == "pending":
-                            # The save covers the file, but a separate inline part still needs the card.
-                            continue
+                            raise PromptFileApprovalStale()
                         snapshot = _current_snapshot(conn, approval_request, options)
                         accepted_value = prompt_review_draft_from_options(options)
                         if accepted_value is None:
@@ -376,6 +415,41 @@ def create_blobs_router() -> APIRouter:
                                 derived_from_state_id=latest_state.id,
                             )
                         )
+                    else:
+                        latest_row = conn.execute(
+                            select(composition_states_table)
+                            .where(composition_states_table.c.session_id == str(session_id))
+                            .order_by(desc(composition_states_table.c.version))
+                            .limit(1)
+                        ).one()
+                        latest_state = session_service._row_to_state_record(latest_row)
+                        options = _current_node_options(conn, approval_request)
+                        snapshot = _current_snapshot(conn, approval_request, options)
+                        resolved = any(
+                            item["kind"] == "llm_prompt_template" and item["status"] == "resolved"
+                            for item in parse_interpretation_requirements(options) or ()
+                        )
+                        if resolved:
+                            nodes = _refresh_resolved_prompt_template_review(
+                                latest_state, affected_node_id=binding.node_id, file_snapshot=snapshot
+                            )
+                            transaction.composition_states.append_state(
+                                SessionCompositionStateCreation(
+                                    id=uuid4(),
+                                    data=CompositionStateData(
+                                        sources=latest_state.sources,
+                                        nodes=nodes,
+                                        edges=latest_state.edges,
+                                        outputs=latest_state.outputs,
+                                        metadata_=latest_state.metadata_,
+                                        is_valid=False,
+                                        composer_meta=latest_state.composer_meta,
+                                    ),
+                                    provenance="interpretation_resolve",
+                                    created_at=now,
+                                    derived_from_state_id=latest_state.id,
+                                )
+                            )
 
             try:
                 await run_sync_in_worker(
