@@ -16,6 +16,8 @@ package version do not establish qualification, a published tag or an image.
 
 ### Upgrade notes
 
+- API clients that approve prompt review cards must now send
+  `reviewed_anchor`; see Web Composer below.
 - **Upgrading from 0.8.13 or earlier: apply the 0.8.14 upgrade notes first.**
   ELSPETH now requires and runs on Python 3.14 only, startup refuses
   `JSON_LOGS=true`, and a run checkpointed under 3.13 refuses to resume under
@@ -140,6 +142,36 @@ Schema and stored data:
   release.
 - The prompt review card shows exactly the reviewed snapshot; each
   interpretation slot shows whether its own review is pending or accepted.
+- Approving a prompt review card is now bound to the text the card showed.
+  Every LLM prompt review card stores a review snapshot (inline prompts
+  included), and `POST /api/sessions/{id}/interpretations/{event_id}/resolve`
+  requires `reviewed_anchor` for prompt cards: the snapshot's `anchor` from
+  `GET /api/sessions/{id}/interpretations/{event_id}/prompt`. A missing anchor
+  is refused with 422 `prompt_review_anchor_required`; an anchor that is not
+  the card's stored snapshot is refused with 409 `prompt_review_stale`, and
+  nothing is written. Other review kinds must omit it (422
+  `interpretation_review_anchor_unexpected`). A second tab or a stale view can
+  no longer approve text the user did not see. API clients that resolve prompt
+  cards must send the anchor.
+- A pending prompt review card whose displayed text changes (for example after
+  a vague-term answer, or an agent change to one query of a multi-query node
+  beside a file-backed prompt) is replaced by a fresh card, and an editor save
+  cannot approve a card that is still waiting on other text. Answering a
+  vague-term review on a node whose prompt uses a session file reopens that
+  prompt's review with the final text.
+- File-backed prompt reviews are always shown, including in a session that has
+  opted out of interpretation reviews, and a forked session's file-backed
+  prompts are reviewed again in the new session.
+- LLM call audit records for a file-backed prompt carry the approved prompt
+  hash, as they do for literal prompts. Governed approval of an earlier
+  revision checks that revision's prompt files.
+- A review whose file has since changed or become unreadable is refused with a
+  typed 409; a prompt file larger than the 256 KiB inline limit is refused with
+  a clear message when its review is raised. A recorded prompt field path is
+  limited only by PostgreSQL's index row size (about 2.6 KB).
+- A resume is refused if the run's prompt files were re-approved with different
+  content after it started. A prompt file whose stored bytes no longer match
+  their recorded hash raises the inline-blob integrity alert.
 
 ### Release pipeline
 
