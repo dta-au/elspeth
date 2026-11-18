@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 import { fetchCompositionState, readPromptFileText, savePromptFile } from "@/api/client";
 import { Button } from "@/components/ui";
+import { useBlobFilename } from "@/components/blobs/BlobFileName";
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
+import { optionLabel } from "./OptionRows";
 
 interface PromptFileEditorProps {
   nodeId: string;
@@ -44,7 +46,11 @@ export function PromptFileEditors({ nodeId, options }: { nodeId: string; options
 }
 
 export function PromptFileEditor({ nodeId, blobId, fieldPath, saveRefusal = null }: PromptFileEditorProps) {
+  const filename = useBlobFilename(blobId);
+  const queryName = fieldPath.startsWith("queries.") ? fieldPath.slice("queries.".length, -".template".length) : null;
+  const slotLabel = queryName === null ? optionLabel(fieldPath) : `User prompt, query ${queryName}`;
   const sessionId = useSessionStore((state) => state.activeSessionId);
+  const filenameLoading = useBlobStore((state) => state.activeSessionId !== sessionId || state.isLoading);
   const isComposing = useSessionStore((state) => state.isComposing);
   const [text, setText] = useState<string | null>(null);
   const [savedText, setSavedText] = useState<string | null>(null);
@@ -110,7 +116,7 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, saveRefusal = null
 
   return (
     <section className="graph-config-section">
-      <label htmlFor={`prompt-file-${blobId}-${fieldPath}`}>Edit bound prompt file ({fieldPath})</label>
+      <label htmlFor={`prompt-file-${blobId}-${fieldPath}`}>Edit prompt file {filename ?? (filenameLoading ? "Loading file name…" : "File not in this session")} ({slotLabel})</label>
       <textarea
         id={`prompt-file-${blobId}-${fieldPath}`}
         value={text ?? ""}

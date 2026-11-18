@@ -2885,6 +2885,7 @@ describe("sessionStore", () => {
     // own coalescing is pinned in subscriptions.test.ts.
     const resolveRequestMock = vi.fn();
     beforeEach(() => {
+      vi.clearAllMocks();
       resolveRequestMock.mockReset();
       registerResolveValidateRequester(resolveRequestMock);
     });
@@ -2944,6 +2945,22 @@ describe("sessionStore", () => {
         mintedVersion: true,
       });
       expect(validateMock).not.toHaveBeenCalled();
+    });
+
+    it.each(["source", "source:upload", "out", "step"])("keeps selected %s after a resolved composer refresh", (selectedNodeId) => {
+      const state = makeCompositionState(3, ["step"]);
+      state.sources = { source: { plugin: "csv", options: {} }, upload: { plugin: "csv", options: {} } };
+      state.outputs = [{ name: "out", plugin: "csv", options: {} }];
+      useSessionStore.setState({ activeSessionId: state.session_id, compositionState: makeCompositionState(2), selectedNodeId });
+      useSessionStore.getState().applyResolvedInterpretation(state);
+      expect(useSessionStore.getState().selectedNodeId).toBe(selectedNodeId);
+    });
+
+    it("deselects a removed component after a resolved composer refresh", () => {
+      const state = makeCompositionState(3);
+      useSessionStore.setState({ activeSessionId: state.session_id, compositionState: makeCompositionState(2), selectedNodeId: "source:removed" });
+      useSessionStore.getState().applyResolvedInterpretation(state);
+      expect(useSessionStore.getState().selectedNodeId).toBeNull();
     });
 
     it("queues validation of the unchanged version when the resolve returns no new state (null)", () => {

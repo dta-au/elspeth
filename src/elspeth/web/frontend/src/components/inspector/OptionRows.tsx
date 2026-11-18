@@ -22,6 +22,7 @@
 import { type JSX, useEffect } from "react";
 
 import { CodeBlock } from "@/components/chat/CodeBlock";
+import { BlobFileName } from "@/components/blobs/BlobFileName";
 import { titleCaseLabel } from "@/components/catalog/pluginDisplayName";
 import { useShowAdvanced } from "@/stores/preferencesStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
@@ -112,7 +113,7 @@ function OptionValue({ label, value }: { label: string; value: unknown }): JSX.E
     typeof value === "string" &&
     value.startsWith(BLOB_REF_PATH_PREFIX)
   ) {
-    return <span title={value}>{BLOB_REF_FRIENDLY_LABEL}</span>;
+    return <BlobFileName blobId={value.slice(BLOB_REF_PATH_PREFIX.length)} fallback={BLOB_REF_FRIENDLY_LABEL} />;
   }
   return <ConfigValue value={value} humaniseKeys={STRUCTURAL_OPTION_CONTAINER_LABELS.has(label)} />;
 }

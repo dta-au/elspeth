@@ -3,6 +3,9 @@ import { beforeEach, expect, it, vi } from "vitest";
 import { fetchCompositionState, readPromptFileText, savePromptFile } from "@/api/client";
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
+import type { BlobMetadata } from "@/types/api";
+import type { CompositionState } from "@/types/api";
+import { ConfigValue } from "./ConfigRows";
 import { PromptFileEditors } from "./PromptFileEditor";
 
 vi.mock("@/api/client", () => ({
@@ -15,14 +18,26 @@ beforeEach(() => {
   vi.restoreAllMocks();
   vi.clearAllMocks();
   useSessionStore.setState({ activeSessionId: "session-1", isComposing: false });
+  useBlobStore.getState().reset();
   vi.mocked(readPromptFileText).mockResolvedValue({ text: "first line\n  second line\n", sha256: "a".repeat(64) });
   vi.mocked(savePromptFile).mockResolvedValue({ changed: true, content_sha256: "b".repeat(64) });
   vi.mocked(fetchCompositionState).mockResolvedValue(null);
 });
 
+it("names the file and human prompt slot in editor labels", async () => {
+  useBlobStore.setState({ activeSessionId: "session-1", blobs: [{ id: "blob-1", filename: "prompt.md" } as BlobMetadata] });
+  render(<PromptFileEditors nodeId="first" options={{
+    system_prompt: { mode: "inline_content", blob_ref: "blob-1" },
+    queries: [{ template: { mode: "inline_content", blob_ref: "blob-1" } }],
+  }} />);
+  expect(await screen.findByRole("textbox", { name: "Edit prompt file prompt.md (System prompt)" })).toBeInTheDocument();
+  expect(screen.getByRole("textbox", { name: "Edit prompt file prompt.md (User prompt, query 0)" })).toBeInTheDocument();
+  expect(screen.queryByRole("textbox", { name: /prompt_template|queries\.0\.template/ })).not.toBeInTheDocument();
+});
+
 it("renders full file text and saves with the observed hash", async () => {
   render(<PromptFileEditors nodeId="first" options={{ prompt_template: { mode: "inline_content", blob_ref: "blob-1" } }} />);
-  const editor = await screen.findByRole("textbox", { name: /Edit bound prompt file/ });
+  const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
   await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
   fireEvent.change(editor, { target: { value: "new line\n  indented\n" } });
   fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
@@ -32,7 +47,7 @@ it("renders full file text and saves with the observed hash", async () => {
 it("shows a typed refusal and retains the user's draft", async () => {
   vi.mocked(savePromptFile).mockRejectedValue({ error_type: "prompt_file_stale", detail: "This file changed; reload it." });
   render(<PromptFileEditors nodeId="first" options={{ prompt_template: { mode: "inline_content", blob_ref: "blob-1" } }} />);
-  const editor = await screen.findByRole("textbox", { name: /Edit bound prompt file/ });
+  const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
   await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
   fireEvent.change(editor, { target: { value: "my draft" } });
   fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
@@ -43,7 +58,7 @@ it("shows a typed refusal and retains the user's draft", async () => {
 it("explains why a node with two prompt files needs agent review", async () => {
   vi.mocked(savePromptFile).mockRejectedValue({ error_type: "prompt_file_node_multi_binding" });
   render(<PromptFileEditors nodeId="first" options={{ prompt_template: { mode: "inline_content", blob_ref: "blob-1" } }} />);
-  const editor = await screen.findByRole("textbox", { name: /Edit bound prompt file/ });
+  const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
   await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
   fireEvent.change(editor, { target: { value: "my draft" } });
   fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
@@ -57,7 +72,7 @@ it.each([
 ])("shows %s guidance", async (errorType, message) => {
   vi.mocked(savePromptFile).mockRejectedValue({ error_type: errorType });
   render(<PromptFileEditors nodeId="first" options={{ prompt_template: { mode: "inline_content", blob_ref: "blob-1" } }} />);
-  const editor = await screen.findByRole("textbox", { name: /Edit bound prompt file/ });
+  const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
   await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
   fireEvent.change(editor, { target: { value: "my draft" } });
   fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
@@ -75,7 +90,7 @@ it("disables Save before any request on a node with two prompt files, and says w
       }}
     />,
   );
-  const editors = await screen.findAllByRole("textbox", { name: /Edit bound prompt file/ });
+  const editors = await screen.findAllByRole("textbox", { name: /Edit prompt file/ });
   expect(editors).toHaveLength(2);
   await waitFor(() => expect(editors[0]).toHaveValue("first line\n  second line\n"));
   fireEvent.change(editors[0], { target: { value: "my draft" } });
@@ -96,7 +111,7 @@ it("keeps Save enabled for a single file-backed slot beside an inline prompt", a
       options={{ prompt_template: { mode: "inline_content", blob_ref: "blob-1" }, system_prompt: "You are terse." }}
     />,
   );
-  const editor = await screen.findByRole("textbox", { name: /Edit bound prompt file/ });
+  const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
   await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
   fireEvent.change(editor, { target: { value: "my draft" } });
   expect(screen.getByRole("button", { name: "Save and approve" })).toBeEnabled();
@@ -105,18 +120,43 @@ it("keeps Save enabled for a single file-backed slot beside an inline prompt", a
 it("reloads the session file list after a successful save so its hash is current", async () => {
   const loadBlobs = vi.spyOn(useBlobStore.getState(), "loadBlobs").mockResolvedValue();
   render(<PromptFileEditors nodeId="first" options={{ prompt_template: { mode: "inline_content", blob_ref: "blob-1" } }} />);
-  const editor = await screen.findByRole("textbox", { name: /Edit bound prompt file/ });
+  const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
   await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
   fireEvent.change(editor, { target: { value: "new text" } });
   fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
   await waitFor(() => expect(loadBlobs).toHaveBeenCalledWith("session-1"));
 });
 
+it("does not show a hash mismatch after save repins the marker and reloads metadata", async () => {
+  const oldMarker = { mode: "inline_content", blob_ref: "blob-1", sha256: "a".repeat(64) };
+  const newMarker = { ...oldMarker, sha256: "b".repeat(64) };
+  const oldState = { nodes: [{ options: { prompt_template: oldMarker } }] } as unknown as CompositionState;
+  const newState = { nodes: [{ options: { prompt_template: newMarker } }] } as unknown as CompositionState;
+  useSessionStore.setState({ compositionState: oldState });
+  useBlobStore.setState({ activeSessionId: "session-1", blobs: [{ id: "blob-1", filename: "prompt.md", content_hash: oldMarker.sha256 } as BlobMetadata] });
+  vi.mocked(fetchCompositionState).mockResolvedValue(newState);
+  const loadBlobs = vi.spyOn(useBlobStore.getState(), "loadBlobs").mockImplementation(async () => {
+    useBlobStore.setState({ blobs: [{ id: "blob-1", filename: "prompt.md", content_hash: newMarker.sha256 } as BlobMetadata] });
+  });
+  function BoundPrompt() {
+    const marker = useSessionStore((state) => state.compositionState?.nodes[0]?.options.prompt_template);
+    return <ConfigValue value={marker} />;
+  }
+  render(<><PromptFileEditors nodeId="first" options={{ prompt_template: oldMarker }} /><BoundPrompt /></>);
+  const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
+  await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
+  fireEvent.change(editor, { target: { value: "new text" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
+  await waitFor(() => expect(loadBlobs).toHaveBeenCalledWith("session-1"));
+  await waitFor(() => expect(useSessionStore.getState().compositionState).toBe(newState));
+  expect(screen.queryByText(/changed since attached/)).not.toBeInTheDocument();
+});
+
 it("does not reload the file list when the save is refused", async () => {
   const loadBlobs = vi.spyOn(useBlobStore.getState(), "loadBlobs").mockResolvedValue();
   vi.mocked(savePromptFile).mockRejectedValue({ error_type: "prompt_file_stale", detail: "This file changed; reload it." });
   render(<PromptFileEditors nodeId="first" options={{ prompt_template: { mode: "inline_content", blob_ref: "blob-1" } }} />);
-  const editor = await screen.findByRole("textbox", { name: /Edit bound prompt file/ });
+  const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
   await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
   fireEvent.change(editor, { target: { value: "new text" } });
   fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));

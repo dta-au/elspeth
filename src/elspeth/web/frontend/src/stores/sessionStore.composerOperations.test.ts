@@ -15,6 +15,27 @@ const scope = { principalId: "principal", authProvider: "local" };
 const assistant: ChatMessage = { id: assistantId, session_id: sid, role: "assistant", content: "done", tool_calls: null, created_at: new Date().toISOString() };
 function composition(version = 1): CompositionState { return { ...compositionStateAuthorityFields, id: stateId, session_id: sid, version, sources: {}, nodes: [], edges: [], outputs: [], metadata: { name: null, description: null } }; }
 function snapshot(operationId: string, kind: "compose_message" | "compose_recompose" = "compose_message"): ComposerOperationSnapshot { return { operation_id: operationId, kind, status: "completed", cancel_requested: false, poll_after_ms: 1000, deadline_at: new Date().toISOString(), deadline_remaining_ms: 0, result: { message: assistant, state: composition(), proposals: [] }, error: null }; }
+
+describe("selected component during composer refresh", () => {
+  it.each(["source", "source:upload", "out"])("keeps selected %s after an authoritative turn", async (selectedNodeId) => {
+    const next = composition(2);
+    next.sources = { source: { plugin: "csv", options: {} }, upload: { plugin: "csv", options: {} } };
+    next.outputs = [{ name: "out", plugin: "csv", options: {} }];
+    useSessionStore.setState({ compositionState: next, selectedNodeId });
+    vi.mocked(api.fetchComposerOperation).mockImplementation(async (_session, operationId) => ({
+      ...snapshot(operationId), result: { message: assistant, state: next, proposals: [] },
+    }));
+    vi.mocked(api.fetchCompositionState).mockResolvedValue(next);
+    await useSessionStore.getState().sendMessage("Keep inspecting");
+    expect(useSessionStore.getState().selectedNodeId).toBe(selectedNodeId);
+  });
+
+  it("deselects a component removed by an authoritative turn", async () => {
+    useSessionStore.setState({ selectedNodeId: "source:removed" });
+    await useSessionStore.getState().sendMessage("Remove the source");
+    expect(useSessionStore.getState().selectedNodeId).toBeNull();
+  });
+});
 beforeEach(() => {
   vi.resetAllMocks(); useSessionStore.getState().reset(); purgeComposerCustody(); sessionStorage.clear(); authenticateComposerCustody(scope);
   useSessionStore.setState({ activeSessionId: sid, compositionStateLoaded: true, compositionState: composition() });
