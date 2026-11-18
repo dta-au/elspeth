@@ -56,7 +56,7 @@ from elspeth.web.sessions.interpretation_validation import (
     SessionInterpretationValidationInputs,
     validate_composition_state_with_interpretation_inputs,
 )
-from elspeth.web.sessions.prompt_file_review import PromptReviewSnapshot, prompt_file_binding_paths
+from elspeth.web.sessions.prompt_file_review import PromptReviewSnapshot, node_binds_prompt_file, prompt_file_binding_paths
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateRecord,
@@ -2037,6 +2037,12 @@ class _SessionPendingInterpretationPlanner:
                 superseded_event_ids=stale,
             )
 
+        # A file-backed prompt card ignores the session's review opt-out: it
+        # stays pending until a person approves the file's bytes. Other kinds,
+        # including a vague term on the same node, follow the opt-out.
+        review_disabled = snapshot.review_disabled and not (
+            kind is InterpretationKind.LLM_PROMPT_TEMPLATE and node_binds_prompt_file(live_state, affected_node_id)
+        )
         matching_event_id: UUID | None = None
         rows_to_supersede: list[UUID] = []
         for site in snapshot.pending_sites:
@@ -2071,7 +2077,7 @@ class _SessionPendingInterpretationPlanner:
                     )
             if (
                 policy is PendingInterpretationPolicy.RECONCILE
-                and not snapshot.review_disabled
+                and not review_disabled
                 and matching_event_id is None
                 and pending_identity == current_identity
                 # Same requirement anchor, but the card's stored file snapshot
@@ -2091,7 +2097,7 @@ class _SessionPendingInterpretationPlanner:
                 superseded_event_ids=tuple(rows_to_supersede),
             )
 
-        if not snapshot.review_disabled:
+        if not review_disabled:
             return SessionPendingInterpretationDecision(
                 result_event_id=event_id,
                 superseded_event_ids=tuple(rows_to_supersede),

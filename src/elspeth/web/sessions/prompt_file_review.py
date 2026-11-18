@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from elspeth.contracts.blobs import ALLOWED_MIME_TYPES, BlobRecord
@@ -18,6 +18,10 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.interpretation_state import approved_prompt_artifact_hash_from_options
+
+if TYPE_CHECKING:
+    # protocol imports this module at runtime; the annotation alone needs it.
+    from elspeth.web.sessions.protocol import CompositionStateRecord
 
 PROMPT_REVIEW_DOMAIN = "elspeth.file-prompt-review.v1"
 PROMPT_FILE_CHANGED_MESSAGE = "This prompt file changed since it was reviewed; review it again."
@@ -200,6 +204,17 @@ def prompt_file_binding_paths(options: Mapping[str, Any]) -> tuple[str, ...]:
         if marker is not None and marker.mode == "inline_content":
             paths.append(path)
     return tuple(sorted(paths))
+
+
+def node_binds_prompt_file(state: CompositionStateRecord, node_id: str) -> bool:
+    """Whether the node ``node_id`` in ``state`` reads any prompt slot from a file.
+
+    A file-backed prompt review is never auto-resolved by a session's review
+    opt-out: the opt-out lets ELSPETH stand in for inline text the planner
+    showed, but no one has read the file's bytes until a card is approved.
+    """
+    node = next((item for item in state.nodes or () if item["id"] == node_id), None)
+    return node is not None and bool(prompt_file_binding_paths(node["options"]))
 
 
 def resolve_prompt_review_snapshot(

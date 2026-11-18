@@ -1317,8 +1317,16 @@ class _RepositoryInterpretationMutations:
         if decision.choice is None or decision.interpretation_source is None:
             raise SessionDerivedCustodyError
         appended_state = decision.appended_state
+        from elspeth.web.sessions.prompt_file_review import node_binds_prompt_file
+
+        # Re-derived here, not trusted from the planner: a file-backed prompt
+        # card ignores the opt-out and must stay pending for a person, while
+        # a vague term on that node still follows the opt-out.
+        node_reads_file = node_binds_prompt_file(snapshot.live_state, command.affected_node_id)
+        file_card = command.kind is InterpretationKind.LLM_PROMPT_TEMPLATE and node_reads_file
+        opt_out_applies = snapshot.review_disabled and not file_card
         if decision.choice is InterpretationChoice.PENDING:
-            if snapshot.review_disabled or decision.interpretation_source is not InterpretationSource.USER_APPROVED:
+            if opt_out_applies or decision.interpretation_source is not InterpretationSource.USER_APPROVED:
                 raise SessionDerivedCustodyError
             if (
                 decision.accepted_value is not None
@@ -1332,7 +1340,7 @@ class _RepositoryInterpretationMutations:
                 raise SessionDerivedCustodyError
         elif decision.choice is InterpretationChoice.OPTED_OUT:
             if (
-                not snapshot.review_disabled
+                not opt_out_applies
                 or decision.interpretation_source is not InterpretationSource.AUTO_INTERPRETED_OPT_OUT
                 or decision.accepted_value != command.llm_draft
                 or decision.resolved_at != command.created_at
@@ -1342,7 +1350,12 @@ class _RepositoryInterpretationMutations:
                 or appended_state is None
             ):
                 raise SessionDerivedCustodyError
-            if command.kind in {InterpretationKind.LLM_PROMPT_TEMPLATE, InterpretationKind.VAGUE_TERM}:
+            if command.kind is InterpretationKind.VAGUE_TERM and node_reads_file:
+                # No inline artifact hash covers a file-read prompt; the file
+                # card's approval is what admits those bytes to a run.
+                if decision.approved_prompt_artifact_hash is not None:
+                    raise SessionDerivedCustodyError
+            elif command.kind in {InterpretationKind.LLM_PROMPT_TEMPLATE, InterpretationKind.VAGUE_TERM}:
                 if not is_lower_sha256_hex(decision.approved_prompt_artifact_hash):
                     raise SessionDerivedCustodyError
             elif decision.approved_prompt_artifact_hash is not None:
