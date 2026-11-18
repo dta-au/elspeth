@@ -1980,12 +1980,14 @@ def _apply_guarded_node_option_patch(
         # Reconciliation invalidates inherited approval and renders structured
         # prompts. Verify the stored evidence first so an unrelated patch cannot
         # heal a corrupt digest, then validate the exact reconciled candidate.
-        if (
-            current.plugin == "llm"
-            and "approved_prompt_artifact_hash" in current.options
-            and current.options["approved_prompt_artifact_hash"] != approved_prompt_artifact_hash_from_options(current.options)
-        ):
-            raise ValueError("Stored approved_prompt_artifact_hash does not match the current prompt artifact")
+        # A file-backed prompt has no options-derivable digest (None): its
+        # stored hash is the reviewed file's effective artifact, which run
+        # admission re-derives from the file bytes and the approval row, and
+        # which execution materialization never trusts from options.
+        if current.plugin == "llm" and "approved_prompt_artifact_hash" in current.options:
+            recomputed_artifact_hash = approved_prompt_artifact_hash_from_options(current.options)
+            if recomputed_artifact_hash is not None and current.options["approved_prompt_artifact_hash"] != recomputed_artifact_hash:
+                raise ValueError("Stored approved_prompt_artifact_hash does not match the current prompt artifact")
         new_state = reconcile_authoritative_reviews(state, proposed_state)
     except (KeyError, TypeError, ValueError) as exc:
         return _saved_graph_rejection_result(
