@@ -1481,3 +1481,81 @@ def test_vague_resolve_keeps_an_inline_only_prompt_review_resolved(tmp_path: Pat
 
     assert _prompt_requirement_status(service, session_id) == "resolved"
     assert _admit(service, blob_service, session_id) == ()
+
+
+# --- The editor-save supersede retires only a pending card ---
+
+
+def test_editor_save_supersedes_only_pending_card_never_a_resolved_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """One node holds an accepted card and a later pending card; an approving save supersedes only the pending one.
+
+    The supersede UPDATE runs inside ``record_prompt_file_approval``, in the
+    same transaction as the approval INSERT and the byte write: a failure
+    raised after that function returns leaves neither the UPDATE nor the
+    INSERT behind.
+    """
+    client, service, blob_service, session_id, _first, _second, events = _live_prompt_setup(tmp_path)
+    accepted_card = events["first"]
+    _approve_card(service, blob_service, session_id, accepted_card)
+
+    # The agent re-points the prompt to a new file, which stages a fresh pending card.
+    new_blob = _upload_blob(client, session_id, b"agent replacement prompt", "replacement.txt", "text/plain")
+    record = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert record is not None
+    from tests.unit.web.composer.test_blob_inline_tools import _catalog, execute_tool
+
+    with fenced_operation_context(blob_service._engine, session_id) as operation:
+        wired = execute_tool(
+            "wire_blob_inline_ref",
+            {"field_path": "node:first.options.prompt_template", "blob_id": new_blob["id"]},
+            state_from_record(record),
+            _catalog(),
+            data_dir=str(tmp_path),
+            session_engine=blob_service._engine,
+            session_id=session_id,
+            session_operation_context=operation,
+            session_operation_authority=service.session_operation_authority,
+        )
+        assert wired.success, wired.to_dict()
+    _save_editor_state(service, blob_service, session_id, wired.updated_state.to_dict())
+    pending_card = _raise_prompt_card(service, blob_service, session_id, tool_call_id="agent-repoint")
+
+    def event_row(event_id: UUID) -> Any:
+        with blob_service._engine.connect() as conn:
+            return conn.execute(select(interpretation_events_table).where(interpretation_events_table.c.id == str(event_id))).one()
+
+    def approval_rows() -> list[Any]:
+        with blob_service._engine.connect() as conn:
+            return list(conn.execute(select(prompt_file_approvals_table).order_by(prompt_file_approvals_table.c.id)).all())
+
+    accepted_before = event_row(accepted_card)
+    pending_before = event_row(pending_card)
+    approvals_before = approval_rows()
+    assert accepted_before.choice == "accepted_as_drafted"
+    assert pending_before.choice == "pending" and pending_before.resolved_at is None
+
+    # Fault after the real writer (approval INSERT + supersede UPDATE) returns:
+    # the whole save transaction rolls back, so neither write survives.
+    real_record = prompt_text_routes.record_prompt_file_approval
+
+    def record_then_fail(conn: Any, request: Any, *, now: datetime) -> Any:
+        real_record(conn, request, now=now)
+        raise RuntimeError("fault after supersede")
+
+    monkeypatch.setattr(prompt_text_routes, "record_prompt_file_approval", record_then_fail)
+    with pytest.raises(RuntimeError, match="fault after supersede"):
+        _save(client, session_id, new_blob["id"], "owner edited replacement", new_blob["content_hash"])
+    assert event_row(accepted_card) == accepted_before
+    assert event_row(pending_card) == pending_before
+    assert approval_rows() == approvals_before
+    assert client.get(f"/api/sessions/{session_id}/blobs/{new_blob['id']}/content").content == b"agent replacement prompt"
+    monkeypatch.setattr(prompt_text_routes, "record_prompt_file_approval", real_record)
+
+    saved = _save(client, session_id, new_blob["id"], "owner edited replacement", new_blob["content_hash"])
+    assert saved.status_code == 200, saved.text
+
+    pending_after = event_row(pending_card)
+    assert pending_after.choice == "superseded"
+    assert pending_after.resolved_at is not None
+    assert event_row(accepted_card) == accepted_before
+    assert len(approval_rows()) == len(approvals_before) + 1
