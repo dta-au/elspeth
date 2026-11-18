@@ -14,6 +14,8 @@ interface PromptFileEditorProps {
   fieldPath: string;
   /** Why the server will refuse every save for this binding; Save stays disabled while set. */
   saveRefusal?: string | null;
+  /** The query's reader-facing name for a `queries.<selector>.template` slot. */
+  queryName?: string;
 }
 
 const MULTI_BINDING_REFUSAL = "This node uses more than one prompt file. Re-point it through the agent and approve the review card.";
@@ -25,9 +27,9 @@ function blobId(value: unknown): string | null {
 }
 
 export function PromptFileEditors({ nodeId, options }: { nodeId: string; options: Record<string, unknown> }) {
-  const bindings = promptFileSlots(options).flatMap(({ fieldPath, value }) => {
+  const bindings = promptFileSlots(options).flatMap(({ fieldPath, value, queryName }) => {
     const id = blobId(value);
-    return id ? [{ fieldPath, blobId: id }] : [];
+    return id ? [{ fieldPath, blobId: id, queryName }] : [];
   });
   // Mirrors the server rule (prompt_file_binding_paths > 1 refuses every save
   // with prompt_file_node_multi_binding), so the user is told before saving.
@@ -35,10 +37,11 @@ export function PromptFileEditors({ nodeId, options }: { nodeId: string; options
   return <>{bindings.map((binding) => <PromptFileEditor key={`${nodeId}:${binding.fieldPath}:${binding.blobId}`} nodeId={nodeId} saveRefusal={saveRefusal} {...binding} />)}</>;
 }
 
-export function PromptFileEditor({ nodeId, blobId, fieldPath, saveRefusal = null }: PromptFileEditorProps) {
+export function PromptFileEditor({ nodeId, blobId, fieldPath, saveRefusal = null, queryName }: PromptFileEditorProps) {
   const filename = useBlobFilename(blobId);
-  const queryName = fieldPath.startsWith("queries.") ? fieldPath.slice("queries.".length, -".template".length) : null;
-  const slotLabel = queryName === null ? optionLabel(fieldPath) : `User prompt, query ${queryName}`;
+  // The same query label the inspector row shows (promptQueryEntries `name`),
+  // never the list index the slot path uses.
+  const slotLabel = queryName === undefined ? optionLabel(fieldPath) : `User prompt, query ${queryName}`;
   const sessionId = useSessionStore((state) => state.activeSessionId);
   const filenameLoading = useBlobStore((state) => state.activeSessionId !== sessionId || state.isLoading);
   const blobSessionId = useBlobStore((state) => state.activeSessionId);

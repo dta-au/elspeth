@@ -51,6 +51,18 @@ function seedFile(overrides: Partial<BlobMetadata> = {}) {
 }
 
 describe("file-backed option values", () => {
+  it("keys a list-form query's Edit by its index, matching the editor and the server", () => {
+    seedFile();
+    const marker = { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH };
+    const options = { system_prompt: "You are a classifier.", queries: [{ name: "classify", template: marker }] };
+    useSessionStore.setState({ compositionState: { sources: {}, outputs: [], nodes: [{ id: "llm", plugin: "llm", options }] } as unknown as CompositionState });
+    render(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
+    const edit = screen.getByRole("button", { name: "Edit prompt.md (User prompt, query classify)" });
+    expect(edit).toHaveAttribute("aria-disabled", "false");
+    act(() => edit.click());
+    expect(useBlobStore.getState().editRequest).toMatchObject({ nodeId: "llm", fieldPath: "queries.0.template" });
+  });
+
   it("adds file and slot named navigation actions only in the inspector", () => {
     seedFile({ filename: "summarise.txt" });
     const marker = { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH };

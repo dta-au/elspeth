@@ -9,6 +9,7 @@ import type { InterpretationEvent } from "@/types/interpretation";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { ConfigValue } from "./ConfigRows";
 import { PromptFileEditors } from "./PromptFileEditor";
+import { OptionRows } from "./OptionRows";
 
 vi.mock("@/api/client", () => ({
   fetchCompositionState: vi.fn(),
@@ -77,7 +78,7 @@ it("names the file and human prompt slot in editor labels", async () => {
   act(() => useBlobStore.getState().requestPromptEdit("first", "system_prompt"));
   act(() => useBlobStore.getState().requestPromptEdit("first", "queries.0.template"));
   expect(await screen.findByRole("textbox", { name: "Edit prompt file prompt.md (System prompt)" })).toBeInTheDocument();
-  expect(screen.getByRole("textbox", { name: "Edit prompt file prompt.md (User prompt, query 0)" })).toBeInTheDocument();
+  expect(screen.getByRole("textbox", { name: "Edit prompt file prompt.md (User prompt, query #0)" })).toBeInTheDocument();
   expect(screen.queryByRole("textbox", { name: /prompt_template|queries\.0\.template/ })).not.toBeInTheDocument();
 });
 
@@ -209,4 +210,41 @@ it("does not reload the file list when the save is refused", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
   await screen.findByRole("alert");
   expect(loadBlobs).not.toHaveBeenCalled();
+});
+
+it("opens a list-form query's editor from the inspector Edit control, labelled by the query name", async () => {
+  const marker = { mode: "inline_content", blob_ref: "blob-1", sha256: "a".repeat(64) };
+  const options = { system_prompt: "You are a classifier.", queries: [{ name: "classify", template: marker }] };
+  useBlobStore.setState({ editRequest: null, activeSessionId: "session-1", isLoading: false,
+    blobs: [{ id: "blob-1", filename: "prompt.md", status: "ready", mime_type: "text/plain", content_hash: null } as BlobMetadata] });
+  useSessionStore.setState({ compositionState: { nodes: [{ id: "first", plugin: "llm", options }], sources: {}, outputs: [] } as unknown as CompositionState });
+  render(<>
+    <OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "first" }} />
+    <PromptFileEditors nodeId="first" options={options} />
+  </>);
+  const edit = screen.getByRole("button", { name: "Edit prompt.md (User prompt, query classify)" });
+  expect(edit).toHaveAttribute("aria-disabled", "false");
+  fireEvent.click(edit);
+  expect(await screen.findByRole("textbox", { name: "Edit prompt file prompt.md (User prompt, query classify)" })).toHaveFocus();
+});
+
+it.each([
+  ["ordered list form", { query_input_mode: "ordered", queries: [{ name: "classify", template: { mode: "inline_content", blob_ref: "blob-1", sha256: "a".repeat(64) } }] }, "queries.0.template"],
+  ["mapping form (control)", { queries: { classify: { template: { mode: "inline_content", blob_ref: "blob-1", sha256: "a".repeat(64) } } } }, "queries.classify.template"],
+])("saves a %s query file from the inspector Edit with the server's slot path", async (_form, queryOptions, expectedPath) => {
+  const options = { system_prompt: "You are a classifier.", ...queryOptions };
+  useBlobStore.setState({ editRequest: null, activeSessionId: "session-1", isLoading: false,
+    blobs: [{ id: "blob-1", filename: "prompt.md", status: "ready", mime_type: "text/plain", content_hash: null } as BlobMetadata] });
+  useSessionStore.setState({ compositionState: { nodes: [{ id: "first", plugin: "llm", options }], sources: {}, outputs: [] } as unknown as CompositionState });
+  vi.spyOn(useBlobStore.getState(), "loadBlobs").mockResolvedValue();
+  render(<>
+    <OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "first" }} />
+    <PromptFileEditors nodeId="first" options={options} />
+  </>);
+  fireEvent.click(screen.getByRole("button", { name: "Edit prompt.md (User prompt, query classify)" }));
+  const editor = await screen.findByRole("textbox", { name: /Edit prompt file prompt\.md/ });
+  await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
+  fireEvent.change(editor, { target: { value: "edited" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
+  await waitFor(() => expect(savePromptFile).toHaveBeenCalledWith("session-1", "blob-1", "edited", "a".repeat(64), "first", expectedPath));
 });

@@ -25,7 +25,7 @@ import { CodeBlock } from "@/components/chat/CodeBlock";
 import { BlobFileName } from "@/components/blobs/BlobFileName";
 import { useBlobFilename } from "@/components/blobs/BlobFileName";
 import { Button } from "@/components/ui";
-import { promptFileEditability } from "@/lib/blobBindings";
+import { promptFileEditability, promptQueryEntries, promptQueryTemplatePath } from "@/lib/blobBindings";
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
@@ -155,25 +155,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-// A multi-query step has ONE system prompt and one user prompt PER QUERY. Both
-// authoring forms the plugin accepts (a mapping keyed by query name, or a list
-// of named entries) resolve to [name, entry] pairs; a malformed entry is
-// skipped here and reported by validation, not by this box. Mirrors the
-// backend's `_well_formed_query_entries`, positional label included.
-function queryEntries(queries: unknown): Array<[string, Record<string, unknown>]> {
-  if (Array.isArray(queries)) {
-    return queries.flatMap((entry, index): Array<[string, Record<string, unknown>]> =>
-      isRecord(entry) ? [[typeof entry.name === "string" && entry.name !== "" ? entry.name : `#${index}`, entry]] : [],
-    );
-  }
-  if (isRecord(queries)) {
-    return Object.entries(queries).flatMap(([name, entry]): Array<[string, Record<string, unknown>]> =>
-      isRecord(entry) ? [[name, entry]] : [],
-    );
-  }
-  return [];
-}
-
 function PromptRoleValue({ label, value, notSet }: { label: string; value: unknown; notSet: string }): JSX.Element {
   if (isUnsuppliedPrompt(value)) return <span className="option-rows-prompt-missing">{notSet}</span>;
   return <OptionValue label={label} value={value} />;
@@ -224,7 +205,13 @@ function BoundPromptActions({ blobId, nodeId, fieldPath, label, sessionId, state
 function LlmPromptRoles({ options, slotActions }: { options: Record<string, unknown>; slotActions?: { nodeId: string } }): JSX.Element {
   const systemLabel = optionLabel("system_prompt");
   const userLabel = optionLabel("prompt_template");
-  const queries = queryEntries(options.queries);
+  // A multi-query step has ONE system prompt and one user prompt PER QUERY.
+  // Both authoring forms (a mapping keyed by query name, or a list of named
+  // entries) come from promptQueryEntries, the same authority the editor and
+  // the binding check use: `selector` builds the slot path (the list INDEX for
+  // list form, as the server keys it), `name` is only ever a label. A
+  // malformed entry is skipped here and reported by validation.
+  const queries = promptQueryEntries(options.queries);
   return (
     <dl className="graph-config-rows option-rows-prompt-roles">
       <div>
@@ -243,8 +230,8 @@ function LlmPromptRoles({ options, slotActions }: { options: Record<string, unkn
         // node-level fallback — the same resolution the runtime applies. The
         // query name is the reader's own identifier, so it is shown verbatim
         // in the value cell, never humanised into the label.
-        queries.map(([name, entry]) => (
-          <div key={name}>
+        queries.map(({ selector, name, entry }) => (
+          <div key={selector}>
             <dt>{userLabel}</dt>
             <dd>
               <span className="option-rows-query-name">{name}</span>
@@ -254,7 +241,7 @@ function LlmPromptRoles({ options, slotActions }: { options: Record<string, unkn
                 notSet={USER_PROMPT_NOT_SET}
               />
               {slotActions && <PromptSlotActions value={isUnsuppliedPrompt(entry.template) ? options.prompt_template : entry.template}
-                nodeId={slotActions.nodeId} fieldPath={isUnsuppliedPrompt(entry.template) ? "prompt_template" : `queries.${name}.template`}
+                nodeId={slotActions.nodeId} fieldPath={isUnsuppliedPrompt(entry.template) ? "prompt_template" : promptQueryTemplatePath(selector)}
                 label={`${userLabel}, query ${name}`} />}
             </dd>
           </div>

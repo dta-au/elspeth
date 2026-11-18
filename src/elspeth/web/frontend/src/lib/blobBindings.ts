@@ -47,18 +47,45 @@ export function componentOptionsById(state: CompositionState | null, id: string 
 
 export interface PromptFileBinding { nodeId: string; fieldPath: string; blobId: string; encoding: unknown }
 
+export interface PromptQueryEntry {
+  /** Path segment the server uses: the list index for list form, the key for mapping form. */
+  selector: string;
+  /** Reader-facing name: the entry's `name` (list form, `#<index>` if unnamed) or the mapping key. */
+  name: string;
+  entry: Record<string, unknown>;
+}
+
+/**
+ * The one authority for a multi-query step's entries. `selector` matches the
+ * server's `queries.<selector>.template` binding path
+ * (sessions/prompt_file_review.py `_surface_slots`); `name` is for labels only.
+ */
+export function promptQueryEntries(queries: unknown): PromptQueryEntry[] {
+  const isEntry = (value: unknown): value is Record<string, unknown> =>
+    typeof value === "object" && value !== null && !Array.isArray(value);
+  if (Array.isArray(queries)) {
+    return queries.flatMap((entry, index) => isEntry(entry)
+      ? [{ selector: String(index), name: typeof entry.name === "string" && entry.name !== "" ? entry.name : `#${index}`, entry }]
+      : []);
+  }
+  if (isEntry(queries)) {
+    return Object.entries(queries).flatMap(([key, entry]) => isEntry(entry) ? [{ selector: key, name: key, entry }] : []);
+  }
+  return [];
+}
+
+export function promptQueryTemplatePath(selector: string): string {
+  return `queries.${selector}.template`;
+}
+
 /** Prompt slots understood by the file editor and the server's prompt binding check. */
-export function promptFileSlots(options: Record<string, unknown>): Array<{ fieldPath: string; value: unknown }> {
-  const slots = ["prompt_template", "system_prompt"]
+export function promptFileSlots(options: Record<string, unknown>): Array<{ fieldPath: string; value: unknown; queryName?: string }> {
+  const slots: Array<{ fieldPath: string; value: unknown; queryName?: string }> = ["prompt_template", "system_prompt"]
     .filter((key) => Object.prototype.hasOwnProperty.call(options, key))
     .map((fieldPath) => ({ fieldPath, value: options[fieldPath] }));
-  const queries = options.queries;
-  const entries = Array.isArray(queries)
-    ? queries.map((query, index) => [String(index), query] as const)
-    : typeof queries === "object" && queries !== null ? Object.entries(queries) : [];
-  for (const [name, query] of entries) {
-    if (typeof query === "object" && query !== null && !Array.isArray(query) && Object.prototype.hasOwnProperty.call(query, "template")) {
-      slots.push({ fieldPath: `queries.${name}.template`, value: (query as Record<string, unknown>).template });
+  for (const { selector, name, entry } of promptQueryEntries(options.queries)) {
+    if (Object.prototype.hasOwnProperty.call(entry, "template")) {
+      slots.push({ fieldPath: promptQueryTemplatePath(selector), value: entry.template, queryName: name });
     }
   }
   return slots;
