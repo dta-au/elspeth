@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import httpx
@@ -246,7 +246,7 @@ def _compile_frozen(harness: _Harness, approved: _ApprovedSession, state_id: UUI
         patch.object(service, "_yaml_generator", composer_yaml_generator),
         patch.object(service, "_call_async", asyncio.run),
         patch.object(ExecutionServiceImpl, "_approval_inputs_from_frozen", inputs_spy),
-        patch.object(service, "_authoritative_state_preflight", AsyncMock(return_value=preflight)),
+        patch.object(service, "_authoritative_state_preflight", autospec=True, return_value=preflight),
         patch("elspeth.web.execution.service.load_settings_from_config_dict", side_effect=load),
         patch("elspeth.web.operator_telemetry.apply_operator_pipeline_telemetry", side_effect=lambda settings, _web: settings),
         patch(
