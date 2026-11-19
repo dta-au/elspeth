@@ -6,7 +6,9 @@ import asyncio
 import contextlib
 import json
 import os
+import shutil
 import sqlite3
+import tempfile
 import threading
 import uuid
 from collections.abc import Callable, Iterator, Mapping
@@ -826,7 +828,7 @@ def _drive_single_example_trace(
 ) -> _TraceOutcome:
     if failure_injection_point != "none":
         cancellation_arrival_time = "after_response_yielded"
-    tmp_path = Path(os.environ.get("PYTEST_TMPDIR", "/tmp")) / f"cl_pp_prop_{uuid.uuid4().hex}"
+    tmp_path = Path(os.environ.get("PYTEST_TMPDIR") or tempfile.gettempdir()) / f"cl_pp_prop_{uuid.uuid4().hex}"
     tmp_path.mkdir(parents=True, exist_ok=True)
     harness = _make_harness(tmp_path, session_state=session_state)
     body: BaseException | None = None
@@ -848,6 +850,10 @@ def _drive_single_example_trace(
             if body is not None and cleanup is not body:
                 raise BaseExceptionGroup("Property trace body and owned cleanup outcomes", [body, cleanup]) from None
             raise
+        finally:
+            # One directory per generated example: without this each run of the
+            # file leaves its examples' directories behind in the temp root.
+            shutil.rmtree(tmp_path, ignore_errors=True)
 
 
 def _drive_single_example_trace_with(
