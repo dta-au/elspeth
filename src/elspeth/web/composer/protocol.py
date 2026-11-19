@@ -38,7 +38,12 @@ if TYPE_CHECKING:
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
-from elspeth.contracts.composer_progress import CONTEXT_BUDGET_REFUSAL_DETAIL, ComposerProgressReason, ComposerProgressSink
+from elspeth.contracts.composer_progress import (
+    CONTEXT_BUDGET_PROVIDER_REFUSAL_DETAIL,
+    CONTEXT_BUDGET_REFUSAL_DETAIL,
+    ComposerProgressReason,
+    ComposerProgressSink,
+)
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata, FrameworkBugError
 from elspeth.web.composer.advisor_audit import AdvisorGraphReviewIdentity, AdvisorTerminalPublication
 from elspeth.web.composer.advisor_decision import AdvisorGateDecision
@@ -610,7 +615,9 @@ class ComposerConvergenceError(ComposerServiceError):
         # only what every timeout has in common. A context budget refusal is
         # neither: it is refused before the provider call and says so.
         if reason == "context_budget_exceeded":
-            super().__init__(CONTEXT_BUDGET_REFUSAL_DETAIL)
+            # The gateway's own rejection is reported as the gateway's, not as ELSPETH's budget.
+            provider_ceiling = evidence is not None and "ceiling" in evidence and evidence["ceiling"] == "provider"
+            super().__init__(CONTEXT_BUDGET_PROVIDER_REFUSAL_DETAIL if provider_ceiling else CONTEXT_BUDGET_REFUSAL_DETAIL)
         else:
             cause = (
                 "The request ran out of time before the turn could be completed."

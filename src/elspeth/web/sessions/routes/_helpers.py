@@ -796,6 +796,23 @@ def _litellm_error_detail(
     return detail
 
 
+# DRAFT wording. Shown in place of the general provider-failure guidance.
+_SENT_OVER_ESTIMATE_REJECTION_GUIDANCE: Final = (
+    "The model gateway rejected this request. The message was above ELSPETH's size estimate for the model, so its size is a likely cause."
+)
+
+
+def _sent_over_estimate_guidance(exc: _BadRequestLLMError) -> str | None:
+    """What to tell the user when a compose request sent above ELSPETH's size estimate was rejected for an unrecognised reason.
+
+    A server-held fact, shown whatever the operator flag: the provider's own
+    reason stays behind ``composer_expose_provider_errors``, but that the
+    request was over the estimate, so that its size is a likely cause, does not.
+    ``None`` when the request was within the estimate: no size claim is made.
+    """
+    return _SENT_OVER_ESTIMATE_REJECTION_GUIDANCE if exc.sent_over_estimate else None
+
+
 async def _handle_composer_provider_failure(
     exc: Exception,
     *,
@@ -4118,6 +4135,7 @@ __all__ = [
     "_runtime_preflight_failure_errors",
     "_runtime_preflight_for_state",
     "_safe_frame_strings",
+    "_sent_over_estimate_guidance",
     "_session_response",
     "_state_data_from_composer_state",
     "_state_from_record",

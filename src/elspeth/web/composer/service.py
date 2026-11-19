@@ -170,7 +170,7 @@ from elspeth.web.composer.provider_config import (
     infer_provider_from_model_name,
     infer_provider_from_unprefixed_model_name,
 )
-from elspeth.web.composer.provider_errors import classify_provider_failure
+from elspeth.web.composer.provider_errors import classify_provider_failure, is_context_length_rejection
 from elspeth.web.composer.provider_gateway import (
     ProviderGateway,
     _BadRequestLLMError,
@@ -1880,6 +1880,38 @@ class ComposerServiceImpl:
             failed_turn=scope.failed_turn,
         )
 
+    def _provider_capacity_refusal(
+        self,
+        budget_record: ComposerContextBudgetRecord,
+        component_bytes: Mapping[str, int],
+        scope: _ContextBudgetRefusalScope,
+    ) -> ComposerConvergenceError:
+        """Build the refusal for a sent request the provider rejected as over the model's context limit.
+
+        The same refusal shape as the pre-dispatch one, with ``provider`` as
+        the ceiling: the request was under ELSPETH's own maximum and was sent;
+        the limit that refused it is the gateway's or the model's. The sizes
+        are those of the request that was sent, from its own budget record.
+        """
+        return ComposerConvergenceError.capture(
+            max_turns=scope.composition_turns_used + scope.discovery_turns_used,
+            budget_exhausted="composition",
+            state=scope.state,
+            initial_version=scope.initial_version,
+            tool_invocations=scope.recorder.invocations,
+            llm_calls=scope.recorder.llm_calls,
+            reason="context_budget_exceeded",
+            evidence={
+                "ceiling": "provider",
+                "estimated_tokens": budget_record.estimated_tokens_after,
+                "request_bytes": budget_record.request_wire_bytes,
+                "max_prompt_tokens": self._context_budget_policy.max_prompt_tokens,
+                "max_request_bytes": self._context_budget_policy.max_request_bytes,
+                "largest_component": largest_component(component_bytes),
+            },
+            failed_turn=scope.failed_turn,
+        )
+
     async def _call_model_turn(
         self,
         *,
@@ -1928,19 +1960,46 @@ class ComposerServiceImpl:
             failed_turn=failed_turn,
             progress=progress,
         )
-        completion = await self._call_llm_before_deadline(
-            selected_messages,
-            selected_tools,
-            state,
-            initial_version,
-            deadline,
-            recorder=recorder,
-            composition_turns_used=composition_turns_used,
-            discovery_turns_used=discovery_turns_used,
-            failed_turn=failed_turn,
-            provider_owner=provider_owner,
-            context_budget=budget_record,
-        )
+        try:
+            completion = await self._call_llm_before_deadline(
+                selected_messages,
+                selected_tools,
+                state,
+                initial_version,
+                deadline,
+                recorder=recorder,
+                composition_turns_used=composition_turns_used,
+                discovery_turns_used=discovery_turns_used,
+                failed_turn=failed_turn,
+                provider_owner=provider_owner,
+                context_budget=budget_record,
+            )
+        except _BadRequestLLMError as rejection:
+            if not is_context_length_rejection(rejection.__cause__):
+                raise
+            # The gateway or the model refused the request as over its context
+            # limit. That is reported to the user as the size refusal it is,
+            # naming the provider as the ceiling, never as a provider outage.
+            kept_history = sum(chat_index not in budget_record.shed_history_indices for chat_index, _kind in budget_frame.history_entries)
+            raise self._provider_capacity_refusal(
+                budget_record,
+                # Sized on the request that was sent.
+                _context_budget_component_bytes(
+                    message_wire_split(selected_messages, selected_tools or None),
+                    state_index=_CONTEXT_BUDGET_HISTORY_START + kept_history,
+                    latest_start=latest_round_trip_start(selected_messages),
+                    latest_stop=len(selected_messages),
+                    sheddable_bytes=0,
+                ),
+                _ContextBudgetRefusalScope(
+                    state=state,
+                    initial_version=initial_version,
+                    composition_turns_used=composition_turns_used,
+                    discovery_turns_used=discovery_turns_used,
+                    failed_turn=failed_turn,
+                    recorder=recorder,
+                ),
+            ) from rejection
         assistant_tool_calls = completion.tool_batch.calls
         self._enforce_tool_call_cap(
             assistant_tool_calls=assistant_tool_calls,

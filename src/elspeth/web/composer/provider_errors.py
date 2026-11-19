@@ -118,6 +118,57 @@ def _admit_request_rejection(exc: OpenAIBadRequestError) -> SafeRequestRejection
     return SafeRequestRejection(reason_code=combined.code, reason_disposition=combined.disposition, reason_source=source)
 
 
+# Wordings by which a provider or gateway says a request was over the model's context limit, lower case.
+# Tried only on an HTTP 400 whose structured fields named no reason, and only as a yes/no: no part of the
+# message is kept. "prompt is too long" is Anthropic's; it is unverified against any particular gateway.
+_CONTEXT_LENGTH_MESSAGE_PATTERNS: tuple[str, ...] = (
+    "prompt is too long",
+    "maximum context length",
+    "context_length_exceeded",
+    "context length exceeded",
+    "exceeds the context window",
+    "input is too long for requested model",
+)
+
+
+def _admit_context_length_evidence(exc: OpenAIBadRequestError, admitted: SafeRequestRejection) -> SafeRequestRejection:
+    """Recognise a context-limit rejection the structured fields did not name.
+
+    A structured reason always wins: this runs only when the envelope carried
+    none. The SDK's own class is nominal evidence. The message is foreign
+    text, so it is matched against fixed wordings and then discarded.
+    """
+    if admitted.reason_disposition not in {"absent", "unavailable"}:
+        return admitted
+    from litellm.exceptions import ContextWindowExceededError
+
+    source: Literal["sdk_class", "message_pattern"]
+    if isinstance(exc, ContextWindowExceededError):
+        source = "sdk_class"
+    else:
+        status_code = exc.status_code
+        if type(status_code) is not int or status_code != 400:
+            return admitted
+        message = exc.message
+        if type(message) is not str:
+            return admitted
+        lowered = message.lower()
+        if not any(pattern in lowered for pattern in _CONTEXT_LENGTH_MESSAGE_PATTERNS):
+            return admitted
+        source = "message_pattern"
+    return SafeRequestRejection(reason_code="context_length_exceeded", reason_disposition="retained", reason_source=source)
+
+
+def is_context_length_rejection(exc: BaseException | None) -> bool:
+    """Whether a provider failure is a recognised rejection of the request for exceeding the model's context limit."""
+    if exc is None:
+        return False
+    failure = classify_provider_failure(exc)
+    return (
+        failure is not None and failure.request_rejection is not None and failure.request_rejection.reason_code == "context_length_exceeded"
+    )
+
+
 def classify_provider_failure(exc: BaseException) -> ProviderFailure | None:
     """Classify only SDK failures; leave lifecycle and first-party errors alone."""
     if isinstance(exc, (asyncio.CancelledError, TimeoutError)):
@@ -140,7 +191,7 @@ def classify_provider_failure(exc: BaseException) -> ProviderFailure | None:
             ComposerLLMCallStatus.BAD_REQUEST_ERROR,
             "bad_request",
             False,
-            _admit_request_rejection(exc),
+            _admit_context_length_evidence(exc, _admit_request_rejection(exc)),
         )
     if isinstance(exc, APITimeoutError):
         return ProviderFailure(ComposerLLMCallStatus.TIMEOUT, "timeout", False)

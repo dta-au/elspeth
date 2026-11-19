@@ -614,7 +614,7 @@ export interface SafeRequestRejection {
   exception_type: "BadRequestError";
   reason_code: "invalid_request" | "context_length_exceeded" | "unsupported_parameter" | null;
   reason_disposition: "retained" | "absent" | "unrecognized" | "unavailable";
-  reason_source: "sdk_body" | "http_response" | "unavailable";
+  reason_source: "sdk_body" | "http_response" | "sdk_class" | "message_pattern" | "unavailable";
   diagnostic_reference: string | null;
   retryable: false;
 }

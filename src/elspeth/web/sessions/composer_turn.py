@@ -172,6 +172,7 @@ from elspeth.web.sessions.routes._helpers import (
     _record_composer_request_terminal,
     _record_composer_runtime_preflight_telemetry,
     _safe_frame_strings,
+    _sent_over_estimate_guidance,
     _state_data_from_composer_state,
     _state_from_record,
     _state_response,
@@ -1662,14 +1663,16 @@ async def _run_composer_turn(
                     ),
                 )
                 observation.audit_cohort_durable = True
-            raise HTTPException(
-                status_code=502,
-                detail=_litellm_error_detail(
-                    "llm_unavailable",
-                    exc,
-                    expose_provider_error=settings.composer_expose_provider_errors,
-                ),
-            ) from exc
+            bad_request_detail = _litellm_error_detail(
+                "llm_unavailable",
+                exc,
+                expose_provider_error=settings.composer_expose_provider_errors,
+            )
+            size_guidance = _sent_over_estimate_guidance(exc)
+            if size_guidance is not None:
+                bad_request_detail["sent_over_estimate"] = True
+                bad_request_detail["guidance"] = size_guidance
+            raise HTTPException(status_code=502, detail=bad_request_detail) from exc
         except ComposerPluginCrashError as crash:
             # MUST precede the generic ComposerServiceError arm (messages.py:697-721).
             observation.pending_exception_llm_calls = _llm_calls_from_exception(crash)

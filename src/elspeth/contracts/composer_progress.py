@@ -57,6 +57,15 @@ CONTEXT_BUDGET_REFUSAL_DETAIL: Final[str] = (
     "This conversation is too large for the composer to continue. Start a new session, or shorten your request."
 )
 
+# What the user reads when the model gateway itself rejected a request for
+# exceeding the model's context limit. ELSPETH sent the request because it
+# was under ELSPETH's own maximum; the limit that refused it is the
+# gateway's or the model's. DRAFT wording.
+CONTEXT_BUDGET_PROVIDER_REFUSAL_DETAIL: Final[str] = (
+    "The model gateway refused this message as too large for the model. "
+    "An administrator can raise the gateway's limit or choose a model with a larger context window."
+)
+
 
 type ComposerProgressPhase = Literal[
     "idle",
