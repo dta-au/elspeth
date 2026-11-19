@@ -302,14 +302,94 @@ def test_a_marker_at_a_non_prompt_llm_option_still_defers_with_zero_guarantees(t
     assert "guarantees: [(none)]" in summary.errors[0].message
 
 
-def test_a_stale_approval_hash_beside_a_file_prompt_fails_closed(tmp_path: Path) -> None:
-    """Approval binds effective text, so it can never match probe text; the tools drop it when a file is bound."""
-    stale = approved_prompt_artifact_hash(prompt_template=GOOD_PROMPT, system_prompt="You summarise customer reviews.")
-    _, state = _state(tmp_path, prompt_template=_marker(), options={"approved_prompt_artifact_hash": stale})
+_SYSTEM_PROMPT = "You summarise customer reviews."
+_HASH_KEY = "approved_prompt_artifact_hash"
 
+
+@pytest.mark.parametrize("digest", ["right", "stale"])
+def test_a_saved_approval_hash_beside_a_file_prompt_is_ignored_by_the_probe_and_by_execution_validation(
+    tmp_path: Path, digest: str
+) -> None:
+    """Approving a file card saves the hash of the reviewed text; the probe holds no such text.
+
+    Formerly "a stale approval hash beside a file prompt fails closed". It
+    failed closed for the RIGHT hash too, which returned every approved
+    file-prompted node to zero guarantees. The saved hash has no authority for
+    a file prompt at run time either: materialization drops it and the run
+    binds the admitted review snapshot's hash instead, so execution validation
+    admits both values here. What refuses a stale approval is the resolved
+    review's anchor (``tests/unit/web/sessions/test_approved_file_prompt_keeps_guarantees.py``).
+    """
+    saved = {
+        "right": approved_prompt_artifact_hash(prompt_template=GOOD_PROMPT, system_prompt=_SYSTEM_PROMPT),
+        "stale": approved_prompt_artifact_hash(prompt_template="An earlier inline prompt {{ row.review }}", system_prompt=_SYSTEM_PROMPT),
+    }[digest]
+    session_id, state = _state(tmp_path, prompt_template=_marker(), options={_HASH_KEY: saved})
+
+    prepared = prepare_validation_probe_options(state.nodes[0].options, plugin="llm")
     summary = state.validate()
-    errors, warnings = _codes(summary)
+    result = _execution_validate(tmp_path, session_id, state, GOOD_PROMPT)
 
+    assert _HASH_KEY not in prepared
+    assert state.nodes[0].options[_HASH_KEY] == saved, "saved options keep the hash"
+    assert summary.is_valid, [entry.to_dict() for entry in summary.errors]
+    assert _codes(summary) == ([], [])
+    assert result.is_valid, [error.message for error in result.errors]
+    assert all(check.passed for check in result.checks), [check.name for check in result.checks if not check.passed]
+
+
+@pytest.mark.parametrize(
+    ("options", "without"),
+    [
+        pytest.param({"system_prompt": _marker(_SYSTEM_PROMPT)}, (), id="file-system-prompt-inline-template"),
+        pytest.param(
+            {"queries": [{**_QUERY, "template": _marker("Rate {{ row.c }}")}]},
+            ("prompt_template", "response_field"),
+            id="file-query-template",
+        ),
+        pytest.param({"queries": [_QUERY], "prompt_template": _marker("Rate {{ row.c }}")}, ("response_field",), id="file-query-fallback"),
+    ],
+)
+def test_one_file_backed_prompt_position_is_enough_to_omit_the_hash(
+    tmp_path: Path, options: dict[str, Any], without: tuple[str, ...]
+) -> None:
+    """The hash binds system text and every effective template together; one unknown part makes it uncheckable."""
+    sink = {"mode": "flexible", "fields": ["review: str"]} if "queries" in options else SINK_FIELDS
+    _, state = _state(tmp_path, prompt_template=GOOD_PROMPT, sink_schema=sink, options={**options, _HASH_KEY: "b" * 64}, without=without)
+
+    prepared = prepare_validation_probe_options(state.nodes[0].options, plugin="llm")
+    summary = state.validate()
+
+    assert _HASH_KEY not in prepared
+    assert summary.is_valid, [entry.to_dict() for entry in summary.errors]
+    assert _codes(summary) == ([], [])
+
+
+def test_a_wrong_approval_hash_beside_an_inline_prompt_still_fails_the_probe(tmp_path: Path) -> None:
+    """Unchanged: with inline text the projection holds what the hash binds, so the model checks it."""
+    right = approved_prompt_artifact_hash(prompt_template=GOOD_PROMPT, system_prompt=_SYSTEM_PROMPT)
+    _, approved = _state(tmp_path / "right", prompt_template=GOOD_PROMPT, options={_HASH_KEY: right})
+    _, drifted = _state(tmp_path / "wrong", prompt_template=GOOD_PROMPT, options={_HASH_KEY: "b" * 64})
+
+    prepared = prepare_validation_probe_options(drifted.nodes[0].options, plugin="llm")
+    summary = drifted.validate()
+
+    assert _codes(approved.validate()) == ([], []), "control: the matching hash is accepted"
+    assert prepared[_HASH_KEY] == "b" * 64
+    assert _codes(summary) == (["sink_contract_violation"], ["contract_probe_failed"])
+    assert "guarantees: [(none)]" in summary.errors[0].message
+
+
+@pytest.mark.parametrize("position", ["prompt_template", "system_prompt"])
+def test_a_malformed_marker_keeps_the_hash_and_fails_the_probe(tmp_path: Path, position: str) -> None:
+    malformed = {"blob_ref": str(BLOB_ID), "mode": "inline_content", "sha256": "not-a-hash"}
+    _, state = _state(tmp_path, prompt_template=GOOD_PROMPT, options={position: malformed, _HASH_KEY: "b" * 64})
+
+    prepared = prepare_validation_probe_options(state.nodes[0].options, plugin="llm")
+    errors, warnings = _codes(state.validate())
+
+    assert prepared[position] == malformed
+    assert prepared[_HASH_KEY] == "b" * 64
     assert errors == ["sink_contract_violation"]
     assert warnings == ["contract_probe_failed"]
 

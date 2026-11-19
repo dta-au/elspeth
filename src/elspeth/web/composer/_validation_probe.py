@@ -87,21 +87,25 @@ def _probe_prompt_file_placeholder(required_input_fields: object, *, reads_row: 
     return " ".join([_PROBE_PROMPT_FILE_PLACEHOLDER, *reads])
 
 
-def _substitute_query_template_placeholders(queries: object) -> None:
+def _substitute_query_template_placeholders(queries: object) -> bool:
     """Replace valid file-backed query templates, in place, in a detached projection.
 
     A query renders against its own ``input_fields`` bindings, which no rule
-    requires its template to read, so the placeholder reads nothing.
+    requires its template to read, so the placeholder reads nothing. Returns
+    whether any template was replaced.
     """
     if type(queries) is dict:
         entries = list(queries.values())
     elif type(queries) is list:
         entries = queries
     else:
-        return
+        return False
+    substituted = False
     for entry in entries:
         if type(entry) is dict and "template" in entry and is_inline_content_reference(entry["template"]):
             entry["template"] = _PROBE_PROMPT_FILE_PLACEHOLDER
+            substituted = True
+    return substituted
 
 
 def prepare_validation_probe_options(options: Mapping[str, Any], *, plugin: str | None) -> dict[str, Any]:
@@ -158,6 +162,24 @@ def prepare_validation_probe_options(options: Mapping[str, Any], *, plugin: str 
     stays a config probe failure. The text exists only in the returned
     detached dict, which the call sites hand to a plugin constructor and drop;
     saved options keep the marker.
+
+    When any of those positions was substituted, the projection also omits
+    ``approved_prompt_artifact_hash``. That hash binds the node's effective
+    prompt text: ``system_prompt`` plus ``prompt_template`` in single-prompt
+    mode, or plus each query's effective template (its own, else
+    ``prompt_template``) in query mode. Approving a file's review card
+    stamps it from the reviewed bytes
+    (``sessions/pending_interpretation.py``), so the saved node carries a
+    digest of text this projection does not hold; the config model would
+    compare it with the placeholder, refuse, and return the node to zero
+    guarantees the moment the user approved. One file-backed position is
+    enough to make the effective text unknowable here, so one substitution
+    drops the hash. Execution does the same before it has the bytes:
+    materialization drops the saved hash for a file marker and the run binds
+    the admitted review snapshot's hash to the substituted text, which the
+    config model then re-derives and checks. An inline prompt substitutes
+    nothing, keeps its hash in the projection and is still checked here; so
+    is a malformed marker, which is not substituted.
     """
     from elspeth.web.interpretation_state import strip_authoring_options
 
@@ -187,10 +209,17 @@ def prepare_validation_probe_options(options: Mapping[str, Any], *, plugin: str 
         # declared row fields; a query-mode fallback renders query bindings.
         single_prompt = "queries" not in prepared or prepared["queries"] is None
         declared = prepared["required_input_fields"] if "required_input_fields" in prepared else None
+        substituted = False
         if "prompt_template" in prepared and is_inline_content_reference(prepared["prompt_template"]):
             prepared["prompt_template"] = _probe_prompt_file_placeholder(declared, reads_row=single_prompt)
+            substituted = True
         if "system_prompt" in prepared and is_inline_content_reference(prepared["system_prompt"]):
             prepared["system_prompt"] = _PROBE_PROMPT_FILE_PLACEHOLDER
-        if not single_prompt:
-            _substitute_query_template_placeholders(prepared["queries"])
+            substituted = True
+        if not single_prompt and _substitute_query_template_placeholders(prepared["queries"]):
+            substituted = True
+        # The approval hash binds effective prompt text this projection does
+        # not hold once a file stands at any prompt position.
+        if substituted and "approved_prompt_artifact_hash" in prepared:
+            del prepared["approved_prompt_artifact_hash"]
     return prepared
