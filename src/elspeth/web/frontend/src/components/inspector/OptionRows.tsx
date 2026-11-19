@@ -205,19 +205,21 @@ function BoundPromptActions({ blobId, nodeId, fieldPath, label, sessionId, state
     {showInFiles && <>
       {/* The accessible name STARTS with the visible label (WCAG 2.5.3), so
           "click Show in files" matches for voice-control users. */}
-      <Button type="button" variant="bare" aria-label={`Show in files: ${filename} (${label})`}
+      <Button type="button" variant="ghost" compact aria-label={`Show in files: ${filename} (${label})`}
         aria-disabled={!present} aria-describedby={!present ? missingReasonId : undefined}
         onClick={(event) => { if (present) useBlobStore.getState().revealBlob(sessionId, blobId, filename, event.currentTarget); }}>
         Show in files
       </Button>
-      {!present && <span id={missingReasonId}>{loading ? "Checking files in this session." : "This file is not in this session."}</span>}
+      {!present && <span id={missingReasonId} className="prompt-slot-reason">{loading ? "Checking files in this session." : "This file is not in this session."}</span>}
     </>}
-    <Button type="button" variant="bare" aria-label={`Edit ${filename} (${label})`}
+    {/* data-prompt-edit-slot: the editor returns focus here when it closes. */}
+    <Button type="button" variant="ghost" compact aria-label={`Edit ${filename} (${label})`}
+      data-prompt-edit-slot={`${nodeId}:${fieldPath}`}
       aria-disabled={editBlocked} aria-describedby={editReason !== null ? reasonId : undefined}
       onClick={() => { if (!editBlocked) useBlobStore.getState().requestPromptEdit(nodeId, fieldPath); }}>
       Edit
     </Button>
-    {editReason !== null && <span id={reasonId}>{editReason}</span>}
+    {editReason !== null && <span id={reasonId} className="prompt-slot-reason">{editReason}</span>}
   </span>;
 }
 

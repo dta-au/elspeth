@@ -38,7 +38,7 @@ it("starts collapsed and opens the requested slot with keyboard focus", async ()
   const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
   expect(editor).toHaveFocus();
   expect(useBlobStore.getState().editRequest).toBeNull();
-  fireEvent.click(screen.getByRole("button", { name: "Close editor" }));
+  fireEvent.click(screen.getByRole("button", { name: "Close" }));
   expect(screen.queryByRole("textbox", { name: /Edit prompt file/ })).not.toBeInTheDocument();
 });
 
@@ -213,8 +213,8 @@ it("does not pull focus back into the editor after a repeated Edit request has b
   act(() => edit.focus());
   fireEvent.click(edit);
   await waitFor(() => expect(editor).toHaveFocus());
-  // The user moves to Cancel; a later text change must not steal focus back.
-  const cancel = screen.getByRole("button", { name: "Cancel" });
+  // The user moves to Discard changes; a later text change must not steal focus back.
+  const cancel = screen.getByRole("button", { name: "Discard changes" });
   act(() => cancel.focus());
   fireEvent.change(editor, { target: { value: "a draft" } });
   expect(cancel).toHaveFocus();
@@ -381,4 +381,125 @@ it.each([
   fireEvent.change(editor, { target: { value: "edited" } });
   fireEvent.click(screen.getByRole("button", { name: "Save" }));
   await waitFor(() => expect(savePromptFile).toHaveBeenCalledWith("session-1", "blob-1", "edited", "a".repeat(64), "first", expectedPath));
+});
+
+// --- What the editor says and how its controls are presented ---
+
+const ONE_FILE = { prompt_template: { mode: "inline_content", blob_ref: "blob-1" } };
+
+async function openOneFileEditor(): Promise<HTMLElement> {
+  render(<PromptFileEditors nodeId="first" options={ONE_FILE} />);
+  const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
+  await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
+  return editor;
+}
+
+it("confirms a save politely, not through the error channel, and clears it on the next keystroke", async () => {
+  const editor = await openOneFileEditor();
+  fireEvent.change(editor, { target: { value: "new text" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  const saved = await screen.findByRole("status");
+  expect(saved).toHaveTextContent("Saved. This step now uses the new text.");
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  fireEvent.change(editor, { target: { value: "newer text" } });
+  expect(screen.queryByRole("status")).not.toBeInTheDocument();
+});
+
+it("says saved-but-not-refreshed politely when only the graph refetch fails", async () => {
+  vi.mocked(fetchCompositionState).mockRejectedValue(new Error("offline"));
+  const editor = await openOneFileEditor();
+  fireEvent.change(editor, { target: { value: "new text" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Saved. Reload the session to see the updated prompt status."));
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
+it("keeps a refused save as an alert and keeps it while the user goes on typing", async () => {
+  vi.mocked(savePromptFile).mockRejectedValue({ error_type: "prompt_file_stale", detail: "This file changed; reload it." });
+  const editor = await openOneFileEditor();
+  fireEvent.change(editor, { target: { value: "my draft" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("This file changed; reload it.");
+  fireEvent.change(editor, { target: { value: "my draft, continued" } });
+  expect(screen.getByRole("alert")).toHaveTextContent("This file changed; reload it.");
+  expect(editor).toHaveValue("my draft, continued");
+});
+
+it("reports a file that cannot be loaded as an alert", async () => {
+  vi.mocked(readPromptFileText).mockRejectedValue(new Error("Could not read the file."));
+  render(<PromptFileEditors nodeId="first" options={ONE_FILE} />);
+  expect(await screen.findByRole("alert")).toHaveTextContent("Could not read the file.");
+  expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+});
+
+it("uses the design system's input and button classes, with the three actions in one row", async () => {
+  const editor = await openOneFileEditor();
+  expect(editor).toHaveClass("textarea", "input-mono", "prompt-editor-text");
+  expect(editor).not.toHaveAttribute("style");
+  const actions = editor.closest("section")?.querySelector(".prompt-editor-actions");
+  expect(actions).not.toBeNull();
+  expect(Array.from(actions?.querySelectorAll("button") ?? []).map((button) => button.textContent)).toEqual(["Save", "Discard changes", "Close"]);
+  expect(screen.getByRole("button", { name: "Save" })).toHaveClass("btn-compact", "btn-primary");
+  expect(screen.getByRole("button", { name: "Discard changes" })).toHaveClass("btn-compact", "btn-ghost");
+  expect(screen.getByRole("button", { name: "Close" })).toHaveClass("btn-compact", "btn-ghost");
+});
+
+it("says why Save is disabled when the server would not refuse", async () => {
+  let deliver: (value: { text: string; sha256: string }) => void = () => undefined;
+  vi.mocked(readPromptFileText).mockReturnValue(new Promise((resolve) => { deliver = resolve; }));
+  render(<PromptFileEditors nodeId="first" options={ONE_FILE} />);
+  const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
+  const save = screen.getByRole("button", { name: "Save" });
+  // Loading: an empty disabled box is not an empty prompt file.
+  expect(editor).toHaveAttribute("aria-busy", "true");
+  expect(editor).toHaveAttribute("placeholder", "Loading…");
+  expect(save).toBeDisabled();
+  expect(save).toHaveAccessibleDescription("Loading the file…");
+  await act(async () => { deliver({ text: "loaded text", sha256: "a".repeat(64) }); await Promise.resolve(); });
+  expect(editor).not.toHaveAttribute("aria-busy");
+  // Nothing changed yet.
+  expect(save).toBeDisabled();
+  expect(save).toHaveAccessibleDescription("No changes to save.");
+  expect(screen.queryByText("Unsaved changes")).not.toBeInTheDocument();
+  // Changed, but the assistant is replying.
+  fireEvent.change(editor, { target: { value: "edited" } });
+  expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+  act(() => useSessionStore.setState({ isComposing: true }));
+  expect(save).toBeDisabled();
+  expect(save).toHaveAccessibleDescription("Wait for the assistant to finish, then save.");
+  // Changed and free to save: no hint, nothing describing the button.
+  act(() => useSessionStore.setState({ isComposing: false }));
+  expect(save).toBeEnabled();
+  expect(save).not.toHaveAccessibleDescription();
+});
+
+it("shows a read-only editor as read-only, with the reason above the text and Save still present and disabled", async () => {
+  useInterpretationEventsStore.setState({ pendingBySession: { "session-1": { card: { choice: "pending", kind: "llm_prompt_template", affected_node_id: "first" } as InterpretationEvent } } });
+  seedTwoFileStep();
+  fireEvent.click(screen.getByRole("button", { name: "Edit user.md (User prompt)" }));
+  const editor = await screen.findByRole("textbox", { name: "Edit prompt file user.md (User prompt)" });
+  await waitFor(() => expect(editor).toHaveValue("text of file A"));
+  const reason = screen.getByRole("note");
+  expect(reason).toHaveTextContent("Complete the existing node review before editing its files.");
+  // The reason comes before the text in reading order, and is not an alert: it is there on open.
+  expect(reason.compareDocumentPosition(editor) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(screen.getByText("Read only")).toBeInTheDocument();
+  expect(screen.queryByText("Unsaved changes")).not.toBeInTheDocument();
+  expect(editor).toHaveAttribute("readonly");
+  expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Close" })).toBeEnabled();
+});
+
+it("returns focus to the row's Edit button when the editor is closed", async () => {
+  seedTwoFileStep();
+  const edit = screen.getByRole("button", { name: "Edit user.md (User prompt)" });
+  fireEvent.click(edit);
+  const editor = await screen.findByRole("textbox", { name: "Edit prompt file user.md (User prompt)" });
+  await waitFor(() => expect(editor).toHaveFocus());
+  const close = screen.getByRole("button", { name: "Close" });
+  act(() => close.focus());
+  fireEvent.click(close);
+  expect(screen.queryByRole("textbox", { name: /Edit prompt file/ })).not.toBeInTheDocument();
+  expect(edit).toHaveFocus();
 });
