@@ -39,7 +39,7 @@ from tests.unit.web.composer._helpers import _clean_advisor_checkpoint, _compose
 from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean as _stub_advisor_end_gate_clean
 from tests.unit.web.composer.conftest import _fake_llm_response, _FakeComposeLLM
 from tests.unit.web.composer.test_compose_loop_llm_audit import _make_llm_response, _make_settings, _passing_preflight
-from tests.unit.web.composer.test_tools import _mock_catalog
+from tests.unit.web.composer.test_tools import _mock_catalog, execute_tool
 from tests.unit.web.sessions.test_blob_proposal_accept import _save_composition_state
 
 _REQUEST_BYTE_CEILING = 960 * 1024  # 983,040: WebSettings.composer_planner_max_request_bytes default
@@ -275,8 +275,30 @@ _SERIAL_PROPOSALS = 1
 
 # --- Explicit approval: the whole chain, staged by the compose loop and accepted through the route --------------
 
+_JSONL_SINK: dict[str, Any] = {"schema": {"mode": "observed"}, "format": "jsonl", "mode": "write", "collision_policy": "auto_increment"}
+_RELAY_OPTIONS: dict[str, Any] = {"schema": {"mode": "observed"}, "mapping": {}}
 
-def _two_consumer_state(input_path: Path) -> CompositionState:
+
+def _chain_node(node_id: str, node_type: str, plugin: str, *, input_connection: str, **fields: Any) -> NodeSpec:
+    return NodeSpec(
+        id=node_id,
+        node_type=node_type,
+        plugin=plugin,
+        input=input_connection,
+        on_success=f"{node_id}_out",
+        on_error="discard",
+        options=fields.pop("options"),
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+        **fields,
+    )
+
+
+def _chain_state(input_path: Path, scenario: str) -> CompositionState:
     state = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1).with_source(
         SourceSpec(
             plugin="csv",
@@ -285,61 +307,78 @@ def _two_consumer_state(input_path: Path) -> CompositionState:
             options={"path": str(input_path), "schema": {"mode": "observed"}},
         )
     )
-    for index in range(2):
-        state = state.with_node(_passthrough(f"step_{index}"))
-    for index in range(2):
+    first = _chain_node("step_0", "transform", "passthrough", input_connection=SHARED, options={"schema": {"mode": "observed"}})
+    if scenario == "transforms":
+        second = _chain_node("step_1", "transform", "passthrough", input_connection=SHARED, options={"schema": {"mode": "observed"}})
+    else:
+        second = _chain_node(
+            "step_1",
+            "aggregation",
+            "batch_stats",
+            input_connection=SHARED,
+            options={"schema": {"mode": "observed"}, "value_field": "score"},
+            trigger={"count": 2},
+        )
+    for node in (first, second):
+        state = state.with_node(node)
         state = state.with_output(
             OutputSpec(
-                name=f"step_{index}_out",
+                name=f"{node.id}_out",
                 plugin="json",
-                options={
-                    "path": f"outputs/step_{index}.jsonl",
-                    "schema": {"mode": "observed"},
-                    "format": "jsonl",
-                    "mode": "write",
-                    "collision_policy": "auto_increment",
-                },
+                options={"path": f"outputs/{node.id}.jsonl", **_JSONL_SINK},
                 on_write_failure="discard",
             )
         )
     return state
 
 
-def _two_consumer_fork_calls() -> list[dict[str, Any]]:
+def _chain_calls(state: CompositionState, scenario: str) -> list[dict[str, Any]]:
+    """The fork as the model sends it: names it chose, steps re-sent whole as it read them."""
+    data = execute_tool("get_pipeline_state", {"component": "set_pipeline_arguments"}, state, _mock_catalog()).to_dict()["data"]
+    nodes = {node["id"]: dict(node) for node in data["nodes"]}
+    branches = [f"{SHARED}_for_step_0", f"{SHARED}_for_step_1"]
     gate = {
         "id": "fan_out",
         "node_type": "gate",
         "input": SHARED,
         "condition": "True",
         "routes": {"true": "fork", "false": "fork"},
-        "fork_to": [f"{SHARED}_for_step_{index}" for index in range(2)],
+        "fork_to": branches,
     }
-    steps = [
-        {
-            "id": f"step_{index}",
-            "node_type": "transform",
-            "plugin": "passthrough",
-            "input": f"{SHARED}_for_step_{index}",
-            "on_success": f"step_{index}_out",
-            "on_error": "discard",
-            "options": {"schema": {"mode": "observed"}},
-        }
-        for index in range(2)
-    ]
-    return [gate, *steps]
+    first = {**nodes["step_0"], "input": branches[0]}
+    if scenario == "transforms":
+        return [gate, first, {**nodes["step_1"], "input": branches[1]}]
+    relay = {
+        "id": "relay_step_1",
+        "node_type": "transform",
+        "plugin": "field_mapper",
+        "input": branches[1],
+        "on_success": "step_1_rows",
+        "on_error": "discard",
+        "options": _RELAY_OPTIONS,
+    }
+    return [gate, first, relay, {**nodes["step_1"], "input": "step_1_rows"}]
 
 
 def _codes(errors: Any) -> list[str]:
     return sorted({error.error_code or error.component for error in errors or ()})
 
 
-def test_under_explicit_approval_the_fork_is_staged_and_accepted_one_call_at_a_time(tmp_path: Path) -> None:
-    """N=2 transforms on a graph whose duplicate-consumer error already stands.
+def _model_visible_codes(turn: Any) -> list[str]:
+    [outcome] = turn.tool_outcomes
+    assert isinstance(outcome.response, ToolResult)
+    return _codes(outcome.response.validation.errors)
+
+
+@pytest.mark.parametrize("scenario", ["transforms", "aggregation_relay"])
+def test_under_explicit_approval_the_fork_is_staged_and_accepted_one_call_at_a_time(tmp_path: Path, scenario: str) -> None:
+    """Two consumers on a graph whose duplicate-consumer error already stands.
 
     Each response carries ONE upsert_node; the real compose loop stages it as a
     pending proposal; the real accept route (dispatch, required-control
-    finalisation, runtime preflight, commit) applies it. Recorded per step:
-    proposal staged, accept status, committed validity and error codes.
+    finalisation, runtime preflight, real plugin catalog, commit) applies it.
+    Recorded per step: what the model sees on the staged result, proposal
+    staged, accept status, committed validity and error codes.
     """
     import asyncio
 
@@ -352,8 +391,9 @@ def test_under_explicit_approval_the_fork_is_staged_and_accepted_one_call_at_a_t
     session_uuid = UUID(session_id)
     input_path = tmp_path / "blobs" / session_id / "input.csv"
     input_path.parent.mkdir(parents=True)
-    input_path.write_text("text\nhello\n", encoding="utf-8")
-    data = _two_consumer_state(input_path).to_dict()
+    input_path.write_text("text,score\nhello,1\n", encoding="utf-8")
+    seed_state = _chain_state(input_path, scenario)
+    data = seed_state.to_dict()
     asyncio.run(
         _save_composition_state(
             sessions,
@@ -373,9 +413,9 @@ def test_under_explicit_approval_the_fork_is_staged_and_accepted_one_call_at_a_t
     seeded = asyncio.run(sessions.get_current_state(session_uuid))
     assert seeded is not None
     seed_summary = state_from_record(seeded).validate()
-    steps: list[tuple[Any, ...]] = [("seed", None, None, seed_summary.is_valid, _codes(seed_summary.errors))]
+    steps: list[tuple[Any, ...]] = [("seed", None, None, None, seed_summary.is_valid, _codes(seed_summary.errors))]
 
-    for index, call in enumerate(_two_consumer_fork_calls()):
+    for index, call in enumerate(_chain_calls(_chain_state(Path("/data/in.csv"), scenario), scenario)):
         current = asyncio.run(sessions.get_current_state(session_uuid))
         assert current is not None
         llm = _FakeComposeLLM(
@@ -398,17 +438,33 @@ def test_under_explicit_approval_the_fork_is_staged_and_accepted_one_call_at_a_t
         after = asyncio.run(sessions.get_current_state(session_uuid))
         assert after is not None
         assert after.id != current.id, "the accept committed a new state"
-        steps.append((call["id"], staged, accepted.status_code, after.is_valid, _codes(after.validation_errors)))
+        steps.append(
+            (call["id"], staged, _model_visible_codes(turn), accepted.status_code, after.is_valid, _codes(after.validation_errors))
+        )
 
-    assert steps == _APPROVAL_CHAIN_EXPECTED, steps
+    assert steps == _APPROVAL_CHAIN_EXPECTED[scenario], steps
 
 
-# Executed (approval-chain-2): every staging records one pending proposal and applies nothing; every accept
-# commits (200) although the gate and the first re-point leave the pipeline invalid; the last accept validates.
-_DUPLICATE_AND_UNREAD_BRANCH = ["duplicate_connection_consumer", "fork_branch_no_destination"]
-_APPROVAL_CHAIN_EXPECTED: list[tuple[Any, ...]] = [
-    ("seed", None, None, False, ["duplicate_connection_consumer"]),
-    ("fan_out", [("upsert_node", True, None)], 200, False, _DUPLICATE_AND_UNREAD_BRANCH),
-    ("step_0", [("upsert_node", True, None)], 200, False, _DUPLICATE_AND_UNREAD_BRANCH),
-    ("step_1", [("upsert_node", True, None)], 200, True, []),
-]
+_DUPLICATE = "duplicate_connection_consumer"
+_UNREAD_BRANCH = "fork_branch_no_destination"
+_STAGED = [("upsert_node", True, None)]
+# Executed: every staging records one pending proposal and applies nothing. The staged result the model sees
+# carries the SAVED state's codes (the change is not applied yet), so the unread fork branch first shows on the
+# result of the call after the gate. Every accept commits (200) although the in-between states are invalid; the
+# last accept validates.
+_DANGLING_RELAY = "transform_on_success_dangling"
+_APPROVAL_CHAIN_EXPECTED: dict[str, list[tuple[Any, ...]]] = {
+    "transforms": [
+        ("seed", None, None, None, False, [_DUPLICATE]),
+        ("fan_out", _STAGED, [_DUPLICATE], 200, False, [_DUPLICATE, _UNREAD_BRANCH]),
+        ("step_0", _STAGED, [_DUPLICATE, _UNREAD_BRANCH], 200, False, [_DUPLICATE, _UNREAD_BRANCH]),
+        ("step_1", _STAGED, [_DUPLICATE, _UNREAD_BRANCH], 200, True, []),
+    ],
+    "aggregation_relay": [
+        ("seed", None, None, None, False, [_DUPLICATE]),
+        ("fan_out", _STAGED, [_DUPLICATE], 200, False, [_DUPLICATE, _UNREAD_BRANCH]),
+        ("step_0", _STAGED, [_DUPLICATE, _UNREAD_BRANCH], 200, False, [_DUPLICATE, _UNREAD_BRANCH]),
+        ("relay_step_1", _STAGED, [_DUPLICATE, _UNREAD_BRANCH], 200, False, [_DUPLICATE, _DANGLING_RELAY]),
+        ("step_1", _STAGED, [_DUPLICATE, _DANGLING_RELAY], 200, True, []),
+    ],
+}
