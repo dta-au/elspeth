@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator, Mapping
 from copy import deepcopy
 from dataclasses import replace
@@ -83,6 +84,62 @@ def _inline_ref_state() -> CompositionState:
                 name="classified",
                 plugin="json",
                 options={"path": "/tmp/output.jsonl", "format": "jsonl", "schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+def _field_declaring_sink_state(tmp_path: Path) -> CompositionState:
+    """csv(text) -> llm(label) -> json sink that declares both fields."""
+    return CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="rows",
+            options={
+                "path": str(tmp_path / "input.csv"),
+                "schema": {"mode": "flexible", "fields": ["text: str"], "guaranteed_fields": ["text"]},
+            },
+            on_validation_failure="discard",
+        ),
+        nodes=(
+            NodeSpec(
+                id="classify",
+                node_type="transform",
+                plugin="llm",
+                input="rows",
+                on_success="classified",
+                on_error="discard",
+                options={
+                    "provider": "openrouter",
+                    "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+                    "model": "openai/gpt-4o",
+                    "system_prompt": "You classify each input row. Reply with one category label.",
+                    "prompt_template": "Classify {{ row.text }}",
+                    "required_input_fields": ["text"],
+                    "response_field": "label",
+                    "schema": {"mode": "observed"},
+                },
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="classified",
+                plugin="json",
+                options={
+                    "path": str(tmp_path / "output.jsonl"),
+                    "format": "jsonl",
+                    "schema": {"mode": "flexible", "fields": ["text: str", "label: str"]},
+                },
                 on_write_failure="discard",
             ),
         ),
@@ -397,6 +454,40 @@ class TestWireBlobInlineRef:
         assert result.updated_state.nodes[0].options["prompt_template"]["blob_ref"] == blob.data["blob_id"]
         requirements = result.updated_state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY]
         assert any(item["kind"] == "llm_prompt_template" and item["status"] == "pending" for item in requirements)
+
+    @pytest.mark.parametrize("field", ["prompt_template", "system_prompt"])
+    def test_wiring_a_prompt_file_leaves_a_field_declaring_pipeline_valid(
+        self, blob_env: dict[str, Any], tmp_path: Path, field: str
+    ) -> None:
+        """Binding a file must not zero the llm node's guarantees for the sink downstream."""
+        state = _field_declaring_sink_state(tmp_path)
+        before = state.validate()
+        assert before.is_valid, [entry.to_dict() for entry in before.errors]
+        blob = _create_blob(blob_env, content="Classify this row: {{ row.text }}")
+        assert blob.success, blob.to_dict()
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {"field_path": f"node:classify.options.{field}", "blob_id": blob.data["blob_id"]},
+            state,
+            _catalog(),
+            data_dir=blob_env["data_dir"],
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
+        )
+
+        assert result.success, result.to_dict()
+        marker = result.updated_state.nodes[0].options[field]
+        assert marker["blob_ref"] == blob.data["blob_id"]
+        assert marker["mode"] == "inline_content"
+        assert result.validation.is_valid, [entry.to_dict() for entry in result.validation.errors]
+        assert [entry.error_code for entry in result.validation.errors] == []
+        assert "contract_probe_deferred" not in [entry.error_code for entry in result.validation.warnings]
+        assert result.updated_state.outputs[0].options["schema"] == state.outputs[0].options["schema"]
+        # The probe's stand-in text never reaches the model-facing result.
+        assert "validation-probe" not in json.dumps(result.to_dict(), default=str)
 
     @pytest.mark.parametrize("field", ["prompt_template", "system_prompt", "queries.0.template", "queries.q.template"])
     def test_binary_mime_refuses_before_writing_marker(self, blob_env: dict[str, Any], field: str) -> None:

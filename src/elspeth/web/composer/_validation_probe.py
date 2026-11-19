@@ -65,6 +65,45 @@ def prepare_query_definition_probe(queries: object) -> object:
     return prepared
 
 
+_PROBE_PROMPT_FILE_PLACEHOLDER = "validation-probe-prompt-file-placeholder"
+"""Inert text standing in for a file-backed llm prompt inside a probe projection."""
+
+
+def _probe_prompt_file_placeholder(required_input_fields: object, *, reads_row: bool) -> str:
+    """Return probe-only text for a file-backed llm prompt position.
+
+    With ``reads_row`` the text reads every declared field by a quoted
+    subscript, because the single-prompt config model refuses a declaration
+    its template never reads and a read the declaration does not cover; the
+    placeholder satisfies both by construction and so decides neither. A
+    malformed declaration contributes no read and is refused by its own
+    validator. ``repr`` yields a string literal Jinja2 lexes for any name,
+    and the names are stripped exactly as that validator strips them.
+    """
+    if not reads_row or type(required_input_fields) not in (list, tuple):
+        return _PROBE_PROMPT_FILE_PLACEHOLDER
+    names = cast("list[object] | tuple[object, ...]", required_input_fields)
+    reads = [f"{{{{ row[{name.strip()!r}] }}}}" for name in names if type(name) is str and name.strip()]
+    return " ".join([_PROBE_PROMPT_FILE_PLACEHOLDER, *reads])
+
+
+def _substitute_query_template_placeholders(queries: object) -> None:
+    """Replace valid file-backed query templates, in place, in a detached projection.
+
+    A query renders against its own ``input_fields`` bindings, which no rule
+    requires its template to read, so the placeholder reads nothing.
+    """
+    if type(queries) is dict:
+        entries = list(queries.values())
+    elif type(queries) is list:
+        entries = queries
+    else:
+        return
+    for entry in entries:
+        if type(entry) is dict and "template" in entry and is_inline_content_reference(entry["template"]):
+            entry["template"] = _PROBE_PROMPT_FILE_PLACEHOLDER
+
+
 def prepare_validation_probe_options(options: Mapping[str, Any], *, plugin: str | None) -> dict[str, Any]:
     """Return detached runtime options safe for validation-only construction.
 
@@ -97,6 +136,28 @@ def prepare_validation_probe_options(options: Mapping[str, Any], *, plugin: str 
     than restating it, so a structured-output node (which demands
     ``json_schema``) still constructs. An authored ``provider`` — a YAML
     import that carries its own — is left to stand on its own config.
+
+    For ``plugin="llm"`` the projection also supplies probe-only text wherever
+    a prompt position (``prompt_template``, ``system_prompt``, a query's
+    ``template``) holds a VALID ``inline_content`` marker. The config model
+    types those positions ``str``, so the marker alone fails construction, the
+    probe defers, and ``_effective_producer_vote`` answers a deferred probe
+    with zero guarantees: every consumer declaring fields downstream of a
+    file-prompted llm was rejected with ``guarantees: [(none)]``, although the
+    list above shows prompt text is no input to the output contract. Deferral
+    is right where the bytes decide the contract (``reference_join``'s table)
+    and stays the answer for every other plugin and every other llm option.
+
+    The placeholder is not the file's text and proves nothing about it. Every
+    check that reads prompt text (Jinja2 syntax, row-access rules, the
+    template/``required_input_fields`` agreement, header-spelled lookups) is
+    left to execution validation, which materializes the authorized bytes and
+    builds the same config model on them before a run is admitted. Those
+    checks did not run at authoring before either: the string-type failure
+    stopped the model ahead of them. A malformed marker is not substituted and
+    stays a config probe failure. The text exists only in the returned
+    detached dict, which the call sites hand to a plugin constructor and drop;
+    saved options keep the marker.
     """
     from elspeth.web.interpretation_state import strip_authoring_options
 
@@ -121,4 +182,15 @@ def prepare_validation_probe_options(options: Mapping[str, Any], *, plugin: str 
         prepared["endpoint"] = "https://validation-probe.invalid/v1"
         prepared["api_key"] = "validation-probe-placeholder"
         prepared["required_capabilities"] = tuple(sorted(GATEWAY_SUPPORTED_CAPABILITIES))
+    if plugin == "llm":
+        # Single-prompt mode is the only one whose template must read the
+        # declared row fields; a query-mode fallback renders query bindings.
+        single_prompt = "queries" not in prepared or prepared["queries"] is None
+        declared = prepared["required_input_fields"] if "required_input_fields" in prepared else None
+        if "prompt_template" in prepared and is_inline_content_reference(prepared["prompt_template"]):
+            prepared["prompt_template"] = _probe_prompt_file_placeholder(declared, reads_row=single_prompt)
+        if "system_prompt" in prepared and is_inline_content_reference(prepared["system_prompt"]):
+            prepared["system_prompt"] = _PROBE_PROMPT_FILE_PLACEHOLDER
+        if not single_prompt:
+            _substitute_query_template_placeholders(prepared["queries"])
     return prepared
