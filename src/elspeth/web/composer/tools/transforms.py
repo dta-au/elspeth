@@ -1801,6 +1801,50 @@ def _node_routing_option_patch_error(patch: Mapping[str, Any], *, node_type: Nod
     return None
 
 
+def _query_names(queries: object) -> tuple[str, ...] | None:
+    """The query names a ``queries`` option carries, in either authoring form.
+
+    A mapping is keyed by query name; a list holds entries with a ``name``. A
+    list entry without a string ``name`` names no query. ``None`` when the
+    value is neither form: its shape is the plugin schema's to refuse.
+    """
+    if isinstance(queries, Mapping):
+        return tuple(name for name in queries if isinstance(name, str))
+    if isinstance(queries, (list, tuple)):
+        return tuple(
+            entry["name"] for entry in queries if isinstance(entry, Mapping) and "name" in entry and isinstance(entry["name"], str)
+        )
+    return None
+
+
+def _queries_omitted_by_patch(stored_queries: object, patched_queries: object) -> tuple[str, ...]:
+    """Stored query names that a patch's ``queries`` value would remove without naming.
+
+    The merge is shallow: a ``queries`` value in the patch replaces the stored
+    one whole, so a patch naming one query silently dropped the rest. The caller
+    passes the two ``queries`` values only when both the patch and the node have
+    the key. ``queries: null`` is not this case: it deletes the option by name,
+    and ``None`` is neither authoring form.
+    """
+    stored = _query_names(stored_queries)
+    patched = _query_names(patched_queries)
+    if stored is None or patched is None:
+        return ()
+    return tuple(name for name in stored if name not in patched)
+
+
+def _queries_patch_omission_refusal(node_id: str, omitted: tuple[str, ...]) -> str:
+    """The repairable refusal for a ``queries`` patch that leaves stored queries out. Names are written whole."""
+    names = ", ".join(repr(name) for name in omitted)
+    which = "that query" if len(omitted) == 1 else "those queries"
+    return (
+        f"Not applied: this patch's queries value leaves out {names}, which node {node_id!r} has, and a patch replaces "
+        f"queries whole, so {which} would have been removed (queries_patch_omits_existing). Nothing was changed. "
+        "To change one query, send queries with EVERY query the node has, each complete, changing only the one you mean. "
+        "To remove a query, send the whole node with upsert_node."
+    )
+
+
 def _execute_patch_node_options(
     args: dict[str, Any],
     state: CompositionState,
@@ -1887,6 +1931,18 @@ def _apply_guarded_node_option_patch(
         component_id=node_id,
         existing_options=current.options,
     )
+    omitted_queries = (
+        _queries_omitted_by_patch(current.options["queries"], patch["queries"])
+        if "queries" in patch and "queries" in current.options
+        else ()
+    )
+    if omitted_queries:
+        return _saved_graph_rejection_result(
+            state,
+            _queries_patch_omission_refusal(node_id, omitted_queries),
+            error_code="queries_patch_omits_existing",
+            rejected_component=node_ref,
+        )
     new_options: Mapping[str, Any] = _apply_merge_patch(current.options, dict(patch))
     new_options = _options_with_default_llm_reviews(
         node_id=node_id,
@@ -2389,7 +2445,8 @@ _PATCH_NODE_OPTIONS_DECLARATION = ToolDeclaration(
     kind=ToolKind.MUTATION,
     description="Apply a shallow merge-patch to a node's options. Use this for option-only edits. "
     "Keys in the patch overwrite existing keys. "
-    "Keys set to null are deleted. Missing keys are unchanged. "
+    "Keys set to null are deleted. Top-level keys the patch does not name are unchanged; a nested value such as queries "
+    "is replaced whole, so send every query (a queries value that omits an existing query is refused; queries: null removes every query). "
     "For an existing structured LLM prompt, edit prompt_template_parts and preserve interpretation_ref entries; "
     "prompt_template is compiled from those parts. Changed prompt context requires fresh review. "
     "Do not use this for node routing fields such as on_success/on_error/input/routes; "

@@ -1600,6 +1600,13 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "Match the actual producer type or convert upstream on a field every arriving row carries. A type_coerce input declares the old arriving type; its conversion determines the output type consumed downstream. A declaration alone does not convert a value.",
     ),
     DirectValidationGuidance(
+        "queries_patch_omits_existing",
+        "A patch_node_options patch sent a queries value without a query the node already has. "
+        "A patch replaces queries whole, so that query would have been removed.",
+        "To change one query, restate every query the node has in the patch, each complete. "
+        "To remove a query, send the whole node with upsert_node.",
+    ),
+    DirectValidationGuidance(
         "quarantine_unknown_output",
         "The source on_validation_failure names an output that is not declared.",
         "Declare the intended quarantine output and reference its name in on_validation_failure, "

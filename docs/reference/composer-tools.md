@@ -388,7 +388,7 @@ Apply a shallow merge-patch to a node's options.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `node_id` | string | **Yes** | ID of the node to patch |
-| `patch` | object | **Yes** | Merge-patch (same semantics as `patch_source_options`) |
+| `patch` | object | **Yes** | Merge-patch (same semantics as `patch_source_options`). The merge is shallow: a nested value such as `queries` is replaced whole, so send every query; a `queries` value that omits an existing query is refused (`queries_patch_omits_existing`), and `queries: null` removes every query. |
 
 ---
 

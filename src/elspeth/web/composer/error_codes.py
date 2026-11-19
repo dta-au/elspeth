@@ -172,6 +172,7 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "proof_repair_exhausted",
         "provider_config_path_policy_invalid",
         "quarantine_unknown_output",
+        "queries_patch_omits_existing",
         "query_input_columns_undeclared",
         "query_generated_fields_required",
         "query_template_unbound_row_fields",
