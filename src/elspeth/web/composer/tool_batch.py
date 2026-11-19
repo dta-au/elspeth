@@ -192,6 +192,7 @@ from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     ServerStagedRequiredControlUserTerm,
     interpretation_sites,
+    server_staged_review_preservation_error,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.converters import state_from_record
@@ -2054,14 +2055,24 @@ async def run_tool_batch(
                                 semantic=True,
                             )
                             interpretation_requirements_are_internal = True
+                        candidate_result = candidate.result
+                        if candidate.acceptable:
+                            review_error = server_staged_review_preservation_error(state, candidate_result.updated_state)
+                            if review_error is not None:
+                                candidate_result = _candidate_rejection_result(
+                                    state,
+                                    review_error,
+                                    error_code="server_owned_review_protected",
+                                    rejected_component="pipeline",
+                                )
                         finalized_candidate_result = finalize_tool_result(
-                            candidate.result,
+                            candidate_result,
                             tool_name=tool_name,
                             catalog=ctx.policy_catalog,
                             context=candidate_context,
                             prior_validation=candidate_prior_validation,
                         )
-                        proposal_acceptable = candidate.acceptable
+                        proposal_acceptable = candidate.acceptable and candidate_result.success
                         if (
                             proposal_acceptable
                             and candidate.prepared_inline_blob is None

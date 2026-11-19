@@ -105,6 +105,7 @@ from elspeth.web.composer.tools._common import (
     _serialize_output,
     _serialize_set_pipeline_arguments,
     _serialize_source,
+    _server_staged_requirement_boundary,
     _validate_mutation_arguments,
     _validate_plugin_name,
     _validate_sink_path,
@@ -1533,6 +1534,16 @@ def build_set_pipeline_candidate(
         # verbatim from the stored node reduce to author shells; the
         # reconciliation pass below restores the server rows.
         if not interpretation_requirements_are_internal:
+            node_options, review_refusal = _server_staged_requirement_boundary(
+                node_options,
+                stored_options=current_nodes[node_id].options if node_id in current_nodes else None,
+                node_id=node_id,
+            )
+            if review_refusal is not None:
+                _record_component_rejection(
+                    _failure_result(state, review_refusal, error_code="server_owned_review_protected", rejected_component=node_ref)
+                )
+                continue
             node_options, node_requirement_echo = _normalize_echoed_interpretation_requirements(
                 node_options,
                 stored_options=current_nodes[node_id].options if node_id in current_nodes else None,

@@ -21,6 +21,7 @@ from typing import Any, Final, Literal, NotRequired, TypedDict
 from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
@@ -111,6 +112,18 @@ GATE_CONDITION_AUTHORED_USER_TERM: Final[str] = "gate_condition_authored"
 COMPOSER_AUTHORED_PIPELINE_DECISION_USER_TERMS: Final[frozenset[str]] = REGISTERED_PIPELINE_DECISION_USER_TERMS - {
     REQUIRED_CONTROL_AUTO_WIRED_USER_TERM
 }
+SERVER_STAGED_PIPELINE_DECISION_USER_TERMS: Final[frozenset[str]] = (
+    REGISTERED_PIPELINE_DECISION_USER_TERMS - COMPOSER_AUTHORED_PIPELINE_DECISION_USER_TERMS
+)
+
+
+def is_server_staged_review(kind: object, user_term: object) -> bool:
+    """Identify only the exact persisted kind and term owned by the server."""
+    return (
+        kind == InterpretationKind.PIPELINE_DECISION.value
+        and isinstance(user_term, str)
+        and user_term in SERVER_STAGED_PIPELINE_DECISION_USER_TERMS
+    )
 
 
 class ServerStagedRequiredControlUserTerm(str):
@@ -691,6 +704,76 @@ def unwired_vague_term_error(state: CompositionState) -> str | None:
                 "unwired requirement stages a review the operator can approve but never resolve, "
                 "and the execution gate blocks Run on it forever."
             )
+    return None
+
+
+def _authored_options_hash(node: NodeSpec) -> str:
+    return stable_hash({key: deep_thaw(value) for key, value in node.options.items() if key != INTERPRETATION_REQUIREMENTS_KEY})
+
+
+@observation_boundary(
+    tier=3,
+    source="untyped interpretation_requirements rows in stored and proposed composer node options",
+    source_param="previous",
+    suppresses=("R1", "R5"),
+    invariant="canonical admission handles model row shape; malformed retained state rows raise; a matching review is required on a retained node",
+)
+def server_staged_review_preservation_error(previous: CompositionState, proposed: CompositionState) -> str | None:
+    """Describe the first server-staged review that a proposed state would not keep."""
+    proposed_nodes = {node.id: node for node in proposed.nodes}
+    for old_node in previous.nodes:
+        old_rows = old_node.options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in old_node.options else ()
+        if not isinstance(old_rows, (list, tuple)):
+            continue
+        owned_rows = []
+        for row in old_rows:
+            if not isinstance(row, Mapping):
+                continue
+            term = row["user_term"] if "user_term" in row else None
+            if "kind" in row and is_server_staged_review(row["kind"], term) and "id" in row and "status" in row:
+                owned_rows.append(row)
+        if not owned_rows:
+            continue
+        new_node = proposed_nodes[old_node.id] if old_node.id in proposed_nodes else None
+        for old_row in owned_rows:
+            term = old_row["user_term"]
+            prefix = f"Node '{old_node.id}' carries a server-staged review ({term}) that only the user can resolve, on its card. "
+            suffix = " Nothing was changed. To edit the node, re-send it without interpretation_requirements; the review is kept."
+            if new_node is None:
+                if old_row["status"] == "pending":
+                    return prefix + "It is still pending, so the node cannot be removed." + suffix
+                continue
+            if (new_node.node_type, new_node.plugin) != (old_node.node_type, old_node.plugin):
+                return prefix + "Its node type and plugin cannot be changed." + suffix
+            new_rows = new_node.options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in new_node.options else ()
+            if not isinstance(new_rows, (list, tuple)):
+                raise AuditIntegrityError(f"Proposed interpretation requirements for node {old_node.id!r} are not rows")
+            identity = (old_row["id"], old_row["kind"], term)
+            matching = next(
+                (
+                    row
+                    for row in new_rows
+                    if isinstance(row, Mapping)
+                    and "id" in row
+                    and "kind" in row
+                    and "user_term" in row
+                    and is_server_staged_review(row["kind"], row["user_term"])
+                    and (row["id"], row["kind"], row["user_term"]) == identity
+                ),
+                None,
+            )
+            matching_status = matching["status"] if matching is not None and "status" in matching else None
+            if matching is None or (old_row["status"] == "pending" and matching_status != "pending"):
+                return prefix + "This change would have removed or altered that review." + suffix
+            if (
+                old_row["status"] == "resolved"
+                and matching_status == "resolved"
+                and (
+                    stable_hash(deep_thaw(old_row)) != stable_hash(deep_thaw(matching))
+                    or _authored_options_hash(old_node) != _authored_options_hash(new_node)
+                )
+            ):
+                return prefix + "This change would have removed or altered that review." + suffix
     return None
 
 
@@ -3396,6 +3479,9 @@ def _reconcile_node_options(
 ) -> Mapping[str, Any]:
     proposed_index = _validated_review_index(proposed.options)
     previous_index = _validated_review_index(previous.options) if previous is not None and previous.plugin == proposed.plugin else {}
+    for identity, stored_row in previous_index.items():
+        if is_server_staged_review(stored_row["kind"], stored_row["user_term"]) and identity not in proposed_index:
+            proposed_index[identity] = stored_row
     options = dict(proposed.options)
     if "approved_prompt_artifact_hash" in options:
         del options["approved_prompt_artifact_hash"]
@@ -3446,6 +3532,8 @@ def _reconcile_node_options(
                 )
             proposed_artifact = _node_review_artifact(proposed, proposed_nodes, kind=kind, user_term=user_term)
             unchanged = proposed_artifact == previous_artifact
+            if unchanged and is_server_staged_review(proposed_requirement["kind"], proposed_requirement["user_term"]):
+                unchanged = _authored_options_hash(previous) == _authored_options_hash(proposed)
         if unchanged:
             reconciled.append(dict(previous_requirement))
             carried_prompt_review = carried_prompt_review or kind in (

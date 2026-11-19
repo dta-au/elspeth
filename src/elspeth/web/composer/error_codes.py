@@ -200,6 +200,7 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "row_union_timeout_invalid",
         "runtime_preflight_not_run",
         "schema_contract_violation",
+        "server_owned_review_protected",
         "secret_context_unavailable",
         "secret_target_required",
         "secret_target_unsupported",

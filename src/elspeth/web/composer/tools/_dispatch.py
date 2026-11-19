@@ -79,6 +79,7 @@ from elspeth.web.composer.tools.sessions import (
     ADVISOR_TRIGGER_VALUES,
 )
 from elspeth.web.credential_guard import require_no_credential_material_for_tool
+from elspeth.web.interpretation_state import server_staged_review_preservation_error
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
 from elspeth.web.sessions.protocol import SessionOperationAuthority
@@ -779,19 +780,24 @@ def _enforce_composition_interpretation_gate(
     prior_state: CompositionState,
 ) -> ToolResult:
     """Reject a successful public state mutation before its result is published."""
-    if not result.success or EffectDomain.GRAPH not in effects.domains:
+    if not result.success:
         return result
-    canonical_error = _composition_canonical_interpretation_requirement_error(
-        result.updated_state,
-        tool_name=tool_name,
-    )
-    if canonical_error is None:
-        return result
-    return _failure_result(
-        prior_state,
-        canonical_error,
-        error_code="interpretation_requirements_invalid",
-    )
+    if EffectDomain.GRAPH in effects.domains:
+        canonical_error = _composition_canonical_interpretation_requirement_error(
+            result.updated_state,
+            tool_name=tool_name,
+        )
+        if canonical_error is not None:
+            return _failure_result(
+                prior_state,
+                canonical_error,
+                error_code="interpretation_requirements_invalid",
+            )
+    if result.updated_state is not prior_state:
+        review_error = server_staged_review_preservation_error(prior_state, result.updated_state)
+        if review_error is not None:
+            return _failure_result(prior_state, review_error, error_code="server_owned_review_protected")
+    return result
 
 
 def execute_tool(
