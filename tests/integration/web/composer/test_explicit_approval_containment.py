@@ -143,6 +143,14 @@ async def test_batch_with_two_staged_edits_is_refused_before_effects_then_one_co
         # including a sibling refused for malformed arguments.
         assert "carried 2 pipeline-change calls" in message
         assert "None of them was applied and no proposal was recorded" in message
+        # Maintainer ruling 2026-11-19: under approval, narrow edits go one at a
+        # time; a whole set_pipeline only when no single change validates.
+        assert "only one proposal can await the user at a time" in message
+        assert "Send the first change alone, then tell the user what follows" in message
+        assert "send each next change after the one before it is accepted" in message
+        assert "Use one `set_pipeline` carrying the whole result only when no single change leaves a pipeline that validates" in message
+        assert "containing every edit" not in message
+        assert "Submit the whole intended result" not in message
         # The file call is not counted and comes first: without this the
         # model recovers with one set_pipeline and the new prompt inline.
         assert "create_blob is not a pipeline change" in message
