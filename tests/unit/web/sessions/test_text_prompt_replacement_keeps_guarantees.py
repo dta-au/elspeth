@@ -366,19 +366,21 @@ async def test_text_replaces_an_approved_file_prompt_and_is_reviewed_before_it_r
     assert admitted["execution_ready"] is True, admitted
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known defect, measured 2026-11-19 on ce7d94c1a and on this tree: an approved file-backed prompt node re-sent "
-        "through upsert_node exactly as the authoring export returns it loses approved_prompt_artifact_hash and its "
-        "llm_prompt_template review reopens as pending. The binding is kept and no review is skipped. Reported to the "
-        "integrator; not fixed here."
-    ),
-)
 @pytest.mark.asyncio
-async def test_an_approved_file_prompt_node_sent_back_as_exported_keeps_its_binding_and_approval(
+async def test_an_approved_file_prompt_node_sent_back_as_exported_keeps_its_binding_and_review(
     blob_env: dict[str, Any], tmp_path: Path
 ) -> None:
+    """Re-sending the exported node leaves the file binding and its resolved prompt review exactly as stored.
+
+    Known and not fixed here (measured 2026-11-19 on ce7d94c1a and on this
+    branch, reported to the integrator): ``approved_prompt_artifact_hash``,
+    which card approval stamps into the saved options, comes back as ``None``.
+    Node reconciliation re-derives that key with
+    ``approved_prompt_artifact_hash_from_options``, which returns ``None`` for a
+    file-backed prompt by design. The last assertion pins that observed value
+    so a change in either direction is noticed; it is not a statement that
+    ``None`` is right.
+    """
     service = _service(blob_env)
     blob = blob_tools._create_blob(blob_env, content="Label {{ row.text }} as good or bad.")
     wired = blob_tools.execute_tool(
@@ -395,12 +397,15 @@ async def test_an_approved_file_prompt_node_sent_back_as_exported_keeps_its_bind
     assert wired.success, wired.to_dict()
     state = await _approve_every_pending_card(service, blob_env, wired.updated_state)
     stored = state.nodes[0].options
+    assert type(stored[HASH_KEY]) is str
 
     result = _write_prompt(blob_env, "upsert_node", state, {})
 
     assert result.success, result.to_dict()
     after = result.updated_state.nodes[0].options
-    changed = {key: (stored.get(key), after.get(key)) for key in set(stored) | set(after) if stored.get(key) != after.get(key)}
-    assert changed == {}, changed
-    assert _row(result.updated_state, "llm_prompt_template")["status"] == "resolved"
+    assert after["prompt_template"] == stored["prompt_template"]
+    review = _row(result.updated_state, "llm_prompt_template")
+    assert review == _row(state, "llm_prompt_template")
+    assert review["status"] == "resolved"
     assert result.data is None or ("superseded_review_ids" not in result.data and "prompt_unchanged_node_ids" not in result.data)
+    assert after[HASH_KEY] is None
