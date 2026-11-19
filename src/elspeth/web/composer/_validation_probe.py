@@ -174,12 +174,17 @@ def prepare_validation_probe_options(options: Mapping[str, Any], *, plugin: str 
     compare it with the placeholder, refuse, and return the node to zero
     guarantees the moment the user approved. One file-backed position is
     enough to make the effective text unknowable here, so one substitution
-    drops the hash. Execution does the same before it has the bytes:
-    materialization drops the saved hash for a file marker and the run binds
-    the admitted review snapshot's hash to the substituted text, which the
-    config model then re-derives and checks. An inline prompt substitutes
-    nothing, keeps its hash in the projection and is still checked here; so
-    is a malformed marker, which is not substituted.
+    drops the hash. For a file prompt the saved hash has no authority at run
+    time either: ``materialize_state_for_execution`` drops it for a marker,
+    and the run binds the admitted review snapshot's hash after the bytes are
+    substituted (``execution/service.py::_bind_admitted_prompt_artifact_hashes``),
+    which the config model then re-derives and checks. The authoring
+    projection has no re-bind step, so dropping the hash here mirrors the
+    existing behaviour and removes no check; what refuses changed text
+    before a run is the review and its approval rows. An inline prompt
+    substitutes nothing, keeps its hash in the projection and is still
+    checked here; so is a malformed marker, or a well-formed marker of any
+    other mode, neither of which is substituted.
     """
     from elspeth.web.interpretation_state import strip_authoring_options
 

@@ -26,6 +26,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
 from elspeth.core.templates import extract_jinja2_field_usage
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
@@ -289,6 +290,50 @@ def test_malformed_marker_is_not_substituted_and_stays_a_probe_failure(tmp_path:
     assert "contract_probe_deferred" not in warnings
 
 
+@pytest.mark.parametrize("position", ["prompt_template", "system_prompt", "query_template"])
+def test_a_well_formed_marker_of_another_mode_is_not_substituted(tmp_path: Path, position: str) -> None:
+    """Only ``inline_content`` names prompt text; ``bind_source`` is a valid marker and still not a prompt file."""
+    other_mode = {"blob_ref": str(BLOB_ID), "mode": "bind_source"}
+    parsed = is_widened_blob_ref(other_mode)
+    assert parsed is not None and parsed.mode == "bind_source", "control: the marker is well formed, not malformed"
+    if position == "query_template":
+        _, state = _state(
+            tmp_path,
+            prompt_template=None,
+            sink_schema={"mode": "flexible", "fields": ["review: str", "q1_score: int"]},
+            options={"queries": [{**_QUERY, "template": other_mode}], _HASH_KEY: "b" * 64},
+            without=("prompt_template", "response_field"),
+        )
+        prepared = prepare_validation_probe_options(state.nodes[0].options, plugin="llm")
+        assert prepared["queries"][0]["template"] == other_mode
+    else:
+        _, state = _state(tmp_path, prompt_template=GOOD_PROMPT, options={position: other_mode, _HASH_KEY: "b" * 64})
+        prepared = prepare_validation_probe_options(state.nodes[0].options, plugin="llm")
+        assert prepared[position] == other_mode
+
+    summary = state.validate()
+    errors, warnings = _codes(summary)
+
+    assert prepared[_HASH_KEY] == "b" * 64, "nothing was substituted, so the hash stays in the projection"
+    assert not summary.is_valid
+    assert "sink_contract_violation" in errors
+    assert "guarantees: [(none)]" in next(entry.message for entry in summary.errors if entry.error_code == "sink_contract_violation")
+    assert warnings == ["contract_probe_failed"]
+
+
+def test_an_explicit_null_queries_key_is_single_prompt_mode(tmp_path: Path) -> None:
+    """``queries: None`` is single-prompt: the stand-in must read the declared row fields or the config refuses it."""
+    _, state = _state(tmp_path, prompt_template=_marker(), options={"queries": None})
+
+    prepared = prepare_validation_probe_options(state.nodes[0].options, plugin="llm")
+    summary = state.validate()
+
+    assert prepared["queries"] is None
+    assert prepared["prompt_template"] == PROBE_PROMPT_FILE_PLACEHOLDER + " {{ row['review'] }}"
+    assert summary.is_valid, [entry.to_dict() for entry in summary.errors]
+    assert _codes(summary) == ([], [])
+
+
 def test_a_marker_at_a_non_prompt_llm_option_still_defers_with_zero_guarantees(tmp_path: Path) -> None:
     _, state = _state(tmp_path, prompt_template=GOOD_PROMPT, options={"response_field": _marker()})
 
@@ -319,6 +364,12 @@ def test_a_saved_approval_hash_beside_a_file_prompt_is_ignored_by_the_probe_and_
     binds the admitted review snapshot's hash instead, so execution validation
     admits both values here. What refuses a stale approval is the resolved
     review's anchor (``tests/unit/web/sessions/test_approved_file_prompt_keeps_guarantees.py``).
+
+    The run-time half is pinned elsewhere: the drop is
+    ``materialize_state_for_execution`` (``_ensure_prompt_template_hash``) and
+    the re-bind is ``execution/service.py::_bind_admitted_prompt_artifact_hashes``,
+    both exercised by
+    ``tests/unit/web/execution/test_file_prompt_approved_artifact_hash.py``.
     """
     saved = {
         "right": approved_prompt_artifact_hash(prompt_template=GOOD_PROMPT, system_prompt=_SYSTEM_PROMPT),
