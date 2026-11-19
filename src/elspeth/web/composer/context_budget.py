@@ -308,7 +308,10 @@ def decide_context_budget(
     # nothing new were shed. Judging it on the unshed size would shed again on
     # every call once a session had crossed the high mark, pinning the request
     # at the low mark and changing the sent prefix each time. Held keys are
-    # never restored.
+    # never restored. A released segment is restored, not exempt: release is
+    # priced at the policy rate and ``over`` at the anchor's, so a request can
+    # be released yet still over the high mark, and then a released segment
+    # is as eligible to be shed again as one never shed.
     released = fits_low(request_bytes)
     sticky = [segment for segment in segments if segment.key in held or (segment.key in previously_shed and not released)]
     kept = request_bytes - sum(segment.saving_bytes for segment in sticky)
@@ -316,8 +319,9 @@ def decide_context_budget(
 
     shed: list[SheddableSegment] = list(sticky)
     if over:
+        sticky_keys = {segment.key for segment in sticky}
         remaining = sorted(
-            (segment for segment in segments if segment.key not in previously_shed and segment.key not in held),
+            (segment for segment in segments if segment.key not in sticky_keys),
             key=lambda segment: _KIND_RANK[segment.kind],
         )
         after = kept

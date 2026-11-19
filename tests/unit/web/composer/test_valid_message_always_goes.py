@@ -47,6 +47,10 @@ from tests.unit.web.composer.test_compose_loop_llm_audit import (
     _mock_catalog,
     _passing_preflight,
 )
+from tests.unit.web.composer.test_duplicate_consumer_repair_llm_consumer import _state_with_resolved_llm_consumer
+from tests.unit.web.composer.test_tools import _llm_options_with_api_key
+from tests.unit.web.composer.test_tools import _mock_catalog as _tools_catalog
+from tests.unit.web.composer.test_tools import execute_tool as _execute_tool
 
 _SETTING = 200_000
 # A setting the fixed part of any request is over, at today's pricing and at one token per three bytes alike.
@@ -520,3 +524,56 @@ async def test_every_plugin_allowlisted_two_discovery_results_in_the_latest_roun
     budget = result.llm_calls[1].context_budget
     assert budget is not None
     assert budget.over_estimate is (budget.estimated_tokens_after > _SETTING)
+
+
+# The enclave's shape: one LLM step carrying 32 queries of about 15.6 KB each, about 500 KB of options.
+# Each template is 15,854 UTF-8 bytes and holds one "{{" and no "{%", inside the 16 KiB per-template cap.
+_ENCLAVE_TEMPLATE = "Exact original synthetic prompt. " * 480 + "{{ row.text }}"
+_ENCLAVE_QUERY_COUNT = 32
+
+
+def _enclave_shape_state() -> CompositionState:
+    """Built the way the enclave's own fixture builds it: through ``upsert_node``, so the step validates."""
+    state = _state_with_resolved_llm_consumer()
+    options = _llm_options_with_api_key({"secret_ref": "OPENROUTER_API_KEY"})
+    options["required_input_fields"] = ["text"]
+    options["max_capacity_retry_seconds"] = 30
+    options["queries"] = [
+        {"name": f"q{index}", "input_fields": {"text": "text"}, "template": _ENCLAVE_TEMPLATE} for index in range(_ENCLAVE_QUERY_COUNT)
+    ]
+    upsert = {"id": "a", "node_type": "transform", "plugin": "llm", "input": "shared", "on_success": "out_a", "on_error": "discard"}
+    result = _execute_tool("upsert_node", upsert | {"options": options}, state, _tools_catalog())
+    assert result.success, [(error.error_code, error.message) for error in result.validation.errors]
+    return result.updated_state
+
+
+@pytest.mark.asyncio
+async def test_a_turn_carrying_the_enclave_shape_32_query_llm_step_is_sent() -> None:
+    """The enclave's shape at a setting of 200,000: every call is sent whole, over the estimate, under the byte maximum.
+
+    The fixture's step carries a pending model-choice review, so the loop answers the model's "Done." with a
+    review nudge and calls again; each of those calls carries the whole step too. Nothing is sheddable on
+    the first call, so the size alone decides: about 770 KB, about 257,000 estimated tokens at 3.0 bytes per token.
+    """
+    state = _enclave_shape_state()
+    assert len(_ENCLAVE_TEMPLATE.encode("utf-8")) == 15_854
+    assert 500_000 <= state_bytes(state) <= 560_000
+    service, session_id = _service()
+    provider = _RecordingProvider(*[_make_llm_response(content="Done.") for _ in range(6)])
+
+    result = await _compose(service, session_id, provider, state=state)
+
+    assert 1 <= len(provider.requests) == len(result.llm_calls)
+    assert _current_request(provider.requests[0]) == _MESSAGE
+    for request, call in zip(provider.requests, result.llm_calls, strict=True):
+        # Every query's template reaches the model whole.
+        (step,) = [node for node in _state_context(request["messages"])["current_state"]["nodes"] if node["id"] == "a"]
+        assert [query["template"] for query in step["options"]["queries"]] == [_ENCLAVE_TEMPLATE] * _ENCLAVE_QUERY_COUNT
+        # The record: the request's size, and that it went over the estimate.
+        budget = call.context_budget
+        assert budget is not None
+        assert budget.request_wire_bytes == _wire_bytes(request)
+        assert 760_000 <= budget.request_wire_bytes <= 800_000
+        assert budget.max_prompt_tokens == _SETTING
+        assert budget.estimated_tokens_after > _SETTING
+        assert budget.over_estimate is True
