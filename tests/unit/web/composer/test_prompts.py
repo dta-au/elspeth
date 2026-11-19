@@ -676,6 +676,7 @@ class TestBuildSystemPrompt:
         assert "### Complex New Pipeline Batching" in result
         assert "After establishing source facts and loading the selected components' live schemas" in flattened
         assert "Use one complete `set_pipeline` when the requested graph has five nodes or fewer" in flattened
+        assert "Send a whole `set_pipeline` only to build or rebuild a pipeline of five steps or fewer" in flattened
         assert "For a larger graph or substantial component configuration, use bounded batches" in flattened
         assert "`set_source`, `set_output`, `upsert_node`, `upsert_edge`, and focused option patches" in flattened
         assert "instead of holding the entire build in one large generation" in flattened
@@ -733,12 +734,14 @@ class TestBuildSystemPrompt:
         assert "Do not report a source-review handoff mismatch merely because there is no transform node named `source`" in flattened
         assert "never summarize, reformat, or describe it as" in flattened
         assert "A missing or mismatched handoff is not a product blocker when the matching pending requirement exists" in flattened
-        assert "retry its exact kind, `user_term` and `draft`" in flattened
+        assert "retry with its exact `kind` and `user_term`, and omit `llm_draft`" in flattened
+        assert "exact `draft`" not in flattened
         assert "mutation's `applied_component` first to find the exact pending requirement" in flattened
         assert (
             "when that mutation omitted the echo or its echo does not cover the affected component, call `get_pipeline_state`" in flattened
         )
-        assert "Then retry only if a matching pending requirement exists, using its exact draft" in flattened
+        assert "Then retry only if a matching pending requirement exists, omitting `llm_draft`" in flattened
+        assert "using its exact draft" not in flattened
         assert "If it is resolved, continue without another review call" in flattened
         assert "If it is absent, establish whether the current change actually requires a new review before staging one" in flattened
         assert "missing-pending-site rejection alone is not evidence that a review is needed" in flattened
@@ -888,13 +891,12 @@ class TestBuildSystemPrompt:
         assert "Did I define how a subjective user criterion will be operationalized?" in result
         assert "audit your own choices before staging the node" in flattened
         assert (
-            'If the answer to any question is yes, stage a pending `kind="vague_term"` requirement on that same LLM node before `set_pipeline`'
+            'If the answer to any question is yes, stage a pending `kind="vague_term"` requirement on that same LLM node and, '
+            "in that SAME mutation, set `prompt_template_parts` on the node with an `interpretation_ref` slot wiring that requirement"
             in flattened
         )
-        assert (
-            "in that SAME `set_pipeline`, set `prompt_template_parts` on the node with an `interpretation_ref` slot wiring that requirement"
-            in flattened
-        )
+        assert "in the same `set_pipeline`" not in flattened
+        assert "SAME `set_pipeline`" not in flattened
         assert "`request_interpretation_review` after the state mutation succeeds" in flattened
         assert "Such semantics need their own review card even when they would otherwise appear only as wording in the prompt" in flattened
         assert "LLM node preflight has four independent review checks" in result
@@ -1587,6 +1589,12 @@ class TestReplyRegisterRule:
     def test_termination_checklist_includes_the_register_line(self) -> None:
         checklist = SYSTEM_PROMPT.split("## Termination States", 1)[1]
         assert "no tool-argument keys, validation fields, or enum values in prose" in checklist
+
+    def test_termination_states_include_the_approval_stop(self) -> None:
+        states = " ".join(SYSTEM_PROMPT.split("## Termination States", 1)[1].split())
+        assert "A change you sent is a proposal awaiting the user's approval (`APPROVAL_REQUIRED`)" in states
+        assert "Another tool call is needed; keep working." not in states
+        assert "OR a change awaiting the user's approval" in " ".join(SYSTEM_PROMPT.split())
 
 
 class TestSkillFollowsCurrentToolBehaviour:
