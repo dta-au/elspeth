@@ -524,9 +524,10 @@ step needs the same rows, build a fork yourself: `upsert_node` a gate
 connection and whose `fork_to` lists one new branch name per step (at most
 32), and `upsert_node` each step with `input` set to its own branch. An
 aggregation or a coalesce cannot read a fork branch directly: add a relay on its
-branch, a `field_mapper` transform (`options`
-`{"schema": {"mode": "observed"}}`, `input` the branch, `on_success` a new
-connection, `on_error` as on any transform), and have the step read that
+branch, a transform that passes each row through unchanged (one the catalog
+offers, configured to change nothing, its `schema` `{"mode": "observed"}`;
+`input` the branch, `on_success` a new connection, `on_error` as on any
+transform), and have the step read that
 connection: an aggregation through `input`, a coalesce through the value of its
 `branches` entry, key kept. A row union cannot read a fork branch, even through
 a relay: build no fork for it and tell the user. The gate id, the relay ids and
