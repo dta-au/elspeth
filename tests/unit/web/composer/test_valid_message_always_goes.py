@@ -22,7 +22,7 @@ from elspeth.web.composer.context_budget import CONTEXT_BUDGET_TOOL_RESULT_STUB
 from elspeth.web.composer.prompts import STATE_CONTEXT_PREFIX
 from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerHistoryMessage
 from elspeth.web.composer.service import ComposerServiceImpl
-from elspeth.web.composer.state import CompositionState, PipelineMetadata, ValidationSummary
+from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec, ValidationSummary
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.credential_guard import CredentialMaterialRefused
 from tests.unit.web.composer._helpers import _clean_advisor_checkpoint, _composer_service_with_session
@@ -47,7 +47,6 @@ from tests.unit.web.composer.test_compose_loop_llm_audit import (
     _mock_catalog,
     _passing_preflight,
 )
-from tests.unit.web.composer.test_duplicate_consumer_repair_llm_consumer import _state_with_resolved_llm_consumer
 from tests.unit.web.composer.test_tools import _llm_options_with_api_key
 from tests.unit.web.composer.test_tools import _mock_catalog as _tools_catalog
 from tests.unit.web.composer.test_tools import execute_tool as _execute_tool
@@ -536,7 +535,25 @@ _INLINE_QUERY_COUNT = 32
 
 def _inline_worst_case_state() -> CompositionState:
     """Built through ``upsert_node``, so the step passes the same validation an authored step does."""
-    state = _state_with_resolved_llm_consumer()
+    state = (
+        _empty_state()
+        .with_source(
+            SourceSpec(
+                plugin="csv",
+                on_success="shared",
+                options={"path": "/data/in.csv", "schema": {"mode": "fixed", "fields": ["text: str"]}},
+                on_validation_failure="quarantine",
+            )
+        )
+        .with_output(
+            OutputSpec(
+                name="out_a",
+                plugin="csv",
+                options={"path": "outputs/out_a.csv"},
+                on_write_failure="discard",
+            )
+        )
+    )
     options = _llm_options_with_api_key({"secret_ref": "OPENROUTER_API_KEY"})
     options["required_input_fields"] = ["text"]
     options["max_capacity_retry_seconds"] = 30
