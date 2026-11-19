@@ -1541,6 +1541,31 @@ IMPORT_BLOB_REFERENCE_MALFORMED = "import_blob_reference_malformed"
 IMPORT_PROMPT_FILE_UNVERIFIED = "import_prompt_file_unverified"
 
 
+_REFUSAL_FIELD_PATH_LIMIT = 5
+_REFUSAL_FIELD_PATH_MAX_CHARS = 120
+_REFUSAL_FIELD_PATH_UNSAFE = re.compile(r"[^A-Za-z0-9_.:-]")
+
+
+def _bounded_field_path_list(field_paths: tuple[str, ...]) -> str:
+    """Render field paths for a refusal message: a fixed number, each of fixed length.
+
+    At most ``_REFUSAL_FIELD_PATH_LIMIT`` paths are shown, followed by a count
+    of the rest. Each is cut to ``_REFUSAL_FIELD_PATH_MAX_CHARS`` characters
+    (the cut is marked ``...``), and every character outside letters, digits
+    and ``_ . : -`` becomes ``?``, so a name can neither break the sentence
+    nor carry markup, whitespace or control characters into it.
+    """
+    shown = []
+    for field_path in field_paths[:_REFUSAL_FIELD_PATH_LIMIT]:
+        safe = _REFUSAL_FIELD_PATH_UNSAFE.sub("?", field_path)
+        if len(safe) > _REFUSAL_FIELD_PATH_MAX_CHARS:
+            safe = f"{safe[:_REFUSAL_FIELD_PATH_MAX_CHARS]}..."
+        shown.append(safe)
+    rendered = ", ".join(shown)
+    remaining = len(field_paths) - len(shown)
+    return f"{rendered} and {remaining} more" if remaining else rendered
+
+
 def _import_prompt_file_review_refusal(state: CompositionState) -> HTTPException:
     """Say why an imported prompt file's review card could not be written.
 
@@ -1554,7 +1579,9 @@ def _import_prompt_file_review_refusal(state: CompositionState) -> HTTPException
 
     Malformed reference (400): some ``blob_ref`` mapping in the YAML is not a
     complete file marker, so no file in the state could be read. The field
-    paths are named; values are not echoed.
+    paths are named; values are not echoed. A path is built from names the
+    YAML's author chose (node ids, source and sink names, option keys), so
+    the list is bounded by :func:`_bounded_field_path_list`.
 
     Unverified file (409): every marker is well-formed, but a prompt file's
     stored contents did not match its marker or could not be read back.
@@ -1566,7 +1593,8 @@ def _import_prompt_file_review_refusal(state: CompositionState) -> HTTPException
             detail={
                 "error_code": IMPORT_BLOB_REFERENCE_MALFORMED,
                 "message": (
-                    f"Imported YAML holds a file reference that is not a complete file marker at: {', '.join(malformed)}. "
+                    "Imported YAML holds a file reference that is not a complete file marker at: "
+                    f"{_bounded_field_path_list(malformed)}. "
                     "Nothing was imported. A file reference inside options needs blob_ref, mode: inline_content and the "
                     "file's sha256; or remove it from the YAML, import again and attach the file in this session."
                 ),
@@ -1579,8 +1607,9 @@ def _import_prompt_file_review_refusal(state: CompositionState) -> HTTPException
             "message": (
                 "Imported YAML binds a prompt file that could not be verified against its reference (the file is "
                 "missing, not ready, or its contents differ from the sha256 in the YAML), so its review could not be "
-                "prepared. Nothing was imported. Bind the file again through the import's file bindings, or upload "
-                "it to this session again, then import again."
+                "prepared. Nothing was imported. Remove that file reference from the YAML and import again, then "
+                "attach the file to the prompt in this session. An API caller can instead bind the file by id in "
+                "inline_blob_bindings."
             ),
         },
     )

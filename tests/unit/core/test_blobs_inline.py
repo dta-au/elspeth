@@ -334,6 +334,38 @@ class TestDiscoverBlobContentRefs:
 
         assert exc_info.value.malformed == ((f"{prefix}.options.notes", "missing mode"),)
 
+    @pytest.mark.parametrize("binding", [{}, {"mode": "bind_source"}], ids=["unmoded", "bind_source"])
+    def test_valid_marker_nested_under_a_source_binding_is_still_found(self, binding: dict[str, str]) -> None:
+        """The binding shape excuses the source options mapping itself, never anything beneath it."""
+        options = {
+            "blob_ref": BLOB1,
+            "path": "/data/blobs/s/input.csv",
+            **binding,
+            "header": _marker(BLOB2),
+            "nested": {"deeper": [{"template": _marker(BLOB3)}]},
+        }
+        config = {"sources": {"main": {"plugin": "csv", "options": options}}}
+
+        refs = _discover_blob_content_refs(config)
+
+        assert sorted((ref.field_path, str(ref.blob_id)) for ref in refs) == [
+            ("source:main.options.header", BLOB2),
+            ("source:main.options.nested.deeper.0.template", BLOB3),
+        ]
+
+    def test_unmoded_binding_shape_one_level_below_source_options_is_malformed(self) -> None:
+        """A walker that carried the excuse down to children would accept this."""
+        options = {
+            "blob_ref": BLOB1,
+            "path": "/data/blobs/s/input.csv",
+            "extra": {"blob_ref": BLOB2, "path": "/data/blobs/s/other.csv"},
+        }
+
+        with pytest.raises(BlobContentResolutionError) as exc_info:
+            _discover_blob_content_refs({"sources": {"main": {"plugin": "csv", "options": options}}})
+
+        assert exc_info.value.malformed == (("source:main.options.extra", "missing mode"),)
+
     @pytest.mark.parametrize(
         ("options", "reason"),
         [

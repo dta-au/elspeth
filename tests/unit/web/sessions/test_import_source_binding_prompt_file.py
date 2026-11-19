@@ -26,6 +26,7 @@ from sqlalchemy import select
 from elspeth.contracts.composer_interpretation import InterpretationKind, InterpretationSurfaceOrigin
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.blobs_inline import _discover_blob_content_refs
+from elspeth.web.blobs.prompt_text_routes import create_prompt_text_router
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.composer._validation_probe import _PROBE_PROMPT_FILE_PLACEHOLDER, prepare_validation_probe_options
 from elspeth.web.composer.interpretation_surfacing import surface_pending_interpretation_reviews_for_state
@@ -34,6 +35,7 @@ from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.models import prompt_file_approvals_table
 from elspeth.web.sessions.prompt_file_review import PROMPT_FILE_CHANGED_MESSAGE, PromptFileReviewStale
 from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.web.sessions.routes.composer.state import _bounded_field_path_list
 from elspeth.web.sessions.routes.sessions import _rewrite_source_blob_options
 from tests.helpers.prompt_review import accept_body
 from tests.helpers.session_fences import fenced_operation_context
@@ -473,3 +475,129 @@ async def test_import_reports_an_unverifiable_prompt_file_under_its_own_code(tmp
     assert PROMPT_FILE_CHANGED_MESSAGE not in detail["message"]
     assert await env.service.get_current_state(session_id) is None
     assert await env.pending(session_id) == []
+
+
+@pytest.mark.asyncio
+async def test_unverified_import_recovers_by_binding_the_file_in_the_request(tmp_path: Path) -> None:
+    """The 409's own instruction, performed: drop the pasted marker, bind the file by id, import again."""
+    env = _Env(tmp_path)
+    session_id = await env.session()
+    csv = await env.upload(session_id, "reviews.csv", CSV, "text/csv")
+    user = await env.upload(session_id, "user.txt", USER, "text/plain")
+    marker = f"    prompt_template:\n      blob_ref: {user.id}\n      mode: inline_content\n      sha256: {'c' * 64}\n"
+    refused = env.import_yaml(session_id, {"yaml": _yaml(node_extra=INLINE_SYSTEM + marker), "source_blob_ids": {"source": str(csv.id)}})
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["error_code"] == "import_prompt_file_unverified"
+    assert refused.json()["detail"]["message"] == (
+        "Imported YAML binds a prompt file that could not be verified against its reference (the file is "
+        "missing, not ready, or its contents differ from the sha256 in the YAML), so its review could not be "
+        "prepared. Nothing was imported. Remove that file reference from the YAML and import again, then "
+        "attach the file to the prompt in this session. An API caller can instead bind the file by id in "
+        "inline_blob_bindings."
+    )
+
+    response = env.import_yaml(
+        session_id,
+        {
+            "yaml": _yaml(node_extra=INLINE_SYSTEM),
+            "source_blob_ids": {"source": str(csv.id)},
+            "inline_blob_bindings": {PROMPT_SLOT: {"blob_id": str(user.id)}},
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    snapshot = await env.approve_prompt_card(session_id)
+    assert [(binding["field_path"], binding["blob_id"]) for binding in snapshot["bindings"]] == [("prompt_template", str(user.id))]
+
+
+# ── The 400's message: pinned, bounded, values never echoed ────────────────
+
+_MALFORMED_MESSAGE = (
+    "Imported YAML holds a file reference that is not a complete file marker at: {paths}. "
+    "Nothing was imported. A file reference inside options needs blob_ref, mode: inline_content and the "
+    "file's sha256; or remove it from the YAML, import again and attach the file in this session."
+)
+_LONG_KEY = "k" * 400
+_HOSTILE_KEY = "sk-live <b>x</b>\tAKIA{}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sink_extra", "shown"),
+    [
+        pytest.param("      blob_ref: BLOB\n      path: outputs/x.json\n", "output:main.options", id="plain"),
+        pytest.param(
+            f"      {_LONG_KEY}:\n        blob_ref: BLOB\n",
+            f"output:main.options.{'k' * 100}...",
+            id="very-long-key",
+        ),
+        pytest.param(
+            f'      "{_HOSTILE_KEY}":\n        blob_ref: BLOB\n',
+            "output:main.options.sk-live??b?x??b??AKIA??",
+            id="hostile-key",
+        ),
+    ],
+)
+async def test_malformed_reference_message_is_pinned_and_bounded(tmp_path: Path, sink_extra: str, shown: str) -> None:
+    """The whole message, byte for byte: the field path is cut and its unsafe characters replaced."""
+    env = _Env(tmp_path)
+    session_id = await env.session()
+    csv = await env.upload(session_id, "reviews.csv", CSV, "text/csv")
+    user = await env.upload(session_id, "user.txt", USER, "text/plain")
+    stray = await env.upload(session_id, "stray.txt", SYSTEM, "text/plain")
+
+    response = env.import_yaml(
+        session_id,
+        {
+            "yaml": _yaml(node_extra=INLINE_SYSTEM, sink_extra=sink_extra).replace("BLOB", str(stray.id)).replace(_SINK_PLUGIN_MODE, ""),
+            "source_blob_ids": {"source": str(csv.id)},
+            "inline_blob_bindings": {PROMPT_SLOT: {"blob_id": str(user.id)}},
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    detail = response.json()["detail"]
+    assert detail["error_code"] == "import_blob_reference_malformed"
+    assert detail["message"] == _MALFORMED_MESSAGE.format(paths=shown)
+    assert len("output:main.options.") + 100 == 120
+    assert str(stray.id) not in detail["message"]
+    assert await env.service.get_current_state(session_id) is None
+
+
+def test_malformed_reference_list_shows_five_paths_then_a_count() -> None:
+    paths = tuple(f"node:step_{index}.options.prompt_template" for index in range(8))
+
+    assert _bounded_field_path_list(paths) == ", ".join(paths[:5]) + " and 3 more"
+    assert _bounded_field_path_list(paths[:5]) == ", ".join(paths[:5])
+    assert _bounded_field_path_list(("a\nb, c<d>", "x" * 121)) == f"a?b??c?d?, {'x' * 120}..."
+    longest = len(_MALFORMED_MESSAGE.format(paths=_bounded_field_path_list(tuple("y" * 5000 for _ in range(50)))))
+    assert longest == len(_MALFORMED_MESSAGE.format(paths="")) + 5 * 123 + 4 * 2 + len(" and 45 more")
+
+
+@pytest.mark.asyncio
+async def test_inspector_save_approves_a_prompt_file_beside_an_unmoded_source(tmp_path: Path) -> None:
+    """The inspector's Save, on a session whose stored source binding has no ``mode``: no data change first."""
+    env = _Env(tmp_path)
+    env.app.include_router(create_prompt_text_router())
+    session_id, csv = await _session_holding_unmoded_source(env)
+    user = await env.upload(session_id, "user.txt", USER, "text/plain")
+    await _wire_prompt_file_and_surface(env, session_id, str(user.id))
+    pending_card = env.client.put(
+        f"/api/sessions/{session_id}/blobs/{user.id}/prompt-text",
+        json={"content": "x", "expected_sha256": user.content_hash, "node_id": NODE, "field_path": "prompt_template"},
+    )
+    # Bound from inline text, so the card comes first: the editor's ordinary rule, not this defect.
+    assert (pending_card.status_code, pending_card.json()["detail"]["error_code"]) == (409, "prompt_file_review_pending_inline")
+    await env.approve_prompt_card(session_id)
+    edited = USER.decode() + "Answer with the number only.\n"
+
+    response = env.client.put(
+        f"/api/sessions/{session_id}/blobs/{user.id}/prompt-text",
+        json={"content": edited, "expected_sha256": user.content_hash, "node_id": NODE, "field_path": "prompt_template"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["changed"] is True
+    assert env.approval_rows(session_id) == [(NODE, "prompt_template", "card"), (NODE, "prompt_template", "editor_save")]
+    options = await env.source_options(session_id)
+    assert options["blob_ref"] == str(csv.id) and "mode" not in options
