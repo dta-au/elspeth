@@ -3259,7 +3259,7 @@ async def _build_valid_pipeline_plan(
     # Stage-2 verdict for a pipeline that is not the one being proposed.
     candidate_state = candidate.result.updated_state
     custody_result: PipelineCustodyResult = "not_required"
-    if candidate.prepared_inline_blob is not None:
+    if candidate.prepared_inline_blob is not None or candidate.prepared_prompt_blobs:
         if custody_config.session_engine is None:
             raise AuditIntegrityError("inline pipeline custody requires session_engine")
         preparation = prepare_pipeline_custody(
@@ -3267,6 +3267,7 @@ async def _build_valid_pipeline_plan(
             candidate.prepared_inline_blob,
             session_id=originating_message.session_id,
             max_storage_per_session=custody_config.max_storage_per_session,
+            prompt_blobs=candidate.prepared_prompt_blobs,
         )
         await _await_custody_settlement(
             finalize_pipeline_custody(
@@ -3290,7 +3291,7 @@ async def _build_valid_pipeline_plan(
             current_state,
             safe_context,
         )
-        if not safe_candidate.acceptable or safe_candidate.prepared_inline_blob is not None:
+        if not safe_candidate.acceptable or safe_candidate.prepared_inline_blob is not None or safe_candidate.prepared_prompt_blobs:
             raise AuditIntegrityError("custody-safe pipeline failed canonical revalidation")
         candidate_state = safe_candidate.result.updated_state
         custody_result = "ready"

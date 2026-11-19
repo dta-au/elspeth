@@ -32,6 +32,7 @@ from elspeth.contracts.freeze import deep_freeze, deep_thaw
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.composer.inline_prompt_limit import inline_prompt_refusal_message, new_long_inline_prompt
 from elspeth.web.composer.protocol import (
     REQUEST_INTERPRETATION_REVIEW_KIND_VALUES,
     SCHEMA_VIOLATION_MAX_LOC_DEPTH,
@@ -995,6 +996,16 @@ def execute_tool(
         effects=effects,
         prior_state=state,
     )
+    if session_id is not None and executing_proposal_id is None and result.success:
+        long_prompt = new_long_inline_prompt(state, result.updated_state)
+        if long_prompt is not None:
+            node_id, field, words, characters = long_prompt
+            result = _saved_graph_rejection_result(
+                state,
+                inline_prompt_refusal_message(field, words, characters),
+                error_code="inline_prompt_too_long",
+                rejected_component=f"node:{node_id}",
+            )
 
     return finalize_tool_result(
         result,

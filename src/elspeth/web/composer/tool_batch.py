@@ -1922,7 +1922,7 @@ async def run_tool_batch(
                     decoded_args_by_call_id[tool_call.id] = audit_arguments
                     transcript_arguments = (
                         redact_tool_call_arguments(tool_name, arguments, telemetry=ctx.redaction_telemetry)
-                        if candidate.prepared_inline_blob is not None
+                        if candidate.prepared_inline_blob is not None or candidate.prepared_prompt_blobs
                         else audit_arguments
                     )
                     _replace_llm_tool_call_arguments(
@@ -1936,6 +1936,7 @@ async def run_tool_batch(
                 if (
                     candidate.acceptable
                     and candidate.prepared_inline_blob is None
+                    and not candidate.prepared_prompt_blobs
                     and composition_content_hash(candidate.result.updated_state) == composition_content_hash(state)
                 ):
                     finalized_candidate_result = finalize_tool_result(
@@ -2049,7 +2050,9 @@ async def run_tool_batch(
                             _replace_llm_tool_call_arguments(
                                 llm_messages,
                                 tool_call_id=tool_call.id,
-                                arguments=redacted_arguments if candidate.prepared_inline_blob is not None else audit_arguments,
+                                arguments=redacted_arguments
+                                if candidate.prepared_inline_blob is not None or candidate.prepared_prompt_blobs
+                                else audit_arguments,
                                 dialect=ctx.tool_contract_dialect,
                                 semantic=True,
                             )
@@ -2065,6 +2068,7 @@ async def run_tool_batch(
                         if (
                             proposal_acceptable
                             and candidate.prepared_inline_blob is None
+                            and not candidate.prepared_prompt_blobs
                             and composition_content_hash(finalized_candidate_result.updated_state) == composition_content_hash(state)
                         ):
                             unapplied_admission = _unapplied_admission(
@@ -2075,7 +2079,7 @@ async def run_tool_batch(
                                 runtime_preflight=last_runtime_preflight,
                             )
                             redacted_arguments = None
-                        if proposal_acceptable and candidate.prepared_inline_blob is not None:
+                        if proposal_acceptable and (candidate.prepared_inline_blob is not None or candidate.prepared_prompt_blobs):
                             if proposals_this_turn >= _MAX_PENDING_PROPOSALS_PER_TURN:
                                 raise _pending_proposal_cap_error(
                                     proposals_this_turn + 1,
@@ -2090,6 +2094,7 @@ async def run_tool_batch(
                                 candidate.prepared_inline_blob,
                                 session_id=session_id,
                                 max_storage_per_session=ctx.custody.max_blob_storage_per_session_bytes,
+                                prompt_blobs=candidate.prepared_prompt_blobs,
                             )
 
                             # From this point forward every authority-bearing

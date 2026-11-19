@@ -432,6 +432,8 @@ def inline_custody_blob_id(request: InlineCustodyRequest) -> UUID:
             "composer_skill_hash": fields["creating_composer_skill_hash"],
         },
     }
+    if request.identity_arguments_hash is not None:
+        identity["safe_arguments_hash"] = request.identity_arguments_hash
     return uuid5(_INLINE_CUSTODY_NAMESPACE, canonical_json(identity))
 
 

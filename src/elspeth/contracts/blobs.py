@@ -207,6 +207,7 @@ class InlineCustodyRequest:
     creating_provider: str | None
     creating_composer_skill_hash: str | None
     creating_arguments_hash: str | None
+    identity_arguments_hash: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

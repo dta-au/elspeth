@@ -1580,6 +1580,11 @@ def _direct_plugin_policy_guidance() -> tuple[DirectValidationGuidance, ...]:
 
 _DIRECT_VALIDATION_GUIDANCE: Final = (
     DirectValidationGuidance(
+        "inline_prompt_too_long",
+        "New or changed inline LLM prompt text exceeds 100 words or 1,000 prose characters.",
+        "Put the complete text in a UTF-8 text file and bind the file. In set_pipeline, use an inline_blob member at the prompt field.",
+    ),
+    DirectValidationGuidance(
         "edge_not_found",
         "The requested edge is not present in the saved composition. No removal was applied.",
         "Inspect the current edges and retry the intended exact edge ID. Preserve unrelated nodes, routes and edges; do not remove a different edge to silence this refusal.",
