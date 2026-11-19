@@ -458,11 +458,12 @@ async def _approval_containment_refusal(
             # checks is included: the wording is true of every call whatever
             # each one's own result says.
             f"This session requires approval for pipeline changes and this response carried {staged} pipeline-change "
-            "calls. None of them was applied and no proposal was recorded. Separate proposals are each "
-            "drawn against the same saved pipeline, so the user could only ever accept one of them. Submit the whole "
-            "intended result as one change: a single set_pipeline call containing every edit, with no other pipeline "
-            "mutation in the same response. create_blob is not a pipeline change: in an earlier response, create the "
-            "file for the prompt; then send the one call carrying its marker.",
+            "calls. None of them was applied and no proposal was recorded: only one proposal can await the user at a "
+            "time. Send the first change alone, then tell the user what follows; send each next change after the one "
+            "before it is accepted. A pipeline between changes does not have to validate: a change that leaves "
+            "errors is still recorded as a proposal, and the errors clear with the last change. "
+            "create_blob is not a pipeline change: in an earlier response, create the file "
+            "for the prompt; then send the one call carrying its marker.",
         )
     if staged == 1:
         pending = [
