@@ -27,6 +27,8 @@ import type { CompositionState } from "@/types/index";
 import type { InterpretationEvent, PromptReviewSnapshotResponse } from "@/types/interpretation";
 import { getPromptReviewSnapshot } from "@/api/client";
 import { Button } from "@/components/ui";
+import { promptQueryCopyName, promptQueryEntries } from "@/lib/blobBindings";
+import { PromptCopyButton } from "@/components/inspector/PromptCopyButton";
 import { CodeBlock } from "./CodeBlock";
 import {
   PENDING_INTERPRETATION_DISPLAY_TEXT,
@@ -728,6 +730,22 @@ export function AcknowledgementCard({
                 });
               })()}
             </pre>
+            {promptReview.status === "ready" && (() => {
+              const surface = promptReview.snapshot.authored_surface;
+              return <>
+                {typeof surface.system_prompt === "string" && (
+                  <PromptCopyButton value={surface.system_prompt} label="system prompt" showLabel />
+                )}
+                {typeof surface.prompt_template === "string" && (
+                  <PromptCopyButton value={surface.prompt_template} label="user prompt template" showLabel />
+                )}
+                {promptQueryEntries(surface.queries).map((query) =>
+                  typeof query.entry.template === "string" ? (
+                    <PromptCopyButton key={query.selector} value={query.entry.template} label={`prompt template for query ${promptQueryCopyName(query)}`} showLabel />
+                  ) : null,
+                )}
+              </>;
+            })()}
             {promptHasSlot && (
               <p className="ack-card-prompt-pending-note">
                 A marked term is reviewed in its own card, which approves its

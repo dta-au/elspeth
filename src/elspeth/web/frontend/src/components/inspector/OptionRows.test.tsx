@@ -1,4 +1,4 @@
-import { act, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { usePreferencesStore } from "@/stores/preferencesStore";
@@ -568,10 +568,95 @@ describe("catalog-tier ordering (elspeth-a6ea581e8a follow-up)", () => {
 describe("llm prompt roles", () => {
   const LLM = { kind: "transform", name: "llm" } as const;
 
+  it("copies exact inline system, user, and query strings", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    const system = "  Système\nλ  ";
+    const user = " \nUser 🐈\n ";
+    const query = "\tQuery café\n ";
+    render(<OptionRows options={{ system_prompt: system, prompt_template: user, queries: { one: { template: query } } }} ariaLabel="copy options" plugin={LLM} />);
+    fireEvent.click(screen.getByRole("button", { name: "Copy system prompt" }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy prompt template for query one" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledTimes(2));
+    expect(writeText.mock.calls[0][0]).toBe(system);
+    expect(writeText.mock.calls[1][0]).toBe(query);
+    // The node-level field is shown only for a single-query step.
+    const { unmount } = render(<OptionRows options={{ prompt_template: user }} ariaLabel="single options" plugin={LLM} />);
+    fireEvent.click(screen.getByRole("button", { name: "Copy user prompt template" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledTimes(3));
+    expect(writeText.mock.calls[2][0]).toBe(user);
+    unmount();
+  });
+
+  it.each([
+    ["distinct names", [{ name: "one", template: "A" }, { name: "two", template: "B" }], ["one", "two"]],
+    ["repeated names", [{ name: "same", template: "A" }, { name: "same", template: "B" }], ["same", "same"]],
+    ["named and unnamed collision", [{ name: "#1", template: "A" }, { template: "B" }], ["#1", "#1"]],
+    ["literal position collision", [{ name: "same", template: "A" }, { name: "same", template: "B" }, { name: "same (position 1)", template: "C" }], ["same", "same", "same (position 1)"]],
+  ])("gives every list query a unique positional label for %s and copies its value", async (_case, queries, names) => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    render(<OptionRows options={{ queries }} ariaLabel="duplicate options" plugin={LLM} />);
+    const buttons = screen.getAllByRole("button", { name: /^Copy prompt template for query / });
+    const labels = buttons.map((button) => button.getAttribute("aria-label"));
+    expect(labels).toEqual(names.map((name, index) => `Copy prompt template for query ${name} (position ${index + 1})`));
+    expect(new Set(labels).size).toBe(labels.length);
+    buttons.forEach((button) => fireEvent.click(button));
+    await waitFor(() => expect(writeText.mock.calls.map((call) => call[0])).toEqual(queries.map((query) => query.template)));
+  });
+
+  it("does not offer copy for file markers or missing prompts", () => {
+    render(<OptionRows options={{ system_prompt: { mode: "inline_content", blob_ref: FILE_ID }, prompt_template: "   \n" }} ariaLabel="file options" plugin={LLM} />);
+    expect(screen.queryByRole("button", { name: /^Copy / })).not.toBeInTheDocument();
+  });
+
+  it("copies the stored node template when a query uses its fallback", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    const fallback = "  shared\nλ  ";
+    render(<OptionRows options={{ system_prompt: "system", prompt_template: fallback, queries: { one: {} } }} ariaLabel="fallback options" plugin={LLM} />);
+    fireEvent.click(screen.getByRole("button", { name: "Copy prompt template for query one" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(fallback));
+  });
+
+  it("shows failure rather than copied after clipboard rejection", async () => {
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: vi.fn().mockRejectedValue(new Error("denied")) } });
+    render(<OptionRows options={{ system_prompt: "hello" }} ariaLabel="failure options" plugin={LLM} />);
+    fireEvent.click(screen.getByRole("button", { name: "Copy system prompt" }));
+    expect(await screen.findByText("Copy failed")).toBeInTheDocument();
+    expect(screen.queryByText("Copied")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Copy failed for system prompt");
+  });
+
+  it("announces success, resets feedback, and keeps focus on the button", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    render(<OptionRows options={{ system_prompt: "hello" }} ariaLabel="feedback options" plugin={LLM} />);
+    const button = screen.getByRole("button", { name: "Copy system prompt" });
+    button.focus();
+    vi.useFakeTimers();
+    try {
+      await act(async () => { fireEvent.click(button); });
+      expect(button).toHaveFocus();
+      expect(button).toHaveTextContent("Copied");
+      expect(screen.getByRole("status")).toHaveTextContent("Copied system prompt");
+      act(() => { vi.advanceTimersByTime(2000); });
+      expect(button).toHaveTextContent("Copy");
+      expect(screen.getByRole("status")).toBeEmptyDOMElement();
+      expect(button).toHaveFocus();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   function roleRows(region: HTMLElement): Array<[string | null, string | null]> {
     const block = region.querySelector(".option-rows-prompt-roles") as HTMLElement;
     expect(block).not.toBeNull();
-    return Array.from(block.querySelectorAll("dt")).map((dt) => [dt.textContent, dt.nextElementSibling?.textContent ?? null]);
+    return Array.from(block.querySelectorAll("dt")).map((dt) => {
+      const value = dt.nextElementSibling?.cloneNode(true) as HTMLElement | undefined;
+      value?.querySelectorAll("button").forEach((button) => button.remove());
+      return [dt.textContent, value?.textContent ?? null];
+    });
   }
 
   it("leads with System prompt then User prompt when both are authored", () => {
