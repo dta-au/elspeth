@@ -25,6 +25,7 @@
 // `reviewAvailable: false` rather than a guessed render.
 // ============================================================================
 
+import { promptFileSlots } from "@/lib/blobBindings";
 import type { InterpretationEvent, PromptReviewSnapshotResponse } from "@/types/interpretation";
 
 /**
@@ -344,6 +345,28 @@ function unavailable(message: string): RenderedSurface {
 }
 
 const UNAVAILABLE_MESSAGE = "This prompt review cannot be shown. Reload the session to see the current review.";
+
+/**
+ * Whether the reviewed prompt is made only of files a user supplied.
+ *
+ * Decides card wording and nothing else. True only when every prompt slot of
+ * the reviewed surface is one of the snapshot's file bindings and every
+ * binding is user-supplied. "User-supplied" is the PAIR the server uses
+ * (`is_user_uploaded_blob`): the file's author is the user AND its content
+ * was not authored by the LLM. A file the assistant created is not
+ * user-supplied even when it holds the user's words verbatim, so the
+ * modality alone never decides. "verbatim" is the one modality that is not
+ * LLM-authored; a missing or unrecognised author or modality counts as not
+ * user-supplied.
+ */
+export function promptReviewIsUserSuppliedFiles(snapshot: PromptReviewSnapshotResponse): boolean {
+  if (!snapshot.is_live_review || snapshot.bindings.length === 0) return false;
+  const filled = promptFileSlots(snapshot.authored_surface).filter((slot) => slot.value !== null && slot.value !== undefined);
+  const bound = new Set(snapshot.bindings.map((binding) => binding.field_path));
+  if (bound.size !== snapshot.bindings.length || filled.length !== bound.size) return false;
+  if (!filled.every((slot) => typeof slot.value === "object" && bound.has(slot.fieldPath))) return false;
+  return snapshot.bindings.every((binding) => binding.created_by === "user" && binding.creation_modality === "verbatim");
+}
 
 /**
  * Render a prompt-template review card from the event's stored snapshot.

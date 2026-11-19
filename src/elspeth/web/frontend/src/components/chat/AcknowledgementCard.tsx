@@ -31,6 +31,7 @@ import { CodeBlock } from "./CodeBlock";
 import {
   PENDING_INTERPRETATION_DISPLAY_TEXT,
   promptReviewDisplay,
+  promptReviewIsUserSuppliedFiles,
   promptSlotLabel,
   promptSlotStatus,
   type PromptDisplayResult,
@@ -470,6 +471,13 @@ export function AcknowledgementCard({
   const llmDraft = event.llm_draft ?? "";
   const userTerm = event.user_term ?? "this term";
 
+  // Wording only. The card says "the LLM wrote the instruction" unless the
+  // loaded snapshot shows the whole prompt is files a user supplied. While
+  // the snapshot is loading, or when it cannot be loaded, nothing is known
+  // and the standing wording stays. The view gate and what Approve sends do
+  // not read this.
+  const promptIsUserSuppliedFiles = promptReview.status === "ready" && promptReviewIsUserSuppliedFiles(promptReview.snapshot);
+
   const promptDisplay: PromptDisplayResult | null = !requiresPromptView
     ? null
     : promptReview.status === "ready"
@@ -758,7 +766,9 @@ export function AcknowledgementCard({
       </h3>
 
       <div className="ack-card-main">
-        <p className="ack-card-line">{presentation.line}</p>
+        <p className="ack-card-line">
+          {promptIsUserSuppliedFiles ? "The instruction for this step comes from a file supplied by a user." : presentation.line}
+        </p>
         {/* Always mounted for a prompt card so a changed-snapshot notice is
             announced when it appears (a live region inserted with its text
             already inside is not reliably read). The replacement text is
@@ -778,9 +788,9 @@ export function AcknowledgementCard({
               promptGateReason
             ) : (
               <>
-            <strong>{ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL}</strong> shows the
-            LLM's instruction; {ACKNOWLEDGEMENT_APPROVE_LABEL} unlocks once
-            you have viewed it.
+            <strong>{ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL}</strong> shows the{" "}
+            {promptIsUserSuppliedFiles ? "file's text" : "LLM's instruction"};{" "}
+            {ACKNOWLEDGEMENT_APPROVE_LABEL} unlocks once you have viewed it.
               </>
             )}
           </p>
