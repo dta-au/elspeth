@@ -374,7 +374,9 @@ def test_skill_wordings_that_identify_a_hint_match_what_the_producers_emit() -> 
     assert "pipeline is unchanged" in no_change.result.post_call_hints[0].lower()
 
 
-async def _run_planner_listing(tool: str, files: int, tmp_path: Path, tool_context: Any, *, budget: int) -> tuple[Any, str | None]:
+async def _run_planner_listing(
+    tool: str, files: int, tmp_path: Path, tool_context: Any, *, budget: int, recorder: Any = None
+) -> tuple[Any, str | None]:
     """Drive the real planner loop: it lists files on every turn, with the inventory key declared pending.
 
     Returns the scripted provider, whose ``requests`` are what the model was
@@ -420,6 +422,7 @@ async def _run_planner_listing(tool: str, files: int, tmp_path: Path, tool_conte
                         custody_config=custody,
                         information_aware=True,
                         model_overrides={"max_discovery_turns": budget},
+                        recorder=recorder,
                     )
                 except planner.PipelinePlannerError as error:
                     code = error.code
@@ -472,3 +475,46 @@ async def test_planner_loop_announces_gaps_closed_after_a_complete_listing(tool:
     assert len(results) == 1 and results[0]["success"] is True
     assert "post_call_hints" not in results[0]
     assert _notices(completion.requests[1]) == 1
+
+
+async def _discovery_attempts(tool: str, files: int, tmp_path: Path, tool_context: Any, *, budget: int) -> list[Any]:
+    from elspeth.contracts.composer_planner_audit import ComposerPlannerAttemptOutcome
+    from elspeth.web.composer.audit import BufferingRecorder
+
+    recorder = BufferingRecorder()
+    await _run_planner_listing(tool, files, tmp_path, tool_context, budget=budget, recorder=recorder)
+    return [attempt for attempt in recorder.planner_attempts if attempt.outcome is ComposerPlannerAttemptOutcome.DISCOVERY_EXECUTED]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", _TOOLS)
+async def test_capped_listing_records_no_new_information_on_the_attempt(tool: str, tmp_path: Path, tool_context: Any) -> None:
+    """The attempt record says what was learned. A capped listing resolved nothing, first time or repeated."""
+    budget = 3
+
+    attempts = await _discovery_attempts(tool, 51, tmp_path, tool_context, budget=budget)
+
+    assert len(attempts) == budget
+    assert all(len(attempt.requested_information) == 1 for attempt in attempts)
+    assert [attempt.new_information for attempt in attempts] == [()] * budget
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", _TOOLS)
+async def test_complete_listing_records_the_file_index_as_new_information(tool: str, tmp_path: Path, tool_context: Any) -> None:
+    """The other direction: the whole inventory was read, so the attempt records it as learned."""
+    attempts = await _discovery_attempts(tool, 50, tmp_path, tool_context, budget=1)
+
+    assert len(attempts) == 1
+    assert len(attempts[0].requested_information) == 1
+    assert attempts[0].new_information == attempts[0].requested_information
+
+
+def test_planner_custody_rule_names_the_marker_the_producer_emits() -> None:
+    """The planner's source-custody rule quotes the marker; a renamed prefix must turn this red."""
+    from elspeth.web.composer.planner_authoring_aids import _SOURCE_CUSTODY_RULES
+
+    quoted = f"`{blobs._BLOB_LIST_INCOMPLETE_PREFIX.rstrip()}`"
+
+    assert sum(rule.count(quoted) for rule in _SOURCE_CUSTODY_RULES) == 1
+    assert sum(rule.count("Incomplete list") for rule in _SOURCE_CUSTODY_RULES) == 1

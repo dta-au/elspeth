@@ -5517,7 +5517,6 @@ async def _plan_pipeline_inner(
                 }
             )
             information_available = result.success
-            newly_covered_keys = tuple(key for key in information_keys[call.call_id] if not information_manifest.supplies(key))
             if call.name == "get_plugin_schema" and result.success:
                 assert isinstance(discovery_result, AdmittedDiscoveryResult)
                 pending_schema_loaded.append((str(call.arguments["plugin_type"]), str(call.arguments["name"])))
@@ -5536,10 +5535,14 @@ async def _plan_pipeline_inner(
                 last_argument_failure = None
                 consecutive_argument_failures = 0
                 assert isinstance(discovery_result, AdmittedDiscoveryResult)
-                information_manifest = information_manifest.with_result(
-                    _resolved_discovery_information_keys(call, discovery_result),
-                    available=information_available,
+                # The attempt records the requested keys this result resolved,
+                # not every key the call asked for: a capped file listing
+                # resolves nothing.
+                resolved_keys = _resolved_discovery_information_keys(call, discovery_result)
+                newly_covered_keys = tuple(
+                    key for key in information_keys[call.call_id] if key in resolved_keys and not information_manifest.supplies(key)
                 )
+                information_manifest = information_manifest.with_result(resolved_keys, available=information_available)
                 if information_available:
                     new_information.extend(_planner_information_classes(newly_covered_keys))
             else:
