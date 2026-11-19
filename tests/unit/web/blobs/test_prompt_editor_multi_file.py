@@ -251,7 +251,7 @@ def test_pending_card_over_two_files_refuses_save_then_card_allows_it(tmp_path: 
     refused = _save(client, session_id, file_a["id"], "file A after", file_a["content_hash"])
 
     assert refused.status_code == 409, refused.text
-    assert refused.json()["detail"]["error_code"] == "prompt_file_review_pending_files"
+    assert refused.json()["detail"]["error_code"] == "prompt_file_review_pending"
     assert _content(client, session_id, file_a) == _A_BEFORE
     assert _content(client, session_id, file_b) == _B_BEFORE
     # Head, approval rows, blob metadata and the card's own choice are untouched.

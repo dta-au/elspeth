@@ -658,7 +658,7 @@
   z-index: 2;
   display: grid;
   gap: var(--space-md);
-  width: min(360px, calc(100% - 2 * var(--space-md)));
+  width: min(720px, calc(100% - 2 * var(--space-md)));
   max-height: calc(100% - 2 * var(--space-md));
   overflow: auto;
   padding: var(--space-md);
@@ -749,12 +749,8 @@
 .graph-config-rows > div,
 .graph-config-nested > div {
   display: grid;
-  /* Stacked key-above-value, not a two-column grid. This panel is a fixed
-     ~360px; with two columns a long key (e.g. dead_letter_connection_string)
-     stretched the auto-sized key track and crushed the value — a connection
-     string or endpoint collapsed into an unreadable one-word-per-line ribbon.
-     Stacking gives every value the full panel measure and cannot overflow. It
-     matches the narrow-viewport fallback that was already defined below. */
+  /* Stack keys above values so prompts use the full panel width, including
+     when the graph workspace constrains the panel on smaller screens. */
   grid-template-columns: minmax(0, 1fr);
   gap: var(--space-2xs);
   min-width: 0;

@@ -179,7 +179,7 @@ def test_save_refuses_node_with_two_prompt_files_while_its_card_is_pending(tmp_p
     assert before is not None
     response = _save(client, session_id, first["id"], "edited", first["content_hash"])
     assert response.status_code == 409
-    assert response.json()["detail"]["error_code"] == "prompt_file_review_pending_files"
+    assert response.json()["detail"]["error_code"] == "prompt_file_review_pending"
     assert client.get(f"/api/sessions/{session_id}/blobs/{first['id']}/content").content == b"first before"
     with blob_service._engine.connect() as conn:
         assert conn.execute(select(prompt_file_approvals_table)).all() == []
@@ -293,7 +293,12 @@ def test_non_owner_cannot_save_or_approve(tmp_path) -> None:
 
 
 def _live_prompt_setup(
-    tmp_path: Path, *, two_nodes: bool = False, field_path: str = "prompt_template", inline_slot: str | None = None
+    tmp_path: Path,
+    *,
+    two_nodes: bool = False,
+    field_path: str = "prompt_template",
+    inline_slot: str | None = None,
+    multiple_files: bool = False,
 ) -> tuple[Any, Any, Any, str, dict[str, Any], dict[str, Any] | None, dict[str, UUID]]:
     app, service, blob_service = _make_app(tmp_path)
     client = SyncASGITestClient(app)
@@ -324,8 +329,24 @@ def _live_prompt_setup(
         marker = {"blob_ref": blob["id"], "mode": "inline_content", "sha256": blob["content_hash"]}
         if field_path == "queries.q.template":
             options["queries"] = {"q": {"input_fields": {}, "template": marker}}
+        elif field_path == "queries.0.template":
+            options["queries"] = [{"name": "q", "input_fields": {}, "template": marker}]
         else:
             options[field_path] = marker
+        if multiple_files:
+            system = _upload_blob(client, session_id, b"system before", "system.txt", "text/plain")
+            options["system_prompt"] = {"blob_ref": system["id"], "mode": "inline_content", "sha256": system["content_hash"]}
+            if "queries" in options:
+                other = _upload_blob(client, session_id, b"other query before", "other.txt", "text/plain")
+                other_query = {
+                    "name": "other",
+                    "input_fields": {},
+                    "template": {"blob_ref": other["id"], "mode": "inline_content", "sha256": other["content_hash"]},
+                }
+                if isinstance(options["queries"], list):
+                    options["queries"].append(other_query)
+                else:
+                    options["queries"]["other"] = other_query
         if inline_slot == "queries.q.template":
             options["queries"] = {"q": {"input_fields": {}, "template": "inline query"}}
         elif inline_slot is not None:
@@ -448,6 +469,65 @@ def _approve_card(service: Any, blob_service: Any, session_id: str, event_id: UU
             )
         )
     assert resolved.choice is InterpretationChoice.ACCEPTED_AS_DRAFTED
+
+
+@pytest.mark.parametrize("field_path", ["prompt_template", "queries.q.template", "queries.0.template"])
+def test_multiple_prompt_files_allow_successive_audited_human_edits(tmp_path: Path, field_path: str) -> None:
+    client, service, blob_service, session_id, first, _second, events = _live_prompt_setup(
+        tmp_path, field_path=field_path, multiple_files=True
+    )
+    _approve_card(service, blob_service, session_id, events["first"])
+    initial = _admit(service, blob_service, session_id)[0]
+    system = next(binding for binding in initial.bindings if binding.field_path == "system_prompt")
+    edits = [
+        (first["id"], field_path, first["content_hash"], "first human edit"),
+        (str(system.blob_id), "system_prompt", system.content_sha256, "human system edit"),
+        (first["id"], field_path, content_hash(b"first human edit"), "second human edit"),
+    ]
+    expected_text = {binding.field_path: binding.text for binding in initial.bindings}
+    for blob_id, slot, old_hash, new_text in edits:
+        response = _save(client, session_id, blob_id, new_text, old_hash, field_path=slot)
+        assert response.status_code == 200, response.text
+        expected_text[slot] = new_text
+        admitted = _admit(service, blob_service, session_id)[0]
+        assert {binding.field_path: binding.text for binding in admitted.bindings} == expected_text
+        assert _review_state(service, session_id)[0]["first"] == "resolved"
+
+    with blob_service._engine.connect() as conn:
+        rows = conn.execute(
+            select(prompt_file_approvals_table)
+            .where(prompt_file_approvals_table.c.trigger == "editor_save")
+            .order_by(prompt_file_approvals_table.c.approved_at)
+        ).all()
+        assert len(rows) == len(edits) * len(initial.bindings)
+        assert all(row.actor_user_id == "alice" and row.event_id is None for row in rows)
+        assert len({row.approved_at for row in rows}) == len(edits)
+        assert {row.review_anchor for row in rows[-len(initial.bindings) :]} == {admitted.anchor}
+        assert conn.execute(select(interpretation_events_table.c.id).where(interpretation_events_table.c.choice == "pending")).all() == []
+
+    before = _save_side_effects(service, blob_service, session_id, first["id"])
+    refused = _save(client, session_id, first["id"], "stale overwrite", first["content_hash"], field_path=field_path)
+    assert refused.status_code == 409
+    assert _save_side_effects(service, blob_service, session_id, first["id"]) == before
+
+
+def test_multiple_file_save_rolls_back_when_sibling_evidence_fails(tmp_path: Path, monkeypatch) -> None:
+    client, service, blob_service, session_id, first, _second, events = _live_prompt_setup(tmp_path, multiple_files=True)
+    _approve_card(service, blob_service, session_id, events["first"])
+    before = _save_side_effects(service, blob_service, session_id, first["id"])
+    record_approval = prompt_text_routes.record_prompt_file_approval
+
+    def fail_sibling(conn, request, *, now):
+        if request.field_path == "system_prompt":
+            raise RuntimeError("sibling evidence failed")
+        return record_approval(conn, request, now=now)
+
+    monkeypatch.setattr(prompt_text_routes, "record_prompt_file_approval", fail_sibling)
+    with pytest.raises(RuntimeError, match="sibling evidence failed"):
+        _save(client, session_id, first["id"], "human edit", first["content_hash"])
+    assert _save_side_effects(service, blob_service, session_id, first["id"]) == before
+    assert client.get(f"/api/sessions/{session_id}/blobs/{first['id']}/content").content == b"first before"
+    assert _admit(service, blob_service, session_id)
 
 
 def test_save_admits_then_agent_edit_requires_review(tmp_path: Path) -> None:

@@ -153,11 +153,12 @@ export function promptFileEditability({ state, blobs, pendingEvents, nodeId, fie
   // and this editor shows one file, so any other slot keeps the save refused.
   if (pendingEvents.some((event) => event.choice === "pending" && event.kind === "llm_prompt_template" && event.affected_node_id === nodeId)) {
     const unseen = promptFileSlots(node.options).filter((slot) => slot.fieldPath !== fieldPath && slot.value !== null && slot.value !== undefined);
-    if (unseen.some((slot) => typeof slot.value === "string")) {
-      return refuse("prompt_file_review_pending_inline", "Approve the review card first, then edit the file.");
+    // Another prompt file is reported first, inline text only when no other file is involved.
+    if (unseen.some((slot) => typeof slot.value !== "string")) {
+      return refuse("prompt_file_review_pending", "Complete the existing node review before editing its files.");
     }
     if (unseen.length > 0) {
-      return refuse("prompt_file_review_pending_files", "This step's review card also covers its other prompt files. Approve the review card first, then edit the file.");
+      return refuse("prompt_file_review_pending_inline", "Approve the review card first, then edit the file.");
     }
   }
   return { editable: true };

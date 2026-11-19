@@ -157,7 +157,7 @@ describe("file-backed option values", () => {
     render(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
     const edit = screen.getByRole("button", { name: "Edit prompt.md (User prompt)" });
     expect(edit).toHaveAttribute("aria-disabled", "false");
-    expect(edit).toHaveAccessibleDescription("This step's review card also covers its other prompt files. Approve the review card first, then edit the file.");
+    expect(edit).toHaveAccessibleDescription("Complete the existing node review before editing its files.");
     act(() => edit.click());
     expect(useBlobStore.getState().editRequest).toMatchObject({ nodeId: "llm", fieldPath: "prompt_template" });
   });

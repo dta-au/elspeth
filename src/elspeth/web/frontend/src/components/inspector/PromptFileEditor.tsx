@@ -135,13 +135,13 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
           useSessionStore.setState({ compositionState: state });
         }
       } catch {
-        if (isCurrent()) setError("Saved and approved. Reload the session to see the updated prompt status.");
+        if (isCurrent()) setError("Saved. Reload the session to see the updated prompt status.");
       }
     } catch (failure: unknown) {
       if (isCurrent()) {
         const typed = failure as { detail?: unknown; error_type?: unknown };
-        setError(typed.error_type === "prompt_file_review_pending_files"
-          ? "This step's review card also covers its other prompt files. Approve the review card first, then edit the file."
+        setError(typed.error_type === "prompt_file_review_pending"
+          ? "Complete the existing node review before editing its files."
           : typed.error_type === "prompt_file_review_pending_inline"
             ? "Approve the review card first, then edit the file."
             : typed.error_type === "prompt_file_binding_changed"
@@ -177,7 +177,7 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
         disabled={refusal !== null || saving || isComposing || text === null || text === savedText || expectedSha256 === null}
         aria-describedby={refusal ? `prompt-file-${blobId}-${fieldPath}-refusal` : undefined}
       >
-        Save and approve
+        Save
       </Button>
       <Button type="button" variant="bare" onClick={() => { setText(savedText); setError(null); }} disabled={saving || savedText === null}>
         Cancel

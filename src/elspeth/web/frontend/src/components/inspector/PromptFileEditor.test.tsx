@@ -62,7 +62,7 @@ it("blocks Save before a request when a pending review has an inline sibling", a
   render(<PromptFileEditors nodeId="first" options={options} />);
   const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
   fireEvent.change(editor, { target: { value: "a different prompt" } });
-  const save = screen.getByRole("button", { name: "Save and approve" });
+  const save = screen.getByRole("button", { name: "Save" });
   expect(save).toBeDisabled();
   expect(save).toHaveAccessibleDescription("Approve the review card first, then edit the file.");
   fireEvent.click(save);
@@ -87,7 +87,7 @@ it("renders full file text and saves with the observed hash", async () => {
   const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
   await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
   fireEvent.change(editor, { target: { value: "new line\n  indented\n" } });
-  fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
   await waitFor(() => expect(savePromptFile).toHaveBeenCalledWith("session-1", "blob-1", "new line\n  indented\n", "a".repeat(64), "first", "prompt_template"));
 });
 
@@ -97,14 +97,14 @@ it("shows a typed refusal and retains the user's draft", async () => {
   const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
   await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
   fireEvent.change(editor, { target: { value: "my draft" } });
-  fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
   expect(await screen.findByRole("alert")).toHaveTextContent("This file changed; reload it.");
   expect(editor).toHaveValue("my draft");
 });
 
 it.each([
   ["prompt_file_review_pending_inline", "Approve the review card first, then edit the file."],
-  ["prompt_file_review_pending_files", "This step's review card also covers its other prompt files. Approve the review card first, then edit the file."],
+  ["prompt_file_review_pending", "Complete the existing node review before editing its files."],
   ["prompt_file_binding_changed", "This prompt file moved since you opened it. Reload the session."],
 ])("shows %s guidance", async (errorType, message) => {
   vi.mocked(savePromptFile).mockRejectedValue({ error_type: errorType });
@@ -112,7 +112,7 @@ it.each([
   const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
   await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
   fireEvent.change(editor, { target: { value: "my draft" } });
-  fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
   expect(await screen.findByRole("alert")).toHaveTextContent(message);
   expect(editor).toHaveValue("my draft");
 });
@@ -154,7 +154,7 @@ it.each([
   // Only the requested file's editor opened.
   expect(screen.getAllByRole("textbox", { name: /Edit prompt file/ })).toHaveLength(1);
   fireEvent.change(editor, { target: { value: "edited" } });
-  const save = screen.getByRole("button", { name: "Save and approve" });
+  const save = screen.getByRole("button", { name: "Save" });
   expect(save).toBeEnabled();
   fireEvent.click(save);
   await waitFor(() => expect(savePromptFile).toHaveBeenCalledWith("session-1", blobId, "edited", sha256, "first", fieldPath));
@@ -171,7 +171,7 @@ it.each([
   const editor = await screen.findByRole("textbox", { name: /Edit prompt file system\.md/ });
   await waitFor(() => expect(editor).toHaveValue("text of file B"));
   fireEvent.change(editor, { target: { value: "edited" } });
-  fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
   await waitFor(() => expect(savePromptFile).toHaveBeenCalledWith("session-1", blobId, "edited", sha256, "first", fieldPath));
 });
 
@@ -232,12 +232,12 @@ it("saves the same file a second time with the hash the first save returned", as
   const editor = await screen.findByRole("textbox", { name: "Edit prompt file user.md (User prompt)" });
   await waitFor(() => expect(editor).toHaveValue("text of file A"));
   fireEvent.change(editor, { target: { value: "first edit" } });
-  fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
   await waitFor(() => expect(useSessionStore.getState().compositionState).toBe(repinned));
   expect(savePromptFile).toHaveBeenLastCalledWith("session-1", "blob-a", "first edit", "a".repeat(64), "first", "prompt_template");
   // The refreshed graph is in the store; the editor is still open and still saveable.
   fireEvent.change(editor, { target: { value: "second edit" } });
-  const save = screen.getByRole("button", { name: "Save and approve" });
+  const save = screen.getByRole("button", { name: "Save" });
   await waitFor(() => expect(save).toBeEnabled());
   fireEvent.click(save);
   await waitFor(() => expect(savePromptFile).toHaveBeenLastCalledWith("session-1", "blob-a", "second edit", "c".repeat(64), "first", "prompt_template"));
@@ -246,7 +246,7 @@ it("saves the same file a second time with the hash the first save returned", as
 it("opens read-only with Save disabled and the reason while the step's card covers its other prompt file", async () => {
   useInterpretationEventsStore.setState({ pendingBySession: { "session-1": { card: { choice: "pending", kind: "llm_prompt_template", affected_node_id: "first" } as InterpretationEvent } } });
   seedTwoFileStep();
-  const reason = "This step's review card also covers its other prompt files. Approve the review card first, then edit the file.";
+  const reason = "Complete the existing node review before editing its files.";
   const edit = screen.getByRole("button", { name: "Edit user.md (User prompt)" });
   expect(edit).toHaveAttribute("aria-disabled", "false");
   expect(edit).toHaveAccessibleDescription(reason);
@@ -255,7 +255,7 @@ it("opens read-only with Save disabled and the reason while the step's card cove
   await waitFor(() => expect(editor).toHaveValue("text of file A"));
   expect(editor).toHaveAttribute("readonly");
   expect(editor).toHaveAccessibleDescription(reason);
-  const save = screen.getByRole("button", { name: "Save and approve" });
+  const save = screen.getByRole("button", { name: "Save" });
   expect(save).toBeDisabled();
   expect(save).toHaveAccessibleDescription(reason);
   fireEvent.click(save);
@@ -272,7 +272,7 @@ it("keeps Save enabled for a single file-backed slot beside an inline prompt", a
   const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
   await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
   fireEvent.change(editor, { target: { value: "my draft" } });
-  expect(screen.getByRole("button", { name: "Save and approve" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
 });
 
 it("reloads the session file list after a successful save so its hash is current", async () => {
@@ -281,7 +281,7 @@ it("reloads the session file list after a successful save so its hash is current
   const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
   await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
   fireEvent.change(editor, { target: { value: "new text" } });
-  fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
   await waitFor(() => expect(loadBlobs).toHaveBeenCalledWith("session-1"));
 });
 
@@ -304,7 +304,7 @@ it("does not show a hash mismatch after save repins the marker and reloads metad
   const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
   await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
   fireEvent.change(editor, { target: { value: "new text" } });
-  fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
   await waitFor(() => expect(loadBlobs).toHaveBeenCalledWith("session-1"));
   await waitFor(() => expect(useSessionStore.getState().compositionState).toBe(newState));
   expect(screen.queryByText(/changed since attached/)).not.toBeInTheDocument();
@@ -317,7 +317,7 @@ it("does not reload the file list when the save is refused", async () => {
   const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
   await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
   fireEvent.change(editor, { target: { value: "new text" } });
-  fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
   await screen.findByRole("alert");
   expect(loadBlobs).not.toHaveBeenCalled();
 });
@@ -352,7 +352,7 @@ it("does not let a post-save refetch from an earlier activation replace a newer 
   const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
   await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
   fireEvent.change(editor, { target: { value: "new text" } });
-  fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
   await waitFor(() => expect(fetchCompositionState).toHaveBeenCalled());
   // Away and back: each activation advances the session publication generation.
   act(() => useSessionStore.getState().resetForTutorialSession("session-2"));
@@ -379,6 +379,6 @@ it.each([
   const editor = await screen.findByRole("textbox", { name: /Edit prompt file prompt\.md/ });
   await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
   fireEvent.change(editor, { target: { value: "edited" } });
-  fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
   await waitFor(() => expect(savePromptFile).toHaveBeenCalledWith("session-1", "blob-1", "edited", "a".repeat(64), "first", expectedPath));
 });

@@ -421,9 +421,10 @@ def assert_latest_prompt_file_approvals_attest_surface(
 class PromptFileReviewCardPending(PromptFileApprovalStale):
     """A pending prompt card covers prompt content the file editor did not show."""
 
-    def __init__(self, *, unseen_inline_text: bool) -> None:
+    def __init__(self, *, only_inline_text: bool) -> None:
         super().__init__()
-        self.unseen_inline_text = unseen_inline_text
+        # True when every unseen slot is inline text; False when another prompt file is among them.
+        self.only_inline_text = only_inline_text
 
 
 def editor_save_settles_pending_card(conn: Connection, *, state: CompositionStateRecord, node_id: str, field_path: str) -> bool:
@@ -451,7 +452,7 @@ def editor_save_settles_pending_card(conn: Connection, *, state: CompositionStat
     options = next(node["options"] for node in state.nodes or () if node["id"] == node_id)
     unseen = [value for path, value in _surface_slots(options) if path != field_path and value is not None]
     if unseen:
-        raise PromptFileReviewCardPending(unseen_inline_text=any(type(value) is str for value in unseen))
+        raise PromptFileReviewCardPending(only_inline_text=all(type(value) is str for value in unseen))
     return True
 
 

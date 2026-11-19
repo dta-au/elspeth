@@ -100,10 +100,11 @@ describe("prompt file editability display mirror", () => {
   });
 
   it.each([
-    ["prompt_file_review_pending_files", { prompt_template: marker, system_prompt: otherFile }],
-    ["prompt_file_review_pending_files", { prompt_template: marker, queries: [{ name: "one", template: otherFile }] }],
-    // Inline text beside another file: the inline refusal is reported, as the server reports it.
-    ["prompt_file_review_pending_inline", { prompt_template: marker, system_prompt: "You are helpful.", queries: { one: { template: otherFile } } }],
+    ["prompt_file_review_pending", { prompt_template: marker, system_prompt: otherFile }],
+    ["prompt_file_review_pending", { prompt_template: marker, queries: [{ name: "one", template: otherFile }] }],
+    // Inline text beside another file: the other-file refusal is reported, as the server reports it.
+    ["prompt_file_review_pending", { prompt_template: marker, system_prompt: "You are helpful.", queries: { one: { template: otherFile } } }],
+    ["prompt_file_review_pending_inline", { prompt_template: marker, system_prompt: "You are helpful." }],
   ])("returns %s while the step's card is pending over content this editor does not show", (code, options) => {
     expect(check({ state: stateFor(options), pendingEvents: [pendingCard] })).toMatchObject({ editable: false, code, opens: true });
     // The same step with no card pending is editable.

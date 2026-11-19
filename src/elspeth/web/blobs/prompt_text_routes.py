@@ -200,7 +200,7 @@ def create_prompt_text_router() -> APIRouter:
             try:
                 attested_snapshots = await run_sync_in_worker(attested_before_save)
             except PromptFileReviewCardPending as exc:
-                if exc.unseen_inline_text:
+                if exc.only_inline_text:
                     raise _prompt_save_refusal(
                         409,
                         "prompt_file_review_pending_inline",
@@ -208,8 +208,8 @@ def create_prompt_text_router() -> APIRouter:
                     ) from exc
                 raise _prompt_save_refusal(
                     409,
-                    "prompt_file_review_pending_files",
-                    "This step's review card also covers its other prompt files. Approve the review card first, then edit the file.",
+                    "prompt_file_review_pending",
+                    "Complete the existing node review before editing its files.",
                 ) from exc
             except PromptFileUnreadable as exc:
                 raise _prompt_save_refusal(409, "prompt_file_stale", _STALE_UNREADABLE) from exc
