@@ -498,8 +498,10 @@ the proposal as validated. Where changes await approval (a result carried
 response: one narrow edit, or one complete `set_pipeline` carrying every part
 of a multi-part change. The narrowest-tool and staged-construction guidance
 applies only where changes apply directly; several changes in one response
-are refused whole. While a proposal is pending, do not stage another: tell
-the user to accept or reject it, and stop.
+are refused whole. `create_blob` is not a composition change and is not
+refused for this reason: create a prompt file first, then send the one call.
+While a proposal is pending, do not stage another: tell the user to accept or
+reject it, and stop.
 `PREVALIDATION_REJECTED`
 with `applied` false (`candidate_version`, `message`) means the candidate was
 not applied: repair from `validation`, which describes the rejected candidate,

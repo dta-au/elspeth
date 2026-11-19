@@ -48,6 +48,7 @@ from elspeth.web.composer.prompts import (
 )
 from elspeth.web.composer.protocol import COMPOSER_HISTORY_USER_AUTHORED_KEY
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
+from elspeth.web.composer.tool_batch import _stages_composition_proposal
 from elspeth.web.composer.tools import ToolContext
 from elspeth.web.composer.tools.sessions import _execute_set_pipeline
 from elspeth.web.composer.tools.transforms import _execute_set_metadata
@@ -1613,6 +1614,19 @@ class TestSkillFollowsCurrentToolBehaviour:
         assert "`approval_proposal_pending`" in flattened
         assert "applies only where changes apply directly" in flattened
         assert "tell the user to accept or reject it, and stop" in flattened
+
+    def test_approval_mode_says_create_blob_comes_before_the_one_call(self) -> None:
+        # Live explicit-approval runs: after approval_batch_not_atomic the
+        # model rebuilt with the new prompt inline, because nothing said the
+        # file call is allowed and comes first. The sentence is only true
+        # while tool_batch.py leaves create_blob out of its count, so that is
+        # pinned beside it.
+        flattened = " ".join(SYSTEM_PROMPT.split())
+
+        assert "`create_blob` is not a composition change and is not refused for this reason" in flattened
+        assert "create a prompt file first, then send the one call" in flattened
+        assert _stages_composition_proposal("create_blob") is False
+        assert _stages_composition_proposal("set_pipeline") is True
 
     def test_declared_schema_modes_say_which_need_fields(self) -> None:
         # contracts.schema refuses mode fixed/flexible without `fields`; three

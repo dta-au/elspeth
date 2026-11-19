@@ -143,6 +143,10 @@ async def test_batch_with_two_staged_edits_is_refused_before_effects_then_one_co
         # including a sibling refused for malformed arguments.
         assert "carried 2 pipeline-change calls" in message
         assert "None of them was applied and no proposal was recorded" in message
+        # The file call is not counted and comes first: without this the
+        # model recovers with one set_pipeline and the new prompt inline.
+        assert "create_blob is not a pipeline change" in message
+        assert message.index("in an earlier response, create the file") < message.index("then send the one call")
         assert json.loads(_persisted_tool_content(harness, call_id))["validation"]["errors"][0]["error_code"] == (
             "approval_batch_not_atomic"
         )

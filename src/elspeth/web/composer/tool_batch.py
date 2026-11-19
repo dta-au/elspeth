@@ -461,7 +461,8 @@ async def _approval_containment_refusal(
             "calls. None of them was applied and no proposal was recorded. Separate proposals are each "
             "drawn against the same saved pipeline, so the user could only ever accept one of them. Submit the whole "
             "intended result as one change: a single set_pipeline call containing every edit, with no other pipeline "
-            "mutation in the same response.",
+            "mutation in the same response. create_blob is not a pipeline change: in an earlier response, create the "
+            "file for the prompt; then send the one call carrying its marker.",
         )
     if staged == 1:
         pending = [
