@@ -426,11 +426,27 @@ def _may_carry(blob_service: Any, *, prior: Any, saved: Any, saved_blob: dict[st
 
 
 def test_carry_guard_passes_when_the_prior_surface_is_attested(tmp_path: Path) -> None:
+    """The pair a real save hands the guard: the surface before, and the surface after with file A's new bytes.
+
+    The two snapshots differ in exactly what a save changes (the saved file's
+    hash and the anchor), so the guard passes only because it leaves the saved
+    file out and compares the OTHER file with what was attested.
+    """
     _client, _service, blob_service, session_id, file_a, _file_b, _event = _two_file_node(tmp_path, "roles")
-    snapshot = _node_snapshot(blob_service, session_id, file_a, "prompt_template")
-    _may_carry(blob_service, prior=snapshot, saved=snapshot, saved_blob=file_a)
+    prior = _node_snapshot(blob_service, session_id, file_a, "prompt_template")
+    saved = replace(
+        prior,
+        anchor="e" * 64,
+        bindings=tuple(
+            replace(binding, content_sha256=content_hash(b"file A after")) if binding.field_path == "prompt_template" else binding
+            for binding in prior.bindings
+        ),
+    )
+    assert saved.bindings != prior.bindings
+    assert {binding.field_path for binding in saved.bindings} == {"prompt_template", "system_prompt"}
+    _may_carry(blob_service, prior=prior, saved=saved, saved_blob=file_a)
     # Nothing to carry and no prior: the saved file is the node's only file.
-    only_a = replace(snapshot, bindings=tuple(binding for binding in snapshot.bindings if binding.field_path == "prompt_template"))
+    only_a = replace(saved, bindings=tuple(binding for binding in saved.bindings if binding.field_path == "prompt_template"))
     _may_carry(blob_service, prior=None, saved=only_a, saved_blob=file_a)
 
 
@@ -534,12 +550,17 @@ def test_save_refuses_when_a_sibling_files_bytes_changed_since_its_approval(tmp_
     assert _save_side_effects(service, blob_service, session_id, file_a["id"]) == before
 
 
-def test_binding_set_changed_before_commit_is_refused_and_rolled_back(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("recheck", ["gains_a_binding", "same_count_different_binding"])
+def test_binding_set_changed_before_commit_is_refused_and_rolled_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recheck: str
+) -> None:
     """The in-transaction re-check requires the SAME binding set the request checked, not merely the opened one.
 
     The route computes the file's bindings once for the request and again on
-    the head inside the save transaction. The second answer here gains a
-    binding the request never saw; the save must refuse and write nothing.
+    the head inside the save transaction. The second answer here differs from
+    the first; the save must refuse and write nothing. ``gains_a_binding`` is
+    also refused by a count check. ``same_count_different_binding`` is the case
+    only an exact comparison catches: still one binding, but on another step.
     """
     client, service, blob_service, session_id, file_a, file_b, _event = _two_file_node(tmp_path, "roles")
     before = _save_side_effects(service, blob_service, session_id, file_a["id"])
@@ -550,7 +571,8 @@ def test_binding_set_changed_before_commit_is_refused_and_rolled_back(tmp_path: 
         bindings, mixed = real_bindings(state, blob)
         calls.append(len(bindings))
         if len(calls) == 2:
-            return (*bindings, PromptBinding("elsewhere", "system_prompt", "utf-8")), mixed
+            moved = PromptBinding("elsewhere", "system_prompt", "utf-8")
+            return ((*bindings, moved) if recheck == "gains_a_binding" else (moved,)), mixed
         return bindings, mixed
 
     monkeypatch.setattr(prompt_text_routes, "prompt_bindings_for_blob", gains_a_binding_on_recheck)
