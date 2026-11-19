@@ -471,11 +471,12 @@ export function AcknowledgementCard({
   const llmDraft = event.llm_draft ?? "";
   const userTerm = event.user_term ?? "this term";
 
-  // Wording only. The card says "the LLM wrote the instruction" unless the
-  // loaded snapshot shows the whole prompt is files a user supplied. While
-  // the snapshot is loading, or when it cannot be loaded, nothing is known
-  // and the standing wording stays. The view gate and what Approve sends do
-  // not read this.
+  // Wording only. Who wrote the instruction is said only once the stored
+  // snapshot says it: files a user supplied, or (every other loaded case)
+  // the LLM. While the snapshot is loading, or when it cannot be loaded,
+  // the card names no author, so a card for a user's file never shows
+  // "The LLM wrote the instruction", even for a moment. The view gate and
+  // what Approve sends do not read any of this.
   const promptIsUserSuppliedFiles = promptReview.status === "ready" && promptReviewIsUserSuppliedFiles(promptReview.snapshot);
 
   const promptDisplay: PromptDisplayResult | null = !requiresPromptView
@@ -531,6 +532,13 @@ export function AcknowledgementCard({
     stepLabel,
     stepTitle ?? defaultStepTitle(stepLabel),
   );
+  const cardLine = !requiresPromptView
+    ? presentation.line
+    : promptReview.status !== "ready"
+      ? "This step's instruction is waiting for your review."
+      : promptIsUserSuppliedFiles
+        ? "The instruction for this step comes from a file supplied by a user."
+        : presentation.line;
   const chooseMode = mode === "choose" || !showAmend;
 
   // Data-contract body: the demanded columns with per-field sample warnings,
@@ -766,9 +774,7 @@ export function AcknowledgementCard({
       </h3>
 
       <div className="ack-card-main">
-        <p className="ack-card-line">
-          {promptIsUserSuppliedFiles ? "The instruction for this step comes from a file supplied by a user." : presentation.line}
-        </p>
+        <p className="ack-card-line">{cardLine}</p>
         {/* Always mounted for a prompt card so a changed-snapshot notice is
             announced when it appears (a live region inserted with its text
             already inside is not reliably read). The replacement text is

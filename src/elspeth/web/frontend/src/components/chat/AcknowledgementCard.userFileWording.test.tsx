@@ -7,9 +7,10 @@
 // wording follows the server's stored review snapshot, and only that: the
 // prompt slots are all file bindings, and every binding is user-supplied,
 // which means the PAIR `created_by == "user"` and a creation modality that is
-// not LLM-authored. Anything else, or anything not known, keeps the standing
-// wording. The wording is presentation only: the view gate and what Approve
-// sends are pinned unchanged here.
+// not LLM-authored. Any other loaded snapshot keeps the standing wording.
+// Until the snapshot has loaded, and when it cannot be loaded, the card names
+// no author at all. The wording is presentation only: the view gate and what
+// Approve sends are pinned unchanged here.
 // ============================================================================
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -33,6 +34,7 @@ import * as api from "@/api/client";
 
 const LLM_LINE = "The LLM wrote the instruction for this step.";
 const FILE_LINE = "The instruction for this step comes from a file supplied by a user.";
+const NEUTRAL_LINE = "This step's instruction is waiting for your review.";
 const LLM_NOTE = "View prompt shows the LLM's instruction; Approve unlocks once you have viewed it.";
 const FILE_NOTE = "View prompt shows the file's text; Approve unlocks once you have viewed it.";
 const ANCHOR = "b".repeat(64);
@@ -126,6 +128,15 @@ function gateNote(): HTMLElement {
   const note = document.querySelector<HTMLElement>(".ack-card-gate-note");
   if (note === null) throw new Error("gate note not rendered");
   return note;
+}
+
+/** No author is named anywhere on the card: neither the LLM nor a user's file. */
+function expectNoAttribution(): void {
+  expect(cardLine()).toBe(NEUTRAL_LINE);
+  expect(document.body).not.toHaveTextContent("The LLM wrote");
+  expect(document.body).not.toHaveTextContent("LLM's instruction");
+  expect(document.body).not.toHaveTextContent("supplied by a user");
+  expect(document.body).not.toHaveTextContent("file's text");
 }
 
 function expectStandingWording(): void {
@@ -272,16 +283,18 @@ describe("prompt card wording — every other case keeps the standing wording", 
     expect(gateNote()).not.toHaveTextContent("file's text");
   });
 
-  it("keeps the LLM wording when the snapshot cannot be loaded", async () => {
+  it("names no author when the snapshot cannot be loaded", async () => {
     vi.mocked(api.getPromptReviewSnapshot).mockRejectedValue({ status: 404, detail: "not found" });
     await renderSettled();
-    expect(cardLine()).toBe(LLM_LINE);
-    expect(document.body).not.toHaveTextContent("supplied by a user");
-    expect(gateNote()).not.toHaveTextContent("file's text");
+    expectNoAttribution();
     expect(screen.getByRole("button", { name: /approve the llm prompt template/i })).toHaveAttribute("aria-disabled", "true");
   });
 
-  it("shows the LLM wording while the snapshot is loading, then the file wording once it has loaded", async () => {
+  it.each([
+    ["a user-supplied file", snapshot({ prompt_template: marker("u1") }, [binding("prompt_template", "u1", "user", "verbatim")]), FILE_LINE],
+    ["a file the assistant wrote", snapshot({ prompt_template: marker("a1") }, [binding("prompt_template", "a1", "assistant", "llm_generated")]), LLM_LINE],
+    ["inline text", snapshot({ prompt_template: "Summarise {{ row['text'] }}" }, []), LLM_LINE],
+  ])("names no author while the snapshot is loading, then says which it is: %s", async (_name, reviewed, line) => {
     let deliver: (value: PromptReviewSnapshotResponse) => void = () => undefined;
     vi.mocked(api.getPromptReviewSnapshot).mockReturnValue(
       new Promise<PromptReviewSnapshotResponse>((resolve) => {
@@ -290,11 +303,12 @@ describe("prompt card wording — every other case keeps the standing wording", 
     );
     renderCard();
     await waitFor(() => expect(api.getPromptReviewSnapshot).toHaveBeenCalled());
-    expect(cardLine()).toBe(LLM_LINE);
+    expectNoAttribution();
+    expect(screen.getByRole("button", { name: /approve the llm prompt template/i })).toHaveAttribute("aria-disabled", "true");
     await act(async () => {
-      deliver(snapshot({ prompt_template: marker("u1") }, [binding("prompt_template", "u1", "user", "verbatim")]));
+      deliver(reviewed);
       await Promise.resolve();
     });
-    expect(cardLine()).toBe(FILE_LINE);
+    expect(cardLine()).toBe(line);
   });
 });
