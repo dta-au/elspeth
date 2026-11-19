@@ -3082,8 +3082,12 @@ async def run_tool_batch(
             else:
                 turn_has_mutation = True
             if session_aware_outcome.result is not None:
+                # Same delta-base rule as the ordinary dispatch below.
+                if session_aware_outcome.result.success:
+                    last_validation = session_aware_outcome.result.validation
+                elif session_aware_outcome.result.updated_state is not state:
+                    last_validation = None
                 state = session_aware_outcome.result.updated_state
-                last_validation = session_aware_outcome.result.validation
             continue
 
         # Precompute runtime preflight for preview_pipeline outside
@@ -3646,8 +3650,16 @@ async def run_tool_batch(
             if findings is not None:
                 result = replace(result, runtime_preflight=findings)
         if unapplied_admission is None:
+            # Only a success becomes the next delta base: a refused result's
+            # validation describes the refused call (its rejection entries,
+            # and for a refused full replacement nothing else), not the graph.
+            # A refusal that replaced the state object drops the base so the
+            # dispatcher revalidates the current state.
+            if result.success:
+                last_validation = result.validation
+            elif result.updated_state is not state:
+                last_validation = None
             state = result.updated_state
-            last_validation = result.validation
             last_runtime_preflight = result.runtime_preflight or last_runtime_preflight
         # Mark the (plugin_type, plugin_name) pair as
         # schema-loaded for this session when a get_plugin_schema
