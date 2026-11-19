@@ -963,16 +963,14 @@ async def test_earlier_tool_results_are_stubbed_and_the_latest_round_is_intact(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("ceiling", ["tokens", "bytes"])
-async def test_an_oversized_intent_is_refused_before_any_provider_call(tmp_path: Path, tool_context: ToolContext, ceiling: str) -> None:
+async def test_an_oversized_intent_is_refused_before_any_provider_call(tmp_path: Path, tool_context: ToolContext) -> None:
+    # Was: parametrised over the token setting and the byte maximum, both refused. Now only the byte
+    # maximum refuses: an intent over the token setting is sent with everything shed and recorded as
+    # over (test_planner_fitting_request_goes.py).
     small_request, _ = await _decline(tmp_path, tool_context, _context(users={0: "Build CSV to JSON."}))
     base_bytes = _sent_bytes(small_request)
     cap_bytes = base_bytes + 10_000
-    policy = (
-        _context_policy(max_prompt_tokens=math.ceil(cap_bytes / _FALLBACK_RATIO), max_request_bytes=1_000_000)
-        if ceiling == "tokens"
-        else _context_policy(max_request_bytes=cap_bytes)
-    )
+    policy = _context_policy(max_request_bytes=cap_bytes)
     completion = _ScriptedCompletion(_text_response("Must not dispatch."))
     recorder = BufferingRecorder()
 
@@ -988,7 +986,7 @@ async def test_an_oversized_intent_is_refused_before_any_provider_call(tmp_path:
         )
 
     assert caught.value.code == ComposerPlannerCode.CONTEXT_BUDGET_EXHAUSTED.value
-    assert caught.value.detail_codes == (f"context_ceiling_{ceiling}", "largest_component_request")
+    assert caught.value.detail_codes == ("context_ceiling_bytes", "largest_component_request")
     assert completion.requests == []
     assert len(completion._responses) == 1  # no scripted response consumed
     assert recorder.llm_calls == ()
@@ -1056,7 +1054,8 @@ async def test_a_request_within_the_re_render_margin_of_the_ceiling_sheds_one_mo
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model", [_ANTHROPIC, _UNMARKED], ids=["anthropic-marked", "unmarked"])
 async def test_a_dispatched_request_never_exceeds_either_ceiling(tmp_path: Path, tool_context: ToolContext, model: str) -> None:
-    """Over ceilings straddling the size after one shed, every request is sent within both ceilings or refused unsent."""
+    """Over ceilings straddling the size after one shed: the byte maximum is never exceeded by a sent request,
+    and a request over the token setting is sent only with everything shed and recorded as over."""
     assistants = {1: "a" * 20_000, 2: "b" * 5_000}
     context = _context(users={0: "Build CSV to JSON."}, assistants=assistants)
     full_request, _ = await _decline(tmp_path, tool_context, context, model=model)
@@ -1066,7 +1065,7 @@ async def test_a_dispatched_request_never_exceeds_either_ceiling(tmp_path: Path,
         _context_policy(max_prompt_tokens=math.ceil((one_shed + delta) / _FALLBACK_RATIO), max_request_bytes=1_000_000)
         for delta in (-6_000, -400, -10, 0, 10, 100, 400)
     ]
-    sent_count = 0
+    sent_count = overs = 0
     for policy in policies:
         completion, recorder, outcome = await _decline_or_refusal(tmp_path, tool_context, context, policy=policy, model=model)
         if type(outcome) is PlannerDeclined:
@@ -1076,12 +1075,21 @@ async def test_a_dispatched_request_never_exceeds_either_ceiling(tmp_path: Path,
             assert _sent_bytes(request) <= policy.max_request_bytes, policy
             assert call.request_byte_split.total_bytes <= policy.max_request_bytes, policy
             assert call.context_budget is not None
-            assert call.context_budget.estimated_tokens_after <= policy.max_prompt_tokens, policy
+            # Was: estimated_tokens_after <= max_prompt_tokens for every sent request. Now a request over the
+            # token setting is sent, recorded as over, with the whole earlier conversation left out.
+            over = call.context_budget.estimated_tokens_after > policy.max_prompt_tokens
+            assert call.context_budget.over_estimate is over, policy
+            assert call.context_budget.max_prompt_tokens == policy.max_prompt_tokens
+            if over:
+                overs += 1
+                assert call.context_budget.shed_history_indices == (0, 1, 2), policy
         else:
-            # Only the budget may refuse, and only before dispatch.
+            # Only the byte maximum may refuse, and only before dispatch.
             assert outcome.code == "CONTEXT_BUDGET_EXHAUSTED", (policy, outcome.code)
+            assert outcome.detail_codes[0] == "context_ceiling_bytes", (policy, outcome.detail_codes)
             assert completion.requests == [] and recorder.llm_calls == ()
-    assert sent_count >= len(policies) - 2  # the two tightest ceilings may refuse; the rest are sent
+    assert sent_count >= len(policies) - 2  # the two tightest byte ceilings may refuse; the rest are sent
+    assert overs >= 1  # the tightest token setting is exceeded with everything shed, and still sent
 
 
 @pytest.mark.asyncio
@@ -1507,7 +1515,8 @@ async def _hatch_run_or_refusal(
 
 @pytest.mark.asyncio
 async def test_a_dispatched_hatch_request_never_exceeds_either_ceiling(tmp_path: Path, tool_context: ToolContext) -> None:
-    """Over ceilings straddling the hatch request after one event is shed, every request is sent within both ceilings or refused unsent."""
+    """Over ceilings straddling the hatch request after one event is shed: no sent request exceeds the byte maximum,
+    and a request over the token setting is sent only recorded as over."""
     measured_completion, _ = await _hatch_run(tmp_path, tool_context, None, None)
     measured_hatch = measured_completion.requests[2]
     transcript = _transcript_of(measured_hatch["messages"][3]["content"])
@@ -1521,13 +1530,17 @@ async def test_a_dispatched_hatch_request_never_exceeds_either_ceiling(tmp_path:
     hatch_shed = 0
     for policy in policies:
         completion, recorder, outcome = await _hatch_run_or_refusal(tmp_path, tool_context, policy)
-        # Every dispatched request is the recorded one and fits both ceilings.
+        # Every dispatched request is the recorded one and fits the byte maximum.
         assert len(completion.requests) == len(recorder.llm_calls)
         for request, call in zip(completion.requests, recorder.llm_calls, strict=True):
             _sent_matches_record(request, call)
             assert _sent_bytes(request) <= policy.max_request_bytes, policy
             assert call.context_budget is not None
-            assert call.context_budget.estimated_tokens_after <= policy.max_prompt_tokens, policy
+            # Was: estimated_tokens_after <= max_prompt_tokens for every sent request. Now a request over
+            # the token setting is sent and its record says so.
+            over = call.context_budget.estimated_tokens_after > policy.max_prompt_tokens
+            assert call.context_budget.over_estimate is over, policy
+            assert call.context_budget.max_prompt_tokens == policy.max_prompt_tokens
         if type(outcome) is PlannerDeclined:
             hatch_sent += 1
             assert completion.requests[2]["model"] == "test/advisor"

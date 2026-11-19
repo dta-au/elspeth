@@ -42,6 +42,7 @@ from elspeth.contracts.composer_interpretation import (
 )
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.composer_progress import (
+    CONTEXT_BUDGET_PROVIDER_REFUSAL_DETAIL,
     CONTEXT_BUDGET_REFUSAL_DETAIL,
     ComposerProgressEvent,
     ComposerProgressReason,
@@ -3097,9 +3098,10 @@ PLANNER_POLICY_DETAIL_CODES: Final[frozenset[str]] = frozenset(
     }
 )
 # The planner codes that mean "this request cannot be fitted to the context
-# budget". ``CONTEXT_BUDGET_EXHAUSTED`` is the budgeter's own refusal;
-# ``REQUEST_BYTES_EXHAUSTED`` is the final byte guard behind it. Both are
-# refused before any provider call and are permanent for the session.
+# budget". ``CONTEXT_BUDGET_EXHAUSTED`` is the budgeter's own refusal of a
+# request over the byte maximum, or (detail code ``context_ceiling_provider``)
+# the gateway's rejection of a sent request as over the model's context limit;
+# ``REQUEST_BYTES_EXHAUSTED`` is the final byte guard behind it.
 _FREEFORM_PLANNER_CONTEXT_BUDGET_CODES: Final[frozenset[str]] = frozenset({"CONTEXT_BUDGET_EXHAUSTED", "REQUEST_BYTES_EXHAUSTED"})
 # ``failure_code -> (http_status, safe static detail)``. The detail text is
 # provider-safe (no exception message, no provider content).
@@ -3227,6 +3229,10 @@ async def _handle_planner_failure(
     """
     failure_code = _freeform_planner_failure_code(exc)
     status_code, detail = _FREEFORM_PLANNER_FAILURE_HTTP[failure_code]
+    if failure_code == CONTEXT_BUDGET_FAILURE_CODE and "context_ceiling_provider" in exc.detail_codes:
+        # The gateway's own rejection is reported as the gateway's, not as ELSPETH's
+        # budget: the compose loop's sentence for the same ceiling (ComposerConvergenceError).
+        detail = CONTEXT_BUDGET_PROVIDER_REFUSAL_DETAIL
     envelope: dict[str, object] = {
         "_kind": "planner_failure_disposition",
         "surface": "freeform",
@@ -3267,8 +3273,8 @@ async def _handle_planner_failure(
         # with no provider content, usage, or model metadata.
         "planner_code": exc.code,
         "detail": detail,
-        # A context budget refusal makes no provider call, so it leaves no
-        # call record: the operation record, which seals this body, is where
+        # A refusal before dispatch leaves no call record (a gateway rejection
+        # leaves one): the operation record, which seals this body, is where
         # the ceiling it hit and the largest component are kept.
         **({"detail_codes": sorted(set(exc.detail_codes))} if failure_code == CONTEXT_BUDGET_FAILURE_CODE else {}),
     }
