@@ -7,9 +7,14 @@ import type { BlobMetadata } from "@/types/api";
 import type { CompositionState } from "@/types/api";
 import type { InterpretationEvent } from "@/types/interpretation";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
-import { ConfigValue } from "./ConfigRows";
-import { PromptFileEditors } from "./PromptFileEditor";
+import { PromptFileEditor } from "./PromptFileEditor";
 import { OptionRows } from "./OptionRows";
+
+// The inspector's wiring (GraphView): the step's option rows, which mount one
+// editor per file-backed prompt inside that prompt's own row.
+function PromptFileEditors({ nodeId, options }: { nodeId: string; options: Record<string, unknown> }) {
+  return <OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId, Editor: PromptFileEditor }} />;
+}
 
 vi.mock("@/api/client", () => ({
   fetchCompositionState: vi.fn(),
@@ -33,7 +38,9 @@ it("starts collapsed and opens the requested slot with keyboard focus", async ()
   useBlobStore.setState({ editRequest: null });
   render(<PromptFileEditors nodeId="first" options={{ prompt_template: { mode: "inline_content", blob_ref: "blob-1" } }} />);
   expect(screen.queryByRole("textbox", { name: /Edit prompt file/ })).not.toBeInTheDocument();
-  expect(screen.getByText(/Prompt file .*User prompt/)).toBeInTheDocument();
+  // Collapsed, the editor renders nothing at all: no placeholder line, no empty section.
+  expect(screen.queryByText(/Prompt file /)).not.toBeInTheDocument();
+  expect(document.querySelector(".prompt-editor")).toBeNull();
   act(() => useBlobStore.getState().requestPromptEdit("first", "prompt_template"));
   const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
   expect(editor).toHaveFocus();
@@ -57,7 +64,7 @@ it("blocks Save before a request when a pending review has an inline sibling", a
   const marker = { mode: "inline_content", blob_ref: "blob-1", sha256: "a".repeat(64) };
   const options = { prompt_template: marker, system_prompt: "You are helpful." };
   useSessionStore.setState({ compositionState: { nodes: [{ id: "first", plugin: "llm", options }], sources: {}, outputs: [] } as unknown as CompositionState });
-  useBlobStore.setState({ activeSessionId: "session-1", blobs: [{ id: "blob-1", filename: "prompt.md", status: "ready", mime_type: "text/plain" } as BlobMetadata] });
+  useBlobStore.setState({ activeSessionId: "session-1", blobs: [{ id: "blob-1", filename: "prompt.md", status: "ready", mime_type: "text/plain", content_hash: null } as BlobMetadata] });
   useInterpretationEventsStore.setState({ pendingBySession: { "session-1": { card: { choice: "pending", kind: "llm_prompt_template", affected_node_id: "first" } as InterpretationEvent } } });
   render(<PromptFileEditors nodeId="first" options={options} />);
   const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
@@ -133,10 +140,7 @@ function seedTwoFileStep(options: Record<string, unknown> = TWO_FILE_OPTIONS) {
     ? { text: "text of file A", sha256: "a".repeat(64) }
     : { text: "text of file B", sha256: "b".repeat(64) });
   vi.spyOn(useBlobStore.getState(), "loadBlobs").mockResolvedValue();
-  render(<>
-    <OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "first" }} />
-    <PromptFileEditors nodeId="first" options={options} />
-  </>);
+  render(<PromptFileEditors nodeId="first" options={options} />);
 }
 
 it.each([
@@ -296,11 +300,13 @@ it("does not show a hash mismatch after save repins the marker and reloads metad
   const loadBlobs = vi.spyOn(useBlobStore.getState(), "loadBlobs").mockImplementation(async () => {
     useBlobStore.setState({ blobs: [{ id: "blob-1", filename: "prompt.md", content_hash: newMarker.sha256 } as BlobMetadata] });
   });
-  function BoundPrompt() {
-    const marker = useSessionStore((state) => state.compositionState?.nodes[0]?.options.prompt_template);
-    return <ConfigValue value={marker} />;
+  // As the inspector does: the row and its editor read the step's options
+  // from the session's graph, so the row shows the marker the save repinned.
+  function Inspector() {
+    const options = useSessionStore((state) => state.compositionState?.nodes[0]?.options);
+    return options ? <PromptFileEditors nodeId="first" options={options} /> : null;
   }
-  render(<><PromptFileEditors nodeId="first" options={{ prompt_template: oldMarker }} /><BoundPrompt /></>);
+  render(<Inspector />);
   const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
   await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
   fireEvent.change(editor, { target: { value: "new text" } });
@@ -328,10 +334,7 @@ it("opens a list-form query's editor from the inspector Edit control, labelled b
   useBlobStore.setState({ editRequest: null, activeSessionId: "session-1", isLoading: false,
     blobs: [{ id: "blob-1", filename: "prompt.md", status: "ready", mime_type: "text/plain", content_hash: null } as BlobMetadata] });
   useSessionStore.setState({ compositionState: { nodes: [{ id: "first", plugin: "llm", options }], sources: {}, outputs: [] } as unknown as CompositionState });
-  render(<>
-    <OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "first" }} />
-    <PromptFileEditors nodeId="first" options={options} />
-  </>);
+  render(<PromptFileEditors nodeId="first" options={options} />);
   const edit = screen.getByRole("button", { name: "Edit prompt.md (User prompt, query classify)" });
   expect(edit).toHaveAttribute("aria-disabled", "false");
   fireEvent.click(edit);
@@ -371,10 +374,7 @@ it.each([
     blobs: [{ id: "blob-1", filename: "prompt.md", status: "ready", mime_type: "text/plain", content_hash: null } as BlobMetadata] });
   useSessionStore.setState({ compositionState: { nodes: [{ id: "first", plugin: "llm", options }], sources: {}, outputs: [] } as unknown as CompositionState });
   vi.spyOn(useBlobStore.getState(), "loadBlobs").mockResolvedValue();
-  render(<>
-    <OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "first" }} />
-    <PromptFileEditors nodeId="first" options={options} />
-  </>);
+  render(<PromptFileEditors nodeId="first" options={options} />);
   fireEvent.click(screen.getByRole("button", { name: "Edit prompt.md (User prompt, query classify)" }));
   const editor = await screen.findByRole("textbox", { name: /Edit prompt file prompt\.md/ });
   await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
@@ -502,4 +502,71 @@ it("returns focus to the row's Edit button when the editor is closed", async () 
   fireEvent.click(close);
   expect(screen.queryByRole("textbox", { name: /Edit prompt file/ })).not.toBeInTheDocument();
   expect(edit).toHaveFocus();
+});
+
+// --- Where the editor sits: inside the row of the prompt it edits ---
+
+it("opens each editor inside the row of its own prompt", async () => {
+  seedTwoFileStep();
+  const editUser = screen.getByRole("button", { name: "Edit user.md (User prompt)" });
+  const editSystem = screen.getByRole("button", { name: "Edit system.md (System prompt)" });
+  fireEvent.click(editUser);
+  const userEditor = await screen.findByRole("textbox", { name: "Edit prompt file user.md (User prompt)" });
+  expect(userEditor.closest("dd")).toBe(editUser.closest("dd"));
+  expect(editSystem.closest("dd")?.querySelector("textarea")).toBeNull();
+  fireEvent.click(editSystem);
+  const systemEditor = await screen.findByRole("textbox", { name: "Edit prompt file system.md (System prompt)" });
+  expect(systemEditor.closest("dd")).toBe(editSystem.closest("dd"));
+});
+
+const STEP_FILE = { mode: "inline_content", blob_ref: "blob-a", sha256: "a".repeat(64) };
+const OWN_FILE = { mode: "inline_content", blob_ref: "blob-b", sha256: "b".repeat(64) };
+const SHARED_NOTE = /This query uses the step's shared prompt file\. Its editor opens under query alpha\./;
+
+it("puts the one editor for a shared step-level file under the first query that uses it, and the other rows say so", async () => {
+  seedTwoFileStep({ prompt_template: STEP_FILE, queries: [{ name: "alpha" }, { name: "beta" }, { name: "gamma", template: OWN_FILE }] });
+  const editAlpha = screen.getByRole("button", { name: "Edit user.md (User prompt, query alpha)" });
+  const editBeta = screen.getByRole("button", { name: "Edit user.md (User prompt, query beta)" });
+  const editGamma = screen.getByRole("button", { name: "Edit system.md (User prompt, query gamma)" });
+  // Only the row that does not hold the editor carries the note.
+  const note = screen.getByText(SHARED_NOTE);
+  expect(note.closest("dd")).toBe(editBeta.closest("dd"));
+  expect(screen.getAllByText(SHARED_NOTE)).toHaveLength(1);
+  // Edit pressed in beta's row opens the shared editor under alpha's row.
+  act(() => editBeta.focus());
+  fireEvent.click(editBeta);
+  const shared = await screen.findByRole("textbox", { name: "Edit prompt file user.md (User prompt)" });
+  expect(shared.closest("dd")).toBe(editAlpha.closest("dd"));
+  expect(screen.getAllByRole("textbox")).toHaveLength(1);
+  // Closing hands focus back to the row the user came from.
+  fireEvent.click(screen.getByRole("button", { name: "Close" }));
+  expect(editBeta).toHaveFocus();
+  // A query with its own file keeps its own editor in its own row.
+  fireEvent.click(editGamma);
+  const own = await screen.findByRole("textbox", { name: "Edit prompt file system.md (User prompt, query gamma)" });
+  expect(own.closest("dd")).toBe(editGamma.closest("dd"));
+});
+
+it("does not add the shared-file note when the shared step-level prompt is typed text", () => {
+  seedTwoFileStep({ prompt_template: "Classify {{ row.text }}", queries: [{ name: "alpha" }, { name: "beta" }] });
+  expect(screen.queryByText(/shared prompt file/)).not.toBeInTheDocument();
+});
+
+it("still opens a file-backed slot that no row shows, when it is opened from the file list", async () => {
+  // Every query overrides the step-level prompt, so no row shows it; the file
+  // list can still ask for its editor.
+  seedTwoFileStep({ prompt_template: STEP_FILE, queries: [{ name: "alpha", template: OWN_FILE }] });
+  expect(screen.queryByRole("button", { name: /Edit user\.md/ })).not.toBeInTheDocument();
+  act(() => useBlobStore.getState().requestPromptEdit("first", "prompt_template"));
+  expect(await screen.findByRole("textbox", { name: "Edit prompt file user.md (User prompt)" })).toBeInTheDocument();
+});
+
+it("mounts no editor and no shared-file note where the host passes no editor", () => {
+  const options = { prompt_template: STEP_FILE, queries: [{ name: "alpha" }, { name: "beta" }] };
+  useBlobStore.setState({ editRequest: null, activeSessionId: "session-1", isLoading: false,
+    blobs: [{ id: "blob-a", filename: "user.md", status: "ready", mime_type: "text/plain", content_hash: null } as BlobMetadata] });
+  render(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "first" }} />);
+  act(() => useBlobStore.getState().requestPromptEdit("first", "prompt_template"));
+  expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+  expect(screen.queryByText(/shared prompt file/)).not.toBeInTheDocument();
 });

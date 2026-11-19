@@ -5,7 +5,7 @@ import { useBlobFilename } from "@/components/blobs/BlobFileName";
 import { useBlobStore } from "@/stores/blobStore";
 import { captureSessionPublicationGuard, useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
-import { promptFileEditability, promptFileSlots } from "@/lib/blobBindings";
+import { promptFileEditability } from "@/lib/blobBindings";
 import { optionLabel } from "./OptionRows";
 
 interface PromptFileEditorProps {
@@ -16,22 +16,12 @@ interface PromptFileEditorProps {
   queryName?: string;
 }
 
-function blobId(value: unknown): string | null {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
-  const marker = value as Record<string, unknown>;
-  return marker.mode === "inline_content" && typeof marker.blob_ref === "string" ? marker.blob_ref : null;
-}
-
-export function PromptFileEditors({ nodeId, options }: { nodeId: string; options: Record<string, unknown> }) {
-  const bindings = promptFileSlots(options).flatMap(({ fieldPath, value, queryName }) => {
-    const id = blobId(value);
-    return id ? [{ fieldPath, blobId: id, queryName }] : [];
-  });
-  // One editor per file-backed prompt. A step with several prompt files edits
-  // and saves each on its own; promptFileEditability decides what is refused.
-  return <>{bindings.map((binding) => <PromptFileEditor key={`${nodeId}:${binding.fieldPath}:${binding.blobId}`} nodeId={nodeId} {...binding} />)}</>;
-}
-
+/**
+ * The editor for ONE file-backed prompt slot. OptionRows mounts one per slot,
+ * inside that prompt's own row (`slotActions.Editor`), so a step with several
+ * prompt files edits and saves each on its own; promptFileEditability decides
+ * what is refused. Until Edit is pressed it renders nothing.
+ */
 export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: PromptFileEditorProps) {
   const filename = useBlobFilename(blobId);
   // The same query label the inspector row shows (promptQueryEntries `name`),
@@ -59,6 +49,9 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
   // neither `expanded` nor `text` changes and the click would do nothing.
   const [focusRequestSeq, setFocusRequestSeq] = useState(0);
   const editorRef = useRef<HTMLTextAreaElement>(null);
+  // The Edit button that opened the editor, so Close can hand focus back to
+  // the row the user came from (several query rows can share one slot).
+  const triggerRef = useRef<HTMLElement | null>(null);
   const shouldFocusRef = useRef(false);
   const editability = compositionState?.nodes.some((node) => node.id === nodeId)
     ? promptFileEditability({ state: compositionState, blobs: blobSessionId === sessionId ? blobs : [],
@@ -71,6 +64,8 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
   useLayoutEffect(() => {
     if (editRequest?.nodeId !== nodeId || editRequest.fieldPath !== fieldPath) return;
     shouldFocusRef.current = true;
+    const active = document.activeElement;
+    triggerRef.current = active instanceof HTMLElement && active.dataset.promptEditSlot === `${nodeId}:${fieldPath}` ? active : null;
     setExpanded(true);
     setFocusRequestSeq(editRequest.seq);
     useBlobStore.getState().consumePromptEdit(editRequest.seq);
@@ -175,17 +170,19 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
   const close = () => {
     setExpanded(false);
     // The button that had focus is about to unmount; hand focus back to the
-    // row's Edit button instead of letting it fall to the page.
+    // Edit button that opened the editor (or, when it was opened from the file
+    // list, the slot's first Edit button) instead of letting it fall to the page.
     const slot = `${nodeId}:${fieldPath}`;
-    const trigger = Array.from(document.querySelectorAll<HTMLElement>("[data-prompt-edit-slot]"))
-      .find((element) => element.dataset.promptEditSlot === slot);
+    const trigger = triggerRef.current?.isConnected
+      ? triggerRef.current
+      : Array.from(document.querySelectorAll<HTMLElement>("[data-prompt-edit-slot]"))
+        .find((element) => element.dataset.promptEditSlot === slot);
     trigger?.focus();
   };
 
+  if (!expanded) return null;
   return (
-    <section className="graph-config-section">
-      {!expanded && <p className="prompt-editor-collapsed">Prompt file {shownName} ({slotLabel})</p>}
-      {expanded && <>
+    <section className="graph-config-section prompt-editor">
       <div className="prompt-editor-heading">
         <label className="prompt-editor-label" htmlFor={fieldId}>Edit prompt file {shownName} ({slotLabel})</label>
         {refusal !== null && <span className="prompt-editor-tag">Read only</span>}
@@ -223,7 +220,6 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
         <Button type="button" variant="ghost" compact className="prompt-editor-close" onClick={close}>Close</Button>
       </div>
       {hint && <p id={hintId} className="prompt-editor-hint">{hint}</p>}
-      </>}
     </section>
   );
 }
