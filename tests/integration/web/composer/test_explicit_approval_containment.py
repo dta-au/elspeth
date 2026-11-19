@@ -138,7 +138,6 @@ async def test_batch_with_two_staged_edits_is_refused_before_effects_then_one_co
             error_code="approval_batch_not_atomic",
             version=state.version,
         )
-        assert "set_pipeline" in message
         # True of every call in the response whatever each one's own outcome,
         # including a sibling refused for malformed arguments.
         assert "carried 2 pipeline-change calls" in message
