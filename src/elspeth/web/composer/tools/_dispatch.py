@@ -287,8 +287,9 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
                     "maxLength": 8192,
                     "description": (
                         "Stable user-facing label for the assumption being reviewed; for kind='pipeline_decision', "
-                        "copy exactly one of drop_raw_html_fields, prompt_injection_shield_recommendation, or "
-                        "web_scrape_http_identity and never mint a decision term."
+                        "copy exactly one of drop_raw_html_fields, gate_condition_authored, "
+                        "prompt_injection_shield_recommendation, or web_scrape_http_identity and never mint a "
+                        "decision term."
                     ),
                 },
                 "llm_draft": {

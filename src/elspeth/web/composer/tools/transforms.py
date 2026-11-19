@@ -202,8 +202,8 @@ _LIST_TRANSFORMS_DECLARATION = ToolDeclaration(
         "The result's `prohibited` array names any transform categorically banned from "
         "the web authoring surface by security policy, with its closed reason and "
         "explanation — cite it when a user asks why a specific plugin is unavailable. "
-        "Call get_plugin_schema only for enum values, nested option shapes, or the "
-        "raw JSON schema; this listing already answers ordinary configuration questions."
+        "The request's `authoring_aids.discovery_digest` is the plugin index: call this listing "
+        "only for a fact it lacks. get_plugin_schema gives a chosen plugin's option contract."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=True,
@@ -237,8 +237,8 @@ _LIST_SINKS_DECLARATION = ToolDeclaration(
         "The result's `prohibited` array names any sink categorically banned from "
         "the web authoring surface by security policy, with its closed reason and "
         "explanation — cite it when a user asks why a specific plugin is unavailable. "
-        "Call get_plugin_schema only for enum values, nested option shapes, or the "
-        "raw JSON schema; this listing already answers ordinary configuration questions."
+        "The request's `authoring_aids.discovery_digest` is the plugin index: call this listing "
+        "only for a fact it lacks. get_plugin_schema gives a chosen plugin's option contract."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=True,
