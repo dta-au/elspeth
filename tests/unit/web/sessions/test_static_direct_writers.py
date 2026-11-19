@@ -2563,6 +2563,19 @@ _TEST_FIXTURE_REVIEWED_WRITERS: tuple[ReviewedWriter, ...] = (
             "rather than matched by spelling — the one live writer that widening surfaced."
         ),
     ),
+    ReviewedWriter(
+        path="tests/unit/web/composer/test_removed_repair_fields_not_emitted.py",
+        enclosing_symbol="test_old_stored_tool_row_is_excluded_from_provider_history",
+        table="chat_messages",
+        operation="sqlalchemy_insert_call",
+        count=2,
+        purpose=(
+            "replay fixture: seeds one assistant row and one tool row in the repair-suggestion "
+            "shape an earlier release stored. The production write path cannot store that "
+            "shape (its typed redaction refuses it), so a raw insert is the only way to "
+            "prove an older stored turn still replays."
+        ),
+    ),
 )
 
 _ALLOWLIST: tuple[ReviewedWriter, ...] = _REVIEWED_ALLOWLIST + _TEST_FIXTURE_REVIEWED_WRITERS
