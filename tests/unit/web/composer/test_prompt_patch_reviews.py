@@ -1187,3 +1187,49 @@ def test_accepting_a_proposed_replace_call_replays_it() -> None:
 
     _assert_prompt_replaced(replayed, superseded=["category"])
     assert replayed.updated_state.nodes[0].options == direct.updated_state.nodes[0].options
+
+
+def _approved_structured_state_with_two_queries() -> CompositionState:
+    """The approved structured prompt of ``_approved_state`` on a node with two queries, approvals re-derived."""
+    state = _approved_state(structured=True)
+    options = deep_thaw(state.nodes[0].options)
+    options["queries"] = [
+        {"name": "first", "input_fields": {"text": "text"}},
+        {"name": "second", "input_fields": {"text": "text"}},
+    ]
+    # Multi-query LLM nodes need a bounded retry budget (llm_retry_budget_policy).
+    options["pool_size"] = 2
+    prompt_review = next(row for row in options["interpretation_requirements"] if row["kind"] == "llm_prompt_template")
+    prompt_review["draft"] = prompt_review_draft_from_options(options)
+    prompt_review["accepted_value"] = prompt_review["draft"]
+    prompt_review["resolved_prompt_template_hash"] = prompt_review_anchor_hash_from_options(options)
+    options["approved_prompt_artifact_hash"] = approved_prompt_artifact_hash_from_options(options)
+    return state.with_node(replace(state.nodes[0], options=options))
+
+
+def test_a_prompt_replacement_sent_with_an_omitting_queries_patch_is_refused_whole() -> None:
+    """One patch that replaces the prompt AND drops a query is refused whole: nothing of it applies."""
+    state = _approved_structured_state_with_two_queries()
+    before = state.to_dict()
+    before_hash = composition_content_hash(state)
+    stored = deep_thaw(state.nodes[0].options)
+    assert "prompt_template_parts" in stored and _vague_ids(state) == ["category"]
+    patch = {
+        "prompt_template": _REPLACEMENT_TEXT,
+        "prompt_template_parts": None,
+        "queries": [stored["queries"][0]],
+    }
+
+    result = execute_tool("patch_node_options", {"node_id": "code_themes", "patch": patch}, state, _mock_catalog())
+
+    assert not result.success, "the replacement applied and dropped query 'second'"
+    assert [error.error_code for error in result.validation.errors] == ["queries_patch_omits_existing"]
+    assert result.updated_state is state and result.affected_nodes == ()
+    assert result.data is None or ("superseded_review_ids" not in result.data and "prompt_unchanged_node_ids" not in result.data)
+    options = deep_thaw(state.nodes[0].options)
+    assert options["prompt_template"] == stored["prompt_template"]
+    assert options["prompt_template_parts"] == stored["prompt_template_parts"]
+    assert options["interpretation_requirements"] == stored["interpretation_requirements"]
+    assert options["queries"] == stored["queries"]
+    assert options["approved_prompt_artifact_hash"] == stored["approved_prompt_artifact_hash"]
+    assert state.to_dict() == before and composition_content_hash(state) == before_hash
