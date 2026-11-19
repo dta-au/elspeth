@@ -2570,8 +2570,12 @@ def restricted_discovery_producer(tmp_path: Path, tool_context: ToolContext) -> 
         return execute_discovery_tool_with_context(tool_name, dict(_DISCOVERY_TEST_ARGUMENTS[tool_name]), _empty_state(), context)
 
     with (
-        patch.object(blobs, "_sync_list_blobs", autospec=True, return_value=[]),
-        patch.object(blobs, "_sync_list_ready_blob_inline_descriptors", autospec=True, return_value=[]),
+        patch.object(
+            blobs,
+            "_sync_read_blob_list",
+            autospec=True,
+            return_value=blobs._BlobListRead(records=(), matching_total=0, ready_only=False),
+        ),
         patch.object(blobs, "_sync_get_blob", autospec=True, return_value=record),
         patch.object(blobs, "_locked_read_ready_blob", autospec=True, return_value=(record, content)),
         patch.object(sources, "_sync_get_blob", autospec=True, return_value=record),

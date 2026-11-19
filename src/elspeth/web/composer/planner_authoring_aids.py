@@ -367,7 +367,8 @@ _SOURCE_CUSTODY_RULES: Final[tuple[str, ...]] = (
     "A file the user NAMES but never uploaded, whose content is not in the "
     "conversation, has NO legal binding: source paths must resolve to real "
     "session-blob storage, so an invented path is always rejected. Discover "
-    "first (list_blobs / list_composer_blobs); if nothing matches, ask one "
+    "first (list_blobs / list_composer_blobs; after an `Incomplete list:` "
+    "hint, a file missing from the list may still exist); if nothing matches, ask one "
     "narrow upload/selection question — or, on a surface with no question "
     "channel, decline with a named gap. Never fabricate a path, blob id, or "
     "stand-in rows.",

@@ -204,7 +204,7 @@ from elspeth.web.composer.tools._common import (
 )
 from elspeth.web.composer.tools._dispatch import _schema_violation_loc, execute_discovery_tool_with_context
 from elspeth.web.composer.tools._generation_schema_response import AdmittedPluginSchemaResponse
-from elspeth.web.composer.tools.blobs import BlobIdArgumentsModel
+from elspeth.web.composer.tools.blobs import BlobIdArgumentsModel, blob_list_is_incomplete
 from elspeth.web.composer.tools.generation import (
     _CLOSED_VALIDATION_ERROR_CODES,
     EXPLAIN_VALIDATION_ERROR_GUIDANCE,
@@ -563,8 +563,15 @@ def _model_catalog_information_covered(key: str, supplied: frozenset[str]) -> bo
 
 
 def _resolved_discovery_information_keys(call: _ParsedToolCall, discovery: AdmittedDiscoveryResult) -> tuple[str, ...]:
-    """Add complete provider coverage only when the real listing is complete."""
+    """Claim coverage only for what the real listing covered.
+
+    Model listings add complete provider coverage when untruncated. A file
+    listing that says older files were left out supplies nothing: its
+    inventory key stays pending, so the gaps-closed notice cannot follow it.
+    """
     keys = planner_discovery_information_keys(call)
+    if call.name in {"list_blobs", "list_composer_blobs"} and discovery.result.success:
+        return () if blob_list_is_incomplete(discovery.result) else keys
     if call.name != "list_models" or not discovery.result.success:
         return keys
     provider = call.arguments["provider"] if "provider" in call.arguments else None

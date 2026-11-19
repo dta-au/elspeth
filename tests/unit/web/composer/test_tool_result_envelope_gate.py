@@ -157,8 +157,8 @@ _DATA_HELPER_PAYLOADS: dict[str, type | _ListPayload | _Literal | None] = {
     "_inventory_item_payload": secrets._SecretInventoryItemPayload,
     "get_schema": PluginSchemaInfo,  # context.catalog.get_schema returns the pydantic model instance
     "get_expression_grammar": None,  # a str
-    "_sync_list_blobs": _Literal(TOOLS_DIR / "blobs.py", "_sync_list_blobs"),
-    "_sync_list_ready_blob_inline_descriptors": _ListPayload(blobs.BlobInlineDescriptor),
+    "_blob_inventory_entries": _Literal(TOOLS_DIR / "blobs.py", "_blob_inventory_entries"),
+    "_blob_inline_descriptors": _ListPayload(blobs.BlobInlineDescriptor),
     "facts_to_dict": _Literal(COMPOSER / "source_inspection.py", "facts_to_dict"),
     "diff_states": _Literal(COMMON, "diff_states"),
     # Element builders of a shipped container. Unreachable from a ``data=`` site directly —
@@ -3130,7 +3130,7 @@ def test_plain_registered_helper_descendants(expression: str, prefix: str, expec
 
 @pytest.mark.parametrize("wrapped", [False, True])
 def test_plain_list_helper_keeps_element_paths(wrapped: bool) -> None:
-    expression = "_sync_list_ready_blob_inline_descriptors()"
+    expression = "_blob_inline_descriptors()"
     if wrapped:
         expression = f"dict({expression})"
     value = ast.parse(expression, mode="eval").body

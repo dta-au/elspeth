@@ -917,7 +917,9 @@ class TestStep3BlobDiscoveryTierMigration:
             "name": "list_blobs",
             "description": (
                 "List uploaded/created files (blobs) in this session with metadata: each entry carries `id`, `filename`, "
-                "`mime_type`, `size_bytes`, `status`, `created_by`, and `creation_modality`."
+                "`mime_type`, `size_bytes`, `status`, `created_by`, and `creation_modality`. Lists at most the 50 newest "
+                "files; when more exist, a `post_call_hints` entry starting `Incomplete list:` says how many are not listed. "
+                "An unlisted file still works by its id; no tool finds a file by name."
             ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
@@ -928,7 +930,9 @@ class TestStep3BlobDiscoveryTierMigration:
             "description": (
                 "List ready blobs available for audited inline-content authoring. "
                 "Returns a `blobs` list whose entries carry only `blob_id`, `mime_type`, `size_bytes`, `content_hash`, "
-                "and `filename`; never content bytes."
+                "and `filename`; never content bytes. Lists at most the 50 newest ready files; when more exist, a "
+                "`post_call_hints` entry starting `Incomplete list:` says how many are not listed. An unlisted file still "
+                "works by its id; no tool finds a file by name."
             ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
