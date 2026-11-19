@@ -994,7 +994,12 @@ class TestBuildSystemPrompt:
         assert "does not by itself require a `vague_term` review" in result
 
     def test_core_skill_requires_schema_proven_cleanup_before_sink(self) -> None:
-        """Saved derived results minimize raw/private intermediates without plugin folklore."""
+        """Saved derived results minimize raw/private intermediates without plugin folklore.
+
+        The fork relay is described by behavior; the model chooses a suitable
+        transform from the live catalog. The skill must not name a deployment
+        plugin as a cleanup or projection rule.
+        """
         result = build_system_prompt(None)
         flattened = " ".join(result.split())
 
@@ -1007,6 +1012,18 @@ class TestBuildSystemPrompt:
         assert "does not remove data" in flattened
         assert "configured options actually project or remove fields" in flattened
         assert "stage that row-shaping choice as a pending `pipeline_decision`" in flattened
+
+        heading = "### Output data minimization"
+        after_heading = result.split(heading, 1)[1]
+        minimization = after_heading.split("\n### ", 1)[0]
+        fork_begin = "<!-- taught:begin validation * validation.graph_repair_suggestions;"
+        block_start = result.index(fork_begin)
+        block_end = result.index("<!-- taught:end -->", block_start)
+        assert minimization.strip()
+        assert "policy-visible cleanup or projection transform" in " ".join(minimization.split())
+        fork_block = " ".join(result[block_start:block_end].split())
+        assert "transform that passes each row through unchanged" in fork_block
+        assert "one the catalog offers" in fork_block
         assert "field_mapper" not in result
 
     def test_core_skill_preserves_requested_workflow_during_repairs(self) -> None:

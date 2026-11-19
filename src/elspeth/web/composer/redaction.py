@@ -3063,69 +3063,14 @@ def _summarize_blob_content(content: str) -> str:
     return "<redacted-blob-content>"
 
 
-def _restore_fixed_repair_arguments_for_validation(value: object) -> object:
-    """Admit only our exact fixed sentinel on an idempotent second projection."""
-    return {} if value == "<redacted-repair-arguments>" else value
-
-
-def _summarize_repair_arguments(arguments: Mapping[str, object]) -> str:
-    """Summarizer for ``get_blob_content`` repair-tool-call ``arguments``.
-
-    The validation envelope's ``graph_repair_suggestions[*].tool_sequence[*].
-    arguments`` slot is the one genuinely heterogeneous leaf in the
-    ``get_blob_content`` response surface. It holds the keyword arguments the
-    composer would pass to a repair tool (field paths, node ids, connection
-    selectors) and varies per repair tool, so it cannot be closed-typed the way
-    the surrounding structural fields can. It is NOT source-data lineage — it is
-    derived, advisory repair guidance — so summarizing it to a structural sketch
-    in ``chat_messages.tool_calls`` does not break attributability.
-
-    The mapping is an open carrier: both keys and values may be externally
-    derived. The summary therefore discloses neither names, values, nor count.
-
-    Contract (spec §4.2.6, §9 RSK-03):
-      * MUST NOT raise on any reachable input value.
-      * MUST return ``str``.
-
-    Pydantic validation guarantees a mapping or the stable fixed sentinel
-    before this runs.
-    """
-    del arguments
-    return "<redacted-repair-arguments>"
-
-
-class _RepairToolCallShadowModel(BaseModel):
-    """Redaction shadow for ``_RepairToolCall`` (tools/_common.py).
-
-    Mirrors the serialized ``tool_sequence[*]`` dict: a closed ``tool`` name
-    plus the heterogeneous ``arguments`` mapping. ``arguments`` is the only
-    leaf in the entire ``get_blob_content`` validation envelope that cannot be
-    closed-typed, so it carries a :class:`Sensitive` marker with a structural
-    summarizer (:func:`_summarize_repair_arguments`). It is advisory repair
-    guidance, not source-data lineage, so retaining only its key count is
-    sufficient for audit shape.
-    """
-
-    tool: str
-    arguments: Annotated[
-        Mapping[str, object],
-        BeforeValidator(_restore_fixed_repair_arguments_for_validation),
-        Sensitive(summarizer=_summarize_repair_arguments),
-    ]
-
-    model_config = ConfigDict(extra="forbid")
-
-
 class _AffectedConsumerShadowModel(BaseModel):
     """Redaction shadow for ``_AffectedConsumer`` (tools/_common.py).
 
-    All three fields are pipeline-structural scalar strings (node id and the
-    before/after input descriptors); none carries operator payload.
+    One pipeline-structural scalar string, the consumer's node id; it carries
+    no operator payload.
     """
 
     id: str
-    current_input: str
-    new_input: str
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3133,18 +3078,15 @@ class _AffectedConsumerShadowModel(BaseModel):
 class _GraphRepairSuggestionShadowModel(BaseModel):
     """Redaction shadow for ``_GraphRepairSuggestion`` (tools/_common.py).
 
-    Mirrors a serialized ``graph_repair_suggestions[*]`` dict. Every scalar
-    field is a structural repair descriptor; the two nested lists descend into
-    :class:`_AffectedConsumerShadowModel` and :class:`_RepairToolCallShadowModel`
-    so the walker reaches the single Sensitive ``arguments`` leaf within.
+    Mirrors a serialized ``graph_repair_suggestions[*]`` dict: the facts of one
+    duplicate consumer. Every field is a structural scalar or a list of
+    :class:`_AffectedConsumerShadowModel`; there is no open-carrier leaf.
     """
 
     code: str
     connection: str
-    strategy: str
     reason: str
     affected_consumers: list[_AffectedConsumerShadowModel]
-    tool_sequence: list[_RepairToolCallShadowModel]
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3283,10 +3225,7 @@ class GetBlobContentValidationModel(BaseModel):
     The validation envelope is structural pipeline-validation metadata, not
     blob bytes, so the field as a whole is intentionally NOT marked Sensitive.
     A post-validation scalar projection preserves closed public framing while
-    summarizing free-form text. The
-    ``graph_repair_suggestions[*].tool_sequence[*].arguments`` mapping also
-    carries its own Sensitive structural summarizer in
-    :class:`_RepairToolCallShadowModel`.
+    summarizing free-form text.
     """
 
     is_valid: bool

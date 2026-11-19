@@ -512,18 +512,35 @@ not the unchanged state the envelope's `version` names. Nothing changed, so
 <!-- taught:end -->
 
 <!-- taught:begin validation * validation.graph_repair_suggestions; validation * validation.graph_repair_suggestions[].* -->
-`graph_repair_suggestions` gives a ready repair for a duplicate consumer:
-`code`, `connection`, `strategy`, `reason` (why the repair is suggested), the `affected_consumers` (`id`,
-`current_input`, `new_input`), and a `tool_sequence` of tool-call objects —
-call each `tool` directly with its `arguments`, in order; never quote
-`arguments` back to the user.
+`graph_repair_suggestions` states the facts of a duplicate consumer and
+proposes no repair: `connection` (the connection read more than once),
+`affected_consumers` (the `id` of every step reading it), `code` and `reason`.
+One connection feeds one step. If the steps were meant to run one after
+another, re-point the later step's `input` at the earlier step's output
+connection with `upsert_node`; that call re-sends the step whole. If each
+step needs the same rows, build a fork yourself: `upsert_node` a gate
+(`node_type` `gate`, no `plugin`, `condition='True'`,
+`routes={"true": "fork", "false": "fork"}`) whose `input` is the shared
+connection and whose `fork_to` lists one new branch name per step (at most
+32), and `upsert_node` each step with `input` set to its own branch. An
+aggregation or a coalesce cannot read a fork branch directly: add a relay on its
+branch, a transform that passes each row through unchanged (one the catalog
+offers, configured to change nothing, its `schema` `{"mode": "observed"}`;
+`input` the branch, `on_success` a new connection, `on_error` as on any
+transform), and have the step read that
+connection: an aggregation through `input`, a coalesce through the value of its
+`branches` entry, key kept. A row union cannot read a fork branch, even through
+a relay: build no fork for it and tell the user. The gate id, the relay ids and
+the branch and connection names are yours to choose. Until the last call the
+duplicate stands, with errors for connections nothing produces or reads yet;
+they clear with the last call. Where changes need approval, send these calls one
+per response, each after the one before is accepted.
 <!-- taught:end -->
 
 <!-- taught:begin failure-data * data.repair.post_hoc_form.tool_sequence -->
-A different `tool_sequence` appears under a
-credential failure's `repair` → `post_hoc_form`: a plain list of tool NAMES
-to call in order, with no `arguments`; build each call's arguments yourself
-from `credential_fields` and `components`.
+Under a credential failure's `repair` → `post_hoc_form`, `tool_sequence` is
+a plain list of tool NAMES to call in order, with no `arguments`; build each
+call's arguments yourself from `credential_fields` and `components`.
 <!-- taught:end -->
 
 ### On failure
@@ -1569,7 +1586,7 @@ These are common one-shot mappings:
 | Producer guarantees are empty and producer is a transform | Patch that transform schema or use plugin assistance for the plugin-owned contract. |
 | Consumer requires fields not produced upstream | Correct the upstream producer, or narrow the consumer's `required_input_fields` if the requirement was overstated. On an `llm` node, narrowing alone trades one rejection for another: a `prompt_template` may not read a `row.<field>` its `required_input_fields` omits, so drop the template reference in the same edit. |
 | A cleanup or projection transform consumes a field that no upstream node guarantees, and the user-requested producer is absent from the current graph | Restore the missing producer node — this is the silent-downgrade pattern from **Requested Workflow Integrity**. The cleanup transform's field requirements are the trace of what the dropped node was supposed to produce. Do not repair by deleting requested result mappings. Resubmit the full `set_pipeline` with the missing node restored and wired before the cleanup transform. Reapply the model-node review preflight when the restored node is a model transform. |
-| `set_pipeline` rejected with "Duplicate consumer for connection" | A single upstream output is wired to two or more consumers. Insert a gate node between the upstream and the two consumers, or restructure so each connection has exactly one consumer. Do not remove either consumer node to resolve the conflict; the user requested both. |
+| Validation reports "Duplicate consumer for connection" | One connection is read by two or more steps, and a connection feeds one. Decide what was meant, steps in sequence or steps that each need the same rows, and repair it as `graph_repair_suggestions` under "Reading a tool result" describes. Do not remove a consumer to resolve the conflict; the user requested each one. |
 | Rejected `set_pipeline` used `source.inline_blob` and the source blob is absent afterward | Failed mutations do not create reusable blobs. Resubmit with the same corrected `source.inline_blob`, or where your palette offers `create_blob` call it with the same artifact and retry using the returned `blob_id`; do not ask for a blob id. |
 | Generated source path is outside the allowed blob directory | Keep the generated artifact, create a blob from the generated rows, bind it as the source, and retry the complete workflow. Do not ask for an upload or replace the source with an imaginary path. |
 | Rejected pipeline included a fake review, recommendation, or placeholder node | Remove the fake node from the next full `set_pipeline` arguments, put the requirement in `interpretation_requirements` on the real source/LLM/cleanup node, and retry the full topology. Do not call `remove_node`; rejected mutations did not persist that node. |

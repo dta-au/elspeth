@@ -88,6 +88,7 @@ from elspeth.web.composer.state import (
     ValidationSummary,
     _coalesce_branch_connections,
     _coalesce_branch_names,
+    _connection_consumer_claims,
     _serialize_branches,
 )
 from elspeth.web.composer.tool_result_envelope import APPLIED_COMPONENT_KEYS, ValidationGuidance
@@ -652,24 +653,21 @@ class _FullPipelineStatePayload(TypedDict):
     inspection: _FullPipelineStateInspectionPayload
 
 
-class _RepairToolCall(TypedDict):
-    tool: str
-    arguments: Mapping[str, object]
-
-
 class _AffectedConsumer(TypedDict):
     id: str
-    current_input: str
-    new_input: str
 
 
 class _GraphRepairSuggestion(TypedDict):
+    """The facts of one duplicate consumer: the shared connection and every node reading it.
+
+    Facts only (Composer invariant 1): no server-proposed names, no gate, no
+    tool calls, no node payloads. The model builds the repair from the skill.
+    """
+
     code: str
     connection: str
-    strategy: str
     reason: str
     affected_consumers: list[_AffectedConsumer]
-    tool_sequence: list[_RepairToolCall]
 
 
 def _semantic_contracts_payload(
@@ -739,20 +737,6 @@ def _repair_identifier_fragment(value: str, *, fallback: str) -> str:
     return fragment
 
 
-def _unique_name(candidate: str, reserved: set[str]) -> str:
-    """Return candidate or a suffixed variant that does not collide with reserved."""
-    if candidate not in reserved:
-        reserved.add(candidate)
-        return candidate
-
-    index = 2
-    while f"{candidate}_{index}" in reserved:
-        index += 1
-    unique = f"{candidate}_{index}"
-    reserved.add(unique)
-    return unique
-
-
 def _reserved_connection_names(state: CompositionState) -> set[str]:
     """Collect existing route/connection/sink names a repair branch must avoid."""
     names: set[str] = {output.name for output in state.outputs}
@@ -787,134 +771,37 @@ def _reserved_connection_names(state: CompositionState) -> set[str]:
     return names
 
 
+_DUPLICATE_CONSUMER_REASON: Final = "One connection can feed one processing node; every node listed reads this one."
+
+
 def _duplicate_consumer_repair_suggestions(
     state: CompositionState,
     validation: ValidationSummary,
 ) -> list[_GraphRepairSuggestion]:
-    """Build copyable repair skeletons for duplicate-consumer validation failures."""
+    """State the facts of each duplicate-consumer error: the connection and every node that reads it.
+
+    The consumers come from the same claim list the validator names in the
+    error (``_connection_consumer_claims``), in the same order, each node id
+    once even when one barrier binds the connection through two branches.
+    """
     duplicate_error_components = {error.component for error in validation.errors if error.error_code == "duplicate_connection_consumer"}
     if not duplicate_error_components:
         return []
 
-    # ``branch_alias`` is None for an ordinary ``node.input`` consumer and
-    # names the branch slot for a row_union consumer. The row_union's own
-    # ``input`` is only an adapter placeholder and must never be repaired as
-    # though it were an independent consumption edge.
-    consumers_by_connection: dict[str, list[tuple[NodeSpec, str | None]]] = {}
-    for node in state.nodes:
-        if node.node_type in ("coalesce", "queue", "row_union"):
-            continue
-        consumers_by_connection.setdefault(node.input, []).append((node, None))
-    for node in state.nodes:
-        if node.node_type != "row_union":
-            continue
-        for row_union_branch_alias, branch_connection in zip(
-            _coalesce_branch_names(node.branches),
-            _coalesce_branch_connections(node.branches),
-            strict=True,
-        ):
-            if row_union_branch_alias == branch_connection:
-                continue
-            consumers_by_connection.setdefault(branch_connection, []).append((node, row_union_branch_alias))
-
-    reserved_node_ids = {node.id for node in state.nodes}
-    reserved_connection_names = _reserved_connection_names(state)
+    claims = _connection_consumer_claims(state.nodes)
     suggestions: list[_GraphRepairSuggestion] = []
-
-    for connection_name, consumer_nodes in sorted(consumers_by_connection.items()):
-        if len(consumer_nodes) < 2 or f"connection:{connection_name}" not in duplicate_error_components:
+    for connection_name in sorted({claimed for claimed, _node_id, _description in claims}):
+        if f"connection:{connection_name}" not in duplicate_error_components:
             continue
-
-        connection_fragment = _repair_identifier_fragment(connection_name, fallback="connection")
-        gate_id = _unique_name(f"fork_{connection_fragment}", reserved_node_ids)
-        branch_names = [
-            _unique_name(
-                f"{connection_fragment}_to_{_repair_identifier_fragment(binding[0].id, fallback='node')}",
-                reserved_connection_names,
-            )
-            for binding in consumer_nodes
-        ]
-        gate_args: dict[str, object] = {
-            "id": gate_id,
-            "node_type": "gate",
-            "plugin": None,
-            "input": connection_name,
-            "on_success": None,
-            "on_error": None,
-            "options": {},
-            "condition": "True",
-            "routes": {"true": "fork", "false": "fork"},
-            "fork_to": branch_names,
-            "branches": None,
-            "policy": None,
-            "merge": None,
-            "trigger": None,
-            "output_mode": None,
-            "expected_output_count": None,
-        }
-        tool_sequence: list[_RepairToolCall] = []
-        affected_consumers: list[_AffectedConsumer] = []
-        # One row_union can contribute two (node, alias) bindings when two of
-        # its aliases share a connection. Every patch for a node must land on
-        # one running payload: re-serializing the original node per binding
-        # emits two upsert_node calls for the same id, and the second reverts
-        # the first. Insertion order preserves the cross-node sequence.
-        patched_consumers: dict[str, dict[str, Any]] = {}
-        for (node, consumer_branch_alias), branch_name in zip(consumer_nodes, branch_names, strict=True):
-            if node.id not in patched_consumers:
-                # Widened deliberately: this is a repair-call argument the loop
-                # below re-keys, not the node payload the census reports, so it
-                # must not borrow ``_SetPipelineNodePayload``'s closed key set.
-                # Built from the AUTHORING projection, not the diagnostic
-                # ``_serialize_node``: every call here is replayed through
-                # upsert_node, which refuses runtime-owned options (a resolved
-                # LLM prompt's node-level approved_prompt_artifact_hash) and
-                # resolver-owned review linkage, so the diagnostic shape made
-                # the first call fail and the rest half-apply.
-                patched_consumers[node.id] = dict(_serialize_set_pipeline_node(node))
-            patched_consumer = patched_consumers[node.id]
-            if consumer_branch_alias is None:
-                patched_consumer["input"] = branch_name
-            else:
-                # _serialize_node writes "branches" as exactly ``dict`` (mapping
-                # form), exactly ``list`` (alias form), or None — a closed owned
-                # union built by _serialize_branches, so the nominal check is exact.
-                patched_branches = patched_consumer["branches"]
-                if type(patched_branches) is not dict:
-                    patched_branches = dict(
-                        zip(
-                            _coalesce_branch_names(node.branches),
-                            _coalesce_branch_connections(node.branches),
-                            strict=True,
-                        )
-                    )
-                patched_branches[consumer_branch_alias] = branch_name
-                patched_consumer["branches"] = patched_branches
-                # ``input`` is only the adapter placeholder for the first
-                # branch connection; re-derive it from the accumulated mapping
-                # so it stays consistent no matter which aliases were repaired.
-                patched_consumer["input"] = next(iter(patched_branches.values()))
-            affected_consumers.append(
-                {
-                    "id": node.id,
-                    "current_input": connection_name,
-                    "new_input": branch_name,
-                }
-            )
-        tool_sequence.extend({"tool": "upsert_node", "arguments": patched_consumer} for patched_consumer in patched_consumers.values())
-        tool_sequence.append({"tool": "upsert_node", "arguments": gate_args})
-        tool_sequence.append({"tool": "preview_pipeline", "arguments": {}})
+        consumer_ids = dict.fromkeys(node_id for claimed, node_id, _description in claims if claimed == connection_name)
         suggestions.append(
             {
-                "code": "duplicate_consumer_connection",
+                "code": "duplicate_connection_consumer",
                 "connection": connection_name,
-                "strategy": "insert_fork_gate",
-                "reason": "One connection can feed one processing node. Give each consumer a unique branch input, then insert a fork gate that consumes the shared connection and publishes those branch inputs from gate.fork_to.",
-                "affected_consumers": affected_consumers,
-                "tool_sequence": tool_sequence,
+                "reason": _DUPLICATE_CONSUMER_REASON,
+                "affected_consumers": [{"id": node_id} for node_id in consumer_ids],
             }
         )
-
     return suggestions
 
 
