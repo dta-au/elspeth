@@ -225,16 +225,49 @@ describe("BlobManager reveal request", () => {
     trigger.remove();
   });
 
-  it("offers Edit prompt only for an editable, uniquely bound file", () => {
+  it("offers Edit prompt for every prompt-bound file, including one that backs two prompts", () => {
     useSessionStore.setState({ compositionState: selectedState({ prompt_template: { blob_ref: "two", mode: "inline_content", sha256: "hash" } }) });
     render(<BlobManager onUseAsInput={vi.fn()} />);
     const edit = screen.getByRole("button", { name: "Edit prompt user.txt" });
+    expect(edit).toHaveAttribute("aria-disabled", "false");
     act(() => edit.click());
     expect(useSessionStore.getState().selectedNodeId).toBe("llm");
     expect(useBlobStore.getState().editRequest).toMatchObject({ nodeId: "llm", fieldPath: "prompt_template" });
+    // The same file on a second prompt slot: the control stays, and still opens the editor.
+    act(() => useBlobStore.setState({ editRequest: null }));
     act(() => useSessionStore.setState({ compositionState: selectedState({ prompt_template: { blob_ref: "two", mode: "inline_content", sha256: "hash" },
       system_prompt: { blob_ref: "two", mode: "inline_content", sha256: "hash" } }) }));
-    expect(screen.queryByRole("button", { name: "Edit prompt user.txt" })).not.toBeInTheDocument();
+    const shared = screen.getByRole("button", { name: "Edit prompt user.txt" });
+    expect(shared).toHaveAttribute("aria-disabled", "false");
+    act(() => shared.click());
+    expect(useBlobStore.getState().editRequest).toMatchObject({ nodeId: "llm" });
+  });
+
+  it("opens a twice-bound file on the selected step's binding, else on the first", () => {
+    const marker = { blob_ref: "two", mode: "inline_content", sha256: "hash" };
+    const base = selectedState({ prompt_template: marker });
+    const state: CompositionState = { ...base, nodes: [...base.nodes,
+      { id: "llm-2", node_type: "transform", plugin: "llm", options: { system_prompt: marker }, input: "rows", on_success: "out", on_error: null }] };
+    useSessionStore.setState({ compositionState: state, selectedNodeId: "llm-2" });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    act(() => screen.getByRole("button", { name: "Edit prompt user.txt" }).click());
+    expect(useBlobStore.getState().editRequest).toMatchObject({ nodeId: "llm-2", fieldPath: "system_prompt" });
+    expect(useSessionStore.getState().selectedNodeId).toBe("llm-2");
+    // A step that does not use the file is selected: the first binding is opened.
+    act(() => useSessionStore.setState({ selectedNodeId: "inject" }));
+    act(() => screen.getByRole("button", { name: "Edit prompt user.txt" }).click());
+    expect(useBlobStore.getState().editRequest).toMatchObject({ nodeId: "llm", fieldPath: "prompt_template" });
+  });
+
+  it("keeps Edit prompt visible but disabled, with the reason, for a bound file that cannot be opened", () => {
+    useSessionStore.setState({ compositionState: selectedState({ prompt_template: { blob_ref: "two", mode: "inline_content", sha256: "hash" } }) });
+    useBlobStore.setState({ blobs: useBlobStore.getState().blobs.map((blob) => blob.id === "two" ? { ...blob, status: "pending" as const } : blob) });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    const edit = screen.getByRole("button", { name: "Edit prompt user.txt" });
+    expect(edit).toHaveAttribute("aria-disabled", "true");
+    expect(edit).toHaveAccessibleDescription(/This file is still being processed\./);
+    act(() => edit.click());
+    expect(useBlobStore.getState().editRequest).toBeNull();
   });
 });
 

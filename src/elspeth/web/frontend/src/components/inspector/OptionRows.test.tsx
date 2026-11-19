@@ -5,7 +5,9 @@ import { usePreferencesStore } from "@/stores/preferencesStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
+import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import type { BlobMetadata, CompositionState } from "@/types/api";
+import type { InterpretationEvent } from "@/types/interpretation";
 import { resetStore } from "@/test/store-helpers";
 import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 import { OptionRows } from "./OptionRows";
@@ -31,6 +33,7 @@ beforeEach(() => {
   resetStore(usePluginCatalogStore);
   resetStore(useBlobStore);
   useSessionStore.setState({ activeSessionId: "session-1", compositionState: null });
+  useInterpretationEventsStore.setState({ pendingBySession: {} });
 });
 
 const FILE_ID = "f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0";
@@ -131,18 +134,57 @@ describe("file-backed option values", () => {
     expect(screen.queryByText("This file is not in this session.")).not.toBeInTheDocument();
   });
 
-  it("disables Edit with the multi-file reason while Show in files stays available", () => {
+  it("opens Edit for a file on a step that uses more than one prompt file", () => {
     seedFile();
     const options = { prompt_template: { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH },
       system_prompt: { blob_ref: "other", mode: "inline_content", sha256: FILE_HASH } };
     useSessionStore.setState({ compositionState: { sources: {}, outputs: [], nodes: [{ id: "llm", plugin: "llm", options }] } as unknown as CompositionState });
     render(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
     const edit = screen.getByRole("button", { name: "Edit prompt.md (User prompt)" });
+    expect(edit).toHaveAttribute("aria-disabled", "false");
+    expect(edit).not.toHaveAccessibleDescription();
+    act(() => edit.click());
+    expect(useBlobStore.getState().editRequest).toMatchObject({ nodeId: "llm", fieldPath: "prompt_template" });
+  });
+
+  it("still opens Edit, with the reason beside it, when a save would be refused", () => {
+    seedFile();
+    const options = { prompt_template: { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH },
+      system_prompt: { blob_ref: "other", mode: "inline_content", sha256: FILE_HASH } };
+    useSessionStore.setState({ compositionState: { sources: {}, outputs: [], nodes: [{ id: "llm", plugin: "llm", options }] } as unknown as CompositionState });
+    useInterpretationEventsStore.setState({ pendingBySession: { "session-1": {
+      card: { choice: "pending", kind: "llm_prompt_template", affected_node_id: "llm" } as InterpretationEvent } } });
+    render(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
+    const edit = screen.getByRole("button", { name: "Edit prompt.md (User prompt)" });
+    expect(edit).toHaveAttribute("aria-disabled", "false");
+    expect(edit).toHaveAccessibleDescription("Complete the existing node review before editing its files.");
+    act(() => edit.click());
+    expect(useBlobStore.getState().editRequest).toMatchObject({ nodeId: "llm", fieldPath: "prompt_template" });
+  });
+
+  it("keeps Edit a described no-op only when the file has no prompt text to show", () => {
+    seedFile({ status: "pending" });
+    const options = { prompt_template: { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH } };
+    useSessionStore.setState({ compositionState: { sources: {}, outputs: [], nodes: [{ id: "llm", plugin: "llm", options }] } as unknown as CompositionState });
+    render(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
+    const edit = screen.getByRole("button", { name: "Edit prompt.md (User prompt)" });
     expect(edit).toHaveAttribute("aria-disabled", "true");
-    expect(edit).toHaveAccessibleDescription("This node uses more than one prompt file. Re-point it through the agent and approve the review card.");
-    expect(screen.getByRole("button", { name: "Show in files: prompt.md (User prompt)" })).toHaveAttribute("aria-disabled", "false");
+    expect(edit).toHaveAccessibleDescription("This file is still being processed.");
     act(() => edit.click());
     expect(useBlobStore.getState().editRequest).toBeNull();
+  });
+
+  it("gives every query row's reason its own DOM id when the rows share the node-level prompt file", () => {
+    seedFile({ status: "pending" });
+    const options = { prompt_template: { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH },
+      queries: [{ name: "one" }, { name: "two" }] };
+    useSessionStore.setState({ compositionState: { sources: {}, outputs: [], nodes: [{ id: "llm", plugin: "llm", options }] } as unknown as CompositionState });
+    const { container } = render(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
+    const edits = screen.getAllByRole("button", { name: /^Edit prompt\.md \(User prompt, query/ });
+    expect(edits).toHaveLength(2);
+    const ids = Array.from(container.querySelectorAll("[id]"), (element) => element.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const edit of edits) expect(edit).toHaveAccessibleDescription("This file is still being processed.");
   });
 
   it("shows the filename for LLM prompt roles and nested markers without exposing marker fields", () => {

@@ -658,7 +658,7 @@
   z-index: 2;
   display: grid;
   gap: var(--space-md);
-  width: min(360px, calc(100% - 2 * var(--space-md)));
+  width: min(720px, calc(100% - 2 * var(--space-md)));
   max-height: calc(100% - 2 * var(--space-md));
   overflow: auto;
   padding: var(--space-md);
@@ -749,12 +749,8 @@
 .graph-config-rows > div,
 .graph-config-nested > div {
   display: grid;
-  /* Stacked key-above-value, not a two-column grid. This panel is a fixed
-     ~360px; with two columns a long key (e.g. dead_letter_connection_string)
-     stretched the auto-sized key track and crushed the value — a connection
-     string or endpoint collapsed into an unreadable one-word-per-line ribbon.
-     Stacking gives every value the full panel measure and cannot overflow. It
-     matches the narrow-viewport fallback that was already defined below. */
+  /* Stack keys above values so prompts use the full panel width, including
+     when the graph workspace constrains the panel on smaller screens. */
   grid-template-columns: minmax(0, 1fr);
   gap: var(--space-2xs);
   min-width: 0;
@@ -884,14 +880,110 @@
      grid-template override here became redundant and was removed. */
 }
 .prompt-slot-actions {
-  display: inline-flex;
+  display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: var(--space-xs);
-  margin-inline-start: var(--space-sm);
+  margin-block-start: var(--space-xs);
 }
 
-.prompt-slot-actions > span {
-  color: var(--color-text-muted);
+/* The reason a row action cannot run sits on its own line under the buttons,
+   so it never squeezes between them. The buttons are compact ghost buttons;
+   the shared aria-disabled treatment in styles/shared.css marks one that
+   cannot run. */
+.prompt-slot-reason {
+  flex-basis: 100%;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+/* --- Prompt file editor (inside the node panel) -----------------------------
+   The editor's controls take the design system's input and button primitives.
+   Before this block they were browser defaults in a 12px tokenised panel. */
+.prompt-editor {
+  margin-block-start: var(--space-sm);
+  padding: var(--space-sm);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+/* A query row that shares the step-level prompt file says where the one
+   editor for that file opens. */
+.prompt-slot-shared {
+  display: block;
+  margin-block-start: var(--space-xs);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.prompt-editor-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2xs) var(--space-sm);
+}
+
+.prompt-editor-label {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  line-height: var(--line-height-tight);
+  overflow-wrap: anywhere;
+}
+
+/* A state tag is text, never colour alone. */
+.prompt-editor-tag {
+  padding: 0 var(--space-xs);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.prompt-editor-text {
+  box-sizing: border-box;
+  min-height: 8lh;
+  max-height: min(50vh, 480px);
+  padding: var(--space-sm);
+  white-space: pre-wrap;
+  tab-size: 2;
+}
+
+/* Read-only must look read-only: recessed, secondary text, no text cursor. */
+.prompt-editor-text[readonly] {
+  background-color: var(--color-well);
+  color: var(--color-text-secondary);
+  cursor: default;
+}
+
+.prompt-editor-notice {
+  font-size: var(--font-size-xs);
+}
+
+/* One row for the three actions, never full-width pills. Sticky to the
+   panel's bottom edge while the editor is taller than the visible area: the
+   negative offset cancels the panel's own padding so the bar sits flush. */
+.prompt-editor-actions {
+  position: sticky;
+  bottom: calc(-1 * var(--space-md));
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-sm) 0;
+  border-top: 1px solid var(--color-border);
+  background-color: var(--color-surface-paper);
+}
+
+.prompt-editor-close {
+  margin-inline-start: auto;
+}
+
+.prompt-editor-hint {
+  margin: 0;
+  color: var(--color-text-secondary);
   font-size: var(--font-size-xs);
 }

@@ -145,6 +145,14 @@
   flex-shrink: 0;
 }
 
+/* A bare button gets no shared disabled treatment; mark the Edit prompt
+   control that cannot open so it does not look live. */
+.blob-row-actions > button[aria-disabled="true"] {
+  color: var(--color-text-muted);
+  cursor: not-allowed;
+  text-decoration: line-through;
+}
+
 .blob-row-preview {
   padding: var(--space-sm) var(--space-md);
   border-bottom: 1px solid var(--color-border);

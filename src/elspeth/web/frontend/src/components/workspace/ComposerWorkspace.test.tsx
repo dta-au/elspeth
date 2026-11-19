@@ -1032,6 +1032,29 @@ describe("ComposerWorkspace", () => {
     expect(observations[observations.length - 1]).toBe("graph");
   });
 
+  it("brings the graph tab back when a prompt edit is requested from another artifact tab", () => {
+    // The file manager's "Edit prompt" only sends the request; the inspector
+    // that hosts the editor lives on the graph tab, so the workspace must show it.
+    function ActiveTabProbe() {
+      const controller = useWorkspacePaneController();
+      return (
+        <button type="button" onClick={() => controller.actions.selectArtifactTab("run")}>
+          Active tab: {controller.state.activeArtifactTab}
+        </button>
+      );
+    }
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    useBlobStore.getState().activateSession("session-1");
+    renderWorkspace({ artifact: <ActiveTabProbe /> });
+    emitWidth(1280);
+    fireEvent.click(screen.getByRole("button", { name: "Active tab: graph" }));
+    expect(screen.getByRole("button", { name: "Active tab: run" })).toBeInTheDocument();
+    act(() => useBlobStore.getState().requestPromptEdit("llm", "prompt_template"));
+    expect(screen.getByRole("button", { name: "Active tab: graph" })).toBeInTheDocument();
+    // The request is left for the inspector's editor to consume.
+    expect(useBlobStore.getState().editRequest).toMatchObject({ nodeId: "llm", fieldPath: "prompt_template" });
+  });
+
   it("lets an artifact intent reveal the narrow Pipeline view", () => {
     function ArtifactIntent() {
       const controller = useWorkspacePaneController();

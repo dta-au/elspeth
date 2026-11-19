@@ -281,10 +281,16 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
                   {CATEGORY_LABELS[category]}
                 </div>
                 {categoryBlobs.map((blob) => {
+                  // Every prompt-bound file gets an Edit prompt control, never a
+                  // silently missing one. A file bound more than once opens the
+                  // binding on the selected step when there is one, else the first.
                   const bindings = promptBindings.filter((binding) => binding.blobId === blob.id.toLowerCase());
-                  const binding = bindings.length === 1 ? bindings[0] : undefined;
+                  const binding = bindings.find((candidate) => candidate.nodeId === selectedNodeId) ?? bindings[0];
                   const editability = binding ? promptFileEditability({ state: compositionState, blobs, pendingEvents: Object.values(pending ?? {}),
                     nodeId: binding.nodeId, fieldPath: binding.fieldPath, blobId: blob.id }) : null;
+                  // A refused save still opens the editor read-only with its
+                  // reason; only a file with no prompt text to show stays shut.
+                  const opensEditor = editability !== null && (editability.editable || editability.opens);
                   return <BlobRow
                     key={blob.id}
                     blob={blob}
@@ -298,7 +304,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
                     focused={focusedBlobId?.toLowerCase() === blob.id.toLowerCase()}
                     onSelect={() => useBlobStore.setState({ focusedBlobId: blob.id })}
                     editRefusal={editability?.editable === false ? editability.reason : undefined}
-                    onEditPrompt={binding && editability?.editable === true ? () => {
+                    onEditPrompt={binding && opensEditor ? () => {
                       useSessionStore.getState().selectNode(binding.nodeId);
                       useBlobStore.getState().requestPromptEdit(binding.nodeId, binding.fieldPath);
                     } : undefined}

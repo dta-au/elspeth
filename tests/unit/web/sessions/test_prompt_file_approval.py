@@ -39,7 +39,12 @@ blob_env = blob_tools.blob_env
 
 
 async def _pending_file_review(
-    env: dict[str, Any], *, file_only: bool = False, pending_vague_term: bool = False, structured_system_file: bool = False
+    env: dict[str, Any],
+    *,
+    file_only: bool = False,
+    pending_vague_term: bool = False,
+    structured_system_file: bool = False,
+    sibling_file: bool = False,
 ) -> tuple[SessionServiceImpl, UUID, UUID, UUID]:
     blob = blob_tools._create_blob(env, content="  First line\nSecond line  \n")
     assert blob.success
@@ -94,6 +99,12 @@ async def _pending_file_review(
         options["prompt_template"] = marker
     if file_only:
         del options["system_prompt"]
+    if sibling_file:
+        # A second prompt file on the same node, backing the system prompt.
+        sibling = blob_tools._create_blob(env, filename="system.txt", content="You classify rows.\n")
+        assert sibling.success
+        sibling_record, _sibling_bytes = read_blob(env["operation"], UUID(sibling.data["blob_id"]))
+        options["system_prompt"] = {"blob_ref": str(sibling_record.id), "mode": "inline_content", "sha256": sibling_record.content_hash}
     node["options"] = _options_with_default_prompt_template_review(node_id="classify", plugin="llm", options=options)
     if pending_vague_term:
         node["options"]["interpretation_requirements"] = [
@@ -396,6 +407,36 @@ async def test_editor_save_refuses_pending_card_with_pending_vague_term(blob_env
 async def test_editor_save_refuses_pending_card_over_unseen_inline_text(blob_env: dict[str, Any]) -> None:
     """The writer itself refuses, whatever its caller checked: the card also covers an inline system prompt."""
     _service, session_id, event_id, blob_id = await _pending_file_review(blob_env)
+    record = blob_env["authority"].mutate(blob_env["operation"], lambda tx: tx.blobs.read_blob(blob_id=blob_id))
+    with pytest.raises(PromptFileApprovalStale), blob_env["engine"].begin() as conn:
+        record_prompt_file_approval(
+            conn,
+            PromptFileApprovalRequest(
+                session_id=session_id,
+                node_id="classify",
+                field_path="prompt_template",
+                blob_id=blob_id,
+                content_sha256=record.content_hash,
+                actor_user_id="test-user",
+                trigger=PromptApprovalTrigger.EDITOR_SAVE,
+            ),
+            now=datetime.now(UTC),
+        )
+    with blob_env["engine"].connect() as conn:
+        assert (
+            conn.execute(select(interpretation_events_table.c.choice).where(interpretation_events_table.c.id == str(event_id))).scalar_one()
+            == "pending"
+        )
+        assert (
+            conn.execute(select(prompt_file_approvals_table.c.id).where(prompt_file_approvals_table.c.session_id == str(session_id))).all()
+            == []
+        )
+
+
+@pytest.mark.asyncio
+async def test_editor_save_refuses_pending_card_over_unseen_sibling_file(blob_env: dict[str, Any]) -> None:
+    """The writer itself refuses: the pending card also covers a second prompt file the editor did not show."""
+    _service, session_id, event_id, blob_id = await _pending_file_review(blob_env, sibling_file=True)
     record = blob_env["authority"].mutate(blob_env["operation"], lambda tx: tx.blobs.read_blob(blob_id=blob_id))
     with pytest.raises(PromptFileApprovalStale), blob_env["engine"].begin() as conn:
         record_prompt_file_approval(

@@ -5951,22 +5951,6 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         line=5800,
         connection_escape=False,
     ),
-    # The prompt-file editor save probes for a PENDING llm_prompt_template card
-    # on the node with one select(...).limit(1) before it decides whether the
-    # save may proceed (4c37cbfdf; fcdcbf366 moved it by one line and changed the
-    # surrounding refusals). The write itself goes through
-    # BlobReplacementCoordinator under the session operation authority.
-    WriterIdentity(
-        path="src/elspeth/web/blobs/prompt_text_routes.py",
-        symbol="create_prompt_text_router.save_prompt_text",
-        table="<sessions-write-connection>",
-        operation="write_connection",
-        fingerprint="b25889042fb05d69",
-        ordinal=1,
-        authority=None,
-        line=156,
-        connection_escape=False,
-    ),
     WriterIdentity(
         path="src/elspeth/web/sessions/service.py",
         symbol="SessionServiceImpl.list_pending_landscape_reconciliations._sync",
