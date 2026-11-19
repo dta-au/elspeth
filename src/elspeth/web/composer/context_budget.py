@@ -101,7 +101,9 @@ class ContextBudgetPolicy:
             {
                 # v3: the token estimate no longer refuses for a caller that sends over it
                 # (``on_over_estimate="send"``); a record's ``over_estimate`` says which happened.
-                "schema": "composer.context-budget.v3",
+                # v4: every byte is priced at ``fallback_bytes_per_token``, or at the anchor's
+                # measured density when that is denser; no byte is priced at one token.
+                "schema": "composer.context-budget.v4",
                 "max_prompt_tokens": self.max_prompt_tokens,
                 "max_request_bytes": self.max_request_bytes,
                 "shed_above": repr(self.shed_above),
@@ -156,6 +158,9 @@ class ContextBudgetDecision:
     # and the request is under the byte maximum, so it goes. A caller that
     # refuses instead never sees True; that path raises.
     over_estimate: bool = False
+    # The byte rate the estimate applied: 1.0 for the anchored arm (one token
+    # per byte beyond the anchor), otherwise the rate of the byte arm.
+    bytes_per_token_used: float = 1.0
 
 
 class ContextBudgetRefusal(Exception):
@@ -213,11 +218,16 @@ def decide_context_budget(
     included. One measure serves both ceilings. It is what the gateway's body
     cap sees, so ``max_request_bytes`` bounds it directly; and it counts
     everything the model reads (content, tool-call arguments, thinking
-    blocks, tool definitions). Authored bytes keep the fallback rate even when
-    an anchor exists. The other arm pays the anchor's ENTIRE reported count
-    plus every non-shared byte. Use the smaller arm unless the anchor's own
-    provider count refutes its authored-model estimate; then use the anchored
-    arm alone.
+    blocks, tool definitions). The byte arm prices EVERY byte at
+    ``fallback_bytes_per_token``; when a plausible anchor shows this
+    conversation's content is denser than that, the anchor's measured density
+    replaces it (``pricing.authored_refuted`` records that it did). The other
+    arm pays the anchor's ENTIRE reported count plus one token for every
+    non-shared byte. The smaller arm is used. ``authored_bytes`` and
+    ``anchor_authored_bytes`` are still validated and recorded; they no longer
+    change the price. A first call whose content is denser than the fallback
+    rate is under-counted: that delays shedding and cannot refuse anything; the
+    provider judges its own limit.
     Shared bytes must belong only to unchanged protected messages/tools;
     no segment saving may overlap them. This deliberately gives no token
     credit for content removed from the anchor. It assumes provider accounting
@@ -259,31 +269,25 @@ def decide_context_budget(
     # When the protected prefix makes the low mark unreachable, shed only
     # to the high mark. If even that is unreachable, exhaust the segments
     # before judging the hard ceilings. Current requests are never segments.
-    def authored_tokens(size: int) -> int:
-        return size - authored_bytes + math.ceil(authored_bytes / policy.fallback_bytes_per_token)
+    rate = policy.fallback_bytes_per_token
+    if anchor_tokens is not None and anchor_tokens <= anchor_wire_bytes <= 8 * anchor_tokens:
+        rate = min(rate, anchor_wire_bytes / anchor_tokens)
+    authored_refuted = rate < policy.fallback_bytes_per_token
 
-    authored_refuted = anchor_tokens is not None and (
-        anchor_authored_bytes is None
-        or (
-            anchor_tokens <= anchor_wire_bytes <= 8 * anchor_tokens
-            and anchor_wire_bytes - anchor_authored_bytes + math.ceil(anchor_authored_bytes / policy.fallback_bytes_per_token)
-            < anchor_tokens
-        )
-    )
+    def byte_arm(size: int) -> int:
+        return math.ceil(size / rate)
+
+    def anchored(size: int) -> bool:
+        return anchor_tokens is not None and anchor_tokens + size - anchor_shared_bytes < byte_arm(size)
 
     def tokens(size: int) -> int:
         if anchor_tokens is None:
-            return authored_tokens(size)
-        if authored_refuted:
-            return anchor_tokens + size - anchor_shared_bytes
-        return min(authored_tokens(size), anchor_tokens + size - anchor_shared_bytes)
+            return byte_arm(size)
+        return min(byte_arm(size), anchor_tokens + size - anchor_shared_bytes)
 
     def pricing(size: int) -> ContextBudgetPricing:
-        mode: Literal["anchored", "conservative", "authored_prefix"] = "conservative"
-        if anchor_tokens is not None and (authored_refuted or anchor_tokens + size - anchor_shared_bytes < authored_tokens(size)):
-            mode = "anchored"
-        elif authored_bytes:
-            mode = "authored_prefix"
+        # "authored_prefix" names the byte arm: every byte now pays the rate only authored bytes paid before.
+        mode: Literal["anchored", "conservative", "authored_prefix"] = "anchored" if anchored(size) else "authored_prefix"
         return ContextBudgetPricing(
             mode, anchor_status, anchor_tokens, anchor_wire_bytes, anchor_shared_bytes, size, authored_bytes, authored_refuted
         )
@@ -291,7 +295,9 @@ def decide_context_budget(
     target = high if tokens(request_bytes - savings) > low else low
 
     def fits_low(size: int) -> bool:
-        return size <= low and size <= policy.max_request_bytes
+        # Priced at the policy rate alone, never the anchor's: an anchor arriving or
+        # being lost must not release what was shed.
+        return math.ceil(size / policy.fallback_bytes_per_token) <= low and size <= policy.max_request_bytes
 
     tokens_before = tokens(request_bytes)
 
@@ -341,4 +347,5 @@ def decide_context_budget(
         shed_keys=tuple(segment.key for segment in shed),
         pricing=pricing(bytes_after),
         over_estimate=over_estimate,
+        bytes_per_token_used=1.0 if anchored(bytes_after) else rate,
     )

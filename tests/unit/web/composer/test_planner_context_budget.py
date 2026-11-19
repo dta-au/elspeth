@@ -644,8 +644,29 @@ async def _discovery_run(
     return completion, recorder
 
 
+def _repriced_estimate(budget: ComposerContextBudgetRecord) -> int:
+    """The estimate the shared decision makes, recomputed from the record's own fields.
+
+    Every byte costs 3.0 bytes per token, or the previous call's measured density when a
+    plausible provider count (between 1 and 8 bytes per token) is denser. The anchored arm is
+    that count plus one token per byte not shared with it. The smaller arm is the estimate.
+    """
+    assert budget.anchor_prompt_tokens is not None
+    rate = 3.0
+    if budget.anchor_prompt_tokens <= budget.anchor_wire_bytes <= 8 * budget.anchor_prompt_tokens:
+        rate = min(rate, budget.anchor_wire_bytes / budget.anchor_prompt_tokens)
+    byte_arm = math.ceil(budget.decision_wire_bytes_after / rate)
+    anchored_arm = budget.anchor_prompt_tokens + budget.decision_wire_bytes_after - budget.anchor_shared_bytes
+    # The record names the rate the estimate applied: 1.0 for the anchored arm, the byte arm's rate otherwise.
+    assert budget.bytes_per_token == repr(1.0 if anchored_arm < byte_arm else rate)
+    assert budget.pricing_mode == ("anchored" if anchored_arm < byte_arm else "authored_prefix")
+    return min(byte_arm, anchored_arm)
+
+
 @pytest.mark.asyncio
-async def test_six_producer_schema_results_fit_authored_budget_with_foreign_control(tmp_path: Path, tool_context: ToolContext) -> None:
+async def test_six_producer_schema_results_fit_the_budget_and_labels_do_not_change_the_price(
+    tmp_path: Path, tool_context: ToolContext
+) -> None:
     schemas = (
         ("transform", "llm"),
         ("source", "llm"),
@@ -688,27 +709,32 @@ async def test_six_producer_schema_results_fit_authored_budget_with_foreign_cont
     assert len(recorder.llm_calls) == 2
     budget = recorder.llm_calls[1].context_budget
     assert budget is not None
+    # "authored_prefix" is the recorded name of the byte arm, which now prices every byte.
     assert budget.pricing_mode == "authored_prefix"
-    assert budget.bytes_per_token == "3.0"
-    assert budget.estimated_tokens_after == budget.decision_wire_bytes_after - budget.authored_bytes + math.ceil(budget.authored_bytes / 3)
-    assert budget.estimated_tokens_after < budget.anchor_prompt_tokens + budget.decision_wire_bytes_after - budget.anchor_shared_bytes
+    # Was: unlabelled bytes at one token each and labelled bytes at 3.0 (the authored formula).
+    assert budget.estimated_tokens_after == _repriced_estimate(budget)
+    assert budget.estimated_tokens_after <= budget.anchor_prompt_tokens + budget.decision_wire_bytes_after - budget.anchor_shared_bytes
     assert budget.estimated_tokens_after <= policy.max_prompt_tokens
 
-    # Removing provenance from the same protected results must cost more.
+    # Was: removing provenance from the same protected results cost more and was refused.
+    # Now the labels do not enter the price: the same estimate, and no refusal.
     assert len(captured) == 2
     foreign = deepcopy(captured[1])
     for message in foreign["messages"]:
         if message["role"] == "tool":
             message.pop(PROMPT_GUARD_CONTENT_PARTS_KEY, None)
-    with pytest.raises(PipelinePlannerError, match="context budget exhausted"):
-        original_fit(**foreign)
+    _messages, foreign_budget = original_fit(**foreign)
+    assert foreign_budget.estimated_tokens_after == budget.estimated_tokens_after
 
 
 @pytest.mark.asyncio
-async def test_six_schema_batch_costs_more_without_producer_labels(tmp_path: Path, tool_context: ToolContext) -> None:
-    """Base-collectable control: producer-labelled schema text is priced below foreign text.
+async def test_six_schema_batch_costs_the_same_with_and_without_producer_labels(tmp_path: Path, tool_context: ToolContext) -> None:
+    """Producer labels do not change the price: this is the test that catches label-dependent pricing coming back.
 
-    Reads only the planner fit's inputs and its refusal, never lane-only record fields.
+    Was ``…costs_more_without_producer_labels``: the unlabelled batch was priced at one token
+    per byte and refused. That was a size rule only (commit 5cf449179: text ELSPETH did not
+    author might be denser than 3.0 bytes per token); the budget never made a trust decision.
+    What replaces it: a provider count denser than 3.0 sets the rate for the next call.
     """
     schemas = (
         ("transform", "llm"),
@@ -754,13 +780,18 @@ async def test_six_schema_batch_costs_more_without_producer_labels(tmp_path: Pat
     for message in foreign["messages"]:
         if message["role"] == "tool":
             message.pop(PROMPT_GUARD_CONTENT_PARTS_KEY, None)
-    with pytest.raises(PipelinePlannerError, match="context budget exhausted"):
-        original_fit(**foreign)
+    _labelled_messages, labelled_budget = original_fit(**deepcopy(captured[1]))
+    _foreign_messages, foreign_budget = original_fit(**foreign)
+    assert foreign_budget.estimated_tokens_after == labelled_budget.estimated_tokens_after
+    assert foreign_budget.estimated_tokens_after <= policy.max_prompt_tokens
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("anchor_tokens", "minimum"), [(100_000, 100_000), (40_000, 57_407)])
-async def test_planner_anchor_refutes_authored_pricing(tmp_path: Path, tool_context: ToolContext, anchor_tokens: int, minimum: int) -> None:
+# 40,000: the byte arm at 3.0 (53,132) is below the anchored arm (57,407, the value before repricing), so it is the estimate.
+@pytest.mark.parametrize(("anchor_tokens", "minimum"), [(100_000, 100_000), (40_000, 53_132)])
+async def test_planner_estimate_is_never_below_the_providers_count_and_uses_the_cheaper_arm(
+    tmp_path: Path, tool_context: ToolContext, anchor_tokens: int, minimum: int
+) -> None:
     lookup = _response_with_call_id("schema", "get_plugin_schema", {"plugin_type": "transform", "name": "web_scrape"})
     lookup.usage = {"prompt_tokens": anchor_tokens, "completion_tokens": 5, "total_tokens": anchor_tokens + 5, "cost": 0.01}
     completion = _ScriptedCompletion(lookup, _text_response("Which output format do you want?"))
@@ -780,12 +811,13 @@ async def test_planner_anchor_refutes_authored_pricing(tmp_path: Path, tool_cont
     if anchor_tokens == 100_000:
         assert budget.estimated_tokens_after >= minimum
     else:
-        assert budget.estimated_tokens_after == minimum
+        assert budget.estimated_tokens_after == minimum == _repriced_estimate(budget)
+        assert budget.pricing_mode == "authored_prefix"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("metadata", ["missing", "legacy", "oversize"])
-async def test_planner_anchor_authored_metadata_fails_closed(
+async def test_planner_anchor_metadata_missing_is_priced_at_provider_density_and_inconsistent_is_refused(
     tmp_path: Path, tool_context: ToolContext, monkeypatch: pytest.MonkeyPatch, metadata: str
 ) -> None:
     def anchor_with_metadata(**kwargs: Any) -> Any:
@@ -829,15 +861,20 @@ async def test_planner_anchor_authored_metadata_fails_closed(
     budget = recorder.llm_calls[1].context_budget
     assert budget is not None
     assert budget.estimated_tokens_after >= 100_000
-    assert budget.pricing_mode == "anchored"
     assert budget.anchor_status == "authored_evidence_unavailable"
+    # Was: missing authored evidence forced the anchored arm. Now the evidence does not select
+    # the arm; what protects the estimate is the provider's own count, whose density (denser
+    # than 3.0 here) replaces the rate. ``authored_refuted`` records that it did.
     assert budget.authored_refuted is True
+    assert budget.pricing_mode == "authored_prefix"
+    assert budget.estimated_tokens_after == _repriced_estimate(budget)
 
 
 @pytest.mark.asyncio
 async def test_planner_anchored_arm_records_one_byte_growth_rate(tmp_path: Path, tool_context: ToolContext) -> None:
     lookup = _response_with_call_id("schema", "get_plugin_schema", {"plugin_type": "transform", "name": "web_scrape"})
-    lookup.usage = {"prompt_tokens": 40_000, "completion_tokens": 5, "total_tokens": 40_005, "cost": 0.01}
+    # 30,000 (was 40,000): low enough that the count plus the growth is below every byte at 3.0, so the anchored arm is used.
+    lookup.usage = {"prompt_tokens": 30_000, "completion_tokens": 5, "total_tokens": 30_005, "cost": 0.01}
     completion = _ScriptedCompletion(lookup, _text_response("Which output format do you want?"))
     recorder = BufferingRecorder()
     with pytest.raises(PlannerDeclined):
@@ -853,8 +890,9 @@ async def test_planner_anchored_arm_records_one_byte_growth_rate(tmp_path: Path,
     budget = recorder.llm_calls[1].context_budget
     assert budget is not None
     assert budget.pricing_mode == "anchored"
-    assert budget.bytes_per_token == "1.0"
+    assert budget.bytes_per_token == repr(1.0)
     assert budget.estimated_tokens_after == budget.anchor_prompt_tokens + budget.decision_wire_bytes_after - budget.anchor_shared_bytes
+    assert budget.estimated_tokens_after == _repriced_estimate(budget)
 
 
 @pytest.mark.asyncio

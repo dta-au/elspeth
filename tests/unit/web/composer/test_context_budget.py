@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 
 import pytest
 
@@ -24,7 +25,11 @@ USER_REQUEST = SheddableKind.USER_REQUEST
 
 
 def _policy(cap: int = 1000, max_bytes: int = 10**9, above: float = 0.85, to: float = 0.60) -> ContextBudgetPolicy:
-    return ContextBudgetPolicy(max_prompt_tokens=cap, max_request_bytes=max_bytes, shed_above=above, shed_to=to)
+    # One token per byte, so the marks and sizes in these tests read directly. They pin the
+    # shedding rules; the shipped rate has its own tests (test_context_budget_repricing.py).
+    return ContextBudgetPolicy(
+        max_prompt_tokens=cap, max_request_bytes=max_bytes, shed_above=above, shed_to=to, fallback_bytes_per_token=1.0
+    )
 
 
 def _seg(kind: SheddableKind, key: str, saving: int) -> SheddableSegment:
@@ -153,6 +158,23 @@ def test_same_input_same_decision_and_policy_hash_changes_with_each_parameter() 
     hashes = {base.audit_hash, *(v.audit_hash for v in variants)}
     assert len(hashes) == 1 + len(variants)
     assert base.audit_hash == _policy().audit_hash
+
+
+def test_at_the_shipped_default_rate_shedding_starts_at_the_high_mark_in_tokens_not_bytes() -> None:
+    """The one test here that runs at the SHIPPED DEFAULT rate: marks are judged on bytes / 3.0."""
+    shipped = ContextBudgetPolicy(max_prompt_tokens=1000, max_request_bytes=10**9, shed_above=0.85, shed_to=0.60)
+    assert shipped.fallback_bytes_per_token == 3.0
+    segs = [_seg(ASSISTANT_PROSE, "history:0", 600), _seg(USER_REQUEST, "history:1", 600)]
+
+    # 2,550 bytes is exactly the high mark (850 tokens): nothing is shed.
+    at_mark = decide_context_budget(policy=shipped, request_bytes=2550, segments=segs, previously_shed=frozenset())
+    assert (at_mark.shed_keys, at_mark.estimated_tokens_after, at_mark.bytes_per_token_used) == ((), 850, 3.0)
+
+    # One byte more crosses it: shed in kind order until at or below the low mark (600 tokens, 1,800 bytes).
+    over = decide_context_budget(policy=shipped, request_bytes=2553, segments=segs, previously_shed=frozenset())
+    assert over.estimated_tokens_before == 851
+    assert over.shed_keys == ("history:0", "history:1")
+    assert over.estimated_tokens_after == math.ceil((2553 - 1200) / 3.0)
 
 
 def test_policy_rejects_marks_out_of_order_and_non_positive_ceilings() -> None:

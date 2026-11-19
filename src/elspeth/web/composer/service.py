@@ -1802,7 +1802,7 @@ class ComposerServiceImpl:
             ) from refusal
         record = ComposerContextBudgetRecord.from_shed_keys(
             policy_hash=decision.policy_hash,
-            bytes_per_token=(self._context_budget_policy.fallback_bytes_per_token if decision.pricing.mode == "authored_prefix" else 1.0),
+            bytes_per_token=decision.bytes_per_token_used,
             estimated_tokens_before=decision.estimated_tokens_before,
             estimated_tokens_after=decision.estimated_tokens_after,
             # The decision's bound; the caller records the exact size of the request it sends.
@@ -1826,7 +1826,7 @@ class ComposerServiceImpl:
             decision_wire_bytes_after=decision.request_bytes_after,
         )
         if not shed:
-            return messages, record, 1.0
+            return messages, record, decision.bytes_per_token_used
 
         shed_history_positions = {
             _CONTEXT_BUDGET_HISTORY_START + position
@@ -1856,7 +1856,7 @@ class ComposerServiceImpl:
                 applied.append(stubbed_tool_message(message))
             else:
                 applied.append(message)
-        return applied, record, 1.0
+        return applied, record, decision.bytes_per_token_used
 
     def _context_budget_refusal(
         self,

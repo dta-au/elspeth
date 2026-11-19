@@ -1155,7 +1155,11 @@ async def test_compose_anchor_refutes_authored_pricing() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("metadata", ["missing", "legacy", "oversize"])
-async def test_compose_anchor_authored_metadata_fails_closed(monkeypatch: pytest.MonkeyPatch, metadata: str) -> None:
+async def test_compose_anchor_without_authored_metadata_is_priced_no_lower_than_the_providers_count(
+    monkeypatch: pytest.MonkeyPatch, metadata: str
+) -> None:
+    """Missing or legacy authored metadata no longer selects the arm; an inconsistent value is still refused."""
+
     def anchor_with_metadata(**kwargs: Any) -> Any:
         calls = []
         for call in kwargs["calls"]:
@@ -1187,9 +1191,11 @@ async def test_compose_anchor_authored_metadata_fails_closed(monkeypatch: pytest
     budget = result.llm_calls[1].context_budget
     assert budget is not None
     assert budget.estimated_tokens_after >= 100_000
-    assert budget.pricing_mode == "anchored"
     assert budget.anchor_status == "authored_evidence_unavailable"
+    # The provider counted the first request denser than the policy rate; its density is the rate used.
     assert budget.authored_refuted is True
+    assert budget.pricing_mode == "authored_prefix"
+    assert 1.0 < float(budget.bytes_per_token) < 3.0
 
 
 @pytest.mark.asyncio

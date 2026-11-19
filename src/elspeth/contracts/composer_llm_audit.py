@@ -196,11 +196,14 @@ class ComposerContextBudgetRecord:
     """The context-budget decision made before one composer model call.
 
     Carries integer counts, the policy hash and the identifiers of what was
-    shed; never any content. ``bytes_per_token`` records the selected pricing
-    arm's byte rate (the policy fallback for authored-prefix pricing, 1.0 for
-    conservative growth). Records written before this change may carry
-    ``"1.0"`` for authored-prefix pricing and remain readable. Anchored
-    pricing uses a measured prompt count plus one token per non-shared byte.
+    shed; never any content. ``bytes_per_token`` records the byte rate the
+    estimate applied: the policy fallback, or the anchor's measured density
+    when that is denser, for the byte arm (``pricing_mode`` ``authored_prefix``,
+    which since policy schema v4 prices every byte, not only an authored
+    prefix); ``"1.0"`` for anchored pricing, which uses a measured prompt count
+    plus one token per non-shared byte. ``conservative`` (one token per byte)
+    is no longer written. Older records carry the older meanings and remain
+    readable; ``policy_hash`` tells the two apart.
     ``request_wire_bytes`` is the size of the request this
     call sent: the canonical JSON of its ``{messages, tools}``, which counts
     content, tool-call arguments, thinking blocks and tool definitions. The
