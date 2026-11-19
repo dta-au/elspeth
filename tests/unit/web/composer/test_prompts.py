@@ -994,7 +994,13 @@ class TestBuildSystemPrompt:
         assert "does not by itself require a `vague_term` review" in result
 
     def test_core_skill_requires_schema_proven_cleanup_before_sink(self) -> None:
-        """Saved derived results minimize raw/private intermediates without plugin folklore."""
+        """Saved derived results minimize raw/private intermediates without plugin folklore.
+
+        The fork-relay mention of `field_mapper` is the sanctioned exception: a relay
+        is a structural fact the model cannot discover, and `passthrough` is not in
+        the web default allowlist; the ban on teaching `field_mapper` as cleanup or
+        projection stands.
+        """
         result = build_system_prompt(None)
         flattened = " ".join(result.split())
 
@@ -1007,7 +1013,24 @@ class TestBuildSystemPrompt:
         assert "does not remove data" in flattened
         assert "configured options actually project or remove fields" in flattened
         assert "stage that row-shaping choice as a pending `pipeline_decision`" in flattened
-        assert "field_mapper" not in result
+
+        heading = "### Output data minimization"
+        after_heading = result.split(heading, 1)[1]
+        minimization = after_heading.split("\n### ", 1)[0]
+        fork_begin = "<!-- taught:begin validation * validation.graph_repair_suggestions;"
+        block_start = result.index(fork_begin)
+        block_end = result.index("<!-- taught:end -->", block_start)
+        occurrences = [index for index in range(len(result)) if result.startswith("field_mapper", index)]
+        problems = []
+        if not minimization.strip() or "policy-visible cleanup or projection transform" not in " ".join(minimization.split()):
+            problems.append("minimization slice is empty or lost its own text")
+        if "field_mapper" in minimization:
+            problems.append("1: the minimization section names field_mapper")
+        if not occurrences or any(not block_start < index < block_end for index in occurrences):
+            problems.append("2: a field_mapper mention lies outside the fork-repair block (or none exists)")
+        if result.count("field_mapper") != 1:
+            problems.append(f"3: field_mapper appears {result.count('field_mapper')} times, not once")
+        assert problems == []
 
     def test_core_skill_preserves_requested_workflow_during_repairs(self) -> None:
         """Validation repairs must not shrink away user-requested behavior."""
