@@ -28,7 +28,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal, NotRequired, TypedDict, cast
+from typing import Any, Literal, NotRequired, TypedDict, TypeGuard, cast
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
@@ -1150,7 +1150,7 @@ def _file_inject_wired_marker_error(state: CompositionState, field_path: str) ->
     return None
 
 
-def _is_vague_term_requirement(row: object) -> bool:
+def _is_vague_term_requirement(row: object) -> TypeGuard[Mapping[str, JsonValue]]:
     return isinstance(row, Mapping) and row.get("kind", InterpretationKind.VAGUE_TERM.value) == InterpretationKind.VAGUE_TERM.value
 
 
@@ -1222,12 +1222,14 @@ def _whole_prompt_text_replacement(
     Returns ``None`` when the write is not that signal or the stored prompt
     carries nothing to supersede, so an ordinary write keeps its ordinary path.
     """
-    if type(written.get("prompt_template")) is not str:
+    prompt = written["prompt_template"] if "prompt_template" in written else None
+    if type(prompt) is not str:
         return None
     if PROMPT_TEMPLATE_PARTS_KEY not in written or written[PROMPT_TEMPLATE_PARTS_KEY] is not None:
         return None
+    stored_parts = stored_options[PROMPT_TEMPLATE_PARTS_KEY] if PROMPT_TEMPLATE_PARTS_KEY in stored_options else None
     replacement = _prompt_replacement(stored_options)
-    if stored_options.get(PROMPT_TEMPLATE_PARTS_KEY) is None and not replacement.superseded_review_ids:
+    if stored_parts is None and not replacement.superseded_review_ids:
         return None
     return replacement
 
@@ -1245,13 +1247,11 @@ def _written_options_for_prompt_replacement(
     is what gives an echoed shell its stored id.
     """
     remaining: dict[str, JsonValue] = {key: value for key, value in written.items() if key != PROMPT_TEMPLATE_PARTS_KEY}
-    requirements = written.get(INTERPRETATION_REQUIREMENTS_KEY)
+    requirements = written[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in written else None
     if isinstance(requirements, (list, tuple)):
         superseded = frozenset(replacement.superseded_review_ids)
         remaining[INTERPRETATION_REQUIREMENTS_KEY] = [
-            row
-            for row in requirements
-            if not (isinstance(row, Mapping) and _is_vague_term_requirement(row) and type(row.get("id")) is str and row["id"] in superseded)
+            row for row in requirements if not (_is_vague_term_requirement(row) and "id" in row and str(row["id"]) in superseded)
         ]
     return remaining
 
@@ -1265,7 +1265,7 @@ def _structured_prompt_template_refusal(
     if "prompt_template" not in patch:
         return None
     candidate = patch["prompt_template"]
-    current_parts = current_options.get(PROMPT_TEMPLATE_PARTS_KEY)
+    current_parts = current_options[PROMPT_TEMPLATE_PARTS_KEY] if PROMPT_TEMPLATE_PARTS_KEY in current_options else None
     parts = patch[PROMPT_TEMPLATE_PARTS_KEY] if PROMPT_TEMPLATE_PARTS_KEY in patch else current_parts
     # The marker branch reads the STORED parts as well as the written ones: a
     # write that nulls prompt_template_parts in the same call must not carry a
