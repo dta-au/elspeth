@@ -626,7 +626,7 @@ def _walk_options(
 ) -> None:
     if type(value) is dict:
         mapping = cast(dict[object, object], value)
-        if source_options and _is_source_options_bind_source(mapping):
+        if source_options and (_is_source_options_bind_source(mapping) or _is_source_options_unmoded_binding(mapping)):
             for key, child in mapping.items():
                 if type(key) is str:
                     _walk_option_key(child, field_path, key, refs, malformed)
@@ -704,6 +704,31 @@ def _is_source_options_bind_source(mapping: dict[object, object]) -> bool:
     if "sha256" in mapping:
         return False
     return "path" not in mapping or type(mapping["path"]) is str
+
+
+def _is_source_options_unmoded_binding(mapping: dict[object, object]) -> bool:
+    """Recognize a root source binding that was written without ``mode``.
+
+    A source bound to an uploaded file keeps the file's identity in
+    ``blob_ref`` beside the storage ``path`` the plugin reads. The composer's
+    bind tool also writes ``mode: bind_source``; the YAML import's
+    ``source_blob_ids`` binding, a reviewed ``set_pipeline`` source and any
+    state saved from them write only ``blob_ref`` and ``path``. Both are the
+    source plugin's own configuration, never a file marker, so the keys are
+    walked as ordinary options.
+
+    Only reachable for the root options of a source: the callers that walk
+    ``source``/``sources`` pass ``source_options=True`` for that one mapping
+    and it is not propagated to children. A mapping holding ``blob_ref``
+    without ``mode`` anywhere else (a prompt slot, a nested source option, a
+    node's or a sink's options) stays a malformed marker, and so does a root
+    source mapping that carries ``sha256`` or lacks a string ``path``.
+    """
+    if "blob_ref" not in mapping or "mode" in mapping or "sha256" in mapping:
+        return False
+    if type(mapping["blob_ref"]) is not str:
+        return False
+    return "path" in mapping and type(mapping["path"]) is str
 
 
 def _ref_from_shape(field_path: str, shape: WidenedBlobRefShape) -> BlobInlineRef:

@@ -290,6 +290,131 @@ class TestDiscoverBlobContentRefs:
 
         assert exc_info.value.malformed == (("source:orders.options.payload.options", "invalid blob_ref marker"),)
 
+    @pytest.mark.parametrize("source_name", [None, "orders"])
+    @pytest.mark.parametrize("plugin_encoding", [{}, {"encoding": "utf-8-sig"}])
+    def test_source_binding_written_without_mode_does_not_hide_prompt_refs(
+        self, source_name: str | None, plugin_encoding: dict[str, str]
+    ) -> None:
+        """``blob_ref`` + ``path`` on root source options is the source's own binding.
+
+        The YAML import's ``source_blob_ids`` binding and a reviewed
+        ``set_pipeline`` source write this shape (no ``mode``). Calling it a
+        malformed marker lost every prompt file in the same state.
+        """
+        source = {
+            "plugin": "csv",
+            "options": {"blob_ref": BLOB1, "path": "/data/blobs/s/input.csv", "schema": {"mode": "observed"}, **plugin_encoding},
+        }
+        config: dict[str, Any] = {
+            "transforms": [{"name": "assess", "plugin": "llm", "options": {"prompt_template": _marker(BLOB2)}}],
+            "outputs": {"main": {"options": {"path": "outputs/out.json"}}},
+        }
+        if source_name is None:
+            config["source"] = source
+        else:
+            config["sources"] = {source_name: source}
+        original = deepcopy(config)
+
+        refs = _discover_blob_content_refs(config)
+
+        assert [(ref.field_path, str(ref.blob_id)) for ref in refs] == [("node:assess.options.prompt_template", BLOB2)]
+        assert config == original
+
+    @pytest.mark.parametrize("source_name", [None, "orders"])
+    def test_marker_nested_under_unmoded_source_binding_is_still_checked(self, source_name: str | None) -> None:
+        source = {
+            "plugin": "csv",
+            "options": {"blob_ref": BLOB1, "path": "/data/blobs/s/input.csv", "header": _marker(BLOB2), "notes": {"blob_ref": BLOB2}},
+        }
+        config = {"source": source} if source_name is None else {"sources": {source_name: source}}
+        prefix = "source" if source_name is None else f"source:{source_name}"
+
+        with pytest.raises(BlobContentResolutionError) as exc_info:
+            _discover_blob_content_refs(config)
+
+        assert exc_info.value.malformed == ((f"{prefix}.options.notes", "missing mode"),)
+
+    @pytest.mark.parametrize(
+        ("options", "reason"),
+        [
+            pytest.param({"blob_ref": BLOB1}, "missing mode", id="no-path"),
+            pytest.param({"blob_ref": BLOB1, "path": 7}, "missing mode", id="non-string-path"),
+            pytest.param({"blob_ref": 7, "path": "/data/input.csv"}, "missing mode", id="non-string-blob-ref"),
+            pytest.param({"blob_ref": BLOB1, "path": "/data/input.csv", "sha256": VALID_HASH}, "missing mode", id="carries-sha256"),
+            pytest.param({"blob_ref": BLOB1, "path": "/data/input.csv", "mode": "inline"}, "unknown mode 'inline'", id="unknown-mode"),
+            pytest.param({"blob_ref": BLOB1, "path": "/data/input.csv", "mode": None}, "mode must be string", id="null-mode"),
+        ],
+    )
+    def test_root_source_options_outside_the_binding_shape_stay_malformed(self, options: dict[str, object], reason: str) -> None:
+        config = {"sources": {"orders": {"plugin": "csv", "options": options}}}
+
+        with pytest.raises(BlobContentResolutionError) as exc_info:
+            _discover_blob_content_refs(config)
+
+        assert exc_info.value.malformed == (("source:orders.options", reason),)
+
+    @pytest.mark.parametrize(
+        ("config", "field_path"),
+        [
+            pytest.param(
+                {"transforms": [{"name": "n", "plugin": "llm", "options": {"prompt_template": {"blob_ref": BLOB1, "path": "/d/p.txt"}}}]},
+                "node:n.options.prompt_template",
+                id="prompt-template",
+            ),
+            pytest.param(
+                {"transforms": [{"name": "n", "plugin": "llm", "options": {"system_prompt": {"blob_ref": BLOB1, "path": "/d/p.txt"}}}]},
+                "node:n.options.system_prompt",
+                id="system-prompt",
+            ),
+            pytest.param(
+                {
+                    "transforms": [
+                        {
+                            "name": "n",
+                            "plugin": "llm",
+                            "options": {"queries": {"q": {"template": {"blob_ref": BLOB1, "path": "/d/p.txt"}}}},
+                        }
+                    ]
+                },
+                "node:n.options.queries.q.template",
+                id="query-template",
+            ),
+            pytest.param(
+                {"transforms": [{"name": "n", "plugin": "llm", "options": {"blob_ref": BLOB1, "path": "/d/p.txt"}}]},
+                "node:n.options",
+                id="node-root-options",
+            ),
+            pytest.param(
+                {"outputs": {"main": {"options": {"blob_ref": BLOB1, "path": "outputs/out.json"}}}},
+                "output:main.options",
+                id="output-root-options",
+            ),
+            pytest.param(
+                {"sinks": {"main": {"options": {"blob_ref": BLOB1, "path": "outputs/out.json"}}}},
+                "output:main.options",
+                id="sink-root-options",
+            ),
+            pytest.param(
+                {"sources": {"orders": {"options": {"payload": {"blob_ref": BLOB1, "path": "/d/p.csv"}}}}},
+                "source:orders.options.payload",
+                id="nested-source-option",
+            ),
+            pytest.param(
+                {"sources": {"orders": {"options": {"items": [{"blob_ref": BLOB1, "path": "/d/p.csv"}]}}}},
+                "source:orders.options.items.0",
+                id="source-option-list-item",
+            ),
+        ],
+    )
+    def test_unmoded_blob_ref_with_path_is_malformed_everywhere_but_root_source_options(
+        self, config: dict[str, Any], field_path: str
+    ) -> None:
+        """The skip is for a source's ROOT options only; a prompt slot or a sink stays fail-closed."""
+        with pytest.raises(BlobContentResolutionError) as exc_info:
+            _discover_blob_content_refs(config)
+
+        assert exc_info.value.malformed == ((field_path, "missing mode"),)
+
     def test_emits_one_ref_per_field_path_even_for_same_blob(self) -> None:
         config = {
             "transforms": [

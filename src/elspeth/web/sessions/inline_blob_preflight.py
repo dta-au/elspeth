@@ -86,6 +86,22 @@ def _inline_discovery_config(state: InlinePreflightState) -> _DiscoveryConfig:
     }
 
 
+def malformed_inline_blob_marker_paths(config: InlinePreflightState) -> tuple[str, ...]:
+    """Field paths of ``blob_ref`` mappings in ``config`` that are not well-formed markers.
+
+    :func:`prepare_session_inline_blob_snapshot` answers ``None`` both for a
+    state with no inline files and for one whose markers cannot be read at
+    all. A caller that was then refused for lack of a snapshot uses this to
+    tell the two apart and to name the fields. Paths only: a reason can quote
+    a value from the options, and these reach an HTTP response.
+    """
+    try:
+        _discover_blob_content_refs(cast(dict[str, Any], _inline_discovery_config(config)))
+    except BlobContentResolutionError as exc:
+        return tuple(field_path for field_path, _reason in exc.malformed)
+    return ()
+
+
 _REFUSAL_LIMIT_BYTES: Mapping[InlineBlobNotAdmittedReason, int | None] = MappingProxyType(
     {
         "unverified": None,

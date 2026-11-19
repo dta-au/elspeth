@@ -81,8 +81,13 @@ from elspeth.web.paths import (
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
-from elspeth.web.sessions.inline_blob_preflight import InlinePreflightState, prepare_session_inline_blob_snapshot
+from elspeth.web.sessions.inline_blob_preflight import (
+    InlinePreflightState,
+    malformed_inline_blob_marker_paths,
+    prepare_session_inline_blob_snapshot,
+)
 from elspeth.web.sessions.operation_receipts import operation_receipt_response_hash
+from elspeth.web.sessions.prompt_file_review import PromptFileReviewStale
 from elspeth.web.sessions.protocol import (
     CompositionStateRecord,
     OperationReceiptResult,
@@ -1517,16 +1522,68 @@ async def seed_state_from_runtime_yaml(
                 state_data,
                 composer_meta=merge_composer_meta_updates(state_data.composer_meta, seed_meta_updates),
             )
-            response_state = await service.save_composition_state_with_interpretations(
-                session.id,
-                state_data,
-                provenance="session_seed",
-                interpretations=interpretation_drafts,
-                session_operation_context=lease.context,
-            )
+            try:
+                response_state = await service.save_composition_state_with_interpretations(
+                    session.id,
+                    state_data,
+                    provenance="session_seed",
+                    interpretations=interpretation_drafts,
+                    session_operation_context=lease.context,
+                )
+            except PromptFileReviewStale as exc:
+                raise _import_prompt_file_review_refusal(imported_state) from exc
             return _state_response(response_state, policy_catalog=catalog)
     finally:
         await lease.close()
+
+
+IMPORT_BLOB_REFERENCE_MALFORMED = "import_blob_reference_malformed"
+IMPORT_PROMPT_FILE_UNVERIFIED = "import_prompt_file_unverified"
+
+
+def _import_prompt_file_review_refusal(state: CompositionState) -> HTTPException:
+    """Say why an imported prompt file's review card could not be written.
+
+    The card writer refuses a file-backed prompt it holds no verified bytes
+    for with ``PromptFileReviewStale``, the class an approval uses for "this
+    file changed since it was reviewed; review it again". Nothing has been
+    reviewed during an import, so that instruction names no step the user can
+    take, and uncaught it was a 500. Both causes are reported under codes of
+    their own, never as ``prompt_file_review_stale``. The whole import rolls
+    back either way: the state and its review cards commit together.
+
+    Malformed reference (400): some ``blob_ref`` mapping in the YAML is not a
+    complete file marker, so no file in the state could be read. The field
+    paths are named; values are not echoed.
+
+    Unverified file (409): every marker is well-formed, but a prompt file's
+    stored contents did not match its marker or could not be read back.
+    """
+    malformed = malformed_inline_blob_marker_paths(InlinePreflightState.from_composition_state(state))
+    if malformed:
+        return HTTPException(
+            status_code=400,
+            detail={
+                "error_code": IMPORT_BLOB_REFERENCE_MALFORMED,
+                "message": (
+                    f"Imported YAML holds a file reference that is not a complete file marker at: {', '.join(malformed)}. "
+                    "Nothing was imported. A file reference inside options needs blob_ref, mode: inline_content and the "
+                    "file's sha256; or remove it from the YAML, import again and attach the file in this session."
+                ),
+            },
+        )
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error_code": IMPORT_PROMPT_FILE_UNVERIFIED,
+            "message": (
+                "Imported YAML binds a prompt file that could not be verified against its reference (the file is "
+                "missing, not ready, or its contents differ from the sha256 in the YAML), so its review could not be "
+                "prepared. Nothing was imported. Bind the file again through the import's file bindings, or upload "
+                "it to this session again, then import again."
+            ),
+        },
+    )
 
 
 def _reject_file_inject_content_not_uploaded(state: CompositionState) -> None:

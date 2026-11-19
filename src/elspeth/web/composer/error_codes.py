@@ -117,6 +117,8 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "gate_route_labels_mismatch",
         "gate_route_target_unknown",
         "gate_routes_empty",
+        "import_blob_reference_malformed",
+        "import_prompt_file_unverified",
         "interpretation_requirements_invalid",
         "interpretation_slot",
         "interpretation_review_contract_unsatisfied",
