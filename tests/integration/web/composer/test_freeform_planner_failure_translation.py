@@ -30,6 +30,7 @@ import structlog
 from litellm.exceptions import APIError as LiteLLMAPIError
 from sqlalchemy import func, select
 
+from elspeth.contracts.composer_progress import CONTEXT_BUDGET_PROVIDER_REFUSAL_DETAIL
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
@@ -219,6 +220,8 @@ def _build_app(
     *,
     pending_llm_review: bool = False,
     context_max_prompt_tokens: int = 200_000,
+    planner_max_request_bytes: int = 960 * 1024,
+    expose_provider_errors: bool = False,
 ) -> tuple[SyncASGITestClient, Any, SessionServiceImpl]:
     """Wire a minimal real FastAPI app whose composer is a real ComposerServiceImpl.
 
@@ -255,6 +258,8 @@ def _build_app(
         else {},
         composer_max_composition_turns=3,
         composer_context_max_prompt_tokens=context_max_prompt_tokens,
+        composer_planner_max_request_bytes=planner_max_request_bytes,
+        composer_expose_provider_errors=expose_provider_errors,
         composer_max_discovery_turns=2,
         composer_timeout_seconds=20.0,
         composer_rate_limit_per_minute=10,
@@ -1024,14 +1029,16 @@ def test_send_message_planner_context_budget_refusal_names_its_cause_on_the_oper
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A planner request whose protected content exceeds the token ceiling is refused before any provider call.
+    """A planner request whose protected content exceeds the byte maximum is refused before any provider call.
 
     There is no call record, so the operation record is where the refusal, the
     ceiling it hit and the largest component must be found.
     """
     provider = AsyncMock(spec=litellm.acompletion, side_effect=AssertionError("a context budget refusal makes no provider call"))
-    # 1,000 tokens at the fallback 3.0 bytes per token: the system skill alone is over the ceiling.
-    client, engine, _sessions = _build_app(tmp_path, monkeypatch, provider, context_max_prompt_tokens=1_000)
+    # Was: a 1,000-token setting (context_ceiling_tokens). Now: the token estimate no longer stops a planner
+    # request (see the next test), so the refusal this test pins is the byte maximum's: 1,000 bytes, which the
+    # system skill alone exceeds.
+    client, engine, _sessions = _build_app(tmp_path, monkeypatch, provider, planner_max_request_bytes=1_000)
     session_id = client.post("/api/sessions", json={"title": "planner context budget refusal"}).json()["id"]
 
     settled = settle_sync(
@@ -1049,7 +1056,7 @@ def test_send_message_planner_context_budget_refusal_names_its_cause_on_the_oper
     assert detail["failure_code"] == "context_budget_exceeded"
     assert detail["planner_code"] == "CONTEXT_BUDGET_EXHAUSTED"
     assert detail["detail"] == _CONTEXT_BUDGET_DETAIL
-    assert detail["detail_codes"] == ["context_ceiling_tokens", "largest_component_system"]
+    assert detail["detail_codes"] == ["context_ceiling_bytes", "largest_component_system"]
     provider.assert_not_awaited()
     assert _llm_audit_rows(engine) == []
 
@@ -1060,7 +1067,7 @@ def test_send_message_planner_context_budget_refusal_names_its_cause_on_the_oper
 
     (disposition,) = _disposition_rows(engine)
     assert disposition.tool_calls[0]["failure_code"] == "context_budget_exceeded"
-    assert disposition.tool_calls[0]["rejection_codes"] == ["context_ceiling_tokens", "largest_component_system"]
+    assert disposition.tool_calls[0]["rejection_codes"] == ["context_ceiling_bytes", "largest_component_system"]
 
     operation_id = settled.accepted.json()["operation_id"]
     with engine.connect() as conn:
@@ -1075,13 +1082,142 @@ def test_send_message_planner_context_budget_refusal_names_its_cause_on_the_oper
     assert recorded["error_type"] == "context_budget_exceeded"
     assert recorded["body"]["detail"]["failure_code"] == "context_budget_exceeded"
     assert recorded["body"]["detail"]["detail"] == _CONTEXT_BUDGET_DETAIL
-    assert recorded["body"]["detail"]["detail_codes"] == ["context_ceiling_tokens", "largest_component_system"]
+    assert recorded["body"]["detail"]["detail_codes"] == ["context_ceiling_bytes", "largest_component_system"]
 
     history = client.get(f"/api/sessions/{session_id}/operations", params={"operation_id": operation_id})
     assert history.status_code == 200, history.text
     (outcome,) = history.json()["items"]
     assert outcome["failure_code"] == "http_error"
     assert outcome["error_type"] == "context_budget_exceeded"
+
+
+_PROVIDER_CAPACITY_DETAIL = CONTEXT_BUDGET_PROVIDER_REFUSAL_DETAIL
+
+
+def _llm_call_records(engine: Any) -> list[dict[str, Any]]:
+    return [row.tool_calls[0]["call"] for row in _llm_audit_rows(engine)]
+
+
+def test_send_message_planner_request_over_the_token_estimate_is_sent_and_its_record_says_so(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A planner request estimated over the token setting and under the byte maximum reaches the provider.
+
+    Was (this setting, in the test above): refused before any provider call, ``context_ceiling_tokens``.
+    Now the provider is called. Here the gateway rejects the request for a reason not recognised as
+    size, so the user sees the existing provider failure, while the persisted call record says the
+    request went out over the estimate.
+    """
+    provider = AsyncMock(
+        spec=litellm.acompletion,
+        side_effect=litellm.BadRequestError(
+            message=f"GatewayError - request rejected by policy {_PROVIDER_LEAK_SENTINEL}", model="test/planner", llm_provider="openai"
+        ),
+    )
+    # 1,000 tokens at the shipped 3.0 bytes per token: the system skill alone is estimated over the setting.
+    client, engine, _sessions = _build_app(tmp_path, monkeypatch, provider, context_max_prompt_tokens=1_000)
+    session_id = client.post("/api/sessions", json={"title": "planner over the estimate"}).json()["id"]
+
+    settled = settle_sync(
+        client,
+        client.app,
+        path=f"/api/sessions/{session_id}/messages",
+        body={"content": _EMPTY_INTENT, "operation_id": str(uuid4()), "state_id": None},
+    )
+
+    status, body = settled.error()
+    assert status == 503, settled.final.text
+    assert body["detail"]["failure_code"] == "provider_unavailable"
+    assert body["detail"]["planner_code"] == "PROVIDER_ERROR"
+    assert provider.await_count == 1
+    (call,) = _llm_call_records(engine)
+    assert call["status"] == "bad_request_error"
+    assert call["error_message"] == "BadRequestError"
+    assert call["context_budget"]["over_estimate"] is True
+    assert call["context_budget"]["max_prompt_tokens"] == 1_000
+    assert call["context_budget"]["estimated_tokens_after"] > 1_000
+    assert _PROVIDER_LEAK_SENTINEL not in settled.final.text
+
+
+@pytest.mark.parametrize("expose_provider_errors", [False, True], ids=["flag-off", "flag-on"])
+@pytest.mark.parametrize(
+    "rejection",
+    [
+        pytest.param(
+            lambda: litellm.ContextWindowExceededError(
+                message=f"BedrockException: Context Window Error - Input is too long for requested model. {_PROVIDER_LEAK_SENTINEL}",
+                model="bedrock/anthropic.claude-opus-4-8",
+                llm_provider="bedrock",
+            ),
+            id="bedrock-context-window-class",
+        ),
+        pytest.param(
+            lambda: litellm.BadRequestError(
+                message=f"GatewayError - prompt is too long: 251000 tokens > 200000 maximum {_PROVIDER_LEAK_SENTINEL}",
+                model="test/planner",
+                llm_provider="openai",
+            ),
+            id="gateway-400-wording",
+        ),
+    ],
+)
+def test_send_message_planner_gateway_length_rejection_is_the_provider_size_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    rejection: Any,
+    expose_provider_errors: bool,
+) -> None:
+    """The compose loop's settled sentence for a gateway length rejection, on the planner path.
+
+    As on the compose loop, a recognised length rejection never shows the provider's text, whatever
+    ``composer_expose_provider_errors`` says: the flag governs only rejections not recognised as size.
+    """
+    provider = AsyncMock(spec=litellm.acompletion, side_effect=rejection())
+    client, engine, _sessions = _build_app(tmp_path, monkeypatch, provider, expose_provider_errors=expose_provider_errors)
+    session_id = client.post("/api/sessions", json={"title": "planner gateway length rejection"}).json()["id"]
+
+    settled = settle_sync(
+        client,
+        client.app,
+        path=f"/api/sessions/{session_id}/messages",
+        body={"content": _EMPTY_INTENT, "operation_id": str(uuid4()), "state_id": None},
+    )
+
+    status, body = settled.error()
+    detail = body["detail"]
+    assert status == 422, settled.final.text
+    assert detail["error_type"] == "composer_planner_failure"
+    assert detail["failure_code"] == "context_budget_exceeded"
+    assert detail["planner_code"] == "CONTEXT_BUDGET_EXHAUSTED"
+    assert detail["detail"] == _PROVIDER_CAPACITY_DETAIL
+    assert detail["detail_codes"][0] == "context_ceiling_provider"
+    assert "provider_detail" not in detail
+    assert provider.await_count == 1
+
+    progress = client.get(f"/api/sessions/{session_id}/composer-progress").json()
+    assert progress["reason"] == "context_budget_exceeded"
+
+    (call,) = _llm_call_records(engine)
+    assert call["status"] == "bad_request_error"
+    assert call["error_message"] == "context_length_exceeded"
+
+    operation_id = settled.accepted.json()["operation_id"]
+    with engine.connect() as conn:
+        operation = (
+            conn.execute(select(composer_async_operations_table).where(composer_async_operations_table.c.operation_id == operation_id))
+            .mappings()
+            .one()
+        )
+        rows = [dict(row) for row in conn.execute(select(chat_messages_table)).mappings()]
+    assert json.loads(operation["result_json"])["body"]["detail"]["detail"] == _PROVIDER_CAPACITY_DETAIL
+    # The provider's own text is not shown, flag on or off, and is stored only where every provider
+    # failure's is: the private credential-filtered diagnostic receipts (see _assert_no_sentinel_leak).
+    private = [row for row in rows if row["tool_calls"] and row["tool_calls"][0].get("_kind") == "composer_diagnostic_evidence"]
+    assert private
+    assert _PROVIDER_LEAK_SENTINEL not in settled.final.text
+    assert _PROVIDER_LEAK_SENTINEL not in operation["result_json"]
+    assert _PROVIDER_LEAK_SENTINEL not in json.dumps([row for row in rows if row not in private], default=str)
 
 
 @pytest.mark.parametrize(

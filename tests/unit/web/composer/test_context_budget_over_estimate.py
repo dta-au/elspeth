@@ -1,7 +1,7 @@
 """The token estimate decides when to leave history out, never whether a message is sent.
 
-Pure calls to the one decision function both the compose loop and the planner use. The compose loop
-passes ``on_over_estimate="send"``; a caller that passes nothing keeps the tokens refusal.
+Pure calls to the one decision function both the compose loop and the planner use. Both pass
+``on_over_estimate="send"``; a caller that passes nothing keeps the tokens refusal.
 """
 
 from __future__ import annotations
@@ -84,7 +84,7 @@ def test_a_request_within_the_estimate_is_not_marked_over() -> None:
 
 
 def test_control_the_default_caller_is_still_refused_over_the_estimate() -> None:
-    """The planner's call shape, which passes no keyword: today's tokens refusal, unchanged."""
+    """A caller that passes no keyword keeps the tokens refusal (no production caller does since the planner passes "send")."""
     with pytest.raises(ContextBudgetRefusal) as exc_info:
         decide_context_budget(
             policy=_POLICY, request_bytes=800_000, segments=_history(4_000), previously_shed=frozenset(), authored_bytes=0

@@ -165,7 +165,7 @@ from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_discovery_response import (
     argument_error_response,
 )
-from elspeth.web.composer.provider_errors import classify_provider_failure
+from elspeth.web.composer.provider_errors import classify_provider_failure, is_context_length_rejection
 from elspeth.web.composer.provider_gateway import _litellm_acompletion
 from elspeth.web.composer.provider_quota import (
     ProviderCallCustody,
@@ -3413,7 +3413,9 @@ def _planner_context_budget_components(
     return named
 
 
-def _planner_context_budget_exhausted(ceiling: Literal["tokens", "bytes"], components: Mapping[str, int]) -> PipelinePlannerError:
+def _planner_context_budget_exhausted(
+    ceiling: Literal["tokens", "bytes", "provider"], components: Mapping[str, int]
+) -> PipelinePlannerError:
     return PipelinePlannerError(
         "planner context budget exhausted",
         code="CONTEXT_BUDGET_EXHAUSTED",
@@ -3458,7 +3460,9 @@ def _fit_planner_context_budget(
     trip are protected.
     ``messages`` and ``hatch_transcript`` are not changed. Raises the
     ``CONTEXT_BUDGET_EXHAUSTED`` planner error when protected content alone
-    exceeds a ceiling.
+    exceeds the byte maximum. A request estimated over ``max_prompt_tokens``
+    is sent with every segment shed, and its record says so
+    (``over_estimate``): the provider judges its own limit.
 
     ``model`` is the model this call requests (the planner's, or the escape
     hatch's on a hatch turn); only a same-model, same-dialect live call can
@@ -3572,6 +3576,10 @@ def _fit_planner_context_budget(
             + protected_reference_bytes(scratch_messages, excluded_positions=frozenset({0, *mutable_positions})),
             previously_shed=previously_shed_keys(history, earlier_calls),
             held=held_tool_keys(earlier_calls),
+            # A request under the byte maximum always goes, as on the compose
+            # loop: the estimate decides what is left out, the provider judges
+            # its own limit.
+            on_over_estimate="send",
         )
     except ContextBudgetRefusal as refusal:
         raise _planner_context_budget_exhausted(
@@ -3602,6 +3610,8 @@ def _fit_planner_context_budget(
         pricing_mode=decision.pricing.mode,
         authored_bytes=decision.pricing.authored_bytes,
         authored_refuted=decision.pricing.authored_refuted,
+        over_estimate=decision.over_estimate,
+        max_prompt_tokens=policy.max_prompt_tokens,
         anchor_status=anchor.reason,
         anchor_prompt_tokens=anchor.tokens,
         anchor_wire_bytes=anchor.wire_bytes,
@@ -4124,7 +4134,8 @@ async def _plan_pipeline_inner(
                 temperature=model_config.temperature,
                 seed=model_config.seed,
                 error_class=type(exc).__name__,
-                error_message=type(exc).__name__,
+                # A recognised context-limit rejection is recorded by its closed reason, never by provider text.
+                error_message="context_length_exceeded" if is_context_length_rejection(exc) else type(exc).__name__,
                 failure=exc,
                 private_request=private_request,
                 max_completion_tokens_requested=budget_policy.max_completion_tokens,
@@ -4346,6 +4357,22 @@ async def _plan_pipeline_inner(
                     # An admitted dispatch still needs terminal evidence, but
                     # a first-party fault must retain its original type.
                     raise
+                if is_context_length_rejection(exc):
+                    # The gateway or the model refused the request as over its
+                    # context limit. That is the size refusal it is, naming the
+                    # provider as the ceiling, never a provider outage; sized on
+                    # the request that was sent.
+                    raise _planner_context_budget_exhausted(
+                        "provider",
+                        _planner_context_budget_components(
+                            message_wire_split(budget_messages, active_tools),
+                            latest_start=latest_round_trip_start(budget_messages),
+                            hatch_transcript_index=hatch_transcript_index,
+                            history_sheddable=0,
+                            tool_sheddable=0,
+                            hatch_sheddable=0,
+                        ),
+                    ) from None
                 if provider_failure.kind == "timeout":
                     raise PipelinePlannerError("planner provider call timed out", code="TIMEOUT") from None
                 if provider_failure.retryable and attempt < model_config.max_api_attempts:
