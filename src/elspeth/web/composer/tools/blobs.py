@@ -28,7 +28,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Final, Literal, NotRequired, TypedDict, cast
+from typing import Any, Final, Literal, NotRequired, TypedDict, TypeGuard, cast
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
@@ -49,7 +49,7 @@ from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.credential_material import DEFAULT_CREDENTIAL_TRAVERSAL_POLICY
 from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
-from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.blobs.protocol import (
@@ -121,6 +121,7 @@ from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_TEMPLATE_PARTS_KEY,
     reconcile_authoritative_reviews,
+    serialize_authoring_review_options,
 )
 from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
 from elspeth.web.resource_identity import canonical_resource_uuid
@@ -1221,26 +1222,28 @@ def _file_inject_wired_marker_error(state: CompositionState, field_path: str) ->
     return None
 
 
-def _is_vague_term_requirement(row: object) -> bool:
+def _is_vague_term_requirement(row: object) -> TypeGuard[Mapping[str, JsonValue]]:
     return isinstance(row, Mapping) and row.get("kind", InterpretationKind.VAGUE_TERM.value) == InterpretationKind.VAGUE_TERM.value
 
 
 def _vague_term_requirement_ids(options: Mapping[str, JsonValue]) -> tuple[str, ...]:
-    """Ids of the vague-term requirements a file replacement of the prompt supersedes."""
+    """Ids of the vague-term requirements a replacement of the prompt supersedes."""
     requirements = options.get(INTERPRETATION_REQUIREMENTS_KEY)
     if not isinstance(requirements, (list, tuple)):
         return ()
     return tuple(str(row["id"]) for row in requirements if isinstance(row, Mapping) and _is_vague_term_requirement(row) and "id" in row)
 
 
-def _options_for_file_prompt_replacement(options: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
-    """Options with the prompt_template's own review state removed, ready for a file.
+def _options_for_prompt_replacement(options: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
+    """Options with the prompt_template's own review state removed, ready for a new prompt.
 
-    Binding a file REPLACES the prompt, so everything that reviewed the old
-    text goes with it: ``prompt_template_parts`` and every vague-term
-    requirement (pending or resolved, slotted or not), because each one
-    defines a term of the text being replaced. The single card left is the
-    file's own, re-derived by ``_options_with_default_prompt_template_review``.
+    The one strip every whole-prompt replacement uses, whether the new prompt
+    is a file (``wire_blob_inline_ref``) or new text (``patch_node_options``,
+    ``upsert_node``, ``set_pipeline``). Replacing the prompt takes everything
+    that reviewed the old text with it: ``prompt_template_parts`` and every
+    vague-term requirement (pending or resolved, slotted or not), because each
+    one defines a term of the text being replaced. The single card left is the
+    new prompt's own, re-derived by ``_options_with_default_prompt_template_review``.
     Other kinds (model choice, pipeline decisions) are not about the prompt
     text and are kept.
     """
@@ -1255,17 +1258,170 @@ def _options_for_file_prompt_replacement(options: Mapping[str, JsonValue]) -> Ma
     return remaining
 
 
+@dataclass(frozen=True, slots=True)
+class _PromptReplacement:
+    """One llm node's stored options with the replaced prompt's review state removed."""
+
+    base_options: Mapping[str, JsonValue]
+    superseded_review_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "base_options")
+
+
+def _prompt_replacement(stored_options: Mapping[str, JsonValue]) -> _PromptReplacement:
+    """The replacement every whole-prompt writer applies to the node it names."""
+    return _PromptReplacement(
+        base_options=_options_for_prompt_replacement(stored_options),
+        superseded_review_ids=_vague_term_requirement_ids(stored_options),
+    )
+
+
+def _whole_prompt_text_replacement(
+    stored_options: Mapping[str, JsonValue],
+    written: Mapping[str, JsonValue],
+) -> _PromptReplacement | None:
+    """Decide whether a write to an llm node replaces its whole prompt with text.
+
+    The signal is explicit and belongs to the model: ``prompt_template`` is a
+    plain string AND ``prompt_template_parts`` is present as ``null``. A file
+    marker never qualifies (binding a file is ``wire_blob_inline_ref``), and
+    ``prompt_template_parts: null`` alone replaces nothing. The server removes
+    only the review state of the text the model replaced; it writes no prompt
+    text, parts or requirement content of its own (maintainer ruling
+    2026-11-19: replacing A with B does not depend on what A was).
+
+    Returns ``None`` when the write is not that signal or the stored prompt
+    carries nothing to supersede, so an ordinary write keeps its ordinary path.
+    """
+    prompt = written["prompt_template"] if "prompt_template" in written else None
+    if type(prompt) is not str:
+        return None
+    if PROMPT_TEMPLATE_PARTS_KEY not in written or written[PROMPT_TEMPLATE_PARTS_KEY] is not None:
+        return None
+    stored_parts = stored_options[PROMPT_TEMPLATE_PARTS_KEY] if PROMPT_TEMPLATE_PARTS_KEY in stored_options else None
+    replacement = _prompt_replacement(stored_options)
+    if stored_parts is None and not replacement.superseded_review_ids:
+        return None
+    return replacement
+
+
+def _written_options_for_prompt_replacement(
+    written: Mapping[str, JsonValue],
+    replacement: _PromptReplacement,
+) -> Mapping[str, JsonValue]:
+    """The model's write without the replace signal's null key or the old prompt's rows.
+
+    The skill tells the model to carry a node's requirement rows on every
+    write, so a replace call routinely echoes the rows it supersedes. Those are
+    dropped by id; every other row the model sent stays for admission and
+    reconciliation to judge. Call after the rows have been canonicalized, which
+    is what gives an echoed shell its stored id.
+    """
+    remaining: dict[str, JsonValue] = {key: value for key, value in written.items() if key != PROMPT_TEMPLATE_PARTS_KEY}
+    requirements = written[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in written else None
+    if isinstance(requirements, (list, tuple)):
+        superseded = frozenset(replacement.superseded_review_ids)
+        remaining[INTERPRETATION_REQUIREMENTS_KEY] = [
+            row for row in requirements if not (_is_vague_term_requirement(row) and "id" in row and str(row["id"]) in superseded)
+        ]
+    return remaining
+
+
+# Result keys for a write that carried a node's existing prompt text. One
+# constant each, so the names and the sentence change in one place.
+PROMPT_UNCHANGED_NODE_IDS_KEY: Final = "prompt_unchanged_node_ids"
+PROMPT_UNCHANGED_NOTE_KEY: Final = "prompt_unchanged_note"
+PROMPT_UNCHANGED_NOTE: Final = (
+    "Each node in prompt_unchanged_node_ids was sent its existing prompt text: its prompt, term definitions and "
+    "approvals are unchanged. To replace it, send different text with prompt_template_parts: null."
+)
+
+
+def _texts_of_the_stored_prompt(stored_options: Mapping[str, JsonValue]) -> frozenset[str]:
+    """The two renderings the server hands out for a node's stored prompt.
+
+    The stored compiled ``prompt_template`` (what the turn context shows) and
+    the authoring export's ``prompt_template`` (what
+    ``get_pipeline_state(component="set_pipeline_arguments")`` returns, with
+    its placeholder words at each term slot). The export text comes from the
+    export's own serializer, so the two cannot drift.
+    """
+    texts: set[str] = set()
+    stored_prompt = stored_options["prompt_template"] if "prompt_template" in stored_options else None
+    if type(stored_prompt) is str:
+        texts.add(stored_prompt)
+    try:
+        exported = serialize_authoring_review_options(stored_options)
+    except ValueError:
+        # Stored options the export itself cannot serialize have no export text.
+        return frozenset(texts)
+    exported_prompt = exported["prompt_template"] if "prompt_template" in exported else None
+    if type(exported_prompt) is str:
+        texts.add(exported_prompt)
+    return frozenset(texts)
+
+
+def _written_options_keeping_an_unchanged_prompt(
+    stored_options: Mapping[str, JsonValue],
+    written: Mapping[str, JsonValue],
+    *,
+    merge_patch: bool,
+) -> Mapping[str, JsonValue] | None:
+    """The write with the stored structured prompt kept, when it re-sends that prompt's own text.
+
+    Text equal to a rendering the server hands out for the stored prompt (see
+    ``_texts_of_the_stored_prompt``) never changes the prompt's structure or
+    reviews, whatever the write says about ``prompt_template_parts`` (null, or
+    no key at all): identical text replaces nothing. Equal means the same
+    string; a re-typed prompt that differs by one space is a change.
+
+    A merge patch loses its ``prompt_template`` and its null parts key, so the
+    stored prompt is not touched and the export's placeholder words are never
+    written. A whole-node write gets the stored text and parts back, and the
+    stored requirement rows when it sent no ``interpretation_requirements`` key
+    at all; rows it did send are judged as on any write that keeps the prompt.
+    Nothing here is authored: every value restored is the node's own stored
+    value. Stored rows are restored in no other case.
+
+    Returns ``None`` for every other write, including one that sends
+    ``prompt_template_parts`` itself.
+    """
+    stored_parts = stored_options[PROMPT_TEMPLATE_PARTS_KEY] if PROMPT_TEMPLATE_PARTS_KEY in stored_options else None
+    if stored_parts is None:
+        return None
+    if PROMPT_TEMPLATE_PARTS_KEY in written and written[PROMPT_TEMPLATE_PARTS_KEY] is not None:
+        return None
+    prompt = written["prompt_template"] if "prompt_template" in written else None
+    if type(prompt) is not str or prompt not in _texts_of_the_stored_prompt(stored_options):
+        return None
+    kept: dict[str, JsonValue] = {key: value for key, value in written.items() if key not in ("prompt_template", PROMPT_TEMPLATE_PARTS_KEY)}
+    if merge_patch:
+        return kept
+    kept["prompt_template"] = stored_options["prompt_template"]
+    kept[PROMPT_TEMPLATE_PARTS_KEY] = deep_thaw(stored_parts)
+    if INTERPRETATION_REQUIREMENTS_KEY not in written:
+        stored_rows = stored_options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in stored_options else None
+        if isinstance(stored_rows, (list, tuple)):
+            kept[INTERPRETATION_REQUIREMENTS_KEY] = [deep_thaw(row) for row in stored_rows]
+    return kept
+
+
 def _structured_prompt_template_refusal(
     node_id: str,
     current_options: Mapping[str, JsonValue],
     patch: Mapping[str, JsonValue],
 ) -> str | None:
     """Shared structured-prompt guard for option patches and file binding."""
-    parts = patch[PROMPT_TEMPLATE_PARTS_KEY] if PROMPT_TEMPLATE_PARTS_KEY in patch else current_options.get(PROMPT_TEMPLATE_PARTS_KEY)
-    if parts is None or "prompt_template" not in patch:
+    if "prompt_template" not in patch:
         return None
     candidate = patch["prompt_template"]
-    if is_widened_blob_ref(deep_thaw(candidate)) is not None:
+    current_parts = current_options[PROMPT_TEMPLATE_PARTS_KEY] if PROMPT_TEMPLATE_PARTS_KEY in current_options else None
+    parts = patch[PROMPT_TEMPLATE_PARTS_KEY] if PROMPT_TEMPLATE_PARTS_KEY in patch else current_parts
+    # The marker branch reads the STORED parts as well as the written ones: a
+    # write that nulls prompt_template_parts in the same call must not carry a
+    # file marker past this guard. Only wire_blob_inline_ref binds a file.
+    if (parts is not None or current_parts is not None) and is_widened_blob_ref(deep_thaw(candidate)) is not None:
         return (
             f"Node '{node_id}' has a structured prompt with interpretation slots, and this path cannot put a file on it. "
             f"To replace the whole prompt with a file, call wire_blob_inline_ref on node:{node_id}.options.prompt_template: "
@@ -1273,10 +1429,17 @@ def _structured_prompt_template_refusal(
             "To keep the structured prompt, edit its text parts in place with change_substring or patch_node_options on "
             "prompt_template_parts, preserving interpretation_ref entries."
         )
+    if parts is None:
+        return None
     if candidate != current_options.get("prompt_template") and PROMPT_TEMPLATE_PARTS_KEY not in patch:
         return (
-            f"Node '{node_id}': edit prompt_template_parts to change this structured prompt, "
-            "preserving its interpretation_ref entries; prompt_template is compiled from those parts."
+            f"Node '{node_id}' has a structured prompt, and this call sends different prompt_template text without "
+            "prompt_template_parts. Nothing was changed. If you are NOT replacing this prompt (for example the node was "
+            "re-sent while changing something else), make the other change with a narrower tool that leaves this node "
+            "alone, or send the node whole and unedited as get_pipeline_state(component='set_pipeline_arguments') returns "
+            "it. Only to REPLACE the whole prompt with new text, send prompt_template together with "
+            "prompt_template_parts: null; the old prompt's term reviews are removed and the new text gets its own review "
+            "card. prompt_template is compiled from prompt_template_parts and their interpretation_ref entries."
         )
     return None
 
@@ -1356,13 +1519,11 @@ def _execute_wire_blob_inline_ref(
                 stored_error = _composition_canonical_interpretation_requirement_error(state, tool_name="wire_blob_inline_ref")
                 if stored_error is not None:
                     return _failure_result(state, stored_error, error_code="interpretation_requirements_invalid")
-                superseded_review_ids = _vague_term_requirement_ids(node.options)
+                replacement = _prompt_replacement(node.options)
+                superseded_review_ids = replacement.superseded_review_ids
                 apply_state = replace(
                     state,
-                    nodes=tuple(
-                        replace(item, options=_options_for_file_prompt_replacement(item.options)) if item.id == node_id else item
-                        for item in state.nodes
-                    ),
+                    nodes=tuple(replace(item, options=replacement.base_options) if item.id == node_id else item for item in state.nodes),
                 )
 
     prompt_surface_error = _llm_authored_prompt_surface_error(

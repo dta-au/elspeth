@@ -7,7 +7,7 @@ from dataclasses import replace
 from hashlib import sha256
 from typing import Annotated, Any, Final, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, StrictFloat, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, StrictFloat, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
@@ -80,9 +80,16 @@ from elspeth.web.composer.tools._common import (
 )
 from elspeth.web.composer.tools._naming_disclosure import _disclose_node_name_constraints
 from elspeth.web.composer.tools.blobs import (
+    PROMPT_UNCHANGED_NODE_IDS_KEY,
+    PROMPT_UNCHANGED_NOTE,
+    PROMPT_UNCHANGED_NOTE_KEY,
     _file_inject_node_option_error,
     _llm_authored_inline_prompt_surface_error,
+    _PromptReplacement,
     _structured_prompt_template_refusal,
+    _whole_prompt_text_replacement,
+    _written_options_for_prompt_replacement,
+    _written_options_keeping_an_unchanged_prompt,
 )
 from elspeth.web.composer.tools.declarations import (
     EffectDomain,
@@ -464,7 +471,11 @@ _UPSERT_NODE_DECLARATION = ToolDeclaration(
         "collector closes a declared EXPAND scope with a batch-aware plugin: "
         "set scope_name, scope_opener (the multi-row transform that opens the "
         "group), and scope_policy ('require_all' or 'best_effort', no default). "
-        "Omit fields that don't apply to your node_type."
+        "Omit fields that don't apply to your node_type. "
+        "For an llm node that has a structured prompt, options with prompt_template text and prompt_template_parts: null "
+        "replace the whole prompt; `superseded_review_ids` names the old prompt's vague-term reviews that were removed. "
+        "To keep that prompt, send the node whole and unedited as get_pipeline_state(component='set_pipeline_arguments') "
+        "returns it; changed prompt_template text without prompt_template_parts is refused (prompt_template_parts_required)."
     ),
     json_schema=_UPSERT_NODE_DECLARATION_JSON_SCHEMA,
     augments_on_failure=True,
@@ -741,6 +752,27 @@ def _execute_upsert_node(
         component_id=node_id,
         existing_options=existing_node.options if existing_node is not None else None,
     )
+    # prompt_template as text with prompt_template_parts: null REPLACES the
+    # stored prompt (see _whole_prompt_text_replacement). Every refusal below
+    # still returns the untouched ``state``, and reviews reconcile against it.
+    replacement: _PromptReplacement | None = None
+    prompt_unchanged_node_ids: tuple[str, ...] = ()
+    if plugin == "llm" and existing_node is not None and existing_node.plugin == "llm":
+        # The stored prompt's own text replaces nothing, whatever the parts key says.
+        kept_options = _written_options_keeping_an_unchanged_prompt(existing_node.options, node_options, merge_patch=False)
+        if kept_options is not None:
+            node_options = kept_options
+            prompt_unchanged_node_ids = (node_id,)
+        replacement = _whole_prompt_text_replacement(existing_node.options, node_options)
+    if replacement is not None:
+        # A stored row that is already non-canonical is refused first, so the
+        # replacement can never launder a malformed row away.
+        stored_error = _composition_canonical_interpretation_requirement_error(state, tool_name="upsert_node")
+        if stored_error is not None:
+            return _saved_graph_rejection_result(
+                state, stored_error, error_code="interpretation_requirements_invalid", rejected_component=node_ref
+            )
+        node_options = _written_options_for_prompt_replacement(node_options, replacement)
     review_options = _options_with_default_llm_reviews(
         node_id=node_id,
         plugin=plugin,
@@ -749,7 +781,9 @@ def _execute_upsert_node(
     )
     if plugin == "llm":
         structured_error = _structured_prompt_template_refusal(
-            node_id, existing_node.options if existing_node is not None else {}, review_options
+            node_id,
+            replacement.base_options if replacement is not None else existing_node.options if existing_node is not None else {},
+            review_options,
         )
         if structured_error is not None:
             return _saved_graph_rejection_result(
@@ -982,11 +1016,19 @@ def _execute_upsert_node(
             affected.add(edge.to_node)
 
     echo_note = _echoed_metadata_note(requirement_echo=requirement_echo)
-    return _mutation_result(
-        new_state,
-        tuple(sorted(affected)),
-        data=None if echo_note is None else {"server_owned_metadata_note": echo_note},
-    )
+    data: dict[str, JsonValue] = {}
+    if echo_note is not None:
+        data["server_owned_metadata_note"] = echo_note
+    if replacement is not None and replacement.superseded_review_ids:
+        # The replaced prompt's vague-term reviews, named so the model can tell
+        # the user which definitions no longer apply.
+        data["superseded_review_ids"] = list(replacement.superseded_review_ids)
+    if prompt_unchanged_node_ids:
+        # The write carried the stored prompt's own text without its parts, so
+        # the stored prompt structure and reviews were kept.
+        data[PROMPT_UNCHANGED_NODE_IDS_KEY] = list(prompt_unchanged_node_ids)
+        data[PROMPT_UNCHANGED_NOTE_KEY] = PROMPT_UNCHANGED_NOTE
+    return _mutation_result(new_state, tuple(sorted(affected)), data=data or None)
 
 
 def _splice_connection_name(node_id: str, state: CompositionState) -> str | None:
@@ -1918,7 +1960,28 @@ def _apply_guarded_node_option_patch(
         return _saved_graph_rejection_result(
             state, f"Node '{node_id}': {runtime_owned_error}", error_code=error_code, rejected_component=node_ref
         )
-    structured_error = _structured_prompt_template_refusal(node_id, current.options, patch) if current.plugin == "llm" else None
+    # prompt_template as text with prompt_template_parts: null REPLACES the
+    # stored prompt (see _whole_prompt_text_replacement): the patch then merges
+    # into the stored options without the old prompt's parts and term reviews.
+    # Every refusal below still returns the untouched ``state``, and reviews
+    # reconcile against it.
+    # The stored prompt's own text replaces nothing, whatever the parts key says.
+    kept_patch = _written_options_keeping_an_unchanged_prompt(current.options, patch, merge_patch=True) if current.plugin == "llm" else None
+    prompt_unchanged_node_ids: tuple[str, ...] = ()
+    if kept_patch is not None:
+        patch = kept_patch
+        prompt_unchanged_node_ids = (node_id,)
+    replacement = _whole_prompt_text_replacement(current.options, patch) if current.plugin == "llm" else None
+    if replacement is not None:
+        # A stored row that is already non-canonical is refused first, so the
+        # replacement can never launder a malformed row away.
+        stored_error = _composition_canonical_interpretation_requirement_error(state, tool_name="patch_node_options")
+        if stored_error is not None:
+            return _saved_graph_rejection_result(
+                state, stored_error, error_code="interpretation_requirements_invalid", rejected_component=node_ref
+            )
+    base_options = replacement.base_options if replacement is not None else current.options
+    structured_error = _structured_prompt_template_refusal(node_id, base_options, patch) if current.plugin == "llm" else None
     if structured_error is not None:
         return _saved_graph_rejection_result(
             state,
@@ -1943,7 +2006,9 @@ def _apply_guarded_node_option_patch(
             error_code="queries_patch_omits_existing",
             rejected_component=node_ref,
         )
-    new_options: Mapping[str, Any] = _apply_merge_patch(current.options, dict(patch))
+    if replacement is not None:
+        patch = _written_options_for_prompt_replacement(patch, replacement)
+    new_options: Mapping[str, Any] = _apply_merge_patch(base_options, dict(patch))
     new_options = _options_with_default_llm_reviews(
         node_id=node_id,
         plugin=current.plugin,
@@ -2110,11 +2175,19 @@ def _apply_guarded_node_option_patch(
             rejected_component=None,
         )
     echo_note = _echoed_metadata_note(requirement_echo=requirement_echo)
-    return _mutation_result(
-        new_state,
-        (node_id,),
-        data=None if echo_note is None else {"server_owned_metadata_note": echo_note},
-    )
+    data: dict[str, JsonValue] = {}
+    if echo_note is not None:
+        data["server_owned_metadata_note"] = echo_note
+    if replacement is not None and replacement.superseded_review_ids:
+        # The replaced prompt's vague-term reviews, named so the model can tell
+        # the user which definitions no longer apply.
+        data["superseded_review_ids"] = list(replacement.superseded_review_ids)
+    if prompt_unchanged_node_ids:
+        # The patch carried the stored prompt's own text with a null parts key,
+        # so the stored prompt structure and reviews were kept.
+        data[PROMPT_UNCHANGED_NODE_IDS_KEY] = list(prompt_unchanged_node_ids)
+        data[PROMPT_UNCHANGED_NOTE_KEY] = PROMPT_UNCHANGED_NOTE
+    return _mutation_result(new_state, (node_id,), data=data or None)
 
 
 def _substring_refusal(state: CompositionState, message: str, code: str) -> ToolResult:
@@ -2447,8 +2520,12 @@ _PATCH_NODE_OPTIONS_DECLARATION = ToolDeclaration(
     "Keys in the patch overwrite existing keys. "
     "Keys set to null are deleted. Top-level keys the patch does not name are unchanged; a nested value such as queries "
     "is replaced whole, so send every query (a queries value that omits an existing query is refused; queries: null removes every query). "
-    "For an existing structured LLM prompt, edit prompt_template_parts and preserve interpretation_ref entries; "
-    "prompt_template is compiled from those parts. Changed prompt context requires fresh review. "
+    "To change the wording of an existing structured LLM prompt, edit prompt_template_parts and preserve "
+    "interpretation_ref entries; prompt_template is compiled from those parts. "
+    "To REPLACE the whole prompt with new text, send prompt_template (the new text) with prompt_template_parts: null "
+    "and no interpretation_requirements key: the parts and every vague-term review of the old prompt are removed, "
+    "`superseded_review_ids` names the removed reviews, and the new text gets its own review card. "
+    "Changed prompt context requires fresh review. "
     "Do not use this for node routing fields such as on_success/on_error/input/routes; "
     "use upsert_edge or upsert_node for routing edits. Gate on_error is node-level and must use upsert_node.",
     json_schema={
@@ -2465,8 +2542,10 @@ _PATCH_NODE_OPTIONS_DECLARATION = ToolDeclaration(
                     "Node-level routing fields such as on_success, on_error, input, routes, "
                     "and fork_to are siblings of options; edit them with upsert_edge or upsert_node. "
                     "For a gate, edit on_error only with upsert_node. "
-                    "If prompt_template_parts exists, edit that structure while preserving interpretation_ref entries; "
-                    "do not change only the compiled prompt_template. "
+                    "If prompt_template_parts exists, edit that structure, preserving interpretation_ref entries, to change the prompt's wording; "
+                    "a changed prompt_template sent without prompt_template_parts is refused. "
+                    "To REPLACE the whole prompt with new text, send prompt_template with prompt_template_parts: null; "
+                    "that removes the old prompt's term reviews. "
                     "A patched schema declares arriving types for consumed fields and output types for created fields. "
                     "To convert an arriving value, change the source contract (patch_source_options) or insert a type_coerce upstream; a declaration does not convert."
                     + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE

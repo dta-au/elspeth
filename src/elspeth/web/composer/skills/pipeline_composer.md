@@ -206,7 +206,8 @@ For ordinary build/edit turns, the action path is:
 | Create a new pipeline or perform an intentional full rebuild | `set_pipeline`, or bounded construction batches as described below |
 | Perform a one-transform insertion between existing nodes on a direct linear path | `splice_transform`: one call, with or without `edges`; the server re-points the successor's `input`. If it is refused, use `upsert_node` for the new node and re-point the successor's `input`, also with `upsert_node` |
 | Make an option-only edit to an existing node | `patch_node_options` |
-| Change a small exact span of an existing LLM prompt | `inspect_prompt_targets`, then `change_substring` |
+| Replace an inline or structured LLM prompt's whole text with new text | `patch_node_options` with `prompt_template` (the new text) and `prompt_template_parts: null` |
+| Change a small exact span of an inline or structured LLM prompt | `inspect_prompt_targets`, then `change_substring` |
 | Add or rewire a node in an existing pipeline, when no narrower row above fits | `upsert_node` / `upsert_edge` |
 
 For a small edit to an existing prompt, call `inspect_prompt_targets` for the node and use its state ID and SHA-256 with `change_substring`; do not resend the whole prompt through `patch_node_options` to change part of it. Send the smallest `old` substring that matches exactly once; use `replace_all` only when every occurrence should change. After a successful edit, call `inspect_prompt_targets` in a later tool batch to obtain the committed revision ID. If the tool returns `target_changed`, inspect again before retrying. A changed prompt needs fresh review.
@@ -823,23 +824,39 @@ preserving `interpretation_ref` entries. A file marker written straight onto a
 structured prompt by `patch_node_options`, `upsert_node`, `set_pipeline` or
 imported YAML is refused (`prompt_template_parts_required`); use
 `wire_blob_inline_ref` instead. File binding does not support `model` or the whole `queries` value.
+To replace an inline or structured prompt with new TEXT rather than a file,
+send `prompt_template` (the new text) with `prompt_template_parts: null` in a
+`patch_node_options` patch, or among that node's options in `upsert_node` or
+`set_pipeline`. The same removal applies: the result lists any removed term
+reviews in `superseded_review_ids` (tell the user those definitions no longer
+apply), and the new text gets its own `llm_prompt_template` card, which the
+server raises. Leave `interpretation_requirements` out of that patch; sent as
+`null` it is refused.
+On a structured prompt, a changed `prompt_template` sent without
+`prompt_template_parts` is refused by all three tools
+(`prompt_template_parts_required`). If you were not replacing that node's
+prompt, do not add the `null`: to reword it, edit its parts with
+`change_substring`; to re-send it, send the node whole and unedited as
+`get_pipeline_state` with `component="set_pipeline_arguments"` returns it.
 Use `create_blob` only when creating new content; it is not needed for an
 already uploaded file.
 
 **Replacing A with B.** When the user asks you to swap one thing for another
-(for example: use this file as the prompt instead), B is new content the user
+(for example: use this file, or this text, as the prompt instead), B is new content the user
 supplied or asked for. Treat it as the user's own authored content: the user
 answers for it through B's own review. The reviews, approvals and accepted
 definitions attached to A belonged to A; they do not carry over to B, they do
 not protect A, and they are never a reason to refuse, to hesitate, or to ask
 the user to choose between keeping A and using B. The request already made
 that choice. Make the replacement in the same turn with the tool that performs
-it; for a file as an LLM prompt that tool is `wire_blob_inline_ref` (above),
-not a marker written by another tool. Do not offer "keep A as it is" as an
+it; for a file replacing a prompt the node already has, that tool is
+`wire_blob_inline_ref` (above), not a marker written by another tool; for new
+text replacing an inline or structured prompt it is `prompt_template` with
+`prompt_template_parts: null` (above). Do not offer "keep A as it is" as an
 option, do not ask the user to confirm that A's approved content may be
 dropped, and do not describe the swap as unsupported because A was structured
-or reviewed. B gets its own review wherever one is required (a file-backed
-prompt opens its own `llm_prompt_template` card); say so in one sentence, and
+or reviewed. B gets its own review wherever one is required (a file or new
+prompt text opens its own `llm_prompt_template` card); say so in one sentence, and
 say once that what was approved for A no longer applies. If the tool itself
 refuses (a damaged or drifted review record, a missing or unreadable file, a
 size or type limit), that is not about A's approvals: relay what the refusal

@@ -118,6 +118,9 @@ from elspeth.web.composer.tools._common import (
     validate_composer_file_sink_collision_policy,
 )
 from elspeth.web.composer.tools.blobs import (
+    PROMPT_UNCHANGED_NODE_IDS_KEY,
+    PROMPT_UNCHANGED_NOTE,
+    PROMPT_UNCHANGED_NOTE_KEY,
     _blob_create_payload,
     _blob_creation_provenance,
     _file_inject_node_option_error,
@@ -125,7 +128,11 @@ from elspeth.web.composer.tools.blobs import (
     _persist_prepared_blob_create,
     _prepare_blob_create,
     _PreparedBlobCreate,
+    _PromptReplacement,
     _structured_prompt_template_refusal,
+    _whole_prompt_text_replacement,
+    _written_options_for_prompt_replacement,
+    _written_options_keeping_an_unchanged_prompt,
 )
 from elspeth.web.composer.tools.declarations import (
     GRAPH_EFFECTS,
@@ -1514,6 +1521,8 @@ def build_set_pipeline_candidate(
     # 2. Validate node plugins and options
     canonical_node_options: dict[int, Mapping[str, Any]] = {}
     current_nodes = {node.id: node for node in state.nodes}
+    superseded_review_ids: list[str] = []
+    prompt_unchanged_node_ids: list[str] = []
     for node_index, node in enumerate(validated.nodes):
         node_id = node.id
         node_ref = f"node:{node_id}"
@@ -1560,6 +1569,29 @@ def build_set_pipeline_candidate(
             node_options = _normalize_trusted_legacy_interpretation_requirements(
                 node_options,
             )
+        # prompt_template as text with prompt_template_parts: null REPLACES
+        # that node's stored prompt (see _whole_prompt_text_replacement). Every
+        # rejection still returns the untouched ``state``, and reviews
+        # reconcile against it.
+        replacement: _PromptReplacement | None = None
+        if node_plugin == "llm" and node_id in current_nodes and current_nodes[node_id].plugin == "llm":
+            # The stored prompt's own text replaces nothing, whatever the parts key says.
+            kept_options = _written_options_keeping_an_unchanged_prompt(current_nodes[node_id].options, node_options, merge_patch=False)
+            if kept_options is not None:
+                node_options = kept_options
+                prompt_unchanged_node_ids.append(node_id)
+            replacement = _whole_prompt_text_replacement(current_nodes[node_id].options, node_options)
+        if replacement is not None:
+            # A stored row that is already non-canonical is refused first, so
+            # the replacement can never launder a malformed row away.
+            stored_error = _composition_canonical_interpretation_requirement_error(state, tool_name="set_pipeline")
+            if stored_error is not None:
+                _record_component_rejection(
+                    _failure_result(state, stored_error, error_code="interpretation_requirements_invalid", rejected_component=node_ref)
+                )
+                continue
+            node_options = _written_options_for_prompt_replacement(node_options, replacement)
+            superseded_review_ids.extend(replacement.superseded_review_ids)
         review_options = _options_with_default_llm_reviews(
             node_id=node_id,
             plugin=node_plugin,
@@ -1568,7 +1600,9 @@ def build_set_pipeline_candidate(
         )
         if node_plugin == "llm":
             structured_error = _structured_prompt_template_refusal(
-                node_id, current_nodes[node_id].options if node_id in current_nodes else {}, review_options
+                node_id,
+                replacement.base_options if replacement is not None else current_nodes[node_id].options if node_id in current_nodes else {},
+                review_options,
             )
             if structured_error is not None:
                 _record_component_rejection(
@@ -2111,6 +2145,19 @@ def build_set_pipeline_candidate(
         # matter how many components echoed.
         note_payload = {"server_owned_metadata_note": " ".join(dict.fromkeys(echoed_metadata_notes))}
         data = note_payload if data is None else {**data, **note_payload}
+    if superseded_review_ids:
+        # The replaced prompts' vague-term reviews, named so the model can tell
+        # the user which definitions no longer apply.
+        superseded_payload = {"superseded_review_ids": list(superseded_review_ids)}
+        data = superseded_payload if data is None else {**data, **superseded_payload}
+    if prompt_unchanged_node_ids:
+        # Nodes whose write carried the stored prompt's own text without its
+        # parts: their stored prompt structure and reviews were kept.
+        kept_payload = {
+            PROMPT_UNCHANGED_NODE_IDS_KEY: list(prompt_unchanged_node_ids),
+            PROMPT_UNCHANGED_NOTE_KEY: PROMPT_UNCHANGED_NOTE,
+        }
+        data = kept_payload if data is None else {**data, **kept_payload}
     return _candidate(
         _mutation_result(
             new_state,
@@ -2186,7 +2233,11 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
     description=(
         "Atomically create or fully rebuild a pipeline. For a narrow edit to an existing pipeline, name the "
         "tool that matches the edit: `patch_node_options` for an option-only change, `splice_transform` to "
-        "insert one transform on a direct linear path, `upsert_node` / `upsert_edge` to add or rewire a node."
+        "insert one transform on a direct linear path, `upsert_node` / `upsert_edge` to add or rewire a node. "
+        "For an llm node that has a structured prompt, options with prompt_template text and prompt_template_parts: null "
+        "replace the whole prompt; `superseded_review_ids` names the old prompt's vague-term reviews that were removed. "
+        "To keep that prompt, send the node whole and unedited as get_pipeline_state(component='set_pipeline_arguments') "
+        "returns it; changed prompt_template text without prompt_template_parts is refused (prompt_template_parts_required)."
     ),
     json_schema={
         "type": "object",
