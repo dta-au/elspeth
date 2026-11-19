@@ -2,6 +2,7 @@
 import { create } from "zustand";
 import type { BlobMetadata } from "@/types/api";
 import * as api from "@/api/client";
+import { BlobListTruncatedError } from "@/api/blobListing";
 import type { ApiError } from "@/types/index";
 import { storageQuotaMessage } from "@/utils/bytes";
 
@@ -214,8 +215,14 @@ export const useBlobStore = create<BlobState>((set, get) => ({
         return;
       }
       set({ blobs, isLoading: false });
-    } catch {
+    } catch (err) {
       if (requestSeq !== blobLoadRequestSeq) {
+        return;
+      }
+      if (err instanceof BlobListTruncatedError) {
+        // Past the client's ceiling: show the newest files and say that
+        // older ones are not listed, instead of dropping them silently.
+        set({ blobs: err.blobs, error: err.message, isLoading: false });
         return;
       }
       set({ error: "Failed to load files.", isLoading: false });
