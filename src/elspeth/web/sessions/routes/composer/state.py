@@ -87,7 +87,7 @@ from elspeth.web.sessions.inline_blob_preflight import (
     prepare_session_inline_blob_snapshot,
 )
 from elspeth.web.sessions.operation_receipts import operation_receipt_response_hash
-from elspeth.web.sessions.prompt_file_review import PromptFileReviewStale
+from elspeth.web.sessions.prompt_file_review import PromptFileReviewStale, prompt_file_binding_paths
 from elspeth.web.sessions.protocol import (
     CompositionStateRecord,
     OperationReceiptResult,
@@ -1531,50 +1531,60 @@ async def seed_state_from_runtime_yaml(
                     session_operation_context=lease.context,
                 )
             except PromptFileReviewStale as exc:
-                raise _import_prompt_file_review_refusal(imported_state) from exc
+                raise _import_prompt_file_review_refusal(imported_state, node_id=exc.node_id) from exc
             return _state_response(response_state, policy_catalog=catalog)
     finally:
         await lease.close()
 
 
-IMPORT_BLOB_REFERENCE_MALFORMED = "import_blob_reference_malformed"
+# The validation code for a malformed marker (``<category>_inline_blob_content``), reused: same cause,
+# reported here before anything is saved. ``inline_blob_not_text`` is reused by this route the same way.
+IMPORT_MALFORMED_INLINE_BLOB_CODE = "malformed_inline_blob_content"
 IMPORT_PROMPT_FILE_UNVERIFIED = "import_prompt_file_unverified"
 
 
 _REFUSAL_FIELD_PATH_LIMIT = 5
-_REFUSAL_FIELD_PATH_MAX_CHARS = 120
 _REFUSAL_FIELD_PATH_UNSAFE = re.compile(r"[^A-Za-z0-9_.:-]")
 
 
 def _bounded_field_path_list(field_paths: tuple[str, ...]) -> str:
-    """Render field paths for a refusal message: a fixed number, each of fixed length.
+    """Render field paths for a refusal message: a fixed number of them, each whole.
 
-    At most ``_REFUSAL_FIELD_PATH_LIMIT`` paths are shown, followed by a count
-    of the rest. Each is cut to ``_REFUSAL_FIELD_PATH_MAX_CHARS`` characters
-    (the cut is marked ``...``), and every character outside letters, digits
-    and ``_ . : -`` becomes ``?``, so a name can neither break the sentence
-    nor carry markup, whitespace or control characters into it.
+    At most ``_REFUSAL_FIELD_PATH_LIMIT`` paths are shown, followed by the
+    exact count of the rest; importing again after fixing those shown lists
+    the next ones. A path is never cut, because the user has to find it in
+    their YAML: its length is bounded only by the request that carried it.
+    Every character outside letters, digits and ``_ . : -`` becomes ``?``, so
+    a name can neither break the sentence nor carry markup, whitespace or
+    control characters into it.
     """
-    shown = []
-    for field_path in field_paths[:_REFUSAL_FIELD_PATH_LIMIT]:
-        safe = _REFUSAL_FIELD_PATH_UNSAFE.sub("?", field_path)
-        if len(safe) > _REFUSAL_FIELD_PATH_MAX_CHARS:
-            safe = f"{safe[:_REFUSAL_FIELD_PATH_MAX_CHARS]}..."
-        shown.append(safe)
+    shown = [_REFUSAL_FIELD_PATH_UNSAFE.sub("?", field_path) for field_path in field_paths[:_REFUSAL_FIELD_PATH_LIMIT]]
     rendered = ", ".join(shown)
     remaining = len(field_paths) - len(shown)
     return f"{rendered} and {remaining} more" if remaining else rendered
 
 
-def _import_prompt_file_review_refusal(state: CompositionState) -> HTTPException:
+def _prompt_file_field_paths(state: CompositionState, node_id: str | None) -> tuple[str, ...]:
+    """The file-backed prompt fields of the node the card writer refused, as field paths."""
+    if node_id is None:
+        return ()
+    return tuple(
+        f"node:{node.id}.options.{path}"
+        for node in state.nodes
+        if node.id == node_id
+        for path in prompt_file_binding_paths(deep_thaw(node.options))
+    )
+
+
+def _import_prompt_file_review_refusal(state: CompositionState, *, node_id: str | None) -> HTTPException:
     """Say why an imported prompt file's review card could not be written.
 
     The card writer refuses a file-backed prompt it holds no verified bytes
     for with ``PromptFileReviewStale``, the class an approval uses for "this
     file changed since it was reviewed; review it again". Nothing has been
     reviewed during an import, so that instruction names no step the user can
-    take, and uncaught it was a 500. Both causes are reported under codes of
-    their own, never as ``prompt_file_review_stale``. The whole import rolls
+    take, and uncaught it was a 500. Each cause is reported under a code that
+    names it, never as ``prompt_file_review_stale``. The whole import rolls
     back either way: the state and its review cards commit together.
 
     Malformed reference (400): some ``blob_ref`` mapping in the YAML is not a
@@ -1584,14 +1594,18 @@ def _import_prompt_file_review_refusal(state: CompositionState) -> HTTPException
     the list is bounded by :func:`_bounded_field_path_list`.
 
     Unverified file (409): every marker is well-formed, but a prompt file's
-    stored contents did not match its marker or could not be read back.
+    stored contents did not match its marker or could not be read back. The
+    card writer stops at the first node it cannot verify and names it
+    (``node_id``); that node's file-backed prompt fields are listed. Which of
+    them failed, and whether a later node would also fail, is not known here
+    without reading the files again, and the message says so.
     """
     malformed = malformed_inline_blob_marker_paths(InlinePreflightState.from_composition_state(state))
     if malformed:
         return HTTPException(
             status_code=400,
             detail={
-                "error_code": IMPORT_BLOB_REFERENCE_MALFORMED,
+                "error_code": IMPORT_MALFORMED_INLINE_BLOB_CODE,
                 "message": (
                     "Imported YAML holds a file reference that is not a complete file marker at: "
                     f"{_bounded_field_path_list(malformed)}. "
@@ -1600,16 +1614,18 @@ def _import_prompt_file_review_refusal(state: CompositionState) -> HTTPException
                 ),
             },
         )
+    unverified = _prompt_file_field_paths(state, node_id)
+    where = f" at: {_bounded_field_path_list(unverified)}" if unverified else ""
     return HTTPException(
         status_code=409,
         detail={
             "error_code": IMPORT_PROMPT_FILE_UNVERIFIED,
             "message": (
-                "Imported YAML binds a prompt file that could not be verified against its reference (the file is "
+                f"Imported YAML binds a prompt file that could not be verified against its reference{where} (a file is "
                 "missing, not ready, or its contents differ from the sha256 in the YAML), so its review could not be "
-                "prepared. Nothing was imported. Remove that file reference from the YAML and import again, then "
-                "attach the file to the prompt in this session. An API caller can instead bind the file by id in "
-                "inline_blob_bindings."
+                "prepared. Later steps were not checked. Nothing was imported. Remove that file reference from the "
+                "YAML and import again, then attach the file to the prompt in this session. An API caller can "
+                "instead bind the file by id in inline_blob_bindings."
             ),
         },
     )

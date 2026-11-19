@@ -306,11 +306,10 @@ _EMITTED_POLICY_AND_EXECUTION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "source_inspection_failed",
         "text_source_url_without_web_scrape",
         # Session-route validation (persisted runtime-preflight failure, and
-        # the YAML import's two prompt-file refusals).
+        # the YAML import's refusal of a prompt file it cannot verify).
         # Not tool responses; registered so the census covers
         # the whole web tree without a special case.
         "runtime_preflight_failed",
-        "import_blob_reference_malformed",
         "import_prompt_file_unverified",
     }
 )

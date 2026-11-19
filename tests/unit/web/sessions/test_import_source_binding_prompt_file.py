@@ -35,7 +35,6 @@ from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.models import prompt_file_approvals_table
 from elspeth.web.sessions.prompt_file_review import PROMPT_FILE_CHANGED_MESSAGE, PromptFileReviewStale
 from elspeth.web.sessions.protocol import CompositionStateData
-from elspeth.web.sessions.routes.composer.state import _bounded_field_path_list
 from elspeth.web.sessions.routes.sessions import _rewrite_source_blob_options
 from tests.helpers.prompt_review import accept_body
 from tests.helpers.session_fences import fenced_operation_context
@@ -438,7 +437,7 @@ async def test_import_refuses_an_unmoded_blob_ref_outside_source_options(
     assert _SINK_PLUGIN_MODE in _yaml()
     assert response.status_code == 400, response.text
     detail = response.json()["detail"]
-    assert detail["error_code"] == "import_blob_reference_malformed"
+    assert detail["error_code"] == "malformed_inline_blob_content"
     assert malformed_path in detail["message"]
     assert "source:source.options" not in detail["message"]
     assert PROMPT_FILE_CHANGED_MESSAGE not in detail["message"]
@@ -462,6 +461,9 @@ async def test_import_reports_an_unverifiable_prompt_file_under_its_own_code(tmp
     detail = response.json()["detail"]
     assert detail["error_code"] == "import_prompt_file_unverified"
     assert detail["error_code"] != PromptFileReviewStale.error_code
+    # The refused step's file-backed prompt field is named; the file's id and hash are not.
+    assert f"at: {PROMPT_SLOT} (" in detail["message"]
+    assert str(user.id) not in detail["message"] and "c" * 64 not in detail["message"]
     assert PROMPT_FILE_CHANGED_MESSAGE not in detail["message"]
     assert await env.service.get_current_state(session_id) is None
     assert await env.pending(session_id) == []
@@ -479,11 +481,11 @@ async def test_unverified_import_recovers_by_binding_the_file_in_the_request(tmp
     assert refused.status_code == 409, refused.text
     assert refused.json()["detail"]["error_code"] == "import_prompt_file_unverified"
     assert refused.json()["detail"]["message"] == (
-        "Imported YAML binds a prompt file that could not be verified against its reference (the file is "
+        f"Imported YAML binds a prompt file that could not be verified against its reference at: {PROMPT_SLOT} (a file is "
         "missing, not ready, or its contents differ from the sha256 in the YAML), so its review could not be "
-        "prepared. Nothing was imported. Remove that file reference from the YAML and import again, then "
-        "attach the file to the prompt in this session. An API caller can instead bind the file by id in "
-        "inline_blob_bindings."
+        "prepared. Later steps were not checked. Nothing was imported. Remove that file reference from the "
+        "YAML and import again, then attach the file to the prompt in this session. An API caller can "
+        "instead bind the file by id in inline_blob_bindings."
     )
 
     response = env.import_yaml(
@@ -518,7 +520,7 @@ _HOSTILE_KEY = "sk-live <b>x</b>\tAKIA{}"
         pytest.param("      blob_ref: BLOB\n      path: outputs/x.json\n", "output:main.options", id="plain"),
         pytest.param(
             f"      {_LONG_KEY}:\n        blob_ref: BLOB\n",
-            f"output:main.options.{'k' * 100}...",
+            f"output:main.options.{_LONG_KEY}",
             id="very-long-key",
         ),
         pytest.param(
@@ -529,7 +531,7 @@ _HOSTILE_KEY = "sk-live <b>x</b>\tAKIA{}"
     ],
 )
 async def test_malformed_reference_message_is_pinned_and_bounded(tmp_path: Path, sink_extra: str, shown: str) -> None:
-    """The whole message, byte for byte: the field path is cut and its unsafe characters replaced."""
+    """The whole message, byte for byte: a long field path is shown whole, unsafe characters replaced."""
     env = _Env(tmp_path)
     session_id = await env.session()
     csv = await env.upload(session_id, "reviews.csv", CSV, "text/csv")
@@ -547,21 +549,23 @@ async def test_malformed_reference_message_is_pinned_and_bounded(tmp_path: Path,
 
     assert response.status_code == 400, response.text
     detail = response.json()["detail"]
-    assert detail["error_code"] == "import_blob_reference_malformed"
+    assert detail["error_code"] == "malformed_inline_blob_content"
     assert detail["message"] == _MALFORMED_MESSAGE.format(paths=shown)
-    assert len("output:main.options.") + 100 == 120
     assert str(stray.id) not in detail["message"]
     assert await env.service.get_current_state(session_id) is None
 
 
 def test_malformed_reference_list_shows_five_paths_then_a_count() -> None:
+    # Imported here so this module still collects on a tree without the helper.
+    from elspeth.web.sessions.routes.composer.state import _bounded_field_path_list
+
     paths = tuple(f"node:step_{index}.options.prompt_template" for index in range(8))
 
     assert _bounded_field_path_list(paths) == ", ".join(paths[:5]) + " and 3 more"
     assert _bounded_field_path_list(paths[:5]) == ", ".join(paths[:5])
-    assert _bounded_field_path_list(("a\nb, c<d>", "x" * 121)) == f"a?b??c?d?, {'x' * 120}..."
-    longest = len(_MALFORMED_MESSAGE.format(paths=_bounded_field_path_list(tuple("y" * 5000 for _ in range(50)))))
-    assert longest == len(_MALFORMED_MESSAGE.format(paths="")) + 5 * 123 + 4 * 2 + len(" and 45 more")
+    assert _bounded_field_path_list((*paths[:5], "sixth")) == ", ".join(paths[:5]) + " and 1 more"
+    # A path is never cut (the user has to find it), only made safe to print.
+    assert _bounded_field_path_list(("a\nb, c<d>", "x" * 5000)) == f"a?b??c?d?, {'x' * 5000}"
 
 
 @pytest.mark.asyncio
