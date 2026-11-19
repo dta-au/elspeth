@@ -539,7 +539,6 @@ def _persisted_first_error(tool_name: str, error_code: str) -> dict[str, object]
         ("patch_node_options", "plugin_options_invalid"),
         ("patch_node_options", "prompt_template_parts_required"),
         ("inspect_prompt_targets", "inspect_after_uncheckpointed_mutation"),
-        ("wire_blob_inline_ref", "prompt_template_parts_required"),
         ("wire_blob_inline_ref", "inline_blob_not_text"),
         ("wire_blob_inline_ref", "inline_blob_missing"),
         ("wire_blob_inline_ref", "inline_blob_not_ready"),
