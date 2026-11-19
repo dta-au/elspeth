@@ -937,8 +937,9 @@ promises are `preserves_input_values` (transform) and `observed_value_type`
 ### Convention: repository and process hygiene
 
 - The pre-commit secret scanner rescans every line of a touched file. Append
-  `# secret-scan: allow-this-line` to a false positive; never bypass the hook
-  with `--no-verify`. A failed hook leaves files staged.
+  `# secret-scan: allow-this-line` to a false positive. Bypass hooks with
+  `--no-verify` only with the maintainer's explicit permission for that
+  commit. A failed hook leaves files staged.
 - Worktrees symlink `.venv` to the main checkout. A bare `uv pip install`
   inside one clobbers the main venv, and a bare `python`/`pytest` inside one
   imports the **main** checkout's `elspeth`. Run
