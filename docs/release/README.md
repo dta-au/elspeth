@@ -1,6 +1,6 @@
 # `docs/release/` — Release Histories and Snapshots
 
-**Release metadata reviewed:** 2026-11-17 (0.8.15 unreleased candidate)
+**Release metadata reviewed:** 2026-11-19 (0.8.15)
 **Audience:** Anyone navigating to release-level documentation
 **Register:** Lightly technical / directory-index
 

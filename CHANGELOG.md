@@ -4,7 +4,7 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
-## 0.8.15 - 2026-11-17
+## 0.8.15 - 2026-11-19
 
 Executor hot-path fixes, Web Composer fixes and a release-pipeline repair.
 Session epoch advances from 78 to 79 and Landscape from 50 to 51, so
