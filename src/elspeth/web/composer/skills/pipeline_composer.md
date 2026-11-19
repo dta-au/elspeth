@@ -198,7 +198,7 @@ For ordinary build/edit turns, the action path is:
    duplicate.**
 6. End only in one of the valid terminal states below.
 
-**On a pipeline that already exists, edit with the narrow tools.** `change_substring` for prompt wording; `patch_node_options` for one step's options; `splice_transform` to insert a step between two others; `upsert_node` to add or replace a step or change its `input` (it re-sends that whole step, so it is not the first choice for a wording or option change); `upsert_edge` to route rows to an output; the remove tools to delete. Send a whole `set_pipeline` only to build or rebuild a pipeline, to change one with five or fewer entries in `nodes`, or when no narrow tool can express the change or a step on the way would leave the pipeline invalid: re-sending every step of a larger pipeline is slow, and a call that long may be cut off before it is complete. This is a choice of tool only: still make the whole change the user asked for; where changes need approval, that is one proposal at a time.
+**On a pipeline that already exists, edit with the narrow tools.** `change_substring` for prompt wording; `patch_node_options` for one step's options; `splice_transform` to insert a step between two others; `upsert_node` to add or replace a step or change its `input` (it re-sends that whole step, so it is not the first choice for a wording or option change); `upsert_edge` to route rows to an output; the remove tools to delete. Send a whole `set_pipeline` only to build or rebuild a pipeline, to change one with five or fewer entries in `nodes`, or when no narrow tool can express the change: re-sending every step of a larger pipeline is slow, and a call that long may be cut off before it is complete. This is a choice of tool only: still make the whole change the user asked for; where changes need approval, that is one proposal at a time.
 
 | Edit intent | Use |
 | --- | --- |
@@ -506,11 +506,12 @@ the proposal as validated. Where changes await approval (a result carried
 response; several in one response are refused whole. Where the user's request
 takes several changes, make them one proposal at a time: send the first change
 alone, then tell the user what follows; send each next change after the one
-before it is accepted. Use one `set_pipeline` carrying the whole result only
-when no single change leaves a pipeline that validates. The rule to continue
-from each saved batch within the same request applies only where changes apply
-directly. `create_blob` is not a composition change and is not refused for this
-reason: create a prompt file first, then send the one call.
+before it is accepted. A pipeline between changes does not have to validate: a
+change that leaves errors is still recorded as a proposal, and the errors clear
+with the last change. The rule to continue from each saved batch within the
+same request applies only where changes apply directly. `create_blob` is not a
+composition change and is not refused for this reason: create a prompt file
+first, then send the one call.
 While a proposal is pending, do not stage another: tell the user to accept or
 reject it, and stop.
 `PREVALIDATION_REJECTED`

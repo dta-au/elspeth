@@ -1613,7 +1613,11 @@ class TestSkillFollowsCurrentToolBehaviour:
             "send the first change alone, then tell the user what follows; send each next change after the one before it is accepted"
             in flattened
         )
-        assert "Use one `set_pipeline` carrying the whole result only when no single change leaves a pipeline that validates" in flattened
+        assert (
+            "A pipeline between changes does not have to validate: a change that leaves errors is still recorded as a proposal, "
+            "and the errors clear with the last change" in flattened
+        )
+        assert "Use one `set_pipeline` carrying the whole result" not in flattened
         assert "`approval_batch_not_atomic`" in flattened
         assert "`approval_proposal_pending`" in flattened
         assert "applies only where changes apply directly" in flattened
