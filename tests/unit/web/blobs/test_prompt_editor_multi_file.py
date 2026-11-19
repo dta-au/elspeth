@@ -892,3 +892,42 @@ def test_the_administrator_message_is_given_only_for_a_review_that_really_drifte
     assert refused.json()["detail"]["error_code"] == "prompt_file_stale"
     assert (False in verdicts) is really_drifted
     assert (refused.json()["detail"]["message"] == prompt_text_routes._STALE_REVIEW_DRIFTED) is really_drifted
+
+
+def test_reverting_to_before_the_card_was_approved_leaves_a_card_the_user_can_approve(tmp_path: Path) -> None:
+    """After such a revert the save answers "review pending", and that is true: a card is there to approve.
+
+    The pending card is found the way the session's card list finds it (a
+    pending llm_prompt_template event for the step), approved through the same
+    service call the Approve button reaches, and the save then works.
+    """
+    client, service, blob_service, session_id, file_a, _file_b, event_id = _two_file_node(tmp_path, "roles", approve=False)
+    assert event_id is not None
+    unapproved = _head_id(service, session_id)
+    _approve_card(service, blob_service, session_id, event_id)
+    assert [snapshot.node_id for snapshot in _admit(service, blob_service, session_id)] == ["first"]
+
+    _revert(client, session_id, unapproved)
+
+    refused = _save(client, session_id, file_a["id"], "file A after", file_a["content_hash"])
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["error_code"] == "prompt_file_review_pending"
+    assert _review_state(service, session_id)[0]["first"] == "pending"
+    with blob_service._engine.connect() as conn:
+        pending = conn.execute(
+            select(interpretation_events_table.c.id).where(
+                interpretation_events_table.c.session_id == session_id,
+                interpretation_events_table.c.affected_node_id == "first",
+                interpretation_events_table.c.kind == "llm_prompt_template",
+                interpretation_events_table.c.choice == "pending",
+            )
+        ).all()
+    assert len(pending) == 1
+    # A new card, not the approved one put back.
+    assert UUID(pending[0].id) != event_id
+
+    _approve_card(service, blob_service, session_id, UUID(pending[0].id))
+
+    saved = _save(client, session_id, file_a["id"], "file A after", file_a["content_hash"])
+    assert saved.status_code == 200, saved.text
+    assert [snapshot.node_id for snapshot in _admit(service, blob_service, session_id)] == ["first"]
