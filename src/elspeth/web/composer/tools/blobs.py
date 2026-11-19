@@ -1196,9 +1196,11 @@ def _structured_prompt_template_refusal(
     candidate = patch["prompt_template"]
     if is_widened_blob_ref(deep_thaw(candidate)) is not None:
         return (
-            f"Node '{node_id}' has a structured prompt with interpretation slots. A file cannot replace a structured prompt yet. "
-            "Edit its text parts in place with change_substring or patch_node_options on prompt_template_parts, "
-            "preserving interpretation_ref entries. Switching a structured prompt to a file is not supported in this release."
+            f"Node '{node_id}' has a structured prompt with interpretation slots, and this path cannot put a file on it. "
+            f"To replace the whole prompt with a file, call wire_blob_inline_ref on node:{node_id}.options.prompt_template: "
+            "it removes the structured parts and the old prompt's term reviews, and the file gets its own review card. "
+            "To keep the structured prompt, edit its text parts in place with change_substring or patch_node_options on "
+            "prompt_template_parts, preserving interpretation_ref entries."
         )
     if candidate != current_options.get("prompt_template") and PROMPT_TEMPLATE_PARTS_KEY not in patch:
         return (

@@ -25,6 +25,7 @@ from elspeth.web.composer.state import (
     SourceSpec,
 )
 from elspeth.web.composer.tools import ToolResult, get_tool_definitions
+from elspeth.web.composer.tools import blobs as blob_tools
 from elspeth.web.composer.tools import execute_tool as _execute_tool
 from elspeth.web.composer.tools._common import _SERVER_OWNED_SOURCE_OPTION_KEYS
 from elspeth.web.composer.yaml_generator import generate_pipeline_dict
@@ -345,6 +346,33 @@ def _resolved_rating_slot() -> dict[str, Any]:
     }
 
 
+_STRUCTURED_RATING_PARTS = (
+    {"kind": "text", "text": "Give a "},
+    {"kind": "interpretation_ref", "requirement_id": "req-rating"},
+)
+
+
+def _structured_rating_node(node: NodeSpec) -> NodeSpec:
+    """A coherent accepted structured prompt: the stored text is what the parts compile to."""
+    return replace(
+        node,
+        options={
+            **node.options,
+            "prompt_template": "Give a 1 to 5",
+            "prompt_template_parts": [dict(part) for part in _STRUCTURED_RATING_PARTS],
+            "interpretation_requirements": [_resolved_rating_slot()],
+        },
+    )
+
+
+def _forced_refusal(*_args: object, **_kwargs: object) -> str:
+    return "forced refusal"
+
+
+def _forced_value_error(*_args: object, **_kwargs: object) -> None:
+    raise ValueError("forced refusal")
+
+
 class TestWireBlobInlineRef:
     def test_assistant_created_text_prompt_wiring_opens_review(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="Assistant-authored prompt", llm_authored=True)
@@ -407,24 +435,10 @@ class TestWireBlobInlineRef:
         """Replace means replace: the prior prompt's form never blocks a file binding."""
         blob = _create_blob(blob_env, content="Replacement prompt")
         state = _inline_ref_state()
-        node = state.nodes[0]
-        slot = _resolved_rating_slot()
-        state = replace(
-            state,
-            nodes=(
-                replace(
-                    node,
-                    options={
-                        **node.options,
-                        "prompt_template_parts": [
-                            {"kind": "text", "text": "Give a "},
-                            {"kind": "interpretation_ref", "requirement_id": "req-rating"},
-                        ],
-                        "interpretation_requirements": [slot],
-                    },
-                ),
-            ),
-        )
+        node = _structured_rating_node(state.nodes[0])
+        # A second structured node downstream: the replacement must not touch it.
+        other = replace(node, id="other", input="classified", on_success="rated")
+        state = replace(state, nodes=(node, other))
 
         result = execute_tool(
             "wire_blob_inline_ref",
@@ -453,6 +467,131 @@ class TestWireBlobInlineRef:
         assert not [kind for kind, _component in kinds if kind == "vague_term"]
         # The original state is untouched.
         assert "prompt_template_parts" in state.nodes[0].options
+        # Only the named node is replaced: the other structured prompt keeps its parts and its review.
+        kept = result.updated_state.nodes[1].options
+        assert [dict(part) for part in kept["prompt_template_parts"]] == [dict(part) for part in _STRUCTURED_RATING_PARTS]
+        assert kept["prompt_template"] == "Give a 1 to 5"
+        assert [(row["id"], row["status"]) for row in kept["interpretation_requirements"] if row["kind"] == "vague_term"] == [
+            ("req-rating", "resolved")
+        ]
+        assert list(result.data["superseded_review_ids"]) == ["req-rating"]
+
+    @pytest.mark.parametrize(
+        ("seam", "forced", "error_code"),
+        (
+            ("_llm_authored_prompt_surface_error", _forced_refusal, "llm_authored_inline_blob_content"),
+            ("_file_inject_blob_binding_error", _forced_refusal, "file_inject_content_not_uploaded"),
+            ("_apply_inline_blob_marker", _forced_value_error, "inline_blob_field_path_invalid"),
+            ("_file_inject_wired_marker_error", _forced_refusal, "file_inject_content_not_uploaded"),
+            ("_inline_blob_endpoint_policy_error", _forced_refusal, "aws_s3_endpoint_url_not_allowed"),
+            ("reconcile_authoritative_reviews", _forced_value_error, "review_reconciliation_failed"),
+        ),
+    )
+    def test_a_refusal_after_the_replacement_returns_the_original_state(
+        self,
+        blob_env: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+        seam: str,
+        forced: Any,
+        error_code: str,
+    ) -> None:
+        """The stripped copy is only ever the base of a success; no refusal may hand it back."""
+        blob = _create_blob(blob_env, content="Replacement prompt")
+        state = _inline_ref_state()
+        state = replace(state, nodes=(_structured_rating_node(state.nodes[0]),))
+        monkeypatch.setattr(blob_tools, seam, forced)
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {"field_path": "node:classify.options.prompt_template", "blob_id": blob.data["blob_id"]},
+            state,
+            _catalog(),
+            data_dir=blob_env["data_dir"],
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
+        )
+
+        assert result.success is False
+        assert result.validation.errors[0].error_code == error_code
+        assert result.updated_state is state
+        assert "prompt_template_parts" in result.updated_state.nodes[0].options
+
+    @pytest.mark.parametrize("refused_call", (2, 3))
+    def test_a_canonical_refusal_after_the_replacement_returns_the_original_state(
+        self,
+        blob_env: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+        refused_call: int,
+    ) -> None:
+        """The requirement check runs on the stored, the wired and the reconciled state; the last two follow the replacement."""
+        blob = _create_blob(blob_env, content="Replacement prompt")
+        state = _inline_ref_state()
+        state = replace(state, nodes=(_structured_rating_node(state.nodes[0]),))
+        real_check = blob_tools._composition_canonical_interpretation_requirement_error
+        calls: list[int] = []
+
+        def check(candidate: CompositionState, *, tool_name: str) -> str | None:
+            calls.append(1)
+            if len(calls) == refused_call:
+                return "forced refusal"
+            return real_check(candidate, tool_name=tool_name)
+
+        monkeypatch.setattr(blob_tools, "_composition_canonical_interpretation_requirement_error", check)
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {"field_path": "node:classify.options.prompt_template", "blob_id": blob.data["blob_id"]},
+            state,
+            _catalog(),
+            data_dir=blob_env["data_dir"],
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
+        )
+
+        assert len(calls) == refused_call
+        assert result.success is False
+        assert result.validation.errors[0].error_code == "interpretation_requirements_invalid"
+        assert result.updated_state is state
+        assert "prompt_template_parts" in result.updated_state.nodes[0].options
+
+    def test_a_drifted_review_of_another_kind_still_refuses_the_replacement(self, blob_env: dict[str, Any]) -> None:
+        """Replacing the prompt retires its term reviews only; a drifted model review is still refused."""
+        blob = _create_blob(blob_env, content="Replacement prompt")
+        state = _inline_ref_state()
+        node = _structured_rating_node(state.nodes[0])
+        drifted_model_review = {
+            "id": "llm_model_choice:classify",
+            "kind": "llm_model_choice",
+            "user_term": "llm_model_choice:classify",
+            "draft": "x",
+            "status": "resolved",
+            "event_id": "evt-model",
+            "accepted_value": "some-other-model",
+            "accepted_artifact_hash": None,
+            "resolved_prompt_template_hash": stable_hash("some-other-model"),
+        }
+        requirements = [*node.options["interpretation_requirements"], drifted_model_review]
+        state = replace(state, nodes=(replace(node, options={**node.options, "interpretation_requirements": requirements}),))
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {"field_path": "node:classify.options.prompt_template", "blob_id": blob.data["blob_id"]},
+            state,
+            _catalog(),
+            data_dir=blob_env["data_dir"],
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
+        )
+
+        assert result.success is False
+        assert result.validation.errors[0].error_code == "review_reconciliation_failed"
+        assert result.updated_state is state
 
     def test_replacing_a_prompt_retires_every_vague_term_review_of_the_old_text(self, blob_env: dict[str, Any]) -> None:
         """A pending term no part cites would otherwise block the run with no card to clear it."""
@@ -586,6 +725,7 @@ class TestWireBlobInlineRef:
         assert result.updated_state is state
         assert result.validation.errors[0].error_code == "prompt_template_parts_required"
         assert "interpretation slots" in result.validation.errors[0].message
+        assert "wire_blob_inline_ref on node:classify.options.prompt_template" in result.validation.errors[0].message
 
     @pytest.mark.parametrize(
         ("node_type", "overrides"),

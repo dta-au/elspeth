@@ -777,7 +777,10 @@ file gets its own review card, which supersedes them. Tell the user that the
 earlier term definitions no longer apply. To keep
 a structured prompt and change its wording instead, edit its text parts with
 `change_substring` or `patch_node_options` on `prompt_template_parts`,
-preserving `interpretation_ref` entries. File binding does not support `model` or the whole `queries` value.
+preserving `interpretation_ref` entries. A file marker written straight onto a
+structured prompt by `patch_node_options`, `upsert_node`, `set_pipeline` or
+imported YAML is refused (`prompt_template_parts_required`); use
+`wire_blob_inline_ref` instead. File binding does not support `model` or the whole `queries` value.
 Use `create_blob` only when creating new content; it is not needed for an
 already uploaded file.
 
