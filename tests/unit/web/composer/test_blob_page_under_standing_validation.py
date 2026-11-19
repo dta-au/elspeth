@@ -312,7 +312,8 @@ class TestBlobPageUnderStandingValidation:
         state = _two_llm_nodes_on_one_connection()
         block = len(json.dumps(execute_tool("preview_pipeline", {}, state, _mock_catalog()).to_dict()["validation"]))
         text = "a" * (READ_ATTACHMENT_MAX_UTF8_BYTES - 2_000)
-        assert block > 4_000, block
+        # The premise: carrying the graph's validation block would push this read over the cap.
+        assert len(text) + block > READ_ATTACHMENT_MAX_UTF8_BYTES, block
         blob_id = self._store(text)
 
         result = self._call("read_attachment", {"blob_id": blob_id}, state)
