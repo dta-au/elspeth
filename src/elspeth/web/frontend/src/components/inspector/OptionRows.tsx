@@ -25,7 +25,7 @@ import { CodeBlock } from "@/components/chat/CodeBlock";
 import { BlobFileName } from "@/components/blobs/BlobFileName";
 import { useBlobFilename } from "@/components/blobs/BlobFileName";
 import { Button } from "@/components/ui";
-import { promptFileEditability, promptFileSlots, promptQueryEntries, promptQueryTemplatePath } from "@/lib/blobBindings";
+import { promptFileEditability, promptFileSlots, promptQueryCopyName, promptQueryEntries, promptQueryTemplatePath } from "@/lib/blobBindings";
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
@@ -34,6 +34,7 @@ import { useShowAdvanced } from "@/stores/preferencesStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 
 import { ConfigValue, STRUCTURAL_OPTION_CONTAINER_KEYS } from "./ConfigRows";
+import { PromptCopyButton } from "./PromptCopyButton";
 
 // Wire sentinel for a blob-backed source's `path` knob. The authoring
 // surface commits `blob:<blob_ref>` in place of the absolute storage_path,
@@ -155,9 +156,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function PromptRoleValue({ label, value, notSet }: { label: string; value: unknown; notSet: string }): JSX.Element {
+function PromptRoleValue({ label, value, notSet, copyLabel }: { label: string; value: unknown; notSet: string; copyLabel: string }): JSX.Element {
   if (isUnsuppliedPrompt(value)) return <span className="option-rows-prompt-missing">{notSet}</span>;
-  return <OptionValue label={label} value={value} />;
+  return <><OptionValue label={label} value={value} />{typeof value === "string" && <PromptCopyButton value={value} label={copyLabel} />}</>;
 }
 
 function PromptSlotActions({ value, nodeId, fieldPath, label, showInFiles }: {
@@ -245,9 +246,14 @@ function LlmPromptRoles({ options, slotActions }: { options: Record<string, unkn
   const queries = promptQueryEntries(options.queries);
   // The user prompt a query actually sends: its own template, else the
   // node-level fallback — the same resolution the runtime applies.
-  const queryRows = queries.map(({ selector, name, entry }) => isUnsuppliedPrompt(entry.template)
-    ? { selector, name, value: options.prompt_template, fieldPath: "prompt_template" }
-    : { selector, name, value: entry.template, fieldPath: promptQueryTemplatePath(selector) });
+  // copyName carries the list position, so copy labels stay unique when names repeat.
+  const queryRows = queries.map((query) => {
+    const { selector, name, entry } = query;
+    const copyName = promptQueryCopyName(query);
+    return isUnsuppliedPrompt(entry.template)
+      ? { selector, name, copyName, value: options.prompt_template, fieldPath: "prompt_template" }
+      : { selector, name, copyName, value: entry.template, fieldPath: promptQueryTemplatePath(selector) };
+  });
   // One editor per file-backed slot (promptFileSlots, the editor's and the
   // server's slot authority), mounted in the row that shows that prompt.
   const Editor = slotActions?.Editor;
@@ -270,14 +276,14 @@ function LlmPromptRoles({ options, slotActions }: { options: Record<string, unkn
     <dl className="graph-config-rows option-rows-prompt-roles">
       <div>
         <dt>{systemLabel}</dt>
-        <dd><PromptRoleValue label={systemLabel} value={options.system_prompt} notSet={SYSTEM_PROMPT_NOT_SET} />
+        <dd><PromptRoleValue label={systemLabel} value={options.system_prompt} notSet={SYSTEM_PROMPT_NOT_SET} copyLabel="system prompt" />
           {slotActions && <PromptSlotActions value={options.system_prompt} nodeId={slotActions.nodeId} fieldPath="system_prompt" label={systemLabel} showInFiles={slotActions.showInFiles ?? true} />}
           {editorAt("system_prompt")}</dd>
       </div>
       {queries.length === 0 ? (
         <div>
           <dt>{userLabel}</dt>
-          <dd><PromptRoleValue label={userLabel} value={options.prompt_template} notSet={USER_PROMPT_NOT_SET} />
+          <dd><PromptRoleValue label={userLabel} value={options.prompt_template} notSet={USER_PROMPT_NOT_SET} copyLabel="user prompt template" />
             {slotActions && <PromptSlotActions value={options.prompt_template} nodeId={slotActions.nodeId} fieldPath="prompt_template" label={userLabel} showInFiles={slotActions.showInFiles ?? true} />}
             {editorAt("prompt_template")}</dd>
         </div>
@@ -289,7 +295,8 @@ function LlmPromptRoles({ options, slotActions }: { options: Record<string, unkn
             <dt>{userLabel}</dt>
             <dd>
               <span className="option-rows-query-name">{row.name}</span>
-              <PromptRoleValue label={userLabel} value={row.value} notSet={USER_PROMPT_NOT_SET} />
+              <PromptRoleValue label={userLabel} value={row.value} notSet={USER_PROMPT_NOT_SET}
+                copyLabel={`prompt template for query ${row.copyName}`} />
               {slotActions && <PromptSlotActions value={row.value} nodeId={slotActions.nodeId} fieldPath={row.fieldPath}
                 label={`${userLabel}, query ${row.name}`} showInFiles={slotActions.showInFiles ?? true} />}
               {row.fieldPath !== "prompt_template" || row === sharedHost

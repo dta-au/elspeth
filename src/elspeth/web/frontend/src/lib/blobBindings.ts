@@ -52,6 +52,8 @@ export interface PromptQueryEntry {
   selector: string;
   /** Reader-facing name: the entry's `name` (list form, `#<index>` if unnamed) or the mapping key. */
   name: string;
+  /** One-based list position; absent for mapping entries. */
+  position?: number;
   entry: Record<string, unknown>;
 }
 
@@ -65,13 +67,18 @@ export function promptQueryEntries(queries: unknown): PromptQueryEntry[] {
     typeof value === "object" && value !== null && !Array.isArray(value);
   if (Array.isArray(queries)) {
     return queries.flatMap((entry, index) => isEntry(entry)
-      ? [{ selector: String(index), name: typeof entry.name === "string" && entry.name !== "" ? entry.name : `#${index}`, entry }]
+      ? [{ selector: String(index), name: typeof entry.name === "string" && entry.name !== "" ? entry.name : `#${index}`, position: index + 1, entry }]
       : []);
   }
   if (isEntry(queries)) {
     return Object.entries(queries).flatMap(([key, entry]) => isEntry(entry) ? [{ selector: key, name: key, entry }] : []);
   }
   return [];
+}
+
+/** Every list label includes its position, including when its name is unique. */
+export function promptQueryCopyName(query: PromptQueryEntry): string {
+  return query.position === undefined ? query.name : `${query.name} (position ${query.position})`;
 }
 
 export function promptQueryTemplatePath(selector: string): string {
