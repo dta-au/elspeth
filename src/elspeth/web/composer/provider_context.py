@@ -21,6 +21,7 @@ from elspeth.contracts.composer_provider_context import PrivateProviderContext, 
 from elspeth.contracts.credential_material import find_credential_material, is_secret_field
 from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES, JsonBoundaryError, JsonTraversalBudget
+from elspeth.web.composer.context_budget import CONTEXT_BUDGET_TOOL_RESULT_STUB
 from elspeth.web.composer.diagnostic_evidence import _POLICY, _decode, _DuplicateKeys, _project
 from elspeth.web.composer.protocol import ComposerAdmissionRefused
 from elspeth.web.composer.provider_thinking import native_thinking_blocks
@@ -116,11 +117,17 @@ def _schema(value: JsonValue, *, credential_property: bool = False) -> None:
         _text(value)
 
 
-def _encoded_tool_json(value: JsonValue, *, tool_name: str, budget: JsonTraversalBudget) -> None:
+def _encoded_tool_json(value: JsonValue, *, tool_name: str, budget: JsonTraversalBudget, tool_result: bool = False) -> None:
     if tool_name not in MANIFEST and tool_name != "emit_pipeline_proposal":
         raise _UnavailableContext("unsupported")
     if type(value) is not str:
         raise _UnavailableContext("unsupported")
+    # The context budget replaces a shed tool result with this one constant,
+    # which is server-authored plain text, not JSON. It is admitted by exact
+    # equality, and only as a result: any other non-JSON text, including the
+    # constant with anything added, and the constant as arguments, still fails.
+    if tool_result and value == CONTEXT_BUDGET_TOOL_RESULT_STUB:
+        return
     try:
         decoded = _decode(value)
     except _DuplicateKeys:
@@ -184,7 +191,7 @@ def _check_messages(messages: JsonValue, budget: JsonTraversalBudget) -> None:
             call_id = _text(message["tool_call_id"])
             if call_id not in calls:
                 raise _UnavailableContext("unsupported")
-            _encoded_tool_json(message["content"], tool_name=calls.pop(call_id), budget=budget)
+            _encoded_tool_json(message["content"], tool_name=calls.pop(call_id), budget=budget, tool_result=True)
         elif "content" in message:
             _message_content(message["content"])
         if "tool_calls" in message:
