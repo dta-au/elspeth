@@ -796,9 +796,10 @@ def _litellm_error_detail(
     return detail
 
 
-# DRAFT wording. Shown in place of the general provider-failure guidance.
+# Shown in place of the general provider-failure guidance.
 _SENT_OVER_ESTIMATE_REJECTION_GUIDANCE: Final = (
-    "The model gateway rejected this request. The message was above ELSPETH's size estimate for the model, so its size is a likely cause."
+    "The model gateway rejected this request. It was larger than ELSPETH expected the model to accept, "
+    "so its size is a likely cause; an administrator can check the gateway's reason."
 )
 
 

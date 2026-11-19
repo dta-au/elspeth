@@ -228,6 +228,13 @@ def _provider_count(messages: list[dict[str, Any]], bytes_per_token: int) -> int
     return sum(math.ceil(_wire(message) / bytes_per_token) for message in messages)
 
 
+def _expected_a2_tokens(size: int, anchor_tokens: int, anchor_wire_bytes: int, shared_bytes: int) -> int:
+    rate = 3.0
+    if anchor_tokens <= anchor_wire_bytes <= 8 * anchor_tokens:
+        rate = min(rate, anchor_wire_bytes / anchor_tokens)
+    return min(math.ceil(size / rate), anchor_tokens + size - shared_bytes)
+
+
 def _decide_across_a_stub(case: str, bytes_per_token: int) -> dict[str, int]:
     """Run the real capture, anchor and budget decision for one case; only the tokenizer is a stand-in."""
     anchor_request, candidate, mutable, held, shared_messages = _ACROSS_A_STUB[case]
@@ -249,8 +256,9 @@ def _decide_across_a_stub(case: str, bytes_per_token: int) -> dict[str, int]:
         for index in sorted(mutable)
     ]
     request_bytes = request_wire_bytes(candidate, None)
-    # A ceiling equal to the unshed estimate puts the request over the high mark, so the decision must shed.
-    unshed_estimate = anchor.tokens + request_bytes - anchor.shared_bytes
+    # Price the unshed request under A2 so the high mark forces a shed even when
+    # its all-byte arm is cheaper than the anchored arm.
+    unshed_estimate = _expected_a2_tokens(request_bytes, anchor.tokens, anchor.wire_bytes, anchor.shared_bytes)
     decision = decide_context_budget(
         policy=ContextBudgetPolicy(unshed_estimate, 10_000_000, 0.85, 0.6),
         request_bytes=request_bytes,
@@ -265,9 +273,10 @@ def _decide_across_a_stub(case: str, bytes_per_token: int) -> dict[str, int]:
     )
     shed_ids = {key.removeprefix("tool:") for key in decision.shed_keys}
     sent = [stubbed_tool_message(m) if m["role"] == "tool" and m["tool_call_id"] in shed_ids else m for m in candidate]
-    assert decision.pricing.mode == "anchored"
+    assert decision.pricing.mode == "authored_prefix"
     return {
         "anchor_tokens": anchor.tokens,
+        "anchor_wire_bytes": anchor.wire_bytes,
         "shared_bytes": anchor.shared_bytes,
         "expected_shared_bytes": sum(_wire(message) for message in shared_messages) + len("[]"),
         "stubs_sent": sum(m["role"] == "tool" and m["content"] == CONTEXT_BUDGET_TOOL_RESULT_STUB for m in sent),
@@ -281,13 +290,11 @@ def _decide_across_a_stub(case: str, bytes_per_token: int) -> dict[str, int]:
 @pytest.mark.parametrize("bytes_per_token", [1, 4])
 @pytest.mark.parametrize("case", sorted(_ACROSS_A_STUB))
 def test_the_anchored_estimate_is_never_below_the_provider_count_across_a_stub(case: str, bytes_per_token: int) -> None:
-    """The estimate is the anchor's whole count plus every byte the two requests do not share.
+    """The smaller A2 pricing arm still covers the stand-in provider's count.
 
     A stubbed position is never shared with a request that held the original,
-    and a sheddable position is never shared at all, so the stub's bytes are
-    charged on top of an anchor count that already paid for what sat there.
-    The only credit a stub can earn is as the identical protected message in
-    both requests, once.
+    and a sheddable position is never shared at all. Only the identical
+    protected stub can earn shared-byte credit, once.
     """
     figures = _decide_across_a_stub(case, bytes_per_token)
 
@@ -296,7 +303,9 @@ def test_the_anchored_estimate_is_never_below_the_provider_count_across_a_stub(c
     assert figures["shared_bytes"] == figures["expected_shared_bytes"]
     assert 0 <= figures["shared_bytes"] <= figures["bytes_after"]
     assert figures["bytes_after"] == figures["sent_wire_bytes"]
-    assert figures["estimated_tokens_after"] == figures["anchor_tokens"] + figures["sent_wire_bytes"] - figures["shared_bytes"]
+    assert figures["estimated_tokens_after"] == _expected_a2_tokens(
+        figures["sent_wire_bytes"], figures["anchor_tokens"], figures["anchor_wire_bytes"], figures["shared_bytes"]
+    )
     assert figures["estimated_tokens_after"] >= figures["provider_count_of_sent"]
 
 

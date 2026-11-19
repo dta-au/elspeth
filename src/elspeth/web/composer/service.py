@@ -1783,6 +1783,9 @@ class ComposerServiceImpl:
                 previously_shed=previously_shed_keys(frame.history, recorder.llm_calls),
                 held=held_tool_keys(recorder.llm_calls)
                 | (frame.history.shed_history_after(recorder.llm_calls) if reply_stage else frozenset()),
+                # A message under the byte maximum always goes: the estimate
+                # decides what is left out, the provider judges its own limit.
+                on_over_estimate="send",
             )
         except ContextBudgetRefusal as refusal:
             raise self._context_budget_refusal(
@@ -1799,7 +1802,7 @@ class ComposerServiceImpl:
             ) from refusal
         record = ComposerContextBudgetRecord.from_shed_keys(
             policy_hash=decision.policy_hash,
-            bytes_per_token=(self._context_budget_policy.fallback_bytes_per_token if decision.pricing.mode == "authored_prefix" else 1.0),
+            bytes_per_token=decision.bytes_per_token_used,
             estimated_tokens_before=decision.estimated_tokens_before,
             estimated_tokens_after=decision.estimated_tokens_after,
             # The decision's bound; the caller records the exact size of the request it sends.
@@ -1813,6 +1816,8 @@ class ComposerServiceImpl:
             pricing_mode=decision.pricing.mode,
             authored_bytes=decision.pricing.authored_bytes,
             authored_refuted=decision.pricing.authored_refuted,
+            over_estimate=decision.over_estimate,
+            max_prompt_tokens=self._context_budget_policy.max_prompt_tokens,
             anchor_status=anchor.reason,
             anchor_prompt_tokens=anchor.tokens,
             anchor_wire_bytes=anchor.wire_bytes,
@@ -1821,7 +1826,7 @@ class ComposerServiceImpl:
             decision_wire_bytes_after=decision.request_bytes_after,
         )
         if not shed:
-            return messages, record, 1.0
+            return messages, record, decision.bytes_per_token_used
 
         shed_history_positions = {
             _CONTEXT_BUDGET_HISTORY_START + position
@@ -1851,7 +1856,7 @@ class ComposerServiceImpl:
                 applied.append(stubbed_tool_message(message))
             else:
                 applied.append(message)
-        return applied, record, 1.0
+        return applied, record, decision.bytes_per_token_used
 
     def _context_budget_refusal(
         self,
@@ -1976,6 +1981,9 @@ class ComposerServiceImpl:
             )
         except _BadRequestLLMError as rejection:
             if not is_context_length_rejection(rejection.__cause__):
+                # Not recognised as a size rejection, so not called one. That the
+                # request went out above the estimate is carried for the user.
+                rejection.sent_over_estimate = budget_record.over_estimate is True
                 raise
             # The gateway or the model refused the request as over its context
             # limit. That is reported to the user as the size refusal it is,

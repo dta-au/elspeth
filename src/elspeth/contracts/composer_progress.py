@@ -60,9 +60,10 @@ CONTEXT_BUDGET_REFUSAL_DETAIL: Final[str] = (
 # What the user reads when the model gateway itself rejected a request for
 # exceeding the model's context limit. ELSPETH sent the request because it
 # was under ELSPETH's own maximum; the limit that refused it is the
-# gateway's or the model's. DRAFT wording.
+# gateway's or the model's. What was refused is the whole request (skill,
+# tools, pipeline), not only what the user typed.
 CONTEXT_BUDGET_PROVIDER_REFUSAL_DETAIL: Final[str] = (
-    "The model gateway refused this message as too large for the model. "
+    "The model gateway refused this request as too large for the model. "
     "An administrator can raise the gateway's limit or choose a model with a larger context window."
 )
 

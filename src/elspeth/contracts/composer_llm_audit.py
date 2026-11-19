@@ -196,11 +196,14 @@ class ComposerContextBudgetRecord:
     """The context-budget decision made before one composer model call.
 
     Carries integer counts, the policy hash and the identifiers of what was
-    shed; never any content. ``bytes_per_token`` records the selected pricing
-    arm's byte rate (the policy fallback for authored-prefix pricing, 1.0 for
-    conservative growth). Records written before this change may carry
-    ``"1.0"`` for authored-prefix pricing and remain readable. Anchored
-    pricing uses a measured prompt count plus one token per non-shared byte.
+    shed; never any content. ``bytes_per_token`` records the byte rate the
+    estimate applied: the policy fallback, or the anchor's measured density
+    when that is denser, for the byte arm (``pricing_mode`` ``authored_prefix``,
+    which since policy schema v4 prices every byte, not only an authored
+    prefix); ``"1.0"`` for anchored pricing, which uses a measured prompt count
+    plus one token per non-shared byte. ``conservative`` (one token per byte)
+    is no longer written. Older records carry the older meanings and remain
+    readable; ``policy_hash`` tells the two apart.
     ``request_wire_bytes`` is the size of the request this
     call sent: the canonical JSON of its ``{messages, tools}``, which counts
     content, tool-call arguments, thinking blocks and tool definitions. The
@@ -233,6 +236,13 @@ class ComposerContextBudgetRecord:
     anchor_status: ContextBudgetAnchorStatus | None = None
     authored_bytes: int | None = None
     authored_refuted: bool | None = None
+    # Whether this request was sent although its estimate was above
+    # ``max_prompt_tokens`` (the token setting it was judged against), with
+    # everything that could be left out already left out. ``None`` on a record
+    # written before these fields existed, or by a path that still refuses
+    # over the estimate: absence never means "false".
+    over_estimate: bool | None = None
+    max_prompt_tokens: int | None = None
 
     def __post_init__(self) -> None:
         _require_non_empty_str(self.policy_hash, "policy_hash")
@@ -253,6 +263,14 @@ class ComposerContextBudgetRecord:
             raise ValueError("invalid pricing_mode")
         if self.authored_refuted is not None and type(self.authored_refuted) is not bool:
             raise TypeError("authored_refuted must be bool or None")
+        if self.over_estimate is not None and type(self.over_estimate) is not bool:
+            raise TypeError("over_estimate must be bool or None")
+        if (self.over_estimate is None) != (self.max_prompt_tokens is None):
+            raise ValueError("over_estimate and max_prompt_tokens are recorded together")
+        if self.max_prompt_tokens is not None:
+            _require_component_bytes(self.max_prompt_tokens, "max_prompt_tokens")
+            if self.max_prompt_tokens == 0:
+                raise ValueError("max_prompt_tokens must be positive")
         if self.anchor_status is not None:
             _require_non_empty_str(self.anchor_status, "anchor_status")
             if self.anchor_status not in get_args(ContextBudgetAnchorStatus):
@@ -338,6 +356,9 @@ class ComposerContextBudgetRecord:
             )
         if self.authored_refuted is not None:
             result["authored_refuted"] = self.authored_refuted
+        if self.over_estimate is not None:
+            result["over_estimate"] = self.over_estimate
+            result["max_prompt_tokens"] = self.max_prompt_tokens
         return result
 
 

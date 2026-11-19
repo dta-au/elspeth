@@ -3587,7 +3587,7 @@ def _fit_planner_context_budget(
         ) from refusal
     record = ComposerContextBudgetRecord.from_shed_keys(
         policy_hash=decision.policy_hash,
-        bytes_per_token=(policy.fallback_bytes_per_token if decision.pricing.mode == "authored_prefix" else 1.0),
+        bytes_per_token=decision.bytes_per_token_used,
         estimated_tokens_before=decision.estimated_tokens_before,
         estimated_tokens_after=decision.estimated_tokens_after,
         request_wire_bytes=decision.request_bytes_after,
