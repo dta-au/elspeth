@@ -356,27 +356,17 @@ async def test_combined_shape_through_the_validation_probe(tmp_path: Path) -> No
         assert probed_node["prompt_template"].startswith(_PROBE_PROMPT_FILE_PLACEHOLDER)
         assert "row['review']" in probed_node["prompt_template"]
         assert probed_node["system_prompt"] == "You rate customer product reviews."
-        assert ("approved_prompt_artifact_hash" in probed_node) is approved
+        # Approval stamps the hash on the stored node; the probe drops it once a
+        # file stands at a prompt position, because it holds no file text to check.
+        assert ("approved_prompt_artifact_hash" in node.options) is approved
+        assert "approved_prompt_artifact_hash" not in probed_node
 
         probed_sink = prepare_validation_probe_options(sink.options, plugin=sink.plugin)
         assert probed_sink["schema"] == {"mode": "flexible", "fields": ["review: str", "rating: str"]}
 
-        # Authoring validation of the whole state. BEFORE approval the llm
-        # step's guarantees reach the sink. AFTER approval, on this base
-        # (hotfix/0815-combined @ b29734fb5), the same state is reported
-        # invalid with ``sink_contract_violation`` ("Producer (llm)
-        # guarantees: [(none)]"): the known defect, owned by another session
-        # and independent of the source binding (the rehearsal measured it
-        # with ``mode: bind_source`` too).
-        #
-        # FLIPS WHEN THAT FIX LANDS: the ``approved`` arm below must then
-        # read ``assert codes == []``. It is asserted, not xfailed, so the
-        # merge that fixes it turns this line red and is seen.
-        codes = [entry.error_code for entry in state.validate().errors]
-        if approved:
-            assert codes == ["sink_contract_violation"]
-        else:
-            assert codes == []
+        # Authoring validation of the whole state: the llm step's guarantees
+        # reach the sink before approval and after it.
+        assert [entry.error_code for entry in state.validate().errors] == []
 
 
 @pytest.mark.asyncio
