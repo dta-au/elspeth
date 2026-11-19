@@ -535,7 +535,7 @@ export function AcknowledgementCard({
   const cardLine = !requiresPromptView
     ? presentation.line
     : promptReview.status !== "ready"
-      ? "This step's instruction is waiting for your review."
+      ? "This step's instruction is waiting for your approval."
       : promptIsUserSuppliedFiles
         ? "The instruction for this step comes from a file supplied by a user."
         : presentation.line;

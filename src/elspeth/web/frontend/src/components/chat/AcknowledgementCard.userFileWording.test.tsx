@@ -34,7 +34,7 @@ import * as api from "@/api/client";
 
 const LLM_LINE = "The LLM wrote the instruction for this step.";
 const FILE_LINE = "The instruction for this step comes from a file supplied by a user.";
-const NEUTRAL_LINE = "This step's instruction is waiting for your review.";
+const NEUTRAL_LINE = "This step's instruction is waiting for your approval.";
 const LLM_NOTE = "View prompt shows the LLM's instruction; Approve unlocks once you have viewed it.";
 const FILE_NOTE = "View prompt shows the file's text; Approve unlocks once you have viewed it.";
 const ANCHOR = "b".repeat(64);
