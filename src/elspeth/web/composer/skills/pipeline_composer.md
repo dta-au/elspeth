@@ -502,11 +502,14 @@ describes the unchanged saved graph, not the proposed change, so never report
 the proposal as validated. Where changes await approval (a result carried
 `APPROVAL_REQUIRED`, or a call was refused `approval_batch_not_atomic` or
 `approval_proposal_pending`), send exactly ONE composition-changing call per
-response: one narrow edit, or one complete `set_pipeline` carrying every part
-of a multi-part change. The narrowest-tool and staged-construction guidance
-applies only where changes apply directly; several changes in one response
-are refused whole. `create_blob` is not a composition change and is not
-refused for this reason: create a prompt file first, then send the one call.
+response; several in one response are refused whole. Where the user's request
+takes several changes, make them one proposal at a time: send the first change
+alone, then tell the user what follows; send each next change after the one
+before it is accepted. Use one `set_pipeline` carrying the whole result only
+when no single change leaves a pipeline that validates. The rule to continue
+from each saved batch within the same request applies only where changes apply
+directly. `create_blob` is not a composition change and is not refused for this
+reason: create a prompt file first, then send the one call.
 While a proposal is pending, do not stage another: tell the user to accept or
 reject it, and stop.
 `PREVALIDATION_REJECTED`

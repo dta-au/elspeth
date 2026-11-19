@@ -1604,12 +1604,16 @@ class TestSkillFollowsCurrentToolBehaviour:
     def test_approval_mode_sends_one_composition_change_per_response(self) -> None:
         # tool_batch.py refuses a multi-mutation response whole
         # (approval_batch_not_atomic) and a further mutation while a proposal
-        # is pending (approval_proposal_pending); the narrowest-tool guidance
-        # would otherwise walk the model straight into both.
+        # is pending (approval_proposal_pending); the build-time rule to keep
+        # going after each batch would otherwise walk the model into both.
         flattened = " ".join(SYSTEM_PROMPT.split())
 
         assert "send exactly ONE composition-changing call per response" in flattened
-        assert "one complete `set_pipeline` carrying every part of a multi-part change" in flattened
+        assert (
+            "send the first change alone, then tell the user what follows; send each next change after the one before it is accepted"
+            in flattened
+        )
+        assert "Use one `set_pipeline` carrying the whole result only when no single change leaves a pipeline that validates" in flattened
         assert "`approval_batch_not_atomic`" in flattened
         assert "`approval_proposal_pending`" in flattened
         assert "applies only where changes apply directly" in flattened
