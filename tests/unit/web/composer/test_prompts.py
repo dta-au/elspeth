@@ -676,7 +676,7 @@ class TestBuildSystemPrompt:
         assert "### Complex New Pipeline Batching" in result
         assert "After establishing source facts and loading the selected components' live schemas" in flattened
         assert "Use one complete `set_pipeline` when the requested graph has five nodes or fewer" in flattened
-        assert "Send a whole `set_pipeline` only to build or rebuild a pipeline of five steps or fewer" in flattened
+        assert "Send a whole `set_pipeline` only to build or rebuild a pipeline of five nodes or fewer" in flattened
         assert "For a larger graph or substantial component configuration, use bounded batches" in flattened
         assert "`set_source`, `set_output`, `upsert_node`, `upsert_edge`, and focused option patches" in flattened
         assert "instead of holding the entire build in one large generation" in flattened
