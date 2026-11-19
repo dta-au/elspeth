@@ -480,6 +480,8 @@ and `total_chars`, half-open `[start_char, end_char)` range, `truncated`, and
 `next_offset_chars`, plus blob identity and recorded origin metadata. Each page
 preserves original Unicode code points. The complete serialized JSON tool
 response, including metadata and escaping, is bounded to 4,096 UTF-8 bytes.
+A successful page carries no `validation` block, so the saved pipeline's
+findings never reduce how much content a page holds.
 
 Continue with `offset_chars` set to the returned `next_offset_chars` and
 `expected_content_hash` set to the returned `content_hash`. A changed content
@@ -598,7 +600,7 @@ Always present:
 | Field | Description |
 |-------|-------------|
 | `success` | Whether the tool call succeeded |
-| `validation` | Whole-document validation after this change: `is_valid`, `errors` / `warnings` / `suggestions` (entries with `component`, `message`, `severity`, `error_code`, `rejected_component` when the rejection is about one component (`source` / `source:<name>` / `node:<id>` / `output:<name>`) and absent when it is about the whole candidate, and, when the code carries facts, a `contract`, `row_union_schema`, or `coalesce_union_type` block), `semantic_contracts` (one check per producer, consumer and required field), `graph_repair_suggestions` (a ready `tool_sequence` for a duplicate-consumer repair) |
+| `validation` | Whole-document validation after this change: `is_valid`, `errors` / `warnings` / `suggestions` (entries with `component`, `message`, `severity`, `error_code`, `rejected_component` when the rejection is about one component (`source` / `source:<name>` / `node:<id>` / `output:<name>`) and absent when it is about the whole candidate, and, when the code carries facts, a `contract`, `row_union_schema`, or `coalesce_union_type` block), `semantic_contracts` (one check per producer, consumer and required field), `graph_repair_suggestions` (a ready `tool_sequence` for a duplicate-consumer repair). Absent on a successful `get_blob_content` or `read_attachment`. |
 | `affected_nodes` | Component ids the call touched |
 | `version` | Pipeline state version (increments on each mutation) |
 

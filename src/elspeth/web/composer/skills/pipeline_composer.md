@@ -404,7 +404,9 @@ values or tool arguments.
 Every tool returns one JSON object with the same framing: `success` is the
 outcome; `version` is the state version after the call; `affected_nodes`
 lists the component ids the call touched; `data` is the tool-specific
-payload each tool's own description names. `validation` is always present.
+payload each tool's own description names. `validation` is always present,
+except on a successful `get_blob_content` or `read_attachment`: a file read
+returns the file, not the pipeline's findings.
 <!-- taught:end -->
 
 Use `read_attachment` when you need the complete supplied UTF-8 instructions,

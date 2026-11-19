@@ -106,6 +106,7 @@ from elspeth.web.composer.redaction import (
     GetBlobContentArgumentsModel,
     GetBlobContentDataModel,
     GetBlobContentResponseModel,
+    GetBlobContentValidationModel,
     ReadAttachmentArgumentsModel,
     ReadAttachmentDataModel,
     ReadAttachmentResponseModel,
@@ -227,9 +228,11 @@ def _get_blob_content_response_strategy() -> st.SearchStrategy[GetBlobContentRes
     # Success requires data; failure can omit it. Other envelope fields retain
     # their inferred strategies, including nested sensitive repair arguments.
     data = st.from_type(GetBlobContentDataModel)
+    # A success may go out without validation; a refusal always carries it.
+    validation = st.from_type(GetBlobContentValidationModel)
     return st.one_of(
-        st.builds(GetBlobContentResponseModel, success=st.just(True), data=data),
-        st.builds(GetBlobContentResponseModel, success=st.just(False), data=st.one_of(st.none(), data)),
+        st.builds(GetBlobContentResponseModel, success=st.just(True), data=data, validation=st.one_of(st.none(), validation)),
+        st.builds(GetBlobContentResponseModel, success=st.just(False), data=st.one_of(st.none(), data), validation=validation),
     )
 
 
@@ -301,9 +304,10 @@ def _read_attachment_data_strategy(draw: st.DrawFn) -> ReadAttachmentDataModel:
 
 def _read_attachment_response_strategy() -> st.SearchStrategy[ReadAttachmentResponseModel]:
     data = st.from_type(ReadAttachmentDataModel)
+    validation = st.from_type(GetBlobContentValidationModel)
     return st.one_of(
-        st.builds(ReadAttachmentResponseModel, success=st.just(True), data=data),
-        st.builds(ReadAttachmentResponseModel, success=st.just(False), data=st.one_of(st.none(), data)),
+        st.builds(ReadAttachmentResponseModel, success=st.just(True), data=data, validation=st.one_of(st.none(), validation)),
+        st.builds(ReadAttachmentResponseModel, success=st.just(False), data=st.one_of(st.none(), data), validation=validation),
     )
 
 
