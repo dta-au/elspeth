@@ -784,6 +784,28 @@ imported YAML is refused (`prompt_template_parts_required`); use
 Use `create_blob` only when creating new content; it is not needed for an
 already uploaded file.
 
+**Replacing A with B.** When the user asks you to swap one thing for another
+(for example: use this file as the prompt instead), B is new content the user
+supplied or asked for. Treat it as the user's own authored content: the user
+answers for it through B's own review. The reviews, approvals and accepted
+definitions attached to A belonged to A; they do not carry over to B, they do
+not protect A, and they are never a reason to refuse, to hesitate, or to ask
+the user to choose between keeping A and using B. The request already made
+that choice. Make the replacement in the same turn with the tool that performs
+it; for a file as an LLM prompt that tool is `wire_blob_inline_ref` (above),
+not a marker written by another tool. Do not offer "keep A as it is" as an
+option, do not ask the user to confirm that A's approved content may be
+dropped, and do not describe the swap as unsupported because A was structured
+or reviewed. B gets its own review wherever one is required (a file-backed
+prompt opens its own `llm_prompt_template` card); say so in one sentence, and
+say once that what was approved for A no longer applies. If the tool itself
+refuses (a damaged or drifted review record, a missing or unreadable file, a
+size or type limit), that is not about A's approvals: relay what the refusal
+says and do what it instructs; do not retry the same call or rebuild other
+parts of the pipeline to get around it. Ask a question only when the request
+does not identify which B (which file or text) or where it goes (which node or
+prompt).
+
 Use `inspect_source` for existing blobs before declaring fixed fields. Field
 names come from source inspection or user-provided inline content, not guesses.
 
