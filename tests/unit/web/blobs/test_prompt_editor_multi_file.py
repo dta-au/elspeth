@@ -716,3 +716,179 @@ def test_out_of_date_approval_recovery_attaching_a_newly_uploaded_copy_works(tmp
     saved = _save(client, session_id, copy["id"], "file A after", copy["content_hash"])
     assert saved.status_code == 200, saved.text
     assert [snapshot.node_id for snapshot in _admit(service, blob_service, session_id)] == ["first"]
+
+
+# --- What a carried approval row means, and how to tell it from a reviewed one ---
+
+
+@pytest.mark.parametrize("shape", _SHAPES)
+def test_a_save_writes_one_reviewed_row_and_carries_every_other_row_unchanged(tmp_path: Path, shape: str) -> None:
+    """The rule a reader of the audit rows applies to one save.
+
+    All rows of one editor save share one approved_at. The row for the saved
+    file is the review: the user saw and saved those bytes. Every other row
+    is a carry: it repeats, byte for byte, the approval that slot already
+    held, under the new anchor, and records no new review. A carried row has
+    no event_id of its own; the approval it carries is the slot's previous
+    latest row, which is where the card's event_id is found.
+    """
+    client, service, blob_service, session_id, file_a, file_b, event_id = _two_file_node(tmp_path, shape)
+    path_a, path_b = _paths(shape)
+    card_rows = {row.field_path: row for row in _approval_rows(blob_service, session_id)}
+    prior = _admit(service, blob_service, session_id)[0]
+    assert {(row.trigger, row.event_id, row.review_anchor) for row in card_rows.values()} == {("card", str(event_id), prior.anchor)}
+
+    assert _save(client, session_id, file_a["id"], "file A after", file_a["content_hash"], field_path=path_a).status_code == 200
+
+    first_rows = [row for row in _approval_rows(blob_service, session_id) if row.id not in {row.id for row in card_rows.values()}]
+    assert len({row.approved_at for row in first_rows}) == 1
+    assert {row.trigger for row in first_rows} == {"editor_save"}
+    reviewed = [row for row in first_rows if row.blob_id == file_a["id"]]
+    carried = [row for row in first_rows if row.blob_id != file_a["id"]]
+    assert [(row.field_path, row.content_sha256) for row in reviewed] == [(path_a, content_hash(b"file A after"))]
+    assert [row.field_path for row in carried] == [path_b]
+    assert (carried[0].blob_id, carried[0].content_sha256) == (card_rows[path_b].blob_id, card_rows[path_b].content_sha256)
+    assert carried[0].content_sha256 == file_b["content_hash"]
+    # The carried row points at nothing itself; the row it carries holds the card.
+    assert [row.event_id for row in first_rows] == [None, None]
+    assert card_rows[path_b].event_id == str(event_id)
+    assert carried[0].review_anchor == reviewed[0].review_anchor != prior.anchor
+
+    # A second save, of the other file: now A's row is the carry, and it repeats the first save's review of A.
+    assert _save(client, session_id, file_b["id"], "file B after", file_b["content_hash"], field_path=path_b).status_code == 200
+
+    seen = {row.id for row in card_rows.values()} | {row.id for row in first_rows}
+    second_rows = [row for row in _approval_rows(blob_service, session_id) if row.id not in seen]
+    assert len({row.approved_at for row in second_rows}) == 1
+    assert second_rows[0].approved_at > first_rows[0].approved_at
+    reviewed_b = [row for row in second_rows if row.blob_id == file_b["id"]]
+    carried_a = [row for row in second_rows if row.blob_id != file_b["id"]]
+    assert [(row.field_path, row.content_sha256) for row in reviewed_b] == [(path_b, content_hash(b"file B after"))]
+    assert [(row.field_path, row.blob_id, row.content_sha256) for row in carried_a] == [
+        (reviewed[0].field_path, reviewed[0].blob_id, reviewed[0].content_sha256)
+    ]
+
+
+# --- One file on two prompt slots of one step ---
+
+
+@pytest.mark.parametrize("card_pending", [True, False])
+def test_one_file_on_two_slots_of_one_step_is_refused_as_shared_before_any_card_check(tmp_path: Path, card_pending: bool) -> None:
+    """The shared-file refusal is decided before the pending card is looked at.
+
+    So a save of such a file never reaches the pending-card rule, which would
+    describe the file's own second slot as another prompt file.
+    """
+    client, service, blob_service, session_id, file_a, _file_b, _event = _two_file_node(tmp_path, "roles", approve=not card_pending)
+    head = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert head is not None
+    same_file_twice = state_from_record(head).to_dict()
+    same_file_twice["nodes"][0]["options"]["system_prompt"] = _marker(file_a)
+    _save_editor_state(service, blob_service, session_id, same_file_twice)
+    with blob_service._engine.connect() as conn:
+        pending = conn.execute(
+            select(interpretation_events_table.c.id).where(
+                interpretation_events_table.c.session_id == session_id,
+                interpretation_events_table.c.kind == "llm_prompt_template",
+                interpretation_events_table.c.choice == "pending",
+            )
+        ).all()
+    assert bool(pending) is card_pending
+    before = _save_side_effects(service, blob_service, session_id, file_a["id"])
+
+    for slot in ("prompt_template", "system_prompt"):
+        refused = _save(client, session_id, file_a["id"], "file A after", file_a["content_hash"], field_path=slot)
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["detail"]["error_code"] == "prompt_file_shared_binding"
+
+    assert _content(client, session_id, file_a) == _A_BEFORE
+    assert _save_side_effects(service, blob_service, session_id, file_a["id"]) == before
+
+
+def test_pending_card_over_another_file_and_inline_text_reports_the_other_file(tmp_path: Path) -> None:
+    """A card covering both another file and inline text is reported as the other-file refusal."""
+    client, service, blob_service, session_id, file_a, _file_b, _event = _two_file_node(tmp_path, "queries_mapping", approve=False)
+    head = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert head is not None
+    with_inline = state_from_record(head).to_dict()
+    with_inline["nodes"][0]["options"]["system_prompt"] = "You are helpful."
+    _save_editor_state(service, blob_service, session_id, with_inline)
+
+    refused = _save(client, session_id, file_a["id"], "file A after", file_a["content_hash"], field_path="queries.a.template")
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"] == {
+        "error_code": "prompt_file_review_pending",
+        "message": "Complete the existing node review before editing its files.",
+    }
+    assert _content(client, session_id, file_a) == _A_BEFORE
+
+
+# --- The "needs an administrator" message is for real drift only ---
+
+
+def _scenario_sibling_added_without_review(tmp_path: Path) -> Any:
+    client, service, blob_service, session_id, file_a, _second, events = _live_prompt_setup(tmp_path)
+    _approve_card(service, blob_service, session_id, events["first"])
+    file_b = _upload_blob(client, session_id, _B_BEFORE, "b.txt", "text/plain")
+    approved = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert approved is not None
+    two_files = state_from_record(approved).to_dict()
+    two_files["nodes"][0]["options"]["system_prompt"] = _marker(file_b)
+    _save_editor_state(service, blob_service, session_id, two_files)
+    return _save(client, session_id, file_a["id"], "file A after", file_a["content_hash"])
+
+
+def _scenario_reverted_behind_a_later_approval(tmp_path: Path) -> Any:
+    client, _service, _blob_service, session_id, file_a, _later = _reverted_behind_a_later_approval(tmp_path)
+    return _save(client, session_id, file_a["id"], "file A after", file_a["content_hash"])
+
+
+def _scenario_reverted_past_an_editor_save(tmp_path: Path) -> Any:
+    client, service, _blob_service, session_id, file_a, _file_b, _event = _two_file_node(tmp_path, "roles")
+    before_save = _head_id(service, session_id)
+    first_save = _save(client, session_id, file_a["id"], "file A after", file_a["content_hash"])
+    assert first_save.status_code == 200, first_save.text
+    _revert(client, session_id, before_save)
+    return _save(client, session_id, file_a["id"], "file A again", first_save.json()["content_sha256"])
+
+
+def _scenario_never_approved(tmp_path: Path) -> Any:
+    client, _service, _blob_service, session_id, file_a, _file_b = _unreviewed_two_file_node(tmp_path)
+    return _save(client, session_id, file_a["id"], "file A after", file_a["content_hash"])
+
+
+@pytest.mark.parametrize(
+    ("scenario", "really_drifted"),
+    [
+        (_scenario_sibling_added_without_review, True),
+        (_scenario_reverted_behind_a_later_approval, False),
+        (_scenario_reverted_past_an_editor_save, False),
+        (_scenario_never_approved, False),
+    ],
+)
+def test_the_administrator_message_is_given_only_for_a_review_that_really_drifted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: Any, really_drifted: bool
+) -> None:
+    """Reverting to an earlier version is an ordinary user action and has a user recovery.
+
+    Every verdict the save route asks for on whether the step's resolved
+    review still matches its prompt is recorded. The administrator message
+    appears when, and only when, one of those verdicts says it does not.
+    """
+    verdicts: list[bool] = []
+    real = prompt_text_routes.resolved_prompt_review_matches_anchor
+
+    def recording(state: Any, *, affected_node_id: str) -> bool:
+        verdict = real(state, affected_node_id=affected_node_id)
+        verdicts.append(verdict)
+        return verdict
+
+    monkeypatch.setattr(prompt_text_routes, "resolved_prompt_review_matches_anchor", recording)
+
+    refused = scenario(tmp_path)
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["error_code"] == "prompt_file_stale"
+    assert (False in verdicts) is really_drifted
+    assert (refused.json()["detail"]["message"] == prompt_text_routes._STALE_REVIEW_DRIFTED) is really_drifted
