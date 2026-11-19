@@ -202,7 +202,10 @@ def test_step_resent_with_a_server_rendering_and_no_rows_keeps_rows_definitions_
     options = deep_thaw(result.updated_state.nodes[0].options)
     assert next(row for row in options["interpretation_requirements"] if row["id"] == "category") == amended
     assert options == stored
-    assert result.data is None or "superseded_review_ids" not in result.data
+    assert result.data is not None and "superseded_review_ids" not in result.data
+    # The result names the step and carries its sentence exactly as when the rows are sent.
+    assert list(result.data["prompt_unchanged_node_ids"]) == ["code_themes"]
+    assert type(result.data["prompt_unchanged_note"]) is str
 
 
 def _two_structured_steps() -> CompositionState:
