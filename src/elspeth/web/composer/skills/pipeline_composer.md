@@ -203,6 +203,7 @@ For ordinary build/edit turns, the action path is:
 | Create a new pipeline or perform an intentional full rebuild | `set_pipeline`, or bounded construction batches as described below |
 | Perform a one-transform insertion between existing nodes on a direct linear path | `splice_transform`, only when the saved `edges` list holds an `on_success` edge joining those two nodes; it refuses a pipeline whose `edges` is empty, so there use `upsert_node` for the new node and re-point the successor's `input` |
 | Make an option-only edit to an existing node | `patch_node_options` |
+| Replace an LLM node's whole prompt with new text | `patch_node_options` with `prompt_template` and `prompt_template_parts: null` |
 | Change a small exact span of an existing LLM prompt | `inspect_prompt_targets`, then `change_substring` |
 | Add or rewire a node in an existing pipeline, when neither narrower row above fits | `upsert_node` / `upsert_edge` |
 
@@ -783,6 +784,14 @@ preserving `interpretation_ref` entries. A file marker written straight onto a
 structured prompt by `patch_node_options`, `upsert_node`, `set_pipeline` or
 imported YAML is refused (`prompt_template_parts_required`); use
 `wire_blob_inline_ref` instead. File binding does not support `model` or the whole `queries` value.
+To replace a structured prompt with new TEXT rather than a file, send
+`prompt_template` (the new text) together with `prompt_template_parts: null`
+through `patch_node_options`, or in the node's options through `upsert_node` or
+`set_pipeline`: the same removal applies, the result names the removed reviews
+in `superseded_review_ids`, and the new text gets its own `llm_prompt_template`
+card. Do not resend the old prompt's vague-term rows. A changed
+`prompt_template` on a structured prompt without `prompt_template_parts: null`
+is refused (`prompt_template_parts_required`).
 Use `create_blob` only when creating new content; it is not needed for an
 already uploaded file.
 
