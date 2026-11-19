@@ -17,6 +17,7 @@ from typing import Final, Literal
 from elspeth.contracts.composer_llm_audit import ContextBudgetAnchorStatus
 from elspeth.contracts.prompt_guard import PROMPT_GUARD_TRUST_KEY, PromptGuardTrust, detach_prompt_guard_evidence
 from elspeth.core.canonical import canonical_json, stable_hash
+from elspeth.web.composer.invariants import InvariantError
 
 CONTEXT_BUDGET_FALLBACK_BYTES_PER_TOKEN: Final[float] = 3.0
 # Every size in this module is WIRE bytes: the canonical JSON of the request
@@ -98,7 +99,9 @@ class ContextBudgetPolicy:
     def audit_hash(self) -> str:
         return stable_hash(
             {
-                "schema": "composer.context-budget.v2",
+                # v3: the token estimate no longer refuses for a caller that sends over it
+                # (``on_over_estimate="send"``); a record's ``over_estimate`` says which happened.
+                "schema": "composer.context-budget.v3",
                 "max_prompt_tokens": self.max_prompt_tokens,
                 "max_request_bytes": self.max_request_bytes,
                 "shed_above": repr(self.shed_above),
@@ -148,6 +151,11 @@ class ContextBudgetDecision:
     estimated_tokens_after: int
     shed_keys: tuple[str, ...]
     pricing: ContextBudgetPricing
+    # True only for a caller that sends over the estimate: every segment is
+    # shed, the estimate of what remains is still above ``max_prompt_tokens``,
+    # and the request is under the byte maximum, so it goes. A caller that
+    # refuses instead never sees True; that path raises.
+    over_estimate: bool = False
 
 
 class ContextBudgetRefusal(Exception):
@@ -183,8 +191,17 @@ def decide_context_budget(
     anchor_authored_bytes: int | None = None,
     anchor_status: ContextBudgetAnchorStatus = "no_previous_call",
     authored_bytes: int = 0,
+    on_over_estimate: Literal["refuse", "send"] = "refuse",
 ) -> ContextBudgetDecision:
     """Decide which segments to shed from one request, or refuse.
+
+    The byte maximum is the only limit that stops a request for a caller that
+    passes ``on_over_estimate="send"``: the token estimate decides what to
+    leave out, never whether the request goes. When protected content alone
+    is estimated above ``max_prompt_tokens``, every segment is shed and the
+    decision is returned with ``over_estimate=True``; the provider is the
+    judge of its own limit. The default, ``"refuse"``, raises the tokens
+    refusal there instead.
 
     ``previously_shed`` are keys an earlier call shed; they follow the release
     rule below. ``held`` are keys that must stay shed whatever the size: a
@@ -306,10 +323,14 @@ def decide_context_budget(
 
     bytes_after = request_bytes - sum(segment.saving_bytes for segment in shed)
     tokens_after = tokens(bytes_after)
-    if tokens_after > policy.max_prompt_tokens:
+    over_estimate = tokens_after > policy.max_prompt_tokens
+    if over_estimate and on_over_estimate == "refuse":
         raise ContextBudgetRefusal(ceiling="tokens", estimated_tokens=tokens_after, request_bytes=bytes_after, pricing=pricing(bytes_after))
     if bytes_after > policy.max_request_bytes:
         raise ContextBudgetRefusal(ceiling="bytes", estimated_tokens=tokens_after, request_bytes=bytes_after, pricing=pricing(bytes_after))
+    if over_estimate and len(shed) != len(segments):
+        # Sending over the estimate is honest only when nothing more could have been left out.
+        raise InvariantError("context budget would send over its estimate with a segment still unshed")
 
     return ContextBudgetDecision(
         policy_hash=policy.audit_hash,
@@ -319,4 +340,5 @@ def decide_context_budget(
         estimated_tokens_after=tokens_after,
         shed_keys=tuple(segment.key for segment in shed),
         pricing=pricing(bytes_after),
+        over_estimate=over_estimate,
     )
