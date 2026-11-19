@@ -12,7 +12,7 @@ fact, the receipt records a sanitized projection of it.
 > **Status.** The implemented ACA slice received desktop acceptance:
 > `elspeth-5ec3befc1a` closed on 2026-09-10 by operator ruling. No live cloud
 > acceptance is claimed. This executable procedure can produce a future receipt
-> at `docs/operator/evidence/azure-container-apps/0.8.15.json` for the unreleased candidate. Steps marked
+> at `docs/operator/evidence/azure-container-apps/0.8.15.json` for this release. Steps marked
 > **LIVE** require measurements from that operator run. Neither a live run nor
 > a receipt is an outstanding closure condition. See
 > [Deployment Platforms](../reference/deployment-platforms.md) for support scope.
