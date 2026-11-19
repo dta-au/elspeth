@@ -474,8 +474,9 @@ validation for other placement constraints.
 
 <!-- taught:begin validation * validation.is_valid; validation * validation.errors; validation * validation.warnings; validation * validation.suggestions; validation * validation.errors[].*; validation * validation.warnings[].*; validation * validation.suggestions[].*; delta * validation_delta.new_errors[].*; delta * validation_delta.resolved_errors[].*; delta * validation_delta.new_warnings[].*; delta * validation_delta.resolved_warnings[].* -->
 The whole-document validation check after the call carries `is_valid`, and `errors` /
-`warnings` / `suggestions` entries, each with `component`, `message`,
-`severity`, and a closed `error_code`; when the code carries facts they ride
+`warnings` / `suggestions` entries, each with `component`, `message` and
+`severity`. `error_code` is optional and closed: most errors carry one, most
+warnings do not, and suggestions never do; when the code carries facts they ride
 as a `contract`, `row_union_schema`, or `coalesce_union_type` block. An
 entry whose `component` is the literal `rejected_mutation` is a rejection of
 the call itself — nothing was applied. A `set_pipeline` rejection names the
