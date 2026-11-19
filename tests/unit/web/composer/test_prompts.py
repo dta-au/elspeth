@@ -675,7 +675,7 @@ class TestBuildSystemPrompt:
 
         assert "### Complex New Pipeline Batching" in result
         assert "After establishing source facts and loading the selected components' live schemas" in flattened
-        assert "Use one complete `set_pipeline` when the requested graph fits a concise call" in flattened
+        assert "Use one complete `set_pipeline` when the requested graph has five nodes or fewer" in flattened
         assert "For a larger graph or substantial component configuration, use bounded batches" in flattened
         assert "`set_source`, `set_output`, `upsert_node`, `upsert_edge`, and focused option patches" in flattened
         assert "instead of holding the entire build in one large generation" in flattened
@@ -1647,10 +1647,12 @@ class TestSkillFollowsCurrentToolBehaviour:
         assert "saying the pipeline is unchanged and no proposal was submitted" in flattened
         assert "The pipeline is unchanged; no proposal was submitted for approval." in Path(tool_batch.__file__).read_text()
 
-    def test_edit_table_does_not_send_an_edgeless_pipeline_to_splice(self) -> None:
+    def test_edit_table_sends_an_edgeless_pipeline_to_splice(self) -> None:
         flattened = " ".join(SYSTEM_PROMPT.split())
 
-        assert "it refuses a pipeline whose `edges` is empty" in flattened
+        assert "it refuses a pipeline whose `edges` is empty" not in flattened
+        assert "only when the saved `edges` list holds" not in flattened
+        assert "`splice_transform`: one call, with or without `edges`" in flattened
         assert "use `upsert_node` for the new node and re-point the successor's `input`" in flattened
 
     def test_preview_and_diff_limits_are_stated(self) -> None:

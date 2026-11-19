@@ -859,12 +859,12 @@ class TestStep3MutationTierMigration:
         assert "Preserve existing components when extending a saved draft" in skill
         assert "use a full replacement only when you can supply the exact current bindings and the requested complete state" in skill
         assert "Make an option-only edit to an existing node | `patch_node_options`" in skill
-        assert "Add or rewire a node in an existing pipeline, when neither narrower row above fits | `upsert_node` / `upsert_edge`" in skill
+        assert "Add or rewire a node in an existing pipeline, when no narrower row above fits | `upsert_node` / `upsert_edge`" in skill
         assert (
             "Follow focused repair diagnostics without discarding already verified components or narrowing the requested final topology"
             in skill
         )
-        assert "For edits to an existing pipeline, continue to choose the narrowest supported tool" in skill
+        assert "On a pipeline that already exists, edit with the narrow tools" in skill
 
     def test_upsert_node_required(self) -> None:
         defn = self._get("upsert_node")

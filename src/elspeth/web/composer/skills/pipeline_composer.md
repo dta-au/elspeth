@@ -198,13 +198,15 @@ For ordinary build/edit turns, the action path is:
    duplicate.**
 6. End only in one of the valid terminal states below.
 
+**On a pipeline that already exists, edit with the narrow tools.** `change_substring` for prompt wording; `patch_node_options` for one step's options; `splice_transform` to insert a step between two others; `upsert_node` to add or replace a step or change its `input` (it re-sends that whole step, so it is not the first choice for a wording or option change); `upsert_edge` to route rows to an output; the remove tools to delete. Send a whole `set_pipeline` only to build or rebuild a pipeline, to change one with five or fewer entries in `nodes`, or when no narrow tool can express the change or a step on the way would leave the pipeline invalid: re-sending every step of a larger pipeline is slow, and a call that long may be cut off before it is complete. This is a choice of tool only: still make the whole change the user asked for; where changes need approval, that is one proposal at a time.
+
 | Edit intent | Use |
 | --- | --- |
 | Create a new pipeline or perform an intentional full rebuild | `set_pipeline`, or bounded construction batches as described below |
-| Perform a one-transform insertion between existing nodes on a direct linear path | `splice_transform`, only when the saved `edges` list holds an `on_success` edge joining those two nodes; it refuses a pipeline whose `edges` is empty, so there use `upsert_node` for the new node and re-point the successor's `input` |
+| Perform a one-transform insertion between existing nodes on a direct linear path | `splice_transform`: one call, with or without `edges`; the server re-points the successor's `input`. If it is refused, use `upsert_node` for the new node and re-point the successor's `input`, also with `upsert_node` |
 | Make an option-only edit to an existing node | `patch_node_options` |
 | Change a small exact span of an existing LLM prompt | `inspect_prompt_targets`, then `change_substring` |
-| Add or rewire a node in an existing pipeline, when neither narrower row above fits | `upsert_node` / `upsert_edge` |
+| Add or rewire a node in an existing pipeline, when no narrower row above fits | `upsert_node` / `upsert_edge` |
 
 For a small edit to an existing prompt, call `inspect_prompt_targets` for the node and use its state ID and SHA-256 with `change_substring`; do not resend the whole prompt through `patch_node_options` to change part of it. Send the smallest `old` substring that matches exactly once; use `replace_all` only when every occurrence should change. After a successful edit, call `inspect_prompt_targets` in a later tool batch to obtain the committed revision ID. If the tool returns `target_changed`, inspect again before retrying. A changed prompt needs fresh review.
 
@@ -212,13 +214,19 @@ The inspection result's `state_id` identifies the revision. Each entry in `targe
 
 The narrower tools also support staged construction of a new pipeline. Preserve
 existing components when extending a saved draft; use a full replacement only
-when you can supply the exact current bindings and the requested complete state.
+when you can supply the exact current bindings and the requested complete state,
+and only in the cases named above the edit table. When a call has to re-send a
+step the pipeline already holds and its prompt is inline or structured, send
+that step whole and unedited as `get_pipeline_state` with
+`component="set_pipeline_arguments"` returns it. Its text reads
+`pending interpretation` where the user's definitions go; the saved definitions
+are kept.
 
 ### Complex New Pipeline Batching
 
 After establishing source facts and loading the selected components' live
 schemas, choose construction batches that you can return and verify promptly.
-Use one complete `set_pipeline` when the requested graph fits a concise call.
+Use one complete `set_pipeline` when the requested graph has five nodes or fewer.
 For a larger graph or substantial component configuration, use bounded batches
 of `set_source`, `set_output`, `upsert_node`, `upsert_edge`, and focused option
 patches instead of holding the entire build in one large generation. Honor the
@@ -237,8 +245,7 @@ blocker prevents the next supported action, use the offered advisor tool's
 the build on that basis.
 
 Follow focused repair diagnostics without discarding already verified components
-or narrowing the requested final topology. For edits to an existing pipeline,
-continue to choose the narrowest supported tool from the table above.
+or narrowing the requested final topology.
 
 Examples of complete workflow scope, whether built atomically or in batches:
 
