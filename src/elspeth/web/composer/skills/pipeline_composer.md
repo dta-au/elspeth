@@ -792,8 +792,12 @@ reviews in `superseded_review_ids` (tell the user those definitions no longer
 apply), and the new text gets its own `llm_prompt_template` card, which the
 server raises. Leave `interpretation_requirements` out of that patch; sent as
 `null` it is refused.
-A changed `prompt_template` on a structured prompt without
-`prompt_template_parts: null` is refused (`prompt_template_parts_required`).
+On a structured prompt, a changed `prompt_template` sent without
+`prompt_template_parts` is refused by all three tools
+(`prompt_template_parts_required`). If you were not replacing that node's
+prompt, do not add the `null`: to reword it, edit its parts with
+`change_substring`; to re-send it, send the node whole and unedited as
+`get_pipeline_state` with `component="set_pipeline_arguments"` returns it.
 Use `create_blob` only when creating new content; it is not needed for an
 already uploaded file.
 

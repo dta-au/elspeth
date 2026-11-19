@@ -2542,9 +2542,10 @@ _PATCH_NODE_OPTIONS_DECLARATION = ToolDeclaration(
                     "Node-level routing fields such as on_success, on_error, input, routes, "
                     "and fork_to are siblings of options; edit them with upsert_edge or upsert_node. "
                     "For a gate, edit on_error only with upsert_node. "
-                    "If prompt_template_parts exists, edit that structure while preserving interpretation_ref entries; "
-                    "do not change only the compiled prompt_template. "
-                    "To replace the whole prompt with new text instead, send prompt_template with prompt_template_parts: null. "
+                    "If prompt_template_parts exists, edit that structure, preserving interpretation_ref entries, to change the prompt's wording; "
+                    "a changed prompt_template sent without prompt_template_parts is refused. "
+                    "To REPLACE the whole prompt with new text, send prompt_template with prompt_template_parts: null; "
+                    "that removes the old prompt's term reviews. "
                     "A patched schema declares arriving types for consumed fields and output types for created fields. "
                     "To convert an arriving value, change the source contract (patch_source_options) or insert a type_coerce upstream; a declaration does not convert."
                     + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE
