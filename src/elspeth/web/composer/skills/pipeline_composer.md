@@ -611,7 +611,10 @@ A successful incremental mutation carries `applied_component` (`source`,
 (`new_errors`, `resolved_errors`, `new_warnings`, `resolved_warnings`, each a
 list of the entries described above); read the delta to choose the next
 repair and never re-read state to confirm the echo. `post_call_hints` are
-advisory next-step notes from the plugin or the server.
+advisory next-step notes from the plugin or the server. Two entries are not
+advice and are recognised by their wording: one that starts `Incomplete list:`
+means the list you just received is partial, and one that says the pipeline is
+unchanged means the call was a no-op.
 <!-- taught:end -->
 
 <!-- taught:begin tool-data patch_node_options data.server_owned_metadata_note; tool-data patch_source_options data.server_owned_metadata_note; tool-data set_pipeline data.server_owned_metadata_note; tool-data set_source data.server_owned_metadata_note; tool-data set_source_from_blob data.server_owned_metadata_note; tool-data set_source_from_blobs data.server_owned_metadata_note; tool-data upsert_node data.server_owned_metadata_note -->
@@ -761,7 +764,12 @@ artifact yourself in the same turn, then retry the complete workflow.
 If the user says they uploaded, attached, provided, or already have a file in
 the session, discover its role before the first binding mutation. Call
 `list_blobs` or `list_composer_blobs` and choose a ready blob when there is
-exactly one obvious match. If multiple ready blobs could match, ask one narrow
+exactly one obvious match. Each list shows at most the 50 newest files. When a
+`post_call_hints` entry starting `Incomplete list:` says older files are not
+listed, a file missing from the list is not absent. No tool finds a file by
+name: use its id if you already have it; otherwise tell the user it is outside
+the files you can see and do what that entry says. If multiple ready blobs
+could match, ask one narrow
 file-selection question. Do not synthesize a replacement artifact, invent a
 future file path, or jump straight to `set_pipeline` from prose about an upload.
 

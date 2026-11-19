@@ -7,7 +7,7 @@ Hosts:
   ``_handle_list_blobs`` / ``_handle_get_blob_metadata``.
 - Quota policy (``_BLOB_QUOTA_BYTES``).
 - Storage primitives (``_prepare_blob_create`` / ``_persist_prepared_blob_create`` /
-  ``_sync_get_blob`` / ``_sync_list_blobs`` / ``_check_blob_quota``).
+  ``_sync_get_blob`` / ``_sync_read_blob_list`` / ``_check_blob_quota``).
 - Blob DTOs (``BlobToolRecord`` / ``BlobCreatePayload`` / ``_PreparedBlobCreate``).
 - Shared public-service custody, recovery, and exact operation authority for
   content reads and mutations.
@@ -24,11 +24,11 @@ helpers here resolve those names via their local module namespace.
 from __future__ import annotations
 
 import hmac
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal, NotRequired, TypedDict, cast
+from typing import Any, Final, Literal, NotRequired, TypedDict, cast
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
@@ -534,45 +534,110 @@ _BLOB_ID_UUID_ERROR = (
 )
 
 
-def _sync_list_blobs(engine: Engine, session_id: str) -> list[BlobInventoryPayload]:
-    """Synchronous blob listing for use in the tool executor thread."""
+# Both model-facing listings show at most this many files, newest first. The
+# bound is deliberate: the session quota limits bytes, not file count, so an
+# uncapped listing has no ceiling on what it puts in front of the model. A
+# capped listing must say so: see ``_blob_list_incomplete_hint``.
+_BLOB_LIST_LIMIT: Final[int] = 50
+
+# Fixed lead-in of the one hint that marks a listing as incomplete. It is the
+# marker: ``blob_list_is_incomplete`` and the planner recognise the hint by it
+# alone, so the wording after it can change without touching either.
+_BLOB_LIST_INCOMPLETE_PREFIX: Final[str] = "Incomplete list: "
+
+
+def _blob_list_incomplete_hint(*, total: int, ready_only: bool) -> str:
+    """Say plainly what a capped listing left out and how to reach it.
+
+    Built from the server's own count only: no file name or other stored text.
+    """
+    kind = "ready files" if ready_only else "files"
+    return (
+        f"{_BLOB_LIST_INCOMPLETE_PREFIX}the {_BLOB_LIST_LIMIT} newest of {total} {kind} in this session are shown; "
+        f"{total - _BLOB_LIST_LIMIT} older {kind} are not listed. A file that is not listed still exists and still works "
+        "by its id. No tool finds a file by name. If you already have its id, use it. Otherwise do not conclude the "
+        "file is absent and do not create a replacement: tell the user it is outside the 50 newest files you can see "
+        "and ask for its id; a data file they can instead select as the pipeline input from their file list. Only if "
+        "neither is possible, ask them to upload it again."
+    )
+
+
+def blob_list_is_incomplete(result: ToolResult) -> bool:
+    """Return whether a file-listing result carries the incomplete-list marker."""
+    return any(hint.startswith(_BLOB_LIST_INCOMPLETE_PREFIX) for hint in result.post_call_hints)
+
+
+@dataclass(frozen=True, slots=True)
+class _BlobListRead:
+    """One capped listing read: the records shown and what the same statement counted.
+
+    The count travels with the records, so no caller can take the page without
+    the answer to whether it is the whole listing.
+    """
+
+    records: tuple[BlobToolRecord, ...]
+    matching_total: int
+    ready_only: bool
+
+    @property
+    def incomplete_hint(self) -> str | None:
+        """The hint to send with this page, or ``None`` when it shows every matching file."""
+        if self.matching_total <= len(self.records):
+            return None
+        return _blob_list_incomplete_hint(total=self.matching_total, ready_only=self.ready_only)
+
+
+def _sync_read_blob_list(engine: Engine, session_id: str, *, ready_only: bool) -> _BlobListRead:
+    """Read one capped listing, newest first, and the uncapped match count, in one statement.
+
+    The count is a window over the listing statement itself, so the page and
+    the number reported beside it come from one read and cannot disagree.
+    ``id`` breaks ``created_at`` ties, so which files fall inside the cap does
+    not depend on database row order.
+    """
+    query = select(blobs_table, func.count().over().label("matching_total")).where(blobs_table.c.session_id == session_id)
+    if ready_only:
+        query = query.where(blobs_table.c.status == "ready")
     with engine.connect() as conn:
-        rows = conn.execute(
-            select(blobs_table).where(blobs_table.c.session_id == session_id).order_by(blobs_table.c.created_at.desc()).limit(50)
-        ).fetchall()
-        return [
-            {
-                "id": blob["id"],
-                "filename": blob["filename"],
-                "mime_type": blob["mime_type"],
-                "size_bytes": blob["size_bytes"],
-                "created_by": blob["created_by"],
-                # Paired with created_by so the inventory answers "who
-                # authored these bytes" at the same depth as the read-back
-                # path (get_blob_content). created_by alone cannot: the
-                # composer writes created_by="assistant" both for content it
-                # generated and for content copied verbatim from the user.
-                "creation_modality": blob["creation_modality"],
-                "status": blob["status"],
-            }
-            for blob in (_blob_row_to_tool_dict(row) for row in rows)
-        ]
+        rows = conn.execute(query.order_by(blobs_table.c.created_at.desc(), blobs_table.c.id.asc()).limit(_BLOB_LIST_LIMIT)).fetchall()
+    records = tuple(_blob_row_to_tool_dict(row) for row in rows)
+    matching_total: int = rows[0].matching_total if rows else 0
+    return _BlobListRead(records=records, matching_total=matching_total, ready_only=ready_only)
 
 
-def _sync_list_ready_blob_inline_descriptors(engine: Engine, session_id: str) -> list[BlobInlineDescriptor]:
-    """Return H4 visibility descriptors for ready session blobs."""
-    with engine.connect() as conn:
-        rows = conn.execute(
-            select(blobs_table)
-            .where(blobs_table.c.session_id == session_id)
-            .where(blobs_table.c.status == "ready")
-            .order_by(blobs_table.c.created_at.desc())
-            .limit(50)
-        ).fetchall()
+def _with_blob_list_completeness(result: ToolResult, listing: _BlobListRead) -> ToolResult:
+    """Attach the incomplete-list hint when the read counted more files than it shows."""
+    hint = listing.incomplete_hint
+    if hint is None:
+        return result
+    return replace(result, post_call_hints=(*result.post_call_hints, hint))
 
+
+def _blob_inventory_entries(records: Sequence[BlobToolRecord]) -> list[BlobInventoryPayload]:
+    """Project listed records to the ``list_blobs`` inventory shape."""
+    return [
+        {
+            "id": blob["id"],
+            "filename": blob["filename"],
+            "mime_type": blob["mime_type"],
+            "size_bytes": blob["size_bytes"],
+            "created_by": blob["created_by"],
+            # Paired with created_by so the inventory answers "who
+            # authored these bytes" at the same depth as the read-back
+            # path (get_blob_content). created_by alone cannot: the
+            # composer writes created_by="assistant" both for content it
+            # generated and for content copied verbatim from the user.
+            "creation_modality": blob["creation_modality"],
+            "status": blob["status"],
+        }
+        for blob in records
+    ]
+
+
+def _blob_inline_descriptors(records: Sequence[BlobToolRecord]) -> list[BlobInlineDescriptor]:
+    """Project listed ready records to the H4 inline-content visibility descriptors."""
     descriptors: list[BlobInlineDescriptor] = []
-    for row in rows:
-        blob = _blob_row_to_tool_dict(row)
+    for blob in records:
         if blob["content_hash"] is None:
             raise AuditIntegrityError(f"Ready blob '{blob['id']}' has null content_hash; cannot list for inline_content authoring")
         descriptors.append(
@@ -597,11 +662,12 @@ def _handle_list_blobs(
     session_id = context.session_id
     if session_engine is None or session_id is None:
         return _failure_result(state, "Blob tools require session context.")
-    blobs = _sync_list_blobs(session_engine, session_id)
+    listing = _sync_read_blob_list(session_engine, session_id, ready_only=False)
+    blobs = _blob_inventory_entries(listing.records)
     refusal = _credential_safe_blob_discovery_result(state, blobs, surface="composer_blob_metadata")
     if refusal is not None:
         return refusal
-    return _discovery_result(state, blobs)
+    return _with_blob_list_completeness(_discovery_result(state, blobs), listing)
 
 
 _LIST_BLOBS_DECLARATION = ToolDeclaration(
@@ -611,7 +677,9 @@ _LIST_BLOBS_DECLARATION = ToolDeclaration(
     response_contract=_BLOB_INVENTORY_RESPONSE,
     description=(
         "List uploaded/created files (blobs) in this session with metadata: each entry carries `id`, `filename`, "
-        "`mime_type`, `size_bytes`, `status`, `created_by`, and `creation_modality`."
+        "`mime_type`, `size_bytes`, `status`, `created_by`, and `creation_modality`. Lists at most the 50 newest "
+        "files; when more exist, a `post_call_hints` entry starting `Incomplete list:` says how many are not listed. "
+        "An unlisted file still works by its id; no tool finds a file by name."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 )
@@ -633,7 +701,8 @@ def _handle_list_composer_blobs(
     session_id = context.session_id
     if session_engine is None or session_id is None:
         return _failure_result(state, "Blob tools require session context.")
-    payload = {"blobs": _sync_list_ready_blob_inline_descriptors(session_engine, session_id)}
+    listing = _sync_read_blob_list(session_engine, session_id, ready_only=True)
+    payload = {"blobs": _blob_inline_descriptors(listing.records)}
     refusal = _credential_safe_blob_discovery_result(
         state,
         payload,
@@ -641,7 +710,7 @@ def _handle_list_composer_blobs(
     )
     if refusal is not None:
         return refusal
-    return _discovery_result(state, payload)
+    return _with_blob_list_completeness(_discovery_result(state, payload), listing)
 
 
 _LIST_COMPOSER_BLOBS_DECLARATION = ToolDeclaration(
@@ -652,7 +721,9 @@ _LIST_COMPOSER_BLOBS_DECLARATION = ToolDeclaration(
     description=(
         "List ready blobs available for audited inline-content authoring. "
         "Returns a `blobs` list whose entries carry only `blob_id`, `mime_type`, `size_bytes`, `content_hash`, "
-        "and `filename`; never content bytes."
+        "and `filename`; never content bytes. Lists at most the 50 newest ready files; when more exist, a "
+        "`post_call_hints` entry starting `Incomplete list:` says how many are not listed. An unlisted file still "
+        "works by its id; no tool finds a file by name."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 )

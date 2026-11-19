@@ -441,7 +441,7 @@ List uploaded/created files (blobs) in this session with metadata.
 
 **Parameters:** None
 
-**Returns:** Array of blob records with ID, filename, MIME type, size, and creation time.
+**Returns:** Array of blob records with ID, filename, MIME type, size, and creation time. At most the 50 newest files are listed. When the session holds more, the result carries a `post_call_hints` entry that starts `Incomplete list:` and gives the number of older files not listed. An unlisted file still works by its ID.
 
 ---
 
@@ -451,7 +451,7 @@ List ready blobs using the inline-content authoring visibility shape.
 
 **Parameters:** None
 
-**Returns:** `{blobs: [...]}` descriptors with `blob_id`, `mime_type`, `size_bytes`, `content_hash`, and `filename`. Content bytes, previews, storage paths, and source descriptions are not returned.
+**Returns:** `{blobs: [...]}` descriptors with `blob_id`, `mime_type`, `size_bytes`, `content_hash`, and `filename`. Content bytes, previews, storage paths, and source descriptions are not returned. At most the 50 newest ready files are listed. When the session holds more, the result carries a `post_call_hints` entry that starts `Incomplete list:` and gives the number of older ready files not listed. An unlisted file still works by its ID.
 
 ---
 
