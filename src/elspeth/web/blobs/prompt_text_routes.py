@@ -41,16 +41,44 @@ from elspeth.web.sessions.prompt_file_approval import (
     PromptApprovalTrigger,
     PromptFileApprovalRequest,
     PromptFileApprovalStale,
+    PromptFileReviewCardOwed,
+    PromptFileReviewCardPending,
+    PromptFileUnreadable,
     _current_node_options,
     _current_snapshot,
+    assert_editor_save_may_carry_approvals,
     assert_latest_prompt_file_approvals_attest_surface,
+    editor_save_settles_pending_card,
     record_prompt_file_approval,
 )
-from elspeth.web.sessions.prompt_file_review import _surface_slots, prompt_file_binding_paths
+from elspeth.web.sessions.prompt_file_review import PromptFileReviewStale, PromptReviewSnapshot
 from elspeth.web.sessions.protocol import CompositionStateData, SessionCompositionStateCreation, SessionOperationMutationTransaction
 
 _MAX_PROMPT_FILE_BYTES = 256 * 1024
 _EDITOR_SAVE_ENCODINGS: frozenset[str] = frozenset({"utf-8"})
+
+# One refusal code, ``prompt_file_stale``, for four states the user gets out of
+# in different ways. A message promises only a recovery a test performs: an
+# agent edit reopens a prompt review only when it changes the prompt surface,
+# and no tool reopens a review on request. The card for a pending review is
+# issued by the validate route's repair pass, which the web app runs when it
+# loads the pipeline.
+_STALE_CARD_OWED = (
+    "This step's prompt is waiting for review. Reload the page so the step's review card appears, approve it, then edit the file."
+)
+_STALE_UNREADABLE = (
+    "A prompt file on this step is missing, not ready, or no longer the version the step was set up with. "
+    "Ask the assistant to attach that file to the step again, approve the review card that opens, then edit the file."
+)
+_STALE_NOT_APPROVED = (
+    "This step's prompt is not in the form that was last approved, and there is no review card to approve. "
+    "If you reverted to an earlier version of the pipeline, revert to the later one. "
+    "Otherwise upload the file again, ask the assistant to attach it to this step, and approve the review card that opens."
+)
+_STALE_REVIEW_DRIFTED = (
+    "This step's approved prompt review no longer matches its prompt, so the file cannot be saved here. "
+    "An administrator needs to look at this session."
+)
 
 
 class SavePromptFileRequest(BaseModel):
@@ -138,13 +166,6 @@ def create_prompt_text_router() -> APIRouter:
                 raise _prompt_save_refusal(
                     409, "prompt_file_binding_changed", "This prompt file moved since you opened it. Reload the session."
                 )
-            node = next(node for node in state.nodes or () if node["id"] == bindings[0].node_id)
-            if len(prompt_file_binding_paths(node["options"])) > 1:
-                raise _prompt_save_refusal(
-                    409,
-                    "prompt_file_node_multi_binding",
-                    "This node uses more than one prompt file; re-point it through the agent and approve the review card.",
-                )
             if any(binding.encoding not in _EDITOR_SAVE_ENCODINGS for binding in bindings):
                 # The editor saves UTF-8; a prompt that decodes this file another way would run
                 # different text from what the user saved.
@@ -153,43 +174,52 @@ def create_prompt_text_router() -> APIRouter:
                     "prompt_file_encoding_unsupported",
                     "This prompt reads the file with a non-UTF-8 encoding; re-attach it as UTF-8 text before editing it here.",
                 )
-            with blob_service._engine.connect() as conn:
-                pending_card = conn.execute(
-                    select(interpretation_events_table.c.id)
-                    .where(
-                        interpretation_events_table.c.session_id == str(session_id),
-                        interpretation_events_table.c.affected_node_id == body.node_id,
-                        interpretation_events_table.c.kind == "llm_prompt_template",
-                        interpretation_events_table.c.choice == "pending",
-                    )
-                    .limit(1)
-                ).scalar_one_or_none()
-            if pending_card is not None and any(
-                path != body.field_path and type(value) is str for path, value in _surface_slots(node["options"])
-            ):
-                raise _prompt_save_refusal(
-                    409,
-                    "prompt_file_review_pending_inline",
-                    "Approve the review card first, then edit the file.",
-                )
-            if pending_card is None:
-                # Defence in depth beside the review anchor: with no card to
-                # settle, a save extends the node's last approval only when
-                # that approval still attests the whole pre-save prompt surface
-                # (its effective artifact, not just this file). Checked under the
-                # session lease; the metadata hook below re-checks the head.
-                def assert_surface_attested() -> None:
-                    with blob_service._engine.connect() as conn:
-                        assert_latest_prompt_file_approvals_attest_surface(conn, state=state, node_id=body.node_id)
 
-                try:
-                    await run_sync_in_worker(assert_surface_attested)
-                except PromptFileApprovalStale as exc:
+            def attested_before_save() -> dict[str, PromptReviewSnapshot | None]:
+                # One entry per node this file is bound on. A node may use other
+                # prompt files beside this one: the editor shows only this file,
+                # so the save is allowed only when it cannot approve anything the
+                # user did not see. With a card pending, this file must be the
+                # node's whole prompt surface (the save then settles the card).
+                # With no card, the node's last approvals must still attest its
+                # whole pre-save surface, and for a node with several files every
+                # one of them must already be approved. Checked under the session
+                # lease; the metadata hook below re-checks the head and, in its
+                # own transaction, the attestation it carries forward.
+                attested: dict[str, PromptReviewSnapshot | None] = {}
+                with blob_service._engine.connect() as conn:
+                    for binding in bindings:
+                        if editor_save_settles_pending_card(conn, state=state, node_id=binding.node_id, field_path=binding.field_path):
+                            attested[binding.node_id] = None
+                        elif binding.node_id not in attested:
+                            attested[binding.node_id] = assert_latest_prompt_file_approvals_attest_surface(
+                                conn, state=state, node_id=binding.node_id
+                            )
+                return attested
+
+            try:
+                attested_snapshots = await run_sync_in_worker(attested_before_save)
+            except PromptFileReviewCardPending as exc:
+                if exc.unseen_inline_text:
                     raise _prompt_save_refusal(
                         409,
-                        "prompt_file_stale",
-                        "This prompt changed since it was reviewed. Ask the assistant to reopen its review, then edit the file.",
+                        "prompt_file_review_pending_inline",
+                        "Approve the review card first, then edit the file.",
                     ) from exc
+                raise _prompt_save_refusal(
+                    409,
+                    "prompt_file_review_pending_files",
+                    "This step's review card also covers its other prompt files. Approve the review card first, then edit the file.",
+                ) from exc
+            except PromptFileUnreadable as exc:
+                raise _prompt_save_refusal(409, "prompt_file_stale", _STALE_UNREADABLE) from exc
+            except PromptFileReviewCardOwed as exc:
+                raise _prompt_save_refusal(409, "prompt_file_stale", _STALE_CARD_OWED) from exc
+            except PromptFileApprovalStale as exc:
+                # A resolved review that drifted from its prompt is not reopened by
+                # any edit to the step: the message offers no recovery.
+                drifted = not all(resolved_prompt_review_matches_anchor(state, affected_node_id=binding.node_id) for binding in bindings)
+                raise _prompt_save_refusal(409, "prompt_file_stale", _STALE_REVIEW_DRIFTED if drifted else _STALE_NOT_APPROVED) from exc
             if new_bytes == old_bytes:
                 return SavePromptFileResponse(changed=False, content_sha256=blob.content_hash)
             replacement = replace(
@@ -223,23 +253,19 @@ def create_prompt_text_router() -> APIRouter:
                 current_row = conn.execute(select(composition_states_table).where(composition_states_table.c.id == current_head)).one()
                 current_state = session_service._row_to_state_record(current_row)
                 current_bindings, current_mixed = prompt_bindings_for_blob(current_state, replacement)
-                if (
-                    current_mixed
-                    or len(current_bindings) != 1
-                    or (current_bindings[0].node_id, current_bindings[0].field_path) != (body.node_id, body.field_path)
-                ):
+                # The binding set the request checked, exactly: the file is still
+                # bound where the user opened it and nowhere it was not before.
+                if current_mixed or current_bindings != bindings:
                     raise _prompt_save_refusal(
                         409, "prompt_file_binding_changed", "This prompt file moved since you opened it. Reload the session."
                     )
                 # Checked on the exact pre-save head, before any write: a save
                 # approves only the file on screen, never prompt text that
                 # drifted from an earlier review.
-                if not resolved_prompt_review_matches_anchor(current_state, affected_node_id=body.node_id):
-                    raise _prompt_save_refusal(
-                        409,
-                        "prompt_file_stale",
-                        "This prompt changed since it was reviewed. Ask the assistant to reopen its review, then edit the file.",
-                    )
+                if not all(
+                    resolved_prompt_review_matches_anchor(current_state, affected_node_id=node_id) for node_id in attested_snapshots
+                ):
+                    raise _prompt_save_refusal(409, "prompt_file_stale", _STALE_REVIEW_DRIFTED)
                 stored_hash = content_hash(stored_bytes)
                 if stored_hash != replacement.content_hash:
                     raise AuditIntegrityError("stored prompt bytes differ from replacement metadata")
@@ -261,10 +287,11 @@ def create_prompt_text_router() -> APIRouter:
                         derived_from_state_id=state.id,
                     )
                 )
-                for binding in bindings:
+                for node_id, attested_snapshot in attested_snapshots.items():
+                    binding = next(item for item in bindings if item.node_id == node_id)
                     approval_request = PromptFileApprovalRequest(
                         session_id=session_id,
-                        node_id=binding.node_id,
+                        node_id=node_id,
                         field_path=binding.field_path,
                         blob_id=blob_id,
                         content_sha256=stored_hash,
@@ -275,18 +302,41 @@ def create_prompt_text_router() -> APIRouter:
                         select(interpretation_events_table.c.id, interpretation_events_table.c.user_term)
                         .where(
                             interpretation_events_table.c.session_id == str(session_id),
-                            interpretation_events_table.c.affected_node_id == binding.node_id,
+                            interpretation_events_table.c.affected_node_id == node_id,
                             interpretation_events_table.c.kind == "llm_prompt_template",
                             interpretation_events_table.c.choice == "pending",
                         )
                         .order_by(interpretation_events_table.c.created_at.desc())
                         .limit(1)
                     ).one_or_none()
-                    record_prompt_file_approval(
-                        conn,
-                        approval_request,
-                        now=now,
-                    )
+                    # The save moved the node's review anchor, so EVERY file
+                    # binding of the node needs an approval under the new
+                    # snapshot or the node stops being admitted to runs. The
+                    # saved file is approved by this save. The node's other
+                    # files are carried forward with the bytes they already had
+                    # approved, which the check below proves in this transaction
+                    # before any row is written. Known limitation: a carried row
+                    # is recorded with the same EDITOR_SAVE trigger as the saved
+                    # file's row (no schema change in this fix); it is told apart
+                    # only by its blob_id differing from the saved blob's row at
+                    # the same approved_at. A dedicated provenance value is
+                    # follow-up work.
+                    saved_snapshot = _current_snapshot(conn, approval_request, _current_node_options(conn, approval_request))
+                    assert_editor_save_may_carry_approvals(conn, prior=attested_snapshot, saved=saved_snapshot, saved_blob_id=blob_id)
+                    for file_binding in saved_snapshot.bindings:
+                        record_prompt_file_approval(
+                            conn,
+                            PromptFileApprovalRequest(
+                                session_id=session_id,
+                                node_id=node_id,
+                                field_path=file_binding.field_path,
+                                blob_id=file_binding.blob_id,
+                                content_sha256=file_binding.content_sha256,
+                                actor_user_id=user.user_id,
+                                trigger=PromptApprovalTrigger.EDITOR_SAVE,
+                            ),
+                            now=now,
+                        )
                     if pending_event is not None:
                         latest_row = conn.execute(
                             select(composition_states_table)
@@ -308,10 +358,10 @@ def create_prompt_text_router() -> APIRouter:
                         sources, nodes, _ = _resolve_prompt_template_review(
                             latest_state,
                             event_id=pending_event.id,
-                            affected_node_id=binding.node_id,
+                            affected_node_id=node_id,
                             user_term=pending_event.user_term,
                             accepted_value=accepted_value,
-                            surfacing_structure_hash=_surfacing_prompt_structure_hash(latest_state, affected_node_id=binding.node_id),
+                            surfacing_structure_hash=_surfacing_prompt_structure_hash(latest_state, affected_node_id=node_id),
                             file_snapshot=snapshot,
                         )
                         transaction.composition_states.append_state(
@@ -346,9 +396,7 @@ def create_prompt_text_router() -> APIRouter:
                             for item in parse_interpretation_requirements(options) or ()
                         )
                         if resolved:
-                            nodes = _refresh_resolved_prompt_template_review(
-                                latest_state, affected_node_id=binding.node_id, file_snapshot=snapshot
-                            )
+                            nodes = _refresh_resolved_prompt_template_review(latest_state, affected_node_id=node_id, file_snapshot=snapshot)
                             transaction.composition_states.append_state(
                                 SessionCompositionStateCreation(
                                     id=uuid4(),
@@ -379,7 +427,9 @@ def create_prompt_text_router() -> APIRouter:
                         on_metadata_commit=approve_stored_bytes,
                     )
                 )
-            except PromptFileApprovalStale as exc:
+            except PromptFileReviewStale as exc:
+                # PromptFileApprovalStale and its parent: an approval, binding or
+                # custody snapshot moved between the checks above and the commit.
                 raise _prompt_save_refusal(409, "prompt_file_stale", "Prompt bindings changed. Reload the session and retry.") from exc
             except (BlobActiveRunError, BlobPendingProposalError, BlobInProgressForkError) as exc:
                 raise _prompt_save_refusal(409, "prompt_file_retained", str(exc)) from exc

@@ -12,13 +12,9 @@ interface PromptFileEditorProps {
   nodeId: string;
   blobId: string;
   fieldPath: string;
-  /** Why the server will refuse every save for this binding; Save stays disabled while set. */
-  saveRefusal?: string | null;
   /** The query's reader-facing name for a `queries.<selector>.template` slot. */
   queryName?: string;
 }
-
-const MULTI_BINDING_REFUSAL = "This node uses more than one prompt file. Re-point it through the agent and approve the review card.";
 
 function blobId(value: unknown): string | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
@@ -31,13 +27,12 @@ export function PromptFileEditors({ nodeId, options }: { nodeId: string; options
     const id = blobId(value);
     return id ? [{ fieldPath, blobId: id, queryName }] : [];
   });
-  // Mirrors the server rule (prompt_file_binding_paths > 1 refuses every save
-  // with prompt_file_node_multi_binding), so the user is told before saving.
-  const saveRefusal = bindings.length > 1 ? MULTI_BINDING_REFUSAL : null;
-  return <>{bindings.map((binding) => <PromptFileEditor key={`${nodeId}:${binding.fieldPath}:${binding.blobId}`} nodeId={nodeId} saveRefusal={saveRefusal} {...binding} />)}</>;
+  // One editor per file-backed prompt. A step with several prompt files edits
+  // and saves each on its own; promptFileEditability decides what is refused.
+  return <>{bindings.map((binding) => <PromptFileEditor key={`${nodeId}:${binding.fieldPath}:${binding.blobId}`} nodeId={nodeId} {...binding} />)}</>;
 }
 
-export function PromptFileEditor({ nodeId, blobId, fieldPath, saveRefusal = null, queryName }: PromptFileEditorProps) {
+export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: PromptFileEditorProps) {
   const filename = useBlobFilename(blobId);
   // The same query label the inspector row shows (promptQueryEntries `name`),
   // never the list index the slot path uses.
@@ -56,18 +51,25 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, saveRefusal = null
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [expanded, setExpanded] = useState(false);
+  // The seq of the last Edit request this editor took. It re-runs the focus
+  // effect for a request that arrives while the editor is already open, where
+  // neither `expanded` nor `text` changes and the click would do nothing.
+  const [focusRequestSeq, setFocusRequestSeq] = useState(0);
   const editorRef = useRef<HTMLTextAreaElement>(null);
   const shouldFocusRef = useRef(false);
   const editability = compositionState?.nodes.some((node) => node.id === nodeId)
     ? promptFileEditability({ state: compositionState, blobs: blobSessionId === sessionId ? blobs : [],
       pendingEvents: Object.values(pending ?? {}), nodeId, fieldPath, blobId })
     : null;
-  const refusal = editability?.editable === false ? editability.reason : saveRefusal;
+  // Why the server would refuse a save right now. While set, the editor is
+  // read-only: the text is shown, Save is disabled and this reason is given.
+  const refusal = editability?.editable === false ? editability.reason : null;
 
   useLayoutEffect(() => {
     if (editRequest?.nodeId !== nodeId || editRequest.fieldPath !== fieldPath) return;
     shouldFocusRef.current = true;
     setExpanded(true);
+    setFocusRequestSeq(editRequest.seq);
     useBlobStore.getState().consumePromptEdit(editRequest.seq);
   }, [editRequest, nodeId, fieldPath]);
   useLayoutEffect(() => {
@@ -89,7 +91,7 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, saveRefusal = null
       return () => observer.disconnect();
     }
     focusEditor();
-  }, [expanded, text]);
+  }, [expanded, text, focusRequestSeq]);
 
   useEffect(() => {
     let live = true;
@@ -138,8 +140,8 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, saveRefusal = null
     } catch (failure: unknown) {
       if (isCurrent()) {
         const typed = failure as { detail?: unknown; error_type?: unknown };
-        setError(typed.error_type === "prompt_file_node_multi_binding"
-          ? MULTI_BINDING_REFUSAL
+        setError(typed.error_type === "prompt_file_review_pending_files"
+          ? "This step's review card also covers its other prompt files. Approve the review card first, then edit the file."
           : typed.error_type === "prompt_file_review_pending_inline"
             ? "Approve the review card first, then edit the file."
             : typed.error_type === "prompt_file_binding_changed"
@@ -162,6 +164,8 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, saveRefusal = null
         value={text ?? ""}
         onChange={(event) => setText(event.target.value)}
         disabled={text === null}
+        readOnly={refusal !== null}
+        aria-describedby={refusal ? `prompt-file-${blobId}-${fieldPath}-refusal` : undefined}
         rows={12}
         style={{ width: "100%", whiteSpace: "pre-wrap" }}
       />

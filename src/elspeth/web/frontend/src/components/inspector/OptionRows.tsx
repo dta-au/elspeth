@@ -19,7 +19,7 @@
 //      "Raw options (JSON)" block, which itself renders only with show_advanced.
 // ============================================================================
 
-import { type JSX, useEffect } from "react";
+import { type JSX, useEffect, useId } from "react";
 
 import { CodeBlock } from "@/components/chat/CodeBlock";
 import { BlobFileName } from "@/components/blobs/BlobFileName";
@@ -190,9 +190,17 @@ function BoundPromptActions({ blobId, nodeId, fieldPath, label, sessionId, state
   const filename = useBlobFilename(blobId) ?? (loading ? "Loading file name…" : "File not in this session");
   const present = blobs.some((blob) => blob.id.toLowerCase() === blobId.toLowerCase());
   const editability = promptFileEditability({ state, blobs, pendingEvents, nodeId, fieldPath, blobId });
-  const editReason = loading && !present ? "Checking files in this session." : editability.editable ? null : editability.reason;
-  const reasonId = `prompt-slot-${nodeId}-${fieldPath}-reason`;
-  const missingReasonId = `prompt-slot-${nodeId}-${fieldPath}-missing`;
+  const checking = loading && !present;
+  const editReason = checking ? "Checking files in this session." : editability.editable ? null : editability.reason;
+  // Edit is a no-op only when there is no prompt text to show (file missing,
+  // still processing, not text). Every other refusal opens the editor
+  // read-only: Save is disabled there and the same reason is shown.
+  const editBlocked = checking || (!editability.editable && !editability.opens);
+  // useId, not the slot path: two query rows that fall back to the node-level
+  // prompt share one slot path and would otherwise share one DOM id.
+  const rowId = useId();
+  const reasonId = `${rowId}-reason`;
+  const missingReasonId = `${rowId}-missing`;
   return <span className="prompt-slot-actions">
     {showInFiles && <>
       {/* The accessible name STARTS with the visible label (WCAG 2.5.3), so
@@ -205,8 +213,8 @@ function BoundPromptActions({ blobId, nodeId, fieldPath, label, sessionId, state
       {!present && <span id={missingReasonId}>{loading ? "Checking files in this session." : "This file is not in this session."}</span>}
     </>}
     <Button type="button" variant="bare" aria-label={`Edit ${filename} (${label})`}
-      aria-disabled={editReason !== null} aria-describedby={editReason !== null ? reasonId : undefined}
-      onClick={() => { if (editReason === null) useBlobStore.getState().requestPromptEdit(nodeId, fieldPath); }}>
+      aria-disabled={editBlocked} aria-describedby={editReason !== null ? reasonId : undefined}
+      onClick={() => { if (!editBlocked) useBlobStore.getState().requestPromptEdit(nodeId, fieldPath); }}>
       Edit
     </Button>
     {editReason !== null && <span id={reasonId}>{editReason}</span>}

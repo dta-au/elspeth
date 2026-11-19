@@ -32,6 +32,7 @@ from elspeth.web.sessions.prompt_file_review import (
     PromptFileReviewStale,
     PromptReviewSnapshot,
     _surface_slots,
+    prompt_file_binding_paths,
     resolve_prompt_review_snapshot,
 )
 from elspeth.web.sessions.protocol import CompositionStateRecord
@@ -74,6 +75,14 @@ class PromptFileApprovalStale(PromptFileReviewStale):
     """A binding, byte version, event or snapshot changed before approval."""
 
     error_code = "prompt_file_approval_stale"
+
+
+class PromptFileUnreadable(PromptFileApprovalStale):
+    """A prompt file on the node is missing, not ready, not UTF-8 text, or not the bytes its marker pins."""
+
+
+class PromptFileReviewCardOwed(PromptFileApprovalStale):
+    """The node's prompt review is pending in the state, but its card has not been issued yet."""
 
 
 def _read_custody_bytes(record: BlobRecord) -> bytes:
@@ -249,10 +258,10 @@ def record_prompt_file_approval(
             raise PromptFileApprovalStale()
     if request.trigger is PromptApprovalTrigger.EDITOR_SAVE:
         # A save is approval only of the bytes the editor showed. With a card
-        # pending, any other inline prompt text or a pending vague-term
-        # requirement on this node is unreviewed, so the save must not retire
-        # the card. Checked here, in the caller's transaction, so this writer
-        # fails closed whatever its caller checked beforehand.
+        # pending, any other prompt slot (inline text or another file) or a
+        # pending vague-term requirement on this node is unreviewed, so the
+        # save must not retire the card. Checked here, in the caller's
+        # transaction, so this writer fails closed whatever its caller checked.
         pending_card = conn.execute(
             select(interpretation_events_table.c.id)
             .where(
@@ -266,7 +275,7 @@ def record_prompt_file_approval(
         if pending_card is not None:
             requirements = options["interpretation_requirements"] if "interpretation_requirements" in options else ()
             if any(requirement["status"] == "pending" and requirement["kind"] == "vague_term" for requirement in requirements) or any(
-                path != request.field_path and type(value) is str for path, value in _surface_slots(options)
+                path != request.field_path and value is not None for path, value in _surface_slots(options)
             ):
                 raise PromptFileApprovalStale()
     approval_id = uuid4()
@@ -357,16 +366,28 @@ def _latest_approvals_attest(conn: Connection, snapshot: PromptReviewSnapshot) -
     return True
 
 
-def assert_latest_prompt_file_approvals_attest_surface(conn: Connection, *, state: CompositionStateRecord, node_id: str) -> None:
+def assert_latest_prompt_file_approvals_attest_surface(
+    conn: Connection, *, state: CompositionStateRecord, node_id: str
+) -> PromptReviewSnapshot | None:
     """Require a node's latest prompt-file approvals to still attest its current prompt surface.
 
     The editor save checks this on the pre-save head when no review card is
     pending: a save may extend an approval only to the file on screen, never
-    to other prompt text (an inline query template, a system prompt) that
-    changed after the node was last approved. A node with no file approval
-    yet has nothing to compare, so a first save is not refused here. Raises
-    :class:`PromptFileApprovalStale` when an approval no longer attests the
-    surface or the custody snapshot cannot be read.
+    to other prompt text (an inline query template, a system prompt) or to
+    another prompt file that changed after the node was last approved.
+
+    Returns the attested pre-save snapshot, which the save re-checks inside
+    its transaction before it carries the approval of the node's other files
+    forward. A node with ONE file-backed prompt and no file approval yet has
+    nothing to compare, so its first save is not refused here and ``None`` is
+    returned. A node with several file-backed prompts gets no such pass: the
+    editor shows one file, so every other file must already hold an approval
+    that attests this surface. Raises :class:`PromptFileApprovalStale` when
+    an approval is missing or no longer attests the surface. Two subclasses
+    name the causes a user recovers from differently:
+    :class:`PromptFileUnreadable` when the custody snapshot cannot be read, and
+    :class:`PromptFileReviewCardOwed` when the state already holds a pending
+    prompt review whose card the next surfacing pass will issue.
     """
     session_id = state.session_id
     options = next(node["options"] for node in state.nodes or () if node["id"] == node_id)
@@ -375,8 +396,8 @@ def assert_latest_prompt_file_approvals_attest_surface(conn: Connection, *, stat
         .where(prompt_file_approvals_table.c.session_id == str(session_id), prompt_file_approvals_table.c.node_id == node_id)
         .limit(1)
     ).scalar_one_or_none()
-    if approved_before is None:
-        return
+    if approved_before is None and len(prompt_file_binding_paths(options)) <= 1:
+        return None
     records: dict[UUID, tuple[BlobRecord, bytes]] = {}
 
     def read_blob(blob_id: UUID) -> tuple[BlobRecord, bytes]:
@@ -388,6 +409,83 @@ def assert_latest_prompt_file_approvals_attest_surface(conn: Connection, *, stat
     try:
         snapshot = resolve_prompt_review_snapshot(session_id=session_id, node_id=node_id, options=options, read_blob=read_blob)
     except (KeyError, TypeError, ValueError) as exc:
-        raise PromptFileApprovalStale() from exc
+        raise PromptFileUnreadable() from exc
     if snapshot is None or not _latest_approvals_attest(conn, snapshot):
+        requirements = options["interpretation_requirements"] if "interpretation_requirements" in options else ()
+        if any(requirement["kind"] == "llm_prompt_template" and requirement["status"] == "pending" for requirement in requirements):
+            raise PromptFileReviewCardOwed()
+        raise PromptFileApprovalStale()
+    return snapshot
+
+
+class PromptFileReviewCardPending(PromptFileApprovalStale):
+    """A pending prompt card covers prompt content the file editor did not show."""
+
+    def __init__(self, *, unseen_inline_text: bool) -> None:
+        super().__init__()
+        self.unseen_inline_text = unseen_inline_text
+
+
+def editor_save_settles_pending_card(conn: Connection, *, state: CompositionStateRecord, node_id: str, field_path: str) -> bool:
+    """Whether a prompt card is pending on the node and this save may settle it.
+
+    The editor shows one file. With a card pending, the save stands in for the
+    card only when that file is the node's whole prompt surface. Any other
+    prompt slot, inline text or another file, is content the user has not seen
+    here, so the save is refused (:class:`PromptFileReviewCardPending`) and the
+    card stays pending. The same rule guards ``record_prompt_file_approval``.
+    Returns ``False`` when no card is pending.
+    """
+    pending_card = conn.execute(
+        select(interpretation_events_table.c.id)
+        .where(
+            interpretation_events_table.c.session_id == str(state.session_id),
+            interpretation_events_table.c.affected_node_id == node_id,
+            interpretation_events_table.c.kind == "llm_prompt_template",
+            interpretation_events_table.c.choice == "pending",
+        )
+        .limit(1)
+    ).scalar_one_or_none()
+    if pending_card is None:
+        return False
+    options = next(node["options"] for node in state.nodes or () if node["id"] == node_id)
+    unseen = [value for path, value in _surface_slots(options) if path != field_path and value is not None]
+    if unseen:
+        raise PromptFileReviewCardPending(unseen_inline_text=any(type(value) is str for value in unseen))
+    return True
+
+
+def assert_editor_save_may_carry_approvals(
+    conn: Connection,
+    *,
+    prior: PromptReviewSnapshot | None,
+    saved: PromptReviewSnapshot,
+    saved_blob_id: UUID,
+) -> None:
+    """Before an editor save writes approvals, prove the node's other files may keep theirs.
+
+    A save changes the node's review anchor, so every file binding of the node
+    needs an approval row under the post-save snapshot ``saved``. The file on
+    screen is approved by the user's save. Each other file is carried forward:
+    it is re-recorded with the bytes it already had. That is sound only when,
+    in this same transaction and before any new row, no card is pending and
+    the pre-save snapshot ``prior`` was fully attested, and each carried
+    binding is the same file and bytes ``prior`` attested.
+
+    ``prior`` is ``None`` only for a node whose sole file is the one saved
+    (a pending card the save settles, or a first save); there is then nothing
+    to carry and nothing further to check here.
+    """
+    carried = {
+        (binding.field_path, binding.blob_id, binding.content_sha256) for binding in saved.bindings if binding.blob_id != saved_blob_id
+    }
+    if prior is None:
+        if carried:
+            raise PromptFileApprovalStale()
+        return
+    try:
+        assert_prompt_file_approvals(conn, prior)
+    except PromptFileReviewStale as exc:
+        raise PromptFileApprovalStale() from exc
+    if not carried <= {(binding.field_path, binding.blob_id, binding.content_sha256) for binding in prior.bindings}:
         raise PromptFileApprovalStale()

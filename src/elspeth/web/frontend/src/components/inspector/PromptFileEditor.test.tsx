@@ -102,19 +102,9 @@ it("shows a typed refusal and retains the user's draft", async () => {
   expect(editor).toHaveValue("my draft");
 });
 
-it("explains why a node with two prompt files needs agent review", async () => {
-  vi.mocked(savePromptFile).mockRejectedValue({ error_type: "prompt_file_node_multi_binding" });
-  render(<PromptFileEditors nodeId="first" options={{ prompt_template: { mode: "inline_content", blob_ref: "blob-1" } }} />);
-  const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
-  await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
-  fireEvent.change(editor, { target: { value: "my draft" } });
-  fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
-  expect(await screen.findByRole("alert")).toHaveTextContent("Re-point it through the agent and approve the review card.");
-  expect(editor).toHaveValue("my draft");
-});
-
 it.each([
   ["prompt_file_review_pending_inline", "Approve the review card first, then edit the file."],
+  ["prompt_file_review_pending_files", "This step's review card also covers its other prompt files. Approve the review card first, then edit the file."],
   ["prompt_file_binding_changed", "This prompt file moved since you opened it. Reload the session."],
 ])("shows %s guidance", async (errorType, message) => {
   vi.mocked(savePromptFile).mockRejectedValue({ error_type: errorType });
@@ -127,29 +117,149 @@ it.each([
   expect(editor).toHaveValue("my draft");
 });
 
-it("disables Save before any request on a node with two prompt files, and says why", async () => {
-  render(
-    <PromptFileEditors
-      nodeId="first"
-      options={{
-        prompt_template: { mode: "inline_content", blob_ref: "blob-1" },
-        system_prompt: { mode: "inline_content", blob_ref: "blob-2" },
-      }}
-    />,
-  );
-  act(() => useBlobStore.getState().requestPromptEdit("first", "system_prompt"));
-  const editors = await screen.findAllByRole("textbox", { name: /Edit prompt file/ });
-  expect(editors).toHaveLength(2);
-  await waitFor(() => expect(editors[0]).toHaveValue("first line\n  second line\n"));
-  fireEvent.change(editors[0], { target: { value: "my draft" } });
-  const saves = screen.getAllByRole("button", { name: "Save and approve" });
-  for (const save of saves) {
-    expect(save).toBeDisabled();
-    expect(save).toHaveAccessibleDescription("This node uses more than one prompt file. Re-point it through the agent and approve the review card.");
+// --- A step that uses more than one prompt file ---
+
+const FILE_A = { mode: "inline_content", blob_ref: "blob-a", sha256: "a".repeat(64) };
+const FILE_B = { mode: "inline_content", blob_ref: "blob-b", sha256: "b".repeat(64) };
+const TWO_FILE_OPTIONS = { prompt_template: FILE_A, system_prompt: FILE_B };
+
+function seedTwoFileStep(options: Record<string, unknown> = TWO_FILE_OPTIONS) {
+  useBlobStore.setState({ editRequest: null, activeSessionId: "session-1", isLoading: false, blobs: [
+    { id: "blob-a", filename: "user.md", status: "ready", mime_type: "text/plain", content_hash: null } as BlobMetadata,
+    { id: "blob-b", filename: "system.md", status: "ready", mime_type: "text/plain", content_hash: null } as BlobMetadata,
+  ] });
+  useSessionStore.setState({ compositionState: { nodes: [{ id: "first", plugin: "llm", options }], sources: {}, outputs: [] } as unknown as CompositionState });
+  vi.mocked(readPromptFileText).mockImplementation(async (_sessionId: string, blobId: string) => blobId === "blob-a"
+    ? { text: "text of file A", sha256: "a".repeat(64) }
+    : { text: "text of file B", sha256: "b".repeat(64) });
+  vi.spyOn(useBlobStore.getState(), "loadBlobs").mockResolvedValue();
+  render(<>
+    <OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "first" }} />
+    <PromptFileEditors nodeId="first" options={options} />
+  </>);
+}
+
+it.each([
+  ["Edit user.md (User prompt)", "Edit prompt file user.md (User prompt)", "text of file A", "blob-a", "a".repeat(64), "prompt_template"],
+  ["Edit system.md (System prompt)", "Edit prompt file system.md (System prompt)", "text of file B", "blob-b", "b".repeat(64), "system_prompt"],
+])("on a step with two prompt files, %s opens that file and saves it", async (editName, editorName, fileText, blobId, sha256, fieldPath) => {
+  seedTwoFileStep();
+  const edit = screen.getByRole("button", { name: editName });
+  expect(edit).toHaveAttribute("aria-disabled", "false");
+  fireEvent.click(edit);
+  const editor = await screen.findByRole("textbox", { name: editorName });
+  await waitFor(() => expect(editor).toHaveValue(fileText));
+  expect(editor).toHaveFocus();
+  expect(editor).not.toHaveAttribute("readonly");
+  // Only the requested file's editor opened.
+  expect(screen.getAllByRole("textbox", { name: /Edit prompt file/ })).toHaveLength(1);
+  fireEvent.change(editor, { target: { value: "edited" } });
+  const save = screen.getByRole("button", { name: "Save and approve" });
+  expect(save).toBeEnabled();
+  fireEvent.click(save);
+  await waitFor(() => expect(savePromptFile).toHaveBeenCalledWith("session-1", blobId, "edited", sha256, "first", fieldPath));
+});
+
+it.each([
+  ["two query files (list form)", { system_prompt: "You classify.", queries: [{ name: "one", template: FILE_A }, { name: "two", template: FILE_B }] },
+    "Edit system.md (User prompt, query two)", "blob-b", "b".repeat(64), "queries.1.template"],
+  ["two query files (mapping form)", { system_prompt: "You classify.", queries: { one: { template: FILE_A }, two: { template: FILE_B } } },
+    "Edit system.md (User prompt, query two)", "blob-b", "b".repeat(64), "queries.two.template"],
+])("on a step with %s, Edit opens the query's own file and saves it", async (_form, options, editName, blobId, sha256, fieldPath) => {
+  seedTwoFileStep(options);
+  fireEvent.click(screen.getByRole("button", { name: editName }));
+  const editor = await screen.findByRole("textbox", { name: /Edit prompt file system\.md/ });
+  await waitFor(() => expect(editor).toHaveValue("text of file B"));
+  fireEvent.change(editor, { target: { value: "edited" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
+  await waitFor(() => expect(savePromptFile).toHaveBeenCalledWith("session-1", blobId, "edited", sha256, "first", fieldPath));
+});
+
+it("scrolls to and focuses an editor that is already open when Edit is requested again", async () => {
+  const scroll = vi.fn();
+  const original = Element.prototype.scrollIntoView;
+  Element.prototype.scrollIntoView = scroll;
+  try {
+    seedTwoFileStep();
+    const edit = screen.getByRole("button", { name: "Edit user.md (User prompt)" });
+    fireEvent.click(edit);
+    const editor = await screen.findByRole("textbox", { name: "Edit prompt file user.md (User prompt)" });
+    await waitFor(() => expect(editor).toHaveFocus());
+    const scrollsAfterOpen = scroll.mock.calls.length;
+    expect(scrollsAfterOpen).toBeGreaterThan(0);
+    // Focus leaves the open editor; the inspector row's Edit is clicked again.
+    act(() => edit.focus());
+    expect(editor).not.toHaveFocus();
+    fireEvent.click(edit);
+    await waitFor(() => expect(editor).toHaveFocus());
+    expect(scroll.mock.calls.length).toBe(scrollsAfterOpen + 1);
+    // The file manager's "Edit prompt" sends the same request (BlobManager.test.tsx pins that).
+    act(() => edit.focus());
+    act(() => useBlobStore.getState().requestPromptEdit("first", "prompt_template"));
+    await waitFor(() => expect(editor).toHaveFocus());
+    expect(scroll.mock.calls.length).toBe(scrollsAfterOpen + 2);
+    expect(useBlobStore.getState().editRequest).toBeNull();
+  } finally {
+    Element.prototype.scrollIntoView = original;
   }
-  fireEvent.click(saves[0]);
+});
+
+it("does not pull focus back into the editor after a repeated Edit request has been served", async () => {
+  seedTwoFileStep();
+  const edit = screen.getByRole("button", { name: "Edit user.md (User prompt)" });
+  fireEvent.click(edit);
+  const editor = await screen.findByRole("textbox", { name: "Edit prompt file user.md (User prompt)" });
+  await waitFor(() => expect(editor).toHaveFocus());
+  act(() => edit.focus());
+  fireEvent.click(edit);
+  await waitFor(() => expect(editor).toHaveFocus());
+  // The user moves to Cancel; a later text change must not steal focus back.
+  const cancel = screen.getByRole("button", { name: "Cancel" });
+  act(() => cancel.focus());
+  fireEvent.change(editor, { target: { value: "a draft" } });
+  expect(cancel).toHaveFocus();
+  fireEvent.click(cancel);
+  expect(editor).toHaveValue("text of file A");
+  expect(cancel).toHaveFocus();
+});
+
+it("saves the same file a second time with the hash the first save returned", async () => {
+  vi.mocked(savePromptFile).mockResolvedValueOnce({ changed: true, content_sha256: "c".repeat(64) });
+  const repinned = { nodes: [{ id: "first", plugin: "llm", options: { ...TWO_FILE_OPTIONS, prompt_template: { ...FILE_A, sha256: "c".repeat(64) } } }], sources: {}, outputs: [] } as unknown as CompositionState;
+  vi.mocked(fetchCompositionState).mockResolvedValue(repinned);
+  seedTwoFileStep();
+  fireEvent.click(screen.getByRole("button", { name: "Edit user.md (User prompt)" }));
+  const editor = await screen.findByRole("textbox", { name: "Edit prompt file user.md (User prompt)" });
+  await waitFor(() => expect(editor).toHaveValue("text of file A"));
+  fireEvent.change(editor, { target: { value: "first edit" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save and approve" }));
+  await waitFor(() => expect(useSessionStore.getState().compositionState).toBe(repinned));
+  expect(savePromptFile).toHaveBeenLastCalledWith("session-1", "blob-a", "first edit", "a".repeat(64), "first", "prompt_template");
+  // The refreshed graph is in the store; the editor is still open and still saveable.
+  fireEvent.change(editor, { target: { value: "second edit" } });
+  const save = screen.getByRole("button", { name: "Save and approve" });
+  await waitFor(() => expect(save).toBeEnabled());
+  fireEvent.click(save);
+  await waitFor(() => expect(savePromptFile).toHaveBeenLastCalledWith("session-1", "blob-a", "second edit", "c".repeat(64), "first", "prompt_template"));
+});
+
+it("opens read-only with Save disabled and the reason while the step's card covers its other prompt file", async () => {
+  useInterpretationEventsStore.setState({ pendingBySession: { "session-1": { card: { choice: "pending", kind: "llm_prompt_template", affected_node_id: "first" } as InterpretationEvent } } });
+  seedTwoFileStep();
+  const reason = "This step's review card also covers its other prompt files. Approve the review card first, then edit the file.";
+  const edit = screen.getByRole("button", { name: "Edit user.md (User prompt)" });
+  expect(edit).toHaveAttribute("aria-disabled", "false");
+  expect(edit).toHaveAccessibleDescription(reason);
+  fireEvent.click(edit);
+  const editor = await screen.findByRole("textbox", { name: "Edit prompt file user.md (User prompt)" });
+  await waitFor(() => expect(editor).toHaveValue("text of file A"));
+  expect(editor).toHaveAttribute("readonly");
+  expect(editor).toHaveAccessibleDescription(reason);
+  const save = screen.getByRole("button", { name: "Save and approve" });
+  expect(save).toBeDisabled();
+  expect(save).toHaveAccessibleDescription(reason);
+  fireEvent.click(save);
   expect(savePromptFile).not.toHaveBeenCalled();
-  expect(editors[0]).toHaveValue("my draft");
 });
 
 it("keeps Save enabled for a single file-backed slot beside an inline prompt", async () => {

@@ -895,3 +895,12 @@
   color: var(--color-text-muted);
   font-size: var(--font-size-xs);
 }
+
+/* These are bare buttons (no .btn class), so the shared disabled treatment in
+   styles/shared.css never reaches them. Without this an Edit that cannot open
+   looked exactly like one that can. */
+.prompt-slot-actions > button[aria-disabled="true"] {
+  color: var(--color-text-muted);
+  cursor: not-allowed;
+  text-decoration: line-through;
+}

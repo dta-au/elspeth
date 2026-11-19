@@ -151,7 +151,8 @@ def test_save_refuses_what_the_user_cannot_see_or_would_not_run(tmp_path, bound,
     assert client.get(f"/api/sessions/{session_id}/blobs/{blob['id']}/content").content == b"before\n"
 
 
-def test_save_refuses_node_with_two_prompt_files(tmp_path: Path) -> None:
+def test_save_refuses_node_with_two_prompt_files_while_its_card_is_pending(tmp_path: Path) -> None:
+    """The pending card covers both files; the editor shows one, so the save must not settle it."""
     client, service, blob_service, session_id, first, _other, _events = _live_prompt_setup(tmp_path)
     second = _upload_blob(client, session_id, b"second", "second.txt", "text/plain")
     current = asyncio.run(service.get_current_state(UUID(session_id)))
@@ -178,7 +179,7 @@ def test_save_refuses_node_with_two_prompt_files(tmp_path: Path) -> None:
     assert before is not None
     response = _save(client, session_id, first["id"], "edited", first["content_hash"])
     assert response.status_code == 409
-    assert response.json()["detail"]["error_code"] == "prompt_file_node_multi_binding"
+    assert response.json()["detail"]["error_code"] == "prompt_file_review_pending_files"
     assert client.get(f"/api/sessions/{session_id}/blobs/{first['id']}/content").content == b"first before"
     with blob_service._engine.connect() as conn:
         assert conn.execute(select(prompt_file_approvals_table)).all() == []
@@ -654,7 +655,7 @@ def test_save_refuses_to_reanchor_a_drifted_resolved_review(tmp_path: Path) -> N
     refused = _save(client, session_id, first["id"], "user edited file", first["content_hash"])
 
     assert refused.status_code == 409, refused.text
-    assert refused.json()["detail"]["error_code"] == "prompt_file_stale"
+    assert refused.json()["detail"] == {"error_code": "prompt_file_stale", "message": prompt_text_routes._STALE_REVIEW_DRIFTED}
     after = asyncio.run(service.get_current_state(UUID(session_id)))
     assert after is not None
     assert after.id == drifted_head.id
@@ -1263,7 +1264,8 @@ def test_editor_save_refuses_when_last_approval_no_longer_attests_the_surface(tm
     before = _save_side_effects(service, blob_service, session_id, fallback["id"])
     refused = _save(client, session_id, fallback["id"], "user edited fallback {{ row.text }}", fallback["content_hash"])
     assert refused.status_code == 409, refused.text
-    assert refused.json()["detail"]["error_code"] == "prompt_file_stale"
+    # The review is resolved and matches its prompt; only the file approval is out of date, and no card is open.
+    assert refused.json()["detail"] == {"error_code": "prompt_file_stale", "message": prompt_text_routes._STALE_NOT_APPROVED}
     assert client.get(f"/api/sessions/{session_id}/blobs/{fallback['id']}/content").content == b"fallback file text {{ row.text }}"
     assert _save_side_effects(service, blob_service, session_id, fallback["id"]) == before
     with pytest.raises(PromptFileReviewStale):

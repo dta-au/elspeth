@@ -32,7 +32,9 @@ interface BlobRowProps {
   attachedFields?: readonly string[];
   selectedNodeLabel?: string | null;
   focused?: boolean;
+  /** Opens the prompt editor for this file. Absent with `editRefusal` set: the control shows, disabled. */
   onEditPrompt?: () => void;
+  /** Why a save of this prompt file would be refused, or why it cannot be opened at all. */
   editRefusal?: string;
   onSelect?: () => void;
 }
@@ -109,6 +111,7 @@ export function BlobRow({
   onSelect,
 }: BlobRowProps) {
   const chipId = useId();
+  const editRefusalId = useId();
   const attached = selectedNodeLabel !== null && selectedNodeLabel !== undefined && (attachedFields?.length ?? 0) > 0;
   const status = statusIndicator(blob.status);
   const creatorLabel = creatorBadgeLabel(blob.created_by);
@@ -237,8 +240,12 @@ export function BlobRow({
 
         {/* Actions */}
         <div className="blob-row-actions">
-          {onEditPrompt && <Button type="button" variant="bare" onClick={onEditPrompt}
-            aria-label={`Edit prompt ${blob.filename}`} aria-describedby={attached ? chipId : undefined}>Edit prompt</Button>}
+          {(onEditPrompt || editRefusal) && <>
+            <Button type="button" variant="bare" onClick={onEditPrompt} aria-disabled={onEditPrompt === undefined} title={editRefusal}
+              aria-label={`Edit prompt ${blob.filename}`}
+              aria-describedby={[attached ? chipId : null, editRefusal ? editRefusalId : null].filter((id) => id !== null).join(" ") || undefined}>Edit prompt</Button>
+            {editRefusal && <span className="sr-only" id={editRefusalId}>{editRefusal}</span>}
+          </>}
           {canPreview && blob.status === "ready" && (
             <Button
               variant="bare"
