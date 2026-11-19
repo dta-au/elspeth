@@ -214,17 +214,19 @@ def test_editing_current_amended_projection_reopens_only_applicable_reviews(fiel
     assert result.success, result.validation.errors
     reviews = result.updated_state.nodes[0].options["interpretation_requirements"]
     assert next(row for row in reviews if row["kind"] == "llm_prompt_template")["status"] == "pending"
+    # A wording edit outside the slots, like a system-prompt edit, reopens the
+    # prompt review only: both amended terms keep their rows unchanged.
     vague = [row for row in reviews if row["kind"] == "vague_term"]
-    assert [row["status"] for row in vague] == (["pending", "pending"] if field == "prompt_template_parts" else ["resolved", "resolved"])
+    assert vague == [row for row in state.nodes[0].options["interpretation_requirements"] if row["kind"] == "vague_term"]
+    assert [(row["status"], row["accepted_value"]) for row in vague] == [("resolved", "support categories"), ("resolved", "new users")]
     assert isinstance(materialize_state_for_execution(result.updated_state), InterpretationReviewPending)
     updated = result.updated_state.nodes[0].options
     if field == "prompt_template_parts":
-        assert "approved_prompt_artifact_hash" not in updated
-    else:
-        # Retained vague-term evidence derives an artifact identity. The
-        # pending prompt review above still blocks execution independently.
-        assert updated["approved_prompt_artifact_hash"] == approved_prompt_artifact_hash_from_options(updated)
-        assert updated["approved_prompt_artifact_hash"] != state.nodes[0].options["approved_prompt_artifact_hash"]
+        assert updated["prompt_template"] == "Assess support categories for {{ row.text }}. Audience: new users"
+    # Retained vague-term evidence derives an artifact identity. The
+    # pending prompt review above still blocks execution independently.
+    assert updated["approved_prompt_artifact_hash"] == approved_prompt_artifact_hash_from_options(updated)
+    assert updated["approved_prompt_artifact_hash"] != state.nodes[0].options["approved_prompt_artifact_hash"]
     assert state.to_dict() == before
 
 
@@ -348,14 +350,49 @@ def test_parts_only_patch_validates_the_new_rendered_prompt() -> None:
 
     assert result.success, result.validation.errors
     options = result.updated_state.nodes[0].options
-    assert options["prompt_template"].startswith("Assess ")
+    assert options["prompt_template"] == "Assess support categories for {{ row.text }}."
     assert options["prompt_template_parts"][1] == state.nodes[0].options["prompt_template_parts"][1]
     assert next(row for row in options["interpretation_requirements"] if row["kind"] == "llm_prompt_template")["status"] == "pending"
+    # The accepted term is carried across the wording edit; the reopened
+    # prompt review is the review of the change and still blocks execution.
     category = next(row for row in options["interpretation_requirements"] if row["id"] == "category")
-    assert category["status"] == "pending"
-    assert category["draft"] == "support categories"
-    assert category["accepted_value"] is None
+    assert category == next(row for row in state.nodes[0].options["interpretation_requirements"] if row["id"] == "category")
+    assert (category["status"], category["accepted_value"], category["event_id"]) == ("resolved", "support categories", "category-event")
     assert isinstance(materialize_state_for_execution(result.updated_state), InterpretationReviewPending)
+
+
+@pytest.mark.parametrize("prompt_review_row", ["present", "absent"])
+def test_term_is_carried_across_a_wording_edit_only_when_the_prompt_review_reopens(prompt_review_row: str) -> None:
+    """The reopened prompt review is the review of the wording change.
+
+    Reconciliation is driven directly: no tool stages a structured LLM prompt
+    without its prompt review row, so that shape is hand-built to hold the
+    guard in place. With nothing to reopen, the term reopens as it did before.
+    """
+    state = _approved_state(structured=True)
+    options = deep_thaw(state.nodes[0].options)
+    edited_options = deep_thaw(state.nodes[0].options)
+    edited_options["prompt_template_parts"][0]["text"] = "Assess "
+    if prompt_review_row == "absent":
+        for candidate in (options, edited_options):
+            candidate["interpretation_requirements"] = [
+                row for row in candidate["interpretation_requirements"] if row["kind"] != "llm_prompt_template"
+            ]
+    previous = state.with_node(replace(state.nodes[0], options=options))
+    proposed = state.with_node(replace(state.nodes[0], options=edited_options))
+
+    reconciled = reconcile_authoritative_reviews(previous, proposed).nodes[0].options
+
+    rows = {row["id"]: row for row in reconciled["interpretation_requirements"]}
+    stored = next(row for row in options["interpretation_requirements"] if row["id"] == "category")
+    if prompt_review_row == "present":
+        assert rows["category"] == stored
+        assert next(row for row in rows.values() if row["kind"] == "llm_prompt_template")["status"] == "pending"
+        assert reconciled["prompt_template"] == "Assess support categories for {{ row.text }}."
+    else:
+        assert (rows["category"]["status"], rows["category"]["accepted_value"], rows["category"]["event_id"]) == ("pending", None, None)
+        assert reconciled["prompt_template"] == "Assess pending interpretation for {{ row.text }}."
+        assert "approved_prompt_artifact_hash" not in reconciled
 
 
 def test_system_prompt_edit_preserves_unchanged_structured_category_review() -> None:
