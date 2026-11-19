@@ -28,7 +28,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal, NotRequired, TypedDict, TypeGuard, cast
+from typing import Any, Final, Literal, NotRequired, TypedDict, TypeGuard, cast
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
@@ -121,6 +121,7 @@ from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_TEMPLATE_PARTS_KEY,
     reconcile_authoritative_reviews,
+    serialize_authoring_review_options,
 )
 from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
 from elspeth.web.resource_identity import canonical_resource_uuid
@@ -1254,6 +1255,85 @@ def _written_options_for_prompt_replacement(
             row for row in requirements if not (_is_vague_term_requirement(row) and "id" in row and str(row["id"]) in superseded)
         ]
     return remaining
+
+
+# Result keys for a write that carried a node's existing prompt text. One
+# constant each, so the names and the sentence change in one place.
+PROMPT_UNCHANGED_NODE_IDS_KEY: Final = "prompt_unchanged_node_ids"
+PROMPT_UNCHANGED_NOTE_KEY: Final = "prompt_unchanged_note"
+PROMPT_UNCHANGED_NOTE: Final = (
+    "Each node in prompt_unchanged_node_ids was sent its existing prompt text: its prompt, term definitions and "
+    "approvals are unchanged. To replace it, send different text with prompt_template_parts: null."
+)
+
+
+def _texts_of_the_stored_prompt(stored_options: Mapping[str, JsonValue]) -> frozenset[str]:
+    """The two renderings the server hands out for a node's stored prompt.
+
+    The stored compiled ``prompt_template`` (what the turn context shows) and
+    the authoring export's ``prompt_template`` (what
+    ``get_pipeline_state(component="set_pipeline_arguments")`` returns, with
+    its placeholder words at each term slot). The export text comes from the
+    export's own serializer, so the two cannot drift.
+    """
+    texts: set[str] = set()
+    stored_prompt = stored_options["prompt_template"] if "prompt_template" in stored_options else None
+    if type(stored_prompt) is str:
+        texts.add(stored_prompt)
+    try:
+        exported = serialize_authoring_review_options(stored_options)
+    except ValueError:
+        # Stored options the export itself cannot serialize have no export text.
+        return frozenset(texts)
+    exported_prompt = exported["prompt_template"] if "prompt_template" in exported else None
+    if type(exported_prompt) is str:
+        texts.add(exported_prompt)
+    return frozenset(texts)
+
+
+def _written_options_keeping_an_unchanged_prompt(
+    stored_options: Mapping[str, JsonValue],
+    written: Mapping[str, JsonValue],
+    *,
+    merge_patch: bool,
+) -> Mapping[str, JsonValue] | None:
+    """The write with the stored structured prompt kept, when it re-sends that prompt's own text.
+
+    Text equal to a rendering the server hands out for the stored prompt (see
+    ``_texts_of_the_stored_prompt``) never changes the prompt's structure or
+    reviews, whatever the write says about ``prompt_template_parts`` (null, or
+    no key at all): identical text replaces nothing. Equal means the same
+    string; a re-typed prompt that differs by one space is a change.
+
+    A merge patch loses its ``prompt_template`` and its null parts key, so the
+    stored prompt is not touched and the export's placeholder words are never
+    written. A whole-node write gets the stored text and parts back, and the
+    stored requirement rows when it sent no ``interpretation_requirements`` key
+    at all; rows it did send are judged as on any write that keeps the prompt.
+    Nothing here is authored: every value restored is the node's own stored
+    value. Stored rows are restored in no other case.
+
+    Returns ``None`` for every other write, including one that sends
+    ``prompt_template_parts`` itself.
+    """
+    stored_parts = stored_options[PROMPT_TEMPLATE_PARTS_KEY] if PROMPT_TEMPLATE_PARTS_KEY in stored_options else None
+    if stored_parts is None:
+        return None
+    if PROMPT_TEMPLATE_PARTS_KEY in written and written[PROMPT_TEMPLATE_PARTS_KEY] is not None:
+        return None
+    prompt = written["prompt_template"] if "prompt_template" in written else None
+    if type(prompt) is not str or prompt not in _texts_of_the_stored_prompt(stored_options):
+        return None
+    kept: dict[str, JsonValue] = {key: value for key, value in written.items() if key not in ("prompt_template", PROMPT_TEMPLATE_PARTS_KEY)}
+    if merge_patch:
+        return kept
+    kept["prompt_template"] = stored_options["prompt_template"]
+    kept[PROMPT_TEMPLATE_PARTS_KEY] = deep_thaw(stored_parts)
+    if INTERPRETATION_REQUIREMENTS_KEY not in written:
+        stored_rows = stored_options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in stored_options else None
+        if isinstance(stored_rows, (list, tuple)):
+            kept[INTERPRETATION_REQUIREMENTS_KEY] = [deep_thaw(row) for row in stored_rows]
+    return kept
 
 
 def _structured_prompt_template_refusal(

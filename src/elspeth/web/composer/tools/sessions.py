@@ -118,6 +118,9 @@ from elspeth.web.composer.tools._common import (
     validate_composer_file_sink_collision_policy,
 )
 from elspeth.web.composer.tools.blobs import (
+    PROMPT_UNCHANGED_NODE_IDS_KEY,
+    PROMPT_UNCHANGED_NOTE,
+    PROMPT_UNCHANGED_NOTE_KEY,
     _blob_create_payload,
     _blob_creation_provenance,
     _file_inject_node_option_error,
@@ -129,6 +132,7 @@ from elspeth.web.composer.tools.blobs import (
     _structured_prompt_template_refusal,
     _whole_prompt_text_replacement,
     _written_options_for_prompt_replacement,
+    _written_options_keeping_an_unchanged_prompt,
 )
 from elspeth.web.composer.tools.declarations import (
     GRAPH_EFFECTS,
@@ -1518,6 +1522,7 @@ def build_set_pipeline_candidate(
     canonical_node_options: dict[int, Mapping[str, Any]] = {}
     current_nodes = {node.id: node for node in state.nodes}
     superseded_review_ids: list[str] = []
+    prompt_unchanged_node_ids: list[str] = []
     for node_index, node in enumerate(validated.nodes):
         node_id = node.id
         node_ref = f"node:{node_id}"
@@ -1570,6 +1575,11 @@ def build_set_pipeline_candidate(
         # reconcile against it.
         replacement: _PromptReplacement | None = None
         if node_plugin == "llm" and node_id in current_nodes and current_nodes[node_id].plugin == "llm":
+            # The stored prompt's own text replaces nothing, whatever the parts key says.
+            kept_options = _written_options_keeping_an_unchanged_prompt(current_nodes[node_id].options, node_options, merge_patch=False)
+            if kept_options is not None:
+                node_options = kept_options
+                prompt_unchanged_node_ids.append(node_id)
             replacement = _whole_prompt_text_replacement(current_nodes[node_id].options, node_options)
         if replacement is not None:
             # A stored row that is already non-canonical is refused first, so
@@ -2140,6 +2150,14 @@ def build_set_pipeline_candidate(
         # the user which definitions no longer apply.
         superseded_payload = {"superseded_review_ids": list(superseded_review_ids)}
         data = superseded_payload if data is None else {**data, **superseded_payload}
+    if prompt_unchanged_node_ids:
+        # Nodes whose write carried the stored prompt's own text without its
+        # parts: their stored prompt structure and reviews were kept.
+        kept_payload = {
+            PROMPT_UNCHANGED_NODE_IDS_KEY: list(prompt_unchanged_node_ids),
+            PROMPT_UNCHANGED_NOTE_KEY: PROMPT_UNCHANGED_NOTE,
+        }
+        data = kept_payload if data is None else {**data, **kept_payload}
     return _candidate(
         _mutation_result(
             new_state,
@@ -2217,7 +2235,9 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
         "tool that matches the edit: `patch_node_options` for an option-only change, `splice_transform` to "
         "insert one transform on a direct linear path, `upsert_node` / `upsert_edge` to add or rewire a node. "
         "For an llm node that has a structured prompt, options with prompt_template text and prompt_template_parts: null "
-        "replace the whole prompt; `superseded_review_ids` names the old prompt's vague-term reviews that were removed."
+        "replace the whole prompt; `superseded_review_ids` names the old prompt's vague-term reviews that were removed. "
+        "prompt_template text equal to the stored prompt replaces nothing: `prompt_unchanged_node_ids` names each node whose "
+        "stored prompt structure and reviews were kept."
     ),
     json_schema={
         "type": "object",

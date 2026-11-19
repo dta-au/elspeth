@@ -12,6 +12,24 @@
    "tool": "get_plugin_schema",
    "key": "data.policy_capabilities",
    "reason": "Same field as plugin_schemas.<kind/plugin>.policy_capabilities on the discovery surface: server-side control-coverage bookkeeping (CapabilityDeclaration) that no composer authoring path reads and that the required-control admission gate enforces independently, so the model gains nothing actionable from it (ratified F3b, 2026-09-02)."
+  },
+  {
+   "surface": "tool-data",
+   "tool": "patch_node_options",
+   "key": "data.prompt_unchanged_note",
+   "reason": "A self-explaining sentence that travels only beside prompt_unchanged_node_ids, which each tool's description does teach: it tells the model in the result itself that the node was sent its existing prompt text and nothing was replaced. The integrator ruled on 2026-11-19 that it gets no clause in the tool descriptions, because teaching 'equal text is harmless' there invites the habit of sending prompt_template on a structured step."
+  },
+  {
+   "surface": "tool-data",
+   "tool": "upsert_node",
+   "key": "data.prompt_unchanged_note",
+   "reason": "A self-explaining sentence that travels only beside prompt_unchanged_node_ids, which each tool's description does teach: it tells the model in the result itself that the node was sent its existing prompt text and nothing was replaced. The integrator ruled on 2026-11-19 that it gets no clause in the tool descriptions, because teaching 'equal text is harmless' there invites the habit of sending prompt_template on a structured step."
+  },
+  {
+   "surface": "tool-data",
+   "tool": "set_pipeline",
+   "key": "data.prompt_unchanged_note",
+   "reason": "A self-explaining sentence that travels only beside prompt_unchanged_node_ids, which each tool's description does teach: it tells the model in the result itself that the node was sent its existing prompt text and nothing was replaced. The integrator ruled on 2026-11-19 that it gets no clause in the tool descriptions, because teaching 'equal text is harmless' there invites the habit of sending prompt_template on a structured step."
   }
  ]
 }

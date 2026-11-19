@@ -33,7 +33,7 @@ import structlog
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.web.composer import yaml_generator
 from elspeth.web.composer.state import CompositionState, ValidationSummary
-from elspeth.web.composer.tools._common import _authored_interpretation_requirement_id
+from elspeth.web.composer.tools._common import _authored_interpretation_requirement_id, _serialize_set_pipeline_arguments
 from elspeth.web.execution.validation import validate_pipeline_for_trained_operator
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
 from elspeth.web.sessions.converters import state_from_record
@@ -224,9 +224,10 @@ async def _approved_structured_prompt(service: SessionServiceImpl, env: dict[str
     return state
 
 
+@pytest.mark.parametrize("explicit_null", [True], ids=["with-null-parts"])
 @pytest.mark.asyncio
 async def test_text_replaces_an_approved_structured_prompt_and_each_edit_is_reviewed_before_it_runs(
-    blob_env: dict[str, Any], tmp_path: Path
+    blob_env: dict[str, Any], tmp_path: Path, explicit_null: bool
 ) -> None:
     service = _service(blob_env)
     approved_a = await _approved_structured_prompt(service, blob_env, tmp_path)
@@ -238,7 +239,8 @@ async def test_text_replaces_an_approved_structured_prompt_and_each_edit_is_revi
     seen_hashes = [hash_a]
     state = approved_a
     for stage, text, superseded in (("first replacement", TEXT_B, [RATING_ID]), ("second replacement", TEXT_C, None)):
-        result = _tool(blob_env, state, {"prompt_template": text, "prompt_template_parts": None})
+        # Both shapes a model sends: the explicit signal, and the text alone.
+        result = _tool(blob_env, state, {"prompt_template": text, **({"prompt_template_parts": None} if explicit_null else {})})
 
         assert result.success, (stage, result.to_dict())
         assert result.validation.is_valid, (stage, [entry.to_dict() for entry in result.validation.errors])
@@ -272,3 +274,133 @@ async def test_text_replaces_an_approved_structured_prompt_and_each_edit_is_revi
         assert admitted["interpretation_review"] is True, (stage, admitted)
         assert admitted["plugin_instantiation"] is True, (stage, admitted)
         assert admitted["execution_ready"] is True, (stage, admitted)
+
+
+async def _approve_every_pending_card(service: SessionServiceImpl, env: dict[str, Any], state: CompositionState) -> CompositionState:
+    while True:
+        pending = [row["kind"] for row in state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY] if row["status"] == "pending"]
+        if not pending:
+            return state
+        state = await _approve(service, env, state, InterpretationKind(pending[0]))
+
+
+def _write_prompt(env: dict[str, Any], writer: str, state: CompositionState, written: dict[str, Any]) -> Any:
+    """Send ``written`` prompt options through one writer; the whole-node writers re-send the exported node."""
+    if writer == "patch_node_options":
+        arguments: dict[str, Any] = {"node_id": "classify", "patch": written}
+    else:
+        exported, error = _serialize_set_pipeline_arguments(state)
+        assert error is None and exported is not None
+        node = next(item for item in exported["nodes"] if item["id"] == "classify")
+        node["options"] = {**node["options"], **written}
+        arguments = node if writer == "upsert_node" else exported
+    return blob_tools.execute_tool(
+        writer,
+        arguments,
+        state,
+        blob_tools._catalog(),
+        data_dir=env["data_dir"],
+        session_engine=env["engine"],
+        session_id=env["session_id"],
+        session_operation_context=env["operation"],
+        session_operation_authority=env["authority"],
+    )
+
+
+# set_pipeline is not driven here: this fixture's source path is refused by the
+# path policy when the whole pipeline is re-sent, before any prompt handling.
+@pytest.mark.parametrize("writer", ["patch_node_options", "upsert_node"])
+@pytest.mark.parametrize("explicit_null", [True, False], ids=["with-null-parts", "text-alone"])
+@pytest.mark.asyncio
+async def test_text_replaces_an_approved_file_prompt_and_is_reviewed_before_it_runs(
+    blob_env: dict[str, Any], tmp_path: Path, writer: str, explicit_null: bool
+) -> None:
+    """Replace works in the file-to-text direction too, and the file's approval never approves the text."""
+    service = _service(blob_env)
+    blob = blob_tools._create_blob(blob_env, content="Label {{ row.text }} as good or bad.")
+    wired = blob_tools.execute_tool(
+        "wire_blob_inline_ref",
+        {"field_path": "node:classify.options.prompt_template", "blob_id": blob.data["blob_id"]},
+        blob_tools._field_declaring_sink_state(tmp_path),
+        blob_tools._catalog(),
+        data_dir=blob_env["data_dir"],
+        session_engine=blob_env["engine"],
+        session_id=blob_env["session_id"],
+        session_operation_context=blob_env["operation"],
+        session_operation_authority=blob_env["authority"],
+    )
+    assert wired.success, wired.to_dict()
+    state = await _approve_every_pending_card(service, blob_env, wired.updated_state)
+    assert state.nodes[0].options["prompt_template"]["blob_ref"] == blob.data["blob_id"]
+    assert set(_reviews(state).values()) == {"resolved"}, _reviews(state)
+    file_review = dict(_row(state, "llm_prompt_template"))
+
+    result = _write_prompt(
+        blob_env, writer, state, {"prompt_template": TEXT_B, **({"prompt_template_parts": None} if explicit_null else {})}
+    )
+
+    assert result.success, result.to_dict()
+    replaced = result.updated_state
+    options = replaced.nodes[0].options
+    # The marker is gone and the text stands in its place.
+    assert options["prompt_template"] == TEXT_B
+    assert options.get("prompt_template_parts") is None
+    assert HASH_KEY not in options
+    # The text gets its own pending card; the file's approval is not carried.
+    text_review = _row(replaced, "llm_prompt_template")
+    assert text_review["status"] == "pending"
+    assert TEXT_B in text_review["draft"]
+    assert text_review["event_id"] is None and text_review["accepted_value"] is None
+    assert text_review["event_id"] != file_review["event_id"]
+    # No term reviews existed, so the result names none as removed.
+    assert result.data is None or "superseded_review_ids" not in result.data
+    _assert_authoring_valid_with_true_guarantees(replaced, stage="text over file, card pending")
+    unreviewed = _run_admission(blob_env, replaced)
+    assert unreviewed["interpretation_review"] is False, unreviewed
+    assert unreviewed["execution_ready"] is False, unreviewed
+
+    state = await _approve_every_pending_card(service, blob_env, replaced)
+
+    admitted = _run_admission(blob_env, state)
+    assert admitted["interpretation_review"] is True, admitted
+    assert admitted["execution_ready"] is True, admitted
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Known defect, measured 2026-11-19 on ce7d94c1a and on this tree: an approved file-backed prompt node re-sent "
+        "through upsert_node exactly as the authoring export returns it loses approved_prompt_artifact_hash and its "
+        "llm_prompt_template review reopens as pending. The binding is kept and no review is skipped. Reported to the "
+        "integrator; not fixed here."
+    ),
+)
+@pytest.mark.asyncio
+async def test_an_approved_file_prompt_node_sent_back_as_exported_keeps_its_binding_and_approval(
+    blob_env: dict[str, Any], tmp_path: Path
+) -> None:
+    service = _service(blob_env)
+    blob = blob_tools._create_blob(blob_env, content="Label {{ row.text }} as good or bad.")
+    wired = blob_tools.execute_tool(
+        "wire_blob_inline_ref",
+        {"field_path": "node:classify.options.prompt_template", "blob_id": blob.data["blob_id"]},
+        blob_tools._field_declaring_sink_state(tmp_path),
+        blob_tools._catalog(),
+        data_dir=blob_env["data_dir"],
+        session_engine=blob_env["engine"],
+        session_id=blob_env["session_id"],
+        session_operation_context=blob_env["operation"],
+        session_operation_authority=blob_env["authority"],
+    )
+    assert wired.success, wired.to_dict()
+    state = await _approve_every_pending_card(service, blob_env, wired.updated_state)
+    stored = state.nodes[0].options
+
+    result = _write_prompt(blob_env, "upsert_node", state, {})
+
+    assert result.success, result.to_dict()
+    after = result.updated_state.nodes[0].options
+    changed = {key: (stored.get(key), after.get(key)) for key in set(stored) | set(after) if stored.get(key) != after.get(key)}
+    assert changed == {}, changed
+    assert _row(result.updated_state, "llm_prompt_template")["status"] == "resolved"
+    assert result.data is None or ("superseded_review_ids" not in result.data and "prompt_unchanged_node_ids" not in result.data)

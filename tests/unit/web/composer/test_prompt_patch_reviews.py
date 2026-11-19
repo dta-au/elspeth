@@ -11,6 +11,7 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.prompts import build_context_string, project_server_owned_option_metadata
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, SourceSpec
+from elspeth.web.composer.tools import blobs as blob_tools
 from elspeth.web.composer.tools import sessions as session_tools
 from elspeth.web.composer.tools import transforms as transform_tools
 from elspeth.web.composer.tools._common import _serialize_set_pipeline_arguments
@@ -135,7 +136,7 @@ def test_current_projection_roundtrip_preserves_amendments_and_review_authority(
         assert updated.options["approved_prompt_artifact_hash"] == original["approved_prompt_artifact_hash"]
 
 
-@pytest.mark.parametrize("damage", ["stale", "history", "accepted", "reference", "missing-parts", "stored-hash", "approval"])
+@pytest.mark.parametrize("damage", ["stale", "history", "accepted", "reference", "stored-hash", "approval"])
 def test_projected_review_corruption_refuses_atomically(damage: str) -> None:
     state = _amended_approved_state()
     if damage in ("stored-hash", "approval"):
@@ -160,8 +161,6 @@ def test_projected_review_corruption_refuses_atomically(damage: str) -> None:
         category["accepted_value"] = "PRIVATE-FORGED-ACCEPTANCE"
     elif damage == "reference":
         options["prompt_template_parts"][1] = {"kind": "interpretation_ref", "requirement_id": "unknown"}
-    elif damage == "missing-parts":
-        del options["prompt_template_parts"]
     args, error = _serialize_set_pipeline_arguments(state)
     assert error is None and args is not None
     args["source"] = visible["sources"]["source"]
@@ -176,6 +175,30 @@ def test_projected_review_corruption_refuses_atomically(damage: str) -> None:
     assert state.to_dict() == before
     assert "PRIVATE-HISTORY-TAMPER" not in repr(result.to_dict())
     assert "PRIVATE-FORGED-ACCEPTANCE" not in repr(result.to_dict())
+
+
+def test_projection_written_back_without_its_parts_keeps_the_stored_prompt() -> None:
+    """The model-visible projection of a node, written back with ``prompt_template_parts`` deleted.
+
+    Until 2026-11-19 this was the ``missing-parts`` case of
+    ``test_projected_review_corruption_refuses_atomically`` and was refused
+    (``review_reconciliation_failed``). The projection carries the stored
+    compiled prompt, and text equal to the stored prompt never changes the
+    prompt's structure or reviews, so the write now keeps the stored node
+    exactly and names it in ``prompt_unchanged_node_ids``. No approval is created:
+    the stored rows come back as stored.
+    """
+    state = _amended_approved_state()
+    visible = project_server_owned_option_metadata(state.to_dict())
+    del visible["nodes"][0]["options"]["prompt_template_parts"]
+    args, error = _serialize_set_pipeline_arguments(state)
+    assert error is None and args is not None
+    args["source"] = visible["sources"]["source"]
+    args["nodes"] = visible["nodes"]
+
+    result = execute_tool("set_pipeline", args, state, _mock_catalog())
+
+    _assert_prompt_kept(result, state)
 
 
 @pytest.mark.parametrize("field", ["prompt_template_parts", "system_prompt"])
@@ -418,6 +441,13 @@ _REPLACEMENT_TEXT = "Summarize {{ row.text }} in one line."
 _FILE_MARKER = {"blob_ref": "00000000-0000-4000-8000-000000000001", "mode": "inline_content", "sha256": "a" * 64}
 
 
+# Verbatim pin: the sentence a tool result carries beside prompt_unchanged_node_ids.
+_PROMPT_UNCHANGED_NOTE = (
+    "Each node in prompt_unchanged_node_ids was sent its existing prompt text: its prompt, term definitions and "
+    "approvals are unchanged. To replace it, send different text with prompt_template_parts: null."
+)
+
+
 def _forced_refusal(*_args: object, **_kwargs: object) -> str:
     return "forced refusal"
 
@@ -594,6 +624,23 @@ def test_structured_prompt_replaced_by_another_structured_prompt_in_one_call(reu
     assert isinstance(materialize_state_for_execution(result.updated_state), InterpretationReviewPending)
 
 
+@pytest.mark.parametrize("slots", ["accepted", "accepted-and-pending"])
+def test_patch_node_options_text_equal_to_the_stored_prompt_replaces_nothing(slots: str) -> None:
+    """Text alone is a replacement only when it changes the prompt; the stored rendered text is not a change."""
+    state = _slot_fixture(slots)
+    stored = state.nodes[0].options
+
+    result = execute_tool(
+        "patch_node_options", {"node_id": "code_themes", "patch": {"prompt_template": stored["prompt_template"]}}, state, _mock_catalog()
+    )
+
+    # Rows and approvals whole: every requirement row equal to the stored row,
+    # resolved reviews still resolved, and nothing reported as replaced or kept.
+    # The model believes it wrote a prompt, so the node is listed as unchanged.
+    _assert_prompt_kept(result, state)
+    assert result.updated_state.nodes[0].options == stored
+
+
 @pytest.mark.parametrize("writer", _WRITERS)
 def test_changed_text_without_the_null_parts_signal_is_refused_and_names_the_replace_call(writer: str) -> None:
     state = _approved_state(structured=True)
@@ -686,18 +733,320 @@ def test_a_refusal_after_the_replacement_is_decided_returns_the_original_state(
     assert "prompt_template_parts" in state.nodes[0].options and _vague_ids(state) == ["category"]
 
 
+def _assert_prompt_kept(result: object, state: CompositionState, *, listed: bool = True) -> None:
+    """The stored prompt, its parts, every requirement row and the approval are exactly as stored."""
+    assert result.success, result.validation.errors
+    stored = deep_thaw(state.nodes[0].options)
+    options = deep_thaw(result.updated_state.nodes[0].options)
+    assert options["prompt_template_parts"] == stored["prompt_template_parts"]
+    # Whole-row equality: ids, statuses, accepted values, events and hashes.
+    assert options["interpretation_requirements"] == stored["interpretation_requirements"]
+    assert options == stored
+    data = result.data or {}
+    # Nothing a model would report as a completed replace.
+    assert "superseded_review_ids" not in data
+    # The list and its sentence travel together, or not at all.
+    assert ("prompt_unchanged_node_ids" in data) is listed
+    assert ("prompt_unchanged_note" in data) is listed
+    if listed:
+        assert list(data["prompt_unchanged_node_ids"]) == ["code_themes"]
+        assert data["prompt_unchanged_note"] == _PROMPT_UNCHANGED_NOTE
+    assert type(materialize_state_for_execution(result.updated_state)) is type(materialize_state_for_execution(state))
+
+
 @pytest.mark.parametrize("writer", _WRITERS)
-def test_byte_identical_replacement_text_still_reopens_the_prompt_review(writer: str) -> None:
-    """Nothing approved for A approves B, even when B renders to the same bytes."""
-    state = _approved_state(structured=True)
+@pytest.mark.parametrize("slots", ["accepted", "two-accepted", "accepted-and-pending"])
+def test_the_stored_prompts_own_text_with_null_parts_replaces_nothing(writer: str, slots: str) -> None:
+    """Text equal to the stored compiled prompt is not a replacement, even with ``prompt_template_parts: null``.
+
+    This test used to assert the opposite
+    (``test_byte_identical_replacement_text_still_reopens_the_prompt_review``):
+    that the pair replaced the prompt and reopened its review even for
+    byte-identical text. It was inverted on the integrator's ruling of
+    2026-11-19: a model that re-sends a structured node and adds the null key
+    must not silently remove the user's accepted definitions. The old test's
+    purpose, that nothing approved for A approves B, still holds here because
+    nothing is written and no approval moves, and it is pinned for changed
+    text by ``test_text_one_character_from_the_stored_prompt_is_a_replacement``.
+    Do not restore the old assertion.
+    """
+    state = _slot_fixture(slots)
     same_text = state.nodes[0].options["prompt_template"]
+
+    result = execute_tool(writer, _replace_call(writer, state, prompt=same_text), state, _mock_catalog())
+
+    _assert_prompt_kept(result, state)
+
+
+@pytest.mark.parametrize("writer", _WRITERS)
+@pytest.mark.parametrize("form", ["stored", "export", "context"])
+def test_the_stored_prompts_own_text_with_null_parts_and_carried_rows_replaces_nothing(writer: str, form: str) -> None:
+    state = _amended_approved_state(pending_audience=True)
+    same_text = state.nodes[0].options["prompt_template"]
+
+    result = execute_tool(
+        writer, _replace_call(writer, state, prompt=same_text, requirements=_echoed_rows(state, form)), state, _mock_catalog()
+    )
+
+    _assert_prompt_kept(result, state)
+
+
+@pytest.mark.parametrize("writer", _WRITERS)
+def test_keeping_the_prompt_does_not_stop_the_rest_of_the_write(writer: str) -> None:
+    state = _approved_state(structured=True)
+    stored = deep_thaw(state.nodes[0].options)
+    call = _replace_call(writer, state, prompt=stored["prompt_template"])
+    written = call["patch"] if writer == "patch_node_options" else _node_options_in_call(writer, call)
+    written["temperature"] = 0.25
+
+    result = execute_tool(writer, call, state, _mock_catalog())
+
+    assert result.success, result.validation.errors
+    options = deep_thaw(result.updated_state.nodes[0].options)
+    assert options["temperature"] == 0.25
+    assert options["prompt_template_parts"] == stored["prompt_template_parts"]
+    assert _vague_ids(result.updated_state) == ["category"]
+    assert list(result.data["prompt_unchanged_node_ids"]) == ["code_themes"]
+    assert "superseded_review_ids" not in result.data
+
+
+def _node_options_in_call(writer: str, call: dict[str, object], node_id: str = "code_themes") -> dict[str, object]:
+    if writer == "upsert_node":
+        return call["options"]
+    return next(item for item in call["nodes"] if item["id"] == node_id)["options"]
+
+
+@pytest.mark.parametrize("writer", _WRITERS)
+def test_text_one_character_from_the_stored_prompt_is_a_replacement(writer: str) -> None:
+    """Nothing approved for A approves B: one changed character replaces the prompt and retires A's reviews by name."""
+    state = _approved_state(structured=True)
+    changed = state.nodes[0].options["prompt_template"] + "!"
     assert next(row for row in state.nodes[0].options["interpretation_requirements"] if row["kind"] == "llm_prompt_template")["status"] == (
         "resolved"
     )
 
-    result = execute_tool(writer, _replace_call(writer, state, prompt=same_text), state, _mock_catalog())
+    result = execute_tool(writer, _replace_call(writer, state, prompt=changed), state, _mock_catalog())
 
-    _assert_prompt_replaced(result, superseded=["category"], prompt=same_text)
+    _assert_prompt_replaced(result, superseded=["category"], prompt=changed)
+    assert "prompt_unchanged_node_ids" not in result.data and "prompt_unchanged_note" not in result.data
+
+
+def test_set_pipeline_reports_a_kept_prompt_and_a_replaced_prompt_per_node() -> None:
+    """One whole-pipeline write: one node re-sent with its own text, another really replaced."""
+    state = _two_structured_nodes()
+    args, error = _serialize_set_pipeline_arguments(state)
+    assert error is None and args is not None
+    kept, replaced = args["nodes"][0], args["nodes"][1]
+    for node, prompt in ((kept, state.nodes[0].options["prompt_template"]), (replaced, _REPLACEMENT_TEXT)):
+        node["options"] = {
+            **{key: value for key, value in node["options"].items() if key not in ("prompt_template_parts", "interpretation_requirements")},
+            "prompt_template": prompt,
+            "prompt_template_parts": None,
+        }
+
+    result = execute_tool("set_pipeline", args, state, _mock_catalog())
+
+    assert result.success, result.validation.errors
+    assert list(result.data["prompt_unchanged_node_ids"]) == [kept["id"]]
+    assert list(result.data["superseded_review_ids"]) == _vague_ids(state, replaced["id"])
+    assert deep_thaw(_node(result.updated_state, kept["id"]).options) == deep_thaw(_node(state, kept["id"]).options)
+    assert "prompt_template_parts" not in _node(result.updated_state, replaced["id"]).options
+
+
+def _export_prompt(state: CompositionState, node_id: str = "code_themes") -> str:
+    """The node's ``prompt_template`` as ``get_pipeline_state(component="set_pipeline_arguments")`` returns it."""
+    args, error = _serialize_set_pipeline_arguments(state)
+    assert error is None and args is not None
+    return next(item for item in args["nodes"] if item["id"] == node_id)["options"]["prompt_template"]
+
+
+@pytest.mark.parametrize("slots", ["accepted", "two-accepted", "accepted-and-pending"])
+def test_the_exports_prompt_text_is_one_of_the_texts_equal_to_the_stored_prompt(slots: str) -> None:
+    """The equal set is built from the export's own serializer, so the export's text is always in it."""
+    state = _slot_fixture(slots)
+    options = state.nodes[0].options
+
+    texts = blob_tools._texts_of_the_stored_prompt(options)
+
+    assert _export_prompt(state) in texts
+    assert options["prompt_template"] in texts
+    assert len(texts) <= 2
+
+
+@pytest.mark.parametrize("writer", _WRITERS)
+@pytest.mark.parametrize("parts_null", [True, False], ids=["null-parts", "no-parts-key"])
+@pytest.mark.parametrize("slots", ["accepted", "two-accepted"])
+def test_the_exports_placeholder_text_never_becomes_the_prompt(writer: str, parts_null: bool, slots: str) -> None:
+    """The export renders accepted terms as placeholder words; sent back as plain text it changes nothing."""
+    state = _slot_fixture(slots)
+    exported = _export_prompt(state)
+    assert "pending interpretation" in exported and exported != state.nodes[0].options["prompt_template"]
+
+    result = execute_tool(writer, _replace_call(writer, state, prompt=exported, parts_null=parts_null), state, _mock_catalog())
+
+    _assert_prompt_kept(result, state)
+    assert "pending interpretation" not in result.updated_state.nodes[0].options["prompt_template"]
+
+
+@pytest.mark.parametrize("writer", _WRITERS)
+def test_an_ordinary_write_reports_no_unchanged_prompt(writer: str) -> None:
+    """The list and its sentence are absent when no node was sent its existing prompt text."""
+    state = _approved_state(structured=True)
+    call = _replace_call(writer, state, parts_null=False, prompt=state.nodes[0].options["prompt_template"])
+    written = call["patch"] if writer == "patch_node_options" else _node_options_in_call(writer, call)
+    del written["prompt_template"]
+    written["temperature"] = 0.25
+    if writer != "patch_node_options":
+        exported = _node_options_in_call(writer, _replace_call(writer, state))
+        del exported["prompt_template"], exported["prompt_template_parts"]
+        args, error = _serialize_set_pipeline_arguments(state)
+        assert error is None and args is not None
+        written.update(args["nodes"][0]["options"])
+        written["temperature"] = 0.25
+
+    result = execute_tool(writer, call, state, _mock_catalog())
+
+    assert result.success, result.validation.errors
+    assert result.data is None or ("prompt_unchanged_node_ids" not in result.data and "prompt_unchanged_note" not in result.data)
+
+
+@pytest.mark.parametrize("writer", ["upsert_node", "set_pipeline"])
+def test_node_sent_back_exactly_as_exported_keeps_an_amended_definition(writer: str) -> None:
+    """The export shows only the original draft, so the amended accepted value survives by row identity."""
+    state = _amended_approved_state()
+    stored = deep_thaw(state.nodes[0].options)
+    category = next(row for row in stored["interpretation_requirements"] if row["id"] == "category")
+    assert category["draft"] != category["accepted_value"]
+    args, error = _serialize_set_pipeline_arguments(state)
+    assert error is None and args is not None
+    exported_rows = args["nodes"][0]["options"]["interpretation_requirements"]
+    # Read shells only: three or four fields, no id, status or accepted value.
+    assert sorted(len(row) for row in exported_rows) == [3, 3, 3, 4]
+    exported_category = next(row for row in exported_rows if row["user_term"] == "category")
+    assert exported_category["draft"] == category["draft"] and "accepted_value" not in exported_category
+
+    result = execute_tool(writer, args["nodes"][0] if writer == "upsert_node" else args, state, _mock_catalog())
+
+    assert result.success, result.validation.errors
+    assert deep_thaw(result.updated_state.nodes[0].options) == stored
+    assert result.data is None or "prompt_unchanged_node_ids" not in result.data
+
+
+@pytest.mark.parametrize("writer", ["upsert_node", "set_pipeline"])
+def test_node_sent_back_as_exported_with_only_its_routing_changed_keeps_the_prompt(writer: str) -> None:
+    state = _two_structured_nodes()
+    stored = deep_thaw(state.nodes[0].options)
+    args, error = _serialize_set_pipeline_arguments(state)
+    assert error is None and args is not None
+    first = args["nodes"][0]
+    first["on_error"] = "main"
+
+    result = execute_tool(writer, first if writer == "upsert_node" else args, state, _mock_catalog())
+
+    assert result.success, result.validation.errors
+    assert result.updated_state.nodes[0].on_error == "main"
+    assert deep_thaw(result.updated_state.nodes[0].options) == stored
+
+
+def test_dropping_the_definitions_while_keeping_the_words_is_still_one_explicit_call() -> None:
+    """Equal text never replaces, so flattening a prompt to the same words is asked for by its structure.
+
+    The call names what changes: text-only parts and an empty requirement list.
+    """
+    state = _approved_state(structured=True)
+    same_text = state.nodes[0].options["prompt_template"]
+
+    result = execute_tool(
+        "patch_node_options",
+        {
+            "node_id": "code_themes",
+            "patch": {"prompt_template_parts": [{"kind": "text", "text": same_text}], "interpretation_requirements": []},
+        },
+        state,
+        _mock_catalog(),
+    )
+
+    assert result.success, result.validation.errors
+    options = deep_thaw(result.updated_state.nodes[0].options)
+    assert options["prompt_template"] == same_text
+    assert options["prompt_template_parts"] == [{"kind": "text", "text": same_text}]
+    assert _vague_ids(result.updated_state) == []
+    reviews = {row["kind"]: row["status"] for row in options["interpretation_requirements"]}
+    assert reviews == {"llm_prompt_template": "pending", "llm_model_choice": "resolved"}
+    assert isinstance(materialize_state_for_execution(result.updated_state), InterpretationReviewPending)
+
+
+@pytest.mark.parametrize("writer", _WRITERS)
+@pytest.mark.parametrize("text", ["", "   "], ids=["empty", "whitespace"])
+def test_empty_replacement_text_is_refused_and_the_terms_stay(writer: str, text: str) -> None:
+    state = _approved_state(structured=True)
+    before = state.to_dict()
+
+    result = execute_tool(writer, _replace_call(writer, state, prompt=text), state, _mock_catalog())
+
+    assert not result.success
+    assert result.updated_state is state and state.to_dict() == before
+    assert result.data is None or "superseded_review_ids" not in result.data
+
+
+@pytest.mark.parametrize("writer", _WRITERS)
+@pytest.mark.parametrize("value", [None, "x", {}], ids=["null", "string", "object"])
+def test_a_replace_call_with_malformed_requirement_rows_is_refused_and_the_terms_stay(writer: str, value: object) -> None:
+    """``interpretation_requirements: null`` beside the replace signal is refused before the replacement is looked at."""
+    state = _approved_state(structured=True)
+    before = state.to_dict()
+    call = _replace_call(writer, state)
+    written = call["patch"] if writer == "patch_node_options" else _node_options_in_call(writer, call)
+    written["interpretation_requirements"] = value
+
+    result = execute_tool(writer, call, state, _mock_catalog())
+
+    assert not result.success
+    assert result.updated_state is state and state.to_dict() == before
+    assert "interpretation_requirements_invalid" in [error.error_code for error in result.validation.errors]
+    assert result.data is None or "superseded_review_ids" not in result.data
+
+
+@pytest.mark.parametrize("writer", _WRITERS)
+def test_a_replace_call_with_an_empty_requirement_list_replaces(writer: str) -> None:
+    state = _approved_state(structured=True)
+
+    result = execute_tool(writer, _replace_call(writer, state, requirements=[]), state, _mock_catalog())
+
+    _assert_prompt_replaced(result, superseded=["category"])
+
+
+def test_a_failed_set_pipeline_reports_no_superseded_reviews() -> None:
+    """A whole-pipeline write that replaces one prompt and is refused for another node names nothing as removed."""
+    state = _two_structured_nodes()
+    args = _replace_call("set_pipeline", state)
+    other = next(item for item in args["nodes"] if item["id"] != "code_themes")
+    other["options"] = {**other["options"], "prompt_template": dict(_FILE_MARKER)}
+    before = state.to_dict()
+
+    result = execute_tool("set_pipeline", args, state, _mock_catalog())
+
+    assert not result.success
+    assert result.updated_state is state and state.to_dict() == before
+    assert result.data is None or ("superseded_review_ids" not in result.data and "prompt_unchanged_node_ids" not in result.data)
+
+
+def test_a_file_marker_on_system_prompt_leaves_a_structured_prompt_alone() -> None:
+    """The structured-prompt guard is about ``prompt_template``; a marker on ``system_prompt`` keeps the parts and the term."""
+    state = _approved_state(structured=True)
+    stored = deep_thaw(state.nodes[0].options)
+
+    result = execute_tool(
+        "patch_node_options", {"node_id": "code_themes", "patch": {"system_prompt": dict(_FILE_MARKER)}}, state, _mock_catalog()
+    )
+
+    assert result.success, result.validation.errors
+    options = deep_thaw(result.updated_state.nodes[0].options)
+    assert options["prompt_template_parts"] == stored["prompt_template_parts"]
+    assert [row for row in options["interpretation_requirements"] if row["kind"] == "vague_term"] == [
+        row for row in stored["interpretation_requirements"] if row["kind"] == "vague_term"
+    ]
+    assert result.data is None or "superseded_review_ids" not in result.data
 
 
 @pytest.mark.parametrize("writer", _WRITERS)

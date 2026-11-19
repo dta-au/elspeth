@@ -80,12 +80,16 @@ from elspeth.web.composer.tools._common import (
 )
 from elspeth.web.composer.tools._naming_disclosure import _disclose_node_name_constraints
 from elspeth.web.composer.tools.blobs import (
+    PROMPT_UNCHANGED_NODE_IDS_KEY,
+    PROMPT_UNCHANGED_NOTE,
+    PROMPT_UNCHANGED_NOTE_KEY,
     _file_inject_node_option_error,
     _llm_authored_inline_prompt_surface_error,
     _PromptReplacement,
     _structured_prompt_template_refusal,
     _whole_prompt_text_replacement,
     _written_options_for_prompt_replacement,
+    _written_options_keeping_an_unchanged_prompt,
 )
 from elspeth.web.composer.tools.declarations import (
     EffectDomain,
@@ -469,7 +473,9 @@ _UPSERT_NODE_DECLARATION = ToolDeclaration(
         "group), and scope_policy ('require_all' or 'best_effort', no default). "
         "Omit fields that don't apply to your node_type. "
         "For an llm node that has a structured prompt, options with prompt_template text and prompt_template_parts: null "
-        "replace the whole prompt; `superseded_review_ids` names the old prompt's vague-term reviews that were removed."
+        "replace the whole prompt; `superseded_review_ids` names the old prompt's vague-term reviews that were removed. "
+        "prompt_template text equal to the stored prompt replaces nothing: `prompt_unchanged_node_ids` names each node whose "
+        "stored prompt structure and reviews were kept."
     ),
     json_schema=_UPSERT_NODE_DECLARATION_JSON_SCHEMA,
     augments_on_failure=True,
@@ -750,7 +756,13 @@ def _execute_upsert_node(
     # stored prompt (see _whole_prompt_text_replacement). Every refusal below
     # still returns the untouched ``state``, and reviews reconcile against it.
     replacement: _PromptReplacement | None = None
+    prompt_unchanged_node_ids: tuple[str, ...] = ()
     if plugin == "llm" and existing_node is not None and existing_node.plugin == "llm":
+        # The stored prompt's own text replaces nothing, whatever the parts key says.
+        kept_options = _written_options_keeping_an_unchanged_prompt(existing_node.options, node_options, merge_patch=False)
+        if kept_options is not None:
+            node_options = kept_options
+            prompt_unchanged_node_ids = (node_id,)
         replacement = _whole_prompt_text_replacement(existing_node.options, node_options)
     if replacement is not None:
         # A stored row that is already non-canonical is refused first, so the
@@ -1011,6 +1023,11 @@ def _execute_upsert_node(
         # The replaced prompt's vague-term reviews, named so the model can tell
         # the user which definitions no longer apply.
         data["superseded_review_ids"] = list(replacement.superseded_review_ids)
+    if prompt_unchanged_node_ids:
+        # The write carried the stored prompt's own text without its parts, so
+        # the stored prompt structure and reviews were kept.
+        data[PROMPT_UNCHANGED_NODE_IDS_KEY] = list(prompt_unchanged_node_ids)
+        data[PROMPT_UNCHANGED_NOTE_KEY] = PROMPT_UNCHANGED_NOTE
     return _mutation_result(new_state, tuple(sorted(affected)), data=data or None)
 
 
@@ -1948,6 +1965,12 @@ def _apply_guarded_node_option_patch(
     # into the stored options without the old prompt's parts and term reviews.
     # Every refusal below still returns the untouched ``state``, and reviews
     # reconcile against it.
+    # The stored prompt's own text replaces nothing, whatever the parts key says.
+    kept_patch = _written_options_keeping_an_unchanged_prompt(current.options, patch, merge_patch=True) if current.plugin == "llm" else None
+    prompt_unchanged_node_ids: tuple[str, ...] = ()
+    if kept_patch is not None:
+        patch = kept_patch
+        prompt_unchanged_node_ids = (node_id,)
     replacement = _whole_prompt_text_replacement(current.options, patch) if current.plugin == "llm" else None
     if replacement is not None:
         # A stored row that is already non-canonical is refused first, so the
@@ -2159,6 +2182,11 @@ def _apply_guarded_node_option_patch(
         # The replaced prompt's vague-term reviews, named so the model can tell
         # the user which definitions no longer apply.
         data["superseded_review_ids"] = list(replacement.superseded_review_ids)
+    if prompt_unchanged_node_ids:
+        # The patch carried the stored prompt's own text with a null parts key,
+        # so the stored prompt structure and reviews were kept.
+        data[PROMPT_UNCHANGED_NODE_IDS_KEY] = list(prompt_unchanged_node_ids)
+        data[PROMPT_UNCHANGED_NOTE_KEY] = PROMPT_UNCHANGED_NOTE
     return _mutation_result(new_state, (node_id,), data=data or None)
 
 
@@ -2496,7 +2524,9 @@ _PATCH_NODE_OPTIONS_DECLARATION = ToolDeclaration(
     "interpretation_ref entries; prompt_template is compiled from those parts. "
     "To REPLACE the whole prompt with new text, send prompt_template together with prompt_template_parts: null: "
     "the parts and every vague-term review of the old prompt are removed, `superseded_review_ids` names the removed "
-    "reviews, and the new text gets its own review card. Changed prompt context requires fresh review. "
+    "reviews, and the new text gets its own review card. prompt_template text equal to the stored prompt replaces "
+    "nothing: `prompt_unchanged_node_ids` names the node whose stored prompt structure and reviews were kept. "
+    "Changed prompt context requires fresh review. "
     "Do not use this for node routing fields such as on_success/on_error/input/routes; "
     "use upsert_edge or upsert_node for routing edits. Gate on_error is node-level and must use upsert_node.",
     json_schema={
