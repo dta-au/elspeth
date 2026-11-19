@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from elspeth.contracts.blobs_inline import is_widened_blob_ref
+from elspeth.contracts.hashing import stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService, PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
@@ -28,7 +29,7 @@ from elspeth.web.composer.tools import execute_tool as _execute_tool
 from elspeth.web.composer.tools._common import _SERVER_OWNED_SOURCE_OPTION_KEYS
 from elspeth.web.composer.yaml_generator import generate_pipeline_dict
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
-from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
+from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, pending_execution_interpretation_sites
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.provider_config_policy import AWS_S3_ENDPOINT_URL_POLICY_ERROR
 from elspeth.web.sessions.engine import create_session_engine
@@ -329,6 +330,21 @@ class TestListComposerBlobs:
         assert [blob["blob_id"] for blob in result.data["blobs"]] == [ready.data["blob_id"]]
 
 
+def _resolved_rating_slot() -> dict[str, Any]:
+    """A canonical resolved vague-term requirement, as an accepted interpretation card leaves it."""
+    return {
+        "id": "req-rating",
+        "kind": "vague_term",
+        "user_term": "rating",
+        "draft": "1 to 5",
+        "status": "resolved",
+        "event_id": "evt-req-rating",
+        "accepted_value": "1 to 5",
+        "accepted_artifact_hash": None,
+        "resolved_prompt_template_hash": stable_hash("1 to 5"),
+    }
+
+
 class TestWireBlobInlineRef:
     def test_assistant_created_text_prompt_wiring_opens_review(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="Assistant-authored prompt", llm_authored=True)
@@ -387,14 +403,26 @@ class TestWireBlobInlineRef:
         assert ".txt or .md" in result.validation.errors[0].message
         assert "PDF shaped bytes" not in result.validation.errors[0].message
 
-    def test_structured_prompt_wire_refuses_without_mutation(self, blob_env: dict[str, Any]) -> None:
+    def test_wiring_a_file_replaces_a_structured_prompt(self, blob_env: dict[str, Any]) -> None:
+        """Replace means replace: the prior prompt's form never blocks a file binding."""
         blob = _create_blob(blob_env, content="Replacement prompt")
         state = _inline_ref_state()
         node = state.nodes[0]
+        slot = _resolved_rating_slot()
         state = replace(
             state,
             nodes=(
-                replace(node, options={**node.options, "prompt_template_parts": [{"kind": "text", "text": "Original structured prompt"}]}),
+                replace(
+                    node,
+                    options={
+                        **node.options,
+                        "prompt_template_parts": [
+                            {"kind": "text", "text": "Give a "},
+                            {"kind": "interpretation_ref", "requirement_id": "req-rating"},
+                        ],
+                        "interpretation_requirements": [slot],
+                    },
+                ),
             ),
         )
 
@@ -410,11 +438,135 @@ class TestWireBlobInlineRef:
             session_operation_authority=blob_env["authority"],
         )
 
-        assert result.success is False
-        assert result.updated_state is state
-        assert result.validation.errors[0].error_code == "prompt_template_parts_required"
-        assert "interpretation slots" in result.validation.errors[0].message
-        assert state.nodes[0].options["prompt_template"] == "Placeholder"
+        assert result.success is True, result.validation.errors
+        options = result.updated_state.nodes[0].options
+        assert options["prompt_template"]["blob_ref"] == blob.data["blob_id"]
+        assert "prompt_template_parts" not in options
+        requirements = options["interpretation_requirements"]
+        # The slot the old prompt cited is gone; the file's own review is pending.
+        assert [row["id"] for row in requirements if row["id"] == "req-rating"] == []
+        assert [(row["kind"], row["status"]) for row in requirements] == [("llm_prompt_template", "pending")]
+        # Only the file's prompt review is left to surface; the retired slot is not.
+        sites = pending_execution_interpretation_sites(result.updated_state)
+        kinds = [(site.kind.value, site.component_id) for site in sites]
+        assert ("llm_prompt_template", "classify") in kinds
+        assert not [kind for kind, _component in kinds if kind == "vague_term"]
+        # The original state is untouched.
+        assert "prompt_template_parts" in state.nodes[0].options
+
+    def test_replacing_a_prompt_retires_every_vague_term_review_of_the_old_text(self, blob_env: dict[str, Any]) -> None:
+        """A pending term no part cites would otherwise block the run with no card to clear it."""
+        blob = _create_blob(blob_env, content="Replacement prompt")
+        state = _inline_ref_state()
+        node = state.nodes[0]
+        cited = _resolved_rating_slot()
+        uncited = {
+            "id": "req-tone",
+            "kind": "vague_term",
+            "user_term": "friendly",
+            "draft": "warm",
+            "status": "pending",
+            "event_id": None,
+            "accepted_value": None,
+            "accepted_artifact_hash": None,
+            "resolved_prompt_template_hash": None,
+        }
+        state = replace(
+            state,
+            nodes=(
+                replace(
+                    node,
+                    options={
+                        **node.options,
+                        "prompt_template_parts": [
+                            {"kind": "text", "text": "Give a "},
+                            {"kind": "interpretation_ref", "requirement_id": "req-rating"},
+                        ],
+                        "interpretation_requirements": [cited, uncited],
+                    },
+                ),
+            ),
+        )
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {"field_path": "node:classify.options.prompt_template", "blob_id": blob.data["blob_id"]},
+            state,
+            _catalog(),
+            data_dir=blob_env["data_dir"],
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
+        )
+
+        assert result.success is True, result.validation.errors
+        requirements = result.updated_state.nodes[0].options["interpretation_requirements"]
+        assert [(row["kind"], row["status"]) for row in requirements] == [("llm_prompt_template", "pending")]
+        sites = pending_execution_interpretation_sites(result.updated_state)
+        assert not [site for site in sites if site.kind.value == "vague_term"]
+        # The tool result names what the file superseded.
+        assert list(result.data["superseded_review_ids"]) == ["req-rating", "req-tone"]
+
+    def test_wiring_a_file_over_a_plain_prompt_retires_its_pending_vague_term(self, blob_env: dict[str, Any]) -> None:
+        blob = _create_blob(blob_env, content="Replacement prompt")
+        state = _inline_ref_state()
+        node = state.nodes[0]
+        pending = {
+            "id": "req-tone",
+            "kind": "vague_term",
+            "user_term": "friendly",
+            "draft": "warm",
+            "status": "pending",
+            "event_id": None,
+            "accepted_value": None,
+            "accepted_artifact_hash": None,
+            "resolved_prompt_template_hash": None,
+        }
+        state = replace(
+            state,
+            nodes=(replace(node, options={**node.options, "interpretation_requirements": [pending]}),),
+        )
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {"field_path": "node:classify.options.prompt_template", "blob_id": blob.data["blob_id"]},
+            state,
+            _catalog(),
+            data_dir=blob_env["data_dir"],
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
+        )
+
+        assert result.success is True, result.validation.errors
+        requirements = result.updated_state.nodes[0].options["interpretation_requirements"]
+        assert [(row["kind"], row["status"]) for row in requirements] == [("llm_prompt_template", "pending")]
+
+    def test_wiring_system_prompt_leaves_a_structured_prompt_intact(self, blob_env: dict[str, Any]) -> None:
+        blob = _create_blob(blob_env, content="You are a careful assistant.")
+        state = _inline_ref_state()
+        node = state.nodes[0]
+        parts = [{"kind": "text", "text": "Original structured prompt"}]
+        state = replace(state, nodes=(replace(node, options={**node.options, "prompt_template_parts": parts}),))
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {"field_path": "node:classify.options.system_prompt", "blob_id": blob.data["blob_id"]},
+            state,
+            _catalog(),
+            data_dir=blob_env["data_dir"],
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
+        )
+
+        assert result.success is True, result.validation.errors
+        options = result.updated_state.nodes[0].options
+        assert [dict(part) for part in options["prompt_template_parts"]] == parts
+        assert options["system_prompt"]["blob_ref"] == blob.data["blob_id"]
 
     def test_structured_prompt_patch_marker_refuses_without_mutation(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="Replacement prompt")

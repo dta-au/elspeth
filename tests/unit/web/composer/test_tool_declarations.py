@@ -1050,8 +1050,8 @@ class TestStep3BlobDiscoveryTierMigration:
                 "Only inline-text MIME is accepted; upload or create a plain-text .txt or .md file for a prompt. "
                 "A user-created or agent-authored UTF-8 prompt file opens a mandatory full-content llm_prompt_template review card; changes require review again. "
                 "Only prompt_template, system_prompt, and individual query templates accept prompt files, never model or whole queries. "
-                "A structured prompt with prompt_template_parts cannot be replaced by a file in this release; edit its text parts with change_substring or patch_node_options on prompt_template_parts, preserving interpretation_ref entries. "
-                "Returns the `field_path` that was wired."
+                "Wiring a file onto prompt_template REPLACES the whole prompt, whatever was there: prompt_template_parts and every vague-term review of the old text (pending or accepted) are removed, and the file gets its own review card. "
+                "Returns the `field_path` that was wired, plus `superseded_review_ids` when the file superseded reviews of the old prompt."
             ),
             "parameters": {
                 "type": "object",

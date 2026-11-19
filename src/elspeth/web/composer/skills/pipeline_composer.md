@@ -769,12 +769,15 @@ position). The blob must have an inline-text MIME type; a PDF or other binary
 file is refused. Upload or create the prompt as plain text (.txt or .md), then
 wire that file and approve its full-content card. The editor saves only a file
 that backs exactly one prompt and is read as UTF-8, so give each prompt its own
-file and do not set a non-UTF-8 `encoding` on a file the user may edit. A structured prompt with
-`prompt_template_parts` has interpretation slots and cannot be replaced by a
-file in this release. Edit its text parts in place with `change_substring` or
-`patch_node_options` on `prompt_template_parts`, preserving `interpretation_ref`
-entries. Switching a structured prompt to a file is not supported in this
-release. File binding does not support `model` or the whole `queries` value.
+file and do not set a non-UTF-8 `encoding` on a file the user may edit. Wiring a file onto
+`prompt_template` with `wire_blob_inline_ref` REPLACES the whole prompt,
+whatever was there: a structured prompt's `prompt_template_parts` and every
+vague-term review of the old text (pending or accepted) are removed, and the
+file gets its own review card, which supersedes them. Tell the user that the
+earlier term definitions no longer apply. To keep
+a structured prompt and change its wording instead, edit its text parts with
+`change_substring` or `patch_node_options` on `prompt_template_parts`,
+preserving `interpretation_ref` entries. File binding does not support `model` or the whole `queries` value.
 Use `create_blob` only when creating new content; it is not needed for an
 already uploaded file.
 

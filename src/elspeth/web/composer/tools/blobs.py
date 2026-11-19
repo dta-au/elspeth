@@ -45,6 +45,7 @@ from elspeth.contracts.blobs_inline import (
     is_widened_blob_ref,
 )
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.credential_material import DEFAULT_CREDENTIAL_TRAVERSAL_POLICY
 from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
@@ -1149,6 +1150,40 @@ def _file_inject_wired_marker_error(state: CompositionState, field_path: str) ->
     return None
 
 
+def _is_vague_term_requirement(row: object) -> bool:
+    return isinstance(row, Mapping) and row.get("kind", InterpretationKind.VAGUE_TERM.value) == InterpretationKind.VAGUE_TERM.value
+
+
+def _vague_term_requirement_ids(options: Mapping[str, JsonValue]) -> tuple[str, ...]:
+    """Ids of the vague-term requirements a file replacement of the prompt supersedes."""
+    requirements = options.get(INTERPRETATION_REQUIREMENTS_KEY)
+    if not isinstance(requirements, (list, tuple)):
+        return ()
+    return tuple(str(row["id"]) for row in requirements if isinstance(row, Mapping) and _is_vague_term_requirement(row) and "id" in row)
+
+
+def _options_for_file_prompt_replacement(options: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
+    """Options with the prompt_template's own review state removed, ready for a file.
+
+    Binding a file REPLACES the prompt, so everything that reviewed the old
+    text goes with it: ``prompt_template_parts`` and every vague-term
+    requirement (pending or resolved, slotted or not), because each one
+    defines a term of the text being replaced. The single card left is the
+    file's own, re-derived by ``_options_with_default_prompt_template_review``.
+    Other kinds (model choice, pipeline decisions) are not about the prompt
+    text and are kept.
+    """
+    remaining: dict[str, JsonValue] = {key: value for key, value in options.items() if key != PROMPT_TEMPLATE_PARTS_KEY}
+    requirements = options.get(INTERPRETATION_REQUIREMENTS_KEY)
+    if isinstance(requirements, (list, tuple)):
+        kept = [row for row in requirements if not _is_vague_term_requirement(row)]
+        if kept:
+            remaining[INTERPRETATION_REQUIREMENTS_KEY] = kept
+        else:
+            remaining.pop(INTERPRETATION_REQUIREMENTS_KEY, None)
+    return remaining
+
+
 def _structured_prompt_template_refusal(
     node_id: str,
     current_options: Mapping[str, JsonValue],
@@ -1218,6 +1253,11 @@ def _execute_wire_blob_inline_ref(
         return _failure_result(state, f"Invalid field_path for inline blob ref: {exc}", error_code="inline_blob_field_path_invalid")
 
     node_id = ref.field_path.partition(".options.")[0].removeprefix("node:")
+    # The state the marker is written into. It differs from ``state`` only when
+    # the file replaces a structured prompt; every refusal below still returns
+    # the untouched ``state``, and reviews reconcile against it.
+    apply_state = state
+    superseded_review_ids: tuple[str, ...] = ()
     if ref.field_path.startswith("node:"):
         node = next((item for item in state.nodes if item.id == node_id), None)
         if node is not None and node.plugin == "llm":
@@ -1233,15 +1273,24 @@ def _execute_wire_blob_inline_ref(
                     "File-backed LLM prompts bind only to prompt_template, system_prompt, or a query template.",
                     error_code="inline_blob_field_path_invalid",
                 )
-            structured_error = (
-                _structured_prompt_template_refusal(
-                    node_id, node.options, {"prompt_template": {"blob_ref": str(blob_id), "mode": "inline_content", "sha256": pinned_hash}}
+            if ref.field_path == f"node:{node_id}.options.prompt_template":
+                # Binding a file REPLACES the prompt, whatever form it had, and
+                # supersedes every card that reviewed the old text: the file's
+                # own review card is the one review of the new prompt
+                # (maintainer ruling 2026-11-19). A state whose requirements are
+                # already non-canonical is refused first, so the replacement
+                # can never launder a malformed row away.
+                stored_error = _composition_canonical_interpretation_requirement_error(state, tool_name="wire_blob_inline_ref")
+                if stored_error is not None:
+                    return _failure_result(state, stored_error, error_code="interpretation_requirements_invalid")
+                superseded_review_ids = _vague_term_requirement_ids(node.options)
+                apply_state = replace(
+                    state,
+                    nodes=tuple(
+                        replace(item, options=_options_for_file_prompt_replacement(item.options)) if item.id == node_id else item
+                        for item in state.nodes
+                    ),
                 )
-                if ref.field_path == f"node:{node_id}.options.prompt_template"
-                else None
-            )
-            if structured_error is not None:
-                return _failure_result(state, structured_error, error_code="prompt_template_parts_required")
 
     prompt_surface_error = _llm_authored_prompt_surface_error(
         state,
@@ -1270,7 +1319,7 @@ def _execute_wire_blob_inline_ref(
         marker["encoding"] = encoding
 
     try:
-        new_state = _apply_inline_blob_marker(state, ref.field_path, marker)
+        new_state = _apply_inline_blob_marker(apply_state, ref.field_path, marker)
     except ValueError as exc:
         return _failure_result(state, str(exc), error_code="inline_blob_field_path_invalid")
     if llm_prompt_file_scalar_field(ref.field_path) is not None:
@@ -1330,7 +1379,12 @@ def _execute_wire_blob_inline_ref(
             canonical_error,
             error_code="interpretation_requirements_invalid",
         )
-    return _mutation_result(reconciled, _affected_component_for_inline_field_path(ref.field_path), data={"field_path": ref.field_path})
+    data: dict[str, JsonValue] = {"field_path": ref.field_path}
+    if superseded_review_ids:
+        # The replaced prompt's vague-term reviews, named so the model can tell
+        # the user which definitions no longer apply.
+        data["superseded_review_ids"] = list(superseded_review_ids)
+    return _mutation_result(reconciled, _affected_component_for_inline_field_path(ref.field_path), data=data)
 
 
 _WIRE_BLOB_INLINE_REF_DECLARATION = ToolDeclaration(
@@ -1343,8 +1397,8 @@ _WIRE_BLOB_INLINE_REF_DECLARATION = ToolDeclaration(
         "Only inline-text MIME is accepted; upload or create a plain-text .txt or .md file for a prompt. "
         "A user-created or agent-authored UTF-8 prompt file opens a mandatory full-content llm_prompt_template review card; changes require review again. "
         "Only prompt_template, system_prompt, and individual query templates accept prompt files, never model or whole queries. "
-        "A structured prompt with prompt_template_parts cannot be replaced by a file in this release; edit its text parts with change_substring or patch_node_options on prompt_template_parts, preserving interpretation_ref entries. "
-        "Returns the `field_path` that was wired."
+        "Wiring a file onto prompt_template REPLACES the whole prompt, whatever was there: prompt_template_parts and every vague-term review of the old text (pending or accepted) are removed, and the file gets its own review card. "
+        "Returns the `field_path` that was wired, plus `superseded_review_ids` when the file superseded reviews of the old prompt."
     ),
     json_schema={
         "type": "object",
