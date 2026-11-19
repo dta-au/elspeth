@@ -422,6 +422,42 @@ def test_blob_body_content_remains_outside_control_plane_admission() -> None:
     )
 
 
+@pytest.mark.parametrize("fragment", ("old", "replacement"))
+def test_inline_substring_fragments_remain_in_credential_projection(fragment: str) -> None:
+    candidate = "sk-" + "a" * 24
+    edit = {"old": "benign", "replacement": "clean", "replace_all": False}
+    edit[fragment] = candidate
+    arguments = {
+        "target": {"kind": "node_option", "node_id": "code_themes", "option": "prompt_template"},
+        "edits": [edit],
+    }
+    projected = credential_material_tool_arguments_projection("change_substring", arguments)
+    assert projected["edits"][0][fragment] == candidate
+    with pytest.raises(CredentialMaterialRefused):
+        require_no_credential_material_for_tool("change_substring", arguments, surface="test_surface")
+
+
+def test_benign_inline_substring_edit_passes_credential_projection() -> None:
+    arguments = {
+        "target": {"kind": "node_option", "node_id": "code_themes", "option": "prompt_template"},
+        "edits": [{"old": "benign", "replacement": "clean", "replace_all": False}],
+    }
+    assert credential_material_tool_arguments_projection("change_substring", arguments) == arguments
+    require_no_credential_material_for_tool("change_substring", arguments, surface="test_surface")
+
+
+def test_blob_substring_fragments_keep_data_plane_exclusion() -> None:
+    candidate = "sk-" + "a" * 24
+    arguments = {
+        "target": {"kind": "blob", "blob_id": "test-blob"},
+        "edits": [{"old": candidate, "replacement": candidate, "replace_all": False}],
+    }
+    projected = credential_material_tool_arguments_projection("change_substring", arguments)
+    assert projected["edits"][0]["old"] == "<data-plane-content>"
+    assert projected["edits"][0]["replacement"] == "<data-plane-content>"
+    require_no_credential_material_for_tool("change_substring", arguments, surface="test_surface")
+
+
 def test_wire_secret_ref_scans_the_option_name_without_treating_it_as_a_secret_value() -> None:
     arguments = {"name": "OPENROUTER_API_KEY", "target": "source", "option_key": "api_key"}
 
@@ -528,6 +564,52 @@ async def test_provider_request_is_refused_before_transport(monkeypatch: pytest.
         )
 
     assert caught.value.surface == "composer_provider_request"
+    assert transport_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content", "category"),
+    [
+        # 400 KiB message: the detector scans the whole string, so a credential
+        # placed past the default 256 KiB cap is still found by pattern.
+        pytest.param(" " * (300 * 1024) + "sk-" + "a" * 24 + " " * (100 * 1024), "token_shape", id="credential_past_256KiB"),
+        # 2 MiB - 1 bytes, the largest string under the cap: a credential near
+        # the END is still found, so nothing under the cap goes unscanned.
+        pytest.param(" " * (2 * 1024 * 1024 - 1 - 27 - 4) + "sk-" + "a" * 24 + " " * 4, "token_shape", id="credential_at_end_of_2MiB"),
+        # A maximum-size YAML import (524,288 characters), all 4-byte characters
+        # except the credential, fits under the cap: it is scanned, and the
+        # trailing credential is found.
+        pytest.param("\U00010400" * (524_288 - 27) + "sk-" + "a" * 24, "token_shape", id="max_import_of_4_byte_chars"),
+        # Past the 2 MiB cap the string is refused unscanned, never skipped:
+        # the cap bounds work, it does not exempt content.
+        pytest.param(" " * (2 * 1024 * 1024 + 1), "traversal_limit", id="over_2MiB_cap"),
+    ],
+)
+async def test_provider_request_scans_large_messages_and_refuses_over_cap(
+    monkeypatch: pytest.MonkeyPatch, provider_custody: ProviderCallCustody, content: str, category: str
+) -> None:
+    transport_calls: list[dict[str, Any]] = []
+
+    async def transport(**kwargs: Any) -> object:
+        transport_calls.append(kwargs)
+        raise AssertionError("request reached transport")
+
+    import litellm
+
+    monkeypatch.setattr(litellm, "acompletion", transport)
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        await provider_gateway._litellm_acompletion(
+            provider_custody=provider_custody,
+            model="openai/test-model",
+            prompt_guard_mount=None,
+            prompt_guard_mode="required",
+            prompt_guard_role="composer",
+            messages=[{"role": "user", "content": content}],
+        )
+
+    assert caught.value.surface == "composer_provider_request"
+    assert caught.value.finding.category == category
     assert transport_calls == []
 
 

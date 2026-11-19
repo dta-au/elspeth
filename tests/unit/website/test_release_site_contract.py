@@ -54,6 +54,7 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
     current_heading = f"\n## {CURRENT_VERSION} - "
     assert changelog.count(current_heading) == 1
     current_release = changelog.split(current_heading, maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
+    release_0814 = changelog.split("\n## 0.8.14 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_0813 = changelog.split("\n## 0.8.13 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_0812 = changelog.split("\n## 0.8.12 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_0810 = changelog.split("\n## 0.8.10 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
@@ -68,21 +69,34 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
     current_text = " ".join(current_release.split())
     release_date = current_release.splitlines()[0].strip()
     assert date.fromisoformat(release_date).isoformat() == release_date
+    assert "0.8.15 supersedes 0.8.14, which was tagged but never published" in current_text
+    assert "**Upgrading from 0.8.13 or earlier: apply the 0.8.14 upgrade notes first.**" in current_text
     assert "ELSPETH now requires and runs on Python 3.14 only" in current_text
-    assert "**Python 3.14 is required**" in current_text
-    assert "**Startup refuses `JSON_LOGS=true`.**" in current_text
-    assert "a run checkpointed under 3.13 refuses to resume under 3.14" in current_text
-    assert "`gcr.io/distroless/cc-debian13:debug-nonroot`" in current_text
-    assert "the repository ruleset must be updated to match" in current_text
     assert (
-        f"Session epoch {SESSION_SCHEMA_EPOCH} and Landscape epoch {SQLITE_SCHEMA_EPOCH} are unchanged from the previous release"
+        f"Session epoch advances from 78 to {SESSION_SCHEMA_EPOCH}; Landscape advances from epoch 50 to {SQLITE_SCHEMA_EPOCH}"
         in current_text
     )
-    assert "this release adds no schema-epoch cutover" in current_text
-    assert "Existing 0.8.13 session and Landscape stores need no action" in current_text
+    assert "`prompt_review_snapshots`" in current_text and "`prompt_file_approvals`" in current_text
+    assert "the Landscape store adds `run_prompt_inputs`" in current_text
+    assert (
+        f"Configure an explicitly new epoch-{SESSION_SCHEMA_EPOCH} session target and an explicitly new "
+        f"epoch-{SQLITE_SCHEMA_EPOCH} Landscape target" in current_text
+    )
+    assert "Preserve epoch-78 session stores and epoch-50 Landscape stores" in current_text
     assert "This authorizes no migration, reset, restamping or downgrade" in current_text
-    assert "Session epoch advances" not in current_text
-    assert "Landscape advances from epoch" not in current_text
+    assert "this release adds no schema-epoch cutover" not in current_text
+    assert "Existing 0.8.14 session and Landscape stores need no action" not in current_text
+    # 0.8.14 is history (tagged, never published), pinned against its own section.
+    text_0814 = " ".join(release_0814.split())
+    assert release_0814.splitlines()[0].strip() == "2026-11-15"
+    assert "ELSPETH now requires and runs on Python 3.14 only" in text_0814
+    assert "**Python 3.14 is required**" in text_0814
+    assert "**Startup refuses `JSON_LOGS=true`.**" in text_0814
+    assert "a run checkpointed under 3.13 refuses to resume under 3.14" in text_0814
+    assert "`gcr.io/distroless/cc-debian13:debug-nonroot`" in text_0814
+    assert "the repository ruleset must be updated to match" in text_0814
+    assert "Existing 0.8.13 session and Landscape stores need no action" in text_0814
+    assert "The 0.8.14 tag and container publication follow successful required checks and the protected merge" in text_0814
     # 0.8.13 is history, pinned against its own section.
     text_0813 = " ".join(release_0813.split())
     assert release_0813.splitlines()[0].strip() == "2026-11-11"
@@ -101,14 +115,14 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
     assert "This authorizes no migration, reset, restamping or downgrade" in text_0812
     assert "The 0.8.12 tag and container publication follow successful required checks and the protected merge" in text_0812
     # The 0.8.10 cutover is history, pinned against its own section.
-    assert f"Session epoch advances from 77 to {SESSION_SCHEMA_EPOCH}" in release_0810
-    assert f"Landscape advances from epoch 49 to {SQLITE_SCHEMA_EPOCH}" in release_0810
+    assert "Session epoch advances from 77 to 78" in release_0810
+    assert "Landscape advances from epoch 49 to 50" in release_0810
     assert "immutable graph snapshots" in release_0810
     assert "both distinct epoch-76" in release_0810
     assert "cannot share session stores or replicas" in release_0810
     assert "Preserve epoch-75 stores" in release_0810
     assert "epoch-77 session stores and epoch-49 Landscape stores" in " ".join(release_0810.split())
-    assert f"new epoch-{SESSION_SCHEMA_EPOCH} target" in release_0810
+    assert "new epoch-78 target" in release_0810
     assert "Drain and isolate old/new deployments" in release_0810
     assert "no migration,\nreset, restamping or downgrade" in release_0810
     assert "Automatic image publication from main remains held" in " ".join(release_0810.split())
@@ -241,7 +255,8 @@ def test_get_started_has_runnable_cli_and_complete_composer_paths() -> None:
     assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH}" in current_text
     assert "Qualification uses explicitly new compatible stores" in current_text
     assert f"explicitly new epoch-{SQLITE_SCHEMA_EPOCH} Landscape target" in current_text
-    assert "epoch-49 Landscape stores with compatible prior application access" in current_text
+    assert "epoch-50 Landscape stores with compatible prior application access" in current_text
+    assert "epoch-77 and epoch-78 Sessions stores" in current_text
     assert "preserved and refused before incompatible writes" in current_text
     assert "Do not recreate, delete, restamp or migrate them" in current_text
     assert "ordinary freeform composition" in current_text

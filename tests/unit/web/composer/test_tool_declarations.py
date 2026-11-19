@@ -897,6 +897,7 @@ class TestStep3MutationTierMigration:
             "remove_output",
             "patch_source_options",
             "patch_node_options",
+            "change_substring",
             "patch_output_options",
             "set_pipeline",
             "clear_source",
@@ -1046,6 +1047,10 @@ class TestStep3BlobDiscoveryTierMigration:
             "description": (
                 "Author a widened blob_ref inline_content marker at a canonical field_path. "
                 "Composer pins sha256 from blob metadata; callers must not pass content bytes. "
+                "Only inline-text MIME is accepted; upload or create a plain-text .txt or .md file for a prompt. "
+                "A user-created or agent-authored UTF-8 prompt file opens a mandatory full-content llm_prompt_template review card; changes require review again. "
+                "Only prompt_template, system_prompt, and individual query templates accept prompt files, never model or whole queries. "
+                "A structured prompt with prompt_template_parts cannot be replaced by a file in this release; edit its text parts with change_substring or patch_node_options on prompt_template_parts, preserving interpretation_ref entries. "
                 "Returns the `field_path` that was wired."
             ),
             "parameters": {
@@ -1056,13 +1061,15 @@ class TestStep3BlobDiscoveryTierMigration:
                         "description": (
                             "Canonical path: source.options.<field>, source:<name>.options.<field>, "
                             "node:<node_id>.options.<field> for a transform, aggregation, or collector, "
-                            "or output:<name>.options.<field>." + _BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE
+                            "or output:<name>.options.<field>. Address an existing list item by its 0-based position, "
+                            "e.g. node:<node_id>.options.queries.0.template; a position never creates an item or a key."
+                            + _BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE
                         ),
                     },
                     "blob_id": {
                         "type": "string",
                         "format": "uuid",
-                        "description": "Ready blob ID to wire as inline content.",
+                        "description": "Ready inline-text blob ID; binary MIME is refused. For a prompt, upload or create plain text (.txt or .md).",
                     },
                     "encoding": {
                         "type": "string",

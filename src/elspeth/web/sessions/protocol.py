@@ -19,6 +19,8 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, final, get_args, runtime_checkable
 from uuid import UUID
 
+from sqlalchemy import Connection
+
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.blobs import (
     BlobAtomicDeletionObligation,
@@ -67,6 +69,7 @@ from elspeth.web.coordination.contracts import (
 )
 from elspeth.web.sessions.pipeline_publication import PipelineProposalSettlementResult as PipelineProposalSettlementResult
 from elspeth.web.sessions.pipeline_settlement_payloads import ComposerOperationBinding
+from elspeth.web.sessions.prompt_file_review import PromptReviewSnapshot
 
 if TYPE_CHECKING:
     from elspeth.web.composer.advisor_audit import AdvisorGraphReviewFact
@@ -1207,12 +1210,19 @@ class SessionPendingInterpretationSiteSnapshot:
 
     event: InterpretationEventRecord
     surfacing_state: CompositionStateRecord | None
+    #: True when this pending prompt card's stored file snapshot no longer
+    #: matches the snapshot the live state derives (for example, a resolved
+    #: vague term re-rendered the inline prompt beside a file). Such a card can
+    #: never be approved, so the planner must not reuse it.
+    file_snapshot_stale: bool = False
 
     def __post_init__(self) -> None:
         if type(self.event) is not InterpretationEventRecord:
             raise AuditIntegrityError("pending interpretation snapshot event must be exact")
         if self.surfacing_state is not None and type(self.surfacing_state) is not CompositionStateRecord:
             raise AuditIntegrityError("pending interpretation surfacing state must be exact or None")
+        if type(self.file_snapshot_stale) is not bool:
+            raise AuditIntegrityError("pending interpretation file snapshot staleness must be an exact boolean")
 
 
 @final
@@ -1871,6 +1881,45 @@ class InterpretationUnsupportedChoiceError(InterpretationResolveError):
     """The requested choice is valid generally but unsupported for this kind."""
 
 
+class PromptFileTooLargeError(InterpretationResolveError):
+    """A file-backed prompt card cannot be created: the file exceeds an inline cap.
+
+    Runtime substitution enforces the same caps
+    (``elspeth.core.blobs_inline``), so a card for this file could never be
+    approved into a run. ``limit_bytes`` is the cap that was exceeded;
+    ``aggregate`` says whether it is the all-files cap rather than the
+    per-file one. Not a stale-review condition: the file did not change.
+    """
+
+    error_code = "prompt_file_too_large"
+
+    def __init__(self, *, node_id: str, limit_bytes: int, aggregate: bool) -> None:
+        self.node_id = node_id
+        self.limit_bytes = limit_bytes
+        self.aggregate = aggregate
+        subject = "The inline files bound to this pipeline together exceed" if aggregate else "A prompt file exceeds"
+        super().__init__(
+            f"Node {node_id}: {subject} the {limit_bytes}-byte ({limit_bytes // 1024} KiB) inline limit, "
+            "so a run could not use it. Shorten the prompt file, then review it."
+        )
+
+
+class PromptReviewAnchorRequiredError(InterpretationResolveError):
+    """A prompt review was resolved without naming the snapshot it showed."""
+
+
+class PromptReviewAnchorUnexpectedError(InterpretationResolveError):
+    """A reviewed anchor was sent for a kind that has no review snapshot."""
+
+
+class PromptReviewSnapshotMissingError(InterpretationResolveError):
+    """The prompt review event has no stored snapshot to approve against."""
+
+
+class PromptReviewStaleError(InterpretationResolveError):
+    """The reviewed anchor is not the anchor of this event's stored snapshot."""
+
+
 class AuditAccessLogWriteError(RuntimeError):
     """Required access disclosure could not be recorded.
 
@@ -2211,6 +2260,7 @@ class SessionOperationBlobMutations(Protocol):
         plan: BlobReplacementPlan,
         max_storage_per_session: int,
         accepting_proposal_id: UUID | None,
+        on_metadata_commit: Callable[[Connection], None] | None,
     ) -> BlobReplacementPlan: ...
 
     def retire_blob_replacement(self, *, plan: BlobReplacementPlan, remaining_output_storage_bytes: int | None = None) -> bool: ...
@@ -2916,6 +2966,7 @@ class SessionServiceProtocol(Protocol):
         resolved_at: datetime | None = None,
         runtime_model_identifier: str | None = None,
         runtime_model_version: str | None = None,
+        reviewed_anchor: str | None = None,
         session_operation_context: SessionOperationContext,
     ) -> tuple[InterpretationEventRecord, CompositionStateRecord]:
         """Commit a resolution and update the affected interpretation surface.
@@ -2924,6 +2975,11 @@ class SessionServiceProtocol(Protocol):
         read ``llm_draft`` from the pending row when ``choice`` is
         ``ACCEPTED_AS_DRAFTED``, and use ``amended_value`` when ``choice``
         is ``AMENDED``.
+
+        ``reviewed_anchor`` is the ``anchor`` of the prompt review snapshot
+        the caller displayed. ``llm_prompt_template`` events require it and
+        it must equal the event's stored snapshot anchor; every other kind
+        refuses it. Each refusal writes nothing.
 
         Single transaction. Raises ``ValueError`` for no pending event
         (TOCTOU / IDOR), missing composition state or affected node,
@@ -2952,6 +3008,14 @@ class SessionServiceProtocol(Protocol):
         ``auto_interpreted_opt_out`` and ``auto_interpreted_no_surfaces``
         rows. ``None`` (default) imposes no source filter.
         """
+        ...
+
+    async def get_prompt_review_snapshot(self, session_id: UUID, event_id: UUID) -> Mapping[str, Any] | None:
+        """Full historical file-prompt card snapshot for a same-session event."""
+        ...
+
+    async def assert_prompt_file_approvals(self, snapshot: PromptReviewSnapshot) -> None:
+        """Refuse unless all current prompt-file bindings have matching approval."""
         ...
 
     async def record_session_interpretation_opt_out(

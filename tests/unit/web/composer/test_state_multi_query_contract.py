@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.plugins.transforms.llm.base import LLMConfig
 from elspeth.web.composer.state import (
@@ -125,6 +126,109 @@ def test_query_override_code_at_each_node_mutation_door(tmp_path: Path, door: st
     assert "vague_term_query_override" in codes
     assert "interpretation_review_contract_unsatisfied" not in codes
     assert "vague_term_unwired" not in codes
+
+
+def _prompt_file() -> dict[str, str]:
+    return {"blob_ref": "00000000-0000-0000-0000-000000000001", "mode": "inline_content", "sha256": "0" * 64}
+
+
+@pytest.mark.parametrize("list_form", [False, True])
+def test_file_backed_queries_preserve_contract_validation_without_a_root_fallback(list_form: bool) -> None:
+    queries = {
+        name: {"input_fields": {"text": "body"}, "template": _prompt_file()}
+        for name in ("first", "second", "third", "fourth", "fifth", "sixth")
+    }
+    options = _options(["body"], queries)
+    options.pop("prompt_template")
+    options["system_prompt"] = _prompt_file()
+    if list_form:
+        options["queries"] = [{"name": name, **entry} for name, entry in queries.items()]
+    state = _state(options)
+    result = state.validate()
+    assert result.is_valid, result.errors
+    assert deep_thaw(state.nodes[0].options) == options
+    assert "prompt_template" not in state.nodes[0].options
+
+
+@pytest.mark.parametrize("defect", ["malformed_hash", "wrong_mode", "input_fields", "output_fields", "extra_key"])
+def test_deferred_query_templates_do_not_hide_malformed_siblings(defect: str) -> None:
+    query: dict[str, Any] = {"input_fields": {"text": "body"}, "template": _prompt_file()}
+    if defect == "malformed_hash":
+        query["template"]["sha256"] = "invalid"
+    elif defect == "wrong_mode":
+        query["template"]["mode"] = "bind_source"
+    elif defect == "input_fields":
+        query["input_fields"] = {"text": ["body"]}
+    elif defect == "output_fields":
+        query["output_fields"] = [{"suffix": "answer", "type": "not-a-type"}]
+    else:
+        query["unknown_option"] = True
+    errors = _validate_multi_query_generated_input_requirements(_state(_options(["body"], {"classify": query})).nodes[0])
+    assert any(entry.error_code == "plugin_options_invalid" for entry in errors)
+
+
+@pytest.mark.parametrize("consumer", ["required", "alias", "schema", "image"])
+def test_deferred_query_templates_still_reject_generated_input_conflicts(consumer: str) -> None:
+    query: dict[str, Any] = {
+        "input_fields": {"text": "body"},
+        "template": _prompt_file(),
+        "output_fields": [{"suffix": "answer", "type": "string"}],
+    }
+    options = _options(["body"], {"classify": query})
+    options["prompt_template"] = _prompt_file()
+    if consumer == "required":
+        options["required_input_fields"].append("classify_answer")
+    elif consumer == "alias":
+        query["input_fields"] = {"text": "classify_answer"}
+    elif consumer == "schema":
+        options["schema"]["required_fields"] = ["classify_answer"]
+    else:
+        options["image_inputs"] = [{"field": "classify_answer", "format": "png"}]
+    errors = _validate_multi_query_generated_input_requirements(_state(options).nodes[0])
+    assert any(entry.error_code == "query_generated_fields_required" for entry in errors)
+
+
+def test_file_backed_ordered_queries_keep_prior_output_and_forward_reference_checks() -> None:
+    from tests.unit.plugins.llm.test_ordered_query_contract import ordered_options
+
+    options = ordered_options()
+    options["prompt_template"] = _prompt_file()
+    for query in options["queries"]:
+        query["template"] = _prompt_file()
+    result = _state(options).validate()
+    assert not [
+        entry for entry in result.errors if entry.error_code in {_CODE, "query_generated_fields_required", "plugin_options_invalid"}
+    ]
+    options["queries"][0]["input_fields"] = {"text": "assess_answer"}
+    errors = _validate_multi_query_generated_input_requirements(_state(options).nodes[0])
+    assert any(entry.error_code == "plugin_options_invalid" for entry in errors)
+
+
+def test_materialized_query_text_is_checked_after_deferred_authoring_validation() -> None:
+    query = {"input_fields": {"text": "body"}, "template": _prompt_file()}
+    options = _options(["body"], {"classify": query})
+    assert _validate_multi_query_generated_input_requirements(_state(options).nodes[0]) == ()
+    with pytest.raises(ValidationError):
+        LLMConfig.model_validate(options)
+    query["template"] = "{{ row.source_row.classify_llm_response }}"
+    errors = _validate_multi_query_generated_input_requirements(_state(options).nodes[0])
+    assert any(entry.error_code == "query_generated_fields_required" for entry in errors)
+    with pytest.raises(ValidationError):
+        LLMConfig.model_validate(options)
+
+
+@pytest.mark.parametrize("list_form", [False, True])
+@pytest.mark.parametrize("fallback_used", [False, True])
+def test_file_override_does_not_inherit_an_unused_root_template(list_form: bool, fallback_used: bool) -> None:
+    queries = {"first": {"input_fields": {"text": "body"}, "template": _prompt_file()}}
+    if fallback_used:
+        queries["second"] = {"input_fields": {"text": "body"}}
+    options = _options(["body"], queries, template="{{ row.source_row.first_llm_response }}")
+    if list_form:
+        options["queries"] = [{"name": name, **entry} for name, entry in queries.items()]
+    errors = _validate_multi_query_generated_input_requirements(_state(options).nodes[0])
+    assert bool(errors) == fallback_used
+    assert all(entry.error_code == "query_generated_fields_required" for entry in errors)
 
 
 def test_ordered_prior_binding_is_admitted_by_stage_one() -> None:

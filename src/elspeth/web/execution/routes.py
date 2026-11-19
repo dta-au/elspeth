@@ -72,6 +72,7 @@ from elspeth.web.execution.errors import (
     UnresolvedInterpretationPlaceholderError,
 )
 from elspeth.web.execution.fanout_guard import FANOUT_GUARD_ERROR_TYPE, ExecutionFanoutGuardRequired
+from elspeth.web.execution.http_errors import pipeline_validation_http_exception
 from elspeth.web.execution.outputs import (
     RunOutputsAuditUnavailableError,
     filesystem_path_candidates,
@@ -118,6 +119,7 @@ from elspeth.web.required_work import (
 )
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.ownership import verify_session_ownership
+from elspeth.web.sessions.prompt_file_review import PromptFileReviewStale
 from elspeth.web.sessions.protocol import (
     RunDiagnosticsAuditAuthority,
     RunDiagnosticsAuthorityLostError,
@@ -1216,23 +1218,11 @@ def create_execution_router() -> APIRouter:
             # and ``except ExecuteRequestValidationError`` (400) — PipelineValidationError
             # subclasses ValueError. The structured ``errors`` mirror the /validate
             # ValidationResult.errors shape so the frontend banner needs no string parsing.
+            raise pipeline_validation_http_exception(exc) from exc
+        except PromptFileReviewStale as exc:
             raise HTTPException(
                 status_code=422,
-                detail={
-                    "error_type": "pipeline_validation_failure",
-                    "detail": str(exc),
-                    "kind": "pipeline_validation_failure",
-                    "errors": [
-                        {
-                            "component_id": err.component_id,
-                            "component_type": err.component_type,
-                            "message": err.message,
-                            "suggestion": err.suggestion,
-                            "error_code": err.error_code,
-                        }
-                        for err in exc.errors
-                    ],
-                },
+                detail={"error_type": exc.error_code, "kind": exc.error_code, "detail": str(exc)},
             ) from exc
         except ExecutionReadinessError as exc:
             raise HTTPException(

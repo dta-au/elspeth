@@ -1,6 +1,6 @@
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { axe, toHaveNoViolations } from "jest-axe";
 import { AcknowledgementStack } from "./AcknowledgementStack";
@@ -22,6 +22,13 @@ vi.mock("@/api/client", () => ({
   resolveInterpretation: vi.fn(),
   optOutOfInterpretations: vi.fn(),
   getInterpretationOptOutSummary: vi.fn(),
+  // Each prompt card loads its stored review snapshot; default to one whose
+  // template is the card's own preview text.
+  getPromptReviewSnapshot: vi.fn((sessionId: string, eventId: string) => Promise.resolve({
+    version: 1, session_id: sessionId, node_id: "node-1", event_id: eventId,
+    authored_surface: { prompt_template: "Stored snapshot template." }, bindings: [],
+    anchor: "a".repeat(64), effective_artifact_hash: null, is_live_review: true,
+  })),
 }));
 
 import * as api from "@/api/client";
@@ -274,57 +281,142 @@ describe("AcknowledgementStack — foot-of-stack opt-out", () => {
   });
 });
 
-describe("AcknowledgementStack — compositionState threading", () => {
-  // Truth test, not an existence test: the card can only render the accepted
-  // sibling value if the stack actually passes its subscribed
-  // compositionState down (elspeth-990f5ea562).
-  it("threads the live compositionState into each card so resolved slot values render", async () => {
+describe("AcknowledgementStack — prompt card from the stored snapshot", () => {
+  // The verifier's two-tab sequence (verify-A A1): this tab still holds v5,
+  // where system_prompt is "A"; another tab moved the server to v6 ("B") and
+  // surfaced the card. The card must show and approve the server's snapshot,
+  // never this tab's stale compositionState.
+  it("shows the snapshot surfaced by the other tab and approves its anchor", async () => {
     const user = userEvent.setup();
-    const promptNode: NodeSpec = {
-      ...makeNode("llm", "llm"),
-      options: {
-        prompt_template_parts: [
-          { kind: "text", text: "Summarise " },
-          { kind: "interpretation_ref", requirement_id: "req-1" },
-          { kind: "text", text: " for an auditor." },
-        ],
-        interpretation_requirements: [
-          {
-            id: "req-1",
-            kind: "vague_term",
-            user_term: "punchy",
-            status: "resolved",
-            draft: "short and direct",
-            event_id: "evt-vague-1",
-            accepted_value: "concise and neutral",
-            accepted_artifact_hash: null,
-            approved_prompt_artifact_hash: null,
-          },
-        ],
-      },
-    };
+    const anchor = "6".repeat(64);
     useSessionStore.setState({
-      compositionState: makeCompositionState([promptNode]),
+      compositionState: makeCompositionState([{
+        ...makeNode("llm", "llm"),
+        options: { system_prompt: "A (stale tab)", prompt_template: "Stale tab template." },
+      }]),
     });
-    seedPending([
-      makeEvent("e1", {
-        kind: "llm_prompt_template",
-        affected_node_id: "llm",
-        user_term: null,
-        llm_draft: "Summarise pending interpretation for an auditor.",
-      }),
-    ]);
+    vi.mocked(api.getPromptReviewSnapshot).mockResolvedValueOnce({
+      version: 1, session_id: SID, node_id: "llm", event_id: "e1",
+      authored_surface: { system_prompt: "B (server)", prompt_template: "Server template." }, bindings: [],
+      anchor, effective_artifact_hash: null, is_live_review: true,
+    });
+    const event = makeEvent("e1", { kind: "llm_prompt_template", affected_node_id: "llm", user_term: null, llm_draft: "Bounded preview." });
+    seedPending([event]);
+    vi.mocked(api.resolveInterpretation).mockResolvedValue({
+      event: { ...event, choice: "accepted_as_drafted", accepted_value: event.llm_draft, resolved_at: "2026-06-22T01:00:00Z" },
+      new_state: makeCompositionState([]),
+    });
     render(<AcknowledgementStack sessionId={SID} />);
 
     await user.click(screen.getByRole("button", { name: "View prompt" }));
-    const region = screen.getByRole("region", {
-      name: /prompt template review/i,
+    const region = screen.getByRole("region", { name: /prompt template review/i });
+    await waitFor(() => expect(region).toHaveTextContent("B (server)"));
+    expect(region).toHaveTextContent("Server template.");
+    expect(region).not.toHaveTextContent("stale tab");
+    expect(region).not.toHaveTextContent("Stale tab template.");
+    await user.click(screen.getByRole("button", { name: /approve the llm prompt template/i }));
+    await waitFor(() => expect(api.resolveInterpretation).toHaveBeenCalledWith(
+      SID, "e1", { choice: "accepted_as_drafted", reviewed_anchor: anchor },
+    ));
+  });
+
+  // A pending inline prompt card whose rendered text changes (a sibling
+  // vague term resolved) is superseded server-side, and a NEW card is issued
+  // with its own snapshot. That snapshot's frozen skeleton carries the
+  // resolved slot's event_id; the still-open slot's event_id stays null.
+  it("renders a re-issued prompt card from its own snapshot, with the resolved slot accepted by its frozen event_id", async () => {
+    const user = userEvent.setup();
+    const oldAnchor = "0".repeat(64);
+    const newAnchor = "9".repeat(64);
+    const parts = [
+      { kind: "text", text: "Summarise " },
+      { kind: "interpretation_ref", requirement_id: "req-topic" },
+      { kind: "text", text: " in a " },
+      { kind: "interpretation_ref", requirement_id: "req-tone" },
+      { kind: "text", text: " tone." },
+    ];
+    const snapshots: Record<string, Awaited<ReturnType<typeof api.getPromptReviewSnapshot>>> = {
+      "p-old": {
+        version: 1, session_id: SID, node_id: "node-1", event_id: "p-old",
+        authored_surface: {
+          prompt_template: "Summarise OLD RENDER pending interpretation in a pending interpretation tone.",
+          prompt_template_parts: parts,
+          interpretation_requirements: [
+            { id: "req-topic", event_id: null, user_term: "the key points" },
+            { id: "req-tone", event_id: null, user_term: "punchy" },
+          ],
+        },
+        bindings: [], anchor: oldAnchor, effective_artifact_hash: null, is_live_review: true,
+      },
+      "p-new": {
+        version: 1, session_id: SID, node_id: "node-1", event_id: "p-new",
+        authored_surface: {
+          // The server's re-rendered text carries the accepted value; the
+          // card must render from the parts, never from this or live state.
+          prompt_template: "Summarise pending interpretation in a RE-RENDERED VALUE tone.",
+          prompt_template_parts: parts,
+          interpretation_requirements: [
+            { id: "req-topic", event_id: null, user_term: "the key points" },
+            { id: "req-tone", event_id: "v-tone", user_term: "punchy" },
+          ],
+        },
+        bindings: [], anchor: newAnchor, effective_artifact_hash: null, is_live_review: true,
+      },
+    };
+    vi.mocked(api.getPromptReviewSnapshot).mockImplementation((_sid, eventId) => Promise.resolve(snapshots[eventId]));
+    const oldCard = makeEvent("p-old", { kind: "llm_prompt_template", user_term: null, llm_draft: "Old preview." });
+    const newCard = makeEvent("p-new", { kind: "llm_prompt_template", user_term: null, llm_draft: "New preview." });
+    const topic = makeEvent("v-topic", { user_term: "the key points" });
+    const tone = makeEvent("v-tone", { user_term: "punchy" });
+    // An earlier review of the same term on the same node, retired before.
+    // It makes the node-and-term lookup ambiguous, so "accepted" below can
+    // only come from the frozen event_id.
+    const retiredTone = makeEvent("v-tone-old", { user_term: "punchy", choice: "superseded" });
+    vi.mocked(api.resolveInterpretation).mockResolvedValue({
+      event: { ...newCard, choice: "accepted_as_drafted", accepted_value: newCard.llm_draft, resolved_at: "2026-06-22T02:00:00Z" },
+      new_state: makeCompositionState([]),
     });
-    // The PRIMARY render (first pre) carries the substitution; the frozen
-    // mask survives only inside the 'View original template' disclosure.
-    const primaryPre = region.querySelector("pre.ack-card-prompt-pre");
-    expect(primaryPre?.textContent).toContain("concise and neutral");
-    expect(primaryPre?.textContent).not.toContain("pending interpretation");
+    seedPending([oldCard, topic, tone]);
+    useInterpretationEventsStore.setState({ resolvedBySession: { [SID]: [retiredTone] } });
+    render(<AcknowledgementStack sessionId={SID} />);
+
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    await waitFor(() => expect(screen.getByRole("region", { name: /prompt template review/i })).toHaveTextContent("Summarise"));
+
+    // The tone review is accepted; the server supersedes the old prompt card
+    // and issues a new one.
+    act(() => {
+      seedPending([newCard, topic]);
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [SID]: [retiredTone, { ...tone, choice: "amended", accepted_value: "LIVE VALUE" }, { ...oldCard, choice: "superseded" }],
+        },
+      });
+    });
+
+    expect(screen.queryAllByRole("button", { name: "View prompt" })).toHaveLength(1);
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    const region = screen.getByRole("region", { name: /prompt template review/i });
+    await waitFor(() => expect(region.querySelectorAll("mark.ack-card-prompt-slot")).toHaveLength(2));
+    expect(api.getPromptReviewSnapshot).toHaveBeenLastCalledWith(SID, "p-new", expect.anything());
+    const slots = Array.from(region.querySelectorAll("mark.ack-card-prompt-slot")).map((mark) => {
+      const clone = mark.cloneNode(true) as HTMLElement;
+      clone.querySelectorAll(".visually-hidden").forEach((hidden) => hidden.remove());
+      return clone.textContent;
+    });
+    expect(slots).toEqual([
+      "[“the key points”, reviewed in its own card: pending]",
+      "[“punchy”, reviewed in its own card: accepted]",
+    ]);
+    expect(region).not.toHaveTextContent("RE-RENDERED VALUE");
+    expect(region).not.toHaveTextContent("LIVE VALUE");
+    expect(region).not.toHaveTextContent("OLD RENDER");
+
+    await user.click(screen.getByRole("button", { name: /approve the llm prompt template/i }));
+    await waitFor(() => expect(api.resolveInterpretation).toHaveBeenCalledTimes(1));
+    expect(api.resolveInterpretation).toHaveBeenCalledWith(
+      SID, "p-new", { choice: "accepted_as_drafted", reviewed_anchor: newAnchor },
+    );
   });
 });
 

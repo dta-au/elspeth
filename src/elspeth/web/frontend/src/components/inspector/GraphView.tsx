@@ -20,12 +20,14 @@ import {
   Handle,
   MarkerType,
   Position,
+  useUpdateNodeInternals,
   type Node,
   type Edge,
   type EdgeProps,
   type EdgeTypes,
   type NodeProps,
   type NodeTypes,
+  type NodeChange,
   type NodeMouseHandler,
   type OnInit,
   type ReactFlowInstance,
@@ -61,6 +63,7 @@ import type { CompositionState } from "@/types/index";
 import { ConfigRows } from "./ConfigRows";
 import { OptionRows } from "./OptionRows";
 import { GraphOutputs } from "./GraphOutputs";
+import { PromptFileEditors } from "./PromptFileEditor";
 import { visibleGraphRoutes } from "@/lib/graphRouteVisibility";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 
@@ -331,8 +334,25 @@ function parallelLanePath(
 }
 
 function PipelineGraphNode({
+  id,
   data,
 }: NodeProps<PipelineGraphNodeModel>): JSX.Element {
+  // Measured sizes are carried across node rebuilds (see measuredNodeSizes), so
+  // React Flow keeps this node's handle bounds. A route change can add, drop or
+  // move a parallel handle without resizing the node, so re-read the handles
+  // whenever their set or placement changes. React Flow measures a node itself
+  // when it mounts, so only a later change needs the explicit re-read.
+  const updateNodeInternals = useUpdateNodeInternals();
+  const handleLayout = [
+    ...(data.parallelTargetHandles ?? []).map((handle) => `t:${handle.id}@${handle.offsetPercent}`),
+    ...(data.parallelSourceHandles ?? []).map((handle) => `s:${handle.id}@${handle.offsetPercent}`),
+  ].join("|");
+  const readHandleLayout = useRef(handleLayout);
+  useEffect(() => {
+    if (readHandleLayout.current === handleLayout) return;
+    readHandleLayout.current = handleLayout;
+    updateNodeInternals(id);
+  }, [id, handleLayout, updateNodeInternals]);
   return (
     <>
       <Handle
@@ -766,10 +786,12 @@ function NodeConfigPanel({
   config,
   onClose,
   panelRef,
+  showInFiles,
 }: {
   config: SelectedComponentConfig;
   onClose: () => void;
   panelRef?: React.Ref<HTMLElement>;
+  showInFiles: boolean;
 }): JSX.Element {
   return (
     <aside
@@ -820,7 +842,9 @@ function NodeConfigPanel({
           options={config.options}
           ariaLabel={`${config.id} settings`}
           plugin={config.plugin === null ? null : { kind: config.pluginKind, name: config.plugin }}
+          slotActions={config.plugin === "llm" ? { nodeId: config.id, showInFiles } : undefined}
         />
+        {config.plugin === "llm" && <PromptFileEditors nodeId={config.id} options={config.options} />}
       </section>
 
       <details className="graph-config-section graph-config-connections">
@@ -877,9 +901,12 @@ export interface GraphViewProps {
   /** Opens the full-screen graph. Passed by the Workflow tab only; GraphModal
    *  renders this same component and must not offer to open itself. */
   onFullscreen?: () => void;
+  /** Rendered inside GraphModal's focus-trapped dialog: the file manager sits
+   *  behind the modal there, so the inspector omits Show in files. */
+  inModal?: boolean;
 }
 
-export function GraphView({ onFullscreen }: GraphViewProps = {}) {
+export function GraphView({ onFullscreen, inModal = false }: GraphViewProps = {}) {
   const compositionState = useSessionStore((s) => s.compositionState);
   const pendingProposalCount = useSessionStore(
     (s) =>
@@ -939,6 +966,26 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
     () => readThemeColor(MINIMAP_NODE_STROKE_COLOR_VAR, FALLBACK_MINIMAP_NODE_COLOR_VAR),
     [],
   );
+
+  // Only the measured sizes React Flow reports are kept: the graph is
+  // display-only, so position and selection changes stay owned by the stores.
+  const [measuredNodeSizes, setMeasuredNodeSizes] = useState<
+    ReadonlyMap<string, { width: number; height: number }>
+  >(() => new Map());
+  const onNodesChange = useCallback((changes: NodeChange[]) => {
+    setMeasuredNodeSizes((previous) => {
+      let next: Map<string, { width: number; height: number }> | null = null;
+      for (const change of changes) {
+        if (change.type !== "dimensions" || change.dimensions === undefined) continue;
+        const { width, height } = change.dimensions;
+        const current = (next ?? previous).get(change.id);
+        if (current?.width === width && current.height === height) continue;
+        next ??= new Map(previous);
+        next.set(change.id, { width, height });
+      }
+      return next ?? previous;
+    });
+  }, []);
 
   // Node click handler — toggle selection
   const onNodeClick: NodeMouseHandler = useCallback(
@@ -2077,9 +2124,18 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
   }));
   // ARGOnite: a selected route's endpoints take the same gap ring as a
   // selected node, over the card shadow.
-  const renderedNodes = visibleGraph.nodes.map((node) => activeEdge && (node.id === activeEdge.source || node.id === activeEdge.target)
-    ? { ...node, className: "graph-node--selected", style: { ...node.style, boxShadow: `${SELECTED_NODE_RING}, var(--shadow-card)` } }
-    : node);
+  // Every node object is rebuilt on each validation result, selection or route
+  // toggle. React Flow treats a controlled node that arrives without `measured`
+  // as unmeasured: it drops its size and handle bounds and hides its edges until
+  // it re-measures, so the whole edge layer blanked and redrew. Carry the last
+  // measured size forward instead.
+  const renderedNodes = visibleGraph.nodes.map((node) => {
+    const measured = measuredNodeSizes.get(node.id);
+    const sized = measured ? { ...node, measured } : node;
+    return activeEdge && (node.id === activeEdge.source || node.id === activeEdge.target)
+      ? { ...sized, className: "graph-node--selected", style: { ...sized.style, boxShadow: `${SELECTED_NODE_RING}, var(--shadow-card)` } }
+      : sized;
+  });
 
   // Accessible, keyboard-operable equivalent of the visual DAG. The React Flow
   // diagram is a visual image (role="img", scoped to the diagram element
@@ -2303,6 +2359,7 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
               nodesFocusable={false}
               edgesFocusable={false}
               elementsSelectable={true}
+              onNodesChange={onNodesChange}
               onNodeClick={onNodeClick}
               onEdgeClick={(_event, edge) => setActiveEdgeId(edge.id)}
               onPaneClick={onPaneClick}
@@ -2371,6 +2428,7 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
             config={selectedConfig}
             onClose={() => selectNode(null)}
             panelRef={configPanelRef}
+            showInFiles={!inModal}
           />
         )}
       </div>

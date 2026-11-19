@@ -62,6 +62,7 @@ from elspeth.web.composer.prompts import build_system_prompt
 from elspeth.web.composer.tools import _common as common
 from elspeth.web.composer.tools import _dispatch, _registry, blobs, secrets
 from elspeth.web.composer.tools._dispatch import get_tool_definitions
+from elspeth.web.composer.tools.prompt_target_responses import PromptTargetMetadata
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 from elspeth.web.execution.schemas import ValidationResult
 from tests.helpers.tree_gate import ParsedPythonFile, iter_gate_sources
@@ -205,6 +206,7 @@ _CONTAINER_ELEMENT_PAYLOADS: dict[str, type | _Elsewhere] = {
     "validation.warnings": _Elsewhere("_validation_typed_sites"),
     "validation.suggestions": _Elsewhere("_validation_typed_sites"),
     "data.edge_contracts": state.EdgeContractDict,
+    "data.targets": PromptTargetMetadata,
 }
 # A nested value the walker can see is a REFERENCE and not a container: its shape lives at the
 # other end of a name, an attribute, a subscript or a call, and this position has no enclosing
@@ -276,6 +278,8 @@ _LOCAL_DATA_PAYLOADS: dict[tuple[str, str, str], type | None] = {}
 _SPLAT_KEYS: dict[str, tuple[str, ...]] = {}
 # enclosing function -> tool name, where the ``_handle_`` / ``_execute_`` prefix rule does not apply.
 _FUNCTION_TOOL_OVERRIDES: dict[str, str] = {
+    "_apply_guarded_node_option_patch": "patch_node_options",
+    "_inspect_prompt_targets": "inspect_prompt_targets",
     "build_set_pipeline_candidate": "set_pipeline",
     "_execute_upsert_queue_node": "upsert_node",
     "_execute_delete_blob_locked": "delete_blob",

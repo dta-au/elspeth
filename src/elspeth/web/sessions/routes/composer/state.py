@@ -6,10 +6,16 @@ import re
 from dataclasses import replace
 from typing import Annotated, NotRequired, TypedDict
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
-from elspeth.contracts.blobs import BlobRecord
-from elspeth.contracts.blobs_inline import BlobInlineRef, ContentEncoding
+from elspeth.contracts.blobs import ALLOWED_MIME_TYPES, BlobRecord
+from elspeth.contracts.blobs_inline import (
+    INLINE_BLOB_NOT_TEXT_CODE,
+    INLINE_BLOB_NOT_TEXT_REPAIR,
+    BlobInlineRef,
+    ContentEncoding,
+    is_widened_blob_ref,
+)
 from elspeth.contracts.composer_interpretation import InterpretationSurfaceOrigin
 from elspeth.contracts.enums import is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError
@@ -24,10 +30,12 @@ from elspeth.web.catalog.schemas import PluginKind
 from elspeth.web.compartments import compartment_ingress_record, compartment_marking_header
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.state import CompositionState, SourceSpec
+from elspeth.web.composer.tools._common import _options_with_default_prompt_template_review
 from elspeth.web.composer.tools.blobs import (
     _apply_inline_blob_marker,
     _file_inject_blob_binding_error,
     _llm_authored_prompt_surface_error,
+    _structured_prompt_template_refusal,
 )
 from elspeth.web.composer.yaml_generator import (
     PUBLIC_EXPORT_REBIND_GUIDANCE,
@@ -46,7 +54,12 @@ from elspeth.web.coordination.composer_progress_authority import (
 )
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.credential_guard import require_no_credential_material_in_state
-from elspeth.web.execution._validation_materialization import FILE_INJECT_ENTRY_RENAME_CONSEQUENCE, file_inject_state_refusals
+from elspeth.web.execution._validation_materialization import (
+    FILE_INJECT_ENTRY_RENAME_CONSEQUENCE,
+    file_inject_state_refusals,
+    llm_prompt_file_scalar_field,
+    llm_prompt_surface_field,
+)
 from elspeth.web.interpretation_state import (
     InterpretationReviewCapacityError,
     InterpretationReviewIntegrityError,
@@ -68,6 +81,7 @@ from elspeth.web.paths import (
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
+from elspeth.web.sessions.inline_blob_preflight import InlinePreflightState, prepare_session_inline_blob_snapshot
 from elspeth.web.sessions.operation_receipts import operation_receipt_response_hash
 from elspeth.web.sessions.protocol import (
     CompositionStateRecord,
@@ -108,6 +122,7 @@ from .._helpers import (
     SessionsTelemetry,
     UpdateComposerPreferencesRequest,
     UserIdentity,
+    ValidationResult,
     _composer_preferences_response,
     _get_composer_progress_registry,
     _get_session_compose_lock_registry,
@@ -674,6 +689,36 @@ def _ready_blob_content_hash(blob: BlobRecord) -> str:
     return blob.content_hash
 
 
+async def _reject_pasted_inline_prompt_blob_mime(
+    state: CompositionState,
+    *,
+    request: Request,
+    session_id: UUID,
+    session_operation_context: SessionOperationContext,
+) -> None:
+    """Check pasted LLM prompt markers against session-scoped blob metadata before publication."""
+    for node in state.nodes:
+        if node.plugin != "llm":
+            continue
+        marker = is_widened_blob_ref(deep_thaw(node.options.get("prompt_template")))
+        if marker is None or marker.mode != "inline_content":
+            continue
+        blob = await _ready_import_blob(
+            marker.blob_id,
+            request=request,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+        )
+        if blob.mime_type not in ALLOWED_MIME_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error_code": INLINE_BLOB_NOT_TEXT_CODE,
+                    "message": f"Blob '{blob.id}' is not inline text. {INLINE_BLOB_NOT_TEXT_REPAIR}",
+                },
+            )
+
+
 async def _state_with_imported_inline_blobs(
     state: CompositionState,
     *,
@@ -709,6 +754,14 @@ async def _state_with_imported_inline_blobs(
             session_operation_context=session_operation_context,
         )
         content_hash = _ready_blob_content_hash(blob)
+        if blob.mime_type not in ALLOWED_MIME_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error_code": INLINE_BLOB_NOT_TEXT_CODE,
+                    "message": f"Blob '{blob.id}' is not inline text. {INLINE_BLOB_NOT_TEXT_REPAIR}",
+                },
+            )
         try:
             ref = BlobInlineRef(field_path=field_path, blob_id=blob.id, sha256=content_hash, encoding=encoding)
         except ValueError:
@@ -719,6 +772,34 @@ async def _state_with_imported_inline_blobs(
                     "(source:<name>.options.<field>, node:<id>.options.<field> or output:<name>.options.<field>)"
                 ),
             ) from None
+        node_id = ref.field_path.partition(".options.")[0].removeprefix("node:")
+        node = next((item for item in state.nodes if item.id == node_id), None)
+        if node is not None and node.plugin == "llm" and llm_prompt_file_scalar_field(ref.field_path) is not None and encoding != "utf-8":
+            raise HTTPException(
+                status_code=400,
+                detail={"error_code": "inline_blob_field_path_invalid", "message": "File-backed LLM prompts require UTF-8 text."},
+            )
+        if (
+            node is not None
+            and node.plugin == "llm"
+            and llm_prompt_surface_field(ref.field_path) is not None
+            and llm_prompt_file_scalar_field(ref.field_path) is None
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error_code": "inline_blob_field_path_invalid",
+                    "message": "File-backed LLM prompts bind only to prompt_template, system_prompt, or a query template.",
+                },
+            )
+        if ref.field_path == f"node:{node_id}.options.prompt_template" and node is not None and node.plugin == "llm":
+            marker: dict[str, JsonValue] = {"blob_ref": str(blob.id), "mode": "inline_content", "sha256": content_hash}
+            structured_error = _structured_prompt_template_refusal(node_id, node.options, {"prompt_template": marker})
+            if structured_error is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error_code": "prompt_template_parts_required", "message": structured_error},
+                )
         prompt_surface_error = _llm_authored_prompt_surface_error(
             state,
             ref.field_path,
@@ -743,6 +824,24 @@ async def _state_with_imported_inline_blobs(
             rebound = _apply_inline_blob_marker(state, ref.field_path, marker, replace_existing=False)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=f"inline_blob_bindings path '{field_path}': {exc}") from None
+        if node is not None and node.plugin == "llm" and llm_prompt_file_scalar_field(ref.field_path) is not None:
+            rebound = replace(
+                rebound,
+                nodes=tuple(
+                    replace(
+                        item,
+                        options=_options_with_default_prompt_template_review(
+                            node_id=item.id,
+                            plugin=item.plugin,
+                            options=item.options,
+                            existing_options=node.options,
+                        ),
+                    )
+                    if item.id == node_id
+                    else item
+                    for item in rebound.nodes
+                ),
+            )
         state = replace(rebound, version=state.version)
     return state
 
@@ -1286,7 +1385,8 @@ async def seed_state_from_runtime_yaml(
             try:
                 imported_state = composition_state_from_runtime_yaml(body.yaml)
             except RuntimeYamlImportError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+                detail = {"error_code": exc.error_code, "message": str(exc)} if exc.error_code is not None else str(exc)
+                raise HTTPException(status_code=400, detail=detail) from exc
             secret_service = request.app.state.scoped_secret_resolver
             env_ref_names = frozenset(item.name for item in secret_service.list_refs(str(user.user_id)))
             require_no_credential_material_in_state(
@@ -1295,6 +1395,12 @@ async def seed_state_from_runtime_yaml(
                 env_ref_names=env_ref_names,
             )
             _reject_imported_plugin_policy(imported_state, catalog, plugin_snapshot)
+            await _reject_pasted_inline_prompt_blob_mime(
+                imported_state,
+                request=request,
+                session_id=session.id,
+                session_operation_context=lease.context,
+            )
             imported_state = await _state_with_imported_source_blobs(
                 imported_state,
                 source_blob_ids=body.source_blob_ids,
@@ -1633,10 +1739,40 @@ async def _require_yaml_export_preflight(
     request: Request,
     session_id: UUID,
     plugin_snapshot: PluginAvailabilitySnapshot,
+    session_operation_context: SessionOperationContext,
 ) -> None:
-    """Keep the existing export preflight for currently available states."""
-    try:
-        runtime_validation = await _runtime_preflight_for_state(
+    """Validate with verified inline bytes under the export's existing lease."""
+
+    def metadata_hint(blob_id: UUID) -> tuple[str, str | None, int] | None:
+        blob_service: BlobServiceProtocol = request.app.state.blob_service
+        try:
+            record = blob_service.get_blob_sync(blob_id, session_operation_context)
+        except BlobNotFoundError:
+            return None
+        if type(record) is not BlobRecord:
+            raise TypeError("BlobServiceProtocol.get_blob_sync() must return BlobRecord")
+        if record.id != blob_id or record.session_id != session_id:
+            raise AuditIntegrityError("YAML export inline blob metadata crossed a custody boundary")
+        return record.status, record.content_hash, record.size_bytes
+
+    def read_blob(blob_id: UUID) -> tuple[BlobRecord, bytes]:
+        blob_service: BlobServiceProtocol = request.app.state.blob_service
+        record, content = blob_service.read_blob_content_sync(blob_id, session_operation_context)
+        if type(record) is not BlobRecord or type(content) is not bytes:
+            raise TypeError("BlobServiceProtocol.read_blob_content_sync() must return BlobRecord and bytes")
+        if record.id != blob_id:
+            raise AuditIntegrityError("YAML export inline blob read returned a different identity")
+        return record, content
+
+    async def preflight() -> ValidationResult:
+        snapshot = await run_sync_in_worker(
+            prepare_session_inline_blob_snapshot,
+            InlinePreflightState.from_composition_state(state),
+            session_id=session_id,
+            read_blob=read_blob,
+            metadata_hint=metadata_hint,
+        )
+        return await _runtime_preflight_for_state(
             state,
             settings=request.app.state.settings,
             secret_service=None,
@@ -1645,6 +1781,13 @@ async def _require_yaml_export_preflight(
             plugin_snapshot=plugin_snapshot,
             profile_registry=request.app.state.operator_profile_registry,
             catalog=request.app.state.catalog_service,
+            blob_get_content=snapshot.content if snapshot is not None else None,
+        )
+
+    try:
+        runtime_validation = await asyncio.wait_for(
+            preflight(),
+            timeout=request.app.state.settings.composer_runtime_preflight_timeout_seconds,
         )
     except (
         TimeoutError,
@@ -1771,6 +1914,7 @@ async def get_state_yaml(
                 request=request,
                 session_id=session.id,
                 plugin_snapshot=plugin_snapshot,
+                session_operation_context=lease.context,
             )
         source_blob_ids = await _verified_yaml_export_blob_ids(
             state,

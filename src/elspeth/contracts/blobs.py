@@ -430,6 +430,37 @@ class BlobContentMissingError(BlobError):
         _guard_frozen_attr(self, name, value)
 
 
+InlineBlobNotAdmittedReason = Literal["unverified", "oversized", "aggregate_oversized"]
+
+
+class InlineBlobNotAdmittedError(BlobStateError):
+    """A preflight inline-blob snapshot holds no verified bytes for this blob.
+
+    ``unverified``: the blob was missing, not ready, its hash disagreed with
+    the marker, or it was never part of the snapshot. ``oversized`` and
+    ``aggregate_oversized``: its bytes exceed the per-reference or the
+    aggregate inline cap, named by ``limit_bytes``; runtime substitution
+    enforces the same caps, so such a reference can never run.
+
+    A ``BlobStateError`` so consumers that already map a not-ready blob to a
+    field-scoped refusal keep doing so.
+    """
+
+    _FROZEN_ATTRS: ClassVar[frozenset[str]] = frozenset({"blob_id", "reason", "limit_bytes"})
+
+    def __init__(self, blob_id: str, *, reason: InlineBlobNotAdmittedReason, limit_bytes: int | None) -> None:
+        if (reason == "unverified") != (limit_bytes is None):
+            raise ValueError("InlineBlobNotAdmittedError: limit_bytes is required exactly for an oversized reason")
+        if reason == "unverified":
+            message = f"Blob {blob_id} has no verified inline bytes in this snapshot"
+        else:
+            scope = "per-file" if reason == "oversized" else "aggregate"
+            message = f"Blob {blob_id} exceeds the {scope} inline limit of {limit_bytes} bytes"
+        super().__init__(blob_id, message=message)
+        self.reason = reason
+        self.limit_bytes = limit_bytes
+
+
 @dataclass(frozen=True, slots=True)
 class BlobFinalizationError:
     """Record of a per-blob finalization failure.

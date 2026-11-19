@@ -749,6 +749,9 @@ files:
     Mapping[str, object]: 2
   src/elspeth/web/auth/session_token.py:
     dict[str, object]: 3
+  src/elspeth/web/blobs/prompt_editor.py:
+    Mapping[str, Any]: 2
+    dict[str, Any]: 1
   src/elspeth/web/catalog/knob_schema.py:
     Mapping[str, Any]: 1
     dict[str, object]: 1
@@ -813,11 +816,13 @@ files:
   src/elspeth/web/composer/composition_completion.py:
     Mapping[str, Any]: 2
     dict[str, Any]: 4
+  src/elspeth/web/composer/context_budget.py:
+    Mapping[str, object]: 1
   src/elspeth/web/composer/context_budget_apply.py:
     Mapping[str, Any]: 4
     dict[str, Any]: 6
   src/elspeth/web/composer/context_budget_history.py:
-    Mapping[str, Any]: 1
+    Mapping[str, Any]: 5
   src/elspeth/web/composer/control_messages.py:
     Mapping[str, Any]: 1
   src/elspeth/web/composer/discovery_cache.py:
@@ -959,9 +964,9 @@ files:
     Mapping[str, Any]: 1
     dict[str, Any]: 5
   src/elspeth/web/composer/tools/transforms.py:
-    Mapping[str, Any]: 7
+    Mapping[str, Any]: 8
     dict[str, Any]: 19
-    dict[str, object]: 2
+    dict[str, object]: 4
   src/elspeth/web/composer/tools/wire_projection.py:
     Mapping[str, Any]: 7
     boundary: 1
@@ -1075,10 +1080,16 @@ files:
   src/elspeth/web/sessions/operation_receipts.py:
     dict[str, Any]: 1
   src/elspeth/web/sessions/pending_interpretation.py:
-    Mapping[str, Any]: 24
+    Mapping[str, Any]: 27
     boundary: 1
     dict[str, Any]: 6
     dict[str, object]: 1
+  src/elspeth/web/sessions/prompt_file_approval.py:
+    Mapping[str, Any]: 3
+  src/elspeth/web/sessions/prompt_file_review.py:
+    Mapping[str, Any]: 4
+    MutableMapping[str, Any]: 1
+    dict[str, object]: 3
   src/elspeth/web/sessions/proposal_authority.py:
     Mapping[str, Any]: 4
   src/elspeth/web/sessions/proposal_blob_refs.py:
@@ -1086,7 +1097,7 @@ files:
   src/elspeth/web/sessions/proposal_decoder.py:
     Mapping[str, Any]: 2
   src/elspeth/web/sessions/protocol.py:
-    Mapping[str, Any]: 37
+    Mapping[str, Any]: 38
   src/elspeth/web/sessions/routes/_helpers.py:
     Mapping[str, Any]: 4
     dict[str, Any]: 1
@@ -1098,21 +1109,23 @@ files:
   src/elspeth/web/sessions/routes/composer/state.py:
     boundary: 1
     dict[str, Any]: 1
+  src/elspeth/web/sessions/routes/interpretation.py:
+    dict[str, object]: 1
   src/elspeth/web/sessions/routes/sessions.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 2
   src/elspeth/web/sessions/service.py:
-    Mapping[str, Any]: 15
+    Mapping[str, Any]: 17
     dict[str, Any]: 1
   src/elspeth/web/shareable_reviews/file_manifest.py:
     dict[str, object]: 1
   src/elspeth/web/shareable_reviews/service.py:
     dict[str, object]: 1
 totals:
-  Mapping[str, Any]: 799
-  Mapping[str, object]: 318
-  MutableMapping[str, Any]: 8
+  Mapping[str, Any]: 819
+  Mapping[str, object]: 319
+  MutableMapping[str, Any]: 9
   boundary: 69
-  dict[str, Any]: 1124
-  dict[str, object]: 401
-  soft: 2650
+  dict[str, Any]: 1125
+  dict[str, object]: 407
+  soft: 2679

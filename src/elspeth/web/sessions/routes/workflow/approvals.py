@@ -45,6 +45,7 @@ from elspeth.web.execution.errors import (
     UnresolvedInterpretationPlaceholderError,
 )
 from elspeth.web.execution.protocol import StateAccessError
+from elspeth.web.sessions.prompt_file_review import PromptFileReviewStale
 from elspeth.web.sessions.protocol import SessionServiceProtocol
 from elspeth.web.sessions.routes._helpers import _verify_session_ownership
 from elspeth.web.validation import reject_credential_material
@@ -273,6 +274,11 @@ def create_approvals_router() -> APIRouter:
                             for error in exc.errors
                         ],
                     },
+                ) from exc
+            except PromptFileReviewStale as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"error_type": exc.error_code, "detail": str(exc)},
                 ) from exc
             except ExecutionReadinessError as exc:
                 raise HTTPException(

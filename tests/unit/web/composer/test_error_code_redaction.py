@@ -61,6 +61,7 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
     {
         # Parameter forwarding inside the rejection builders.
         ("composer/tools/_common.py", "_failure_result", "error_code"),
+        ("blobs/prompt_text_routes.py", "_prompt_save_refusal", "code"),
         ("composer/tools/_common.py", "reject", "error_code"),
         ("composer/tools/_common.py", "_build_rejection_result", "error_code"),
         ("composer/tools/_common.py", "_candidate_rejection_result", "error_code"),
@@ -87,7 +88,7 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("composer/tools/sources.py", "_resolve_source_blobs", "prevalidation_error[1]"),
         ("composer/tools/sources.py", "_execute_patch_source_options", "prevalidation_error[1]"),
         ("composer/tools/transforms.py", "_execute_upsert_node", "prevalidation_error[1]"),
-        ("composer/tools/transforms.py", "_execute_patch_node_options", "prevalidation_error[1]"),
+        ("composer/tools/transforms.py", "_apply_guarded_node_option_patch", "prevalidation_error[1]"),
         ("composer/tools/transforms.py", "_prepare_transform_candidate", "prevalidation_error[1]"),
         ("composer/tools/sessions.py", "build_set_pipeline_candidate", "src_prevalidation[1]"),
         ("composer/tools/sessions.py", "_legacy_source_rejection", "src_prevalidation[1]"),
@@ -103,7 +104,8 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("composer/tools/sessions.py", "_legacy_source_rejection", "header_conflict.error_code"),
         ("composer/tools/transforms.py", "_execute_upsert_node", "error_code"),
         ("composer/tools/transforms.py", "_execute_upsert_edge", "error_code"),
-        ("composer/tools/transforms.py", "_execute_patch_node_options", "error_code"),
+        ("composer/tools/transforms.py", "_apply_guarded_node_option_patch", "error_code"),
+        ("composer/tools/transforms.py", "_substring_refusal", "code"),
         ("composer/tools/transforms.py", "_prepare_transform_candidate", "error_code"),
         ("composer/turn_audit.py", "_state_payload_for_compose_turn", "error.error_code"),
         # The imported ``ADVISOR_SIGNOFF_BLOCKED_CODE`` (pinned below).
@@ -151,11 +153,23 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("execution/validation.py", "_interpretation_review_capacity_failure", "SOURCE_DATA_CONTRACT_ANALYSIS_LIMIT_CODE"),
         ("execution/validation.py", "_interpretation_review_drift_failure", "INTERPRETATION_REVIEW_DRIFT_CODE"),
         ("execution/_validation_diagnostics.py", "_reframe_settings_missing_parts", "_SETTINGS_MISSING_PART_REFRAMES[part][0]"),
-        ("execution/_validation_materialization.py", "_blob_inline_validation_error", "f'{violation.category}_inline_blob_content'"),
+        (
+            "execution/_validation_materialization.py",
+            "_blob_inline_validation_error",
+            "INLINE_BLOB_NOT_TEXT_CODE if not_text else f'{violation.category}_inline_blob_content'",
+        ),
+        ("composer/tools/blobs.py", "_execute_wire_blob_inline_ref", "INLINE_BLOB_NOT_TEXT_CODE"),
+        # YAML import refuses a non-text prompt file with the same Final constant.
+        ("sessions/routes/composer/state.py", "_state_with_imported_inline_blobs", "INLINE_BLOB_NOT_TEXT_CODE"),
+        ("sessions/routes/composer/state.py", "_reject_pasted_inline_prompt_blob_mime", "INLINE_BLOB_NOT_TEXT_CODE"),
         ("execution/service.py", "_merge_authoritative_proof_diagnostics", "code"),
+        ("execution/service.py", "_authoritative_state_preflight_sync", "exc.error_code"),
         # Route projections and persistence of codes produced (and censused)
         # elsewhere; none of them authors a code.
-        ("execution/routes.py", "execute_pipeline", "err.error_code"),
+        # The execute route and the tutorial run share this one projection.
+        ("execution/http_errors.py", "pipeline_validation_http_exception", "err.error_code"),
+        # RuntimeYamlImportError's only code is the literal censused at yaml_importer.py.
+        ("sessions/routes/composer/state.py", "seed_state_from_runtime_yaml", "exc.error_code"),
         ("coordination/repository.py", "record_composition_rejection", "error_code"),
         ("sessions/protocol.py", "decode_stored_composition_validation_errors", "error_code"),
         ("sessions/protocol.py", "serialize_composition_validation_error", "value.error_code"),
@@ -409,7 +423,10 @@ class TestRegistryCensus:
             SOURCE_DATA_CONTRACT_ANALYSIS_LIMIT_CODE,
         } <= REGISTERED_ERROR_CODES
         assert {reframe[0] for reframe in _SETTINGS_MISSING_PART_REFRAMES.values()} <= REGISTERED_ERROR_CODES
-        assert {f"{category}_inline_blob_content" for category in get_args(BlobInlineValidationCategory)} <= REGISTERED_ERROR_CODES
+        assert {
+            f"{category}_inline_blob_content" for category in get_args(BlobInlineValidationCategory) if category != "not_text"
+        } <= REGISTERED_ERROR_CODES
+        assert "inline_blob_not_text" in REGISTERED_ERROR_CODES
         assert {"web_scrape_private_network_not_allowed", "web_fetch_private_network_not_allowed"} <= REGISTERED_ERROR_CODES
 
     def test_every_blocking_proof_diagnostic_code_is_registered(self) -> None:
@@ -521,6 +538,16 @@ def _persisted_first_error(tool_name: str, error_code: str) -> dict[str, object]
         ("patch_output_options", "plugin_options_invalid"),
         ("patch_node_options", "plugin_options_invalid"),
         ("patch_node_options", "prompt_template_parts_required"),
+        ("inspect_prompt_targets", "inspect_after_uncheckpointed_mutation"),
+        ("wire_blob_inline_ref", "prompt_template_parts_required"),
+        ("wire_blob_inline_ref", "inline_blob_not_text"),
+        ("wire_blob_inline_ref", "inline_blob_missing"),
+        ("wire_blob_inline_ref", "inline_blob_not_ready"),
+        ("wire_blob_inline_ref", "inline_blob_field_path_invalid"),
+        ("wire_blob_inline_ref", "inline_blob_session_required"),
+        ("wire_blob_inline_ref", "inline_blob_id_invalid"),
+        ("update_blob", "blob_bound_update"),
+        ("delete_blob", "blob_bound_delete"),
         # Plugin-policy and execution-validation codes (produced outside
         # web/composer) on option tools.
         ("upsert_node", "profile_alias_used_as_bucket"),

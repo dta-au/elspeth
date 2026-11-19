@@ -30,8 +30,9 @@ import yaml
 import tests.integration.pipeline.test_composer_runtime_agreement as agreement
 from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts.blobs import BlobCreator, BlobRecord
-from elspeth.contracts.blobs_inline import BlobInlineRef
+from elspeth.contracts.blobs_inline import BlobContentResolutionError, BlobInlineRef
 from elspeth.contracts.enums import CreationModality
+from elspeth.core.blobs_inline import _discover_blob_content_refs
 from elspeth.plugins.transforms.file_inject import FileInjectConfig
 from elspeth.web.blobs.protocol import BlobIntegrityError
 from elspeth.web.composer import yaml_generator as composer_yaml_generator
@@ -285,12 +286,18 @@ def test_only_a_user_created_non_llm_authored_blob_is_an_upload(created_by: Blob
 
 
 def test_llm_prompt_surface_rule_stays_modality_only() -> None:
-    """Unchanged in this change: an assistant-created VERBATIM blob may still back an llm prompt."""
+    """The llm prompt rule reads modality only, never the creator.
+
+    A scalar prompt position is never refused here: every file there goes to the
+    mandatory full-content review. A model position still refuses LLM-authored files.
+    """
     for modality in CreationModality:
-        refused = guard.is_llm_authored_prompt_surface_binding(
+        scalar = guard.is_llm_authored_prompt_surface_binding(
             "node:c.options.prompt_template", node_plugins={"c": "llm"}, creation_modality=modality
         )
-        assert refused is modality.requires_llm_provenance()
+        model = guard.is_llm_authored_prompt_surface_binding("node:c.options.model", node_plugins={"c": "llm"}, creation_modality=modality)
+        assert scalar is False
+        assert model is modality.requires_llm_provenance()
 
 
 def test_refusal_names_the_entry_and_the_path_to_attach_at() -> None:
@@ -310,9 +317,14 @@ def test_option_refusals_name_an_unaddressable_entry_whole(entry_name: str) -> N
 
     assert (refusal.cause, refusal.entry_name, refusal.option_path) == ("unaddressable_entry", entry_name, f"files.{entry_name}")
     assert "wire_blob_inline_ref" not in refusal.repair
-    # The rule is the grammar BlobInlineRef enforces: the same name is refused there.
-    with pytest.raises(ValueError):
-        BlobInlineRef(field_path=f"node:n.options.files.{entry_name}.content", blob_id=_BLOB_ID, sha256=_SHA256, encoding="utf-8")
+    # The rule is the one the inline resolver applies to a mapping key: a marker
+    # under the same name is refused there too. (``BlobInlineRef`` alone cannot
+    # decide it once numeric list positions are valid path segments: the text
+    # ``files.v1.2.content`` is also a well-formed list path.)
+    config = {"transforms": [{"name": "n", "plugin": "file_inject", "options": {"files": {entry_name: {"content": _marker()}}}}]}
+    with pytest.raises(BlobContentResolutionError) as caught:
+        _discover_blob_content_refs(config)
+    assert [path for path, _reason in caught.value.malformed] == [f"node:n.options.files.{entry_name}"]
 
 
 @pytest.mark.parametrize("entry_name", ["invoice", "_x", "Type-A_2"])

@@ -671,6 +671,32 @@ export const TOOL_PROJECTORS = {
     if (fragment === undefined) return null;
     return optionPatchEntries(nodeId, fragment.options, args.patch);
   },
+  change_substring: (args) => {
+    const target = asRecord(args.target);
+    if (target === null) return null;
+    const kind = asString(target.kind);
+    const nodeId = asString(target.node_id);
+    const blobId = asString(target.blob_id);
+    const edits = Array.isArray(args.edits) ? args.edits : null;
+    if (edits === null || (nodeId === null && blobId === null)) return null;
+    const label = kind === "prompt_part"
+      ? `${nodeId} prompt part ${String(target.part_index)}`
+      : kind === "node_option"
+        ? `${nodeId} ${asString(target.option) ?? "prompt"}`
+        : kind === "blob"
+          ? `session file ${blobId}`
+          : null;
+    if (label === null) return null;
+    return [{
+      kind: "changed",
+      section: "option",
+      identity: label,
+      before: undefined,
+      after: undefined,
+      beforeSummary: "Existing text",
+      afterSummary: `${plural(edits.length, "exact edit")} proposed`,
+    }];
+  },
   patch_output_options: (args, currentState) => {
     const name = asString(args.sink_name);
     if (name === null) return null;

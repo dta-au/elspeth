@@ -831,7 +831,10 @@ class TestToolRegistry:
 
         # 2. the forbidden set names exactly the three stateful tools. A
         # fourth, or a reclassification of one of these, must land here.
-        assert frozenset({"diff_pipeline", "get_pipeline_state", "preview_pipeline"}) == _SESSION_MUTABLE_DISCOVERY_TOOL_NAMES
+        assert (
+            frozenset({"diff_pipeline", "get_pipeline_state", "inspect_prompt_targets", "preview_pipeline"})
+            == _SESSION_MUTABLE_DISCOVERY_TOOL_NAMES
+        )
 
     def test_cacheable_is_subset_of_discovery(self) -> None:
         from elspeth.web.composer.tools import (

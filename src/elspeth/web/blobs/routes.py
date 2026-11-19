@@ -40,7 +40,7 @@ from elspeth.web.blobs.protocol import (
     StorageMimeType,
 )
 from elspeth.web.blobs.schemas import BlobMetadataResponse, CreateInlineBlobRequest
-from elspeth.web.blobs.service import BlobServiceImpl, sanitize_filename
+from elspeth.web.blobs.service import BlobServiceImpl, content_hash, sanitize_filename
 from elspeth.web.blobs.sniff import detect_mime_type
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
@@ -450,7 +450,10 @@ def create_blobs_router() -> APIRouter:
             return Response(
                 content=content,
                 media_type=blob.mime_type,
-                headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(blob.filename, safe='')}"},
+                headers={
+                    "Content-Disposition": f"attachment; filename*=UTF-8''{quote(blob.filename, safe='')}",
+                    "X-Content-SHA256": content_hash(content),
+                },
             )
         finally:
             await lease.close()

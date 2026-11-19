@@ -1056,7 +1056,10 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # json-explode-parent-child). reopen-resume (csv source, json sink) moved its
 # resumed_full_projection_sha256 b046c184... -> 17235100..., measured by the production
 # harness. Captured from this file's parity failure (previous pin 18037487...).
-EXPECTED_CASE_REGISTRY_SHA256 = "0dfb70c221fd36767b286390481ce85247d22c07c9d80076ba762f4e5a48b6f3"
+# 0.8.15 version cut: the same eight engine-owned plugin_version values
+# advance (seven manifest lines), engine:0.8.14 -> engine:0.8.15. Captured
+# from this file's parity failure (previous pin 0dfb70c2...).
+EXPECTED_CASE_REGISTRY_SHA256 = "64bf28cbea6907dc93a1f0bfd2a3d7a174a69b7218fee6f606e31b4540ec65ec"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

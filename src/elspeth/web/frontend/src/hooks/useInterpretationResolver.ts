@@ -2,7 +2,7 @@ import { useSessionStore } from "@/stores/sessionStore";
 
 import { useState } from "react";
 import type { ApiError, CompositionState } from "@/types/index";
-import type { InterpretationEvent } from "@/types/interpretation";
+import type { InterpretationEvent, InterpretationResolveRequest } from "@/types/interpretation";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 
 /**
@@ -47,8 +47,48 @@ function isApiError(err: unknown): err is ApiError {
   );
 }
 
+/** 409 codes meaning the card's review snapshot is not the one to approve. */
+const PROMPT_REVIEW_CHANGED_CODES: ReadonlySet<string> = new Set([
+  "prompt_review_stale",
+  "prompt_review_snapshot_missing",
+]);
+
+export function isPromptReviewChanged(err: unknown): boolean {
+  return isApiError(err) && err.status === 409 &&
+    err.error_type !== undefined && PROMPT_REVIEW_CHANGED_CODES.has(err.error_type);
+}
+
+/**
+ * The ONE builder of a resolve request body: every resolve path (Approve,
+ * Acknowledge, amend Submit) goes through it. A prompt review is bound to
+ * the anchor of the snapshot the card rendered; with no snapshot there is
+ * nothing to bind to, so it returns null and the caller sends nothing. Any
+ * other kind never carries an anchor (the server refuses one).
+ */
+export function resolveRequestFor(
+  event: InterpretationEvent,
+  decision: { choice: "accepted_as_drafted" } | { choice: "amended"; amended_value: string },
+  reviewedAnchor: string | null,
+): InterpretationResolveRequest | null {
+  if (event.kind !== "llm_prompt_template") return { ...decision };
+  if (reviewedAnchor === null) return null;
+  return { ...decision, reviewed_anchor: reviewedAnchor };
+}
+
 export function describeError(err: unknown): DisplayedError {
   if (isApiError(err)) {
+    if (isPromptReviewChanged(err)) {
+      return {
+        heading: "Prompt changed",
+        body: "This prompt changed since you opened it. Review it again before approving.",
+      };
+    }
+    if (err.status === 409 && err.error_type === "prompt_file_review_stale") {
+      return {
+        heading: "Prompt file changed",
+        body: "A prompt file behind this review changed. Reload the session and review the current files.",
+      };
+    }
     if (
       err.status === 409 &&
       err.error_type === "interpretation_already_resolved"
@@ -132,6 +172,17 @@ export interface UseInterpretationResolverParams {
   event: InterpretationEvent;
   sessionId: string;
   onResolved?: (newState: CompositionState | null) => void;
+  /**
+   * For a prompt review: the anchor of the snapshot the card is showing, or
+   * null while none is loaded (every resolve is then refused client-side).
+   */
+  reviewedAnchor?: string | null;
+  /**
+   * Called when the server refuses the anchor (409 prompt_review_stale or
+   * prompt_review_snapshot_missing). The card re-fetches and tells the user;
+   * the hook shows no error of its own for these codes.
+   */
+  onPromptReviewChanged?: () => void;
 }
 
 export interface UseInterpretationResolverResult {
@@ -186,6 +237,8 @@ export function useInterpretationResolver({
   event,
   sessionId,
   onResolved,
+  reviewedAnchor = null,
+  onPromptReviewChanged,
 }: UseInterpretationResolverParams): UseInterpretationResolverResult {
   // Store actions.  Selecting individual actions (rather than the whole
   // state) keeps re-renders scoped: this hook never reads pendingBySession
@@ -226,20 +279,37 @@ export function useInterpretationResolver({
   const submitDisabled = amendIsEmpty || amendIsTooLong || resolveInFlight || isComposing;
   const primaryButtonsDisabled = resolveInFlight || optOutInFlight || isComposing;
 
-  async function handleUseMine(): Promise<void> {
-    if (primaryButtonsDisabled || useSessionStore.getState().isComposing) return;
+  /** Send one resolve built by resolveRequestFor; the single wire path. */
+  async function submit(
+    decision: { choice: "accepted_as_drafted" } | { choice: "amended"; amended_value: string },
+  ): Promise<void> {
+    const body = resolveRequestFor(event, decision, reviewedAnchor);
+    if (body === null) {
+      setDisplayedError({
+        heading: "Prompt not loaded",
+        body: "The reviewed prompt has not loaded, so there is nothing to approve yet.",
+      });
+      return;
+    }
     setDisplayedError(null);
     setResolveInFlight(true);
     try {
-      const { new_state } = await resolveEvent(sessionId, event.id, {
-        choice: "accepted_as_drafted",
-      });
+      const { new_state } = await resolveEvent(sessionId, event.id, body);
       onResolved?.(new_state);
     } catch (err) {
-      setDisplayedError(describeError(err));
+      if (onPromptReviewChanged !== undefined && isPromptReviewChanged(err)) {
+        onPromptReviewChanged();
+      } else {
+        setDisplayedError(describeError(err));
+      }
     } finally {
       setResolveInFlight(false);
     }
+  }
+
+  async function handleUseMine(): Promise<void> {
+    if (primaryButtonsDisabled || useSessionStore.getState().isComposing) return;
+    await submit({ choice: "accepted_as_drafted" });
   }
 
   function handleOpenAmend(): void {
@@ -277,19 +347,7 @@ export function useInterpretationResolver({
       });
       return;
     }
-    setDisplayedError(null);
-    setResolveInFlight(true);
-    try {
-      const { new_state } = await resolveEvent(sessionId, event.id, {
-        choice: "amended",
-        amended_value: amendText,
-      });
-      onResolved?.(new_state);
-    } catch (err) {
-      setDisplayedError(describeError(err));
-    } finally {
-      setResolveInFlight(false);
-    }
+    await submit({ choice: "amended", amended_value: amendText });
   }
 
   function handleRequestOptOut(): void {

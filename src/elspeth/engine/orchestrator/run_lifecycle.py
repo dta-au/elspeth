@@ -52,6 +52,7 @@ from elspeth.contracts.events import (
     PipelinePhase,
     RunStarted,
 )
+from elspeth.contracts.run_prompt_input import RunPromptInputEvidence
 from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.ids import generate_id
 from elspeth.core.landscape.factory import RecorderFactory
@@ -113,6 +114,7 @@ class InitializeDatabasePhase(Protocol):
         openrouter_catalog_sha256: str,
         openrouter_catalog_source: str,
         web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
+        run_prompt_inputs: tuple[RunPromptInputEvidence, ...] = (),
         run_start_permit: RunStartPermitBinding | None = None,
         pre_effect_guard: Callable[[], None] | None = None,
     ) -> tuple[RecorderFactory, Any, CoordinationToken]: ...
@@ -169,6 +171,7 @@ class RunLifecycleCoordinator:
         openrouter_catalog_sha256: str,
         openrouter_catalog_source: str,
         web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
+        run_prompt_inputs: tuple[RunPromptInputEvidence, ...] = (),
         run_start_permit: RunStartPermitBinding | None = None,
         pre_effect_guard: Callable[[], None] | None = None,
     ) -> tuple[RecorderFactory, Any, CoordinationToken]:
@@ -237,6 +240,7 @@ class RunLifecycleCoordinator:
                 openrouter_catalog_source=openrouter_catalog_source,
                 leader_worker_id=worker_id,
                 web_plugin_policy_evidence=web_plugin_policy_evidence,
+                run_prompt_inputs=run_prompt_inputs,
                 run_start_permit=run_start_permit,
             )
             if run_start_permit is None:
@@ -432,6 +436,7 @@ class RunLifecycleCoordinator:
         openrouter_catalog_sha256: str | None = None,
         openrouter_catalog_source: str | None = None,
         web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
+        run_prompt_inputs: tuple[RunPromptInputEvidence, ...] = (),
         check_coordination_latch: Callable[[], None] | None = None,
         initialize_database_phase: InitializeDatabasePhase,
         pre_effect_guard: Callable[[], None] | None = None,
@@ -535,6 +540,7 @@ class RunLifecycleCoordinator:
             openrouter_catalog_sha256=openrouter_catalog_sha256,
             openrouter_catalog_source=openrouter_catalog_source,
             web_plugin_policy_evidence=web_plugin_policy_evidence,
+            run_prompt_inputs=run_prompt_inputs,
             run_start_permit=run_start_permit,
             pre_effect_guard=pre_effect_guard if run_start_permit is not None else None,
         )

@@ -3711,8 +3711,15 @@ class TestCopyBlobsForFork:
             written_copy.creating_composer_skill_hash,
             written_copy.creating_arguments_hash,
         ) == ("model-a", "version-a", "provider-a", "a" * 64, "b" * 64)
-        assert is_llm_authored_prompt_surface_binding(
+        # The copy keeps its LLM provenance: a scalar prompt binding goes to the
+        # mandatory file review, and a model binding is still refused outright.
+        assert not is_llm_authored_prompt_surface_binding(
             "node:c.options.prompt_template",
+            node_plugins={"c": "llm"},
+            creation_modality=written_copy.creation_modality,
+        )
+        assert is_llm_authored_prompt_surface_binding(
+            "node:c.options.model",
             node_plugins={"c": "llm"},
             creation_modality=written_copy.creation_modality,
         )

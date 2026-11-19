@@ -5,7 +5,7 @@ W is derived from it once, at import, per ``ToolContractDialect``:
 
 * ``none`` is S exactly (plus the set_pipeline ``{"pipeline": ...}``
   envelope), with no ``strict`` key anywhere;
-* ``openai_strict`` makes every S-optional property of the 33 strict-capable
+* ``openai_strict`` makes every S-optional property of the 34 strict-capable
   tools required and nullable (decode strips the ``null``), moves keywords
   outside the wire allowlist into a ledger rendered as description text, and
   rewrites the 6 omission instructions into "pass null" wording.
@@ -107,6 +107,7 @@ _STRICT_CAPABLE: frozenset[str] = frozenset(
         "clear_source",
         "inspect_source",
         "get_pipeline_state",
+        "inspect_prompt_targets",
         "get_plugin_schema",
         "get_expression_grammar",
         "explain_validation_error",
@@ -140,12 +141,13 @@ _OPTION_TOOLS: frozenset[str] = frozenset(
         "upsert_node",
         "splice_transform",
         "patch_node_options",
+        "change_substring",
         "set_output",
         "patch_output_options",
     }
 )
 
-# The 17 promoted positions: S-optional properties of the 33.
+# The 17 promoted positions: S-optional properties of the 34.
 _PROMOTED: frozenset[tuple[str, tuple[str, ...]]] = frozenset(
     {
         ("get_blob_content", ("offset_chars",)),
@@ -187,7 +189,7 @@ _UPSERT_EDGE_EXAMPLE: dict[str, Any] = {
     "label": "LLM failures",
 }
 
-# The 18 ledger entries on the 33: (tool, JSON pointer of the owner node, keyword, value).
+# The 18 ledger entries on the 34: (tool, JSON pointer of the owner node, keyword, value).
 _LEDGER: frozenset[tuple[str, str, str, Any]] = frozenset(
     {
         ("get_blob_content", "/properties/offset_chars", "default", 0),
@@ -558,7 +560,7 @@ def test_limits_fail_closed_when_lowered_below_the_measured_value(limit_field: s
 
 
 def test_limits_report_counts_the_strict_tools() -> None:
-    assert wire_limits_report(STRICT).strict_tool_count == 33
+    assert wire_limits_report(STRICT).strict_tool_count == 34
     assert wire_limits_report(NONE).strict_tool_count == 0
 
 
@@ -602,7 +604,7 @@ def test_wire_tool_definitions_returns_fresh_isolated_copies() -> None:
 # ---------------------------------------------------------------- stamping
 
 
-def test_openai_strict_stamps_true_on_the_33_and_false_on_the_10() -> None:
+def test_openai_strict_stamps_true_on_the_34_and_false_on_the_11() -> None:
     for tool in wire_tool_definitions(STRICT):
         function = tool["function"]
         assert function["strict"] is (function["name"] in _STRICT_CAPABLE), function["name"]

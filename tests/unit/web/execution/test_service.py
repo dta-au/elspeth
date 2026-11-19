@@ -115,6 +115,7 @@ from elspeth.web.interpretation_state import (
 from elspeth.web.plugin_policy.models import (
     PluginAvailabilitySnapshot,
 )
+from elspeth.web.sessions.prompt_file_review import PromptFileReviewStale
 from elspeth.web.sessions.protocol import (
     CompositionStateRecord,
     RunStartPermitRecord,
@@ -1804,6 +1805,29 @@ class TestB3Construction:
         assert mock_from_settings.call_args.args[0] is not mock_load.return_value.rate_limit
 
 
+def _mock_inline_prompt_state(mock_session_service: MagicMock, *, session_id: UUID, blob_id: UUID, sha256: str, tmp_path: Path) -> None:
+    """Model the persisted state now read for scalar prompt-file admission."""
+    mock_session_service.get_state_in_session.return_value = _composition_state_record(
+        session_id=session_id,
+        source_path=tmp_path / "input.csv",
+        output_path=tmp_path / "output.jsonl",
+        nodes=[
+            {
+                "id": "classify",
+                "node_type": "transform",
+                "plugin": "llm",
+                "input": "source_rows",
+                "on_success": "out",
+                "on_error": "discard",
+                "options": {
+                    "prompt_template": "Summarize {{ row.body }}",
+                    "system_prompt": {"blob_ref": str(blob_id), "mode": "inline_content", "sha256": sha256},
+                },
+            }
+        ],
+    )
+
+
 @pytest.mark.usefixtures("mock_pipeline_config_assembly")
 class TestInlineBlobRuntimePreflight:
     """Inline-content blob refs resolve before plugin construction.
@@ -1828,6 +1852,7 @@ class TestInlineBlobRuntimePreflight:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
     ) -> None:
         # Blob bytes are attacker-controllable. A ${VAR} smuggled inside them is
         # invisible to preflight (the blob is an opaque ref at validation time),
@@ -1838,6 +1863,7 @@ class TestInlineBlobRuntimePreflight:
         run_id = uuid4()
         owner_session = uuid4()
         sha256 = hashlib.sha256(content).hexdigest()
+        _mock_inline_prompt_state(mock_session_service, session_id=owner_session, blob_id=blob_id, sha256=sha256, tmp_path=tmp_path)
         order: list[str] = []
         # The valid same-session path: run and blob share an owning session, so
         # the cross-session guard added for elspeth-195ecb1d58 passes through.
@@ -1897,6 +1923,8 @@ class TestInlineBlobRuntimePreflight:
             )
         )
         mock_orch_cls.return_value = mock_orch
+        # The new run-owned prompt evidence table starts empty for this test.
+        mock_landscape_cls.return_value.write_connection.return_value.__enter__.return_value.execute.return_value.one_or_none.return_value = None
 
         pipeline_yaml = f"""
 source:
@@ -1938,6 +1966,114 @@ sinks:
 
     @patch("elspeth.web.execution.service.Orchestrator")
     @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_fresh_run_carries_admitted_prompt_evidence_into_orchestrator_run(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """The snapshot final admission returns is the evidence ``begin_run`` records.
+
+        ``Orchestrator.run`` is the only web call that carries admitted prompt
+        evidence into run creation; an empty or dropped ``run_prompt_inputs``
+        would start a provider-calling run with no prompt-input rows.
+        """
+        from elspeth.contracts.run_prompt_input import RunPromptInputEvidence
+        from elspeth.web.sessions.prompt_file_review import PromptReviewSnapshot
+
+        del mock_payload_cls
+        content = b"You are an audited prompt."
+        blob_id = uuid4()
+        run_id = uuid4()
+        owner_session = uuid4()
+        sha256 = hashlib.sha256(content).hexdigest()
+        _mock_inline_prompt_state(mock_session_service, session_id=owner_session, blob_id=blob_id, sha256=sha256, tmp_path=tmp_path)
+        mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=owner_session)
+        blob_service = _blob_service_stub()
+        blob_service.link_blob_to_run.return_value = None
+        blob_service.read_blob_content.return_value = content
+        blob_service.get_blob.return_value = _blob_record_stub(
+            blob_id=blob_id,
+            session_id=owner_session,
+            content_hash=sha256,
+            size_bytes=len(content),
+        )
+        blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
+        cast(Any, service)._blob_service = blob_service
+
+        # Spy on the real admission so the expected evidence is the snapshot it
+        # actually returned, not one the test fabricates.
+        real_admission = ExecutionServiceImpl._assert_state_prompt_file_approvals
+        admitted: list[tuple[PromptReviewSnapshot, ...]] = []
+
+        def admission_spy(self_: ExecutionServiceImpl, *args: Any, **kwargs: Any) -> tuple[PromptReviewSnapshot, ...]:
+            snapshots = real_admission(self_, *args, **kwargs)
+            admitted.append(snapshots)
+            return snapshots
+
+        monkeypatch.setattr(ExecutionServiceImpl, "_assert_state_prompt_file_approvals", admission_spy)
+
+        mock_load.return_value = _mock_pipeline_settings()
+        mock_runtime_graph.return_value = SimpleNamespace(plugin_bundle=_plugin_bundle_stub(), graph=_execution_graph_stub())
+        mock_orch = _orchestrator_stub(_orchestrator_result_stub(run_id=str(run_id), rows_processed=1, rows_succeeded=1))
+        mock_orch_cls.return_value = mock_orch
+        mock_landscape_cls.return_value.write_connection.return_value.__enter__.return_value.execute.return_value.one_or_none.return_value = None
+
+        pipeline_yaml = f"""
+source:
+  plugin: csv
+  options:
+    path: input.csv
+transforms:
+  - name: classify
+    plugin: llm
+    options:
+      prompt_template: "Summarize {{{{ row.body }}}}"
+      system_prompt:
+        blob_ref: {blob_id}
+        mode: inline_content
+        sha256: {sha256}
+sinks:
+  primary:
+    plugin: json
+    options:
+      path: output.jsonl
+"""
+
+        with patch(
+            "elspeth.web.execution.service.load_run_accounting_from_db",
+            return_value=_run_accounting_for_status(RunStatus.COMPLETED),
+        ):
+            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
+
+        assert len(admitted) == 1
+        (snapshot,) = admitted[0]
+        assert snapshot.node_id == "classify"
+        mock_session_service.assert_prompt_file_approvals.assert_called_once_with(snapshot)
+        mock_orch.run.assert_called_once()
+        assert mock_orch.run.call_args.kwargs["run_id"] == str(run_id)
+        assert mock_orch.run.call_args.kwargs["run_prompt_inputs"] == (
+            RunPromptInputEvidence(
+                node_id="classify",
+                field_path="system_prompt",
+                blob_id=str(blob_id),
+                content_sha256=sha256,
+                review_anchor=snapshot.anchor,
+                effective_artifact_hash=snapshot.effective_artifact_hash,
+            ),
+        )
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
     @patch("elspeth.web.execution.service.load_settings_from_yaml_string")
     @patch("elspeth.web.execution.service.open_landscape_db")
     @patch("elspeth.web.execution.service.FilesystemPayloadStore")
@@ -1950,6 +2086,7 @@ sinks:
         mock_orch_cls: MagicMock,
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
+        tmp_path: Path,
     ) -> None:
         del mock_payload_cls, mock_landscape_cls, mock_runtime_graph
         content = b"You are an audited prompt."
@@ -1957,6 +2094,7 @@ sinks:
         run_id = uuid4()
         owner_session = uuid4()
         sha256 = hashlib.sha256(content).hexdigest()
+        _mock_inline_prompt_state(mock_session_service, session_id=owner_session, blob_id=blob_id, sha256=sha256, tmp_path=tmp_path)
         mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=owner_session)
         blob_record = _blob_record_stub(
             blob_id=blob_id,
@@ -2152,7 +2290,7 @@ sinks:
     @patch("elspeth.web.execution.service.load_settings_from_yaml_string")
     @patch("elspeth.web.execution.service.open_landscape_db")
     @patch("elspeth.web.execution.service.FilesystemPayloadStore")
-    def test_hash_mismatch_increments_zero_threshold_counter_without_run_id_label(
+    def test_prompt_marker_hash_mismatch_is_stale_review_without_integrity_alert(
         self,
         mock_payload_cls: MagicMock,
         mock_landscape_cls: MagicMock,
@@ -2163,7 +2301,6 @@ sinks:
         mock_session_service: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from elspeth.web.blobs.protocol import BlobIntegrityError
         from elspeth.web.execution import service as service_module
 
         del mock_payload_cls, mock_landscape_cls, mock_runtime_graph
@@ -2209,12 +2346,296 @@ sinks:
       path: output.jsonl
 """
 
+        with pytest.raises(PromptFileReviewStale):
+            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
+
+        # Metadata disagrees with the authored prompt marker before a custody
+        # read; this is stale review evidence, not a stored-byte integrity hit.
+        hash_counter.add.assert_not_called()
+        mock_load.assert_not_called()
+        mock_orch_cls.assert_not_called()
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_hash_mismatch_increments_zero_threshold_counter_without_run_id_label(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A non-prompt inline ref whose marker disagrees with the stored hash is an integrity hit.
+
+        Prompt-file slots turn the same disagreement into ``PromptFileReviewStale``
+        (see the test above); a ``file_inject`` upload has no review, so the
+        mismatch stays ``BlobIntegrityError`` and fires the zero-threshold alert.
+        """
+        from elspeth.web.blobs.protocol import BlobIntegrityError
+        from elspeth.web.execution import service as service_module
+
+        del mock_payload_cls, mock_landscape_cls, mock_runtime_graph
+        content = b"Check the totals.\n"
+        blob_id = uuid4()
+        run_id = uuid4()
+        owner_session = uuid4()
+        mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=owner_session)
+        hash_counter = MagicMock(spec=["add"])
+        monkeypatch.setattr(service_module, "_BLOB_INLINE_HASH_MISMATCH_TOTAL", hash_counter)
+
+        # A user upload, so the file_inject upload-only refusal admits it and the
+        # metadata check is what refuses the run.
+        blob_record = _blob_record_stub(
+            blob_id=blob_id,
+            session_id=owner_session,
+            content_hash=hashlib.sha256(content).hexdigest(),
+            size_bytes=len(content),
+        )
+
+        blob_service = _blob_service_stub()
+        blob_service.link_blob_to_run.return_value = None
+        blob_service.read_blob_content.return_value = content
+        blob_service.get_blob.return_value = blob_record
+        blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
+        cast(Any, service)._blob_service = blob_service
+
+        pipeline_yaml = f"""
+source:
+  plugin: csv
+  options:
+    path: input.csv
+transforms:
+  - name: inject
+    plugin: file_inject
+    options:
+      files:
+        invoice:
+          format: text
+          content:
+            blob_ref: {blob_id}
+            mode: inline_content
+            sha256: {"b" * 64}
+sinks:
+  primary:
+    plugin: json
+    options:
+      path: output.jsonl
+"""
+
         with pytest.raises(BlobIntegrityError):
             service._run_pipeline(str(run_id), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
 
+        # Zero-threshold alert: one increment, no attributes, so no run_id label.
+        hash_counter.add.assert_called_once_with(1)
+        blob_service.read_blob_content.assert_not_awaited()
+        mock_session_service.record_blob_inline_resolutions.assert_not_called()
+        mock_load.assert_not_called()
+        mock_orch_cls.assert_not_called()
+
+    def _run_prompt_custody_integrity_failure(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        reread: str | Exception,
+    ) -> tuple[pytest.ExceptionInfo[Exception], MagicMock, Any, BlobIntegrityError]:
+        """Admit a prompt blob's record, then fail its custody byte read with an integrity error.
+
+        ``reread`` is the content hash the second, session-scoped record read
+        returns, or the exception it raises, once the byte read has failed.
+        """
+        from elspeth.web.execution import service as service_module
+
+        content = b"You are an audited prompt."
+        admitted_sha = hashlib.sha256(content).hexdigest()
+        blob_id = uuid4()
+        run_id = uuid4()
+        owner_session = uuid4()
+        mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=owner_session)
+        hash_counter = MagicMock(spec=["add"])
+        monkeypatch.setattr(service_module, "_BLOB_INLINE_HASH_MISMATCH_TOTAL", hash_counter)
+        admitted_record = _blob_record_stub(blob_id=blob_id, session_id=owner_session, content_hash=admitted_sha, size_bytes=len(content))
+        reread_result: BlobRecord | Exception = (
+            _blob_record_stub(blob_id=blob_id, session_id=owner_session, content_hash=reread, size_bytes=len(content))
+            if isinstance(reread, str)
+            else reread
+        )
+        custody_error = BlobIntegrityError(str(blob_id), expected=admitted_sha, actual="c" * 64)
+
+        blob_service = _blob_service_stub()
+        blob_service.link_blob_to_run.return_value = None
+        blob_service.get_blob.side_effect = [admitted_record, reread_result]
+        blob_service.read_blob_content.side_effect = custody_error
+        cast(Any, service)._blob_service = blob_service
+
+        pipeline_yaml = f"""
+source:
+  plugin: csv
+  options:
+    path: input.csv
+transforms:
+  - name: classify
+    plugin: llm
+    options:
+      system_prompt:
+        blob_ref: {blob_id}
+        mode: inline_content
+        sha256: {admitted_sha}
+sinks:
+  primary:
+    plugin: json
+    options:
+      path: output.jsonl
+"""
+        with pytest.raises(Exception) as exc_info:
+            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
+
+        mock_session_service.record_blob_inline_resolutions.assert_not_called()
+        return exc_info, hash_counter, blob_service, custody_error
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_prompt_save_racing_admission_is_stale_review_without_integrity_alert(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Record admitted at hash X, user saved Y before the byte read: stale, not corruption."""
+        del mock_payload_cls, mock_landscape_cls, mock_runtime_graph
+        exc_info, hash_counter, blob_service, custody_error = self._run_prompt_custody_integrity_failure(
+            service, mock_session_service, monkeypatch, reread="d" * 64
+        )
+
+        assert type(exc_info.value) is PromptFileReviewStale
+        assert exc_info.value.__cause__ is custody_error
+        hash_counter.add.assert_not_called()
+        mock_load.assert_not_called()
+        mock_orch_cls.assert_not_called()
+        # Stale is decided by the re-read record, not assumed: admission read it
+        # once, then it was re-read through the same session-scoped call.
+        assert blob_service.get_blob.await_count == 2
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_prompt_custody_corruption_with_unchanged_record_fires_integrity_alert(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Record unchanged since admission but the stored bytes differ: corruption, counted once."""
+        del mock_payload_cls, mock_landscape_cls, mock_runtime_graph
+        unchanged_sha = hashlib.sha256(b"You are an audited prompt.").hexdigest()
+
+        exc_info, hash_counter, blob_service, custody_error = self._run_prompt_custody_integrity_failure(
+            service, mock_session_service, monkeypatch, reread=unchanged_sha
+        )
+
+        assert exc_info.value is custody_error
         hash_counter.add.assert_called_once_with(1)
         mock_load.assert_not_called()
         mock_orch_cls.assert_not_called()
+        assert blob_service.get_blob.await_count == 2
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_prompt_custody_failure_with_failed_record_reread_fires_integrity_alert(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A re-read that cannot answer never downgrades an integrity failure to stale review."""
+        del mock_payload_cls, mock_landscape_cls, mock_runtime_graph
+        reread_failure = SQLAlchemyError("sessions database unavailable")
+
+        exc_info, hash_counter, blob_service, custody_error = self._run_prompt_custody_integrity_failure(
+            service, mock_session_service, monkeypatch, reread=reread_failure
+        )
+
+        assert exc_info.value is custody_error
+        assert exc_info.value.__cause__ is reread_failure
+        hash_counter.add.assert_called_once_with(1)
+        mock_load.assert_not_called()
+        mock_orch_cls.assert_not_called()
+        assert blob_service.get_blob.await_count == 2
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_prompt_custody_reread_fence_loss_propagates_unchanged_without_integrity_alert(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Losing the session fence during the re-read is authority loss, not corruption.
+
+        It must reach ``_run_pipeline``'s dedicated fence-loss handler unchanged:
+        translated into ``BlobIntegrityError`` it would finalize the run as failed
+        while a successor owns the session.
+        """
+        from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
+
+        del mock_payload_cls, mock_landscape_cls, mock_runtime_graph
+        fence_lost = SessionOperationFenceLost(FenceLossReason.OWNER_INACTIVE)
+        # The fixture bridge swallows RuntimeError (fence loss is one) and returns
+        # None; this test needs the exception exactly as production raises it.
+        strict_call_async, strict_loop = _make_strict_call_async()
+        cast(Any, service)._call_async = strict_call_async
+
+        try:
+            exc_info, hash_counter, blob_service, _ = self._run_prompt_custody_integrity_failure(
+                service, mock_session_service, monkeypatch, reread=fence_lost
+            )
+        finally:
+            strict_loop.close()
+
+        assert exc_info.value is fence_lost
+        hash_counter.add.assert_not_called()
+        blob_service.finalize_run_output_blobs.assert_not_called()
+        mock_load.assert_not_called()
+        mock_orch_cls.assert_not_called()
+        assert blob_service.get_blob.await_count == 2
 
     @pytest.mark.parametrize(
         "case",
@@ -6911,29 +7332,22 @@ def _llm_inline_marker_pipeline_yaml(field_path: str, *, blob_id: UUID, sha256: 
 
 @pytest.mark.usefixtures("mock_pipeline_config_assembly")
 class TestInlineBlobPromptSurfaceModalityAdmission:
-    """An LLM-authored blob must not become an executed LLM prompt or model by substitution.
-
-    The prompt-template and model-choice reviews read those options as strings,
-    so an inline_content marker there opens no review site. Run admission is
-    the gate that holds for every authoring path: it refuses an LLM-authored
-    blob in an ``llm`` transform's prompt surfaces before linking or reading
-    it, as the ``blob_rows`` arm refuses LLM-authored rows.
-    """
+    """Structured positions refuse before I/O; scalar prompts require review."""
 
     @pytest.mark.parametrize(
         "modality",
         [
             pytest.param(CreationModality.LLM_GENERATED, id="llm_generated"),
-            pytest.param(CreationModality.LLM_GENERATED_THEN_AMENDED, id="llm_generated_then_amended"),
+            pytest.param(CreationModality.VERBATIM, id="verbatim"),
         ],
     )
-    @pytest.mark.parametrize("field_path", ["prompt_template", "system_prompt", "queries.q1.template", "model"])
+    @pytest.mark.parametrize("field_path", ["model", "queries"])
     @patch("elspeth.web.execution.service.Orchestrator")
     @patch("elspeth.web.execution.service.build_validated_runtime_graph")
     @patch("elspeth.web.execution.service.load_settings_from_config_dict")
     @patch("elspeth.web.execution.service.open_landscape_db")
     @patch("elspeth.web.execution.service.FilesystemPayloadStore")
-    def test_llm_authored_blob_in_llm_prompt_surface_is_refused_before_link(
+    def test_file_in_model_or_whole_queries_is_refused_before_link(
         self,
         mock_payload_cls: MagicMock,
         mock_landscape_cls: MagicMock,
@@ -6963,7 +7377,7 @@ class TestInlineBlobPromptSurfaceModalityAdmission:
         blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
         cast(Any, service)._blob_service = blob_service
 
-        with pytest.raises(InlineBlobPromptSurfaceAdmissionError, match="LLM-authored") as caught:
+        with pytest.raises(InlineBlobPromptSurfaceAdmissionError, match="unsupported") as caught:
             service._run_pipeline(
                 str(uuid4()),
                 _llm_inline_marker_pipeline_yaml(field_path, blob_id=blob_id, sha256=sha256),
@@ -6979,13 +7393,14 @@ class TestInlineBlobPromptSurfaceModalityAdmission:
         mock_orch_cls.assert_not_called()
         mock_payload_cls.return_value.store.assert_not_called()
 
-    @pytest.mark.parametrize("field_path", ["prompt_template", "queries.q1.template", "model"])
+    @pytest.mark.parametrize("modality", [CreationModality.VERBATIM, CreationModality.LLM_GENERATED])
+    @pytest.mark.parametrize("field_path", ["prompt_template", "system_prompt", "queries.q1.template"])
     @patch("elspeth.web.execution.service.Orchestrator")
     @patch("elspeth.web.execution.service.build_validated_runtime_graph")
     @patch("elspeth.web.execution.service.load_settings_from_config_dict")
     @patch("elspeth.web.execution.service.open_landscape_db")
     @patch("elspeth.web.execution.service.FilesystemPayloadStore")
-    def test_verbatim_blob_in_llm_prompt_surface_passes_modality_admission(
+    def test_scalar_prompt_file_reaches_mandatory_review_after_read(
         self,
         mock_payload_cls: MagicMock,
         mock_landscape_cls: MagicMock,
@@ -6995,12 +7410,10 @@ class TestInlineBlobPromptSurfaceModalityAdmission:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         field_path: str,
+        modality: CreationModality,
+        tmp_path: Path,
     ) -> None:
-        """Control: user-verbatim content is linked, read and substituted as before.
-
-        The audit write is made to fail so the run stops right after
-        substitution; reaching it proves the modality gate admitted the ref.
-        """
+        """Both upload and assistant files bind, but unapproved bytes cannot run."""
         del mock_payload_cls, mock_landscape_cls, mock_runtime_graph
         content = b"You are a user-written prompt."
         blob_id = uuid4()
@@ -7013,15 +7426,38 @@ class TestInlineBlobPromptSurfaceModalityAdmission:
             session_id=owner_session,
             content_hash=sha256,
             size_bytes=len(content),
-            creation_modality=CreationModality.VERBATIM,
+            creation_modality=modality,
         )
         blob_service.link_blob_to_run.return_value = None
         blob_service.read_blob_content.return_value = content
         blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
         cast(Any, service)._blob_service = blob_service
-        mock_session_service.record_blob_inline_resolutions.side_effect = AuditIntegrityError("stop after substitution")
+        marker = {"blob_ref": str(blob_id), "mode": "inline_content", "sha256": sha256}
+        options: dict[str, Any] = {"prompt_template": "Classify {{ row.text }}"}
+        if field_path == "queries.q1.template":
+            options["queries"] = {"q1": {"template": marker}}
+        else:
+            options[field_path] = marker
+        state_record = _composition_state_record(
+            session_id=owner_session,
+            source_path=tmp_path / "input.csv",
+            output_path=tmp_path / "output.jsonl",
+            nodes=[
+                {
+                    "id": "classify",
+                    "node_type": "transform",
+                    "plugin": "llm",
+                    "input": "source_rows",
+                    "on_success": "out",
+                    "on_error": "discard",
+                    "options": options,
+                }
+            ],
+        )
+        mock_session_service.get_state_in_session.return_value = state_record
+        mock_session_service.assert_prompt_file_approvals.side_effect = PromptFileReviewStale()
 
-        with pytest.raises(AuditIntegrityError, match="stop after substitution"):
+        with pytest.raises(PromptFileReviewStale):
             service._run_pipeline(
                 str(uuid4()),
                 _llm_inline_marker_pipeline_yaml(field_path, blob_id=blob_id, sha256=sha256),
@@ -7031,8 +7467,8 @@ class TestInlineBlobPromptSurfaceModalityAdmission:
 
         blob_service.link_blob_to_run.assert_awaited_once()
         blob_service.read_blob_content.assert_awaited_once()
-        resolutions = mock_session_service.record_blob_inline_resolutions.await_args.kwargs["resolutions"]
-        assert [resolution.field_path for resolution in resolutions] == [f"node:classify.options.{field_path}"]
+        mock_session_service.assert_prompt_file_approvals.assert_awaited_once()
+        mock_session_service.record_blob_inline_resolutions.assert_not_awaited()
         mock_load.assert_not_called()
         mock_orch_cls.assert_not_called()
 

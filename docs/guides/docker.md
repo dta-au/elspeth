@@ -86,7 +86,7 @@ docker run --rm --name elspeth-web \
 ```
 
 `ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS` is required; `200000` is a
-placeholder. Set it to your model gateway's prompt-token limit.
+placeholder. Set it to your model gateway's prompt-token limit, reserving room for completion tokens and provider overhead. The Composer uses a conservative estimate: the shipped skill and tools use a measured static rate before usage is available, while foreign content costs one token per byte. Large protected content can therefore be refused before the model's actual token limit.
 
 The explicit `0.0.0.0` bind is required for Docker's published port to reach
 the process; the native CLI keeps its safer `127.0.0.1` default. From another
@@ -674,7 +674,7 @@ docker run --rm \
 - [AWS ECS Full Acceptance Runbook](../runbooks/aws-ecs-deployment.md) - Disposable two-scenario provisioning and acceptance
 - [Azure Container Apps Cold Install](../runbooks/azure-container-apps-cold-install.md) - Bicep environment with external PostgreSQL and NFS Azure Files
 - [Azure Container Apps Existing-Service Redeploy](../runbooks/azure-container-apps-existing-service-redeploy.md) - Digest-pinned revision rollout
-- [Azure Container Apps Full Acceptance Runbook](../runbooks/azure-container-apps-deployment.md) - Disposable 0.8.14 test and fix-on-fail procedure
+- [Azure Container Apps Full Acceptance Runbook](../runbooks/azure-container-apps-deployment.md) - Disposable 0.8.15 test and fix-on-fail procedure
 - [Your First Pipeline](your-first-pipeline.md) - Getting started guide
 - [Configuration Reference](../reference/configuration.md) - Complete config options
 - [Runbooks](../runbooks/) - Operational procedures

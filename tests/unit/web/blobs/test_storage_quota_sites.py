@@ -576,7 +576,7 @@ async def test_replacement_commit_rechecks_net_growth(
             authority.mutate(
                 compose,
                 lambda transaction: transaction.blobs.commit_blob_replacement(
-                    plan=plan, max_storage_per_session=10_000, accepting_proposal_id=None
+                    plan=plan, max_storage_per_session=10_000, accepting_proposal_id=None, on_metadata_commit=None
                 ),
             )
         assert _rows(db_engine, session_id) == [("ready", 3)]
@@ -585,7 +585,7 @@ async def test_replacement_commit_rechecks_net_growth(
         result = authority.mutate(
             compose,
             lambda transaction: transaction.blobs.commit_blob_replacement(
-                plan=plan, max_storage_per_session=10_000, accepting_proposal_id=None
+                plan=plan, max_storage_per_session=10_000, accepting_proposal_id=None, on_metadata_commit=None
             ),
         )
         assert result.phase == "purge_pending"

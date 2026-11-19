@@ -286,7 +286,9 @@ async def test_a_real_reply_stage_refusal_names_the_largest_component_of_the_req
     composer = turn.composer
     decide = composer._shed_to_context_budget
     policy = composer._context_budget_policy
-    tight_policy = replace(policy, max_request_bytes=1024)
+    # Isolate the byte ceiling: quoting the foreign result can also cross the
+    # ordinary token ceiling under conservative growth pricing.
+    tight_policy = replace(policy, max_request_bytes=1024, max_prompt_tokens=10**9)
     measured: list[tuple[int, int, int]] = []
 
     def _decide_on_a_quote_heavy_latest_round(**kwargs: Any) -> Any:

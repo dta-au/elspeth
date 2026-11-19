@@ -22,6 +22,8 @@ from sqlalchemy.pool import StaticPool
 
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.blobs import routes as blob_routes
+from elspeth.web.blobs.prompt_text_routes import create_prompt_text_router
 from elspeth.web.blobs.protocol import BlobPendingProposalError
 from elspeth.web.blobs.routes import create_blobs_router
 from elspeth.web.blobs.service import BlobServiceImpl
@@ -92,6 +94,7 @@ def _make_app(
 
     app.include_router(create_session_router())
     app.include_router(create_blobs_router())
+    app.include_router(create_prompt_text_router())
 
     return app, session_service, blob_service
 
@@ -446,6 +449,7 @@ class TestIDORProtection:
 
             app.include_router(create_session_router())
             app.include_router(create_blobs_router())
+            app.include_router(create_prompt_text_router())
             return app
 
         alice_app = make_app_for_user("alice")
@@ -885,16 +889,16 @@ class TestBinaryDocumentUpload:
         )
         assert resp.status_code == 422
 
-    def test_binary_over_textract_inline_ceiling_rejected(self, tmp_path) -> None:
-        from elspeth.contracts.binary_documents import BINARY_DOCUMENT_MAX_BYTES
-
+    def test_binary_over_textract_inline_ceiling_rejected(self, tmp_path, monkeypatch) -> None:
+        binary_ceiling = len(_PNG_BYTES) + 16
+        monkeypatch.setattr(blob_routes, "BINARY_DOCUMENT_MAX_BYTES", binary_ceiling)
         # App-level limit above the binary ceiling so THIS gate is the one
         # that fires (the general limit is a separate 413).
-        app, _, _ = _make_app(tmp_path, max_upload_bytes=BINARY_DOCUMENT_MAX_BYTES + 1024)
+        app, _, _ = _make_app(tmp_path, max_upload_bytes=binary_ceiling + 1024)
         client = TestClient(app)
         session_id = _create_session(client)
 
-        oversized = _PNG_BYTES + b"\x00" * BINARY_DOCUMENT_MAX_BYTES
+        oversized = _PNG_BYTES + b"\x00" * binary_ceiling
         resp = client.post(
             f"/api/sessions/{session_id}/blobs",
             files={"file": ("big.png", io.BytesIO(oversized), "image/png")},

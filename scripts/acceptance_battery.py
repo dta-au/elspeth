@@ -134,11 +134,23 @@ class Battery:
         print("pending reviews:", len(events))
         for event in events:
             event_id = event.get("id") or event.get("event_id")
+            resolve_body: dict[str, Any] = {"choice": "accepted_as_drafted"}
+            if event.get("kind") == "llm_prompt_template":
+                # A prompt card approves the stored snapshot it showed, named by its anchor.
+                status, snapshot = self.api(
+                    "GET",
+                    f"/api/sessions/{session_id}/interpretations/{event_id}/prompt",
+                    save=f"{graph}/review-prompt-{event_id}.json",
+                )
+                if status != 200:
+                    print("review prompt", event_id, "->", status)
+                    continue
+                resolve_body["reviewed_anchor"] = snapshot["anchor"]
             status, _ = self.api(
                 "POST",
                 f"/api/sessions/{session_id}/interpretations/{event_id}/resolve",
                 save=f"{graph}/resolve-{event_id}.json",
-                json={"choice": "accepted_as_drafted"},
+                json=resolve_body,
             )
             print("resolved", event_id, "->", status)
         return 0

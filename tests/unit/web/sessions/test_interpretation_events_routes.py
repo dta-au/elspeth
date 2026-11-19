@@ -26,7 +26,7 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient, Response
-from sqlalchemy import insert
+from sqlalchemy import insert, select
 
 from elspeth.contracts.composer_interpretation import (
     InterpretationChoice,
@@ -38,8 +38,18 @@ from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.canonical import stable_hash
 from elspeth.web.composer.source_demand import SOURCE_DATA_CONTRACT_USER_TERM, build_source_data_contract_draft
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
-from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, SOURCE_AUTHORING_KEY, SOURCE_COMPONENT_ID
-from elspeth.web.sessions.models import session_operation_fences_table
+from elspeth.web.composer.tools._common import _options_with_default_prompt_template_review
+from elspeth.web.interpretation_state import (
+    INTERPRETATION_REQUIREMENTS_KEY,
+    SOURCE_AUTHORING_KEY,
+    SOURCE_COMPONENT_ID,
+    prompt_review_draft_from_options,
+)
+from elspeth.web.sessions.models import (
+    prompt_file_approvals_table,
+    prompt_review_snapshots_table,
+    session_operation_fences_table,
+)
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateProvenance,
@@ -665,6 +675,33 @@ async def test_08_resolve_event_from_different_session_returns_404(
 
 
 @pytest.mark.asyncio
+async def test_prompt_snapshot_route_refuses_non_owner_before_read(test_client: TestClient) -> None:
+    node = _llm_node(user_term="file")
+    node["options"] = _options_with_default_prompt_template_review(node_id=node["id"], plugin="llm", options=node["options"])
+    seeded = await _seed_session_with_pending_event(
+        test_client,
+        user_id="bob",
+        node=node,
+        user_term="llm_prompt_template:llm_transform_1",
+        kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
+        llm_draft=node["options"]["prompt_template"],
+    )
+    # A present snapshot row makes this an authorization test: without the
+    # ownership check the reader reaches the row and this request cannot 404.
+    # Surfacing stores the row for every prompt card, inline ones included.
+    with test_client.app.state.phase3_engine.connect() as conn:
+        stored = conn.execute(
+            select(prompt_review_snapshots_table.c.event_id).where(prompt_review_snapshots_table.c.event_id == str(seeded["event"].id))
+        ).all()
+    assert len(stored) == 1
+    response = await _get(
+        test_client,
+        f"/api/sessions/{seeded['session_id']}/interpretations/{seeded['event'].id}/prompt",
+    )
+    assert response.status_code == 404, response.text
+
+
+@pytest.mark.asyncio
 async def test_08b_resolve_existing_event_with_consumed_placeholder_returns_422(
     test_client: TestClient,
 ) -> None:
@@ -859,11 +896,13 @@ async def test_prompt_draft_remains_readable_and_ordinary_user_can_approve_it(te
     assert pending["choice"] == "pending"
     assert pending["accepted_value"] is None
     assert pending["resolved_at"] is None
+    snapshot = await _snapshot(test_client, session_id, seeded["event"].id)
+    assert snapshot["authored_surface"]["prompt_template"] == draft
 
     response = await _post(
         test_client,
         f"/api/sessions/{session_id}/interpretations/{event_id}/resolve",
-        json={"choice": "accepted_as_drafted"},
+        json={"choice": "accepted_as_drafted", "reviewed_anchor": snapshot["anchor"]},
     )
     assert response.status_code == 200, response.text
     accepted = response.json()["event"]
@@ -908,6 +947,267 @@ async def test_resolve_prompt_template_amended_returns_422(test_client: TestClie
 
     assert response.status_code == 422, response.text
     assert response.json()["detail"]["code"] == "interpretation_resolution_unsupported"
+
+
+# --------------------------------------------------------------------------- #
+# Prompt review cards bind the approval to the snapshot the user was shown
+# --------------------------------------------------------------------------- #
+
+
+_REVIEWED_PROMPT = "Read {{ row.html }} and return JSON."
+
+
+def _system_prompt_review_node(system_prompt: str, *, node_id: str = "identify_colour") -> dict[str, Any]:
+    """An inline single-prompt LLM node whose review surface includes a system prompt."""
+    options = _options_with_default_prompt_template_review(
+        node_id=node_id,
+        plugin="llm",
+        options={"prompt_template": _REVIEWED_PROMPT, "system_prompt": system_prompt},
+    )
+    return CompositionState(
+        source=None,
+        nodes=(
+            NodeSpec(
+                id=node_id,
+                node_type="transform",
+                plugin="llm",
+                input="rows",
+                on_success="out",
+                on_error="quarantine",
+                options=options,
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(name="Phase 5b Routes Test", description=""),
+        version=1,
+    ).to_dict()["nodes"][0]
+
+
+async def _seed_system_prompt_review(test_client: TestClient, system_prompt: str) -> dict[str, Any]:
+    node = _system_prompt_review_node(system_prompt)
+    return await _seed_session_with_pending_event(
+        test_client,
+        node=node,
+        user_term="llm_prompt_template:identify_colour",
+        kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
+        llm_draft=_review_draft(node),
+    )
+
+
+def _review_draft(node: dict[str, Any]) -> str:
+    draft = prompt_review_draft_from_options(node["options"])
+    assert draft is not None
+    return draft
+
+
+async def _resurface_with_system_prompt(test_client: TestClient, session_id: UUID, system_prompt: str) -> Any:
+    """Another tab's turn: the system prompt changes and the card is surfaced again."""
+    service: SessionServiceImpl = test_client.app.state.session_service
+    node = _system_prompt_review_node(system_prompt)
+    state = await _save_composition_state(
+        service,
+        session_id,
+        CompositionStateData(
+            nodes=[node],
+            metadata_={"name": "Phase 5b Routes Test", "description": ""},
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
+    return await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state.id,
+        affected_node_id=node["id"],
+        tool_call_id="call_43",
+        user_term="llm_prompt_template:identify_colour",
+        kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
+        llm_draft=_review_draft(node),
+        model_identifier="anthropic/claude-opus-4-7",
+        model_version="2026-05-01",
+        provider="anthropic",
+        composer_skill_hash="a" * 64,
+    )
+
+
+async def _snapshot(test_client: TestClient, session_id: UUID, event_id: UUID) -> dict[str, Any]:
+    response = await _get(test_client, f"/api/sessions/{session_id}/interpretations/{event_id}/prompt")
+    assert response.status_code == 200, response.text
+    payload: dict[str, Any] = response.json()
+    return payload
+
+
+async def _write_surface(test_client: TestClient, session_id: UUID) -> tuple[Any, ...]:
+    """Everything a resolve could write: events, the state head, approval rows."""
+    service: SessionServiceImpl = test_client.app.state.session_service
+    events = await service.list_interpretation_events(session_id, status="all")
+    current = await service.get_current_state(session_id)
+    assert current is not None
+    with test_client.app.state.phase3_engine.connect() as conn:
+        approvals = conn.execute(
+            select(prompt_file_approvals_table).where(prompt_file_approvals_table.c.session_id == str(session_id))
+        ).all()
+    return (
+        tuple((event.id, event.choice, event.accepted_value, event.resolved_at) for event in events),
+        current.id,
+        current.version,
+        tuple(approvals),
+    )
+
+
+@pytest.mark.asyncio
+async def test_prompt_snapshot_serves_inline_review_surface_with_anchor(test_client: TestClient) -> None:
+    """An inline prompt card has a stored snapshot too, so its anchor can be echoed."""
+    seeded = await _seed_system_prompt_review(test_client, "System prompt A")
+    snapshot = await _snapshot(test_client, seeded["session_id"], seeded["event"].id)
+    assert snapshot["authored_surface"] == {"prompt_template": _REVIEWED_PROMPT, "system_prompt": "System prompt A"}
+    assert snapshot["bindings"] == []
+    assert snapshot["is_live_review"] is True
+    assert isinstance(snapshot["anchor"], str)
+    assert len(snapshot["anchor"]) == 64
+
+
+@pytest.mark.asyncio
+async def test_prompt_snapshot_serves_structured_card_parts_skeleton_without_values(test_client: TestClient) -> None:
+    """GET .../prompt carries the frozen slot skeleton the card renders from."""
+    from tests.unit.web.sessions.test_interpretation_events_service import _vague_term_and_prompt_template_node
+
+    seeded = await _seed_session_with_pending_event(
+        test_client,
+        node=_vague_term_and_prompt_template_node(vague_draft="Innovative and creative"),
+        user_term="llm_prompt_template:llm_transform_1",
+        kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
+        llm_draft="Rate pending interpretation this is.",
+    )
+    snapshot = await _snapshot(test_client, seeded["session_id"], seeded["event"].id)
+    surface = snapshot["authored_surface"]
+    assert surface["prompt_template_parts"] == [
+        {"kind": "text", "text": "Rate "},
+        {"kind": "interpretation_ref", "requirement_id": "cool"},
+        {"kind": "text", "text": " this is."},
+    ]
+    assert surface["interpretation_requirements"] == [{"id": "cool", "event_id": None, "user_term": "cool"}]
+    assert "Innovative and creative" not in repr(surface["prompt_template_parts"]) + repr(surface["interpretation_requirements"])
+
+
+@pytest.mark.asyncio
+async def test_prompt_review_resolve_with_another_cards_anchor_is_refused_and_writes_nothing(
+    test_client: TestClient,
+) -> None:
+    """Two tabs: tab A holds card E1's snapshot, tab B changes the system prompt.
+
+    Tab A approves the newly surfaced card E2 while still having shown E1's
+    system prompt. The anchor it echoes is E1's, so the server must refuse
+    and leave every row as it was. Approving with E2's own anchor then works.
+    """
+    seeded = await _seed_system_prompt_review(test_client, "System prompt A")
+    session_id = seeded["session_id"]
+    first_event = seeded["event"]
+    shown_anchor = (await _snapshot(test_client, session_id, first_event.id))["anchor"]
+
+    second_event = await _resurface_with_system_prompt(test_client, session_id, "System prompt B")
+    assert second_event.id != first_event.id
+    current_snapshot = await _snapshot(test_client, session_id, second_event.id)
+    assert current_snapshot["authored_surface"]["system_prompt"] == "System prompt B"
+    assert current_snapshot["anchor"] != shown_anchor
+
+    before = await _write_surface(test_client, session_id)
+    stale = await _post(
+        test_client,
+        f"/api/sessions/{session_id}/interpretations/{second_event.id}/resolve",
+        json={"choice": "accepted_as_drafted", "reviewed_anchor": shown_anchor},
+    )
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["detail"]["code"] == "prompt_review_stale"
+    assert await _write_surface(test_client, session_id) == before
+    pending_ids = {
+        event.id for event in await test_client.app.state.session_service.list_interpretation_events(session_id, status="pending")
+    }
+    assert second_event.id in pending_ids
+
+    approved = await _post(
+        test_client,
+        f"/api/sessions/{session_id}/interpretations/{second_event.id}/resolve",
+        json={"choice": "accepted_as_drafted", "reviewed_anchor": current_snapshot["anchor"]},
+    )
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["event"]["choice"] == "accepted_as_drafted"
+    approved_node = next(node for node in approved.json()["new_state"]["nodes"] if node["id"] == "identify_colour")
+    assert approved_node["options"]["system_prompt"] == "System prompt B"
+
+
+@pytest.mark.asyncio
+async def test_prompt_review_resolve_without_anchor_is_refused_and_writes_nothing(test_client: TestClient) -> None:
+    seeded = await _seed_system_prompt_review(test_client, "System prompt A")
+    session_id = seeded["session_id"]
+    before = await _write_surface(test_client, session_id)
+
+    response = await _post(
+        test_client,
+        f"/api/sessions/{session_id}/interpretations/{seeded['event'].id}/resolve",
+        json={"choice": "accepted_as_drafted"},
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["code"] == "prompt_review_anchor_required"
+    assert await _write_surface(test_client, session_id) == before
+
+
+@pytest.mark.asyncio
+async def test_prompt_review_resolve_without_stored_snapshot_is_refused_and_writes_nothing(test_client: TestClient) -> None:
+    """An event surfaced before snapshots were stored cannot be approved blind."""
+    seeded = await _seed_system_prompt_review(test_client, "System prompt A")
+    session_id = seeded["session_id"]
+    anchor = (await _snapshot(test_client, session_id, seeded["event"].id))["anchor"]
+    with test_client.app.state.phase3_engine.begin() as conn:
+        conn.execute(prompt_review_snapshots_table.delete().where(prompt_review_snapshots_table.c.event_id == str(seeded["event"].id)))
+    before = await _write_surface(test_client, session_id)
+
+    response = await _post(
+        test_client,
+        f"/api/sessions/{session_id}/interpretations/{seeded['event'].id}/resolve",
+        json={"choice": "accepted_as_drafted", "reviewed_anchor": anchor},
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "prompt_review_snapshot_missing"
+    assert await _write_surface(test_client, session_id) == before
+
+
+@pytest.mark.asyncio
+async def test_vague_term_resolve_needs_no_anchor_and_refuses_one(test_client: TestClient) -> None:
+    """Other kinds have no snapshot, so an echoed anchor would bind nothing."""
+    seeded = await _seed_session_with_pending_event(test_client)
+    session_id = seeded["session_id"]
+    url = f"/api/sessions/{session_id}/interpretations/{seeded['event'].id}/resolve"
+    before = await _write_surface(test_client, session_id)
+
+    with_anchor = await _post(test_client, url, json={"choice": "accepted_as_drafted", "reviewed_anchor": "a" * 64})
+    assert with_anchor.status_code == 422, with_anchor.text
+    assert with_anchor.json()["detail"]["code"] == "interpretation_review_anchor_unexpected"
+    assert await _write_surface(test_client, session_id) == before
+
+    without_anchor = await _post(test_client, url, json={"choice": "accepted_as_drafted"})
+    assert without_anchor.status_code == 200, without_anchor.text
+    assert without_anchor.json()["event"]["choice"] == "accepted_as_drafted"
+
+
+@pytest.mark.parametrize("anchor", ["A" * 64, "a" * 63, "a" * 65, "g" * 64, ""])
+@pytest.mark.asyncio
+async def test_resolve_rejects_malformed_reviewed_anchor_at_schema(test_client: TestClient, anchor: str) -> None:
+    seeded = await _seed_system_prompt_review(test_client, "System prompt A")
+    response = await _post(
+        test_client,
+        f"/api/sessions/{seeded['session_id']}/interpretations/{seeded['event'].id}/resolve",
+        json={"choice": "accepted_as_drafted", "reviewed_anchor": anchor},
+    )
+    assert response.status_code == 422, response.text
 
 
 @pytest.mark.asyncio

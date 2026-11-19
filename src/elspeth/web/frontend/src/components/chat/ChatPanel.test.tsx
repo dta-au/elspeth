@@ -151,6 +151,8 @@ vi.mock("./ChatInput", async (importOriginal) => ({
     onBlobUploadSettled,
     uploadPromptSentence,
     uploadDisabled,
+    onToggleBlobManager,
+    showBlobManager,
   }: {
     placeholder?: string;
     onSend?: (content: string) => void;
@@ -171,8 +173,13 @@ vi.mock("./ChatInput", async (importOriginal) => ({
     onBlobUploadSettled?: (requestId: string, sessionId: string) => void;
     uploadPromptSentence?: (filename: string) => string;
     uploadDisabled?: boolean;
+    onToggleBlobManager?: () => void;
+    showBlobManager?: boolean;
   }) => (
     <>
+      {onToggleBlobManager && <button type="button" onClick={onToggleBlobManager}>
+        {showBlobManager ? "Hide file manager" : "Show file manager"}
+      </button>}
       <button
         type="button"
         data-testid="chat-input"
@@ -267,7 +274,8 @@ vi.mock("./ChatInput", async (importOriginal) => ({
 }));
 
 vi.mock("@/components/blobs/BlobManager", () => ({
-  BlobManager: () => <div data-testid="blob-manager" />,
+  BlobManager: ({ onUseAsInput }: { onUseAsInput: (blob: BlobMetadata) => void }) =>
+    <div data-testid="blob-manager"><button type="button" onClick={() => onUseAsInput({ filename: "prompt.txt" } as BlobMetadata)}>Use as input</button></div>,
 }));
 
 describe("ChatPanel", () => {
@@ -284,6 +292,20 @@ describe("ChatPanel", () => {
       compositionState: null,
       error: null,
     });
+  });
+
+  it("honours store-opened files and retains toggle and Use-as-input close behaviour", () => {
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    useBlobStore.getState().activateSession("session-1");
+    render(<ChatPanel />);
+    expect(screen.queryByTestId("blob-manager")).not.toBeInTheDocument();
+    act(() => useBlobStore.getState().setFileManagerOpen(true));
+    expect(screen.getByTestId("blob-manager")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Hide file manager" }));
+    expect(screen.queryByTestId("blob-manager")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show file manager" }));
+    fireEvent.click(screen.getByRole("button", { name: "Use as input" }));
+    expect(useBlobStore.getState().fileManagerOpen).toBe(false);
   });
 
   it("observes the InlineRunResults sentinel when the retired owner is imported", async () => {

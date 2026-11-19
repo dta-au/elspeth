@@ -95,6 +95,12 @@ describe("forced-colors: active boundaries", () => {
     expect(rule).toMatch(/outline-offset:\s*2px/);
   });
 
+  it("outlines an attached file row in forced colours", () => {
+    const rule = declarations(forced, ".blob-row-item--attached > .blob-row-container");
+    expect(rule).toMatch(/outline:\s*2px solid Highlight/);
+    expect(rule).toMatch(/outline-offset:\s*-2px/);
+  });
+
   it("uses no !important", () => {
     expect(forced).not.toContain("!important");
   });

@@ -125,6 +125,7 @@ from elspeth.web.composer.tools.blobs import (
     _persist_prepared_blob_create,
     _prepare_blob_create,
     _PreparedBlobCreate,
+    _structured_prompt_template_refusal,
 )
 from elspeth.web.composer.tools.declarations import (
     GRAPH_EFFECTS,
@@ -1565,6 +1566,15 @@ def build_set_pipeline_candidate(
             options=node_options,
             existing_options=current_nodes[node_id].options if node_id in current_nodes else None,
         )
+        if node_plugin == "llm":
+            structured_error = _structured_prompt_template_refusal(
+                node_id, current_nodes[node_id].options if node_id in current_nodes else {}, review_options
+            )
+            if structured_error is not None:
+                _record_component_rejection(
+                    _failure_result(state, structured_error, error_code="prompt_template_parts_required", rejected_component=node_ref)
+                )
+                continue
         canonical_error = _canonical_interpretation_requirement_error(
             review_options,
             tool_name="set_pipeline",

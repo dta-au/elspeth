@@ -103,6 +103,7 @@ from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import InterpretationPlaceholderConsumedError, SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
+from tests.helpers.prompt_review import reviewed_anchor_for, reviewed_anchor_kwargs
 from tests.helpers.session_fences import acquire_compose_context, ensure_session_fence
 from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noqa: F401  (autouse end-gate CLEAN stub)
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
@@ -2514,6 +2515,7 @@ async def test_control_fleet_graph_reaches_validatable_state(
             choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
             amended_value=None,
             actor="user:alice",
+            **await reviewed_anchor_kwargs(sessions_service, session_id, event.id, event.kind),
         )
 
     # The execution gate's materializer must see zero pending sites on the
@@ -4547,6 +4549,7 @@ async def test_stranded_prompt_template_requirements_surface_via_backstop(
         choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
         amended_value=None,
         actor="user:alice",
+        reviewed_anchor=await reviewed_anchor_for(sessions_service, session_id, pending[0].id),
     )
 
     # Repair mode honours evidence in ANY status: no resurrection after resolve.

@@ -361,6 +361,25 @@ def _make_transform_with_mock_provider(
 # ---------------------------------------------------------------------------
 
 
+def test_multi_query_row_wait_covers_requests_beyond_capacity_retry_budget() -> None:
+    from elspeth.plugins.infrastructure.batching.ports import CollectorOutputPort
+    from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+    config = _make_multi_query_config(
+        provider="openrouter",
+        timeout_seconds=90.0,
+        max_capacity_retry_seconds=30.0,
+        pool_size=1,
+    )
+    transform = LLMTransform(config)
+    transform.connect_output(CollectorOutputPort(), max_pending=1)
+    try:
+        # Two ordinary sequential requests can outlast the retry-only budget.
+        assert transform.batch_wait_timeout >= 2 * config["timeout_seconds"] + config["max_capacity_retry_seconds"]
+    finally:
+        transform.shutdown_batch_processing()
+
+
 class TestProviderDispatch:
     """Verify correct provider creation based on provider field."""
 

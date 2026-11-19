@@ -351,6 +351,19 @@ def credential_material_tool_arguments_projection(
     if tool_name in {"create_blob", "update_blob"} and "content" in projected:
         projected["content"] = _OUT_OF_SCOPE_DATA_PLANE_CONTENT
         return projected
+    if (
+        tool_name == "change_substring"
+        and type(projected.get("target")) is dict
+        and projected["target"].get("kind") == "blob"
+        and type(projected.get("edits")) is list
+    ):
+        projected["edits"] = [
+            {key: (_OUT_OF_SCOPE_DATA_PLANE_CONTENT if key in {"old", "replacement"} else value) for key, value in edit.items()}
+            if type(edit) is dict
+            else edit
+            for edit in projected["edits"]
+        ]
+        return projected
     if tool_name not in {"set_pipeline", "emit_pipeline_proposal"}:
         return projected
 

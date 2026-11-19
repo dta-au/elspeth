@@ -92,6 +92,7 @@ from elspeth.web.sessions.protocol import (
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.prompt_review import reviewed_anchor_kwargs
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 # --------------------------------------------------------------------------- #
@@ -789,6 +790,7 @@ async def test_only_event_for_exact_current_draft_can_settle(
             choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
             amended_value=None,
             actor="user:alice",
+            **await reviewed_anchor_kwargs(service, session_id, old_event.id, old_event.kind),
         )
     pending_rows = await service.list_interpretation_events(session_id, status="pending")
     assert [row.id for row in pending_rows] == [old_event.id]
@@ -814,6 +816,7 @@ async def test_only_event_for_exact_current_draft_can_settle(
         choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
         amended_value=None,
         actor="user:alice",
+        **await reviewed_anchor_kwargs(service, session_id, current_event.id, current_event.kind),
     )
 
     assert resolved_event.accepted_value == current_draft
@@ -891,6 +894,7 @@ async def test_delayed_older_surface_cannot_displace_current_pending_review(
         choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
         amended_value=None,
         actor="user:alice",
+        **await reviewed_anchor_kwargs(service, session_id, current_event.id, current_event.kind),
     )
     assert resolved.accepted_value == "the current interpretation"
 
@@ -1044,6 +1048,7 @@ async def test_review_event_identity_supersedes_same_text_changed_artifact(
             choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
             amended_value=None,
             actor="user:alice",
+            **await reviewed_anchor_kwargs(service, session_id, event_a.id, event_a.kind),
         )
     assert [row.id for row in await service.list_interpretation_events(session_id, status="pending")] == [event_a.id]
 
@@ -1090,6 +1095,7 @@ async def test_review_event_identity_supersedes_same_text_changed_artifact(
         choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
         amended_value=None,
         actor="user:alice",
+        **await reviewed_anchor_kwargs(service, session_id, event_b.id, event_b.kind),
     )
     assert resolved_event.choice is InterpretationChoice.ACCEPTED_AS_DRAFTED
     assert resolved_event.accepted_value == draft
@@ -1186,6 +1192,7 @@ async def test_structured_vague_term_identity_tracks_prompt_parts_structure(
             choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
             amended_value=None,
             actor="user:alice",
+            **await reviewed_anchor_kwargs(service, session_id, event_a.id, event_a.kind),
         )
 
     event_b = await service.create_pending_interpretation_event(
@@ -1222,6 +1229,7 @@ async def test_structured_vague_term_identity_tracks_prompt_parts_structure(
         choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
         amended_value=None,
         actor="user:alice",
+        **await reviewed_anchor_kwargs(service, session_id, event_b.id, event_b.kind),
     )
     assert resolved_event.choice is InterpretationChoice.ACCEPTED_AS_DRAFTED
     assert resolved_state.nodes is not None
@@ -1269,6 +1277,7 @@ async def test_legacy_vague_term_event_is_bound_to_its_surfacing_prompt(
             choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
             amended_value=None,
             actor="user:alice",
+            **await reviewed_anchor_kwargs(service, session_id, old_event.id, old_event.kind),
         )
 
     current_event = await service.create_pending_interpretation_event(
@@ -1287,6 +1296,7 @@ async def test_legacy_vague_term_event_is_bound_to_its_surfacing_prompt(
         choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
         amended_value=None,
         actor="user:alice",
+        **await reviewed_anchor_kwargs(service, session_id, current_event.id, current_event.kind),
     )
 
     assert resolved.accepted_value == "aesthetically pleasing"

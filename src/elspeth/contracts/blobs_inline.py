@@ -29,14 +29,14 @@ BlobRefMode = Literal["bind_source", "inline_content"]
 ALLOWED_BLOB_REF_MODES: frozenset[str] = frozenset(get_args(BlobRefMode))
 """Runtime view derived from ``BlobRefMode`` to prevent drift."""
 
-BlobInlineValidationCategory = Literal["missing", "oversized", "not_ready", "hash_mismatch", "malformed"]
+BlobInlineValidationCategory = Literal["missing", "oversized", "not_ready", "hash_mismatch", "malformed", "not_text"]
 """Validation failure categories for inline-content blob refs."""
 
 _SHA256_HEX_PATTERN: Final = re.compile(r"^[0-9a-f]{64}$")
 _UUID_PATTERN: Final = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _FIELD_PATH_PATTERN: Final = re.compile(
     r"^(?:source(?::[^.\[\]]+)?|node:[^.\[\]]+|output:[^.\[\]]+)"
-    r"\.options(?:\.[A-Za-z_][A-Za-z0-9_-]*)+$"
+    r"\.options\.[A-Za-z_][A-Za-z0-9_-]*(?:\.(?:[A-Za-z_][A-Za-z0-9_-]*|0|[1-9][0-9]*))*$"
 )
 _ALLOWED_MARKER_KEYS: Final = frozenset({"blob_ref", "mode", "path", "sha256", "encoding"})
 
@@ -102,6 +102,19 @@ class BlobInlineValidationViolation:
     category: BlobInlineValidationCategory
     field_path: str
     detail: str
+
+
+INLINE_BLOB_NOT_TEXT_CODE: Final = "inline_blob_not_text"
+INLINE_BLOB_NOT_TEXT_REPAIR: Final = "Upload or create the prompt as plain text (.txt or .md) and wire that file."
+
+
+class InlineBlobNotTextError(ValueError):
+    """A file-backed inline marker points to a non-text blob."""
+
+    error_code = INLINE_BLOB_NOT_TEXT_CODE
+
+    def __init__(self, field_path: str) -> None:
+        super().__init__(f"Inline content blob reference at {field_path} is not text. {INLINE_BLOB_NOT_TEXT_REPAIR}")
 
 
 @dataclass(frozen=True, slots=True)

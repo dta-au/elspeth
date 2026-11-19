@@ -22,7 +22,7 @@ from elspeth.web.composer.tools.strict_profile import (
 
 K = StrictViolationKind
 
-# The 33 loop tools with no free-form object anywhere in their flat schema S.
+# The 34 loop tools with no free-form object anywhere in their flat schema S.
 _STRICT_CANDIDATES: frozenset[str] = frozenset(
     {
         "list_blobs",
@@ -38,6 +38,7 @@ _STRICT_CANDIDATES: frozenset[str] = frozenset(
         "clear_source",
         "inspect_source",
         "get_pipeline_state",
+        "inspect_prompt_targets",
         "get_plugin_schema",
         "get_expression_grammar",
         "explain_validation_error",
@@ -61,7 +62,7 @@ _STRICT_CANDIDATES: frozenset[str] = frozenset(
     }
 )
 
-# The 10 option-bearing loop tools: each carries at least one free-form object.
+# The 11 loop tools not eligible for a strict stamp.
 _OPTION_TOOLS: frozenset[str] = frozenset(
     {
         "set_source",
@@ -72,6 +73,7 @@ _OPTION_TOOLS: frozenset[str] = frozenset(
         "upsert_node",
         "splice_transform",
         "patch_node_options",
+        "change_substring",
         "set_output",
         "patch_output_options",
     }
@@ -351,12 +353,12 @@ def test_checker_does_not_mutate_its_input() -> None:
 def test_inventory_partition_over_flat_s_is_pinned_by_name() -> None:
     definitions = {definition["name"]: definition["parameters"] for definition in get_tool_definitions()}
     assert set(definitions) == _STRICT_CANDIDATES | _OPTION_TOOLS
-    assert len(_STRICT_CANDIDATES) == 33
-    assert len(_OPTION_TOOLS) == 10
+    assert len(_STRICT_CANDIDATES) == 34
+    assert len(_OPTION_TOOLS) == 11
 
     clean = {name for name in _STRICT_CANDIDATES if check_openai_strict(definitions[name], tool=name) == ()}
     assert clean == _STRICT_CANDIDATES - _NOT_CLEAN_AS_SENT
-    assert len(clean) == 19
+    assert len(clean) == 20
     # Native continuation defaults remain optional. The strict-wire projection
     # has its own controls; native inventory must not pretend it was projected.
     assert {(row.kind, row.path) for row in check_openai_strict(definitions["get_blob_content"], tool="get_blob_content")} == {

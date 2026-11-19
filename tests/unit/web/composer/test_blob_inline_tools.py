@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
+from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -329,6 +330,111 @@ class TestListComposerBlobs:
 
 
 class TestWireBlobInlineRef:
+    def test_assistant_created_text_prompt_wiring_opens_review(self, blob_env: dict[str, Any]) -> None:
+        blob = _create_blob(blob_env, content="Assistant-authored prompt", llm_authored=True)
+        assert blob.success, blob.to_dict()
+        with blob_env["engine"].connect() as conn:
+            row = conn.execute(blobs_table.select().where(blobs_table.c.id == blob.data["blob_id"])).one()
+        assert row.creation_modality == "llm_generated"
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {"field_path": "node:classify.options.prompt_template", "blob_id": blob.data["blob_id"]},
+            _inline_ref_state(),
+            _catalog(),
+            data_dir=blob_env["data_dir"],
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
+        )
+
+        assert result.success, result.to_dict()
+        assert result.updated_state.nodes[0].options["prompt_template"]["blob_ref"] == blob.data["blob_id"]
+        requirements = result.updated_state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY]
+        assert any(item["kind"] == "llm_prompt_template" and item["status"] == "pending" for item in requirements)
+
+    @pytest.mark.parametrize("field", ["prompt_template", "system_prompt", "queries.0.template", "queries.q.template"])
+    def test_binary_mime_refuses_before_writing_marker(self, blob_env: dict[str, Any], field: str) -> None:
+        blob = _create_blob(blob_env, content="PDF shaped bytes")
+        with blob_env["engine"].begin() as conn:
+            conn.execute(blobs_table.update().where(blobs_table.c.id == blob.data["blob_id"]).values(mime_type="application/pdf"))
+        state = _inline_ref_state()
+        node = state.nodes[0]
+        options = dict(node.options)
+        options["queries"] = (
+            [{"name": "q", "input_fields": {"text": "text"}, "template": "Before"}]
+            if field == "queries.0.template"
+            else {"q": {"input_fields": {"text": "text"}, "template": "Before"}}
+        )
+        state = replace(state, nodes=(replace(node, options=options),))
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {"field_path": f"node:classify.options.{field}", "blob_id": blob.data["blob_id"]},
+            state,
+            _catalog(),
+            data_dir=blob_env["data_dir"],
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.validation.errors[0].error_code == "inline_blob_not_text"
+        assert ".txt or .md" in result.validation.errors[0].message
+        assert "PDF shaped bytes" not in result.validation.errors[0].message
+
+    def test_structured_prompt_wire_refuses_without_mutation(self, blob_env: dict[str, Any]) -> None:
+        blob = _create_blob(blob_env, content="Replacement prompt")
+        state = _inline_ref_state()
+        node = state.nodes[0]
+        state = replace(
+            state,
+            nodes=(
+                replace(node, options={**node.options, "prompt_template_parts": [{"kind": "text", "text": "Original structured prompt"}]}),
+            ),
+        )
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {"field_path": "node:classify.options.prompt_template", "blob_id": blob.data["blob_id"]},
+            state,
+            _catalog(),
+            data_dir=blob_env["data_dir"],
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.validation.errors[0].error_code == "prompt_template_parts_required"
+        assert "interpretation slots" in result.validation.errors[0].message
+        assert state.nodes[0].options["prompt_template"] == "Placeholder"
+
+    def test_structured_prompt_patch_marker_refuses_without_mutation(self, blob_env: dict[str, Any]) -> None:
+        blob = _create_blob(blob_env, content="Replacement prompt")
+        state = _inline_ref_state()
+        node = state.nodes[0]
+        state = replace(
+            state,
+            nodes=(
+                replace(node, options={**node.options, "prompt_template_parts": [{"kind": "text", "text": "Original structured prompt"}]}),
+            ),
+        )
+        marker = {"blob_ref": blob.data["blob_id"], "mode": "inline_content", "sha256": blob.data["content_hash"]}
+
+        result = execute_tool("patch_node_options", {"node_id": "classify", "patch": {"prompt_template": marker}}, state, _catalog())
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.validation.errors[0].error_code == "prompt_template_parts_required"
+        assert "interpretation slots" in result.validation.errors[0].message
+
     @pytest.mark.parametrize(
         ("node_type", "overrides"),
         (
@@ -1072,6 +1178,52 @@ def test_set_nested_option_refuses_occupied_leaf_when_not_replacing() -> None:
         _set_nested_option({"a": {"b": "kept"}}, ["a", "b"], "marker", replace_existing=False)
     assert _set_nested_option({"a": {"b": "old"}}, ["a", "b"], "marker") == {"a": {"b": "marker"}}
     assert _set_nested_option({}, ["a", "b"], "marker", replace_existing=False) == {"a": {"b": "marker"}}
+
+
+def test_set_nested_option_binds_existing_list_query_without_changing_order() -> None:
+    from elspeth.web.composer.tools.blobs import _set_nested_option
+
+    options = {"queries": [{"name": "first", "template": "Original"}, {"name": "second", "template": "Other"}]}
+    marker = {"blob_ref": "user-file"}
+    updated = _set_nested_option(options, ["queries", "0", "template"], marker)
+    assert updated == {"queries": [{"name": "first", "template": marker}, {"name": "second", "template": "Other"}]}
+
+
+@pytest.mark.parametrize("position", ["-1", "00", "2", "two", "\u0661"])
+def test_set_nested_option_rejects_invalid_list_positions(position: str) -> None:
+    from elspeth.web.composer.tools.blobs import _set_nested_option
+
+    options = {"queries": [{"template": "Original"}]}
+    with pytest.raises(ValueError):
+        _set_nested_option(options, ["queries", position, "template"], "Replacement")
+    assert options == {"queries": [{"template": "Original"}]}
+
+
+@pytest.mark.parametrize(
+    ("options", "keys"),
+    [
+        ({"files": {}}, ["files", "v1", "2", "content"]),
+        ({"files": {"v1": {}}}, ["files", "v1", "2"]),
+        ({"queries": {"q": {}}}, ["queries", "0", "template"]),
+        ({}, ["0"]),
+    ],
+)
+def test_set_nested_option_never_creates_a_mapping_key_from_a_list_position(options: dict[str, Any], keys: list[str]) -> None:
+    from elspeth.web.composer.tools.blobs import _set_nested_option
+
+    original = deepcopy(options)
+    with pytest.raises(ValueError, match="is a list position"):
+        _set_nested_option(options, keys, "Replacement")
+    assert options == original
+
+
+def test_set_nested_option_does_not_overwrite_occupied_list_template_when_rebinding() -> None:
+    from elspeth.web.composer.tools.blobs import _set_nested_option
+
+    options = {"queries": [{"template": "Original"}]}
+    with pytest.raises(ValueError, match="already holds a value"):
+        _set_nested_option(options, ["queries", "0", "template"], "Replacement", replace_existing=False)
+    assert options == {"queries": [{"template": "Original"}]}
 
 
 def test_set_nested_option_rejects_empty_field_path() -> None:

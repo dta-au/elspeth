@@ -11,6 +11,7 @@ import {
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 import { Button, Icon } from "@/components/ui";
 import { useSessionStore } from "@/stores/sessionStore";
+import { useBlobStore } from "@/stores/blobStore";
 import { hasCompositionContent } from "@/utils/compositionState";
 import {
   FOCUS_AUTHORING_EVENT,
@@ -97,6 +98,10 @@ export function ComposerWorkspace({
   const [workspaceWidth, setWorkspaceWidth] = useState(0);
   const [narrowView, setNarrowView] = useState<NarrowView>("compose");
   const [authoringFocusRequest, setAuthoringFocusRequest] = useState(0);
+  const revealRequest = useBlobStore((state) => state.revealRequest);
+  const editRequest = useBlobStore((state) => state.editRequest);
+  const returnRequest = useBlobStore((state) => state.returnRequest);
+  const consumeReturnRequest = useBlobStore((state) => state.consumeReturnRequest);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const composeTabRef = useRef<HTMLButtonElement | null>(null);
   const pipelineTabRef = useRef<HTMLButtonElement | null>(null);
@@ -111,6 +116,7 @@ export function ComposerWorkspace({
     sessionId: activeSessionId,
     availableArtifactTabs,
   });
+  const { setAuthoringCollapsed, selectArtifactTab } = paneState;
   const mode = layoutMode(workspaceWidth);
   const narrow = mode === "narrow";
   const authoringViewHidden = narrow && narrowView === "pipeline";
@@ -193,6 +199,38 @@ export function ComposerWorkspace({
     paneState.setAuthoringCollapsed(false);
     setAuthoringFocusRequest((current) => current + 1);
   }, [paneState]);
+
+  // Navigation to a file reveals the pane without moving focus to ChatInput.
+  useLayoutEffect(() => {
+    if (revealRequest?.sessionId !== activeSessionId) return;
+    claimWorkspaceViewIntent();
+    setNarrowView("compose");
+    setAuthoringCollapsed(false);
+  }, [revealRequest, activeSessionId, setAuthoringCollapsed]);
+
+  // Closing the file manager returns focus to its Show in files trigger. In
+  // the narrow layout that trigger's pane may be the hidden one, so show the
+  // view that holds it; blobStore focuses it once the pane is unhidden.
+  useLayoutEffect(() => {
+    if (!returnRequest) return;
+    const { trigger, seq } = returnRequest;
+    if (artifactSlotRef.current?.contains(trigger)) {
+      claimWorkspaceViewIntent();
+      setNarrowView("pipeline");
+    } else if (authoringSlotRef.current?.contains(trigger)) {
+      claimWorkspaceViewIntent();
+      setNarrowView("compose");
+      setAuthoringCollapsed(false);
+    }
+    consumeReturnRequest(seq);
+  }, [returnRequest, consumeReturnRequest, setAuthoringCollapsed]);
+
+  useLayoutEffect(() => {
+    if (!editRequest) return;
+    claimWorkspaceViewIntent();
+    setNarrowView("pipeline");
+    selectArtifactTab("graph");
+  }, [editRequest, selectArtifactTab]);
 
   useLayoutEffect(() => {
     window.addEventListener(FOCUS_AUTHORING_EVENT, focusAuthoring);

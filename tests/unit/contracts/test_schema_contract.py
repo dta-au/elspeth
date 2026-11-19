@@ -5,12 +5,19 @@ Task 4 of Phase 1: Core Contracts Implementation.
 
 from __future__ import annotations
 
+import copy
+import pickle
+from dataclasses import replace
 from decimal import Decimal
+from enum import StrEnum
 
 import numpy as np
 import pytest
 
+from elspeth.contracts import hashing
+from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
+from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.testing import make_field
 
 # --- Fixtures ---
@@ -733,6 +740,128 @@ class TestSchemaContractCheckpoint:
         hash2 = sample_contract.version_hash()
         assert hash1 == hash2
         assert len(hash1) == 32  # Truncated SHA-256 (128 bits)
+
+    @pytest.mark.parametrize("mode", ["FIXED", "FLEXIBLE", "OBSERVED"])
+    @pytest.mark.parametrize("field_count", [0, 1, 5])
+    @pytest.mark.parametrize("locked", [False, True])
+    def test_memo_matches_uncached_hash(self, mode: str, field_count: int, locked: bool) -> None:
+        field_types = (int, str, float, bool, object)
+        fields = tuple(
+            make_field(
+                f"field_{index}",
+                field_types[index],
+                original_name=f"Original {index}",
+                required=index % 2 == 0,
+                source="declared" if index % 2 == 0 else "inferred",
+            )
+            for index in range(field_count)
+        )
+        contract = SchemaContract(mode=mode, fields=fields, locked=locked)
+        expected = contract._compute_version_hash()
+        assert contract.version_hash() == expected
+        assert contract.version_hash() == expected
+
+    @pytest.mark.parametrize(
+        ("contract", "expected"),
+        [
+            (SchemaContract("FIXED", (), False), "c5cd9386e7a07ec1697ad72c54bc0dd4"),
+            (
+                SchemaContract("FIXED", (FieldContract("value", "Value", int, True, "declared"),), True),
+                "be61d4a89232d7042f064efd707a3588",
+            ),
+            (
+                SchemaContract(
+                    "FLEXIBLE",
+                    (
+                        FieldContract("a", "A", int, True, "declared", False),
+                        FieldContract("b", "B", str, False, "inferred", True),
+                        FieldContract("c", "C", float, False, "declared", True),
+                    ),
+                    True,
+                ),
+                "27e42b33beef437eb95e897750cb20d5",
+            ),
+            (
+                # Same fields declared out of order: the hash sorts by normalized name.
+                SchemaContract(
+                    "FLEXIBLE",
+                    (
+                        FieldContract("c", "C", float, False, "declared", True),
+                        FieldContract("a", "A", int, True, "declared", False),
+                        FieldContract("b", "B", str, False, "inferred", True),
+                    ),
+                    True,
+                ),
+                "27e42b33beef437eb95e897750cb20d5",
+            ),
+        ],
+    )
+    def test_version_hash_matches_base_golden(self, contract: SchemaContract, expected: str) -> None:
+        assert contract.version_hash() == expected
+
+    def test_strenum_original_header_matches_plain_string(self) -> None:
+        class OriginalHeader(StrEnum):
+            VALUE = "Value"
+
+        config = SchemaConfig.from_dict({"mode": "fixed", "fields": ["value: int"]})
+        control = create_contract_from_config(config, field_resolution={"Value": "value"})
+        contract = create_contract_from_config(config, field_resolution={OriginalHeader.VALUE: "value"})
+        assert contract.version_hash() == control.version_hash()
+        assert contract.version_hash() == "be61d4a89232d7042f064efd707a3588"
+
+    def test_version_hash_computes_once_per_instance(self, sample_contract: SchemaContract, monkeypatch: pytest.MonkeyPatch) -> None:
+        original = hashing.canonical_json
+        calls = 0
+
+        def counted(value: object) -> str:
+            nonlocal calls
+            calls += 1
+            return original(value)
+
+        monkeypatch.setattr(hashing, "canonical_json", counted)
+        for _ in range(100):
+            sample_contract.version_hash()
+        assert calls == 1
+
+    def test_derived_contracts_have_their_own_memo(self, sample_contract: SchemaContract) -> None:
+        parent_hash = sample_contract.version_hash()
+        extended = sample_contract.with_field("added", "Added", 1)
+        variants = (
+            extended,
+            sample_contract.with_locked(),
+            replace(sample_contract, mode="OBSERVED"),
+            sample_contract.merge_for_batch(extended),
+            sample_contract.merge_for_node_evolution(extended),
+            SchemaContract.from_checkpoint(sample_contract.to_checkpoint_format()),
+        )
+        for variant in variants[:-1]:
+            assert variant._version_hash_memo is None
+        for variant in variants:
+            assert variant.version_hash() == variant._compute_version_hash()
+        assert variants[0].version_hash() != parent_hash
+        assert variants[2].version_hash() != parent_hash
+
+    def test_memo_does_not_change_value_semantics(self, sample_contract: SchemaContract) -> None:
+        cold = replace(sample_contract)
+        warm = replace(sample_contract)
+        warm.version_hash()
+        assert warm == cold
+        assert hash(warm) == hash(cold)
+        assert repr(warm) == repr(cold)
+        assert copy.copy(warm) == copy.copy(cold)
+        assert warm.to_checkpoint_format() == cold.to_checkpoint_format()
+        # The pre-existing mappingproxy indices make deep copy and pickle fail.
+        # Computing the memo must not change either failure contract.
+        for operation in (copy.deepcopy, pickle.dumps):
+            with pytest.raises(TypeError, match="mappingproxy"):
+                operation(warm)
+            with pytest.raises(TypeError, match="mappingproxy"):
+                operation(replace(sample_contract))
+
+    def test_non_tuple_fields_are_rejected_before_memoisation(self) -> None:
+        field_contract = make_field("value", int)
+        with pytest.raises(TypeError, match="fields must be a tuple"):
+            SchemaContract(mode="FIXED", fields=[field_contract])
 
     def test_version_hash_changes_on_field_change(self) -> None:
         """Different fields produce different hashes."""

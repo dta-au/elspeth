@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
+from hashlib import sha256
 from typing import Annotated, Any, Final, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, TypeAdapter
@@ -15,6 +16,8 @@ from elspeth.core.config import RuntimeNodeName
 from elspeth.web.composer.inventory_response_contracts import PLUGIN_INVENTORY_RESPONSE_CONTRACT
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
+    ChangeSubstringArgumentsModel,
+    InspectPromptTargetsArgumentsModel,
     PatchNodeOptionsArgumentsModel,
     SpliceTransformArgumentsModel,
     _JsonInteger,
@@ -53,6 +56,7 @@ from elspeth.web.composer.tools._common import (
     _composition_canonical_interpretation_requirement_error,
     _discovery_result,
     _echoed_metadata_note,
+    _failure_result,
     _mutation_result,
     _normalize_echoed_interpretation_requirements,
     _options_with_default_llm_reviews,
@@ -75,11 +79,23 @@ from elspeth.web.composer.tools._common import (
     review_reconciliation_failure_message,
 )
 from elspeth.web.composer.tools._naming_disclosure import _disclose_node_name_constraints
-from elspeth.web.composer.tools.blobs import _file_inject_node_option_error, _llm_authored_inline_prompt_surface_error
+from elspeth.web.composer.tools.blobs import (
+    _file_inject_node_option_error,
+    _llm_authored_inline_prompt_surface_error,
+    _structured_prompt_template_refusal,
+)
 from elspeth.web.composer.tools.declarations import (
+    EffectDomain,
     ToolDeclaration,
+    ToolEffects,
     ToolKind,
 )
+from elspeth.web.composer.tools.prompt_target_responses import (
+    PROMPT_TARGETS_RESPONSE_CONTRACT,
+    PromptTargetMetadata,
+    PromptTargetsResponse,
+)
+from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material_for_tool
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_TEMPLATE_PARTS_KEY,
@@ -731,6 +747,14 @@ def _execute_upsert_node(
         options=node_options,
         existing_options=existing_node.options if existing_node is not None else None,
     )
+    if plugin == "llm":
+        structured_error = _structured_prompt_template_refusal(
+            node_id, existing_node.options if existing_node is not None else {}, review_options
+        )
+        if structured_error is not None:
+            return _saved_graph_rejection_result(
+                state, structured_error, error_code="prompt_template_parts_required", rejected_component=node_ref
+            )
     canonical_error = _canonical_interpretation_requirement_error(
         review_options,
         tool_name="upsert_node",
@@ -1810,8 +1834,18 @@ def _execute_patch_node_options(
             category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         ) from exc
     node_id = validated.node_id
+    return _apply_guarded_node_option_patch(node_id, validated.patch, state, context)
+
+
+def _apply_guarded_node_option_patch(
+    node_id: str,
+    option_patch: Mapping[str, Any],
+    state: CompositionState,
+    context: ToolContext,
+) -> ToolResult:
+    """One guarded candidate builder for whole-option and exact-text edits."""
     node_ref = f"node:{node_id}"
-    patch: Mapping[str, Any] = validated.patch
+    patch = option_patch
     current = next((n for n in state.nodes if n.id == node_id), None)
     if current is None:
         return _saved_graph_rejection_result(
@@ -1840,17 +1874,11 @@ def _execute_patch_node_options(
         return _saved_graph_rejection_result(
             state, f"Node '{node_id}': {runtime_owned_error}", error_code=error_code, rejected_component=node_ref
         )
-    if (
-        current.plugin == "llm"
-        and current.options.get(PROMPT_TEMPLATE_PARTS_KEY) is not None
-        and "prompt_template" in patch
-        and patch["prompt_template"] != current.options.get("prompt_template")
-        and PROMPT_TEMPLATE_PARTS_KEY not in patch
-    ):
+    structured_error = _structured_prompt_template_refusal(node_id, current.options, patch) if current.plugin == "llm" else None
+    if structured_error is not None:
         return _saved_graph_rejection_result(
             state,
-            f"Node '{node_id}': edit prompt_template_parts to change this structured prompt, "
-            "preserving its interpretation_ref entries; prompt_template is compiled from those parts.",
+            structured_error,
             error_code="prompt_template_parts_required",
             rejected_component=node_ref,
         )
@@ -1952,12 +1980,14 @@ def _execute_patch_node_options(
         # Reconciliation invalidates inherited approval and renders structured
         # prompts. Verify the stored evidence first so an unrelated patch cannot
         # heal a corrupt digest, then validate the exact reconciled candidate.
-        if (
-            current.plugin == "llm"
-            and "approved_prompt_artifact_hash" in current.options
-            and current.options["approved_prompt_artifact_hash"] != approved_prompt_artifact_hash_from_options(current.options)
-        ):
-            raise ValueError("Stored approved_prompt_artifact_hash does not match the current prompt artifact")
+        # A file-backed prompt has no options-derivable digest (None): its
+        # stored hash is the reviewed file's effective artifact, which run
+        # admission re-derives from the file bytes and the approval row, and
+        # which execution materialization never trusts from options.
+        if current.plugin == "llm" and "approved_prompt_artifact_hash" in current.options:
+            recomputed_artifact_hash = approved_prompt_artifact_hash_from_options(current.options)
+            if recomputed_artifact_hash is not None and current.options["approved_prompt_artifact_hash"] != recomputed_artifact_hash:
+                raise ValueError("Stored approved_prompt_artifact_hash does not match the current prompt artifact")
         new_state = reconcile_authoritative_reviews(state, proposed_state)
     except (KeyError, TypeError, ValueError) as exc:
         return _saved_graph_rejection_result(
@@ -2029,6 +2059,296 @@ def _execute_patch_node_options(
         (node_id,),
         data=None if echo_note is None else {"server_owned_metadata_note": echo_note},
     )
+
+
+def _substring_refusal(state: CompositionState, message: str, code: str) -> ToolResult:
+    return _failure_result(state, message, error_code=code)
+
+
+def _utf8_bytes(value: str) -> bytes | None:
+    try:
+        return value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        return None
+
+
+def _apply_exact_substring_edits(text: str, edits: Sequence[Any]) -> tuple[str, int] | tuple[None, tuple[str, str]]:
+    """Build the complete result in memory; overlapping starts count for uniqueness."""
+    fragments = 0
+    total_replacements = 0
+    current = text
+    for index, edit in enumerate(edits, start=1):
+        old_bytes = _utf8_bytes(edit.old)
+        new_bytes = _utf8_bytes(edit.replacement)
+        if old_bytes is None or new_bytes is None:
+            return None, ("invalid_utf8", "Edit text must be valid UTF-8.")
+        fragments += len(old_bytes) + len(new_bytes)
+        if fragments > 65536:
+            return None, ("edit_too_large", "Edit fragments exceed the allowed byte limit.")
+        if not edit.old:
+            return None, ("empty_old", f"Edit {index} needs a non-empty old substring.")
+        if edit.replace_all:
+            count = current.count(edit.old)
+        else:
+            first = current.find(edit.old)
+            if first < 0:
+                count = 0
+            elif current.find(edit.old, first + 1) >= 0:
+                return None, (
+                    "substring_not_unique",
+                    f"Edit {index} matched more than one location; provide a longer exact substring or explicitly set replace_all.",
+                )
+            else:
+                count = 1
+        if count == 0:
+            return None, ("substring_not_found", f"Edit {index} matched no text.")
+        current_bytes = _utf8_bytes(current)
+        assert current_bytes is not None
+        if len(current_bytes) + count * (len(new_bytes) - len(old_bytes)) > 262144:
+            return None, ("edited_text_too_large", "Edited text exceeds the allowed byte limit.")
+        current = current.replace(edit.old, edit.replacement, count)
+        current_bytes = _utf8_bytes(current)
+        if current_bytes is None or len(current_bytes) > 262144:
+            return None, ("edited_text_too_large", "Edited text exceeds the allowed byte limit.")
+        total_replacements += count
+    return current, total_replacements
+
+
+def _execute_change_substring(args: dict[str, object], state: CompositionState, context: ToolContext) -> ToolResult:
+    try:
+        validated = ChangeSubstringArgumentsModel.model_validate(args)
+    except PydanticValidationError:
+        return _substring_refusal(state, "Invalid exact-edit arguments; inspect the target and retry.", "invalid_arguments")
+    target = validated.target
+    if target.kind == "blob":
+        return _substring_refusal(
+            state, "File text editing is not supported yet; edit an inline prompt or use update_blob.", "blob_substring_not_supported"
+        )
+    # Proposal acceptance already compares its captured base state ID with the
+    # current DB record under the COMPOSE lease. Recheck the selected text hash
+    # below as well; direct and preview calls receive the live state ID here.
+    if context.executing_proposal_id is None and (
+        context.current_state_id is None or validated.expected_state_id != context.current_state_id
+    ):
+        return _substring_refusal(state, "Text changed since inspection; inspect it and retry.", "target_changed")
+    node = next((item for item in state.nodes if item.id == target.node_id), None)
+    if node is None:
+        return _substring_refusal(state, "Node not found; inspect the pipeline and retry.", "node_not_found")
+    if node.plugin != "llm":
+        return _substring_refusal(state, "Select an LLM prompt text target.", "unsupported_target")
+    if target.kind == "node_option":
+        if target.option == "prompt_template" and node.options.get(PROMPT_TEMPLATE_PARTS_KEY) is not None:
+            return _substring_refusal(state, "This prompt has parts; select a text part.", "prompt_template_parts_required")
+        selected = node.options.get(target.option)
+    else:
+        parts = node.options.get(PROMPT_TEMPLATE_PARTS_KEY)
+        if not isinstance(parts, tuple | list) or target.part_index >= len(parts):
+            return _substring_refusal(state, "Prompt part not found; inspect the node and retry.", "part_not_found")
+        part = parts[target.part_index]
+        if not isinstance(part, Mapping):
+            return _substring_refusal(state, "Prompt part is invalid; inspect the node and retry.", "part_invalid")
+        if part.get("kind") != "text":
+            return _substring_refusal(state, "This target is an interpretation slot; select a text part.", "interpretation_slot")
+        selected = part.get("text")
+    if not isinstance(selected, str):
+        return _substring_refusal(state, "Select a text prompt target.", "unsupported_target")
+    selected_bytes = _utf8_bytes(selected)
+    if selected_bytes is None or len(selected_bytes) > 262144:
+        return _substring_refusal(state, "Target text is not valid UTF-8 within the allowed byte limit.", "invalid_target_text")
+    if sha256(selected_bytes).hexdigest() != validated.expected_sha256:
+        return _substring_refusal(state, "Text changed since inspection; inspect it and retry.", "target_changed")
+    edited = _apply_exact_substring_edits(selected, validated.edits)
+    if edited[0] is None:
+        error = edited[1]
+        return _substring_refusal(state, error[1], error[0])
+    new_text, replacement_count = edited
+    if target.kind == "node_option":
+        patch: dict[str, str] = {target.option: new_text}
+    else:
+        from elspeth.contracts.freeze import deep_thaw
+
+        updated_parts = deep_thaw(parts)
+        updated_parts[target.part_index]["text"] = new_text
+        patch = {PROMPT_TEMPLATE_PARTS_KEY: updated_parts}
+    try:
+        require_no_credential_material_for_tool(
+            "patch_node_options",
+            {"node_id": target.node_id, "patch": dict(patch)},
+            surface="composer_tool_arguments",
+            credential_state=state,
+        )
+    except CredentialMaterialRefused:
+        return _substring_refusal(state, "Edited prompt contains disallowed credential material.", "credential_material_rejected")
+    result = _apply_guarded_node_option_patch(target.node_id, patch, state, context)
+    if not result.success:
+        code = result.validation.errors[0].error_code if result.validation.errors else "node_options_invalid"
+        return _substring_refusal(
+            state, "Edited prompt did not pass node validation; inspect the node and retry.", code or "node_options_invalid"
+        )
+    raw = _utf8_bytes(new_text)
+    assert raw is not None
+    changed = new_text != selected
+    metadata = {
+        "target": target.model_dump(),
+        "changed": changed,
+        "replacement_count": replacement_count,
+        "length_chars": len(new_text),
+        "size_bytes": len(raw),
+        "sha256": sha256(raw).hexdigest(),
+    }
+    if not changed:
+        result = replace(result, updated_state=state, affected_nodes=())
+    return replace(result, data=metadata, applied_component=None)
+
+
+def _change_substring_effects(arguments: Mapping[str, Any]) -> ToolEffects:
+    target = arguments.get("target")
+    domains = (EffectDomain.GRAPH, EffectDomain.VALIDATION, EffectDomain.YAML, EffectDomain.INTERPRETATION)
+    if isinstance(target, Mapping) and target.get("kind") == "blob":
+        return ToolEffects(())
+    return ToolEffects(domains)
+
+
+def _inspect_prompt_targets(args: dict[str, object], state: CompositionState, context: ToolContext) -> ToolResult:
+    try:
+        validated = InspectPromptTargetsArgumentsModel.model_validate(args)
+    except PydanticValidationError:
+        return _substring_refusal(state, "Specify one node_id to inspect.", "invalid_arguments")
+    node_id = validated.node_id
+    node = next((item for item in state.nodes if item.id == node_id), None)
+    if node is None:
+        return _substring_refusal(state, "Node not found; inspect the pipeline and retry.", "node_not_found")
+    if node.plugin != "llm":
+        return _substring_refusal(state, "Select an LLM prompt text target.", "unsupported_target")
+    targets: list[PromptTargetMetadata] = []
+    for option in ("prompt_template", "system_prompt"):
+        if option == "prompt_template" and node.options.get(PROMPT_TEMPLATE_PARTS_KEY) is not None:
+            continue
+        value = node.options.get(option)
+        if isinstance(value, str):
+            raw = _utf8_bytes(value)
+            if raw is not None:
+                targets.append(
+                    PromptTargetMetadata.model_validate(
+                        {
+                            "target": {"kind": "node_option", "node_id": node_id, "option": option},
+                            "length_chars": len(value),
+                            "size_bytes": len(raw),
+                            "sha256": sha256(raw).hexdigest(),
+                        }
+                    )
+                )
+    parts = node.options.get(PROMPT_TEMPLATE_PARTS_KEY)
+    if isinstance(parts, tuple | list):
+        for index, part in enumerate(parts):
+            if isinstance(part, Mapping) and part.get("kind") == "text" and isinstance(part.get("text"), str):
+                value = part["text"]
+                raw = _utf8_bytes(value)
+                if raw is not None:
+                    targets.append(
+                        PromptTargetMetadata.model_validate(
+                            {
+                                "target": {"kind": "prompt_part", "node_id": node_id, "part_index": index},
+                                "length_chars": len(value),
+                                "size_bytes": len(raw),
+                                "sha256": sha256(raw).hexdigest(),
+                            }
+                        )
+                    )
+    response = PromptTargetsResponse(state_id=context.current_state_id, targets=tuple(targets))
+    return _discovery_result(
+        state,
+        {"state_id": response.state_id, "targets": [target.model_dump(mode="json") for target in response.targets]},
+    )
+
+
+_INSPECT_PROMPT_TARGETS_DECLARATION = ToolDeclaration(
+    name="inspect_prompt_targets",
+    handler=_inspect_prompt_targets,
+    kind=ToolKind.DISCOVERY,
+    response_contract=PROMPT_TARGETS_RESPONSE_CONTRACT,
+    description="Inspect an LLM node's inline prompt text targets. Result `state_id` is the inspected composition revision; `targets` lists text targets. In each entry, `target` identifies the prompt option or text part, `length_chars` counts characters, `size_bytes` counts UTF-8 bytes, and `sha256` hashes those bytes. No prompt text or interpretation slot values are returned.",
+    json_schema={
+        "type": "object",
+        "properties": {"node_id": {"type": "string", "description": "ID of the LLM node whose prompt text targets should be inspected."}},
+        "required": ["node_id"],
+        "additionalProperties": False,
+    },
+)
+
+
+_CHANGE_SUBSTRING_DECLARATION = ToolDeclaration(
+    name="change_substring",
+    handler=_execute_change_substring,
+    kind=ToolKind.MUTATION,
+    description="Change exact text in one LLM prompt target. Inspect the target hash and state ID first. Each old substring must match once, counting overlapping starts; replace_all replaces left to right without rematching inserted text. File targets are declared but not supported yet. Prompt review reopens after a change. Result `target` identifies the edited text, `changed` reports whether it differs, `replacement_count` counts replacements, `length_chars` and `size_bytes` measure the result, and `sha256` hashes it. Inspect in a later tool batch to obtain the committed revision ID.",
+    json_schema={
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "object",
+                "description": "One inline prompt text target, or a session file target (not supported yet).",
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"const": "node_option"},
+                            "node_id": {"type": "string"},
+                            "option": {"enum": ["prompt_template", "system_prompt"]},
+                        },
+                        "required": ["kind", "node_id", "option"],
+                        "additionalProperties": False,
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"const": "prompt_part"},
+                            "node_id": {"type": "string"},
+                            "part_index": {"type": "integer", "minimum": 0},
+                        },
+                        "required": ["kind", "node_id", "part_index"],
+                        "additionalProperties": False,
+                    },
+                    {
+                        "type": "object",
+                        "properties": {"kind": {"const": "blob"}, "blob_id": {"type": "string"}},
+                        "required": ["kind", "blob_id"],
+                        "additionalProperties": False,
+                    },
+                ],
+            },
+            "expected_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "SHA-256 of the selected text's UTF-8 bytes from inspection.",
+            },
+            "expected_state_id": {
+                "type": ["string", "null"],
+                "description": "Current composition state ID from inspection; required for inline targets.",
+            },
+            "edits": {
+                "type": "array",
+                "description": "One to 32 exact substring replacements, applied in order to this one target.",
+                "minItems": 1,
+                "maxItems": 32,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "old": {"type": "string", "minLength": 1, "description": "Non-empty exact old substring."},
+                        "replacement": {"type": "string"},
+                        "replace_all": {"type": "boolean"},
+                    },
+                    "required": ["old", "replacement", "replace_all"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["target", "expected_sha256", "expected_state_id", "edits"],
+        "additionalProperties": False,
+    },
+    argument_effects=_change_substring_effects,
+    augments_on_failure=True,
+)
 
 
 def _handle_patch_node_options(
@@ -2158,6 +2478,12 @@ def _prepare_transform_candidate(
         options=options,
         existing_options=existing_options,
     )
+    if plugin == "llm":
+        structured_error = _structured_prompt_template_refusal(node_id, existing_options or {}, review_options)
+        if structured_error is not None:
+            return _saved_graph_rejection_result(
+                state, structured_error, error_code="prompt_template_parts_required", rejected_component=node_ref
+            )
     canonical_error = _canonical_interpretation_requirement_error(
         review_options,
         tool_name=tool_name,
@@ -2384,6 +2710,8 @@ TOOLS_IN_MODULE: tuple[ToolDeclaration, ...] = (
     _REMOVE_EDGE_DECLARATION,
     _SET_METADATA_DECLARATION,
     _PATCH_NODE_OPTIONS_DECLARATION,
+    _INSPECT_PROMPT_TARGETS_DECLARATION,
+    _CHANGE_SUBSTRING_DECLARATION,
 )
 """Every tool declared in this module, in stable order.
 

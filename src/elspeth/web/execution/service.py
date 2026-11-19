@@ -43,6 +43,7 @@ from elspeth.config_loading import load_settings_from_config_dict, load_settings
 from elspeth.contracts.audit import SecretResolutionInput
 from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities
 from elspeth.contracts.aws_textract import TextractProfiledAuditIdentities
+from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionDecision, ChargeableAdmissionRefused, ChargeableOperation
 from elspeth.contracts.cli import ProgressEvent
@@ -53,6 +54,7 @@ from elspeth.contracts.hashing import CANONICAL_VERSION, stable_hash
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.contracts.plugin_semantics import SemanticOutcome, UnknownSemanticPolicy
+from elspeth.contracts.run_prompt_input import RunPromptInputEvidence
 from elspeth.contracts.run_start import RunStartPermitBinding
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
 from elspeth.contracts.secrets import WebSecretResolver
@@ -120,11 +122,14 @@ from elspeth.web.credential_guard import require_no_credential_material_in_state
 from elspeth.web.execution._semantic_helpers import semantic_affected_component_id
 from elspeth.web.execution._validation_materialization import (
     FILE_INJECT_PLUGIN,
+    _runtime_config_plugin_nodes,
+    _RuntimePluginNode,
     file_inject_admission_message,
     file_inject_blob_refusals,
     file_inject_runtime_config_refusals,
-    is_llm_authored_prompt_surface_binding,
+    llm_prompt_file_scalar_field,
     runtime_config_node_plugins,
+    unsupported_llm_prompt_file_refs,
 )
 from elspeth.web.execution.accounting import load_run_accounting_from_db
 from elspeth.web.execution.completion_gates import (
@@ -208,6 +213,13 @@ from elspeth.web.plugin_policy.validation import validate_plugin_policy
 from elspeth.web.provider_config_policy import web_llm_retry_budget_policy_error
 from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.sessions.converters import state_from_record
+from elspeth.web.sessions.prompt_file_review import (
+    PromptFileReviewStale,
+    PromptReviewSnapshot,
+    _surface_slots,
+    prompt_file_binding_paths,
+    resolve_prompt_review_snapshot,
+)
 from elspeth.web.sessions.protocol import (
     SESSION_TERMINAL_RUN_STATUS_VALUES,
     IllegalRunTransitionError,
@@ -1080,6 +1092,46 @@ def _load_most_recent_failed_node_id(landscape_db: LandscapeDB, *, run_id: str) 
     return None
 
 
+def _run_prompt_input_evidence(snapshots: tuple[PromptReviewSnapshot, ...]) -> tuple[RunPromptInputEvidence, ...]:
+    """Carry final admitted snapshot identities into run creation."""
+    return tuple(
+        RunPromptInputEvidence(
+            node_id=snapshot.node_id,
+            field_path=binding.field_path,
+            blob_id=str(binding.blob_id),
+            content_sha256=binding.content_sha256,
+            review_anchor=snapshot.anchor,
+            effective_artifact_hash=snapshot.effective_artifact_hash,
+        )
+        for snapshot in snapshots
+        for binding in snapshot.bindings
+    )
+
+
+def _bind_admitted_prompt_artifact_hashes(runtime_nodes: Sequence[_RuntimePluginNode], snapshots: tuple[PromptReviewSnapshot, ...]) -> None:
+    """Put each admitted snapshot's effective artifact hash on its LLM node, after substitution.
+
+    Materialization drops ``approved_prompt_artifact_hash`` for a file-backed
+    prompt (the option-only derivation cannot read a blob marker), and blob
+    substitution only inlines text, so without this the provider-call audit
+    rows record NULL. The value comes only from the admitted snapshot, never
+    from storage; ``LLMConfig`` re-derives it from the substituted text and
+    refuses a mismatch. ``runtime_nodes`` is ``_runtime_config_plugin_nodes``
+    of the substituted config: each carries the config's own option mapping,
+    so this binds in place.
+    """
+    for snapshot in snapshots:
+        if snapshot.effective_artifact_hash is None:
+            continue
+        nodes = [node for node in runtime_nodes if node.name == snapshot.node_id]
+        options = nodes[0].options if len(nodes) == 1 and nodes[0].plugin == "llm" else None
+        if type(options) is not dict:
+            raise AuditIntegrityError(f"admitted prompt node {snapshot.node_id!r} is not exactly one runtime llm node")
+        if "approved_prompt_artifact_hash" in options and options["approved_prompt_artifact_hash"] != snapshot.effective_artifact_hash:
+            raise AuditIntegrityError(f"runtime approved prompt artifact hash for {snapshot.node_id!r} differs from admitted evidence")
+        options["approved_prompt_artifact_hash"] = snapshot.effective_artifact_hash
+
+
 # B1 fix: RunAlreadyActiveError is NOT defined here — imported from
 # sessions.protocol where the canonical definition lives. Defining a
 # second class with the same name would prevent app.py's global
@@ -1236,6 +1288,57 @@ class ExecutionServiceImpl:
             user_id = "trained-operator"
         return self._plugin_snapshot_factory(user_id)
 
+    def _assert_state_prompt_file_approvals(
+        self,
+        state: CompositionState,
+        *,
+        session_id: UUID,
+        session_operation_context: SessionOperationContext,
+        admitted_contents: Mapping[UUID, bytes] | None = None,
+        admitted_records: Mapping[UUID, BlobRecord] | None = None,
+    ) -> tuple[PromptReviewSnapshot, ...]:
+        """Derive current bytes once per bound blob and compare approved evidence."""
+        blob_service = self._blob_service
+        if blob_service is None:
+            if any(node.plugin == "llm" and prompt_file_binding_paths(node.options) for node in state.nodes):
+                raise PromptFileReviewStale()
+            return ()
+        cached: dict[UUID, tuple[BlobRecord, bytes]] = {}
+
+        snapshots: list[PromptReviewSnapshot] = []
+        for node in state.nodes:
+            if node.plugin != "llm" or not prompt_file_binding_paths(node.options):
+                continue
+            try:
+                for _path, value in _surface_slots(node.options):
+                    marker = is_widened_blob_ref(deep_thaw(value))
+                    if marker is None or marker.mode != "inline_content" or marker.blob_id in cached:
+                        continue
+                    blob_id = marker.blob_id
+                    if admitted_contents is not None and admitted_records is not None:
+                        if blob_id not in admitted_contents or blob_id not in admitted_records:
+                            raise PromptFileReviewStale()
+                        cached[blob_id] = admitted_records[blob_id], admitted_contents[blob_id]
+                    else:
+                        record = self._call_async(blob_service.get_blob(blob_id, session_operation_context=session_operation_context))
+                        content = self._call_async(
+                            blob_service.read_blob_content(blob_id, session_operation_context=session_operation_context)
+                        )
+                        cached[blob_id] = record, content
+                snapshot = resolve_prompt_review_snapshot(
+                    session_id=session_id,
+                    node_id=node.id,
+                    options=node.options,
+                    read_blob=cached.__getitem__,
+                )
+                if snapshot is None:
+                    raise PromptFileReviewStale()
+                self._call_async(self._session_service.assert_prompt_file_approvals(snapshot))
+            except PromptFileReviewStale as exc:
+                raise PromptFileReviewStale(node_id=node.id) from exc
+            snapshots.append(snapshot)
+        return tuple(snapshots)
+
     def _approval_inputs_from_frozen(
         self,
         frozen: FrozenRunSettings,
@@ -1243,12 +1346,18 @@ class ExecutionServiceImpl:
         user_id: str,
         session_id: UUID,
         session_operation_context: SessionOperationContext,
+        state_id: UUID,
     ) -> ApprovalGateInputs:
         """Compile the approval tuple from the same frozen inputs used by a run.
 
         This path deliberately applies the operator's telemetry and export
         settings before hashing. Those settings also enter the Landscape run
         config; the authored settings alone are not the run's config.
+
+        ``state_id`` names the revision ``frozen`` was compiled from (never the
+        session head): prompt-file approvals are asserted on it, with the bytes
+        read here, and its admitted snapshots supply the approved prompt
+        artifact hashes the worker binds the same way, so the config hashes agree.
         """
         from elspeth.core.secrets import resolve_secret_refs
         from elspeth.web.execution.export_marking import apply_operator_export_marking, operator_marked_config_dict
@@ -1257,6 +1366,7 @@ class ExecutionServiceImpl:
         catalog_sha = self._openrouter_catalog_sha256
         if catalog_sha is None:
             raise RuntimeError("ExecutionServiceImpl has no OpenRouter catalog snapshot")
+        state = state_from_record(self._call_async(self._session_service.get_state_in_session(state_id, session_id)))
         executable_config = cast(dict[str, Any], deep_thaw(frozen.executable_config))
         # Durable execution replaces path sources with content-addressed retained
         # paths. Predict that exact path without creating a retained copy while
@@ -1289,11 +1399,12 @@ class ExecutionServiceImpl:
         if file_inject_refusals:
             raise InlineBlobPromptSurfaceAdmissionError(file_inject_admission_message(file_inject_refusals))
         inline_refs = _discover_blob_content_refs(executable_config)
+        records_by_id: dict[UUID, BlobRecord] = {}
+        contents: dict[UUID, bytes] = {}
         if inline_refs:
             blob_service = self._blob_service
             if blob_service is None:
                 raise RuntimeError("Inline blob approval compilation requires the blob service")
-            records_by_id: dict[UUID, BlobRecord] = {}
             for ref in inline_refs:
                 if ref.blob_id in records_by_id:
                     continue
@@ -1301,35 +1412,36 @@ class ExecutionServiceImpl:
                 if record.session_id != session_id:
                     raise BlobNotFoundError(str(ref.blob_id))
                 records_by_id[ref.blob_id] = record
+            node_plugins = runtime_config_node_plugins(executable_config)
+            if unsupported := unsupported_llm_prompt_file_refs(inline_refs, node_plugins=node_plugins):
+                raise InlineBlobPromptSurfaceAdmissionError(
+                    "File-backed prompt binding is unsupported at " + ", ".join(ref.field_path for ref in unsupported)
+                )
+            prompt_blob_ids = {
+                ref.blob_id
+                for ref in inline_refs
+                if (surface := llm_prompt_file_scalar_field(ref.field_path)) is not None and node_plugins.get(surface[0]) == "llm"
+            }
+            if any(records_by_id[ref.blob_id].content_hash != ref.sha256 for ref in inline_refs if ref.blob_id in prompt_blob_ids):
+                raise PromptFileReviewStale()
             _enforce_blob_content_ref_metadata(
                 inline_refs,
                 records_by_id,
                 per_ref_byte_cap=BLOB_INLINE_PER_REF_BYTE_CAP,
                 aggregate_byte_cap=BLOB_INLINE_AGGREGATE_BYTE_CAP,
             )
-            node_plugins = runtime_config_node_plugins(executable_config)
-            refused_prompt_refs = [
-                ref
-                for ref in inline_refs
-                if is_llm_authored_prompt_surface_binding(
-                    ref.field_path,
-                    node_plugins=node_plugins,
-                    creation_modality=records_by_id[ref.blob_id].creation_modality,
-                )
-            ]
             file_inject_blob_refs = file_inject_blob_refusals(inline_refs, records_by_id, node_plugins=node_plugins)
             if file_inject_blob_refs:
                 raise InlineBlobPromptSurfaceAdmissionError(file_inject_admission_message(file_inject_blob_refs))
-            if refused_prompt_refs:
-                bound = ", ".join(f"{ref.field_path} (blob {ref.blob_id})" for ref in refused_prompt_refs)
-                raise InlineBlobPromptSurfaceAdmissionError(
-                    f"{bound} binds LLM-authored blob content into an llm prompt surface; inline prompt, "
-                    "system prompt, query template and model content admits only user-verbatim blobs"
-                )
-            contents = {
-                blob_id: self._call_async(blob_service.read_blob_content(blob_id, session_operation_context=session_operation_context))
-                for blob_id in records_by_id
-            }
+            for blob_id in records_by_id:
+                try:
+                    contents[blob_id] = self._call_async(
+                        blob_service.read_blob_content(blob_id, session_operation_context=session_operation_context)
+                    )
+                except BlobIntegrityError as exc:
+                    if blob_id in prompt_blob_ids:
+                        raise PromptFileReviewStale() from exc
+                    raise
             executable_config, _ = _substitute_blob_content_refs(
                 executable_config,
                 {ref: contents[ref.blob_id] for ref in inline_refs},
@@ -1338,6 +1450,16 @@ class ExecutionServiceImpl:
                     blob_id: (cast(AllowedMimeType, record.mime_type), record.size_bytes) for blob_id, record in records_by_id.items()
                 },
             )
+        # Approvals of the frozen revision, over exactly the bytes read above (a
+        # prompt file this config does not reference refuses as stale).
+        prompt_snapshots = self._assert_state_prompt_file_approvals(
+            state,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+            admitted_contents=contents,
+            admitted_records=records_by_id,
+        )
+        _bind_admitted_prompt_artifact_hashes(_runtime_config_plugin_nodes(executable_config), prompt_snapshots)
         settings = load_settings_from_config_dict(operator_marked_config_dict(executable_config, self._settings), expand_env_vars=False)
         settings = apply_operator_pipeline_telemetry(settings, self._settings)
         effective_export = apply_operator_export_marking(settings.landscape.export, self._settings)
@@ -1438,6 +1560,7 @@ class ExecutionServiceImpl:
             user_id=user_id,
             session_id=session_id,
             session_operation_context=session_operation_context,
+            state_id=record.id,
         )
         return inputs.binding
 
@@ -1643,6 +1766,44 @@ class ExecutionServiceImpl:
         )
         if not result.is_valid:
             return result
+
+        if session_id is not None:
+            try:
+                self._assert_state_prompt_file_approvals(
+                    state,
+                    session_id=session_id,
+                    session_operation_context=session_operation_context,
+                )
+            except PromptFileReviewStale as exc:
+                error = ValidationError(
+                    component_id=None,
+                    component_type="transform",
+                    message=str(exc),
+                    suggestion="Review the current prompt file card.",
+                    error_code=exc.error_code,
+                )
+                blocker = ValidationReadinessBlocker(
+                    code=exc.error_code,
+                    component_id=None,
+                    component_type="transform",
+                    detail=str(exc),
+                    suggestion="Review the current prompt file card.",
+                    note=None,
+                )
+                readiness = result.readiness.model_copy(
+                    update={
+                        "execution_ready": False,
+                        "completion_ready": False,
+                        "blockers": [*result.readiness.blockers, blocker],
+                    }
+                )
+                return result.model_copy(
+                    update={
+                        "is_valid": False,
+                        "errors": [*result.errors, error],
+                        "readiness": readiness,
+                    }
+                )
 
         diagnostics = compute_proof_diagnostics(
             state,
@@ -2687,6 +2848,7 @@ class ExecutionServiceImpl:
                 user_id=user_id,
                 session_id=session_id,
                 session_operation_context=session_operation_context,
+                state_id=state_record.id,
             )
             reason = await self._session_service.check_approval_binding(
                 session_id,
@@ -2710,6 +2872,7 @@ class ExecutionServiceImpl:
                 user_id=user_id,
                 session_id=session_id,
                 session_operation_context=session_operation_context,
+                state_id=state_record.id,
             )
             reason = await self._session_service.check_approval_binding(
                 session_id,
@@ -2860,6 +3023,7 @@ class ExecutionServiceImpl:
                 user_id=session.user_id,
                 session_id=run.session_id,
                 session_operation_context=session_operation_lease.context,
+                state_id=run.state_id,
             )
         if approval_inputs is None:
             permit = await self._session_service.assess_run_start_admission(
@@ -3372,7 +3536,11 @@ class ExecutionServiceImpl:
                 blob_reads, session_id=session_id, session_operation_context=session_operation_context
             )
 
-        if fresh or _state_has_secret_ref_sites(state, env_ref_names):
+        if (
+            fresh
+            or _state_has_secret_ref_sites(state, env_ref_names)
+            or any(node.plugin == "llm" and prompt_file_binding_paths(node.options) for node in state.nodes)
+        ):
             result = await _compute(None)
         else:
             result = await self._validation_memo.get_or_compute(
@@ -3507,6 +3675,7 @@ class ExecutionServiceImpl:
         run_start_permit: RunStartPermitBinding | None = None
         admission_decision: ChargeableAdmissionDecision | None = None
         admission_refusal_pending = False
+        prompt_snapshots: tuple[PromptReviewSnapshot, ...] = ()
         outputs_finalized = False
         terminal_event_persisted = False
         try:
@@ -3522,6 +3691,7 @@ class ExecutionServiceImpl:
                     user_id=user_id,
                     session_id=approval_run.session_id,
                     session_operation_context=session_operation_context,
+                    state_id=approval_run.state_id,
                 )
             if durable_admission and restored_envelope is None:
                 admitted_run = self._call_async(self._session_service.get_run(run_uuid))
@@ -3842,48 +4012,65 @@ class ExecutionServiceImpl:
                         records_by_blob_id: dict[UUID, BlobRecord] = {
                             blob_id: cast(BlobRecord, record) for blob_id, record in zip(unique_blob_ids, metadata_records, strict=True)
                         }
+                        node_plugins = runtime_config_node_plugins(resolved_dict)
+                        if unsupported := unsupported_llm_prompt_file_refs(inline_refs, node_plugins=node_plugins):
+                            raise InlineBlobPromptSurfaceAdmissionError(
+                                "File-backed prompt binding is unsupported at " + ", ".join(ref.field_path for ref in unsupported)
+                            )
+                        prompt_blob_ids = {
+                            ref.blob_id
+                            for ref in inline_refs
+                            if (surface := llm_prompt_file_scalar_field(ref.field_path)) is not None
+                            and node_plugins.get(surface[0]) == "llm"
+                        }
+                        if any(
+                            records_by_blob_id[ref.blob_id] is None or records_by_blob_id[ref.blob_id].content_hash != ref.sha256
+                            for ref in inline_refs
+                            if ref.blob_id in prompt_blob_ids
+                        ):
+                            raise PromptFileReviewStale()
                         _enforce_blob_content_ref_metadata(
                             inline_refs,
                             records_by_blob_id,
                             per_ref_byte_cap=BLOB_INLINE_PER_REF_BYTE_CAP,
                             aggregate_byte_cap=BLOB_INLINE_AGGREGATE_BYTE_CAP,
                         )
-                        # Modality is checked at ADMISSION, as the blob_rows arm
-                        # below does: the prompt-template and model-choice reviews
-                        # read those options as strings, so an inline_content
-                        # marker there opens no review site, and substituting an
-                        # LLM-authored blob would make planner-written text the
-                        # executed prompt (or model) with no human review. Fail
-                        # closed before any link or read.
-                        node_plugins = runtime_config_node_plugins(resolved_dict)
-                        llm_authored_prompt_refs = [
-                            ref
-                            for ref in inline_refs
-                            if is_llm_authored_prompt_surface_binding(
-                                ref.field_path,
-                                node_plugins=node_plugins,
-                                creation_modality=records_by_blob_id[ref.blob_id].creation_modality,
-                            )
-                        ]
                         file_inject_blob_refs = file_inject_blob_refusals(inline_refs, records_by_blob_id, node_plugins=node_plugins)
                         if file_inject_blob_refs:
                             raise InlineBlobPromptSurfaceAdmissionError(file_inject_admission_message(file_inject_blob_refs))
-                        if llm_authored_prompt_refs:
-                            bound = ", ".join(f"{ref.field_path} (blob {ref.blob_id})" for ref in llm_authored_prompt_refs)
-                            raise InlineBlobPromptSurfaceAdmissionError(
-                                f"{bound} binds LLM-authored blob content into an llm prompt surface; inline prompt, "
-                                "system prompt, query template and model content admits only user-verbatim blobs — "
-                                "write the reviewed text into the option instead so its review is staged"
-                            )
                         self._call_async(_link_inline_blobs_to_run())
 
                         async def _read_inline_blob_contents() -> dict[Any, bytes]:
                             async def _read_one(blob_id: UUID) -> bytes:
                                 await run_sync_in_worker(session_operation_lease.guard_external_effect)
-                                if restored_envelope is not None:
-                                    item = next(item for item in restored_envelope.blob_inputs if item.reference.blob_id == blob_id)
-                                    return await run_sync_in_worker(read_retained_input, item.retained)
-                                return await blob_service.read_blob_content(blob_id, session_operation_context=session_operation_context)
+                                try:
+                                    if restored_envelope is not None:
+                                        item = next(item for item in restored_envelope.blob_inputs if item.reference.blob_id == blob_id)
+                                        return await run_sync_in_worker(read_retained_input, item.retained)
+                                    return await blob_service.read_blob_content(
+                                        blob_id, session_operation_context=session_operation_context
+                                    )
+                                except BlobIntegrityError as exc:
+                                    if blob_id not in prompt_blob_ids:
+                                        raise
+                                    # A prompt save racing admission (record read at
+                                    # hash X, bytes already Y) is stale review; bytes
+                                    # disagreeing with an unchanged record are
+                                    # corruption. Re-read the record through the same
+                                    # session-scoped read to tell them apart. Both
+                                    # refuse; only corruption reaches the outer
+                                    # zero-threshold counter (it counts exactly once).
+                                    try:
+                                        current = await _get_blob_scoped(blob_id)
+                                    except SessionOperationFenceLost:
+                                        # Authority loss is not corruption: it keeps
+                                        # its dedicated handler (no finalization).
+                                        raise
+                                    except Exception as reread_exc:
+                                        raise exc from reread_exc
+                                    if current.content_hash != records_by_blob_id[blob_id].content_hash:
+                                        raise PromptFileReviewStale() from exc
+                                    raise
 
                             results = await asyncio.gather(
                                 *(_read_one(blob_id) for blob_id in unique_blob_ids),
@@ -3892,6 +4079,26 @@ class ExecutionServiceImpl:
                             return _resolve_blob_content_results(inline_refs, unique_blob_ids, results)
 
                         fetched = self._call_async(_read_inline_blob_contents())
+                        admitted_by_blob = {ref.blob_id: fetched[ref] for ref in inline_refs}
+                        # A prompt-file review exists only for an LLM scalar
+                        # prompt slot. Unknown node identities still read the
+                        # state so an incomplete config cannot skip admission.
+                        prompt_state_needed = bool(prompt_blob_ids) or any(
+                            (surface := llm_prompt_file_scalar_field(ref.field_path)) is not None and surface[0] not in node_plugins
+                            for ref in inline_refs
+                        )
+                        if prompt_state_needed:
+                            admitted_run = self._call_async(self._session_service.get_run(run_uuid))
+                            admitted_state = self._call_async(
+                                self._session_service.get_state_in_session(admitted_run.state_id, admitted_run.session_id)
+                            )
+                            prompt_snapshots = self._assert_state_prompt_file_approvals(
+                                state_from_record(admitted_state),
+                                session_id=admitted_run.session_id,
+                                session_operation_context=session_operation_context,
+                                admitted_contents=admitted_by_blob,
+                                admitted_records=records_by_blob_id,
+                            )
                         blob_metadata: dict[UUID, tuple[AllowedMimeType, int]] = {
                             blob_id: (cast(AllowedMimeType, record.mime_type), record.size_bytes)
                             for blob_id, record in zip(unique_blob_ids, metadata_records, strict=True)
@@ -3902,6 +4109,7 @@ class ExecutionServiceImpl:
                             refs=inline_refs,
                             blob_metadata=blob_metadata,
                         )
+                        _bind_admitted_prompt_artifact_hashes(_runtime_config_plugin_nodes(resolved_dict), prompt_snapshots)
                     except BlobIntegrityError:
                         _BLOB_INLINE_HASH_MISMATCH_TOTAL.add(1)
                         raise
@@ -4334,6 +4542,11 @@ class ExecutionServiceImpl:
                     resume_point = recovery.get_resume_point(run_id, graph)
                     if resume_point is None:
                         raise _RunRecoveryRequired(RecoveryRequiredReason.COMPATIBILITY_MISMATCH)
+                    # The resumed rows must use exactly the prompt files the run
+                    # recorded when it started; a re-approval since then refuses.
+                    RecorderFactory(landscape_db).run_lifecycle.assert_resumed_run_prompt_inputs(
+                        run_id, _run_prompt_input_evidence(prompt_snapshots)
+                    )
                     result = orchestrator.resume(
                         resume_point,
                         pipeline_config,
@@ -4369,6 +4582,7 @@ class ExecutionServiceImpl:
                             else _build_web_plugin_policy_evidence(snapshot=plugin_snapshot, policy=self._web_plugin_policy),
                             admission_decision=admission_decision,
                         ),
+                        run_prompt_inputs=_run_prompt_input_evidence(prompt_snapshots),
                         check_coordination_latch=session_operation_lease.guard_external_effect,
                         pre_effect_guard=session_operation_lease.guard_external_effect,
                         run_start_permit=run_start_permit,

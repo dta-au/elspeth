@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
+from fastapi.routing import APIRoute
 from sqlalchemy import select
 
 from elspeth.contracts import CallStatus, CallType, NodeType
@@ -539,6 +540,125 @@ async def test_pending_interpretation_reviews_block_tutorial_run_as_coded_409(tm
     assert detail["code"] == "tutorial_interpretations_pending"
     assert "review" in detail["detail"].lower()
     assert "SENTINEL_NODE_ID" not in repr(detail)
+
+
+@pytest.mark.asyncio
+async def test_tutorial_route_projects_real_pdf_validation_as_422(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, projection_execution: None
+) -> None:
+    from elspeth.contracts.enums import CreationModality
+    from elspeth.web.composer import tutorial_run_routes
+    from elspeth.web.composer import yaml_generator as composer_yaml_generator
+    from elspeth.web.composer.tutorial_models import TutorialRunRequest
+    from elspeth.web.execution import routes as execution_routes
+    from elspeth.web.execution.errors import PipelineValidationError
+    from elspeth.web.execution.validation import validate_pipeline_for_trained_operator
+    from tests.unit.web.execution.test_inline_blob_prompt_surface_readiness import _BLOB_ID, _SESSION_ID, _record, _state
+
+    state = _state(tmp_path, "prompt_template")
+    record = replace(_record(CreationModality.VERBATIM), mime_type="application/pdf")
+    result = validate_pipeline_for_trained_operator(
+        state,
+        SimpleNamespace(data_dir=tmp_path),
+        composer_yaml_generator,
+        blob_get_metadata=lambda blob_id: record if blob_id == _BLOB_ID else None,
+        blob_get_content=lambda _blob_id: (_ for _ in ()).throw(AssertionError("PDF content read")),
+        session_id=str(_SESSION_ID),
+    )
+    assert "inline_blob_not_text" in {error.error_code for error in result.errors}
+    validation_error = PipelineValidationError(errors=tuple(result.errors), readiness=result.readiness)
+
+    class FakeExecutionService:
+        async def execute(self, _session_id: Any, _state_id: Any = None, **_kwargs: Any) -> Any:
+            raise validation_error
+
+    session_service = SimpleNamespace(
+        session_operation_authority=RecordingSessionOperationAuthority(),
+        session_operation_owner_instance_id="tutorial-test-owner",
+        session_operation_lease_seconds=60,
+    )
+    settings = _make_tutorial_settings(tmp_path)
+
+    async def run_pipeline(*, request: Any, user: Any, session_id: str) -> Any:
+        return await tutorial_service_module._run_live_tutorial(
+            request=request,
+            user=user,
+            session_id=uuid4(),
+            state_id=uuid4(),
+            settings=settings,
+            session_service=session_service,
+        )
+
+    monkeypatch.setattr(tutorial_run_routes, "run_tutorial_pipeline", run_pipeline)
+    execution_service = FakeExecutionService()
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            execution_service=execution_service,
+            execution_lease_release_registry=None,
+            settings=settings,
+        )
+    )
+    route = next(
+        route
+        for route in tutorial_run_routes.create_tutorial_run_router().routes
+        if isinstance(route, APIRoute) and route.path == "/api/tutorial/run"
+    )
+    response: HTTPException | None = None
+    try:
+        await route.endpoint(
+            body=TutorialRunRequest(session_id=uuid4()),
+            request=SimpleNamespace(app=app),
+            user=SimpleNamespace(user_id="tutorial-user"),
+            rate_limiter=SimpleNamespace(check=lambda _user_id: _async_noop()),
+        )
+    except HTTPException as exc:
+        response = exc
+    except PipelineValidationError:
+        response = None
+
+    async def verify_ownership(*_args: Any) -> None:
+        return None
+
+    async def acquire_lease(*_args: Any, **_kwargs: Any) -> tuple[Any, Any]:
+        obligation = SimpleNamespace(completion_required=False, assert_business_dispatch=lambda _context: None)
+        return obligation, SimpleNamespace(context=object())
+
+    async def close_lease(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(execution_routes, "verify_session_ownership", verify_ownership)
+    monkeypatch.setattr(execution_routes, "acquire_execute_lease", acquire_lease)
+    monkeypatch.setattr(execution_routes, "_close_execute_lease_before_transfer", close_lease)
+    execute_route = next(
+        route
+        for route in execution_routes.create_execution_router().routes
+        if isinstance(route, APIRoute) and route.path == "/api/sessions/{session_id}/execute"
+    )
+    ordinary_response: HTTPException | None = None
+    try:
+        await execute_route.endpoint(
+            session_id=uuid4(),
+            request=SimpleNamespace(app=app),
+            user=SimpleNamespace(user_id="tutorial-user"),
+            state_id=None,
+            execute_request=None,
+            service=execution_service,
+            session_service=session_service,
+        )
+    except HTTPException as exc:
+        ordinary_response = exc
+    assert response is not None, "tutorial route did not project the validation failure"
+    assert ordinary_response is not None, "ordinary execute route did not project the validation failure"
+    assert response.status_code == ordinary_response.status_code == 422
+    assert response.detail == ordinary_response.detail
+    detail: Any = response.detail
+    assert isinstance(detail, dict)
+    assert detail["errors"][0]["error_code"] == "inline_blob_not_text"
+    assert detail["errors"][0]["suggestion"]
+
+
+async def _async_noop() -> None:
+    return None
 
 
 @pytest.mark.asyncio

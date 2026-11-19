@@ -97,6 +97,7 @@ from elspeth.web.composer.context_budget import (
     SheddableSegment,
     decide_context_budget,
     escaped_bytes,
+    protected_reference_bytes,
 )
 from elspeth.web.composer.context_budget_apply import (
     CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
@@ -111,7 +112,7 @@ from elspeth.web.composer.context_budget_apply import (
     stubbed_tool_message,
     tool_result_segments,
 )
-from elspeth.web.composer.context_budget_history import ContextBudgetHistory
+from elspeth.web.composer.context_budget_history import ContextBudgetHistory, request_anchor
 from elspeth.web.composer.diagnostic_evidence import diagnostic_evidence_identity
 from elspeth.web.composer.discovery_cache import serialize_tool_result, tool_result_content_parts
 from elspeth.web.composer.discovery_response import (
@@ -3420,6 +3421,20 @@ def _planner_context_budget_exhausted(ceiling: Literal["tokens", "bytes"], compo
     )
 
 
+def _planner_mutable_positions(
+    tool_positions: Mapping[str, list[int]],
+    history_index_by_key: Mapping[str, int],
+    hatch_index_by_key: Mapping[str, int],
+    hatch_transcript_index: int | None,
+) -> set[int]:
+    positions = {index for result_positions in tool_positions.values() for index in result_positions}
+    if history_index_by_key:
+        positions.add(_PLANNER_REQUEST_INDEX)
+    if hatch_index_by_key and hatch_transcript_index is not None:
+        positions.add(hatch_transcript_index)
+    return positions
+
+
 def _fit_planner_context_budget(
     *,
     messages: list[dict[str, Any]],
@@ -3432,6 +3447,8 @@ def _fit_planner_context_budget(
     model: str,
     earlier_calls: Sequence[ComposerLLMCall],
     mark_for_cache: bool,
+    dialect: ToolContractDialect | None = None,
+    shipped_skill_bytes: int = 0,
 ) -> tuple[list[dict[str, Any]], ComposerContextBudgetRecord]:
     """Label the planner request's sheddable segments, decide, and apply the decision to a copy of ``messages``.
 
@@ -3444,8 +3461,8 @@ def _fit_planner_context_budget(
     exceeds a ceiling.
 
     ``model`` is the model this call requests (the planner's, or the escape
-    hatch's on a hatch turn); the bytes-per-token ratio is the one the
-    session measured on that model, when it has one.
+    hatch's on a hatch turn); only a same-model, same-dialect live call can
+    supply a provider-count anchor. Stored ratios are not admission inputs.
 
     The decision is fed the request as it will be sent and checked: cache
     markers applied when ``mark_for_cache``, prompt-guard keys detached,
@@ -3454,7 +3471,7 @@ def _fit_planner_context_budget(
     arguments, thinking blocks and tool definitions), plus the omission
     allowance when history may be shed and the transcript gap allowance when
     transcript events may be shed. Token estimates use the same measure, with
-    a ratio calibrated on it. Segment savings are what each segment occupies
+    provider anchoring for unchanged protected messages. Segment savings are what each segment occupies
     on the wire, escapes included, never more than removing it saves, so a
     request the decision admits passes the final check while anything remains
     sheddable.
@@ -3524,13 +3541,35 @@ def _fit_planner_context_budget(
         CONTEXT_BUDGET_TRANSCRIPT_GAP_ALLOWANCE_BYTES if hatch_segments else 0
     )
     scratch_messages, scratch_tools = apply_anthropic_cache_markers(messages, tools) if mark_for_cache else (messages, tools)
-
+    mutable_positions = _planner_mutable_positions(tool_positions, history_index_by_key, hatch_index_by_key, hatch_transcript_index)
+    segment_positions = {
+        **{key: {_PLANNER_REQUEST_INDEX} for key in history_index_by_key},
+        **{key: set(positions) for key, positions in tool_positions.items()},
+        **({key: {hatch_transcript_index} for key in hatch_index_by_key} if hatch_transcript_index is not None else {}),
+    }
+    if any(not segment_positions.get(segment.key) or not segment_positions[segment.key] <= mutable_positions for segment in segments):
+        raise FrameworkBugError("context-budget sheddable segment is outside mutable messages")
+    anchor = request_anchor(
+        calls=earlier_calls,
+        model=model,
+        dialect=dialect,
+        messages=scratch_messages,
+        tools=scratch_tools,
+        mutable_positions=frozenset(mutable_positions),
+    )
     try:
         decision = decide_context_budget(
             policy=policy,
             request_bytes=request_wire_bytes(scratch_messages, scratch_tools if scratch_tools is not None else tools) + omission_allowance,
             segments=segments,
-            bytes_per_token=history.ratio_for(model),
+            anchor_tokens=anchor.tokens,
+            anchor_shared_bytes=anchor.shared_bytes,
+            anchor_wire_bytes=anchor.wire_bytes,
+            anchor_authored_bytes=anchor.authored_bytes,
+            anchor_status=anchor.reason,
+            authored_bytes=shipped_skill_bytes
+            + (message_wire_split([], scratch_tools).tools_bytes or 0)
+            + protected_reference_bytes(scratch_messages, excluded_positions=frozenset({0, *mutable_positions})),
             previously_shed=previously_shed_keys(history, earlier_calls),
             held=held_tool_keys(earlier_calls),
         )
@@ -3548,13 +3587,28 @@ def _fit_planner_context_budget(
         ) from refusal
     record = ComposerContextBudgetRecord.from_shed_keys(
         policy_hash=decision.policy_hash,
-        bytes_per_token=decision.bytes_per_token,
+        bytes_per_token=(policy.fallback_bytes_per_token if decision.pricing.mode == "authored_prefix" else 1.0),
         estimated_tokens_before=decision.estimated_tokens_before,
         estimated_tokens_after=decision.estimated_tokens_after,
         request_wire_bytes=decision.request_bytes_after,
-        shed_keys=decision.shed_keys,
+        # A hatch without conversation context made no history release
+        # decision. Carry its prior history state through the call record.
+        shed_keys=decision.shed_keys
+        + (tuple(sorted(history.shed_history_after(earlier_calls))) if request_conversation_context is None else ()),
     )
     shed = frozenset(decision.shed_keys)
+    record = replace(
+        record,
+        pricing_mode=decision.pricing.mode,
+        authored_bytes=decision.pricing.authored_bytes,
+        authored_refuted=decision.pricing.authored_refuted,
+        anchor_status=anchor.reason,
+        anchor_prompt_tokens=anchor.tokens,
+        anchor_wire_bytes=anchor.wire_bytes,
+        anchor_shared_bytes=anchor.shared_bytes,
+        decision_wire_bytes=decision.request_bytes_before,
+        decision_wire_bytes_after=decision.request_bytes_after,
+    )
     applied = list(messages)
     # History keys exist only when the request carries a conversation context.
     shed_history = frozenset(index for key, index in history_index_by_key.items() if key in shed)
@@ -3590,6 +3644,7 @@ async def plan_pipeline(
     base: ProposalBase,
     model_config: PlannerModelConfig,
     rendered_skill: str,
+    shipped_skill_bytes: int = 0,
     repair_budget: int,
     budget_policy: PlannerBudgetPolicy,
     context_policy: ContextBudgetPolicy,
@@ -3674,6 +3729,7 @@ async def plan_pipeline(
                 base=base,
                 model_config=model_config,
                 rendered_skill=rendered_skill,
+                shipped_skill_bytes=shipped_skill_bytes,
                 repair_budget=repair_budget,
                 budget_policy=budget_policy,
                 context_policy=context_policy,
@@ -3759,6 +3815,7 @@ async def _plan_pipeline_inner(
     base: ProposalBase,
     model_config: PlannerModelConfig,
     rendered_skill: str,
+    shipped_skill_bytes: int = 0,
     repair_budget: int,
     budget_policy: PlannerBudgetPolicy,
     context_policy: ContextBudgetPolicy,
@@ -3989,6 +4046,8 @@ async def _plan_pipeline_inner(
             model=effective_model,
             earlier_calls=recorder.llm_calls,
             mark_for_cache=supports_anthropic_prompt_cache_markers(effective_model),
+            dialect=effective_dialect,
+            shipped_skill_bytes=shipped_skill_bytes,
         )
         cache_marked_messages, cache_marked_tools = (
             apply_anthropic_cache_markers(budget_messages, active_tools)
@@ -4031,7 +4090,7 @@ async def _plan_pipeline_inner(
         # so it is reached only when the planner's byte budget is set below
         # the context budget's ceiling.
         request_size = _planner_request_size(marked_messages, marked_tools)
-        # The exact wire bytes of the request sent, where a later call's bytes-per-token ratio is read from.
+        # The exact wire bytes of the request sent, retained in the audit record.
         context_budget = replace(context_budget, request_wire_bytes=request_size)
         if request_size > budget_policy.max_request_bytes:
             raise PipelinePlannerError("planner request byte budget exhausted", code="REQUEST_BYTES_EXHAUSTED")

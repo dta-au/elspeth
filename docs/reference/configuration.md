@@ -2870,7 +2870,29 @@ Concurrent drains for one path are serialized across processes.
 | `dump_to_jsonl_include_payloads` | bool | `false` | Include request/response bodies in journal |
 | `dump_to_jsonl_payload_base_path` | string | (from payload_store) | Payload store path for inlining |
 
-### Landscape schema epoch 50
+### Landscape schema epoch 51
+
+Epoch 51 adds `run_prompt_inputs`. When a Web run starts, in the same
+transaction that creates its `runs` row and before any provider call, it
+records each approved prompt file the run admitted (each row references its
+run through a foreign key to `runs`): the node and option path,
+the session file's blob ID, the SHA-256 of the bytes the run read, the review
+anchor and the effective artifact hash. The run reads each file once and is
+admitted only when those bytes equal the approved review snapshot. The table is
+additive; no existing table changes. It pairs with Sessions epoch 79, which adds
+the prompt review snapshots and approval evidence.
+
+ELSPETH is pre-1.0. It does not transform an older Landscape schema into epoch
+51, either automatically at startup or through an operator migration command.
+Preserve incompatible stores, including epoch-50 stores, and their compatible
+prior application access; this candidate refuses them before incompatible
+writes. Provision an explicitly new, object-free target for a fresh
+installation. This grants no authority to delete, recreate, restamp or
+downgrade existing stores. PostgreSQL schema-owner and runtime/DML roles remain
+separate. Code that understands only an older epoch must not be rolled back
+over an epoch-51 database.
+
+#### Earlier Landscape schema epochs (26 to 50)
 
 Landscape epoch 26 added durable sink-effect streams, effects, ordered members,
 attempts, and sealed audit-export snapshots. Epoch 27 adds durable coalesce
@@ -2958,15 +2980,6 @@ settlement can recover without an in-memory attempt/call mapping. It also retain
 nullable `calls.returned_model` independently of response payload retention.
 Exported row-call and operation-call records include an additive nullable
 `returned_model` field; consumers enforcing a closed export shape must admit it.
-
-ELSPETH is pre-1.0. It does not transform an older Landscape schema into epoch
-50, either automatically at startup or through an operator migration command.
-Preserve incompatible stores and their compatible prior application access;
-this candidate refuses them before incompatible writes. Provision an explicitly
-new, object-free target for a fresh installation. This grants no authority to
-delete, recreate, restamp or downgrade existing stores. PostgreSQL schema-owner
-and runtime/DML roles remain separate. Code that understands only an older epoch
-must not be rolled back over an epoch-50 database.
 
 Data-preserving, version-to-version schema migrations become a first-class
 compatibility obligation at 1.0. They are intentionally not a pre-1.0 promise.

@@ -31,6 +31,7 @@ describe("read-only / mutating membership", () => {
     "get_plugin_schema",
     "get_plugin_assistance",
     "get_pipeline_state",
+    "inspect_prompt_targets",
     "get_audit_info",
     "get_expression_grammar",
     "diff_pipeline",
@@ -66,6 +67,12 @@ describe("read-only / mutating membership", () => {
     expect(Object.keys(TOOL_CALL_DESCRIPTIONS)).toHaveLength(
       READ_ONLY_TOOL_CALL_NAMES.length + MUTATING_TOOL_CALL_NAMES.length,
     );
+  });
+
+  it("classifies exact prompt editing as mutation and target inspection as lookup", () => {
+    expect(isReadOnlyToolCall("inspect_prompt_targets")).toBe(true);
+    expect(isReadOnlyToolCall("change_substring")).toBe(false);
+    expect(describeToolCall("change_substring")).toContain("fresh review");
   });
 
   it("admits no mutating verb prefix into the read-only half", () => {

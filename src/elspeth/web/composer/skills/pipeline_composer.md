@@ -203,7 +203,12 @@ For ordinary build/edit turns, the action path is:
 | Create a new pipeline or perform an intentional full rebuild | `set_pipeline`, or bounded construction batches as described below |
 | Perform a one-transform insertion between existing nodes on a direct linear path | `splice_transform`, only when the saved `edges` list holds an `on_success` edge joining those two nodes; it refuses a pipeline whose `edges` is empty, so there use `upsert_node` for the new node and re-point the successor's `input` |
 | Make an option-only edit to an existing node | `patch_node_options` |
+| Change a small exact span of an existing LLM prompt | `inspect_prompt_targets`, then `change_substring` |
 | Add or rewire a node in an existing pipeline, when neither narrower row above fits | `upsert_node` / `upsert_edge` |
+
+For a small edit to an existing prompt, call `inspect_prompt_targets` for the node and use its state ID and SHA-256 with `change_substring`; do not resend the whole prompt through `patch_node_options` to change part of it. Send the smallest `old` substring that matches exactly once; use `replace_all` only when every occurrence should change. After a successful edit, call `inspect_prompt_targets` in a later tool batch to obtain the committed revision ID. If the tool returns `target_changed`, inspect again before retrying. A changed prompt needs fresh review.
+
+The inspection result's `state_id` identifies the revision. Each entry in `targets` has a `target` selector, `length_chars`, `size_bytes`, and `sha256`; use the selector and hash for the edit without asking for the complete prompt text.
 
 The narrower tools also support staged construction of a new pipeline. Preserve
 existing components when extending a saved draft; use a full replacement only
@@ -361,9 +366,9 @@ The web composer already sends tool JSON Schemas with the model request. Use
 tools for real work, not for memorising signatures.
 
 <!-- BEGIN AUTOGEN: tool-inventory (generate_skill_inventory.py) -->
-- **Discovery:** `list_sources`, `get_plugin_schema`, `get_expression_grammar`, `get_plugin_assistance`, `get_audit_info`, `list_models`, `list_transforms`, `list_sinks`
+- **Discovery:** `list_sources`, `get_plugin_schema`, `get_expression_grammar`, `get_plugin_assistance`, `get_audit_info`, `list_models`, `list_transforms`, `list_sinks`, `inspect_prompt_targets`
 - **State / preview:** `get_pipeline_state` (for full state, omit the component argument or use full, all, pipeline, or the empty string), `preview_pipeline`, `diff_pipeline`
-- **Build / edit:** `set_source`, `patch_source_options`, `clear_source`, `set_source_from_blob`, `set_pipeline`, `upsert_node`, `splice_transform`, `upsert_edge`, `remove_node`, `remove_edge`, `set_metadata`, `patch_node_options`, `set_output`, `remove_output`, `patch_output_options`
+- **Build / edit:** `set_source`, `patch_source_options`, `clear_source`, `set_source_from_blob`, `set_pipeline`, `upsert_node`, `splice_transform`, `upsert_edge`, `remove_node`, `remove_edge`, `set_metadata`, `patch_node_options`, `change_substring`, `set_output`, `remove_output`, `patch_output_options`
 - **Diagnostics:** `explain_validation_error`, `request_advisor_hint`, `request_interpretation_review`
 - **Blobs:** `list_blobs`, `list_composer_blobs`, `get_blob_metadata`, `get_blob_content`, `read_attachment`, `create_blob`, `update_blob`, `delete_blob`, `wire_blob_inline_ref`, `set_source_from_blobs`, `inspect_source`
 - **Secrets:** `list_secret_refs`, `validate_secret_ref`, `wire_secret_ref`
@@ -750,10 +755,28 @@ with the blob's id and `content_hash`. `default_content` is not accepted either:
 use `on_miss: null` or `on_miss: fail` and handle the miss downstream. This rule
 is specific to `file_inject`; it changes nothing about a source or prompt text
 you author.
-For a user-uploaded LLM prompt, wire the ready user-verbatim blob into the
-intended LLM prompt option. Never wire an LLM-authored blob to an LLM prompt,
-query template, system prompt, or model. Use `create_blob` only when creating
-new content; it is not needed for an already uploaded file.
+For a file-backed LLM prompt, wire a ready UTF-8 text session blob into
+`prompt_template`, `system_prompt`, or one existing query template. The file
+may be user-created or agent-authored. Binding opens a mandatory
+`llm_prompt_template` card showing the full file text. The user must approve
+that card before validation or Run admits it. A content change or re-point
+opens a fresh card and requires approval again. The session owner can edit a
+bound prompt file as plain text in the graph node inspector; saving it records
+approval for the saved bytes without a separate card. An agent cannot change a bound prompt file's bytes (`update_blob` is refused, and in-file substring edits are unsupported); create a new text file and re-point it for a fresh review, or ask the user to edit it in the node inspector. The editor edits a prompt file only when it is the node's sole file-backed prompt; otherwise re-point through the agent and approve the card. If a pending review card also covers inline prompt text, approve that card before editing the file. A multi-query template is wired at
+`node:<node_id>.options.queries.<query_name>.template`, or for the list form at
+`node:<node_id>.options.queries.<index>.template` (the query's existing 0-based
+position). The blob must have an inline-text MIME type; a PDF or other binary
+file is refused. Upload or create the prompt as plain text (.txt or .md), then
+wire that file and approve its full-content card. The editor saves only a file
+that backs exactly one prompt and is read as UTF-8, so give each prompt its own
+file and do not set a non-UTF-8 `encoding` on a file the user may edit. A structured prompt with
+`prompt_template_parts` has interpretation slots and cannot be replaced by a
+file in this release. Edit its text parts in place with `change_substring` or
+`patch_node_options` on `prompt_template_parts`, preserving `interpretation_ref`
+entries. Switching a structured prompt to a file is not supported in this
+release. File binding does not support `model` or the whole `queries` value.
+Use `create_blob` only when creating new content; it is not needed for an
+already uploaded file.
 
 Use `inspect_source` for existing blobs before declaring fixed fields. Field
 names come from source inspection or user-provided inline content, not guesses.

@@ -1,19 +1,27 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { readFileSync } from "node:fs";
-import { render, screen, within } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import dagre from "@dagrejs/dagre";
 import { GraphView } from "./GraphView";
 import { useSessionStore } from "@/stores/sessionStore";
+import { useBlobStore } from "@/stores/blobStore";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { resetStore } from "@/test/store-helpers";
-import type { CompositionProposal, CompositionState, NodeSpec, EdgeSpec } from "@/types/index";
+import type { CompositionProposal, CompositionState, NodeSpec, EdgeSpec, BlobMetadata } from "@/types/index";
 import type { InterpretationEvent } from "@/types/interpretation";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 import { projectValidationWorkspaceStatus } from "@/components/workspace/workspaceStatus";
+
+// React Flow's measurement seam: the onNodesChange the graph hands the library,
+// and the updateNodeInternals spy its custom node calls when handles change.
+const flowProbe = vi.hoisted(() => ({
+  onNodesChange: undefined as undefined | ((changes: unknown[]) => void),
+  updateNodeInternals: vi.fn(),
+}));
 
 // Mock @xyflow/react — jsdom cannot do DOM measurements required by React Flow.
 // Render ordinary elements directly and invoke custom node/edge renderers with
@@ -38,9 +46,12 @@ vi.mock("@xyflow/react", () => ({
     fitViewOptions,
     minZoom,
     onNodeClick,
+    onNodesChange,
     nodesFocusable,
     edgesFocusable,
-  }: any) => (
+  }: any) => {
+    flowProbe.onNodesChange = onNodesChange;
+    return (
     <div
       data-testid="react-flow"
       data-color-mode={colorMode}
@@ -71,6 +82,7 @@ vi.mock("@xyflow/react", () => ({
             // testable truth about what GraphView hands the library
             // (elspeth-003794d55c).
             data-node-style={JSON.stringify(n.style ?? null)}
+            data-measured={JSON.stringify(n.measured ?? null)}
             onClick={(event) => onNodeClick?.(event, n)}
           >
             {NodeRenderer
@@ -125,7 +137,9 @@ vi.mock("@xyflow/react", () => ({
       })}
       {children}
     </div>
-  ),
+    );
+  },
+  useUpdateNodeInternals: () => flowProbe.updateNodeInternals,
   BaseEdge: ({
     id,
     path,
@@ -421,6 +435,8 @@ function makeProposal(
 
 describe("GraphView", () => {
   beforeEach(() => {
+    vi.clearAllMocks();
+    useBlobStore.getState().reset();
     useSessionStore.setState({
       activeSessionId: null,
       compositionState: null,
@@ -651,6 +667,34 @@ describe("GraphView", () => {
       settings.compareDocumentPosition(connections) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).not.toBe(0);
     expect(connections.closest("details")).not.toHaveAttribute("open");
+  });
+
+  it("names a bound prompt file in the inspector without exposing its marker", async () => {
+    const blobId = "f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0";
+    useBlobStore.setState({ activeSessionId: "session-1", fileManagerHosts: 1, blobs: [{ id: blobId, filename: "prompt.md", content_hash: "a".repeat(64), status: "ready", mime_type: "text/plain" } as BlobMetadata] });
+    useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeState({ nodes: [makeNode({
+      id: "classify", plugin: "llm", options: { prompt_template: { blob_ref: blobId, mode: "inline_content", sha256: "a".repeat(64) } },
+    })] }) });
+    render(<GraphView />);
+    await userEvent.setup().click(screen.getByTestId("node-classify"));
+    const panel = screen.getByRole("complementary", { name: /classify configuration/i });
+    expect(within(panel).getAllByText(/prompt\.md/).length).toBeGreaterThanOrEqual(1);
+    expect(panel.textContent).not.toMatch(/blob_ref|inline_content|f976fd8b-4432|a{64}/);
+    expect(within(panel).getByRole("button", { name: "Show in files: prompt.md (User prompt)" })).toBeInTheDocument();
+    expect(within(panel).getByRole("button", { name: "Edit prompt.md (User prompt)" })).toBeInTheDocument();
+  });
+
+  it("omits Show in files in the modal graph, whose focus trap hides the file manager", async () => {
+    const blobId = "f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0";
+    useBlobStore.setState({ activeSessionId: "session-1", fileManagerHosts: 1, blobs: [{ id: blobId, filename: "prompt.md", content_hash: "a".repeat(64), status: "ready", mime_type: "text/plain" } as BlobMetadata] });
+    useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeState({ nodes: [makeNode({
+      id: "classify", plugin: "llm", options: { prompt_template: { blob_ref: blobId, mode: "inline_content", sha256: "a".repeat(64) } },
+    })] }) });
+    render(<GraphView inModal />);
+    await userEvent.setup().click(screen.getByTestId("node-classify"));
+    const panel = screen.getByRole("complementary", { name: /classify configuration/i });
+    expect(within(panel).queryByText("Show in files")).not.toBeInTheDocument();
+    expect(within(panel).getByRole("button", { name: "Edit prompt.md (User prompt)" })).toBeInTheDocument();
   });
 
   it("exposes every collector scope binding from the keyboard inspector", async () => {
@@ -4173,4 +4217,64 @@ describe("GraphView", () => {
     });
   });
 
+});
+
+describe("measured node sizes survive node rebuilds", () => {
+  // React Flow drops a controlled node's measured size and handle bounds when it
+  // receives a node object without `measured`, hiding that node's edges until it
+  // re-measures; the graph rebuilds every node object on validation, selection
+  // and route toggles, so the edge layer blanked and redrew (0.8.15).
+  function parallelPairState(): CompositionState {
+    return makeState({
+      sources: { source: { plugin: "csv", options: {}, on_success: "rows", on_validation_failure: "quarantine" } },
+      nodes: [makeNode({ id: "step", input: "rows", on_success: "shared", on_error: "shared" })],
+      outputs: [
+        { name: "shared", plugin: "json", options: {}, on_write_failure: "discard" },
+        { name: "quarantine", plugin: "json", options: {}, on_write_failure: "discard" },
+      ],
+    });
+  }
+
+  beforeEach(() => {
+    resetStore(useSessionStore);
+    resetStore(useExecutionStore);
+    flowProbe.onNodesChange = undefined;
+    flowProbe.updateNodeInternals.mockClear();
+  });
+
+  it("carries the size React Flow measured onto every rebuilt node object", async () => {
+    useSessionStore.setState({ compositionState: parallelPairState() });
+    const user = userEvent.setup();
+    render(<GraphView />);
+    expect(flowProbe.onNodesChange).toBeTypeOf("function");
+    act(() => {
+      flowProbe.onNodesChange!([
+        { type: "dimensions", id: "step", dimensions: { width: 180, height: 64 } },
+        { type: "position", id: "step", position: { x: 5, y: 5 } },
+      ]);
+    });
+    expect(JSON.parse(screen.getByTestId("node-step").getAttribute("data-measured")!)).toEqual({ width: 180, height: 64 });
+    expect(JSON.parse(screen.getByTestId("node-shared").getAttribute("data-measured")!)).toBeNull();
+
+    await user.click(screen.getByTestId("node-step"));
+    await user.click(screen.getByRole("switch", { name: "Show quarantine and discard routes" }));
+    expect(JSON.parse(screen.getByTestId("node-step").getAttribute("data-measured")!)).toEqual({ width: 180, height: 64 });
+  });
+
+  it("re-reads a node's handles when its parallel handle set changes, and only then", async () => {
+    useSessionStore.setState({ compositionState: parallelPairState() });
+    const user = userEvent.setup();
+    render(<GraphView />);
+    expect(screen.getByTestId("node-step").querySelectorAll("[data-handle-id^='parallel-source-']")).toHaveLength(2);
+    flowProbe.updateNodeInternals.mockClear();
+
+    await user.click(screen.getByTestId("node-step"));
+    expect(flowProbe.updateNodeInternals).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("switch", { name: "Show quarantine and discard routes" }));
+    expect(screen.getByTestId("node-step").querySelectorAll("[data-handle-id^='parallel-source-']")).toHaveLength(0);
+    expect(flowProbe.updateNodeInternals).toHaveBeenCalledWith("step");
+    expect(flowProbe.updateNodeInternals).toHaveBeenCalledWith("shared");
+    expect(flowProbe.updateNodeInternals).not.toHaveBeenCalledWith("source");
+  });
 });

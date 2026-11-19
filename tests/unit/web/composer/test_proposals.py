@@ -60,6 +60,8 @@ def test_every_declared_tool_has_owned_effects(declaration: ToolDeclaration) -> 
         expected = ()
     elif declaration.blob_store_only:
         expected = ("blob_store",)
+    elif declaration.name == "change_substring":
+        expected = ("graph", "validation", "yaml", "interpretation")
     else:
         expected = ("graph", "validation", "yaml")
     assert tuple(domain.value for domain in effects.domains) == expected

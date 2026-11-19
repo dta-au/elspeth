@@ -532,7 +532,14 @@ async def _litellm_acompletion(
             credential_messages.append(message)
     if prepared_advisor_content is not None:
         credential_messages = scan_prepared_advisor_content(credential_messages, prepared_advisor_content, role=prompt_guard_role)
-    require_no_credential_material(credential_messages, surface="composer_provider_request")
+    require_no_credential_material(
+        credential_messages,
+        surface="composer_provider_request",
+        # 2 MiB covers a maximum-size runtime YAML import (524,288 characters,
+        # MAX_RUNTIME_YAML_IMPORT_CHARS) at 4 UTF-8 bytes per character. A
+        # longer string is refused unscanned (traversal_limit), never skipped.
+        max_string_bytes=2 * 1024 * 1024,
+    )
     await enforce_prompt_guard(
         mount=prompt_guard_mount,
         mode=prompt_guard_mode,

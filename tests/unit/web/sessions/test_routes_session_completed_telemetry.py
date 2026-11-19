@@ -182,9 +182,9 @@ async def test_export_yaml_authority_failure_returns_no_yaml_and_emits_no_counte
     await _save_composition_state(service, session.id, _csv_state(), provenance="session_seed")
 
     async def _pass_preflight(  # type: ignore[no-untyped-def]
-        state, *, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog
+        state, *, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog, blob_get_content=None
     ):
-        del state, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog
+        del state, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog, blob_get_content
         return ValidationResult(is_valid=True, checks=[], errors=[], readiness=_ready_readiness())
 
     with (
@@ -210,9 +210,9 @@ async def test_export_yaml_taken_over_authority_returns_no_yaml_and_emits_no_cou
     await _save_composition_state(service, session.id, _csv_state(), provenance="session_seed")
 
     async def _pass_preflight(  # type: ignore[no-untyped-def]
-        state, *, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog
+        state, *, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog, blob_get_content=None
     ):
-        del state, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog
+        del state, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog, blob_get_content
         return ValidationResult(is_valid=True, checks=[], errors=[], readiness=_ready_readiness())
 
     authority = service.session_operation_authority
@@ -258,10 +258,10 @@ async def test_export_yaml_records_authored_state_while_newer_state_waits_for_le
     superseding_state = None
 
     async def _queue_contender_after_preflight(  # type: ignore[no-untyped-def]
-        state, *, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog
+        state, *, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog, blob_get_content=None
     ):
         nonlocal contender_queued
-        del state, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog
+        del state, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog, blob_get_content
         contender_queued = True
         return ValidationResult(is_valid=True, checks=[], errors=[], readiness=_ready_readiness())
 
@@ -318,9 +318,9 @@ async def test_export_yaml_route_emits_completion_counter(tmp_path: Path) -> Non
     )
 
     async def _pass_preflight(  # type: ignore[no-untyped-def]
-        state, *, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog
+        state, *, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog, blob_get_content=None
     ):
-        del state, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog
+        del state, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog, blob_get_content
         return ValidationResult(is_valid=True, checks=[], errors=[], readiness=_ready_readiness())
 
     # Baseline.
@@ -374,9 +374,9 @@ async def test_export_yaml_route_runtime_preflight_failure_does_not_emit(tmp_pat
     )
 
     async def _fail_preflight(  # type: ignore[no-untyped-def]
-        state, *, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog
+        state, *, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog, blob_get_content=None
     ):
-        del state, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog
+        del state, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog, blob_get_content
         return ValidationResult(
             is_valid=False,
             checks=[],

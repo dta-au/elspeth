@@ -38,6 +38,7 @@ from tests.fixtures.identities import ensure_test_identity
 
 _ROOT = Path(__file__).parents[3]
 _BLOB_ROUTES = _ROOT / "src/elspeth/web/blobs/routes.py"
+_PROMPT_TEXT_ROUTES = _ROOT / "src/elspeth/web/blobs/prompt_text_routes.py"
 _CONTEXT_PARAMETER = "session_operation_context"
 
 
@@ -313,7 +314,7 @@ _PRODUCTION_ENDPOINT_PREAMBLE_AST_SHA256 = {
     # delete_blob: the docstring names the idempotent, cleanup-capable contract.
     "delete_blob": "24bded45619a8b1ff30e436119136e59b1a8e8427fd205cac69cd09d3a96a04e",
 }
-_PRODUCTION_IMPORTS_AST_SHA256 = "0d5048d304b1cfb950213080415f2cc5838ab7779b9f7d9a4b3598e7af1cd6d2"
+_PRODUCTION_IMPORTS_AST_SHA256 = "dc6080dc2f01ef094b8da66bb1c6428bf46505dbcda91c86e248033b874fa85c"
 _SYNTHETIC_IMPORTS_AST_SHA256 = "94033e0618e2844484fe405c1390874e190827ea0928d790784c88ca22422c20"
 _SYNTHETIC_DELETE_IMPORTS_AST_SHA256 = "495d568047a365b64f2ea5b19dc4f628b0a881f9580b622a6b524913ed180b99"
 _ROUTER_FACTORY_SIGNATURE_AST_SHA256 = "6662cca5c620abce45dd4871654fd02fea18f10e2ebfcb15db05f466dd165115"
@@ -328,7 +329,8 @@ _PRODUCTION_ENDPOINT_POST_ACQUIRE_AST_SHA256 = {
     "create_blob_upload": "87a53ffacd366127e3cde8a2888f01219dae7a6480f57f1412b1b3d7ff71ebbb",
     "create_blob_inline": "68af41a0ab9906e42c27deee68be72cc87c40732ae79f4ad292e1bd6c74b4ae1",
     "get_blob_metadata": "6f5fecde5c973519d1f0f19cd46daa3c95365844275ad8802eb6a1963e5907e1",
-    "download_blob_content": "de533132ec1ef83d39add60f4c16b3ac3230ebc0a4142dc5ce36b27357cc40ec",
+    # The download response exposes a digest of the same fenced bytes the editor shows.
+    "download_blob_content": "8d6c7af9f77c4d1d7a8fbd44ff215ca59321781cecf2e801d4c19010bc81e465",
     "preview_blob_content": "7ccaecad1d53f7b5db494ff1d06e9f23ead181d5b9eca977cae4eab8be957468",
     "delete_blob": "baec4f40f5b083e876f15bace5f21536939eb9522fc1627ffc5aa02b38509a28",
 }
@@ -390,6 +392,7 @@ _ALLOWED_ROUTE_CALLABLES = {
             "_get_owned_blob",
             "HTTPException",
             "blob_service.read_blob_content",
+            "content_hash",
             "Response",
             "quote",
             "lease.close",
@@ -1757,6 +1760,70 @@ def test_standalone_blob_routes_bind_the_exact_renewable_lease() -> None:
     tree = ast.parse(_BLOB_ROUTES.read_text(encoding="utf-8"), filename=str(_BLOB_ROUTES))
     violations = [violation for contract in _ENDPOINTS for violation in _route_violations(tree, contract)]
     assert not violations, "\n".join(violations)
+
+
+def _prompt_text_route_violations(source: str) -> list[str]:
+    tree = ast.parse(source)
+    imports = {
+        (statement.module, alias.name) for statement in tree.body if isinstance(statement, ast.ImportFrom) for alias in statement.names
+    }
+    required_imports = {
+        ("elspeth.web.blobs.routes", "_get_owned_blob"),
+        ("elspeth.web.blobs.routes", "_verify_session_and_get_blob_service"),
+        ("elspeth.web.coordination.lifecycle", "SessionOperationLease"),
+        ("elspeth.web.coordination.contracts", "SessionOperationKind"),
+    }
+    violations = [f"missing canonical import {item}" for item in sorted(required_imports - imports)]
+    endpoints = _endpoint_definitions(tree, "save_prompt_text")
+    if len(endpoints) != 1:
+        return [*violations, "save_prompt_text must have exactly one definition"]
+    endpoint = endpoints[0]
+    calls = [candidate for candidate in ast.walk(endpoint) if isinstance(candidate, ast.Call)]
+    expected = {
+        "SessionOperationLease.acquire": (1, {"operation_kind": "SessionOperationKind.COMPOSE"}),
+        "_verify_session_and_get_blob_service": (1, {}),
+        "_get_owned_blob": (1, {"session_operation_context": "lease.context"}),
+        "blob_service.read_blob_content": (1, {"session_operation_context": "lease.context"}),
+        "driver.replace_blob": (1, {"context": "lease.context"}),
+        "lease.close": (1, {}),
+    }
+    for name, (count, keywords) in expected.items():
+        matches = [call for call in calls if _dotted_name(call.func) == name]
+        if len(matches) != count:
+            violations.append(f"{name} must appear exactly {count} time")
+        for call in matches:
+            actual = {keyword.arg: ast.unparse(keyword.value) for keyword in call.keywords}
+            if any(actual.get(key) != value for key, value in keywords.items()):
+                violations.append(f"{name} must pass the canonical lease context")
+    if not any(
+        isinstance(statement, ast.Try)
+        and any(
+            isinstance(call, ast.Call) and _dotted_name(call.func) == "lease.close"
+            for final_statement in statement.finalbody
+            for call in ast.walk(final_statement)
+        )
+        for statement in endpoint.body
+    ):
+        violations.append("lease.close must run in a finally clause")
+    return violations
+
+
+def test_prompt_text_editor_route_binds_canonical_blob_helpers_and_lease() -> None:
+    assert _prompt_text_route_violations(_PROMPT_TEXT_ROUTES.read_text(encoding="utf-8")) == []
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    (
+        ("from elspeth.web.blobs.routes import _get_owned_blob", "from attacker import _get_owned_blob"),
+        ("session_operation_context=lease.context", "session_operation_context=None"),
+        ("context=lease.context,", "context=None,"),
+    ),
+)
+def test_prompt_text_editor_route_gate_rejects_broken_custody(before: str, after: str) -> None:
+    source = _PROMPT_TEXT_ROUTES.read_text(encoding="utf-8")
+    assert before in source
+    assert _prompt_text_route_violations(source.replace(before, after, 1))
 
 
 @pytest.mark.parametrize(
@@ -3237,7 +3304,8 @@ def test_blob_read_vocabulary_is_present_in_epoch_51_without_protocol_bump() -> 
     # Epoch 75 combines graph recovery with durable authentication families and bound tickets.
     # Epoch 76 requires effective graph-review facts from committed terminal cohorts.
     # Epoch 78 binds quota custody and output storage reservations, retaining blob_read.
-    assert SESSION_SCHEMA_EPOCH == 78
+    # Epoch 79 stores prompt file approval evidence and retains blob_read.
+    assert SESSION_SCHEMA_EPOCH == 79
     assert WEB_COORDINATION_PROTOCOL_VERSION == 1
     kind_check = next(
         constraint for constraint in session_operation_fences_table.constraints if constraint.name == "ck_session_operation_fences_kind"

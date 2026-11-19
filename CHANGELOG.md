@@ -4,6 +4,195 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
+## 0.8.15 - 2026-11-17
+
+Executor hot-path fixes, Web Composer fixes and a release-pipeline repair.
+Session epoch advances from 78 to 79 and Landscape from 50 to 51, so
+deployments need explicitly new session and Landscape stores. 0.8.15
+supersedes 0.8.14, which was tagged but never published as a GitHub release or
+version-tagged image: its smoke test could not run on hardened CI runners. Everything in the 0.8.14 section below therefore ships for the first
+time in this release, including its upgrade actions. The dated entry and
+package version do not establish qualification, a published tag or an image.
+
+### Upgrade notes
+
+- API clients that approve prompt review cards must now send
+  `reviewed_anchor`; see Web Composer below.
+- **Upgrading from 0.8.13 or earlier: apply the 0.8.14 upgrade notes first.**
+  ELSPETH now requires and runs on Python 3.14 only, startup refuses
+  `JSON_LOGS=true`, and a run checkpointed under 3.13 refuses to resume under
+  3.14. Drain in-flight runs and pending approvals before upgrading.
+- A run interrupted before upgrading cannot be resumed after it: the
+  schema-contract module changed, so the runtime manifest recorded at run start
+  no longer matches and resume refuses (no data is changed; re-run or finish
+  interrupted runs before upgrading).
+
+Schema and stored data:
+
+- Session epoch advances from 78 to 79; Landscape advances from epoch 50 to
+  51. File-backed LLM prompts are reviewed, admitted only on the approved
+  bytes, and the run records the hash of the prompt file it read. The session
+  store adds `prompt_review_snapshots` (the reviewed file text and its
+  identity, kept with the review event) and `prompt_file_approvals`
+  (append-only approvals, whose latest row per binding is the admission
+  authority); the Landscape store adds `run_prompt_inputs` (the approved
+  prompt-file identity and content hash a Web run admitted, recorded when the
+  run starts, in the same transaction as its run row and before any LLM call,
+  with a foreign key to the run). The new tables are additive.
+- Configure an explicitly new epoch-79 session target and an explicitly new
+  epoch-51 Landscape target. Preserve epoch-78 session stores and epoch-50
+  Landscape stores with compatible prior application access; 0.8.15 startup
+  refuses to open them, and no 0.8.14 data is read across. The 0.8.10
+  cutover guidance below continues to apply to older stores. This authorizes no migration, reset,
+  restamping or downgrade. Drain and isolate old/new deployments; they cannot
+  share session stores or replicas.
+
+### Engine and runtime
+
+- `SchemaContract.version_hash()` is computed once per contract instance.
+  Constructing a `SchemaContract` with `fields` that is not a plain tuple now
+  raises `TypeError`.
+- Gates reuse the input hash recorded for the node state instead of hashing
+  each row a second time. A row that cannot be canonically hashed (for example
+  one containing NaN) still fails with the same `ValueError` and writes no
+  Landscape row, but now emits one error gate telemetry span where it emitted
+  none before.
+
+### Web Composer
+
+- The pipeline graph no longer blanks and redraws its connectors when the view
+  loads, a node is selected or failure routes are toggled. React Flow had been
+  re-measuring every node on each rebuild; measured sizes are now carried
+  forward, and nodes re-read their handles when their parallel routes change.
+- The composer's context budget now estimates a request's size from the
+  provider's own token count for an earlier call in the same exchange (same
+  model and dialect), plus every byte added since. With no usable count, text
+  ELSPETH ships (the composer skill, tool definitions and labelled plugin
+  schemas) is priced at 3 bytes per token, and everything else at one token
+  per byte; the lower of the two estimates is used. If the provider's count
+  for that earlier call shows the 3-bytes-per-token assumption undercounted
+  it, or the earlier call's authored size is unknown, the provider-anchored
+  estimate is used alone. Requests carrying several large plugin schemas that
+  were refused as over budget are now admitted. Once older history is dropped
+  to fit, it stays dropped until the raw request is back under the configured
+  low mark, so long sessions keep a stable prompt prefix. Composer LLM audit
+  records gain optional anchor and pricing fields; records written by earlier
+  versions still load.
+- `wire_blob_inline_ref` can bind a session file to a list entry by position,
+  such as `options.queries.0.template`. A numeric path segment always means a
+  list position. An option key that is not a plain name (for example `v1.2`
+  or `2024`) holding a file marker is refused as malformed rather than
+  misread as a nested path.
+- A prompt backed by a session file is validated when the file's content is
+  resolved, not refused at authoring time for not being literal text.
+- Exporting a pipeline as YAML no longer fails with a 409 when an option is
+  backed by a session file.
+- Composer provider requests now scan text values up to 2 MiB for credential
+  material (was 256 KiB), so real file-backed prompts and a maximum-size YAML
+  import fit; larger values are still refused unscanned, never passed
+  through. The limit applies to each text value, not to a whole request.
+- The composer runtime preflight timeout
+  (`composer_runtime_preflight_timeout_seconds`) now defaults to 60 s (was
+  5 s), so preflight that reads and verifies real file-backed prompts can
+  finish.
+- Runtime YAML import, including the browser Import YAML dialog, accepts
+  documents up to 524,288 characters (was 262,144), so pipelines carrying real
+  file-backed prompts fit. This supersedes the 0.8.14 decision to leave the
+  limit unchanged (composer remediation checklist item 05.21).
+- The composer can change part of an existing LLM prompt without resending
+  it: `inspect_prompt_targets` reports a prompt's length and SHA-256 (never
+  its text), and `change_substring` applies up to 32 exact, all-or-none
+  substring edits to that prompt (or one text part of a structured prompt)
+  against that hash, under the same checks as `patch_node_options`. A match
+  must be unique unless `replace_all` is set; edit text is redacted to its
+  length in tool results, proposal cards and audit records, and is checked
+  for credentials. Changing a prompt reopens its prompt review. A one-line
+  edit now sends a few hundred bytes of tool arguments instead of the whole
+  prompt. The composer cannot yet edit text inside a session file; use the
+  prompt editor below. The composer now offers 47 tools by default (was 45).
+- An LLM prompt can be backed by a session file. Pointing the prompt at a
+  different file, or a change to the file's content, reopens the prompt review
+  ("Re-approve first"), and the run is blocked until the new text is approved.
+  Each run uses exactly the approved bytes and records their hash.
+- The inspector's new prompt editor edits a prompt file in place. Saving is
+  your approval of the new text, so no new review card appears. A save is
+  refused when the file backs more than one prompt
+  (`prompt_file_shared_binding`), is not UTF-8
+  (`prompt_file_encoding_unsupported`), changed since you opened it or its
+  binding moved (`prompt_file_stale`, `prompt_file_binding_changed`; the
+  request must carry `expected_sha256`), or while the node's review card is
+  still waiting (`prompt_file_review_pending_inline`, 409: approve the card
+  first, then edit). Approvals are kept append-only, whether from the card or
+  an editor save.
+- The inspector shows a prompt file by name, with a "changed since attached"
+  hint, instead of its blob ID and hash, and each prompt slot has Edit and
+  "Show in files" buttons. The editor starts collapsed, and Edit and Save are
+  disabled with the reason shown when the server would refuse. With the file
+  manager open, the selected node's files are highlighted and labelled "Used
+  by <node>". Uploaded source files show their filename in the pipeline view.
+- Selecting a source or sink in the graph no longer clears on every composer
+  turn.
+- A prompt that points at a session file now gets a clear, typed refusal
+  instead of an internal error or a silent change when the file is not
+  plain text (`inline_blob_not_text`) or the prompt is a structured prompt
+  (`prompt_template_parts_required`). This applies when the file is wired,
+  when the pipeline is validated, exported, approved or run (including the
+  tutorial run), and when pipeline YAML is imported. Each refusal says how to
+  fix it; switching a structured prompt to a file is not supported in this
+  release.
+- The prompt review card shows exactly the reviewed snapshot; each
+  interpretation slot shows whether its own review is pending or accepted.
+- Approving a prompt review card is now bound to the text the card showed.
+  Every LLM prompt review card stores a review snapshot (inline prompts
+  included), and `POST /api/sessions/{id}/interpretations/{event_id}/resolve`
+  requires `reviewed_anchor` for prompt cards: the snapshot's `anchor` from
+  `GET /api/sessions/{id}/interpretations/{event_id}/prompt`. A missing anchor
+  is refused with 422 `prompt_review_anchor_required`; an anchor that is not
+  the card's stored snapshot is refused with 409 `prompt_review_stale`, and
+  nothing is written. Other review kinds must omit it (422
+  `interpretation_review_anchor_unexpected`). A second tab or a stale view can
+  no longer approve text the user did not see. API clients that resolve prompt
+  cards must send the anchor.
+- A pending prompt review card whose displayed text changes (for example after
+  a vague-term answer, or an agent change to one query of a multi-query node
+  beside a file-backed prompt) is replaced by a fresh card, and an editor save
+  cannot approve a card that is still waiting on other text. Answering a
+  vague-term review on a node whose prompt uses a session file reopens that
+  prompt's review with the final text.
+- File-backed prompt reviews are always shown, including in a session that has
+  opted out of interpretation reviews, and a forked session's file-backed
+  prompts are reviewed again in the new session.
+- LLM call audit records for a file-backed prompt carry the approved prompt
+  hash, as they do for literal prompts. Governed approval of an earlier
+  revision checks that revision's prompt files.
+- A review whose file has since changed or become unreadable is refused with a
+  typed 409; a prompt file larger than the 256 KiB inline limit is refused with
+  a clear message when its review is raised. A recorded prompt field path is
+  limited only by PostgreSQL's index row size (about 2.6 KB).
+- A resume is refused if the run's prompt files were re-approved with different
+  content after it started. A prompt file whose stored bytes no longer match
+  their recorded hash raises the inline-blob integrity alert.
+
+### Release pipeline
+
+- The image smoke test runs on CI runners with a `0077` umask. The image's
+  non-root user (uid 1654) could not read the checked-out example, and the
+  runner could not read the `0600` sink outputs, so the 0.8.14 tag build
+  stopped before release. Only the mounted example directories are opened to
+  the container, and the image user makes its own outputs readable afterwards.
+- The release image scan accepts the four chromadb 1.5.5 advisories that
+  `pip-audit` already accepts (CVE-2026-45829, -45830, -45831, -45833) as
+  version-scoped, expiring exceptions in `.trivyignore.yaml`. They affect the
+  Chroma server, which ELSPETH does not run; the gateway image takes no
+  exceptions.
+
+### Publication and acceptance
+
+Automatic image publication from main remains held. The 0.8.15 tag and
+container publication follow successful required checks and the protected
+merge. Operator signing, live-provider acceptance and deployment remain
+separate steps.
+
 ## 0.8.14 - 2026-11-15
 
 Python 3.14, Web Composer remediation and plugin fixes. ELSPETH now requires

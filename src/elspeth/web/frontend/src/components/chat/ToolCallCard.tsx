@@ -182,20 +182,19 @@ export function ToolCallCard({
       )}
       {/* Primary change surface (elspeth-10f76f9250): a before/after diff of
           the affected pipeline fragment when derivable, otherwise structured
-          per-argument fields. The raw JSON stays available behind the
-          details expander below in both cases. */}
-      {diffEntries !== null ? (
+          per-argument fields. Exact prompt edits show only targets and counts. */}
+      {proposal.tool_name === "change_substring" && diffEntries === null ? null : diffEntries !== null ? (
         <ProposalChanges diff={diffEntries} />
       ) : (
         <ArgumentFields args={proposal.arguments_redacted_json} />
       )}
-      <details className="tool-call-details">
+      {proposal.tool_name !== "change_substring" && <details className="tool-call-details">
         <summary>View arguments (JSON)</summary>
         <pre
           tabIndex={0}
           aria-label="Tool call arguments (scrollable)"
         >{JSON.stringify(proposal.arguments_redacted_json, null, 2)}</pre>
-      </details>
+      </details>}
       {baseChanged && !isStale && (
         <p>This proposal targets an earlier pipeline state. Its arguments are shown without a current-state comparison; the server will check whether it can still be accepted.</p>
       )}

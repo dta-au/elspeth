@@ -103,6 +103,8 @@ from elspeth.web.composer.context_budget import (
     SheddableKind,
     SheddableSegment,
     decide_context_budget,
+    escaped_bytes,
+    protected_reference_bytes,
 )
 from elspeth.web.composer.context_budget_apply import (
     CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
@@ -116,7 +118,7 @@ from elspeth.web.composer.context_budget_apply import (
     stubbed_tool_message,
     tool_result_segments,
 )
-from elspeth.web.composer.context_budget_history import ContextBudgetHistory
+from elspeth.web.composer.context_budget_history import ContextBudgetHistory, request_anchor
 from elspeth.web.composer.control_messages import anti_anchor_control_envelope
 from elspeth.web.composer.discovery_cache import (
     CachedDiscoveryPayload as _CachedDiscoveryPayload,
@@ -141,6 +143,7 @@ from elspeth.web.composer.progress import (
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount, prompt_guard_user_scope
 from elspeth.web.composer.prompt_guard_rendering import JsonPath, json_content_parts
 from elspeth.web.composer.prompts import (
+    SYSTEM_PROMPT,
     build_messages,
     build_run_diagnostics_messages,
     build_state_context_message,
@@ -617,6 +620,13 @@ class _ContextBudgetFrame:
     @property
     def state_index(self) -> int:
         return _CONTEXT_BUDGET_HISTORY_START + len(self.history_entries)
+
+
+def _sheddable_message_positions(frame: _ContextBudgetFrame, tool_positions: Mapping[str, list[int]]) -> set[int]:
+    """Positions whose bytes a context-budget segment can remove or replace."""
+    return {
+        _CONTEXT_BUDGET_HISTORY_START + position for position, (_chat_index, kind) in enumerate(frame.history_entries) if kind is not None
+    } | {index for positions in tool_positions.values() for index in positions}
 
 
 @dataclass(frozen=True, slots=True)
@@ -1621,7 +1631,7 @@ class ComposerServiceImpl:
             marked_messages, marked_tools_or_none = apply_anthropic_cache_markers(selected_messages, selected_tools, mark_history_tail=True)
             marked_tools = marked_tools_or_none if marked_tools_or_none is not None else selected_tools
         # The wire bytes of the request that will be sent: recorded on the
-        # call, where a later call's bytes-per-token ratio is read from, and
+        # call, where the exact request size is audited, and
         # checked by the final guard. The decision was fed this measure, so
         # the guard is reached only if applying the decision grew the request
         # past what the decision's allowances cover.
@@ -1629,7 +1639,7 @@ class ComposerServiceImpl:
         budget_record = replace(budget_record, request_wire_bytes=marked_wire_bytes)
         if marked_wire_bytes > self._context_budget_policy.max_request_bytes:
             marked_split = message_wire_split(marked_messages, marked_tools or None)
-            kept_history = len(budget_frame.history_entries) - len(budget_record.shed_history_indices)
+            kept_history = sum(chat_index not in budget_record.shed_history_indices for chat_index, _kind in budget_frame.history_entries)
             raise self._context_budget_refusal(
                 ContextBudgetRefusal(
                     ceiling="bytes",
@@ -1670,7 +1680,7 @@ class ComposerServiceImpl:
         """Label the request's segments, decide, and apply the decision to ``messages`` (a private copy).
 
         Returns the fitted loop messages, the record of the decision, and the
-        bytes-per-token ratio it used.
+        conservative byte-to-token rate for the final byte guard.
 
         Segments are always labelled on the loop's messages. With
         ``reply_stage`` the size the decision is fed is that of the
@@ -1726,15 +1736,53 @@ class ComposerServiceImpl:
             sent_messages, marked_tools = apply_anthropic_cache_markers(sent_messages, tools, mark_history_tail=True)
             sent_tools = marked_tools or None
 
+        sheddable_positions = _sheddable_message_positions(frame, tool_positions)
+        mutable_positions = set(sheddable_positions)
+        if frame.history_entries:
+            mutable_positions.add(state_index)
+        # Reply rendering preserves the fixed skill/catalog prefix. Everything
+        # after it may be quoted or re-rendered; only the fixed prefix and an
+        # exactly matching tools block can receive anchor credit.
+        if reply_stage:
+            mutable_positions = set(range(_CONTEXT_BUDGET_HISTORY_START, len(sent_messages)))
+        segment_positions = {
+            **{
+                f"history:{chat_index}": {_CONTEXT_BUDGET_HISTORY_START + position}
+                for position, (chat_index, kind) in enumerate(frame.history_entries)
+                if kind is not None
+            },
+            **{key: set(positions) for key, positions in tool_positions.items()},
+        }
+        if any(not segment_positions.get(segment.key) or not segment_positions[segment.key] <= mutable_positions for segment in segments):
+            raise InvariantError("context-budget sheddable segment is outside mutable messages")
+        anchor = request_anchor(
+            calls=recorder.llm_calls,
+            model=self._model,
+            dialect=self._planner_dialect,
+            messages=sent_messages,
+            tools=sent_tools,
+            mutable_positions=frozenset(mutable_positions),
+        )
+        # Authorship comes from the producer's reference labels, never text
+        # inspection. The system message can include an operator overlay, so
+        # only its shipped core qualifies. Sheddable messages must not enter
+        # this fixed allowance: their savings are charged entirely per byte.
+        authored_bytes = escaped_bytes(SYSTEM_PROMPT) + (message_wire_split([], sent_tools).tools_bytes or 0)
+        authored_bytes += protected_reference_bytes(sent_messages, excluded_positions=frozenset({0, *sheddable_positions}))
         try:
             decision = decide_context_budget(
                 policy=self._context_budget_policy,
                 request_bytes=request_wire_bytes(sent_messages, sent_tools) + omission_allowance,
                 segments=segments,
-                # The ratio measured on this model's own budgeted calls, when the session has one.
-                bytes_per_token=frame.history.ratio_for(self._model),
+                anchor_tokens=anchor.tokens,
+                anchor_shared_bytes=anchor.shared_bytes,
+                anchor_wire_bytes=anchor.wire_bytes,
+                anchor_authored_bytes=anchor.authored_bytes,
+                anchor_status=anchor.reason,
+                authored_bytes=authored_bytes,
                 previously_shed=previously_shed_keys(frame.history, recorder.llm_calls),
-                held=held_tool_keys(recorder.llm_calls),
+                held=held_tool_keys(recorder.llm_calls)
+                | (frame.history.shed_history_after(recorder.llm_calls) if reply_stage else frozenset()),
             )
         except ContextBudgetRefusal as refusal:
             raise self._context_budget_refusal(
@@ -1751,16 +1799,29 @@ class ComposerServiceImpl:
             ) from refusal
         record = ComposerContextBudgetRecord.from_shed_keys(
             policy_hash=decision.policy_hash,
-            bytes_per_token=decision.bytes_per_token,
+            bytes_per_token=(self._context_budget_policy.fallback_bytes_per_token if decision.pricing.mode == "authored_prefix" else 1.0),
             estimated_tokens_before=decision.estimated_tokens_before,
             estimated_tokens_after=decision.estimated_tokens_after,
             # The decision's bound; the caller records the exact size of the request it sends.
             request_wire_bytes=decision.request_bytes_after,
-            shed_keys=decision.shed_keys,
+            shed_keys=decision.shed_keys
+            + (tuple(sorted(frame.history.shed_history_after(recorder.llm_calls))) if not frame.history_entries else ()),
         )
         shed = frozenset(decision.shed_keys)
+        record = replace(
+            record,
+            pricing_mode=decision.pricing.mode,
+            authored_bytes=decision.pricing.authored_bytes,
+            authored_refuted=decision.pricing.authored_refuted,
+            anchor_status=anchor.reason,
+            anchor_prompt_tokens=anchor.tokens,
+            anchor_wire_bytes=anchor.wire_bytes,
+            anchor_shared_bytes=anchor.shared_bytes,
+            decision_wire_bytes=decision.request_bytes_before,
+            decision_wire_bytes_after=decision.request_bytes_after,
+        )
         if not shed:
-            return messages, record, decision.bytes_per_token
+            return messages, record, 1.0
 
         shed_history_positions = {
             _CONTEXT_BUDGET_HISTORY_START + position
@@ -1790,7 +1851,7 @@ class ComposerServiceImpl:
                 applied.append(stubbed_tool_message(message))
             else:
                 applied.append(message)
-        return applied, record, decision.bytes_per_token
+        return applied, record, 1.0
 
     def _context_budget_refusal(
         self,

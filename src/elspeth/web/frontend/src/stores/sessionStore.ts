@@ -30,6 +30,7 @@ import {
   isComposePermanentRefusal,
 } from "@/config/composer";
 import { useBlobStore } from "./blobStore";
+import { componentOptionsById } from "@/lib/blobBindings";
 import { useExecutionStore } from "./executionStore";
 import { useInterpretationEventsStore } from "./interpretationEventsStore";
 import { requestValidateAfterResolve } from "./validationRequests";
@@ -540,7 +541,7 @@ async function runDurableComposerTurn(descriptor: OperationCustody, localMessage
     const recovery = error && isComposerRecoveryError(error) ? { recoveryError: error, recoveryStartedCompositionVersion: nextState?.id === error.partial_state.id ? nextState.version : beforeVersion } : {};
     const confirmedRecovery = result?.recovery_notice != null && result.state != null && nextState !== null;
     const nextProposals = proposals !== null ? proposalSnapshot.reconcile(state.compositionProposals, mergeCompositionProposals(proposals, result?.proposals ?? [])) : proposalSnapshot.isCurrent() ? mergeCompositionProposals(state.compositionProposals, result?.proposals ?? []) : state.compositionProposals;
-    const head = { compositionState: nextState, unavailableCompositionHead: nextUnavailableHead, compositionStateLoaded: refreshed || confirmedRecovery, ...(state.selectedNodeId && !nextState?.nodes.some((node) => node.id === state.selectedNodeId) ? { selectedNodeId: null } : {}) };
+    const head = { compositionState: nextState, unavailableCompositionHead: nextUnavailableHead, compositionStateLoaded: refreshed || confirmedRecovery, ...(state.selectedNodeId && componentOptionsById(nextState, state.selectedNodeId) === null ? { selectedNodeId: null } : {}) };
     if (surface === "messages") return { messages };
     if (surface === "state") return { ...head, ...(nextUnavailableHead !== null && state.error === null ? { error: GRAPH_UNAVAILABLE_MESSAGE } : {}) };
     if (surface === "proposals") return { compositionProposals: nextProposals };
@@ -2052,7 +2053,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         unavailableCompositionHead: null,
         selectedNodeId:
           !s.selectedNodeId ||
-          newState.nodes.some((n) => n.id === s.selectedNodeId)
+          componentOptionsById(newState, s.selectedNodeId) !== null
             ? s.selectedNodeId
             : null,
       }));

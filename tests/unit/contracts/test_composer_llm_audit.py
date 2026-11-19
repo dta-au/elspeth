@@ -10,6 +10,7 @@ import pytest
 
 from elspeth.contracts.composer_llm_audit import (
     PROVIDER_COST_SOURCE_HIDDEN_PARAMS_RESPONSE_COST,
+    ComposerContextBudgetRecord,
     ComposerLLMCall,
     ComposerLLMCallRecorder,
     ComposerLLMCallStatus,
@@ -55,6 +56,55 @@ def test_status_strenum_values() -> None:
     assert ComposerLLMCallStatus.BAD_REQUEST_ERROR.value == "bad_request_error"
     assert ComposerLLMCallStatus.MALFORMED_RESPONSE.value == "malformed_response"
     assert ComposerLLMCallStatus.CANCELLED.value == "cancelled"
+
+
+def test_context_budget_anchor_status_is_closed_and_older_records_still_load() -> None:
+    legacy = ComposerContextBudgetRecord.from_shed_keys(
+        policy_hash="a" * 64,
+        bytes_per_token=1.0,
+        estimated_tokens_before=10,
+        estimated_tokens_after=10,
+        request_wire_bytes=10,
+        shed_keys=(),
+    )
+    assert legacy.anchor_status is None
+    stored = dataclasses.asdict(legacy)
+    stored.pop("anchor_status")
+    assert ComposerContextBudgetRecord(**stored) == legacy
+    with pytest.raises(ValueError, match="invalid anchor_status"):
+        dataclasses.replace(legacy, anchor_status="not-an-anchor-status")
+
+
+@pytest.mark.parametrize("rate", [1.0, 3.0, 4.25])
+def test_context_budget_record_without_lane_metadata_loads(rate: float) -> None:
+    current = ComposerContextBudgetRecord.from_shed_keys(
+        policy_hash="a" * 64,
+        bytes_per_token=rate,
+        estimated_tokens_before=10,
+        estimated_tokens_after=10,
+        request_wire_bytes=10,
+        shed_keys=(),
+    )
+    stored = dataclasses.asdict(current)
+    for key in (
+        "pricing_mode",
+        "anchor_prompt_tokens",
+        "anchor_wire_bytes",
+        "anchor_shared_bytes",
+        "decision_wire_bytes",
+        "decision_wire_bytes_after",
+        "anchor_status",
+        "authored_bytes",
+        "authored_refuted",
+    ):
+        stored.pop(key)
+    loaded = ComposerContextBudgetRecord(**stored)
+    assert loaded.bytes_per_token == repr(rate)
+    assert loaded.pricing_mode is None
+    assert loaded.anchor_prompt_tokens is None
+    assert loaded.anchor_status is None
+    assert loaded.authored_bytes is None
+    assert loaded.authored_refuted is None
 
 
 def test_to_dict_serializes_enum_and_datetimes() -> None:

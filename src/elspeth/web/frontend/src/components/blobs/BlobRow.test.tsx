@@ -39,6 +39,31 @@ function makeBlob(overrides: Partial<BlobMetadata> = {}): BlobMetadata {
   };
 }
 
+describe("BlobRow attached file cue", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("shows a named chip and links it to the filename and row actions", () => {
+    const { container } = render(<BlobRow blob={makeBlob()} sessionId="session-1"
+      onDownload={vi.fn()} onDelete={vi.fn()} onUseAsInput={vi.fn()}
+      attachedFields={["system_prompt", "prompt_template"]} selectedNodeLabel="llm" />);
+    expect(container.querySelector(".blob-row-item--attached")).toBeInTheDocument();
+    const chip = screen.getByText(/Used by llm/);
+    expect(chip).toHaveTextContent("System prompt");
+    expect(chip).toHaveTextContent("User prompt");
+    expect(chip).toHaveAttribute("title", "system_prompt, prompt_template");
+    const id = chip.getAttribute("id");
+    expect(container.querySelector(".blob-row-filename")).toHaveAttribute("aria-describedby", id);
+    expect(screen.getByRole("button", { name: "Download data.csv" })).toHaveAttribute("aria-describedby", id);
+  });
+
+  it("leaves an unrelated row without an attached cue", () => {
+    const { container } = render(<BlobRow blob={makeBlob()} sessionId="session-1"
+      onDownload={vi.fn()} onDelete={vi.fn()} onUseAsInput={vi.fn()} />);
+    expect(container.querySelector(".blob-row-item--attached")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Used by/)).not.toBeInTheDocument();
+  });
+});
+
 describe("BlobRow preview", () => {
   beforeEach(() => {
     vi.clearAllMocks();

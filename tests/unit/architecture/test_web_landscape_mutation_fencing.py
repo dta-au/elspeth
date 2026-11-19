@@ -344,12 +344,17 @@ _FRESH_EPOCH_ONE_EXCEPTION = AuthorityEstablishmentException(
     caller_symbol="RunLifecycleRepository.begin_run",
     callee_path="src/elspeth/core/landscape/run_coordination_repository.py",
     callee_symbol="RunCoordinationRepository.register_run_leader_on",
+    # PFR option 1 (maintainer ruling 2026-11-18): begin_run appends the
+    # admitted run_prompt_inputs evidence in this same runs-row transaction,
+    # beside run_start_admissions and the web plugin policy evidence, so the
+    # rows exist with their run FK before any provider call.
     write_counts=(
         ("run_attributions", "insert", 1),
         ("run_start_admissions", "insert", 1),
         ("run_coordination", "insert", 1),
         ("run_coordination", "update", 1),
         ("run_coordination_events", "insert", 2),
+        ("run_prompt_inputs", "insert", 1),
         ("run_web_plugin_policy", "insert", 1),
         ("run_workers", "insert", 1),
         ("run_workers", "update", 1),
@@ -663,7 +668,10 @@ def _verb_authority_scope(path: str, method: str) -> str:
 # (72/72). Against release a375d7f13: arrived 1 (the QR node_states insert above),
 # departed 0, moved 0. Measured by scripts/fencing_inventory.py --baseline against a
 # git archive of a375d7f13.
-_EXPECTED_DML_COUNT = 165
+# Round 5: 165 -> 166; begin_run inserts one run_prompt_inputs row shape
+# inside its runs-row transaction. The live scanner adds one identity and
+# one write shape; no existing identity changes.
+_EXPECTED_DML_COUNT = 166
 # D8.1 (P4-D8 elspeth-43ddb79074): 6ca139a7… → 504d39e2…. Count 139 and the write set
 # unchanged; twelve construction FINGERPRINTS moved because the constructions
 # themselves were rewritten to fence first / execute once: the eleven
@@ -794,7 +802,7 @@ _EXPECTED_DML_COUNT = 165
 # _EXPECTED_DML_COUNT.
 # QR merged with release/0.8.1: 6a08f651… (release) -> the value below, the one
 # arrival named at _EXPECTED_DML_COUNT.
-_EXPECTED_DML_INVENTORY_SHA256 = "e36c8c4358dc70992a98c6b6209b37c2d958aac25f8bd39ac615e9c2a9d16032"
+_EXPECTED_DML_INVENTORY_SHA256 = "913e9295eafa5185df205e3c5920242d66753d5c21e4ad0eaf8aa9a230ac88b0"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -837,6 +845,7 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
         ("run_coordination", "insert"),
         ("run_coordination", "update"),
         ("run_coordination_events", "insert"),
+        ("run_prompt_inputs", "insert"),
         ("run_sources", "delete"),
         ("run_sources", "insert"),
         ("run_sources", "update"),
@@ -9861,7 +9870,7 @@ def _reserve_sink_effect_disjoint_receipts(units):
         (
             "src/elspeth/core/landscape/execution/sink_effect_reservation.py",
             "SinkEffectReservation",
-            "a11e1beb3191778c50109a6d8ee25b92125cd614b498396f93445f3a69acc7c5",
+            "e07a4a33cba5e345462d5f07a9c01731beb2379f43075dab6613f60b7ca1dc62",
         ),
         (
             "src/elspeth/engine/executors/sink_effects.py",
@@ -14388,10 +14397,11 @@ def _raw_attribute_collector(unit: SourceUnit, units: tuple[SourceUnit, ...]) ->
 # callback, EMPTY-only admission, and its shared occupancy implementation.
 # These are source bindings, not permissions granted by a filename alone.
 # Landscape creation now serializes and restores SQLAlchemy's transient DDL
-# rules. The EMPTY-only admission, locked callback and stamp are unchanged.
+# rules and creates append-only run_prompt_inputs with run-owned evidence.
+# The EMPTY-only admission, locked callback and stamp are unchanged.
 _NEW_LANDSCAPE_STAMP_SOURCES = {
     "src/elspeth/web/schema_probe.py": "0e4ba641686cba00c9b459e3cc241ce686847211197c2563a4991f5a5d31c4cd",
-    "src/elspeth/core/landscape/database.py": "099a5bff4fa162b87119cadbd5fc10109938cff4d6c4d2a1e8ac2e5d3f31f1ed",
+    "src/elspeth/core/landscape/database.py": "39e9a510defefdc59656abda19b3863727288435ccc60ed1459f955d2773bccf",
     "src/elspeth/core/schema_shape.py": "5b32f7faf09a03a7c482b48a092eb0f7cf5811eb927302ad72820fde81ceccb0",
 }
 
@@ -16039,7 +16049,9 @@ _REVIEWED_REGISTRY_MODULES = {
     # sites: all three install_deadline_guard calls, journal attachment before
     # the guard, and guard installation before table creation are unchanged,
     # and nothing in the journal, guard or clock modules calls the helper.
-    "src/elspeth/core/landscape/database.py": "032c18d341b47fc96ea110e88b222201ea98ab12754cc1527220e71c2b2c661f",
+    # Epoch 51 adds the append-only run_prompt_inputs table and required
+    # trigger; constructor and deadline-guard ordering stay as before.
+    "src/elspeth/core/landscape/database.py": "63edf0d3b00f02f3572b3d02cf9af02e38e947bc3003c8cce01de6f25ddcd2d6",
 }
 
 
@@ -17444,7 +17456,7 @@ def _coordination_repo(self) -> RunCoordinationRepository:
     return self._run_coordination
 """,
     ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.begin_run"): """
-def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id: str | None=None, reproducibility_grade: ReproducibilityGrade | None=None, status: RunStatus=RunStatus.RUNNING, source_schema_json: str | None=None, initiated_by_user_id: str | None=None, auth_provider_type: str | None=None, openrouter_catalog_sha256: str, openrouter_catalog_source: str, leader_worker_id: str | None=None, web_plugin_policy_evidence: WebPluginPolicyEvidence | None=None, run_start_permit: RunStartPermitBinding | None=None, run_mode: RunMode=RunMode.LIVE, replay_from_run_id: str | None=None) -> Run:
+def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id: str | None=None, reproducibility_grade: ReproducibilityGrade | None=None, status: RunStatus=RunStatus.RUNNING, source_schema_json: str | None=None, initiated_by_user_id: str | None=None, auth_provider_type: str | None=None, openrouter_catalog_sha256: str, openrouter_catalog_source: str, leader_worker_id: str | None=None, web_plugin_policy_evidence: WebPluginPolicyEvidence | None=None, run_prompt_inputs: tuple[RunPromptInputEvidence, ...]=(), run_start_permit: RunStartPermitBinding | None=None, run_mode: RunMode=RunMode.LIVE, replay_from_run_id: str | None=None) -> Run:
     if status == RunStatus.COMPLETED:
         raise AuditIntegrityError('begin_run() cannot create a COMPLETED run. Use complete_run() so completed_at is recorded in the audit trail.')
     if type(run_mode) is not RunMode:
@@ -17455,6 +17467,11 @@ def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id
     _validate_openrouter_catalog_snapshot(sha256=openrouter_catalog_sha256, source=openrouter_catalog_source)
     if web_plugin_policy_evidence is not None and (not isinstance(web_plugin_policy_evidence, WebPluginPolicyEvidence)):
         raise AuditIntegrityError('web_plugin_policy_evidence must be a WebPluginPolicyEvidence value')
+    if type(run_prompt_inputs) is not tuple or any(type(item) is not RunPromptInputEvidence for item in run_prompt_inputs):
+        raise AuditIntegrityError('run_prompt_inputs must be a tuple of RunPromptInputEvidence values')
+    keys = [(item.node_id, item.field_path) for item in run_prompt_inputs]
+    if len(keys) != len(set(keys)):
+        raise AuditIntegrityError('run_prompt_inputs contains duplicate prompt fields')
     run_id = run_id or generate_id()
     if replay_from_run_id == run_id:
         raise AuditIntegrityError('a replay/verify run cannot cite itself as its source')
@@ -17470,7 +17487,7 @@ def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id
     try:
         with self._db.write_connection() as conn:
             if run_start_permit is not None:
-                existing = self._observe_permitted_run_on(conn, run_start_permit, config_hash=config_hash, canonical_version=canonical_version, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type, source_schema_json=source_schema_json, runtime_val_manifest_json=runtime_val_manifest_json, web_plugin_policy_evidence=web_plugin_policy_evidence)
+                existing = self._observe_permitted_run_on(conn, run_start_permit, config_hash=config_hash, canonical_version=canonical_version, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type, source_schema_json=source_schema_json, runtime_val_manifest_json=runtime_val_manifest_json, web_plugin_policy_evidence=web_plugin_policy_evidence, run_prompt_inputs=run_prompt_inputs)
                 if existing is not None:
                     return existing
             conn.execute(runs_table.insert().values(run_id=run.run_id, started_at=run.started_at, config_hash=run.config_hash, settings_json=run.settings_json, canonical_version=run.canonical_version, status=run.status.value, run_mode=run.run_mode.value, replay_from_run_id=run.replay_from_run_id, reproducibility_grade=run.reproducibility_grade, source_schema_json=source_schema_json, runtime_val_manifest_json=runtime_val_manifest_json, llm_call_count=None, seeded_from_cache=False, cache_key=None, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source))
@@ -17480,12 +17497,14 @@ def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id
                 conn.execute(run_attributions_table.insert().values(run_id=run.run_id, recorded_at=timestamp, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type))
             if web_plugin_policy_evidence is not None:
                 self._insert_web_plugin_policy_evidence(conn, run_id=run.run_id, evidence=web_plugin_policy_evidence)
+            for evidence in run_prompt_inputs:
+                conn.execute(run_prompt_inputs_table.insert().values(run_id=run.run_id, node_id=evidence.node_id, field_path=evidence.field_path, blob_id=evidence.blob_id, content_sha256=evidence.content_sha256, review_anchor=evidence.review_anchor, effective_artifact_hash=evidence.effective_artifact_hash, admitted_at=now()))
             leader_token = coordination.register_run_leader_on(conn, run_id=run.run_id, worker_id=worker_id, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, entry_point='run')
             coordination._finalize_leader_registration_on(conn, token=leader_token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS)
     except SQLAlchemyError as exc:
         if run_start_permit is not None:
             with self._db.engine.connect() as conn:
-                existing = self._observe_permitted_run_on(conn, run_start_permit, config_hash=config_hash, canonical_version=canonical_version, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type, source_schema_json=source_schema_json, runtime_val_manifest_json=runtime_val_manifest_json, web_plugin_policy_evidence=web_plugin_policy_evidence)
+                existing = self._observe_permitted_run_on(conn, run_start_permit, config_hash=config_hash, canonical_version=canonical_version, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type, source_schema_json=source_schema_json, runtime_val_manifest_json=runtime_val_manifest_json, web_plugin_policy_evidence=web_plugin_policy_evidence, run_prompt_inputs=run_prompt_inputs)
                 if existing is not None:
                     return existing
         raise LandscapeRecordError(f'begin_run — database rejected audit write: {type(exc).__name__}') from exc
@@ -17592,6 +17611,7 @@ _COORDINATION_FINALIZATION_DEPENDENCIES = {
         "SQLAlchemyError": "sqlalchemy.exc.SQLAlchemyError",
         "ReproducibilityGrade": "elspeth.contracts.ReproducibilityGrade",
         "WebPluginPolicyEvidence": "elspeth.contracts.plugin_policy_audit.WebPluginPolicyEvidence",
+        "RunPromptInputEvidence": "elspeth.contracts.run_prompt_input.RunPromptInputEvidence",
         "AuditIntegrityError": "elspeth.contracts.errors.AuditIntegrityError",
         "generate_id": "elspeth.core.ids.generate_id",
         "mint_worker_id": "elspeth.contracts.coordination.mint_worker_id",
@@ -17599,6 +17619,7 @@ _COORDINATION_FINALIZATION_DEPENDENCIES = {
         "DEFAULT_RUN_LIVENESS_WINDOW_SECONDS": "elspeth.contracts.coordination.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS",
         "runs_table": "elspeth.core.landscape.schema.runs_table",
         "run_attributions_table": "elspeth.core.landscape.schema.run_attributions_table",
+        "run_prompt_inputs_table": "elspeth.core.landscape.schema.run_prompt_inputs_table",
     },
 }
 
@@ -17633,7 +17654,7 @@ def acquire_reconciliation_leadership(self, *, run_id: str, worker_id: str, wind
 _COORDINATION_FINALIZATION_RECIPES[
     ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository._observe_permitted_run_on")
 ] = """
-def _observe_permitted_run_on(self, conn: Connection, binding: RunStartPermitBinding, *, config_hash: str, canonical_version: str, openrouter_catalog_sha256: str, openrouter_catalog_source: str, initiated_by_user_id: str | None, auth_provider_type: str | None, source_schema_json: str | None, runtime_val_manifest_json: str | None, web_plugin_policy_evidence: WebPluginPolicyEvidence | None) -> Run | None:
+def _observe_permitted_run_on(self, conn: Connection, binding: RunStartPermitBinding, *, config_hash: str, canonical_version: str, openrouter_catalog_sha256: str, openrouter_catalog_source: str, initiated_by_user_id: str | None, auth_provider_type: str | None, source_schema_json: str | None, runtime_val_manifest_json: str | None, web_plugin_policy_evidence: WebPluginPolicyEvidence | None, run_prompt_inputs: tuple[RunPromptInputEvidence, ...] | None) -> Run | None:
     row = conn.execute(select(runs_table).where(runs_table.c.run_id == binding.run_id)).one_or_none()
     if row is None:
         return None
@@ -17661,6 +17682,9 @@ def _observe_permitted_run_on(self, conn: Connection, binding: RunStartPermitBin
             raise AuditIntegrityError('Permit retry found corrupt admission evidence') from exc
         if (policy.schema_version, policy.policy_hash, policy.snapshot_hash, policy.authorized_plugin_ids_json, policy.available_plugin_ids_json, policy.control_modes_json, policy.selected_implementations_json, policy.selected_profile_aliases_json, policy.plugin_code_identities_json, policy.binding_generation_fingerprint, policy.decision_codes_json, admission_decision) != (evidence.schema_version, evidence.policy_hash, evidence.snapshot_hash, canonical_json(evidence.authorized_plugin_ids), canonical_json(evidence.available_plugin_ids), canonical_json(evidence.control_modes), canonical_json(evidence.selected_implementations), canonical_json(evidence.selected_profile_aliases), canonical_json(evidence.plugin_code_identities), evidence.binding_generation_fingerprint, canonical_json(evidence.decision_codes), evidence.admission_decision):
             raise AuditIntegrityError('Permit retry changed web plugin policy evidence')
+    stored = _stored_run_prompt_inputs_on(conn, binding.run_id)
+    if run_prompt_inputs is not None and stored != frozenset(run_prompt_inputs):
+        raise AuditIntegrityError('Permit retry changed run prompt input evidence')
     return self._run_loader.load(row)
 """
 _COORDINATION_FINALIZATION_RECIPES[("src/elspeth/core/landscape/run_start_admission.py", "RunStartAdmissionRepository.observe_on")] = """
@@ -17704,12 +17728,33 @@ _COORDINATION_FINALIZATION_DEPENDENCIES[
     "RunStartAdmissionRepository": "elspeth.core.landscape.run_start_admission.RunStartAdmissionRepository",
     "AuditIntegrityError": "elspeth.contracts.errors.AuditIntegrityError",
     "WebPluginPolicyEvidence": "elspeth.contracts.plugin_policy_audit.WebPluginPolicyEvidence",
+    "RunPromptInputEvidence": "elspeth.contracts.run_prompt_input.RunPromptInputEvidence",
     "select": "sqlalchemy.select",
     "runs_table": "elspeth.core.landscape.schema.runs_table",
     "run_attributions_table": "elspeth.core.landscape.schema.run_attributions_table",
     "run_web_plugin_policy_table": "elspeth.core.landscape.schema.run_web_plugin_policy_table",
+    "_stored_run_prompt_inputs_on": "elspeth.core.landscape.run_lifecycle_repository._stored_run_prompt_inputs_on",
     "canonical_json": "elspeth.core.canonical.canonical_json",
     "decode_admission_decision": "elspeth.contracts.plugin_policy_audit.decode_admission_decision",
+}
+# The stored prompt-evidence read moved out of _observe_permitted_run_on into
+# this module helper (73d844a2c), shared with the resume check (db303fc21).
+# It is pinned here exactly as it was inline: one select of the run's rows on
+# the caller's connection, decoded into evidence, corrupt rows refused.
+_COORDINATION_FINALIZATION_RECIPES[("src/elspeth/core/landscape/run_lifecycle_repository.py", "_stored_run_prompt_inputs_on")] = """
+def _stored_run_prompt_inputs_on(conn: Connection, run_id: str) -> frozenset[RunPromptInputEvidence]:
+    rows = conn.execute(select(run_prompt_inputs_table).where(run_prompt_inputs_table.c.run_id == run_id)).all()
+    try:
+        return frozenset((RunPromptInputEvidence(node_id=item.node_id, field_path=item.field_path, blob_id=item.blob_id, content_sha256=item.content_sha256, review_anchor=item.review_anchor, effective_artifact_hash=item.effective_artifact_hash) for item in rows))
+    except ValueError as exc:
+        raise AuditIntegrityError('Stored run prompt input evidence is corrupt') from exc
+"""
+_COORDINATION_FINALIZATION_DEPENDENCIES[("src/elspeth/core/landscape/run_lifecycle_repository.py", "_stored_run_prompt_inputs_on")] = {
+    "Connection": "sqlalchemy.engine.Connection",
+    "RunPromptInputEvidence": "elspeth.contracts.run_prompt_input.RunPromptInputEvidence",
+    "AuditIntegrityError": "elspeth.contracts.errors.AuditIntegrityError",
+    "select": "sqlalchemy.select",
+    "run_prompt_inputs_table": "elspeth.core.landscape.schema.run_prompt_inputs_table",
 }
 _COORDINATION_FINALIZATION_DEPENDENCIES[("src/elspeth/core/landscape/run_start_admission.py", "RunStartAdmissionRepository.observe_on")] = {
     "Connection": "sqlalchemy.Connection",
@@ -17734,7 +17779,7 @@ def materialize_cancelled_permit(self, binding: RunStartPermitBinding, config: M
     worker_id = mint_worker_id(binding.run_id)
     with self._db.engine.connect() as conn:
         header = conn.execute(select(runs_table).where(runs_table.c.run_id == binding.run_id)).one_or_none()
-        run = None if header is None else self._observe_permitted_run_on(conn, binding, config_hash=stable_hash(config), canonical_version=canonical_version, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type, source_schema_json=header.source_schema_json, runtime_val_manifest_json=header.runtime_val_manifest_json, web_plugin_policy_evidence=web_plugin_policy_evidence)
+        run = None if header is None else self._observe_permitted_run_on(conn, binding, config_hash=stable_hash(config), canonical_version=canonical_version, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type, source_schema_json=header.source_schema_json, runtime_val_manifest_json=header.runtime_val_manifest_json, web_plugin_policy_evidence=web_plugin_policy_evidence, run_prompt_inputs=None)
     if run is None:
         run = self.begin_run(config, canonical_version, run_id=binding.run_id, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type, web_plugin_policy_evidence=web_plugin_policy_evidence, leader_worker_id=worker_id, run_start_permit=binding)
     if run.status in _TERMINAL_RUN_STATUSES:
@@ -25202,6 +25247,7 @@ def test_authority_establishment_exception_is_exact_and_non_release() -> None:
         ("run_coordination", "insert", 1),
         ("run_coordination", "update", 1),
         ("run_coordination_events", "insert", 2),
+        ("run_prompt_inputs", "insert", 1),
         ("run_web_plugin_policy", "insert", 1),
         ("run_workers", "insert", 1),
         ("run_workers", "update", 1),

@@ -1,17 +1,12 @@
-"""Every node-option authoring tool refuses an LLM-authored blob in an llm prompt surface or model.
+"""Every node-option authoring tool applies the same prompt file policy.
 
-``wire_blob_inline_ref`` refuses to bind an LLM-authored blob into an ``llm``
-node's prompt surface or model (finding #1). A red-team pass showed the refusal
-covered one of several authoring tools: ``upsert_node``, ``patch_node_options``,
-``splice_transform`` and ``set_pipeline`` accept a hand-authored widened ``inline_content``
-marker, and plugin prevalidation withholds it as a deferred value, so the
-planner could route around the wire tool. Each of those tools now refuses with
-the wire tool's repairable text, through the predicate /validate and run
-admission share. User-uploaded (verbatim) blobs are the accepted control.
+Scalar prompt files bind and open review, independent of creator. Model and
+structured query positions remain refused through every authoring path.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -30,12 +25,9 @@ from tests.unit.web.composer import test_splice_transform_tool as splice_fixture
 # Reuse the session/blob fixture the blob-tool suite already owns.
 blob_env = blob_tools.blob_env
 
-_GUARDED_FIELDS = ("prompt_template", "system_prompt", "model", "queries.q.template", "queries.q", "queries")
-# Plugin prevalidation withholds a marker only as a whole top-level option, so
-# only these fields can reach a successful write for the verbatim control. (A
-# whole-``queries`` marker is also withheld, but the multi-query provider policy
-# then refuses the node for an unrelated reason.)
-_TOP_LEVEL_FIELDS = frozenset({"prompt_template", "system_prompt", "model"})
+_SCALAR_FIELDS = ("prompt_template", "system_prompt", "queries.q.template", "queries.0.template")
+_REFUSED_FIELDS = ("model", "queries.q", "queries")
+_NON_SCALAR_REFUSAL = "File-backed LLM prompts bind only to prompt_template, system_prompt, or a query template."
 _LLM_AUTHORED_MODALITIES = tuple(modality for modality in CreationModality if modality.requires_llm_provenance())
 
 
@@ -53,10 +45,14 @@ def _blob(blob_env: dict[str, Any], modality: CreationModality) -> dict[str, str
 
 def _options(field: str, marker: dict[str, str]) -> dict[str, Any]:
     options = dict(deep_thaw(blob_tools._inline_ref_state().nodes[0].options))
+    if field.startswith("queries"):
+        options["max_capacity_retry_seconds"] = 30
     if field in ("prompt_template", "system_prompt", "model", "queries"):
         options[field] = marker
     elif field == "queries.q.template":
         options["queries"] = {"q": {"input_fields": {"x": "x"}, "template": marker}}
+    elif field == "queries.0.template":
+        options["queries"] = [{"name": "q", "input_fields": {"x": "x"}, "template": marker}]
     elif field == "queries.q":
         options["queries"] = {"q": marker}
     else:
@@ -107,11 +103,20 @@ def _set_pipeline_arguments(blob_env: dict[str, Any], options: dict[str, Any]) -
     }
 
 
-def _run(tool: str, field: str, marker: dict[str, str], blob_env: dict[str, Any]) -> tuple[ToolResult, CompositionState, str]:
+def _run(
+    tool: str, field: str, marker: dict[str, str], blob_env: dict[str, Any], *, structured: bool = False
+) -> tuple[ToolResult, CompositionState, str]:
     options = _options(field, marker)
+    if structured:
+        options["prompt_template_parts"] = [{"kind": "text", "text": "Original structured prompt"}]
     catalog = blob_tools._catalog()
     if tool == "upsert_node":
         state = blob_tools._inline_ref_state()
+        if structured:
+            node = state.nodes[0]
+            state = replace(
+                state, nodes=(replace(node, options={**node.options, "prompt_template_parts": options["prompt_template_parts"]}),)
+            )
         node_id = "classify"
         arguments: dict[str, Any] = {
             "id": node_id,
@@ -124,9 +129,17 @@ def _run(tool: str, field: str, marker: dict[str, str], blob_env: dict[str, Any]
         }
     elif tool == "patch_node_options":
         state = blob_tools._inline_ref_state()
+        if structured:
+            node = state.nodes[0]
+            state = replace(
+                state, nodes=(replace(node, options={**node.options, "prompt_template_parts": options["prompt_template_parts"]}),)
+            )
         node_id = "classify"
         root = field.split(".")[0]
-        arguments = {"node_id": node_id, "patch": {root: options[root]}}
+        patch = {root: options[root]}
+        if root == "queries":
+            patch["max_capacity_retry_seconds"] = 30
+        arguments = {"node_id": node_id, "patch": patch}
     elif tool == "splice_transform":
         state = splice_fixtures._state()
         node_id = "inserted"
@@ -159,10 +172,22 @@ def _run(tool: str, field: str, marker: dict[str, str], blob_env: dict[str, Any]
 _TOOLS = ("upsert_node", "patch_node_options", "splice_transform", "set_pipeline")
 
 
-@pytest.mark.parametrize("modality", _LLM_AUTHORED_MODALITIES, ids=lambda modality: modality.value)
-@pytest.mark.parametrize("field", _GUARDED_FIELDS)
 @pytest.mark.parametrize("tool", _TOOLS)
-def test_authoring_tool_refuses_llm_authored_blob_marker_in_llm_prompt_surface(
+def test_structured_prompt_refuses_manually_supplied_marker(blob_env: dict[str, Any], tool: str) -> None:
+    marker = _blob(blob_env, CreationModality.VERBATIM)
+
+    result, state, _node_id = _run(tool, "prompt_template", marker, blob_env, structured=True)
+
+    assert result.success is False
+    assert result.updated_state is state
+    assert result.validation.errors[0].error_code == "prompt_template_parts_required"
+    assert "interpretation slots" in result.validation.errors[0].message
+
+
+@pytest.mark.parametrize("modality", _LLM_AUTHORED_MODALITIES, ids=lambda modality: modality.value)
+@pytest.mark.parametrize("field", _REFUSED_FIELDS)
+@pytest.mark.parametrize("tool", _TOOLS)
+def test_authoring_tool_refuses_llm_authored_blob_in_non_scalar_position(
     blob_env: dict[str, Any], tool: str, field: str, modality: CreationModality
 ) -> None:
     marker = _blob(blob_env, modality)
@@ -174,27 +199,57 @@ def test_authoring_tool_refuses_llm_authored_blob_marker_in_llm_prompt_surface(
     [error] = result.validation.errors
     # set_pipeline names the rejected component with its per-component prefix.
     component_prefix = rejected_component_prefix(f"node:{node_id}") if tool == "set_pipeline" else ""
-    assert error.message.startswith(
-        f"{component_prefix}{tool} cannot wire LLM-authored blob '{marker['blob_ref']}' into LLM node '{node_id}' option '{field}': "
-    )
+    assert error.message == f"{component_prefix}{_NON_SCALAR_REFUSAL}"
+    assert error.error_code == "llm_authored_inline_blob_content"
     if tool == "set_pipeline":
         assert error.rejected_component == f"node:{node_id}"
-        assert error.error_code == "llm_authored_inline_blob_content"
     assert "Prompt {{ row.x }}" not in error.message
 
 
-@pytest.mark.parametrize("field", _GUARDED_FIELDS)
+@pytest.mark.parametrize("modality", _LLM_AUTHORED_MODALITIES, ids=lambda modality: modality.value)
+@pytest.mark.parametrize("field", _SCALAR_FIELDS)
 @pytest.mark.parametrize("tool", _TOOLS)
-def test_authoring_tool_does_not_refuse_user_uploaded_blob_marker_in_llm_prompt_surface(
-    blob_env: dict[str, Any], tool: str, field: str
+def test_authoring_tool_binds_llm_authored_scalar_prompt_file_for_review(
+    blob_env: dict[str, Any], tool: str, field: str, modality: CreationModality
 ) -> None:
+    marker = _blob(blob_env, modality)
+
+    result, _state, node_id = _run(tool, field, marker, blob_env)
+
+    assert result.success is True, [error.message for error in result.validation.errors]
+    assert result.updated_state is not None
+    node = next(node for node in result.updated_state.nodes if node.id == node_id)
+    requirements = deep_thaw(node.options["interpretation_requirements"])
+    assert any(item["kind"] == "llm_prompt_template" and item["status"] == "pending" for item in requirements)
+
+
+@pytest.mark.parametrize("field", _SCALAR_FIELDS)
+@pytest.mark.parametrize("tool", _TOOLS)
+def test_authoring_tool_binds_user_uploaded_scalar_prompt_file_for_review(blob_env: dict[str, Any], tool: str, field: str) -> None:
     marker = _blob(blob_env, CreationModality.VERBATIM)
 
-    result, _state, _node_id = _run(tool, field, marker, blob_env)
+    result, _state, node_id = _run(tool, field, marker, blob_env)
 
-    assert all("LLM-authored" not in error.message for error in result.validation.errors)
-    if field in _TOP_LEVEL_FIELDS and tool != "splice_transform":
-        assert result.success is True, [error.message for error in result.validation.errors]
+    assert result.success is True, [error.message for error in result.validation.errors]
+    assert result.updated_state is not None
+    node = next(node for node in result.updated_state.nodes if node.id == node_id)
+    requirements = deep_thaw(node.options["interpretation_requirements"])
+    assert any(item["kind"] == "llm_prompt_template" and item["status"] == "pending" for item in requirements)
+
+
+@pytest.mark.parametrize("field", _REFUSED_FIELDS)
+@pytest.mark.parametrize("tool", _TOOLS)
+def test_authoring_tool_refuses_uploaded_file_in_non_scalar_position(blob_env: dict[str, Any], tool: str, field: str) -> None:
+    marker = _blob(blob_env, CreationModality.VERBATIM)
+
+    result, state, node_id = _run(tool, field, marker, blob_env)
+
+    assert result.success is False
+    assert result.updated_state is state
+    [error] = result.validation.errors
+    component_prefix = rejected_component_prefix(f"node:{node_id}") if tool == "set_pipeline" else ""
+    assert error.message == f"{component_prefix}{_NON_SCALAR_REFUSAL}"
+    assert error.error_code == "llm_authored_inline_blob_content"
 
 
 @pytest.mark.parametrize("tool", _TOOLS)

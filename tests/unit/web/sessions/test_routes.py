@@ -4549,6 +4549,10 @@ class TestIDORCoverageDrift:
             "list_interpretations",
             "opt_out_of_interpretations",
             "opt_out_summary",
+            # PFR R2: full file text of a prompt-file review card
+            # (``GET /{session_id}/interpretations/{event_id}/prompt``), owner-gated
+            # like the other interpretation routes.
+            "get_interpretation_prompt_snapshot",
             # Phase 4 hello-world tutorial (commit ca9bc05bd) added the
             # audit-story endpoint at ``GET /api/sessions/{session_id}
             # /runs/{run_id}/audit-story``. Like every other session-scoped
@@ -4604,6 +4608,7 @@ class TestIDORCoverageDrift:
             # cross-session 404 assertion lives in
             # ``tests/unit/web/blobs/test_routes.py::TestIDORProtection``.
             "preview_blob_content",
+            "save_prompt_text",
             "delete_blob",
         }
     )
@@ -4732,9 +4737,10 @@ class TestIDORCoverageDrift:
         bypass the session IDOR guard entirely — that is the drift
         this inventory exists to catch.
         """
-        from elspeth.web.blobs import routes
+        from elspeth.web.blobs import prompt_text_routes, routes
 
         found = _collect_ownership_call_site_identities(routes, "_verify_session_and_get_blob_service")
+        found.update(_collect_ownership_call_site_identities(prompt_text_routes, "_verify_session_and_get_blob_service"))
         self._assert_inventory(
             "blobs/routes.py",
             "_verify_session_and_get_blob_service",
@@ -9530,6 +9536,9 @@ async def test_runtime_preflight_for_state_threads_session_id_to_validate_pipeli
             "plugin_snapshot": plugin_snapshot,
             "profile_registry": profile_registry,
             "catalog": catalog,
+            # No blob reader supplied: the validator gets neither callback.
+            "blob_get_metadata": None,
+            "blob_get_content": None,
         }
     ]
 
@@ -12015,9 +12024,9 @@ class TestSendMessageTranscriptSnapshot:
     def test_send_message_passes_context_budget_history_from_the_transcript(self, tmp_path) -> None:
         """The route derives the context-budget history from the turn's records and hands it to compose.
 
-        A stored budgeted call record that shed history index 1, with a
-        recorded 400 wire bytes over 100 prompt tokens, must reach the composer as
-        exactly that ratio, for its model, and that shed set.
+        A stored budgeted call record that shed history index 1 must reach the
+        composer as exactly that shed set. Historical ratios are no longer derived:
+        admission uses live anchors or authored-prefix pricing.
         """
         mock_composer = _make_composer_mock(response_text="Budgeted")
         app, _service = _make_app(tmp_path)
@@ -12076,9 +12085,7 @@ class TestSendMessageTranscriptSnapshot:
         assert resp.status_code == 200, resp.text
         assert mock_composer.compose.await_count == 1
         assert mock_composer.compose.await_args.kwargs["context_budget_history"] == ContextBudgetHistory(
-            bytes_per_token=4.0,
             previously_shed_history=frozenset({"history:1"}),
-            bytes_per_token_by_model=(("test/composer-model", 4.0),),
         )
 
     def test_send_message_transcript_snapshot_contains_prior_turns(self, tmp_path) -> None:

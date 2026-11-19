@@ -513,8 +513,16 @@ def test_composition_state_from_runtime_yaml_rejects_non_mapping_root() -> None:
 def test_composition_state_from_runtime_yaml_rejects_oversized_document() -> None:
     """Hardening: a paste over the character cap is rejected before parsing."""
     oversized = "sources:\n  source:\n    plugin: csv\n" + ("#" * (MAX_RUNTIME_YAML_IMPORT_CHARS + 1))
-    with pytest.raises(RuntimeYamlImportError, match="exceeds the 262144 character import limit"):
+    assert MAX_RUNTIME_YAML_IMPORT_CHARS == 524_288
+    with pytest.raises(RuntimeYamlImportError, match="exceeds the 524288 character import limit"):
         composition_state_from_runtime_yaml(oversized)
+    # The limit itself is admitted: only the excess refuses.
+    at_limit = "sources:\n  source:\n    plugin: csv\n"
+    at_limit += "#" * (MAX_RUNTIME_YAML_IMPORT_CHARS - len(at_limit))
+    try:
+        composition_state_from_runtime_yaml(at_limit)
+    except RuntimeYamlImportError as exc:
+        assert "character import limit" not in str(exc)
 
 
 def test_composition_state_from_runtime_yaml_rejects_malformed_yaml_syntax() -> None:

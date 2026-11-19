@@ -189,6 +189,19 @@ class TestWebSettingsValidation:
                 shareable_link_signing_key=b"\x00" * 32,
             )
 
+    def test_composer_runtime_preflight_timeout_defaults_to_60_seconds(self) -> None:
+        # Raised from 5 s: file-backed prompts make preflight read and verify
+        # session blob bytes, and staging hit the old default doing so.
+        settings = WebSettings(
+            composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
+            composer_max_discovery_turns=10,
+            composer_timeout_seconds=85.0,
+            composer_rate_limit_per_minute=10,
+            shareable_link_signing_key=b"\x00" * 32,
+        )
+        assert settings.composer_runtime_preflight_timeout_seconds == 60.0
+
     def test_composer_max_tool_calls_per_turn_defaults_to_16(self) -> None:
         settings = WebSettings(
             composer_max_composition_turns=15,
