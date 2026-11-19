@@ -1362,10 +1362,13 @@ def _structured_prompt_template_refusal(
         return None
     if candidate != current_options.get("prompt_template") and PROMPT_TEMPLATE_PARTS_KEY not in patch:
         return (
-            f"Node '{node_id}' has a structured prompt. To REPLACE the whole prompt with new text, send prompt_template "
-            "together with prompt_template_parts: null; the old prompt's term reviews are removed and the new text gets "
-            "its own review card. To keep the structured prompt and change its wording, edit prompt_template_parts, "
-            "preserving its interpretation_ref entries; prompt_template is compiled from those parts."
+            f"Node '{node_id}' has a structured prompt, and this call sends different prompt_template text without "
+            "prompt_template_parts. Nothing was changed. If you are NOT replacing this prompt (for example the node was "
+            "re-sent while changing something else), make the other change with a narrower tool that leaves this node "
+            "alone, or send the node whole and unedited as get_pipeline_state(component='set_pipeline_arguments') returns "
+            "it. Only to REPLACE the whole prompt with new text, send prompt_template together with "
+            "prompt_template_parts: null; the old prompt's term reviews are removed and the new text gets its own review "
+            "card. prompt_template is compiled from prompt_template_parts and their interpretation_ref entries."
         )
     return None
 

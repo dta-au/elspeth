@@ -2236,6 +2236,8 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
         "insert one transform on a direct linear path, `upsert_node` / `upsert_edge` to add or rewire a node. "
         "For an llm node that has a structured prompt, options with prompt_template text and prompt_template_parts: null "
         "replace the whole prompt; `superseded_review_ids` names the old prompt's vague-term reviews that were removed. "
+        "To keep that prompt, send the node whole and unedited as get_pipeline_state(component='set_pipeline_arguments') "
+        "returns it; changed prompt_template text without prompt_template_parts is refused (prompt_template_parts_required). "
         "prompt_template text equal to the stored prompt replaces nothing: `prompt_unchanged_node_ids` names each node whose "
         "stored prompt structure and reviews were kept."
     ),
