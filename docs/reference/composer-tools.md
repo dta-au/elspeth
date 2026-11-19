@@ -580,7 +580,7 @@ twin all derive from, and this section is pinned to it by
     "is_valid": true,
     "errors": [],
     "warnings": [
-      {"component": "source", "message": "Source schema mode is 'observed' — consider 'fixed'", "severity": "low", "error_code": "source_schema_mode_observed"}
+      {"component": "source", "message": "Source schema mode is 'observed' — consider 'fixed'", "severity": "low"}
     ],
     "suggestions": [],
     "semantic_contracts": [],
@@ -598,7 +598,7 @@ Always present:
 | Field | Description |
 |-------|-------------|
 | `success` | Whether the tool call succeeded |
-| `validation` | Whole-document validation after this change: `is_valid`, `errors` / `warnings` / `suggestions` (entries with `component`, `message`, `severity`, `error_code`, `rejected_component` when the rejection is about one component (`source` / `source:<name>` / `node:<id>` / `output:<name>`) and absent when it is about the whole candidate, and, when the code carries facts, a `contract`, `row_union_schema`, or `coalesce_union_type` block), `semantic_contracts` (one check per producer, consumer and required field), `graph_repair_suggestions` (the facts of a duplicate consumer: the connection and the steps reading it; no repair is proposed) |
+| `validation` | Whole-document validation after this change: `is_valid`, `errors` / `warnings` / `suggestions` (entries with `component`, `message`, `severity`, `error_code` when the entry has one, `rejected_component` when the rejection is about one component (`source` / `source:<name>` / `node:<id>` / `output:<name>`) and absent when it is about the whole candidate, and, when the code carries facts, a `contract`, `row_union_schema`, or `coalesce_union_type` block), `semantic_contracts` (one check per producer, consumer and required field), `graph_repair_suggestions` (the facts of a duplicate consumer: the connection and the steps reading it; no repair is proposed) |
 | `affected_nodes` | Component ids the call touched |
 | `version` | Pipeline state version (increments on each mutation) |
 

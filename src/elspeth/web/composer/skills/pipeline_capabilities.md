@@ -10,11 +10,12 @@ these exact bytes before their interaction rules.
 
 [capability:discovery-order]
 
-Author pipelines as one complete canonical pipeline document — the
-`set_pipeline` object shape. Each authoring surface accepts that document
-through its own terminal authoring tool; your tool palette and any
-per-request instruction identify yours. Use the read-only discovery tools
-before authoring:
+A pipeline is one canonical pipeline document — the `set_pipeline` object
+shape. To build or rebuild a pipeline, send that complete document through
+your surface's terminal authoring tool; your tool palette and any per-request
+instruction identify yours. Where your palette has narrow edit tools, change an
+existing pipeline with them; without them every change is the complete
+document. Use the read-only discovery tools before authoring:
 
 1. Read the request's information manifest first. Its current pipeline
    projection and policy snapshot are already supplied facts; do not repeat a
@@ -38,8 +39,9 @@ before authoring:
    expression grammar is already supplied. Use blob and secret-reference
    discovery when the request needs them; secret values are never part of
    authoring discovery.
-5. Author through your surface's terminal authoring tool with the complete
-   canonical document. Preserve the requested topology during every repair.
+5. Build or rebuild through your surface's terminal authoring tool with the
+   complete canonical document; change an existing pipeline as stated above.
+   Preserve the requested topology during every repair.
 
 Batch independent missing facts. Pages of one blob depend on its
 returned continuation offset and content hash; read them sequentially, without
@@ -517,6 +519,6 @@ the schema does not contain; use those when correcting a prior conclusion.
 
 Validation failures are structured repair input. Preserve the complete
 requested shape, apply required fields/enums/options from the returned schema or
-assistance, correct routing and field guarantees, then resubmit the complete
-proposal. Never delete a requested source, node,
+assistance, correct routing and field guarantees, then retry what failed: the
+same narrow edit, or the complete proposal. Never delete a requested source, node,
 branch, output, cleanup, LLM, or failure path merely to make validation pass.

@@ -310,8 +310,8 @@ class TestStep3DiscoveryTierMigration:
                 "The result's `prohibited` array names any source categorically banned from "
                 "the web authoring surface by security policy, with its closed reason and "
                 "explanation — cite it when a user asks why a specific plugin is unavailable. "
-                "Call get_plugin_schema only for enum values, nested option shapes, or the "
-                "raw JSON schema; this listing already answers ordinary configuration questions."
+                "The request's `authoring_aids.discovery_digest` is the plugin index: call this listing "
+                "only for a fact it lacks. get_plugin_schema gives a chosen plugin's option contract."
             ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
@@ -332,8 +332,8 @@ class TestStep3DiscoveryTierMigration:
                 "The result's `prohibited` array names any transform categorically banned from "
                 "the web authoring surface by security policy, with its closed reason and "
                 "explanation — cite it when a user asks why a specific plugin is unavailable. "
-                "Call get_plugin_schema only for enum values, nested option shapes, or the "
-                "raw JSON schema; this listing already answers ordinary configuration questions."
+                "The request's `authoring_aids.discovery_digest` is the plugin index: call this listing "
+                "only for a fact it lacks. get_plugin_schema gives a chosen plugin's option contract."
             ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
@@ -353,8 +353,8 @@ class TestStep3DiscoveryTierMigration:
                 "The result's `prohibited` array names any sink categorically banned from "
                 "the web authoring surface by security policy, with its closed reason and "
                 "explanation — cite it when a user asks why a specific plugin is unavailable. "
-                "Call get_plugin_schema only for enum values, nested option shapes, or the "
-                "raw JSON schema; this listing already answers ordinary configuration questions."
+                "The request's `authoring_aids.discovery_digest` is the plugin index: call this listing "
+                "only for a fact it lacks. get_plugin_schema gives a chosen plugin's option contract."
             ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
@@ -859,12 +859,12 @@ class TestStep3MutationTierMigration:
         assert "Preserve existing components when extending a saved draft" in skill
         assert "use a full replacement only when you can supply the exact current bindings and the requested complete state" in skill
         assert "Make an option-only edit to an existing node | `patch_node_options`" in skill
-        assert "Add or rewire a node in an existing pipeline, when neither narrower row above fits | `upsert_node` / `upsert_edge`" in skill
+        assert "Add or rewire a node in an existing pipeline, when no narrower row above fits | `upsert_node` / `upsert_edge`" in skill
         assert (
             "Follow focused repair diagnostics without discarding already verified components or narrowing the requested final topology"
             in skill
         )
-        assert "For edits to an existing pipeline, continue to choose the narrowest supported tool" in skill
+        assert "On a pipeline that already exists, edit with the narrow tools" in skill
 
     def test_upsert_node_required(self) -> None:
         defn = self._get("upsert_node")

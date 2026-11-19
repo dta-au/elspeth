@@ -675,7 +675,8 @@ class TestBuildSystemPrompt:
 
         assert "### Complex New Pipeline Batching" in result
         assert "After establishing source facts and loading the selected components' live schemas" in flattened
-        assert "Use one complete `set_pipeline` when the requested graph fits a concise call" in flattened
+        assert "Use one complete `set_pipeline` when the requested graph has five nodes or fewer" in flattened
+        assert "Send a whole `set_pipeline` only to build or rebuild a pipeline of five nodes or fewer" in flattened
         assert "For a larger graph or substantial component configuration, use bounded batches" in flattened
         assert "`set_source`, `set_output`, `upsert_node`, `upsert_edge`, and focused option patches" in flattened
         assert "instead of holding the entire build in one large generation" in flattened
@@ -733,12 +734,14 @@ class TestBuildSystemPrompt:
         assert "Do not report a source-review handoff mismatch merely because there is no transform node named `source`" in flattened
         assert "never summarize, reformat, or describe it as" in flattened
         assert "A missing or mismatched handoff is not a product blocker when the matching pending requirement exists" in flattened
-        assert "retry its exact kind, `user_term` and `draft`" in flattened
+        assert "retry with its exact `kind` and `user_term`, and omit `llm_draft`" in flattened
+        assert "exact `draft`" not in flattened
         assert "mutation's `applied_component` first to find the exact pending requirement" in flattened
         assert (
             "when that mutation omitted the echo or its echo does not cover the affected component, call `get_pipeline_state`" in flattened
         )
-        assert "Then retry only if a matching pending requirement exists, using its exact draft" in flattened
+        assert "Then retry only if a matching pending requirement exists, omitting `llm_draft`" in flattened
+        assert "using its exact draft" not in flattened
         assert "If it is resolved, continue without another review call" in flattened
         assert "If it is absent, establish whether the current change actually requires a new review before staging one" in flattened
         assert "missing-pending-site rejection alone is not evidence that a review is needed" in flattened
@@ -888,13 +891,12 @@ class TestBuildSystemPrompt:
         assert "Did I define how a subjective user criterion will be operationalized?" in result
         assert "audit your own choices before staging the node" in flattened
         assert (
-            'If the answer to any question is yes, stage a pending `kind="vague_term"` requirement on that same LLM node before `set_pipeline`'
+            'If the answer to any question is yes, stage a pending `kind="vague_term"` requirement on that same LLM node and, '
+            "in that SAME mutation, set `prompt_template_parts` on the node with an `interpretation_ref` slot wiring that requirement"
             in flattened
         )
-        assert (
-            "in that SAME `set_pipeline`, set `prompt_template_parts` on the node with an `interpretation_ref` slot wiring that requirement"
-            in flattened
-        )
+        assert "in the same `set_pipeline`" not in flattened
+        assert "SAME `set_pipeline`" not in flattened
         assert "`request_interpretation_review` after the state mutation succeeds" in flattened
         assert "Such semantics need their own review card even when they would otherwise appear only as wording in the prompt" in flattened
         assert "LLM node preflight has four independent review checks" in result
@@ -1605,6 +1607,12 @@ class TestReplyRegisterRule:
         checklist = SYSTEM_PROMPT.split("## Termination States", 1)[1]
         assert "no tool-argument keys, validation fields, or enum values in prose" in checklist
 
+    def test_termination_states_include_the_approval_stop(self) -> None:
+        states = " ".join(SYSTEM_PROMPT.split("## Termination States", 1)[1].split())
+        assert "A change you sent is a proposal awaiting the user's approval (`APPROVAL_REQUIRED`)" in states
+        assert "Another tool call is needed; keep working." not in states
+        assert "OR a change awaiting the user's approval" in " ".join(SYSTEM_PROMPT.split())
+
 
 class TestSkillFollowsCurrentToolBehaviour:
     """Skill sentences that had drifted from what the tools now do."""
@@ -1621,12 +1629,20 @@ class TestSkillFollowsCurrentToolBehaviour:
     def test_approval_mode_sends_one_composition_change_per_response(self) -> None:
         # tool_batch.py refuses a multi-mutation response whole
         # (approval_batch_not_atomic) and a further mutation while a proposal
-        # is pending (approval_proposal_pending); the narrowest-tool guidance
-        # would otherwise walk the model straight into both.
+        # is pending (approval_proposal_pending); the build-time rule to keep
+        # going after each batch would otherwise walk the model into both.
         flattened = " ".join(SYSTEM_PROMPT.split())
 
         assert "send exactly ONE composition-changing call per response" in flattened
-        assert "one complete `set_pipeline` carrying every part of a multi-part change" in flattened
+        assert (
+            "send the first change alone, then tell the user what follows; send each next change after the one before it is accepted"
+            in flattened
+        )
+        assert (
+            "A pipeline between changes does not have to validate: a change that leaves errors is still recorded as a proposal, "
+            "and the errors clear with the last change" in flattened
+        )
+        assert "Use one `set_pipeline` carrying the whole result" not in flattened
         assert "`approval_batch_not_atomic`" in flattened
         assert "`approval_proposal_pending`" in flattened
         assert "applies only where changes apply directly" in flattened
@@ -1664,10 +1680,12 @@ class TestSkillFollowsCurrentToolBehaviour:
         assert "saying the pipeline is unchanged and no proposal was submitted" in flattened
         assert "The pipeline is unchanged; no proposal was submitted for approval." in Path(tool_batch.__file__).read_text()
 
-    def test_edit_table_does_not_send_an_edgeless_pipeline_to_splice(self) -> None:
+    def test_edit_table_sends_an_edgeless_pipeline_to_splice(self) -> None:
         flattened = " ".join(SYSTEM_PROMPT.split())
 
-        assert "it refuses a pipeline whose `edges` is empty" in flattened
+        assert "it refuses a pipeline whose `edges` is empty" not in flattened
+        assert "only when the saved `edges` list holds" not in flattened
+        assert "`splice_transform`: one call, with or without `edges`" in flattened
         assert "use `upsert_node` for the new node and re-point the successor's `input`" in flattened
 
     def test_preview_and_diff_limits_are_stated(self) -> None:
