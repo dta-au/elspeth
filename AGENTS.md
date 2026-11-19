@@ -203,7 +203,9 @@ working around it.
   never `git restore`/`clean` files you did not stage.
 - The pre-commit secret scanner rescans every line of a touched file, so old
   lines can fire on unrelated edits. Append `# secret-scan: allow-this-line`
-  to a false positive; do not bypass the hook with `--no-verify`.
+  to a false positive. Bypassing hooks with `--no-verify` needs the
+  maintainer's explicit permission for that commit; without it, fix the
+  cause or report the commit as blocked.
 - Do not use `git stash` — use a worktree or a commit instead. This is a
   convention, not an enforced gate: nothing blocks it. (A `.git/hooks/pre-stash`
   once claimed to, but git has no such hook, so it never ran; it was removed
