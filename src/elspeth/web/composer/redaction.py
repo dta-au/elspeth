@@ -3429,7 +3429,7 @@ class ReadAttachmentResponseModel(BaseModel):
     """Sensitive full-file text and recoverable failures share a closed envelope."""
 
     success: bool
-    validation: GetBlobContentValidationModel
+    validation: GetBlobContentValidationModel | None = Field(default=None, exclude_if=lambda validation: validation is None)
     affected_nodes: list[str]
     version: int
     data: ReadAttachmentDataModel | None = Field(default=None, exclude_if=lambda data: data is None)
@@ -3440,6 +3440,10 @@ class ReadAttachmentResponseModel(BaseModel):
     def require_success_data(self) -> ReadAttachmentResponseModel:
         if self.success and self.data is None:
             raise ValueError("Successful read_attachment response requires complete data")
+        if not self.success and self.validation is None:
+            # A successful bounded read carries no validation block; a refusal's
+            # rejection lives only in ``validation.errors`` and must be present.
+            raise ValueError("Refused read_attachment response requires validation")
         return self
 
 
@@ -3453,7 +3457,7 @@ class GetBlobContentResponseModel(BaseModel):
     """
 
     success: bool
-    validation: GetBlobContentValidationModel
+    validation: GetBlobContentValidationModel | None = Field(default=None, exclude_if=lambda validation: validation is None)
     affected_nodes: list[str]
     version: int
     data: GetBlobContentDataModel | None = Field(default=None, exclude_if=lambda data: data is None)
@@ -3464,6 +3468,10 @@ class GetBlobContentResponseModel(BaseModel):
     def require_success_data(self) -> GetBlobContentResponseModel:
         if self.success and self.data is None:
             raise ValueError("Successful get_blob_content response requires data")
+        if not self.success and self.validation is None:
+            # A successful bounded read carries no validation block; a refusal's
+            # rejection lives only in ``validation.errors`` and must be present.
+            raise ValueError("Refused get_blob_content response requires validation")
         return self
 
 
@@ -4265,10 +4273,16 @@ def redact_tool_call_response(
         # an oversized structure.
         over_budget = frozenset(key for key, value in response.items() if not _response_within_projection_budget(value, depth=1))
         response_fields = entry.response_model.model_fields
-        if any(key not in response_fields or response_fields[key].is_required() for key in over_budget):
-            # A required typed field (validation / affected_nodes on the shared
+        if any(
+            key not in response_fields or response_fields[key].is_required() or key in _TOOL_RESULT_ENVELOPE_KEYS for key in over_budget
+        ):
+            # A typed framing field (validation / affected_nodes on the shared
             # ToolResult shadow) cannot take a string sentinel before
-            # validation, and an undeclared key has no field to degrade.
+            # validation, and an undeclared key has no field to degrade. The
+            # framing keys are named as well as the required ones: the bounded
+            # file reads declare ``validation`` optional because a success
+            # omits it, and an over-budget block there must still degrade the
+            # whole row rather than be withheld from a refusal that needs it.
             telemetry.response_projection_limit(tool_name=tool_name, scope="row")
             return dict(_RESPONSE_PROJECTION_LIMIT)
         # Walk the response via its Pydantic model schema.

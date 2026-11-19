@@ -6926,7 +6926,8 @@ async def test_blob_content_discovery_buffers_admitted_result_and_redacts_persis
     assert invocation.tool_name == "get_blob_content"
     buffered = json.loads(invocation.result_canonical or "{}")
     assert buffered["data"]["content"] == "name,score\nada,42\n"
-    assert "affected_nodes" in buffered and "errors" in buffered["validation"]
+    # A successful file read carries no validation block, on the wire or in its buffered record.
+    assert "affected_nodes" in buffered and "validation" not in buffered
     from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 
     summary, envelope = redacted_tool_invocation_content_and_envelope(invocation)
