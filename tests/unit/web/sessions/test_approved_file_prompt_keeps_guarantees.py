@@ -65,6 +65,7 @@ from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.helpers.prompt_review import reviewed_anchor_for
+from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.blobs import test_prompt_editor as prompt_editor
 from tests.unit.web.composer import test_blob_inline_tools as blob_tools
 
@@ -98,12 +99,11 @@ def _service(env: dict[str, Any]) -> SessionServiceImpl:
     return service
 
 
-async def _save_and_approve_prompt_card(service: SessionServiceImpl, env: dict[str, Any], state: CompositionState) -> CompositionState:
-    """Save ``state``, open its pending prompt card, approve it as the card does, return what was saved."""
-    session_id = UUID(env["session_id"])
+async def _save_state(service: SessionServiceImpl, env: dict[str, Any], state: CompositionState) -> Any:
+    """Save ``state`` as the session's next composition state, as a tool call's result is saved."""
     document = state.to_dict()
-    saved = await service.save_composition_state(
-        session_id,
+    return await service.save_composition_state(
+        UUID(env["session_id"]),
         CompositionStateData(
             sources=document["sources"],
             nodes=document["nodes"],
@@ -115,6 +115,12 @@ async def _save_and_approve_prompt_card(service: SessionServiceImpl, env: dict[s
         provenance="tool_call",
         session_operation_context=env["operation"],
     )
+
+
+async def _save_and_approve_prompt_card(service: SessionServiceImpl, env: dict[str, Any], state: CompositionState) -> CompositionState:
+    """Save ``state``, open its pending prompt card, approve it as the card does, return what was saved."""
+    session_id = UUID(env["session_id"])
+    saved = await _save_state(service, env, state)
     draft = prompt_review_draft_from_options(state.nodes[0].options)
     assert draft is not None, "the state carries a pending llm_prompt_template requirement"
     event = await service.create_pending_interpretation_event(
@@ -189,7 +195,7 @@ def _assert_file_prompt_holds_true_guarantees(
     options = state.nodes[0].options
     marker = options
     for key in position.split("."):
-        marker = marker[key]
+        marker = marker[int(key)] if key.isdigit() else marker[key]
     assert marker["mode"] == "inline_content", stage
     verdict = _verdict(state.validate())
     assert verdict == {"is_valid": True, "errors": [], "probe_warnings": [], "messages": []}, (stage, sorted(options), verdict)
@@ -391,14 +397,16 @@ async def test_the_authoring_probe_does_not_judge_a_re_pointed_file_prompt(blob_
 _QUERY_STATE_SINK = {"mode": "flexible", "fields": ["text: str", "q1_score: int"]}
 
 
-def _query_mode_state(tmp_path: Path) -> CompositionState:
-    """The field-declaring pipeline with the llm in query mode: one query with its own inline template."""
+def _query_mode_state(tmp_path: Path, *, form: str) -> CompositionState:
+    """The field-declaring pipeline with the llm in query mode: one query with its own inline template.
+
+    ``form`` is ``"mapping"`` (``queries: {q1: ...}``) or ``"list"`` (``queries: [{name: q1, ...}]``).
+    """
     state = blob_tools._field_declaring_sink_state(tmp_path)
     node = state.nodes[0]
     options = {key: value for key, value in node.options.items() if key not in ("prompt_template", "response_field")}
-    options["queries"] = {
-        "q1": {"input_fields": {"c": "text"}, "output_fields": [{"suffix": "score", "type": "integer"}], "template": "Rate {{ row.c }}"}
-    }
+    query = {"input_fields": {"c": "text"}, "output_fields": [{"suffix": "score", "type": "integer"}], "template": "Rate {{ row.c }}"}
+    options["queries"] = {"q1": query} if form == "mapping" else [{"name": "q1", **query}]
     sink = state.outputs[0]
     return replace(
         state,
@@ -413,7 +421,12 @@ def _query_mode_state(tmp_path: Path) -> CompositionState:
         pytest.param(
             "single", "system_prompt", "You classify each input row. Reply with one label.", ("text", "label"), id="file-system-prompt"
         ),
-        pytest.param("query", "queries.q1.template", "Rate {{ row.c }} from one to five.", ("text", "q1_score"), id="file-query-template"),
+        pytest.param(
+            "mapping", "queries.q1.template", "Rate {{ row.c }} from one to five.", ("text", "q1_score"), id="file-query-template"
+        ),
+        pytest.param(
+            "list", "queries.0.template", "Rate {{ row.c }} from one to five.", ("text", "q1_score"), id="file-query-template-list"
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -424,10 +437,10 @@ async def test_approval_with_the_file_at_another_prompt_position_keeps_true_guar
 
     The first test in this file is the file-template-beside-inline-system-prompt
     case; these are the inline template beside a file system prompt, and a
-    query's own file template.
+    query's own file template, with ``queries`` as a mapping and as a list.
     """
     service = _service(blob_env)
-    state = _query_mode_state(tmp_path) if shape == "query" else blob_tools._field_declaring_sink_state(tmp_path)
+    state = blob_tools._field_declaring_sink_state(tmp_path) if shape == "single" else _query_mode_state(tmp_path, form=shape)
     wired = _wire_file(blob_env, state, content=content, position=position)
     assert _prompt_reviews(wired) == ["pending"]
     _assert_file_prompt_holds_true_guarantees(wired, stage="after wire, card pending", position=position, emitted=emitted)
@@ -442,7 +455,11 @@ async def test_approval_with_the_file_at_another_prompt_position_keeps_true_guar
 
 @pytest.mark.asyncio
 async def test_a_later_tool_write_clears_the_saved_hash_and_the_guarantees_hold(blob_env: dict[str, Any], tmp_path: Path) -> None:
-    """Both saved shapes of an approved file prompt: the hash right after approval, ``None`` after the next tool write."""
+    """Both saved shapes of an approved file prompt: the hash right after approval, ``None`` after the next tool write.
+
+    The ``None`` shape is asserted on the tool's result and again on the state
+    the session service saved and read back.
+    """
     service = _service(blob_env)
     approved = await _save_and_approve_prompt_card(
         service, blob_env, _wire_file(blob_env, blob_tools._field_declaring_sink_state(tmp_path))
@@ -469,38 +486,144 @@ async def test_a_later_tool_write_clears_the_saved_hash_and_the_guarantees_hold(
     assert _prompt_reviews(later) == ["resolved"], "an unrelated option change keeps the approval"
     _assert_file_prompt_holds_true_guarantees(later, stage="hash None, after a later tool write")
 
+    saved = await _save_state(service, blob_env, later)
+    current = await service.get_current_state(UUID(blob_env["session_id"]))
+    assert current is not None and current.id == saved.id
+    reloaded = state_from_record(current)
 
-def test_a_hand_written_marker_over_an_approved_file_prompt_reopens_review_and_is_refused_before_a_run(tmp_path: Path) -> None:
+    assert reloaded.nodes[0].options["temperature"] == 0.2
+    assert HASH_KEY in reloaded.nodes[0].options and reloaded.nodes[0].options[HASH_KEY] is None, "saving does not re-stamp the hash"
+    assert _prompt_reviews(reloaded) == ["resolved"]
+    _assert_file_prompt_holds_true_guarantees(reloaded, stage="hash None, saved and reloaded")
+
+
+def _field_declaring_editor_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, ...]:
+    """The prompt-editor harness (real app, routes and services) over the field-declaring pipeline.
+
+    ``_live_prompt_setup`` builds its session from ``_inline_ref_state``: an
+    observed sink, which requires nothing, so validity there says nothing
+    about the llm's guarantees. Standing the field-declaring state in gives a
+    sink that names ``text`` and ``label``; the inline system prompt keeps the
+    node free of ``llm_system_prompt_missing``.
+    """
+    monkeypatch.setattr(blob_tools, "_inline_ref_state", lambda: blob_tools._field_declaring_sink_state(tmp_path))
+    return prompt_editor._live_prompt_setup(tmp_path, inline_slot="system_prompt")
+
+
+def _current_state(service: Any, session_id: str) -> CompositionState:
+    record = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert record is not None
+    return state_from_record(record)
+
+
+def test_a_hand_written_marker_over_an_approved_file_prompt_reopens_review_and_is_refused_before_a_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """``patch_node_options`` accepts a marker the model typed; the approval does not carry over to it.
 
     The final admission check here is
     ``ExecutionServiceImpl._assert_state_prompt_file_approvals``, the check a
     run passes through; it reads the review and the approval rows, never the
-    saved hash.
+    saved hash. The pipeline is authoring-valid with its true guarantee set
+    at every step: approved, re-pointed and pending, and approved again.
     """
-    client, service, blob_service, session_id, _first, _second, events = prompt_editor._live_prompt_setup(
-        tmp_path, inline_slot="system_prompt"
-    )
+    client, service, blob_service, session_id, _first, _second, events = _field_declaring_editor_setup(tmp_path, monkeypatch)
     prompt_editor._approve_card(service, blob_service, session_id, events["first"])
     assert [snapshot.node_id for snapshot in prompt_editor._admit(service, blob_service, session_id)] == ["first"]
-    other = prompt_editor._upload_blob(client, session_id, b"Prompt text nobody reviewed", "unreviewed.txt", "text/plain")
+    approved = _current_state(service, session_id)
+    first_hash = approved.nodes[0].options[HASH_KEY]
+    assert type(first_hash) is str and len(first_hash) == 64
+    _assert_file_prompt_holds_true_guarantees(approved, stage="after the first file card is approved")
+    other = prompt_editor._upload_blob(client, session_id, OTHER_FILE_TEXT.encode(), "unreviewed.txt", "text/plain")
     marker = {"blob_ref": other["id"], "mode": "inline_content", "sha256": other["content_hash"]}
 
-    updated = prompt_editor._patch_and_save(service, blob_service, session_id, tmp_path, {"prompt_template": marker})
+    prompt_editor._patch_and_save(service, blob_service, session_id, tmp_path, {"prompt_template": marker})
 
-    node = next(node for node in updated.nodes if node.id == "first")
-    assert node.options["prompt_template"] == marker
-    assert HASH_KEY not in node.options, "the write removes the approval's hash"
+    pending = _current_state(service, session_id)
+    assert pending.nodes[0].options["prompt_template"] == marker
+    assert HASH_KEY not in pending.nodes[0].options, "the write removes the approval's hash"
     assert prompt_editor._review_state(service, session_id)[0]["first"] == "pending"
     with pytest.raises(prompt_editor.PromptFileReviewStale) as refusal:
         prompt_editor._admit(service, blob_service, session_id)
     assert refusal.value.error_code == "prompt_file_review_stale"
-    summary = updated.validate()
-    assert not [entry.error_code for entry in summary.warnings if entry.error_code in _PROBE_CODES]
+    _assert_file_prompt_holds_true_guarantees(pending, stage="hand-written marker, review pending again")
+
+    record = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert record is not None
+    draft = prompt_review_draft_from_options(pending.nodes[0].options)
+    assert draft is not None
+    with fenced_operation_context(blob_service._engine, session_id) as operation:
+        reopened = asyncio.run(
+            service.create_pending_interpretation_event(
+                session_id=UUID(session_id),
+                composition_state_id=record.id,
+                affected_node_id="first",
+                tool_call_id="hand-written-marker",
+                user_term="llm_prompt_template:first",
+                kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
+                llm_draft=draft,
+                model_identifier="test-model",
+                model_version="1",
+                provider="test-provider",
+                composer_skill_hash="a" * 64,
+                session_operation_context=operation,
+            )
+        )
+    prompt_editor._approve_card(service, blob_service, session_id, reopened.id)
+
+    assert [snapshot.node_id for snapshot in prompt_editor._admit(service, blob_service, session_id)] == ["first"]
+    reapproved = _current_state(service, session_id)
+    assert reapproved.nodes[0].options["prompt_template"] == marker
+    second_hash = reapproved.nodes[0].options[HASH_KEY]
+    assert type(second_hash) is str and len(second_hash) == 64 and second_hash != first_hash
+    _assert_file_prompt_holds_true_guarantees(reapproved, stage="after the hand-written marker's card is approved")
 
 
-def test_editor_save_stamps_the_hash_and_the_probe_still_computes_guarantees(tmp_path: Path) -> None:
-    """The second stamp site: the owner saves the bound file in the node inspector."""
+def test_editor_save_restamps_the_hash_and_the_pipeline_stays_valid_with_true_guarantees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The second stamp site, on a pipeline whose validity is decided by the llm's guarantees.
+
+    A node with inline prompt text beside the file cannot be saved from the
+    editor while its card is pending
+    (``test_prompt_editor.py::test_pending_inline_card_refuses_save_then_card_allows_it``),
+    so the owner approves the card, then edits the file: the save records its
+    own approval of the new bytes and stamps a new hash.
+    """
+    client, service, blob_service, session_id, uploaded, _second, events = _field_declaring_editor_setup(tmp_path, monkeypatch)
+    prompt_editor._approve_card(service, blob_service, session_id, events["first"])
+    card_hash = _current_state(service, session_id).nodes[0].options[HASH_KEY]
+    assert type(card_hash) is str and len(card_hash) == 64
+
+    saved = prompt_editor._save(client, session_id, uploaded["id"], FILE_TEXT, uploaded["content_hash"])
+
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["changed"] is True
+    state = _current_state(service, session_id)
+    assert state.nodes[0].options["prompt_template"]["sha256"] == saved.json()["content_sha256"]
+    save_hash = state.nodes[0].options[HASH_KEY]
+    assert type(save_hash) is str and len(save_hash) == 64 and save_hash != card_hash, "the editor save stamps the new text's hash"
+    assert prompt_editor._review_state(service, session_id)[0]["first"] == "resolved"
+    assert [snapshot.node_id for snapshot in prompt_editor._admit(service, blob_service, session_id)] == ["first"]
+    _assert_file_prompt_holds_true_guarantees(state, stage="after the editor save")
+    _assert_helper_goes_red_on_a_failed_probe(state)
+
+
+def test_editor_save_as_the_first_approval_stamps_the_hash_and_the_probe_still_computes_guarantees(tmp_path: Path) -> None:
+    """The editor save as the FIRST approval, on a node with no inline prompt text; asserts probe codes, not validity.
+
+    The owner saves the bound file before any card is approved. The editor
+    refuses that while inline prompt text sits beside the file
+    (``prompt_file_review_pending_inline``), so this path exists only for a
+    node whose one prompt is the file. That shape cannot be authoring-valid,
+    for two reasons unrelated to the probe: the node has no system prompt
+    (``llm_system_prompt_missing``), and a second file for the system prompt
+    is not open to it either (the editor refuses a node with two prompt
+    files). The harness's sink is also observed and requires nothing, so the
+    test adds one required field to make the llm's guarantees decide. The
+    valid pipeline, where the save follows an approved card, is the test
+    above.
+    """
     client, service, _blob_service, session_id, uploaded, _second, _events = prompt_editor._live_prompt_setup(tmp_path)
     saved = prompt_editor._save(client, session_id, uploaded["id"], "Owner edited prompt", uploaded["content_hash"])
     assert saved.status_code == 200, saved.text
