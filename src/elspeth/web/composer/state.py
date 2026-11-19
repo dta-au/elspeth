@@ -922,6 +922,35 @@ def _coalesce_mapped_branch_connections(branches: CoalesceBranches | None) -> tu
     )
 
 
+def _connection_consumer_claims(nodes: Sequence[NodeSpec]) -> list[tuple[str, str, str]]:
+    """Return ``(connection, node id, description)`` for every binding that consumes a connection.
+
+    Queue and row_union ``NodeSpec.input`` fields are structural placeholders,
+    not consuming bindings. Coalesce/row_union identity branches are direct
+    COPY edges; only mapped branches claim their input connection. One node
+    can claim one connection twice (two mapped branches of one barrier).
+
+    The one authority for who consumes what: the duplicate-consumer error and
+    the duplicate-consumer facts in ``graph_repair_suggestions`` both read it,
+    so the two never name different consumers.
+    """
+    claims: list[tuple[str, str, str]] = [
+        (node.input, node.id, f"node '{node.id}'") for node in nodes if node.node_type not in ("coalesce", "queue", "row_union")
+    ]
+    for node in nodes:
+        if node.node_type == "coalesce":
+            claims.extend(
+                (connection_name, node.id, f"coalesce '{node.id}' mapped branch")
+                for connection_name in _coalesce_mapped_branch_connections(node.branches)
+            )
+        elif node.node_type == "row_union":
+            claims.extend(
+                (connection_name, node.id, f"row_union '{node.id}' mapped branch")
+                for connection_name in _coalesce_mapped_branch_connections(node.branches)
+            )
+    return claims
+
+
 def _serialize_branches(branches: CoalesceBranches) -> list[str] | dict[str, str]:
     """Serialize coalesce branches preserving list-vs-mapping semantics."""
     if isinstance(branches, Mapping):
@@ -5002,35 +5031,18 @@ def _check_schema_contracts(
             )
         )
 
-    # Queue and row_union NodeSpec.input fields are structural placeholders,
-    # not consuming bindings. Coalesce/row_union identity branches are direct
-    # COPY edges; only mapped branches claim their input connection.
-    consumer_claims: list[tuple[str, str, str]] = [
-        (node.input, node.id, f"node '{node.id}'") for node in nodes if node.node_type not in ("coalesce", "queue", "row_union")
-    ]
-    for node in nodes:
-        if node.node_type == "coalesce":
-            consumer_claims.extend(
-                (connection_name, node.id, f"coalesce '{node.id}' mapped branch")
-                for connection_name in _coalesce_mapped_branch_connections(node.branches)
-            )
-        elif node.node_type == "row_union":
-            consumer_claims.extend(
-                (connection_name, node.id, f"row_union '{node.id}' mapped branch")
-                for connection_name in _coalesce_mapped_branch_connections(node.branches)
-            )
+    consumer_claims = _connection_consumer_claims(nodes)
     consumer_counts = Counter(connection_name for connection_name, _node_id, _desc in consumer_claims)
     duplicate_consumers = sorted(name for name, count in consumer_counts.items() if count > 1)
     for connection_name in duplicate_consumers:
-        dup_entries = [(node_id, desc) for name, node_id, desc in consumer_claims if name == connection_name]
-        first_node, first_desc = dup_entries[0]
-        second_node, second_desc = dup_entries[1]
+        named = [f"{desc} ({node_id})" for name, node_id, desc in consumer_claims if name == connection_name]
+        # Every consumer is named. At exactly two the message is the one
+        # shipped before every consumer was named, byte for byte.
+        listed = ", ".join(named[:-1]) + " and " + named[-1]
         errors.append(
             _err(
                 f"connection:{connection_name}",
-                f"Duplicate consumer for connection '{connection_name}': "
-                f"{first_desc} ({first_node}) and {second_desc} ({second_node}). "
-                "Use a gate for fan-out.",
+                f"Duplicate consumer for connection '{connection_name}': {listed}. Use a gate for fan-out.",
                 "high",
                 "duplicate_connection_consumer",
             )

@@ -1262,8 +1262,8 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"duplicate_connection_consumer|Duplicate consumer for connection",
-        "Two different nodes read the same connection as their input; every connection has exactly one consumer.",
-        "Give each consumer its own input connection (fan out with a gate fork_to if both need the same rows).",
+        "Two or more nodes read the same connection as their input; every connection has exactly one consumer.",
+        "Give each consumer its own input connection (fan out with a gate fork_to if they need the same rows).",
     ),
     (
         r"connection_sink_name_overlap|Connection names overlap with sink names|collides with a sink of the same name",
