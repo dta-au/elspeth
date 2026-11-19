@@ -17,19 +17,37 @@
    "surface": "tool-data",
    "tool": "patch_node_options",
    "key": "data.prompt_unchanged_note",
-   "reason": "A self-explaining sentence that travels only beside prompt_unchanged_node_ids, which each tool's description does teach: it tells the model in the result itself that the node was sent its existing prompt text and nothing was replaced. The integrator ruled on 2026-11-19 that it gets no clause in the tool descriptions, because teaching 'equal text is harmless' there invites the habit of sending prompt_template on a structured step."
+   "reason": "The note is itself the teaching: it is the one sentence that explains prompt_unchanged_node_ids in the same result."
   },
   {
    "surface": "tool-data",
    "tool": "upsert_node",
    "key": "data.prompt_unchanged_note",
-   "reason": "A self-explaining sentence that travels only beside prompt_unchanged_node_ids, which each tool's description does teach: it tells the model in the result itself that the node was sent its existing prompt text and nothing was replaced. The integrator ruled on 2026-11-19 that it gets no clause in the tool descriptions, because teaching 'equal text is harmless' there invites the habit of sending prompt_template on a structured step."
+   "reason": "The note is itself the teaching: it is the one sentence that explains prompt_unchanged_node_ids in the same result."
   },
   {
    "surface": "tool-data",
    "tool": "set_pipeline",
    "key": "data.prompt_unchanged_note",
-   "reason": "A self-explaining sentence that travels only beside prompt_unchanged_node_ids, which each tool's description does teach: it tells the model in the result itself that the node was sent its existing prompt text and nothing was replaced. The integrator ruled on 2026-11-19 that it gets no clause in the tool descriptions, because teaching 'equal text is harmless' there invites the habit of sending prompt_template on a structured step."
+   "reason": "The note is itself the teaching: it is the one sentence that explains prompt_unchanged_node_ids in the same result."
+  },
+  {
+   "surface": "tool-data",
+   "tool": "patch_node_options",
+   "key": "data.prompt_unchanged_node_ids",
+   "reason": "Not taught in prose by ruling: the same result carries prompt_unchanged_note, one sentence that says what the listed nodes keep. A description or skill clause was considered and not chosen, to keep per-request text small."
+  },
+  {
+   "surface": "tool-data",
+   "tool": "upsert_node",
+   "key": "data.prompt_unchanged_node_ids",
+   "reason": "Not taught in prose by ruling: the same result carries prompt_unchanged_note, one sentence that says what the listed nodes keep. A description or skill clause was considered and not chosen, to keep per-request text small."
+  },
+  {
+   "surface": "tool-data",
+   "tool": "set_pipeline",
+   "key": "data.prompt_unchanged_node_ids",
+   "reason": "Not taught in prose by ruling: the same result carries prompt_unchanged_note, one sentence that says what the listed nodes keep. A description or skill clause was considered and not chosen, to keep per-request text small."
   }
  ]
 }

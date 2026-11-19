@@ -475,9 +475,7 @@ _UPSERT_NODE_DECLARATION = ToolDeclaration(
         "For an llm node that has a structured prompt, options with prompt_template text and prompt_template_parts: null "
         "replace the whole prompt; `superseded_review_ids` names the old prompt's vague-term reviews that were removed. "
         "To keep that prompt, send the node whole and unedited as get_pipeline_state(component='set_pipeline_arguments') "
-        "returns it; changed prompt_template text without prompt_template_parts is refused (prompt_template_parts_required). "
-        "prompt_template text equal to the stored prompt replaces nothing: `prompt_unchanged_node_ids` names each node whose "
-        "stored prompt structure and reviews were kept."
+        "returns it; changed prompt_template text without prompt_template_parts is refused (prompt_template_parts_required)."
     ),
     json_schema=_UPSERT_NODE_DECLARATION_JSON_SCHEMA,
     augments_on_failure=True,
@@ -2527,8 +2525,6 @@ _PATCH_NODE_OPTIONS_DECLARATION = ToolDeclaration(
     "To REPLACE the whole prompt with new text, send prompt_template (the new text) with prompt_template_parts: null "
     "and no interpretation_requirements key: the parts and every vague-term review of the old prompt are removed, "
     "`superseded_review_ids` names the removed reviews, and the new text gets its own review card. "
-    "prompt_template text equal to the stored prompt replaces nothing: `prompt_unchanged_node_ids` names the node "
-    "whose stored prompt structure and reviews were kept. "
     "Changed prompt context requires fresh review. "
     "Do not use this for node routing fields such as on_success/on_error/input/routes; "
     "use upsert_edge or upsert_node for routing edits. Gate on_error is node-level and must use upsert_node.",
