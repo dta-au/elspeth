@@ -1,15 +1,21 @@
 """The structural-cycle workload for the Composer edit battery, and its verifier.
 
-This is the large-graph stress workload a customer measured on their deployment,
-carried into the battery so the same edits can be sent and judged the same
-way. The fixture is one source, one LLM node (the *anchor*) and a main-flow
-sink; the size comes from the LLM node's prompt and query configuration.
-Each ten-step cycle edits the routing around the anchor only:
+This is the large-graph stress workload a customer measured on their
+deployment, carried into the battery so the same edits can be sent and
+judged the same way. Each ten-step cycle edits the routing around one
+*anchor* step, between its *upstream* (a source or step) and its
+*downstream* (a step or sink) -- a :class:`Position`:
 
 1. add a passthrough before the anchor, 2. one after it, 3. a second before,
 4. a second after, 5. swap the before pair, 6. swap the after pair, then
 7-10. remove all four, the last step also restoring the original routing
 values. Cycle 1 names its nodes ``compact_*``, later cycles ``cycleN_*``.
+
+The customer's fixture was one source, one LLM node and a sink, so their
+one position was ``source -> capacity_probe -> results``. Given several
+positions (from a generated fixture's manifest), cycle ``k`` edits around
+position ``k`` modulo their number, so the edits land in different places of
+a realistic graph.
 
 The instruction wording is the workload that was measured and is pinned by
 ``tests/unit/scripts/staging/test_structural_cycle.py``; change it only with
@@ -22,7 +28,10 @@ of names. The built plan is hashed like a plan file, so a resumed attempt
 with other names or another step count is refused.
 
 The verifier (:func:`verify_state` and :func:`operation_codes`) reports the
-same error codes as the customer's runner. Codes from the state check:
+same error codes as the customer's runner, generalised from their one node to
+any graph: every node, source and output the step did not name must equal
+the starting graph, and a named one may differ only in the wiring the step
+had to touch. Codes from the state check:
 
 ``node_inventory_mismatch``, ``original_llm_content_changed``,
 ``source_content_changed``, ``sink_content_changed``, ``metadata_changed``,
@@ -42,6 +51,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from scripts.staging.edit_plan import Plan
@@ -60,7 +70,36 @@ CHECKPOINT_NOTICE_PREFIX = "Checkpoint save status:"
 # A component name lands in chat text and in JSON pointers; keep it to plain identifier characters.
 _COMPONENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,127}")
 
+# The names a cycle gives the nodes it adds.
+_CYCLE_NODE = re.compile(r"(compact|cycle[0-9]+)_(before|after)_[ab]")
+
 type EndReviewEvidence = Literal["required", "if-recorded"]
+
+
+@dataclass(frozen=True, slots=True)
+class Position:
+    """Where a cycle edits: ``upstream -> anchor -> downstream``.
+
+    The upstream is a source or a node; the downstream a node or, with
+    ``downstream_is_sink``, an output.
+    """
+
+    upstream: str
+    anchor: str
+    downstream: str
+    downstream_is_sink: bool
+
+    def as_json(self) -> JsonObject:
+        return {
+            "upstream": self.upstream,
+            "anchor": self.anchor,
+            "downstream": self.downstream,
+            "downstream_is_sink": self.downstream_is_sink,
+        }
+
+    @classmethod
+    def from_json(cls, value: Mapping[str, Any]) -> Position:
+        return cls(value["upstream"], value["anchor"], value["downstream"], value["downstream_is_sink"] is True)
 
 
 def _was(pointer: str) -> str:
@@ -68,12 +107,17 @@ def _was(pointer: str) -> str:
     return "{was:" + pointer + "}"
 
 
-def planned_step(number: int, source: str, anchor: str, sink: str) -> tuple[str, list[str]]:
-    """The instruction for step ``number`` (from 1) and the node order it must leave between source and sink.
+def planned_step(number: int, position: Position) -> tuple[str, list[str]]:
+    """The instruction for step ``number`` (from 1) and the node order it must leave between upstream and downstream.
 
-    The last step of a cycle names the original routing values as
-    ``{was:...}`` fields, filled in from the attempt's starting graph.
+    The wording is the customer's template with the position's names put in;
+    a downstream output is called "the <name> sink" where the template says
+    so, a downstream node just "<name>". The last step of a cycle names the
+    original routing values as ``{was:...}`` fields, filled in from the
+    attempt's starting graph.
     """
+    source, anchor, sink = position.upstream, position.anchor, position.downstream
+    sink_phrase = f"the {sink} sink" if position.downstream_is_sink else sink
     cycle, index = divmod(number - 1, CYCLE_LENGTH)
     prefix = "compact" if cycle == 0 else f"cycle{cycle}"
     before_a, before_b = prefix + "_before_a", prefix + "_before_b"
@@ -82,10 +126,10 @@ def planned_step(number: int, source: str, anchor: str, sink: str) -> tuple[str,
     original_output = _was(f"/nodes/{anchor}/on_success")
     steps = [
         (f"Add a passthrough transform named {before_a} between {source} and {anchor}.", [before_a, anchor]),
-        (f"Add a passthrough transform named {after_a} between {anchor} and the {sink} sink.", [before_a, anchor, after_a]),
+        (f"Add a passthrough transform named {after_a} between {anchor} and {sink_phrase}.", [before_a, anchor, after_a]),
         (f"Add a passthrough transform named {before_b} between {source} and {before_a}.", [before_b, before_a, anchor, after_a]),
         (
-            f"Add a passthrough transform named {after_b} between {after_a} and the {sink} sink.",
+            f"Add a passthrough transform named {after_b} between {after_a} and {sink_phrase}.",
             [before_b, before_a, anchor, after_a, after_b],
         ),
         (
@@ -110,24 +154,32 @@ def planned_step(number: int, source: str, anchor: str, sink: str) -> tuple[str,
     return instruction + INSTRUCTION_SUFFIX, order
 
 
-def check_names(source: str, anchor: str, sink: str) -> None:
-    for flag, value in (("--source", source), ("--anchor", anchor), ("--sink", sink)):
-        if not _COMPONENT_NAME.fullmatch(value):
-            raise UsageError(f"{flag} must be a component name of letters, digits, _ and - (got {value!r})")
-    if len({source, anchor, sink}) != 3:
-        raise UsageError("--source, --anchor and --sink must be three different names")
+def check_positions(positions: Sequence[Position]) -> None:
+    if not positions:
+        raise UsageError("the workload needs at least one position")
+    for position in positions:
+        for label, value in (("upstream", position.upstream), ("anchor", position.anchor), ("downstream", position.downstream)):
+            if not _COMPONENT_NAME.fullmatch(value):
+                raise UsageError(f"position {label} must be a component name of letters, digits, _ and - (got {value!r})")
+        if len({position.upstream, position.anchor, position.downstream}) != 3:
+            raise UsageError("a position's upstream, anchor and downstream must be three different names")
 
 
-def structural_cycle_plan(*, steps: int, source: str, anchor: str, sink: str) -> Plan:
-    """The workload as a battery plan of ``steps`` edits; each edit carries the node ``order`` it must leave."""
+def structural_cycle_plan(*, steps: int, positions: Sequence[Position]) -> Plan:
+    """The workload as a battery plan of ``steps`` edits.
+
+    Cycle ``k`` (ten steps) edits around ``positions[k % len(positions)]``.
+    Each edit carries the node ``order`` it must leave and its ``position``.
+    """
     if not 1 <= steps <= MAX_STEPS:
         raise UsageError(f"--steps must be between 1 and {MAX_STEPS}")
-    check_names(source, anchor, sink)
+    check_positions(positions)
     edits: list[JsonObject] = []
     for number in range(1, steps + 1):
-        message, order = planned_step(number, source, anchor, sink)
-        edits.append({"id": f"cycle-step-{number}", "message": message, "expect": [], "order": order})
-    verifier_args = {"source": source, "anchor": anchor, "sink": sink}
+        position = positions[((number - 1) // CYCLE_LENGTH) % len(positions)]
+        message, order = planned_step(number, position)
+        edits.append({"id": f"cycle-step-{number}", "message": message, "expect": [], "order": order, "position": position.as_json()})
+    verifier_args: JsonObject = {"positions": [position.as_json() for position in positions]}
     identity = json.dumps({"verifier": VERIFIER, "args": verifier_args, "edits": edits}, sort_keys=True).encode()
     return Plan(
         name=f"{VERIFIER}_{steps}",
@@ -143,28 +195,59 @@ def structural_cycle_plan(*, steps: int, source: str, anchor: str, sink: str) ->
 # ── the fixture ────────────────────────────────────────────────────────────
 
 
-def check_fixture(state: Mapping[str, Any], *, source: str, anchor: str, sink: str) -> JsonObject:
-    """Refuse a graph that is not the workload's fixture; return its counts.
+def _route_out(state: Mapping[str, Any], name: str) -> object:
+    """The connection an upstream source or node sends its rows to (``None`` if it has none)."""
+    if name in state["sources"]:
+        return _field(state["sources"][name], "on_success")
+    nodes = {node["id"]: node for node in state["nodes"]}
+    return _field(nodes[name] if name in nodes else None, "on_success")
 
-    One LLM node with the anchor id, exactly the named source, the named sink
-    among the outputs, a valid graph, and the source routed straight through
-    the LLM node to the sink.
+
+def _route_in(state: Mapping[str, Any], position: Position) -> object:
+    """The connection the downstream takes rows from: the sink's own name, or the node's ``input``."""
+    if position.downstream_is_sink:
+        return position.downstream
+    nodes = {node["id"]: node for node in state["nodes"]}
+    return _field(nodes[position.downstream] if position.downstream in nodes else None, "input")
+
+
+def check_fixture(state: Mapping[str, Any], *, positions: Sequence[Position]) -> JsonObject:
+    """Refuse a graph the workload cannot run on; return its counts.
+
+    Each position's upstream (a source or node) must route straight into its
+    anchor (a transform), and the anchor straight into its downstream (a
+    node, or an output when the position says so); the graph must be valid
+    and hold no node that a cycle would add.
     """
-    nodes = state["nodes"]
-    if len(nodes) != 1 or nodes[0]["id"] != anchor or nodes[0]["plugin"] != "llm":
-        raise OperationFailed(f"the fixture must have exactly one node: an LLM node with the id {anchor} (--anchor)")
-    if set(state["sources"]) != {source} or not any(output["name"] == sink for output in state["outputs"]):
-        raise OperationFailed(f"the fixture must have the one source {source} (--source) and the sink {sink} (--sink)")
+    nodes = {node["id"]: node for node in state["nodes"]}
+    outputs = {output["name"] for output in state["outputs"]}
+    added = [name for name in nodes if _CYCLE_NODE.fullmatch(name)]
+    if added:
+        raise OperationFailed(f"the graph already holds nodes a cycle adds: {', '.join(sorted(added))}; start from a fresh copy")
+    for position in positions:
+        if position.upstream not in state["sources"] and position.upstream not in nodes:
+            raise OperationFailed(f"position upstream {position.upstream} is neither a source nor a node of the graph")
+        if position.anchor not in nodes or nodes[position.anchor]["node_type"] != "transform":
+            raise OperationFailed(f"position anchor {position.anchor} is not a transform node of the graph")
+        if (position.downstream in outputs) is not position.downstream_is_sink or (
+            not position.downstream_is_sink and position.downstream not in nodes
+        ):
+            kind = "an output" if position.downstream_is_sink else "a node"
+            raise OperationFailed(f"position downstream {position.downstream} is not {kind} of the graph")
+        anchor = nodes[position.anchor]
+        if _route_out(state, position.upstream) != anchor["input"] or anchor["on_success"] != _route_in(state, position):
+            raise OperationFailed(f"the graph must route {position.upstream} straight through {position.anchor} to {position.downstream}")
     if state["is_valid"] is not True:
         raise OperationFailed("validate the fixture and resolve its prompt and file reviews before starting")
-    if state["sources"][source]["on_success"] != nodes[0]["input"] or nodes[0]["on_success"] != sink:
-        raise OperationFailed(f"the fixture must route {source} straight through {anchor} to {sink}")
-    queries = nodes[0]["options"]["queries"] if "queries" in nodes[0]["options"] else None
+    llm = [node for node in state["nodes"] if node["plugin"] == "llm"]
     return {
         "sources": len(state["sources"]),
-        "nodes": len(nodes),
+        "nodes": len(state["nodes"]),
+        "llm_nodes": len(llm),
         "sinks": len(state["outputs"]),
-        "prompt_queries": len(queries) if isinstance(queries, (list, dict)) else 0,
+        "prompt_queries": sum(
+            len(node["options"]["queries"]) for node in llm if isinstance(_field(node["options"], "queries"), (list, dict))
+        ),
     }
 
 
@@ -185,28 +268,42 @@ def _field(component: Mapping[str, Any] | None, key: str) -> Any:
     return component[key] if component is not None and key in component else None
 
 
-def verify_state(
-    baseline: Mapping[str, Any], current: Mapping[str, Any], order: Sequence[str], *, source: str, anchor: str, sink: str
-) -> list[str]:
-    """The state codes for a graph that should hold ``order`` between source and sink (sorted, distinct)."""
+def verify_state(baseline: Mapping[str, Any], current: Mapping[str, Any], order: Sequence[str], position: Position) -> list[str]:
+    """The state codes for a graph that should hold ``order`` between the position's upstream and downstream.
+
+    The customer's verifier, generalised from one node to any graph: every
+    node, source and output the step did not name must equal the starting
+    graph, and a named one may differ only in the wiring the step had to
+    touch (the upstream's ``on_success``, the anchor's ``input`` and
+    ``on_success``, a downstream node's ``input``). A changed node is
+    reported as ``original_llm_content_changed``, whichever node it is.
+    Returns the codes sorted and distinct.
+    """
     errors: set[str] = set()
+    up, anchor, down = position.upstream, position.anchor, position.downstream
     nodes = {node["id"]: node for node in current["nodes"]}
-    if set(nodes) != set(order):
+    baseline_nodes = {node["id"]: node for node in baseline["nodes"]}
+    if set(nodes) != set(baseline_nodes) | set(order):
         errors.add("node_inventory_mismatch")
-    original_anchor = baseline["nodes"][0]
-    actual_anchor = nodes[anchor] if anchor in nodes else None
-    if _without(original_anchor, ("input", "on_success")) != (_without(actual_anchor, ("input", "on_success")) or {}):
-        errors.add("original_llm_content_changed")
-    actual_source = current["sources"][source] if source in current["sources"] else None
-    if _without(baseline["sources"][source], ("on_success",)) != (_without(actual_source, ("on_success",)) or {}) or set(
-        current["sources"]
-    ) != {source}:
+    wiring = {up: ("on_success",), anchor: ("input", "on_success")}
+    if not position.downstream_is_sink:
+        wiring[down] = ("input",)
+    for name, original in baseline_nodes.items():
+        allowed = wiring[name] if name in wiring else ()
+        if _without(original, allowed) != (_without(nodes[name] if name in nodes else None, allowed) or {}):
+            errors.add("original_llm_content_changed")
+    sources_changed = set(current["sources"]) != set(baseline["sources"])
+    for name, original in baseline["sources"].items():
+        allowed = ("on_success",) if name == up else ()
+        if _without(original, allowed) != (_without(current["sources"][name] if name in current["sources"] else None, allowed) or {}):
+            sources_changed = True
+    if sources_changed:
         errors.add("source_content_changed")
     if current["outputs"] != baseline["outputs"]:
         errors.add("sink_content_changed")
     if current["metadata"] != baseline["metadata"]:
         errors.add("metadata_changed")
-    route = _field(actual_source, "on_success")
+    route = _route_out(current, up)
     for name in order:
         node = nodes[name] if name in nodes else None
         if node is None or _field(node, "input") != route:
@@ -215,12 +312,13 @@ def verify_state(
         if name != anchor and (_field(node, "plugin") != "passthrough" or _field(node, "node_type") != "transform"):
             errors.add("unexpected_auxiliary_plugin")
         route = _field(node, "on_success")
-    if route != sink:
+    if route != _route_in(current, position):
         errors.add("routing_does_not_reach_sink")
     if list(order) == [anchor] and (
-        _field(actual_source, "on_success") != baseline["sources"][source]["on_success"]
-        or _field(actual_anchor, "input") != original_anchor["input"]
-        or _field(actual_anchor, "on_success") != original_anchor["on_success"]
+        _route_out(current, up) != _route_out(baseline, up)
+        or _field(nodes[anchor] if anchor in nodes else None, "input") != baseline_nodes[anchor]["input"]
+        or _field(nodes[anchor] if anchor in nodes else None, "on_success") != baseline_nodes[anchor]["on_success"]
+        or _route_in(current, position) != _route_in(baseline, position)
     ):
         errors.add("baseline_routing_not_restored")
     if current["is_valid"] is not True:

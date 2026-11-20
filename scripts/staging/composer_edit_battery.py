@@ -101,6 +101,8 @@ from scripts.staging.edit_plan import (
     tool_findings,
     tool_warnings,
 )
+from scripts.staging.fixture_setup import setup_fixture
+from scripts.staging.large_graph_fixture import load_fixture
 from scripts.staging.opslib import (
     AccountAuth,
     CheckpointStore,
@@ -125,6 +127,7 @@ from scripts.staging.opslib import (
     validate_base_url,
 )
 from scripts.staging.repair_copied_prompt_reviews import prompt_surface
+from scripts.staging.structural_cycle import Position
 from scripts.staging.turn_evidence import UNAVAILABLE_FROM_API, operation_rows, shed_state, shed_this_turn, turn_evidence
 
 LIVE_STATUSES = ("queued", "running")
@@ -473,7 +476,7 @@ class EditBattery:
         counts: JsonObject | None = None
         if self.plan.verifier == structural_cycle.VERIFIER:
             args = self.plan.verifier_args
-            counts = structural_cycle.check_fixture(baseline, source=args["source"], anchor=args["anchor"], sink=args["sink"])
+            counts = structural_cycle.check_fixture(baseline, positions=[Position.from_json(entry) for entry in args["positions"]])
         targets = resolve_targets(self.plan, baseline, self.overrides)
         rows = self.rows_from(0)
         baseline_files = sorted(item["id"] for item in self.session_files())
@@ -590,10 +593,7 @@ class EditBattery:
         extra: JsonObject = {}
         if self.plan.verifier == structural_cycle.VERIFIER:
             # The workload's own verifier judges the turn, with the customer's codes, in place of the plan expectations.
-            args = self.plan.verifier_args
-            state_codes = structural_cycle.verify_state(
-                baseline_state, after_state, edit["order"], source=args["source"], anchor=args["anchor"], sink=args["sink"]
-            )
+            state_codes = structural_cycle.verify_state(baseline_state, after_state, edit["order"], Position.from_json(edit["position"]))
             turn_codes, review_warnings = structural_cycle.operation_codes(
                 operation, evidence["end_reviews"], end_review_evidence=self.end_review_evidence
             )
@@ -1080,9 +1080,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "action",
-        choices=["run", "plan", "report", "cleanup"],
+        choices=["run", "plan", "report", "cleanup", "setup"],
         help=(
-            "run the battery; plan: validate and list the plan with its tool coverage; report: summarise a saved attempt "
+            "setup: with --execute, create a generated --fixture's graph in an empty session (upload, import, approve its "
+            "prompt reviews after checking them); run the battery; plan: validate and list the plan with its tool coverage; report: summarise a saved attempt "
             "(no network); cleanup: with --execute, ask the Composer in judged chat turns to remove a battery attempt's "
             "leftovers and report what remains (without --execute it only prints what it would do, with no network call)"
         ),
@@ -1113,7 +1114,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["structural-cycle"],
         help=(
             "run a workload built in code instead of --plan: structural-cycle is the ten-step add/swap/remove cycle around "
-            "one LLM node, judged by its own verifier (see the runbook)"
+            "an anchor step, rotating through --fixture's positions, judged by its own verifier (see the runbook)"
         ),
     )
     parser.add_argument(
@@ -1123,7 +1124,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"structural-cycle: steps to request, 1-{structural_cycle.MAX_STEPS} (default {structural_cycle.DEFAULT_STEPS})",
     )
     for role, default in structural_cycle.DEFAULT_NAMES.items():
-        parser.add_argument(f"--{role}", default=default, help=f"structural-cycle: the fixture's {role} component (default {default})")
+        parser.add_argument(f"--{role}", help=f"structural-cycle without --fixture: the {role} of the one position (default {default})")
+    parser.add_argument(
+        "--fixture",
+        type=Path,
+        help=(
+            "a directory written by scripts.staging.large_graph_fixture: setup creates its graph; structural-cycle "
+            "rotates through its manifest's positions"
+        ),
+    )
     parser.add_argument(
         "--end-review-evidence",
         choices=["required", "if-recorded"],
@@ -1143,6 +1152,36 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _setup(
+    args: argparse.Namespace, session_id: str, *, client_factory: Callable[[str], WebClient], prompt_secret: Callable[[str], str]
+) -> int:
+    """The ``setup`` action: create a generated fixture's graph in an empty session (dry run unless ``--execute``)."""
+    if args.fixture is None:
+        raise UsageError("setup needs --fixture, a directory written by scripts.staging.large_graph_fixture")
+    fixture = load_fixture(args.fixture)
+    base_url = validate_base_url(setting(args.base_url, flag="--base-url", env="ELSPETH_OPS_BASE_URL"))
+    auth = account_from(args, prefix="", env="ELSPETH_OPS_ACCOUNT")
+    if not args.execute:
+        emit(
+            "dry_run",
+            base_url=base_url,
+            session_id=session_id,
+            account=auth.username,
+            uploads=[{"name": name, "bytes": len(content)} for name, content in fixture.contents.items()],
+            yaml_bytes=len(fixture.yaml_text.encode()),
+            measures=fixture.manifest["measures"],
+            note="nothing was contacted; pass --execute to upload the files, import the graph and approve its prompt reviews",
+        )
+        return 0
+    client = client_factory(base_url)
+    try:
+        sign_in(client, auth, prompt_secret=prompt_secret)
+        setup_fixture(client, session_id, fixture, emit=emit)
+    finally:
+        client.close()
+    return 0
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -1152,8 +1191,16 @@ def main(
     prompt_secret: Callable[[str], str] = getpass.getpass,
 ) -> int:
     args = build_parser().parse_args(argv)
+    names = {"source": args.source, "anchor": args.anchor, "sink": args.sink}
     if args.workload == "structural-cycle":
-        plan = structural_cycle.structural_cycle_plan(steps=args.steps, source=args.source, anchor=args.anchor, sink=args.sink)
+        if args.fixture is not None and any(value is not None for value in names.values()):
+            raise UsageError("give --fixture or --source/--anchor/--sink, not both")
+        if args.fixture is not None:
+            positions = list(load_fixture(args.fixture).positions)
+        else:
+            chosen = {role: value or structural_cycle.DEFAULT_NAMES[role] for role, value in names.items()}
+            positions = [Position(chosen["source"], chosen["anchor"], chosen["sink"], True)]
+        plan = structural_cycle.structural_cycle_plan(steps=args.steps, positions=positions)
     else:
         plan = load_plan(args.plan)
     if args.action == "cleanup" and plan.verifier is not None:
@@ -1174,6 +1221,8 @@ def main(
             emit("planned_edit", number=number, id=edit["id"], message=edit["message"], roles=sorted(plan.roles_of(edit)))
         return 0
     session_id = require_uuid(setting(args.session, flag="--session", env="ELSPETH_OPS_SESSION"), flag="--session")
+    if args.action == "setup":
+        return _setup(args, session_id, client_factory=client_factory, prompt_secret=prompt_secret)
     store = CheckpointStore(Path(setting(args.state_dir, flag="--state-dir", env="ELSPETH_OPS_STATE_DIR")))
     if not args.attempt.isalnum() or args.attempt != args.attempt.lower():
         raise UsageError("--attempt must be lowercase letters and digits")

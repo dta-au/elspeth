@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ from tests.unit.scripts.staging.fake_deployment import BASE_URL, FakeDeployment,
 SESSION = "11111111-2222-4333-8444-555555555555"
 SOURCE, ANCHOR, SINK = "source", "capacity_probe", "results"
 NAMES = {"source": SOURCE, "anchor": ANCHOR, "sink": SINK}
+POS = cycle.Position(SOURCE, ANCHOR, SINK, True)
 type State = dict[str, Any]
 
 SUFFIX = (
@@ -55,6 +57,10 @@ CYCLE_ONE_ORDERS = [
     [ANCHOR, "compact_after_b"],
     [ANCHOR],
 ]
+
+
+def position_of(names: dict[str, str]) -> cycle.Position:
+    return cycle.Position(names["source"], names["anchor"], names["sink"], True)
 
 
 def fixture(queries: int = 3) -> State:
@@ -114,8 +120,10 @@ def rewire(state: State, order: list[str]) -> None:
 class CycleComposer:
     """Rewires the graph to each step's order and records an end review, unless told otherwise."""
 
-    def __init__(self, orders: list[list[str]]) -> None:
+    def __init__(self, orders: list[list[str]], positions: list[cycle.Position] | None = None) -> None:
         self.orders = orders
+        # With positions, each turn rewires around its own position in a multi-node graph.
+        self.positions = positions
         self.turn = 0
         self.messages: list[str] = []
         self.skip: set[int] = set()
@@ -128,7 +136,10 @@ class CycleComposer:
         self.messages.append(message)
         number = self.turn
         if number not in self.skip:
-            rewire(state, self.orders[number - 1])
+            if self.positions is None:
+                rewire(state, self.orders[number - 1])
+            else:
+                rewire_between(state, self.positions[number - 1], self.orders[number - 1])
         if number in self.extra:
             self.extra[number](state)
         state["id"] = f"state-{number}"
@@ -178,7 +189,7 @@ class Clock:
 
 
 def orders_for(steps: int) -> list[list[str]]:
-    return [cycle.planned_step(number, SOURCE, ANCHOR, SINK)[1] for number in range(1, steps + 1)]
+    return [cycle.planned_step(number, POS)[1] for number in range(1, steps + 1)]
 
 
 def make(
@@ -189,6 +200,7 @@ def make(
     keep_going: bool = False,
     end_review_evidence: cycle.EndReviewEvidence = "required",
     state: State | None = None,
+    positions: list[cycle.Position] | None = None,
 ) -> tuple[battery.EditBattery, FakeDeployment, CycleComposer]:
     composer = composer or CycleComposer(orders_for(steps))
     clock = Clock()
@@ -201,7 +213,7 @@ def make(
         store=CheckpointStore(tmp_path / "state"),
         session_id=SESSION,
         attempt="1",
-        plan=cycle.structural_cycle_plan(steps=steps, **NAMES),
+        plan=cycle.structural_cycle_plan(steps=steps, positions=positions or [POS]),
         keep_going=keep_going,
         sleep=clock.sleep,
         now=clock,
@@ -226,14 +238,14 @@ def results(run: battery.EditBattery) -> list[dict[str, Any]]:
 
 
 def test_the_first_cycle_is_the_measured_wording_word_for_word() -> None:
-    plan = cycle.structural_cycle_plan(steps=10, **NAMES)
+    plan = cycle.structural_cycle_plan(steps=10, positions=[POS])
     edits = resolve_edits(plan, {}, fixture())
     assert [edit["message"] for edit in edits] == [text + SUFFIX for text in CYCLE_ONE]
     assert [edit["order"] for edit in edits] == CYCLE_ONE_ORDERS
 
 
 def test_later_cycles_name_their_nodes_by_cycle_and_sixty_steps_end_on_a_restore() -> None:
-    plan = cycle.structural_cycle_plan(steps=60, **NAMES)
+    plan = cycle.structural_cycle_plan(steps=60, positions=[POS])
     edits = resolve_edits(plan, {}, fixture())
     assert edits[10]["message"] == "Add a passthrough transform named cycle1_before_a between source and capacity_probe." + SUFFIX
     assert edits[59]["message"].startswith("Remove cycle5_after_b and reconnect capacity_probe directly to results. Restore ")
@@ -246,43 +258,49 @@ def test_the_restore_step_names_the_fixture_s_own_routing_values() -> None:
     state["sources"][SOURCE]["on_success"] = "into llm"
     state["nodes"][0]["input"] = "into llm"
     state["nodes"][0]["on_success"] = SINK
-    message = resolve_edits(cycle.structural_cycle_plan(steps=10, **NAMES), {}, state)[9]["message"]
+    message = resolve_edits(cycle.structural_cycle_plan(steps=10, positions=[POS]), {}, state)[9]["message"]
     assert 'Restore source.on_success="into llm", capacity_probe.input="into llm", and capacity_probe.on_success="results".' in message
 
 
 @pytest.mark.parametrize("steps", [0, 61])
 def test_a_step_count_outside_one_to_sixty_is_refused(steps: int) -> None:
     with pytest.raises(UsageError, match="between 1 and 60"):
-        cycle.structural_cycle_plan(steps=steps, **NAMES)
+        cycle.structural_cycle_plan(steps=steps, positions=[POS])
 
 
 @pytest.mark.parametrize("names", [{**NAMES, "anchor": "a/b"}, {**NAMES, "sink": "{x}"}, {**NAMES, "sink": SOURCE}])
 def test_component_names_must_be_plain_and_distinct(names: dict[str, str]) -> None:
     with pytest.raises(UsageError):
-        cycle.structural_cycle_plan(steps=10, **names)
+        cycle.structural_cycle_plan(steps=10, positions=[position_of(names)])
 
 
 def test_the_plan_identity_changes_with_names_and_step_count() -> None:
-    base = cycle.structural_cycle_plan(steps=25, **NAMES)
+    base = cycle.structural_cycle_plan(steps=25, positions=[POS])
     assert base.name == "structural_cycle_25"
-    assert base.sha256 == cycle.structural_cycle_plan(steps=25, **NAMES).sha256
-    assert base.sha256 != cycle.structural_cycle_plan(steps=22, **NAMES).sha256
-    assert base.sha256 != cycle.structural_cycle_plan(steps=25, **{**NAMES, "anchor": "other"}).sha256
+    assert base.sha256 == cycle.structural_cycle_plan(steps=25, positions=[POS]).sha256
+    assert base.sha256 != cycle.structural_cycle_plan(steps=22, positions=[POS]).sha256
+    assert base.sha256 != cycle.structural_cycle_plan(steps=25, positions=[position_of({**NAMES, "anchor": "other"})]).sha256
 
 
 # ── the fixture ────────────────────────────────────────────────────────────
 
 
 def test_the_fixture_is_counted() -> None:
-    assert cycle.check_fixture(fixture(queries=32), **NAMES) == {"sources": 1, "nodes": 1, "sinks": 2, "prompt_queries": 32}
+    assert cycle.check_fixture(fixture(queries=32), positions=[POS]) == {
+        "sources": 1,
+        "nodes": 1,
+        "llm_nodes": 1,
+        "sinks": 2,
+        "prompt_queries": 32,
+    }
 
 
-def _second_node(state: State) -> None:
-    state["nodes"].append(passthrough("extra"))
+def _no_anchor(state: State) -> None:
+    state["nodes"][0]["id"] = "renamed"
 
 
-def _not_llm(state: State) -> None:
-    state["nodes"][0]["plugin"] = "passthrough"
+def _cycle_leftover(state: State) -> None:
+    rewire(state, ["compact_before_a", ANCHOR])
 
 
 def _second_source(state: State) -> None:
@@ -304,10 +322,9 @@ def _not_direct(state: State) -> None:
 @pytest.mark.parametrize(
     ("damage", "match"),
     [
-        (_second_node, "exactly one node"),
-        (_not_llm, "exactly one node"),
-        (_second_source, "one source"),
-        (_no_sink, "one source"),
+        (_no_anchor, "not a transform node"),
+        (_no_sink, "not an output"),
+        (_cycle_leftover, "already holds nodes a cycle adds"),
         (_invalid, "validate the fixture"),
         (_not_direct, "straight through"),
     ],
@@ -316,7 +333,7 @@ def test_a_graph_that_is_not_the_fixture_is_refused(damage: Any, match: str) -> 
     state = fixture()
     damage(state)
     with pytest.raises(OperationFailed, match=match):
-        cycle.check_fixture(state, **NAMES)
+        cycle.check_fixture(state, positions=[POS])
 
 
 # ── the verifier: every code with a failing graph ──────────────────────────
@@ -329,7 +346,7 @@ def at_step(number: int) -> State:
 
 
 def verify(state: State, number: int) -> list[str]:
-    return cycle.verify_state(fixture(), state, CYCLE_ONE_ORDERS[number - 1], **NAMES)
+    return cycle.verify_state(fixture(), state, CYCLE_ONE_ORDERS[number - 1], POS)
 
 
 @pytest.mark.parametrize("number", range(1, 11))
@@ -489,7 +506,7 @@ def test_an_obedient_ten_step_cycle_passes_every_step_and_leaves_the_fixture_as_
     assert summary["line"] == "longest run in a row: 10 of 10"
     assert summary["as_found_differences"] == []
     assert summary["gold"] is False  # ten edits are too few for gold
-    assert summary["baseline_graph_counts"] == {"sources": 1, "nodes": 1, "sinks": 2, "prompt_queries": 3}
+    assert summary["baseline_graph_counts"] == {"sources": 1, "nodes": 1, "llm_nodes": 1, "sinks": 2, "prompt_queries": 3}
     assert summary["end_reviews_recorded"] == 10
     expected = [message + SUFFIX for message in CYCLE_ONE]
     assert composer.messages == expected
@@ -550,9 +567,9 @@ def test_a_step_that_changes_the_llm_node_fails_with_the_customer_s_code(tmp_pat
 
 def test_a_graph_that_is_not_the_fixture_is_refused_before_anything_is_sent(tmp_path: Path) -> None:
     state = fixture()
-    _second_node(state)
+    _cycle_leftover(state)
     run, fake, composer = make(tmp_path, state=state)
-    with pytest.raises(OperationFailed, match="exactly one node"):
+    with pytest.raises(OperationFailed, match="already holds nodes"):
         run.run()
     assert composer.turn == 0
     assert not [path for verb, path, _ in fake.requests if verb == "POST" and path.endswith("/messages")]
@@ -591,3 +608,157 @@ def test_a_workload_run_exits_zero_only_when_every_requested_step_passed(tmp_pat
     failing = CycleComposer(orders_for(10))
     failing.skip = {10}
     assert exit_code(failing, "2") == 1
+
+
+# ── a multi-node graph: generalised verifier and rotated positions ─────────
+
+# src -> step_a (llm) -> middle (llm) -> step_b (llm) -> tail (field_mapper) -> out, with an error sink.
+FIRST = cycle.Position("src", "step_a", "middle", False)
+MID = cycle.Position("step_a", "middle", "step_b", False)
+LAST = cycle.Position("step_b", "tail", "out", True)
+_CYCLE_NODE = re.compile(r"(compact|cycle[0-9]+)_(before|after)_[ab]")
+
+
+def chain() -> State:
+    def node(node_id: str, plugin: str, route_in: str, route_out: str) -> State:
+        return {
+            "id": node_id,
+            "node_type": "transform",
+            "plugin": plugin,
+            "input": route_in,
+            "on_success": route_out,
+            "on_error": "errors",
+            "options": {"schema": {"mode": "observed"}, "note": f"{node_id} options"},
+            "description": None,
+        }
+
+    return {
+        "id": "state-0",
+        "version": 1,
+        "sources": {"src": {"plugin": "csv", "on_success": "r0", "options": {"path": "rows.csv"}, "on_validation_failure": "errors"}},
+        "nodes": [
+            node("step_a", "llm", "r0", "r1"),
+            node("middle", "llm", "r1", "r2"),
+            node("step_b", "llm", "r2", "r3"),
+            node("tail", "field_mapper", "r3", "out"),
+        ],
+        "edges": [],
+        "outputs": [
+            {"name": "out", "plugin": "json", "options": {"path": "out.json"}, "on_write_failure": "discard"},
+            {"name": "errors", "plugin": "json", "options": {"path": "errors.json"}, "on_write_failure": "discard"},
+        ],
+        "metadata": {"name": "Chain", "description": ""},
+        "is_valid": True,
+        "validation_errors": None,
+    }
+
+
+def rewire_between(state: State, position: cycle.Position, order: list[str]) -> None:
+    """Leave exactly ``order`` between the position's upstream and downstream, keeping every other node as it is."""
+    nodes = {node["id"]: node for node in state["nodes"] if not _CYCLE_NODE.fullmatch(node["id"]) or node["id"] in order}
+    for name in order:
+        if name not in nodes:
+            nodes[name] = passthrough(name)
+    if position.upstream in state["sources"]:
+        route = state["sources"][position.upstream]["on_success"]
+    else:
+        route = nodes[position.upstream]["on_success"]
+    target = position.downstream if position.downstream_is_sink else nodes[position.downstream]["input"]
+    for index, name in enumerate(order):
+        nodes[name]["input"] = route
+        route = target if index == len(order) - 1 else f"{name}_out"
+        nodes[name]["on_success"] = route
+    state["nodes"] = list(nodes.values())
+
+
+def chain_at(position: cycle.Position, number: int) -> State:
+    state = chain()
+    rewire_between(state, position, cycle.planned_step(number, position)[1])
+    return state
+
+
+def verify_chain(state: State, position: cycle.Position, number: int) -> list[str]:
+    return cycle.verify_state(chain(), state, cycle.planned_step(number, position)[1], position)
+
+
+@pytest.mark.parametrize("position", [FIRST, MID, LAST], ids=["after-source", "mid-chain", "before-sink"])
+@pytest.mark.parametrize("number", range(1, 11))
+def test_every_step_passes_at_every_position_of_a_multi_node_graph(position: cycle.Position, number: int) -> None:
+    assert verify_chain(chain_at(position, number), position, number) == []
+
+
+def test_a_downstream_node_may_take_the_new_route_instead_of_the_anchor_keeping_its_own() -> None:
+    state = chain_at(MID, 2)
+    after = next(node for node in state["nodes"] if node["id"] == "compact_after_a")
+    after["on_success"] = "renamed"
+    next(node for node in state["nodes"] if node["id"] == "step_b")["input"] = "renamed"
+    assert verify_chain(state, MID, 2) == []
+
+
+def _node(state: State, node_id: str) -> State:
+    found: State = next(node for node in state["nodes"] if node["id"] == node_id)
+    return found
+
+
+@pytest.mark.parametrize(
+    ("damage", "codes"),
+    [
+        (lambda state: state["nodes"].append(passthrough("stray")), ["node_inventory_mismatch"]),
+        # A node the step did not name, and a named one outside the wiring it may touch.
+        (lambda state: _node(state, "tail")["options"].update(note="changed"), ["original_llm_content_changed"]),
+        (lambda state: _node(state, "step_b")["options"].update(note="changed"), ["original_llm_content_changed"]),
+        (lambda state: _node(state, "step_a").update(on_error="discard"), ["original_llm_content_changed"]),
+        (lambda state: state["sources"]["src"].update(on_success="moved"), ["source_content_changed"]),
+        (lambda state: state["outputs"][0]["options"].update(path="elsewhere.json"), ["sink_content_changed"]),
+        (lambda state: state["metadata"].update(name="Renamed"), ["metadata_changed"]),
+        (lambda state: _node(state, "compact_after_a").update(plugin="llm"), ["unexpected_auxiliary_plugin"]),
+        (lambda state: _node(state, "middle").update(input="nowhere"), ["routing_does_not_reach_sink", "routing_mismatch"]),
+        (lambda state: _node(state, "compact_after_a").update(on_success="nowhere"), ["routing_does_not_reach_sink"]),
+        (lambda state: state.update(is_valid=False), ["runtime_validation_failed"]),
+    ],
+)
+def test_each_state_code_fires_on_a_multi_node_graph(damage: Any, codes: list[str]) -> None:
+    state = chain_at(MID, 2)
+    damage(state)
+    assert verify_chain(state, MID, 2) == codes
+
+
+def test_rewiring_a_connection_the_step_did_not_name_is_reported_even_when_the_graph_stays_connected() -> None:
+    state = chain_at(MID, 2)
+    _node(state, "step_b")["on_success"] = "renamed"
+    _node(state, "tail")["input"] = "renamed"
+    assert verify_chain(state, MID, 2) == ["original_llm_content_changed"]
+
+
+def test_the_end_of_a_cycle_must_restore_the_route_names_around_a_mid_chain_anchor() -> None:
+    state = chain_at(MID, 10)
+    assert verify_chain(state, MID, 10) == []
+    _node(state, "step_a")["on_success"] = "renamed"
+    _node(state, "middle")["input"] = "renamed"
+    assert verify_chain(state, MID, 10) == ["baseline_routing_not_restored"]
+
+
+def test_a_node_downstream_is_named_without_the_word_sink_and_a_sink_with_it() -> None:
+    assert cycle.planned_step(2, MID)[0].startswith("Add a passthrough transform named compact_after_a between middle and step_b.")
+    assert cycle.planned_step(2, LAST)[0].startswith("Add a passthrough transform named compact_after_a between tail and the out sink.")
+
+
+def test_positions_must_be_wired_straight_through_in_the_graph() -> None:
+    assert cycle.check_fixture(chain(), positions=[FIRST, MID, LAST])["llm_nodes"] == 3
+    with pytest.raises(OperationFailed, match="straight through"):
+        cycle.check_fixture(chain(), positions=[cycle.Position("src", "middle", "step_b", False)])
+    with pytest.raises(OperationFailed, match="not a node"):
+        cycle.check_fixture(chain(), positions=[cycle.Position("step_a", "middle", "out", False)])
+
+
+def test_a_battery_run_rotates_its_cycles_through_the_positions_and_leaves_the_graph_as_found(tmp_path: Path) -> None:
+    positions = [FIRST, MID, LAST]
+    plan = cycle.structural_cycle_plan(steps=30, positions=positions)
+    turns = [cycle.Position.from_json(edit["position"]) for edit in plan.edits]
+    assert turns == [FIRST] * 10 + [MID] * 10 + [LAST] * 10
+    composer = CycleComposer([edit["order"] for edit in plan.edits], positions=turns)
+    run, _, _ = make(tmp_path, steps=30, composer=composer, state=chain(), positions=positions)
+    summary = run.run()
+    assert summary["all_passed"] is True
+    assert summary["as_found_differences"] == []
+    assert "between step_a and middle" in composer.messages[10]

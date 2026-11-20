@@ -156,49 +156,52 @@ Not available from the API, so not reported:
 
 `--workload structural-cycle` sends the customer's large-graph stress
 workload instead of a plan file, and judges it with their verifier and error
-codes. It repeats a ten-step cycle around one LLM node: add two passthrough
+codes. It repeats a ten-step cycle around an anchor step: add two passthrough
 nodes before it and two after it, swap each pair, remove all four, and on the
 tenth step restore the original route names. Cycle 1 names its nodes
 `compact_*`, later cycles `cycle1_*`, `cycle2_*` and so on. The wording of
-every step is pinned by a test; do not edit it.
+every step is the customer's, pinned by a test; do not edit it.
+
+A *position* is where a cycle edits: an upstream (a source or step), the
+anchor step, and a downstream (a step or a sink). With `--fixture` the cycles
+rotate through the positions in the fixture's manifest, so the edits land in
+different places of the graph. Without it there is one position, the
+customer's: `--source` → `--anchor` → `--sink` (defaults `source`,
+`capacity_probe`, `results`). Giving both is refused.
 
 ```bash
-python -m scripts.staging.composer_edit_battery plan --workload structural-cycle --steps 50
-python -m scripts.staging.composer_edit_battery run --workload structural-cycle --steps 50 \
-  --source source --anchor capacity_probe --sink results \
+python -m scripts.staging.composer_edit_battery plan --workload structural-cycle --steps 50 --fixture "$FIXTURE"
+python -m scripts.staging.composer_edit_battery run --workload structural-cycle --steps 50 --fixture "$FIXTURE" \
   --base-url "$URL" --session "$SESSION" --account "$ACCOUNT" --state-dir "$STATE" --execute
 ```
 
-The `plan` action prints the tenth step's restore values as
-`{was:/nodes/<anchor>/...}` fields; `run` fills them from the fixture as JSON
-text, as the customer's runner does.
+For a downstream sink the wording says "the `<name>` sink", as the
+customer's does; a downstream step is just named. The `plan` action prints
+the tenth step's restore values as `{was:/nodes/<anchor>/...}` fields; `run`
+fills them from the graph as JSON text, as the customer's runner does.
 
-`--steps` is 1 to 60 (default 30). `--source`, `--anchor` and `--sink` name
-the fixture's components (defaults `source`, `capacity_probe`, `results`).
-The step count and names are part of the attempt's identity: resuming with
-others is refused.
+`--steps` is 1 to 60 (default 30). The step count and positions are part of
+the attempt's identity: resuming with others is refused.
 
 **The run changes the test graph.** Every step is a real, auto-committed
-edit. Run it only on a copy made for the run, never on a graph anyone uses.
-A complete cycle ends with the fixture's original wiring; an attempt stopped
+edit. Run it only on a session made for the run (see
+[Large-graph fixture](#large-graph-fixture)), never on a graph anyone uses.
+A complete cycle ends with the graph's original wiring; an attempt stopped
 mid-cycle leaves passthrough nodes in place. `cleanup` does not apply to a
-workload: restore the fixture from a fresh copy.
+workload: set the fixture up again in a new session.
 
-### Preparing the fixture
+### What the battery checks before the first step
 
-The battery refuses to start unless the session's graph is exactly:
+- each position's upstream routes straight into its anchor (a transform), and
+  the anchor straight into its downstream, which is a sink exactly when the
+  position says so;
+- no node already has a name a cycle adds;
+- the graph is valid, with its prompt and file reviews resolved, and the
+  session is in auto-commit.
 
-- one source, named by `--source`;
-- one node, an LLM transform with the id given by `--anchor`;
-- the sink named by `--sink` among the outputs (other sinks, such as an
-  error sink, may be present);
-- the source routed straight through the LLM node to that sink;
-- valid, with its prompt and file reviews resolved, and auto-commit on.
-
-The graph's size comes from the LLM node's prompt and query configuration.
-The customer's recorded fixture had 32 LLM queries and two sinks. The summary
-reports the fixture's counts as `baseline_graph_counts`, and each step's
-result its `graph_counts`.
+The summary reports the graph's counts as `baseline_graph_counts` (sources,
+nodes, LLM nodes, sinks, prompt queries), and each step's result its
+`graph_counts`.
 
 ### How a step is judged
 
@@ -206,15 +209,15 @@ Each step must pass all of these. The codes are the customer's.
 
 | Code | Fails when |
 | --- | --- |
-| `node_inventory_mismatch` | The node ids are not exactly the ones the step should leave |
-| `original_llm_content_changed` | Anything on the LLM node other than its `input` and `on_success` changed |
-| `source_content_changed` | Anything on the source other than `on_success` changed, or another source appeared |
+| `node_inventory_mismatch` | The node ids are not the starting graph's plus exactly the passthroughs the step should leave |
+| `original_llm_content_changed` | A starting node changed beyond the wiring the step had to touch: the upstream's `on_success`, the anchor's `input` and `on_success`, a downstream step's `input`. The customer's code; it covers every starting node, not only the LLM one |
+| `source_content_changed` | A source changed (beyond the upstream source's `on_success`), or a source was added or removed |
 | `sink_content_changed` | Any output changed |
 | `metadata_changed` | The graph metadata changed |
-| `routing_mismatch` | The chain from the source does not visit the step's nodes in order |
-| `unexpected_auxiliary_plugin` | A node other than the LLM node is not a passthrough transform |
-| `routing_does_not_reach_sink` | The chain does not end at the sink |
-| `baseline_routing_not_restored` | At the end of a cycle, the original route names are not back |
+| `routing_mismatch` | The chain from the upstream does not visit the step's nodes in order |
+| `unexpected_auxiliary_plugin` | A node other than the anchor in the chain is not a passthrough transform |
+| `routing_does_not_reach_sink` | The chain does not end at the downstream (the sink, or the downstream step's `input`) |
+| `baseline_routing_not_restored` | At the end of a cycle, the original route names around the anchor are not back |
 | `runtime_validation_failed` | The graph is not valid |
 | `operation_not_completed` | The turn did not complete |
 | `operation_result_unavailable` | The completed turn has no result |
@@ -245,6 +248,80 @@ used.
 The first failing step stops the attempt; `--keep-going` judges every step.
 A workload run exits 0 when every requested step passed. The summary still
 reports `gold` (50 or more steps, all passed, fixture as found).
+
+## Large-graph fixture
+
+`scripts/staging/large_graph_fixture.py` writes a synthetic large graph for
+the workload, and the battery's `setup` action creates it in a session. All
+names, fields and text are made up from a seed; the same seed and arguments
+give the same bytes.
+
+The `acceptance` preset is wired like a real assessment graph rather than one
+big LLM block: a CSV source with a fixed schema of 14 fields, bound to an
+uploaded file, with validation failures routed to the error sink; a
+`file_inject` step with file-held content; two case-study chains (an
+assessment LLM step feeding a multi-query scoring step); evidence checks, a
+cross-case comparison, risk and equity reviews and a larger multi-query
+overall rubric; a gate that routes low scores to a moderation-queue sink;
+summary and feedback LLM steps; truncate steps capping case text before the
+steps that read it; and a final `field_mapper` into a main sink that
+declares its fields. Every LLM step declares `required_input_fields` that
+earlier steps produce, and its prompts name those fields. Single-prompt
+steps hold a system and a user prompt in files, multi-query steps their
+rubric (query templates cannot be file-held, so they are short and inline).
+
+| Default (acceptance) | Value |
+| --- | --- |
+| Steps (transforms and gates) | 27 |
+| LLM steps | 12 (4 multi-query: 3, 3, 3 and 8 queries) |
+| Prompt files | 22, holding exactly 200,000 bytes (16 of 3.6-4.8 KB, 6 of 18-27 KB); 20 with `--file-inject omit` |
+| Sinks | 3 (main, error, moderation queue) |
+| Graph document once imported | about 32 KB: the prompt text stays in the bound files |
+| Positions | after the source, mid-chain between two LLM steps, at the final mapper |
+
+`--steps`, `--llm-steps`, `--queries-per-step`, `--large-queries`,
+`--prompt-bytes`, `--inject-files` and `--seed` change the size; the counts
+and prompt bytes are met exactly. `--profile` names the LLM profile the
+steps use on the target server (default `task-role`).
+
+The `single-node` preset reproduces the customer's recorded shape for a
+like-for-like comparison with their telemetry: source `source`, one LLM node
+`capacity_probe` with 32 queries, sinks `results` and `errors`, and query
+text inline as theirs was. Its graph document is within 5% of their recorded
+298,161 authored bytes.
+
+### File-held `file_inject` and the validation defect
+
+On servers without the fix for the "Producer guarantees: (none)" defect, a
+`file_inject` step whose content is a file makes authoring validation lose
+every upstream field, so each later step fails `schema_contract_violation`
+and the default fixture does not validate. Until that fix is on the server,
+generate with `--file-inject omit`: the step is left out and its share of
+the prompt bytes goes to the other prompt files. With the fix, use the
+default (`--file-inject file`). The composer refuses `file_inject` content
+written into the YAML, so there is no inline form.
+
+### Creating the session
+
+```bash
+python -m scripts.staging.large_graph_fixture --preset acceptance --out "$FIXTURE" [--file-inject omit]
+python -m scripts.staging.composer_edit_battery setup --fixture "$FIXTURE" \
+  --base-url "$URL" --session "$NEW_SESSION" --account "$ACCOUNT" --execute
+```
+
+`--out` must be an empty directory outside the repository. Create a new,
+empty session in the Composer first; `setup` refuses a session that already
+has a graph. With `--execute` it uploads the source data and prompt files,
+imports `pipeline.yaml` with their bindings (`POST /state/yaml`, as a person
+importing YAML does), resolves each prompt review card as accepted only after
+checking that it belongs to one of the fixture's LLM steps and shows exactly
+the text uploaded for that step, and requires the graph to be valid with no
+review pending. A review of any other kind is left for you and setup fails.
+Without `--execute` it prints what it would upload and contacts nothing.
+
+The fixture directory's `manifest.json` lists every file with its digest, the
+positions and the measured sizes; the battery refuses a fixture whose files
+no longer match it.
 
 ## Run it against a local server
 

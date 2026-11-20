@@ -205,7 +205,7 @@ class Plan:
     targets: Mapping[str, JsonObject]
     edits: tuple[JsonObject, ...]
     verifier: str | None = None
-    verifier_args: Mapping[str, str] = field(default_factory=dict)
+    verifier_args: Mapping[str, Any] = field(default_factory=dict)
 
     def roles_of(self, edit: Mapping[str, Any]) -> set[str]:
         return set(_NAME.findall(json.dumps(edit)))
@@ -564,6 +564,8 @@ def resolve_edits(plan: Plan, targets: Mapping[str, str], baseline_state: Mappin
         )
         if "order" in edit:
             resolved[-1]["order"] = _fill(edit["order"], targets, pointer=False)
+        if "position" in edit:
+            resolved[-1]["position"] = dict(edit["position"])
     return resolved
 
 
