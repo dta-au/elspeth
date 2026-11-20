@@ -12,21 +12,30 @@ THIS TOOL EXERCISES APPROVAL AUTHORITY on the target account. It is an
 operator action for a copy the operator made, not a substitute for a reviewer:
 never use it to clear reviews of text that was authored or edited in the
 target session. It refuses any review that is not an ``llm_prompt_template``
-review, any prompt whose file bytes do not match a source-session file, and any
-review whose text the operator has not been shown and approved interactively.
+review, any prompt whose text -- inline or in a file -- is not byte-for-byte the
+text of the same node in the SOURCE session, any review whose surface it cannot
+show in full, and any review whose text the operator has not been shown and
+approved interactively.
 
 Safety properties (named by tests in
 ``tests/unit/scripts/staging/test_repair_copied_prompt_reviews.py``):
 
 * Approvals go only through ``POST .../interpretations/{id}/resolve``; nothing
   is written to a database.
-* Before resolving a review it checks: the review is live; its authored surface
-  equals the node's current prompt options; its bindings are exactly the file
-  markers in that surface; each bound file downloads from the target session
-  with the bytes of a ready, hash-verified file of the source session; and the
-  snapshot text equals those bytes decoded. Any mismatch stops the run.
-* The operator sees every bound file's text and must type ``approve`` for each
-  review; anything else stops the run with nothing resolved for that review.
+* Before resolving a review it checks: the review is live; its surface holds
+  only prompt text slots (``prompt_template``, ``system_prompt``,
+  ``queries``), each inline text or an ``inline_content`` file marker -- a
+  structured (``prompt_template_parts``) or otherwise unshowable surface is
+  refused; the surface equals the node's current prompt options; its bindings
+  are exactly the file markers in that surface; each bound file downloads from
+  the target session with the bytes of a ready, hash-verified file of the
+  source session; the snapshot text equals those bytes decoded; and the whole
+  surface -- inline text byte for byte, files by content hash -- equals the
+  prompt surface of the same node in the source session. Any mismatch stops
+  the run with nothing resolved for that review.
+* The operator sees the full text of every slot the review covers, inline and
+  file alike, and must type ``approve`` for each review; anything else stops
+  the run with nothing resolved for that review.
 * Graph content and chat history must be unchanged afterwards.
 * A run resumes only from a checkpoint that is complete and valid for the same
   session; a malformed checkpoint stops it.
@@ -59,7 +68,6 @@ from scripts.staging.opslib import (
     add_account_arguments,
     add_execute_flag,
     api_projection,
-    blob_markers,
     differences,
     emit,
     list_pages,
@@ -72,6 +80,7 @@ from scripts.staging.opslib import (
 )
 
 PROMPT_KEYS = ("prompt_template", "system_prompt", "queries")
+INLINE_CONTENT = "inline_content"
 CHECKPOINT_KEYS = frozenset({"version", "session_id", "source_session_id", "before", "history_before", "resolved"})
 
 
@@ -83,9 +92,25 @@ def prompt_surface(options: Mapping[str, Any]) -> JsonObject:
     return {key: copy.deepcopy(options[key]) for key in PROMPT_KEYS if key in options}
 
 
-def source_files(client: WebClient, session_id: str) -> dict[str, bytes]:
+@dataclass(frozen=True, slots=True)
+class SourceSession:
+    """The source session's verified files (by SHA-256), their ids' hashes, and its graph."""
+
+    files: Mapping[str, bytes]
+    hash_by_blob_id: Mapping[str, str]
+    nodes: Mapping[str, Mapping[str, Any]]
+
+
+def read_source(client: WebClient, session_id: str) -> SourceSession:
+    files, hashes = source_files(client, session_id)
+    state = require_dict(client.get_json(f"/api/sessions/{session_id}/state"), "source state")
+    return SourceSession(files=files, hash_by_blob_id=hashes, nodes={node["id"]: node for node in state["nodes"]})
+
+
+def source_files(client: WebClient, session_id: str) -> tuple[dict[str, bytes], dict[str, str]]:
     """Every ready file of the source session by SHA-256, each verified against its recorded hash and size."""
     files: dict[str, bytes] = {}
+    hashes: dict[str, str] = {}
     for raw in list_pages(client, f"/api/sessions/{session_id}/blobs"):
         blob = require_dict(raw, "blob")
         if blob["status"] != "ready" or blob["content_hash"] is None:
@@ -94,7 +119,8 @@ def source_files(client: WebClient, session_id: str) -> dict[str, bytes]:
         if hashlib.sha256(data).hexdigest() != blob["content_hash"] or len(data) != blob["size_bytes"]:
             raise OperationFailed(f"source file {blob['id']} does not match its recorded hash or size")
         files[blob["content_hash"]] = data
-    return files
+        hashes[blob["id"]] = blob["content_hash"]
+    return files, hashes
 
 
 def all_messages(client: WebClient, session_id: str) -> list[Any]:
@@ -130,51 +156,134 @@ def assert_parity(expected: Mapping[str, Any], actual: Mapping[str, Any]) -> Non
 
 @dataclass(frozen=True, slots=True)
 class ReviewEvidence:
+    """Everything a review covers, as shown to the operator: each slot's full text and where it lives."""
+
     event_id: str
     node_id: str
     anchor: str
-    files: tuple[JsonObject, ...]
+    slots: tuple[JsonObject, ...]
+
+    @property
+    def files(self) -> tuple[JsonObject, ...]:
+        return tuple(slot for slot in self.slots if slot["form"] == "file")
+
+
+def surface_slots(surface: Mapping[str, Any]) -> list[tuple[str, Any]]:
+    """The prompt text slots of a surface, as the server enumerates them, by field path."""
+    slots: list[tuple[str, Any]] = [(key, surface[key]) for key in ("prompt_template", "system_prompt") if key in surface]
+    if "queries" in surface:
+        queries = surface["queries"]
+        entries = list(queries.items()) if type(queries) is dict else list(enumerate(queries)) if type(queries) is list else None
+        if entries is None:
+            raise OperationFailed("the review's queries are neither a mapping nor a list; it cannot be shown")
+        for name, entry in entries:
+            if type(entry) is not dict or "template" not in entry:
+                raise OperationFailed(f"query {name} has no template; the review cannot be shown in full")
+            slots.append((f"queries.{name}.template", entry["template"]))
+    return slots
+
+
+def _is_file_marker(value: object) -> bool:
+    return type(value) is dict and "blob_ref" in value
+
+
+def normalised_surface(surface: Mapping[str, Any], hash_of: Callable[[str], str]) -> JsonObject:
+    """The surface with each file marker replaced by the SHA-256 of its file, for comparison across sessions."""
+
+    def walk(value: object) -> object:
+        if type(value) is dict:
+            if "blob_ref" in value:
+                return {"file_sha256": hash_of(value["blob_ref"])}
+            return {key: walk(item) for key, item in value.items()}
+        if type(value) is list:
+            return [walk(item) for item in value]
+        return copy.deepcopy(value)
+
+    return require_dict(walk(dict(surface)), "surface")
 
 
 def check_review(
-    client: WebClient, session_id: str, event: Mapping[str, Any], nodes: Mapping[str, Any], files: Mapping[str, bytes]
+    client: WebClient, session_id: str, event: Mapping[str, Any], nodes: Mapping[str, Any], source: SourceSession
 ) -> ReviewEvidence:
-    """Prove that a pending prompt review shows exactly the copied source files' text."""
+    """Prove that a pending prompt review shows exactly the source session's prompt for the same node, and nothing unshown."""
     if event["kind"] != "llm_prompt_template":
         raise OperationFailed(f"review {event['id']} is a {event['kind']} review; it needs separate human inspection")
     path = f"/api/sessions/{session_id}/interpretations/{event['id']}/prompt"
     prompt = require_dict(client.get_json(path), "prompt review snapshot")
     if prompt["is_live_review"] is not True:
         raise OperationFailed(f"review {event['id']} is not live")
-    if prompt["node_id"] not in nodes:
+    node_id = prompt["node_id"]
+    if node_id not in nodes:
         raise OperationFailed(f"review {event['id']} names a node that is not in the graph")
-    surface = prompt_surface(nodes[prompt["node_id"]]["options"])
-    if prompt["authored_surface"] != surface:
+    authored = require_dict(prompt["authored_surface"], "authored surface")
+    unshowable = sorted(set(authored) - set(PROMPT_KEYS))
+    if unshowable or not authored:
+        raise OperationFailed(f"review {event['id']} covers {unshowable or 'no prompt text'}; this tool cannot show and verify it")
+    surface = prompt_surface(nodes[node_id]["options"])
+    if differences(authored, surface):
         raise OperationFailed(f"review {event['id']} does not show the node's current prompt options")
-    markers = blob_markers(surface)
+    slots = surface_slots(surface)
+    for field_path, value in slots:
+        if type(value) is str:
+            continue
+        if not _is_file_marker(value) or ("mode" in value and value["mode"] != INLINE_CONTENT):
+            raise OperationFailed(
+                f"review {event['id']} slot {field_path} is neither inline text nor an inline-content file; it cannot be shown"
+            )
     bindings = require_list(prompt["bindings"], "bindings")
+    markers = [value for _path, value in slots if _is_file_marker(value)]
     if sorted(binding["blob_id"] for binding in bindings) != sorted(marker["blob_ref"] for marker in markers):
         raise OperationFailed(f"review {event['id']} bindings are not exactly the prompt's file markers")
-    shown: list[JsonObject] = []
+    hash_by_target_blob: dict[str, str] = {}
+    text_by_target_blob: dict[str, str] = {}
     for binding in bindings:
         sha256 = binding["content_sha256"]
-        if sha256 not in files:
+        if sha256 not in source.files:
             raise OperationFailed(f"review {event['id']} binds a file that is not in the source session")
-        data = files[sha256]
+        data = source.files[sha256]
         downloaded = client.download(f"/api/sessions/{session_id}/blobs/{binding['blob_id']}/content")
         if downloaded != data or hashlib.sha256(downloaded).hexdigest() != sha256:
             raise OperationFailed(f"review {event['id']} file {binding['blob_id']} differs from the source file")
         if binding["text"] != data.decode(binding["encoding"]):
             raise OperationFailed(f"review {event['id']} shows text that differs from the file bytes")
-        shown.append({"field_path": binding["field_path"], "filename": binding["filename"], "sha256": sha256, "text": binding["text"]})
-    return ReviewEvidence(event_id=event["id"], node_id=prompt["node_id"], anchor=prompt["anchor"], files=tuple(shown))
+        hash_by_target_blob[binding["blob_id"]] = sha256
+        text_by_target_blob[binding["blob_id"]] = binding["text"]
+    if node_id not in source.nodes:
+        raise OperationFailed(f"review {event['id']} is for node {node_id}, which the source session does not have")
+    source_surface = prompt_surface(source.nodes[node_id]["options"])
+
+    def source_hash(blob_id: str) -> str:
+        # A source marker with no ready source file can never equal a verified target file.
+        return source.hash_by_blob_id[blob_id] if blob_id in source.hash_by_blob_id else "missing-source-file:" + blob_id
+
+    if differences(normalised_surface(source_surface, source_hash), normalised_surface(surface, hash_by_target_blob.__getitem__)):
+        raise OperationFailed(
+            f"review {event['id']} prompt for {node_id} is not byte-for-byte the source session's prompt for that node; not resolved"
+        )
+    shown: list[JsonObject] = []
+    for field_path, value in slots:
+        if type(value) is str:
+            shown.append({"field_path": field_path, "form": "inline", "text": value})
+        else:
+            binding = next(item for item in bindings if item["blob_id"] == value["blob_ref"])
+            shown.append(
+                {
+                    "field_path": field_path,
+                    "form": "file",
+                    "filename": binding["filename"],
+                    "sha256": binding["content_sha256"],
+                    "text": text_by_target_blob[binding["blob_id"]],
+                }
+            )
+    return ReviewEvidence(event_id=event["id"], node_id=node_id, anchor=prompt["anchor"], slots=tuple(shown))
 
 
 def show_review(evidence: ReviewEvidence) -> None:
-    """Print a review's full text to stderr for the operator; stdout stays a JSON event stream."""
+    """Print a review's full text, every slot, to stderr for the operator; stdout stays a JSON event stream."""
     print(f"\n=== Prompt review {evidence.event_id} on node {evidence.node_id} ===", file=sys.stderr)
-    for item in evidence.files:
-        print(f"--- {item['field_path']}  file {item['filename']}  sha256 {item['sha256']}", file=sys.stderr)
+    for item in evidence.slots:
+        where = f"file {item['filename']}  sha256 {item['sha256']}" if item["form"] == "file" else "inline text"
+        print(f"--- {item['field_path']}  {where}", file=sys.stderr)
         print(item["text"], file=sys.stderr)
     print("=== end of review ===", file=sys.stderr)
 
@@ -204,7 +313,7 @@ def repair(
         return saved
     sign_in(source, source_auth, prompt_secret=prompt_secret)
     try:
-        files = source_files(source, source_session_id)
+        source_session = read_source(source, source_session_id)
     finally:
         source.close()
     sign_in(target, target_auth, prompt_secret=prompt_secret)
@@ -231,7 +340,7 @@ def repair(
         nodes = {node["id"]: node for node in state["nodes"]}
         pending = require_dict(target.get_json(f"/api/sessions/{session_id}/interpretations?status=pending"), "reviews")["events"]
         for event in pending:
-            evidence = check_review(target, session_id, event, nodes, files)
+            evidence = check_review(target, session_id, event, nodes, source_session)
             present(evidence)
             answer = confirm(f"Type approve to accept review {evidence.event_id} as drafted: ")
             if answer.strip() != "approve":
@@ -272,8 +381,9 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Re-establish the pending prompt-file reviews of a COPIED session through the normal review API. "
             "This exercises approval authority on the target account: each review is resolved accepted_as_drafted "
-            "only after its file bytes match a source-session file AND the operator has read the text and typed "
-            "'approve'. Never use it for text authored or edited in the target session. Dry run unless --execute."
+            "only after its whole prompt -- inline text byte for byte, files by content -- matches the same node in "
+            "the source session AND the operator has read every slot's full text and typed 'approve'. A review it "
+            "cannot show in full is refused. Never use it for text authored or edited in the target session. Dry run unless --execute."
         ),
     )
     parser.add_argument("--base-url", help="deployment origin, https://... (env ELSPETH_OPS_BASE_URL)")
@@ -312,7 +422,7 @@ def main(
             steps=[
                 f"read and hash-verify every file of the source session as {source_auth.username}",
                 f"record the target graph and history as {target_auth.username}",
-                "for each pending llm_prompt_template review: check surface, bindings and file bytes, show the text, ask for 'approve', resolve accepted_as_drafted",
+                "for each pending llm_prompt_template review: check surface, bindings, file bytes and inline text against the source node, show every slot's text, ask for 'approve', resolve accepted_as_drafted",
                 "check graph and history unchanged, no review pending, then run normal validation",
             ],
             checkpoint=str(store.root / (checkpoint_name(session_id) + ".json")),

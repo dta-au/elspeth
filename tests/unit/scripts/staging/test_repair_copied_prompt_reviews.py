@@ -129,6 +129,72 @@ def test_review_resolved_through_the_api_after_bytes_match_and_operator_approves
     }
 
 
+def with_inline_system(fake: FakeDeployment, *, source_text: str, target_text: str) -> None:
+    """Make system_prompt inline text on both sessions' node: a mixed surface (file template, inline system prompt)."""
+    fake.sessions[SOURCE].state["nodes"][0]["options"]["system_prompt"] = source_text
+    fake.sessions[TARGET].state["nodes"][0]["options"]["system_prompt"] = target_text
+    snapshot = fake.sessions[TARGET].reviews["event-1"]["snapshot"]
+    snapshot["authored_surface"]["system_prompt"] = target_text
+    snapshot["bindings"] = [item for item in snapshot["bindings"] if item["blob_id"] != "t-sys"]
+
+
+def test_inline_text_is_shown_in_full_and_resolved_only_when_it_is_the_source_nodes_text(tmp_path: Path) -> None:
+    fake = deployment()
+    with_inline_system(fake, source_text="Inline system text.", target_text="Inline system text.")
+    shown: list[repair.ReviewEvidence] = []
+    run(fake, tmp_path, shown=shown)
+    assert [(slot["field_path"], slot["form"], slot["text"]) for slot in shown[0].slots] == [
+        ("prompt_template", "file", USER.decode()),
+        ("system_prompt", "inline", "Inline system text."),
+    ]
+    assert len(resolves(fake)) == 1
+
+
+def test_inline_text_differing_from_the_source_node_is_never_resolved(tmp_path: Path) -> None:
+    fake = deployment()
+    with_inline_system(fake, source_text="Inline system text.", target_text="Inline system text, edited in the copy.")
+    with pytest.raises(OperationFailed, match="not byte-for-byte the source session's prompt"):
+        run(fake, tmp_path)
+    assert resolves(fake) == []
+
+
+def test_inline_only_card_with_no_bindings_is_verified_against_the_source(tmp_path: Path) -> None:
+    fake = deployment()
+    for session, text in ((SOURCE, "Rate it."), (TARGET, "Rate it, differently.")):
+        fake.sessions[session].state["nodes"][0]["options"] = {"prompt_template": text, "model": "m"}
+    snapshot = fake.sessions[TARGET].reviews["event-1"]["snapshot"]
+    snapshot.update(authored_surface={"prompt_template": "Rate it, differently."}, bindings=[])
+    with pytest.raises(OperationFailed, match="not byte-for-byte"):
+        run(fake, tmp_path)
+    assert resolves(fake) == []
+
+
+def test_files_swapped_between_slots_are_refused(tmp_path: Path) -> None:
+    fake = deployment()
+    source_options = fake.sessions[SOURCE].state["nodes"][0]["options"]
+    source_options["system_prompt"], source_options["prompt_template"] = source_options["prompt_template"], source_options["system_prompt"]
+    with pytest.raises(OperationFailed, match="not byte-for-byte"):
+        run(fake, tmp_path)
+    assert resolves(fake) == []
+
+
+def test_a_node_the_source_does_not_have_is_refused(tmp_path: Path) -> None:
+    fake = deployment()
+    fake.sessions[SOURCE].state["nodes"][0]["id"] = "renamed"
+    with pytest.raises(OperationFailed, match="source session does not have"):
+        run(fake, tmp_path)
+    assert resolves(fake) == []
+
+
+def test_a_surface_this_tool_cannot_show_in_full_is_refused(tmp_path: Path) -> None:
+    fake = deployment()
+    snapshot = fake.sessions[TARGET].reviews["event-1"]["snapshot"]
+    snapshot["authored_surface"]["prompt_template_parts"] = [{"kind": "text", "text": "x"}]
+    with pytest.raises(OperationFailed, match="cannot show and verify"):
+        run(fake, tmp_path)
+    assert resolves(fake) == []
+
+
 def test_target_file_bytes_differing_from_the_source_refuses(tmp_path: Path) -> None:
     fake = deployment(target_system=b"Edited in the target session.\n")
     with pytest.raises(OperationFailed, match="not in the source session"):
