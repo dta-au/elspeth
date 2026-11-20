@@ -24,6 +24,7 @@ import {
   FOCUS_AUTHORING_EVENT,
   REQUEST_ARTIFACT_VIEW_EVENT,
   REQUEST_RUN_EVENT,
+  TOGGLE_AUTHORING_EVENT,
   type RequestArtifactViewDetail,
 } from "./lib/composer-events";
 import type {
@@ -686,26 +687,19 @@ describe("App banner roles", () => {
     expect(useSessionStore.getState().activeSessionId).toBe("11111111-1111-4111-8111-111111111111");
   });
 
-  it.each([
-    ["busy", { isComposing: true, error: null }],
-    ["error", { isComposing: false, error: "authoring failed" }],
-  ] as const)(
-    "renders the real App-owned collapsed status projection with %s tone",
-    async (tone, state) => {
-      useSessionStore.setState({
-        activeSessionId: "11111111-1111-4111-8111-111111111111",
-        ...state,
-      });
-      render(<App />);
-      await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
-
-      const projection = within(
-        screen.getByTestId("collapsed-authoring-status"),
-      ).getByText(tone === "busy" ? "Authoring in progress" : /Authoring error:/);
-      expect(projection).toHaveAttribute("data-tone", tone);
-      expect(projection).toHaveClass("workspace-collapsed-status");
-    },
-  );
+  it("leaves the collapsed-pane status to the workspace's live projection", async () => {
+    // 2026-11-20: ComposerWorkspace projects the status itself
+    // (useCollapsedAuthoringStatus) so the tutorial, which mounts the same
+    // workspace without App's wiring, gets the same badge and live region.
+    useSessionStore.setState({
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
+    });
+    render(<App />);
+    await waitFor(() => expect(workspaceMountSpy).toHaveBeenCalled());
+    for (const [props] of workspaceMountSpy.mock.calls) {
+      expect(props).not.toHaveProperty("collapsedStatus");
+    }
+  });
 
   it("loads sessions on startup after SessionSidebar removal", async () => {
     const session: Session = {
@@ -838,6 +832,40 @@ describe("App banner roles", () => {
     expect(artifactRequests).toEqual([]);
     window.removeEventListener(FOCUS_AUTHORING_EVENT, onFocusAuthoring);
     window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+  });
+
+  it.each([
+    [{ ctrlKey: true }, 1],
+    [{ metaKey: true }, 1],
+    // AltGr arrives as Ctrl+Alt on Windows; German and Nordic layouts type a
+    // backslash with it, so the chord must not fire on a typed "\\".
+    [{ ctrlKey: true, altKey: true }, 0],
+    [{}, 0],
+  ])("maps %o + \\ to the hide/show conversation toggle %i time(s)", async (modifiers, calls) => {
+    const onToggle = vi.fn();
+    window.addEventListener(TOGGLE_AUTHORING_EVENT, onToggle);
+    try {
+      useSessionStore.setState({
+        activeSessionId: "11111111-1111-4111-8111-111111111111",
+      });
+      render(<App />);
+      await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+
+      const event = new KeyboardEvent("keydown", {
+        key: "\\",
+        bubbles: true,
+        cancelable: true,
+        ...modifiers,
+      });
+      act(() => {
+        document.dispatchEvent(event);
+      });
+
+      expect(onToggle).toHaveBeenCalledTimes(calls);
+      expect(event.defaultPrevented).toBe(calls === 1);
+    } finally {
+      window.removeEventListener(TOGGLE_AUTHORING_EVENT, onToggle);
+    }
   });
 
   it("does not dispatch Ctrl+E when backend execution readiness is false", async () => {
@@ -2050,10 +2078,10 @@ describe("App shared-route keyboard isolation", () => {
     it.each(modifiers)(`leaves workspace intent chords dormant via %s on ${hash}`, async (modifier) => {
       await mountSurface(hash);
       const events = vi.fn();
-      const names = ["open-catalog", REQUEST_ARTIFACT_VIEW_EVENT, FOCUS_AUTHORING_EVENT, REQUEST_RUN_EVENT];
+      const names = ["open-catalog", REQUEST_ARTIFACT_VIEW_EVENT, FOCUS_AUTHORING_EVENT, TOGGLE_AUTHORING_EVENT, REQUEST_RUN_EVENT];
       for (const name of names) window.addEventListener(name, events);
       try {
-        for (const [key, shift] of [["k", false], ["P", true], ["G", true], ["Y", true], ["/", false], ["e", false]] as const) {
+        for (const [key, shift] of [["k", false], ["P", true], ["G", true], ["Y", true], ["/", false], ["\\", false], ["e", false]] as const) {
           expect((await press(key, modifier, shift)).defaultPrevented).toBe(false);
         }
         const help = new KeyboardEvent("keydown", { key: "?", bubbles: true, cancelable: true });
