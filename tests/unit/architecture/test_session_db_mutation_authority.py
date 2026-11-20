@@ -20891,10 +20891,10 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "_probe_database_engine",
             "<sessions-write-connection>",
             "write_connection",
-            "65d5d82276d99f4d",
+            "366439004953a9ab",
             1,
             None,
-            line=147,
+            line=213,
             connection_escape=True,
         ),
         WriterIdentity(
