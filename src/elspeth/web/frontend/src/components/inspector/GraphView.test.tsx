@@ -20,6 +20,7 @@ import { projectValidationWorkspaceStatus } from "@/components/workspace/workspa
 // and the updateNodeInternals spy its custom node calls when handles change.
 const flowProbe = vi.hoisted(() => ({
   onNodesChange: undefined as undefined | ((changes: unknown[]) => void),
+  onInit: undefined as undefined | ((instance: unknown) => void),
   updateNodeInternals: vi.fn(),
 }));
 
@@ -51,6 +52,7 @@ vi.mock("@xyflow/react", () => ({
     edgesFocusable,
   }: any) => {
     flowProbe.onNodesChange = onNodesChange;
+    flowProbe.onInit = onInit;
     return (
     <div
       data-testid="react-flow"
@@ -469,6 +471,45 @@ describe("GraphView", () => {
     expect(within(screen.getByTestId("node-classify")).getByText("classify")).toBeInTheDocument();
     // The plugin name
     expect(within(screen.getByTestId("node-classify")).getByText("llm_transform")).toBeInTheDocument();
+  });
+
+  it("shows a file's component from the Files table: selects it, fits it, and refuses one the view hides", async () => {
+    const marker = { blob_ref: "prompt-file", mode: "inline_content", sha256: "a".repeat(64) };
+    useSessionStore.setState({ compositionState: makeState({
+      sources: { source: { plugin: "csv", options: {}, on_success: "rows", on_validation_failure: "quarantine" } },
+      nodes: [makeNode({ id: "step", plugin: "llm", input: "rows", on_success: "shared", options: { prompt_template: marker } })],
+      outputs: [
+        { name: "shared", plugin: "json", options: {}, on_write_failure: "quarantine" },
+        { name: "quarantine", plugin: "json", options: { path: "blob:dump-file" }, on_write_failure: "discard" },
+      ],
+    }) });
+    render(<GraphView />);
+    const fitView = vi.fn().mockResolvedValue(true);
+    act(() => flowProbe.onInit?.({ fitView }));
+    const user = userEvent.setup();
+    await user.click(screen.getByText((_content, element) => element?.tagName === "SUMMARY" && element.textContent?.trim() === "Files"));
+    await user.click(screen.getByRole("button", { name: "Show node step" }));
+    expect(useSessionStore.getState().selectedNodeId).toBe("step");
+    expect(fitView).toHaveBeenLastCalledWith(expect.objectContaining({ nodes: [{ id: "step" }] }));
+    expect(screen.getByRole("button", { name: "Show node quarantine" })).toHaveAttribute("aria-disabled", "false");
+    // Hiding quarantine and discard routes removes the quarantine sink from the view.
+    await user.click(screen.getByRole("switch", { name: "Show quarantine and discard routes" }));
+    expect(screen.queryByTestId("node-quarantine")).not.toBeInTheDocument();
+    const hidden = screen.getByRole("button", { name: "Show node quarantine" });
+    expect(hidden).toHaveAttribute("aria-disabled", "true");
+    fitView.mockClear();
+    await user.click(hidden);
+    expect(useSessionStore.getState().selectedNodeId).toBe("step");
+    expect(fitView).not.toHaveBeenCalled();
+  });
+
+  it("places the file mapping dropdown above Wiring", () => {
+    useSessionStore.setState({ compositionState: makeState({ nodes: [makeNode()] }) });
+    render(<GraphView />);
+    const summary = screen.getByText((_content, element) => element?.tagName === "SUMMARY" && element.textContent?.trim() === "Files");
+    const wiring = screen.getByText(wiringSummary(1));
+    expect(summary.compareDocumentPosition(wiring) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(summary.closest("details")).not.toHaveAttribute("open");
   });
 
   it.each([

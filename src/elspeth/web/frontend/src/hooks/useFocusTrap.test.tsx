@@ -37,7 +37,37 @@ function StackedTraps() {
   );
 }
 
+function FocusableContainerTrap() {
+  const ref = useRef<HTMLDivElement>(null);
+  useFocusTrap(ref, true);
+  return (
+    <div ref={ref} tabIndex={-1} aria-label="pad">
+      <p>pad text</p>
+      <button>pad-first</button>
+      <button>pad-last</button>
+    </div>
+  );
+}
+
 describe("useFocusTrap recapture (WCAG 2.4.3 — modal focus containment)", () => {
+  it.each([
+    ["Shift+Tab", true, "pad-last"],
+    ["Tab", false, "pad-first"],
+  ])("keeps %s inside the trap when focus is on a focusable container itself", (_key, shiftKey, expected) => {
+    render(
+      <>
+        <button>outside</button>
+        <FocusableContainerTrap />
+      </>,
+    );
+    const container = screen.getByLabelText("pad");
+    act(() => container.focus());
+    expect(container).toHaveFocus();
+    const event = fireEvent.keyDown(document, { key: "Tab", shiftKey });
+    expect(event).toBe(false); // default prevented: the browser's own move would leave the trap
+    expect(screen.getByRole("button", { name: expected })).toHaveFocus();
+  });
+
   it("pulls focus back to the first element on Tab when focus has escaped the trap", () => {
     render(
       <>

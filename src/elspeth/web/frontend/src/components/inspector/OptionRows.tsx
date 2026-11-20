@@ -74,6 +74,11 @@ export function optionLabel(key: string): string {
   return OPTION_LABELS[key] ?? titleCaseLabel(key);
 }
 
+/** Reader-facing name of one prompt slot from `promptFileSlots`: its role, or its query's name. */
+export function promptSlotLabel(fieldPath: string, queryName?: string): string {
+  return queryName === undefined ? optionLabel(fieldPath) : `${optionLabel("prompt_template")}, query ${queryName}`;
+}
+
 // Fallback partition when the plugin's catalog schema is not cached (catalog
 // never loaded, invalidated, structural node). Declared explicitly — NOT
 // derived from OPTION_LABELS — so a copy edit cannot change what is visible.

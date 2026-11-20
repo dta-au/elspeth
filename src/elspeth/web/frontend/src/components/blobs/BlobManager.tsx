@@ -7,8 +7,11 @@ import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { BlobRow } from "./BlobRow";
 import { IdentityStorageTotal } from "./IdentityStorageTotal";
 import type { BlobMetadata, BlobCategory } from "@/types/api";
-import { componentOptionsById, optionBlobReferences, promptFileBindings, promptFileEditability } from "@/lib/blobBindings";
+import { componentOptionsById, isPromptTextMimeType, optionBlobReferences, promptFileBindings, promptFileEditability } from "@/lib/blobBindings";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
+import { useComposer } from "@/hooks/useComposer";
+import { FileWiringPad } from "./FileWiringPad";
+import { COMPOSE_LOADING_SESSION_MESSAGE } from "@/config/composer";
 
 interface BlobManagerProps {
   onUseAsInput: (blob: BlobMetadata) => void;
@@ -43,10 +46,20 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const selectedNodeId = useSessionStore((s) => s.selectedNodeId);
   const compositionState = useSessionStore((s) => s.compositionState);
-  // Use-as-input is a compose entry point: disable it while a freeform
-  // compose is in flight (elspeth-3f38ebb1b5) so the manager cannot offer a
-  // second compose the store admission gate would refuse.
+  // Use-as-input and the wiring pad are compose entry points: disable them
+  // while a freeform compose is in flight (elspeth-3f38ebb1b5) or the session
+  // has not finished loading, so the manager cannot offer a compose the store
+  // admission gate (sessionStore composeRequest) would silently refuse. The
+  // chat box gates on the same two flags (ChatInput awaitingComposeTimeout).
   const isComposing = useSessionStore((s) => s.isComposing);
+  const composeReady = useSessionStore((s) => s.compositionStateLoaded);
+  const requestInFlight = useSessionStore((s) => activeSessionId !== null && s.composeRequests.has(activeSessionId));
+  const { sendMessage } = useComposer();
+  // The file wiring pad is bound to the session, file and graph state it was
+  // opened on; a change to any of them refuses the connection until reopened.
+  const [pendingWire, setPendingWire] = useState<{ blob: BlobMetadata; sessionId: string; stateId: string | null } | null>(null);
+  // `seq` re-keys the pad's alert so a repeated refusal is announced again.
+  const [wireSendRefusal, setWireSendRefusal] = useState<{ message: string; seq: number } | null>(null);
   const pending = useInterpretationEventsStore((s) => activeSessionId ? s.pendingBySession[activeSessionId] : undefined);
   const { blobs, isLoading, error, activeSessionId: blobSessionId, loadBlobs, uploadBlob, deleteBlob, downloadBlob } =
     useBlobStore();
@@ -78,6 +91,17 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   );
   const missingCount = !isLoading && listBelongsToSession ? attached.size - matchedIds.size : 0;
   const promptBindings = useMemo(() => promptFileBindings(compositionState), [compositionState]);
+  const wireFile = pendingWire ? blobs.find((blob) => blob.id === pendingWire.blob.id) : undefined;
+  const wiringDisabledReason = !composeReady ? COMPOSE_LOADING_SESSION_MESSAGE
+    : isComposing || requestInFlight ? "Wait for Composer to finish before connecting this file."
+    : !wireFile || !listBelongsToSession || isLoading || wireFile.status !== "ready" || wireFile.content_hash !== pendingWire?.blob.content_hash
+      ? "This file changed or is unavailable. Close the wiring pad and reopen it."
+      : (compositionState?.id ?? null) !== pendingWire?.stateId ? "The graph changed. Close the wiring pad and reopen it." : null;
+
+  useEffect(() => {
+    // A pad opened in another session never comes back when that session is reopened.
+    setPendingWire(null);
+  }, [activeSessionId]);
 
   useEffect(() => {
     if (previousSelectedNode.current !== selectedNodeId) {
@@ -298,12 +322,18 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
                     onDownload={handleDownload}
                     onDelete={handleRequestDelete}
                     onUseAsInput={onUseAsInput}
-                    useAsInputDisabled={isComposing}
+                    useAsInputDisabled={isComposing || !composeReady}
                     attachedFields={listBelongsToSession ? attached.get(blob.id.toLowerCase()) : undefined}
                     selectedNodeLabel={selectedNodeId}
                     focused={focusedBlobId?.toLowerCase() === blob.id.toLowerCase()}
                     onSelect={() => useBlobStore.setState({ focusedBlobId: blob.id })}
                     editRefusal={editability?.editable === false ? editability.reason : undefined}
+                    onWire={isPromptTextMimeType(blob.mime_type)
+                      ? () => {
+                        setWireSendRefusal(null);
+                        setPendingWire({ blob, sessionId: activeSessionId, stateId: compositionState?.id ?? null });
+                      } : undefined}
+                    wiringDisabled={blob.status !== "ready" || !listBelongsToSession || isLoading}
                     onEditPrompt={binding && opensEditor ? () => {
                       useSessionStore.getState().selectNode(binding.nodeId);
                       useBlobStore.getState().requestPromptEdit(binding.nodeId, binding.fieldPath);
@@ -324,6 +354,36 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
           variant="danger"
           onConfirm={confirmDelete}
           onCancel={() => setPendingDelete(null)}
+        />
+      )}
+      {pendingWire?.sessionId === activeSessionId && (
+        <FileWiringPad
+          key={`${pendingWire.sessionId}:${pendingWire.blob.id}:${pendingWire.stateId}`}
+          blob={pendingWire.blob}
+          state={compositionState}
+          blobs={listBelongsToSession ? blobs : []}
+          disabledReason={wiringDisabledReason}
+          sendRefusal={wireSendRefusal}
+          onClose={() => setPendingWire(null)}
+          onConnect={(request) => {
+            // A pad from an earlier session, or one whose last render refused, never sends.
+            if (useSessionStore.getState().activeSessionId !== pendingWire.sessionId || wiringDisabledReason !== null) return;
+            // composeRequest returns nothing when its admission gate refuses; an
+            // accepted request registers its owner before its first await. Close
+            // only on that evidence, so a refused send keeps the user's selection
+            // and typed text in the pad.
+            const prior = useSessionStore.getState().composeRequests.get(pendingWire.sessionId);
+            void sendMessage(request);
+            const owner = useSessionStore.getState().composeRequests.get(pendingWire.sessionId);
+            if (owner !== undefined && owner !== prior) {
+              setPendingWire(null);
+            } else {
+              setWireSendRefusal((previous) => ({
+                message: "Composer did not take this request. Your choices are kept; try again.",
+                seq: (previous?.seq ?? 0) + 1,
+              }));
+            }
+          }}
         />
       )}
     </div>

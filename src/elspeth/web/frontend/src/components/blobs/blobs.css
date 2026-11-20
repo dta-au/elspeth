@@ -296,3 +296,33 @@
   background-color: var(--color-surface-elevated);
   border-bottom: 1px solid var(--color-border);
 }
+
+.file-wiring-pad {
+  width: min(720px, calc(100vw - 32px));
+}
+
+.file-wiring-mode,
+.file-wiring-targets {
+  margin: var(--space-md) 0;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-sm);
+}
+
+.file-wiring-mode label,
+.file-wiring-target {
+  display: flex;
+  align-items: start;
+  gap: var(--space-sm);
+  padding: var(--space-xs);
+}
+
+.file-wiring-target small {
+  display: block;
+  color: var(--color-text-muted);
+}
+
+.file-wiring-instructions {
+  display: grid;
+  gap: var(--space-xs);
+}
