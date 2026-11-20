@@ -370,8 +370,9 @@ class ComposerPreflight:
         """Read what a runtime preflight of ``state`` reads that can change, or say why not.
 
         Runs in a worker thread, through the same ``list_refs`` call, the same
-        ``get_blob_sync`` and operation context, and the same path resolvers
-        that the preflight's own readers use. A reason means "cannot vouch for
+        fenced metadata read as ``get_blob_sync`` (every record in one
+        ``get_blobs_sync`` transaction) under the same operation context, and
+        the same path resolvers that the preflight's own readers use. A reason means "cannot vouch for
         the evidence": the caller then neither reuses nor stores, so the
         compute that follows runs exactly as base and reports any failure
         through its own reads.
@@ -400,8 +401,11 @@ class ComposerPreflight:
             if _state_has_secret_ref_sites(state, frozenset(item.name for item in secret_inventory)):
                 return "secret_ref_sites"
             blobs: list[BlobEvidence] = []
-            for blob_id in sorted(blob_ids):
-                record = self._blob_service.get_blob_sync(blob_id, session_operation_context)
+            # One fenced transaction for every record (one fence write at any
+            # N); a missing or out-of-custody blob fails the whole read, as one
+            # failing ``get_blob_sync`` did. Stats follow the commit, as before:
+            # the before/after bracket, not this read, vouches for them.
+            for record in self._blob_service.get_blobs_sync(blob_ids, session_operation_context):
                 stat = os.stat(record.storage_path)
                 blobs.append(
                     BlobEvidence(
