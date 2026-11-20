@@ -57,6 +57,9 @@ Every plugin interaction is recorded. The audit trail must answer:
 
 Plugins MUST return audit-relevant information. "Trust me, I did it" is not acceptable.
 
+A plugin MUST NOT mutate its own config after build, including values held inside it such as arrays.
+Checkpoints (a resumed run's included) and the audit trail record the configuration as of run start, so a later change is recorded nowhere.
+
 ### 2. Plugins Control Their Own Schedule
 
 ELSPETH doesn't dictate internal timing. Plugins may:

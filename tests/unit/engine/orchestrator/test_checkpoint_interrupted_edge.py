@@ -26,12 +26,16 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import create_autospec
 
+import pytest
+
 from elspeth.contracts import NodeType
 from elspeth.contracts.barrier_scalars import AggregationNodeScalars, BarrierScalars
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.types import NodeID
+from elspeth.core.canonical import compute_full_topology_hash
 from elspeth.core.checkpoint import CheckpointManager
+from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
 from elspeth.core.dag import ExecutionGraph
 from elspeth.engine.orchestrator.checkpointing import CheckpointCoordinator
 
@@ -44,14 +48,14 @@ class _ScalarProcessor:
         return self.barrier_scalars
 
 
-def _make_coordinator() -> CheckpointCoordinator:
+def _make_coordinator(plugin_name: str = "test") -> CheckpointCoordinator:
     config = RuntimeCheckpointConfig(enabled=True, frequency=1, checkpoint_interval=None)
     coordinator = CheckpointCoordinator(
         checkpoint_manager=create_autospec(CheckpointManager, instance=True, spec_set=True),
         checkpoint_config=config,
     )
     graph = ExecutionGraph()
-    graph.add_node("source", node_type=NodeType.SOURCE, plugin_name="test", config={})
+    graph.add_node("source", node_type=NodeType.SOURCE, plugin_name=plugin_name, config={})
     coordinator.set_active_graph(graph)
     return coordinator
 
@@ -138,3 +142,140 @@ class TestFlushEmptiedAggregationCheckpoints:
         assert kwargs["draft"].run_id == "run-no-anchor"
         assert kwargs["coordination_token"] is token
         assert kwargs["draft"].barrier_scalars.has_state is False
+
+
+class TestTopologyHashFixedAtRunStart:
+    """E-9a: the checkpoint topology hash is fixed at run start (maintainer ruling 2026-11-20).
+
+    The coordinator hashes the graph when it is installed (if a checkpoint
+    can be written) and reuses that digest for every checkpoint of the run, the graceful
+    shutdown checkpoint included. ``set_active_graph`` discards it on every
+    install and every clear.
+    """
+
+    def test_shutdown_checkpoint_reuses_run_start_hash(self) -> None:
+        """A topology change after the first checkpoint does not reach the shutdown checkpoint.
+
+        The shutdown path neither recomputes nor refuses: it writes the
+        run-start digest and returns normally, as every other checkpoint does.
+        """
+        coordinator = _make_coordinator()
+        graph = coordinator._active_graph
+        assert graph is not None
+        token = _token("run-fixed-hash")
+        run_start_hash = compute_full_topology_hash(graph)
+        coordinator.checkpoint_run_start(coordination_token=token)
+
+        # Manually built graphs keep a mutable config dict; change a hashed input.
+        graph.get_node_info("source").config["changed"] = True
+        assert compute_full_topology_hash(graph) != run_start_hash
+
+        coordinator.checkpoint_interrupted_progress(_loop_ctx({}), coordination_token=token)
+
+        manager = coordinator._checkpoint_manager
+        assert manager is not None
+        drafts = [call.kwargs["draft"] for call in manager.create_checkpoint.call_args_list]
+        assert [draft.sequence_number for draft in drafts] == [0, 1]
+        assert [draft.upstream_topology_hash for draft in drafts] == [run_start_hash, run_start_hash]
+
+    def test_install_and_clear_each_reset_the_cached_hash(self) -> None:
+        """Installing a graph over a primed one, and clearing, each discard the cache.
+
+        The second graph is installed WITHOUT a preceding clear (a fresh-run
+        exception before the clearing ``finally``, or a failing plugin
+        cleanup, can skip the clear), so a reset that only happens on clear
+        hands the second run the first run's digest. Clearing is then checked
+        on its own, so a reset that only happens on install fails too.
+        """
+        coordinator = _make_coordinator()
+        first_graph = coordinator._active_graph
+        assert first_graph is not None
+        first_hash = compute_full_topology_hash(first_graph)
+        coordinator.checkpoint_run_start(coordination_token=_token("first-run"))
+
+        second_graph = ExecutionGraph()
+        second_graph.add_node("source", node_type=NodeType.SOURCE, plugin_name="different-source", config={})
+        second_hash = compute_full_topology_hash(second_graph)
+        assert second_hash != first_hash
+        coordinator.set_active_graph(second_graph)
+        coordinator.reset_sequence()
+        coordinator.checkpoint_run_start(coordination_token=_token("second-run"))
+
+        manager = coordinator._checkpoint_manager
+        assert manager is not None
+        drafts = [call.kwargs["draft"] for call in manager.create_checkpoint.call_args_list]
+        assert [(draft.run_id, draft.upstream_topology_hash) for draft in drafts] == [
+            ("first-run", first_hash),
+            ("second-run", second_hash),
+        ]
+
+        # Clearing must discard the cache too. Through the public API this is
+        # not observable: after a clear the gate refuses every draft, and the
+        # next install recomputes. So "reset only on install" is behaviourally
+        # equivalent and only this private-state check can fail it.
+        assert coordinator._active_topology_hash == second_hash
+        coordinator.set_active_graph(None)
+        assert coordinator._active_topology_hash is None
+
+    def test_interleaved_live_coordinators_keep_their_own_hash(self) -> None:
+        """Two coordinators alive at once (concurrent web runs in one process) never share a hash.
+
+        Installs and drafts are interleaved: install A, install B, draft A,
+        draft B, draft A, draft B. A cache shared between coordinators (a
+        class or module global), even one reset on every install, hands one
+        run the other's digest.
+        """
+        coordinator_a = _make_coordinator("source-a")
+        coordinator_b = _make_coordinator("source-b")
+        graph_a = coordinator_a._active_graph
+        graph_b = coordinator_b._active_graph
+        assert graph_a is not None and graph_b is not None
+        hash_a = compute_full_topology_hash(graph_a)
+        hash_b = compute_full_topology_hash(graph_b)
+        assert hash_a != hash_b
+        token_a = _token("run-a")
+        token_b = _token("run-b")
+
+        coordinator_a.checkpoint_run_start(coordination_token=token_a)
+        coordinator_b.checkpoint_run_start(coordination_token=token_b)
+        coordinator_a.checkpoint_interrupted_progress(_loop_ctx({}), coordination_token=token_a)
+        coordinator_b.checkpoint_interrupted_progress(_loop_ctx({}), coordination_token=token_b)
+
+        for coordinator, run_id, expected in ((coordinator_a, "run-a", hash_a), (coordinator_b, "run-b", hash_b)):
+            manager = coordinator._checkpoint_manager
+            assert manager is not None
+            drafts = [call.kwargs["draft"] for call in manager.create_checkpoint.call_args_list]
+            assert [(draft.run_id, draft.sequence_number, draft.upstream_topology_hash) for draft in drafts] == [
+                (run_id, 0, expected),
+                (run_id, 1, expected),
+            ]
+
+    @pytest.mark.parametrize(
+        ("enabled", "with_manager"),
+        [pytest.param(False, True, id="checkpointing-disabled"), pytest.param(True, False, id="no-manager")],
+    )
+    def test_install_hashes_nothing_when_checkpoints_cannot_be_written(
+        self, enabled: bool, with_manager: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Installing a graph costs no topology hash unless a checkpoint can be written."""
+        calls: list[ExecutionGraph] = []
+        original = CheckpointCompatibilityValidator.compute_full_topology_hash
+
+        def counting(self: CheckpointCompatibilityValidator, graph: ExecutionGraph) -> str:
+            calls.append(graph)
+            return original(self, graph)
+
+        monkeypatch.setattr(CheckpointCompatibilityValidator, "compute_full_topology_hash", counting)
+        coordinator = CheckpointCoordinator(
+            checkpoint_manager=create_autospec(CheckpointManager, instance=True, spec_set=True) if with_manager else None,
+            checkpoint_config=RuntimeCheckpointConfig(enabled=enabled, frequency=1, checkpoint_interval=None),
+        )
+        graph = ExecutionGraph()
+        graph.add_node("source", node_type=NodeType.SOURCE, plugin_name="test", config={})
+
+        coordinator.set_active_graph(graph)
+        coordinator.checkpoint_run_start(coordination_token=_token("run-no-checkpoints"))
+        coordinator.checkpoint_interrupted_progress(_loop_ctx({}), coordination_token=_token("run-no-checkpoints"))
+        coordinator.set_active_graph(None)
+
+        assert calls == []
