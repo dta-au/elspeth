@@ -63,6 +63,12 @@ not call `get_pipeline_state` to confirm those components. Use
 question, or a successful mutation that omits the echo. A successful result
 whose hint reports the pipeline unchanged needs no confirming read.
 
+For an existing transform's routing edit, preserve its description, options,
+and unrelated error routes in the replacement `upsert_node` arguments unless
+the user requests their change. `upsert_node` replaces the whole node: an
+omitted `description` is dropped and the supplied `options` replace the old
+ones, so resupply both; an omitted `on_error` keeps the existing choice.
+
 An absent policy-visible plugin is different from an unsupported pipeline
 shape. Say that a plugin is unavailable or policy-denied only when live
 discovery proves it — use the supplied discovery digest's `prohibited` entries
@@ -273,9 +279,10 @@ runtime connection contract. Do not invent fields outside the terminal schema.
 
 Every source, node, and output accepts an optional `description`: one short
 sentence of plain prose saying what that step does, shown to human reviewers
-beside the raw config. Supply it when authoring a step and refresh it when the
-step's behavior changes. It is informational only — never routing, validation,
-or a substitute for review.
+beside the raw config. Supply it when authoring a step; refresh it only when
+the requested change includes the step's purpose or description. Preserve it
+for routing-only edits or explicit content-preservation requests. It is
+informational only — never routing, validation, or a substitute for review.
 
 ## Field contracts and structured plugin output
 

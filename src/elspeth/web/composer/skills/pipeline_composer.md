@@ -262,8 +262,9 @@ Examples of complete workflow scope, whether built atomically or in batches:
 
 The capability core defines the optional `description` on every source, node,
 and output. Describe the step's purpose in the user's terms ("Fetch each page
-at its url"), not its plugin mechanics, and refresh it whenever you change what
-the step does — a stale description is worse than none.
+at its url"), not its plugin mechanics. Preserve existing descriptions during
+routing-only edits or when the user asks to preserve content. Refresh them
+only when the requested change includes the step's purpose or description.
 
 ## Reply Register
 
