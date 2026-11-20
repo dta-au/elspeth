@@ -56,6 +56,51 @@ def test_cached_results_never_skip_current_source_size_admission(monkeypatch):
         templates.extract_jinja2_context_fields(text, row_attribute="source_row")
 
 
+def test_context_analysis_cache_keys_on_namespace_and_row_attribute():
+    text = "{{ row.direct }} {{ row.source_row.nested }} {{ row.alternate.other }} {{ other.foreign }}"
+    assert templates.extract_jinja2_context_fields(text, row_attribute="source_row") == frozenset({"direct", "alternate"})
+    # Same text and row attribute, different namespace: a key without the namespace returns the row answer.
+    assert templates.extract_jinja2_context_fields(text, "other", row_attribute="source_row") == frozenset({"foreign"})
+    # Same text and namespace, different row attribute: a key without it returns the source_row answer.
+    assert templates.extract_jinja2_context_fields(text, row_attribute="alternate") == frozenset({"direct", "source_row"})
+    assert templates.extract_jinja2_context_fields(text + " {{ row.new }}", row_attribute="source_row") == frozenset(
+        {"direct", "alternate", "new"}
+    )
+    assert templates.extract_jinja2_context_fields(text, row_attribute="source_row") == frozenset({"direct", "alternate"})
+    assert templates._cached_jinja2_context_fields.cache_info().misses == 4
+    assert templates._cached_jinja2_context_fields.cache_info().hits == 1
+
+
+@pytest.mark.parametrize("wrapper", ["field", "context"])
+@pytest.mark.parametrize(
+    ("text", "limit"),
+    [
+        pytest.param("abcdef", 4, id="ascii-over-chars-and-bytes"),
+        pytest.param("ééé", 4, id="multibyte-under-chars-over-bytes"),
+    ],
+)
+def test_source_admission_runs_before_any_analysis_cache_lookup(monkeypatch, wrapper, text, limit):
+    if wrapper == "field":
+        cache = templates._cached_jinja2_field_usage
+
+        def analyse() -> object:
+            return templates.extract_jinja2_field_usage(text)
+    else:
+        cache = templates._cached_jinja2_context_fields
+
+        def analyse() -> object:
+            return templates.extract_jinja2_context_fields(text, row_attribute="source_row")
+
+    analyse()
+    warm = cache.cache_info()
+    assert warm.currsize == 1
+    monkeypatch.setattr(templates, "MAX_JINJA_TEMPLATE_BYTES", limit)
+    with pytest.raises(ValueError, match="Template exceeds"):
+        analyse()
+    # A warm entry exists for this exact key, so any lookup before admission would count a hit.
+    assert cache.cache_info() == warm
+
+
 def test_both_caches_evict_old_entries():
     for index in range(129):
         text = "{{ row.field_" + str(index) + " }}"
