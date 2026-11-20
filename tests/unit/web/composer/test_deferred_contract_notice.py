@@ -293,7 +293,7 @@ def test_a_deferring_non_pass_through_abstains(tmp_path: Path) -> None:
 
     assert summary.is_valid, [entry.to_dict() for entry in summary.errors]
     assert _notices(summary) == [
-        "Node 'rename' (field_mapper) reads an attached file that this check does not open, so the fields this step adds, "
+        "Node 'rename' (field_mapper) reads an attached file that this check does not open, so the fields this step reads and adds, "
         "their types and whether they can be empty are checked before the run starts. No change is needed."
     ]
     assert not [contract for contract in summary.edge_contracts if contract.from_id == "rename"]
@@ -585,33 +585,36 @@ def test_a_field_neither_upstream_nor_the_join_could_supply_is_still_refused(tmp
     assert _notices(summary) == [_join_notice("enrich")]
 
 
-def test_2B_BOUNDARY_a_fixed_upstream_lacking_a_joined_field_still_refuses_a_consumer_requiring_it(tmp_path: Path) -> None:
-    """Known 2a limit, closed by stage 2b: ``added`` IS the joined field, yet a consumer requiring it is refused.
+# Formerly ``test_2B_BOUNDARY_a_fixed_upstream_lacking_a_joined_field_still_refuses_a_consumer_requiring_it``,
+# the known 2a limit; stage 2b closes it and this is its rewrite.
+def test_a_consumer_requiring_a_field_the_join_adds_behind_a_fixed_upstream_is_left_to_the_preflight(tmp_path: Path) -> None:
+    """``added`` is an ``output`` key: the join adds it once its table is read, so it is not refused here.
 
-    The join forwards ``id, k`` and adds ``added``; 2a promotes nothing the
-    node adds, so behind a fixed upstream the requirement is unmet at
-    authoring while execution validation admits the graph. The error text is
-    no worse than before 2a (it then read ``guarantees: [(none)]``) and the
-    notice is still emitted. When 2b lands this test is rewritten, not deleted.
+    The fixed upstream guarantees ``id, k``; the join's own additions stay
+    unverified (never a guarantee, no edge contract), and the notice names
+    them. Execution validation admits the graph over a table with the column
+    and refuses it over one without; per-site and per-shape tests are in
+    ``test_deferred_possible_additions.py``.
     """
-    state = _graph(
-        tmp_path,
-        _join_node("enrich", "src_out", "output", _join(_marker(CSV_TABLE), "csv")),
-        source_schema=FIXED_SOURCE,
-        sink_schema={"mode": "observed", "required_fields": ["added"]},
-    )
 
-    summary = state.validate()
-    execution = _execution_validate(tmp_path, state, CSV_TABLE, mime_type="text/csv")
+    def build(table: str) -> CompositionState:
+        return _graph(
+            tmp_path / table.split("\n")[0],
+            _join_node("enrich", "src_out", "output", _join(_marker(table), "csv")),
+            source_schema=FIXED_SOURCE,
+            sink_schema={"mode": "observed", "required_fields": ["added"]},
+        )
 
-    assert not summary.is_valid
-    [error] = summary.errors
-    assert error.message == (
-        "Schema contract violation: 'enrich' -> 'output:output'. Sink 'output' requires fields: [added]. "
-        "Producer (reference_join) guarantees: [id, k]. Missing fields: [added]."
-    )
+    summary = build(CSV_TABLE).validate()
+    admitted = _execution_validate(tmp_path / "sku,description", build(CSV_TABLE), CSV_TABLE, mime_type="text/csv")
+    refused = _execution_validate(tmp_path / "sku,label", build(CSV_TABLE_WITHOUT_COLUMN), CSV_TABLE_WITHOUT_COLUMN, mime_type="text/csv")
+
+    assert summary.is_valid, [entry.to_dict() for entry in summary.errors]
     assert _notices(summary) == [_join_notice("enrich")]
-    assert execution.is_valid, [error.message for error in execution.errors]
+    assert not [contract for contract in summary.edge_contracts if contract.from_id == "enrich"]
+    assert admitted.is_valid, [error.message for error in admitted.errors]
+    assert not refused.is_valid
+    assert any("resolved against none of the 1 reference entries" in error.message for error in refused.errors)
 
 
 # ---------------------------------------------------------------------------
@@ -894,8 +897,9 @@ def test_the_notice_rides_in_the_same_tool_result_as_is_valid(tmp_path: Path, bl
 def _join_fed_chain(tmp_path: Path) -> CompositionState:
     """The stage-1 llm chain with its ``file_inject`` replaced by a ``reference_join`` whose table is a file.
 
-    The llm reads only upstream fields by name (``remark_one``): requiring the
-    joined field behind this FIXED source is the 2b boundary, pinned above.
+    The llm reads only upstream fields by name (``remark_one``); requiring the
+    joined field too is left to the preflight since stage 2b
+    (``test_deferred_possible_additions.py``).
     """
     state = chain_fixtures._profiled(chain_fixtures._chain(tmp_path, inject_file=False, prompt_files=True, query_file=True))
     table = "kind,rubric\nround,Grade round gadgets gently.\n"
