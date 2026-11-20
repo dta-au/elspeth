@@ -1339,11 +1339,13 @@ async def test_actual_inspection_review_controls_public_and_saved_equivalence_cl
         assert review["saved_effects"]["net_changed"] is False
         assert review["saved_effects"]["initial_authored_state_hash"] == review["saved_effects"]["latest_verified_authored_state_hash"]
         assert review["saved_effects"]["changed_fields"] == []
-    # The primary graph is newly FLAGGED, so it keeps its remaining review even
-    # when the reply is admitted: one repair reply and a second END pass.
-    assert len([call for call in calls if "response_format" in call]) == (1 if route == "planner" else 2)
+    # The turn only inspected: it changed no saved graph, so an admitted reply
+    # ends on the first END pass even though the graph is newly flagged.
+    assert len([call for call in calls if "response_format" in call]) == (1 if admit or route == "planner" else 2)
     inspected_page_count = len({page["start_char"] for page in selected_pages})
-    assert len([call for call in calls if "response_format" not in call]) == inspected_page_count + 1 + int(route == "primary")
+    assert len([call for call in calls if "response_format" not in call]) == inspected_page_count + 1 + int(
+        not admit and route == "primary"
+    )
     if read_all:
         assert len(selected_pages) > 1
         for earlier, later in pairwise(selected_pages):
@@ -1371,6 +1373,155 @@ async def test_actual_inspection_review_controls_public_and_saved_equivalence_cl
     if not admit:
         assert "withheld" in response.message.content.lower()
         assert candidate not in json.dumps(_helpers._composer_chat_history(rows))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ("timeout", "provider_error"))
+async def test_failed_extra_review_round_publishes_the_first_admitted_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """A turn that changed the graph gets an extra round after a newly FLAGGED, admitted reply.
+
+    When that round's composer call times out or fails, the user still gets the
+    reply the first pass admitted, and the advisor block stands.
+    """
+    import litellm
+    from litellm.exceptions import BadGatewayError
+
+    from elspeth.web.blobs.service import BlobServiceImpl
+    from elspeth.web.catalog.policy_view import PolicyCatalogView
+    from elspeth.web.composer.tools import execute_tool
+    from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+    from tests.helpers.session_fences import fenced_operation_context
+    from tests.unit.web.composer._helpers import _mock_catalog
+
+    app, sessions = _make_app(tmp_path)
+    app.state.settings = app.state.settings.model_copy(update={"composer_prompt_guard_mode": "debug-when-unconfigured"})
+    monkeypatch.setattr(
+        "elspeth.web.composer.service.compute_availability",
+        lambda **kwargs: ComposerAvailability(available=True, model=kwargs["model"], provider="test"),
+    )
+    catalog = _mock_catalog()
+    catalog.list_transforms.return_value = []
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    policy_catalog = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+    session = await sessions.create_session("alice", "Existing title", "local")
+    # A runnable seed (blob source -> json output), so the END review is reached.
+    with fenced_operation_context(app.state.session_engine, str(session.id)) as context:
+        blob = await BlobServiceImpl(app.state.session_engine, app.state.settings.data_dir).create_blob(
+            session.id, "orders.csv", b"order_id,customer\nO-1,Alice\n", "text/csv", session_operation_context=context
+        )
+        state = CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+        for name, arguments in (
+            (
+                "set_source_from_blob",
+                {
+                    "blob_id": str(blob.id),
+                    "on_success": "out",
+                    "on_validation_failure": "discard",
+                    "options": {"schema": {"mode": "fixed", "fields": ["order_id: str", "customer: str"]}},
+                },
+            ),
+            (
+                "set_output",
+                {
+                    "sink_name": "out",
+                    "plugin": "json",
+                    "on_write_failure": "discard",
+                    "options": {
+                        "path": "outputs/orders.json",
+                        "schema": {"mode": "observed"},
+                        "mode": "write",
+                        "collision_policy": "auto_increment",
+                    },
+                },
+            ),
+        ):
+            outcome = execute_tool(
+                name,
+                arguments,
+                state,
+                policy_catalog,
+                plugin_snapshot=snapshot,
+                data_dir=str(app.state.settings.data_dir),
+                session_engine=app.state.session_engine,
+                session_id=str(session.id),
+                session_operation_context=context,
+                session_operation_authority=SQLiteLocalSessionOperationAuthority(app.state.session_engine),
+            )
+            assert outcome.success
+            state = outcome.updated_state
+        payload = state.to_dict()
+        await sessions.save_composition_state(
+            session.id,
+            CompositionStateData(
+                sources=payload["sources"],
+                nodes=payload["nodes"],
+                edges=payload["edges"],
+                outputs=payload["outputs"],
+                metadata_=payload["metadata"],
+                is_valid=True,
+            ),
+            provenance="session_seed",
+            session_operation_context=context,
+        )
+    composer = ComposerServiceImpl.for_trained_operator(
+        catalog=catalog, settings=app.state.settings, sessions_service=sessions, session_engine=app.state.session_engine
+    )
+    app.state.composer_service = composer
+    first_reply = "FIRST_ADMITTED_REPLY: I renamed the pipeline as requested."
+    calls: list[dict[str, Any]] = []
+
+    def response(content: str | None, tool_calls: list[Any] | None, model: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=content, tool_calls=tool_calls), finish_reason="tool_calls" if tool_calls else "stop"
+                )
+            ],
+            usage={"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20, "cost": 0.001},
+            model=model,
+        )
+
+    async def complete(**kwargs):
+        calls.append(kwargs)
+        if "response_format" in kwargs:
+            verdict = {
+                "verdict": "FLAGGED",
+                "category": "other",
+                "steps": [],
+                "findings": "The draft still has no source.",
+                "note": None,
+                "publication_verdict": "ADMIT",
+            }
+            return response(json.dumps(verdict), None, kwargs["model"])
+        composer_calls = len([call for call in calls if "response_format" not in call])
+        if composer_calls == 1:
+            rename = SimpleNamespace(
+                id="rename-1",
+                function=SimpleNamespace(name="set_metadata", arguments=json.dumps({"patch": {"name": "Renamed pipeline"}})),
+            )
+            return response(None, [rename], kwargs["model"])
+        if composer_calls == 2:
+            return response(first_reply, None, kwargs["model"])
+        # The extra round's composer call.
+        if failure == "timeout":
+            raise TimeoutError
+        raise BadGatewayError("upstream gateway failed", model=kwargs["model"], llm_provider="openai")
+
+    monkeypatch.setattr(litellm, "acompletion", complete)
+    async with _running_job(app, sessions, session.id, kind="compose_message", content="Rename the pipeline to Renamed pipeline.") as job:
+        record = await _run(app, job)
+
+    assert record.status == "completed"
+    response_model = MessageWithStateResponse.model_validate_json(record.result_json)
+    assert first_reply in response_model.message.content
+    assert len([call for call in calls if "response_format" in call]) == 1
+    assert len([call for call in calls if "response_format" not in call]) == 3
+    versions = await sessions.get_state_versions(session.id)
+    assert any(version.metadata_ is not None and version.metadata_.get("name") == "Renamed pipeline" for version in versions)
+    rows = await sessions.get_messages(session.id, limit=None)
+    assert any(first_reply in row.content for row in rows if row.role == "assistant")
 
 
 @pytest.mark.asyncio

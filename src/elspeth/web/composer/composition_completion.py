@@ -26,6 +26,7 @@ from elspeth.web.composer import advisor_context as _advisor_context
 from elspeth.web.composer import advisor_policy as _advisor_policy
 from elspeth.web.composer._compose_loop_carriers import (
     _AdmittedAssistantMessage,
+    _AdmittedReplyFallback,
     _AdvisorReviewState,
     _TerminateOutcome,
 )
@@ -751,6 +752,14 @@ class _TerminalNoToolAdvisorGateOutcome:
     graph_review_identity: AdvisorGraphReviewIdentity | None = None
 
 
+def _usable_admitted_fallback(review_state: _AdvisorReviewState, state: CompositionState) -> _AdmittedReplyFallback | None:
+    """The kept admitted reply, only while the graph is the one it was admitted against."""
+    fallback = review_state.admitted_fallback
+    if fallback is None or fallback.for_graph != completion_gate_fingerprint(state):
+        return None
+    return fallback
+
+
 def _advance_advisor_review_state(
     review_state: _AdvisorReviewState,
     *,
@@ -765,6 +774,7 @@ def _advance_advisor_review_state(
         previous_findings=(bounded_finding, *review_state.previous_findings)[:_ADVISOR_RECENT_ERRORS_MAX_ITEMS],
         previous_evidence_hash=evidence_hash,
         successful_mutating_actions=(),
+        admitted_fallback=review_state.admitted_fallback,
     )
 
 
@@ -895,6 +905,77 @@ class CompositionCompletion:
         if self._sessions_service is None:
             raise RuntimeError("sessions_service not wired")
         return self._sessions_service
+
+    async def _admitted_fallback_result(
+        self,
+        *,
+        advisor_review_state: _AdvisorReviewState | None,
+        state: CompositionState,
+        runtime_preflight: ValidationResult | None,
+        session_id: str | None,
+        session_operation_context: SessionOperationContext | None,
+        recorder: BufferingRecorder,
+        repair_turns_used: int,
+        persisted_assistant_message_id: str | None,
+        persisted_assistant_content: str | None,
+        persisted_tool_call_turn: bool,
+    ) -> ComposerResult | None:
+        """The blocked result the earlier admitted reply earns when its extra round failed.
+
+        Used when the extra repair/review round for a newly flagged graph
+        timed out or errored before a second review could decide. It
+        publishes the earlier admitted reply under that pass's FLAGGED
+        verdict, without a provider call or deadline-bound validation, so the
+        user ends with what the first pass would have given. ``None`` keeps
+        the caller's own failure: no kept reply, a changed graph, or a graph
+        whose blocked result needs interpretation-review surfacing or the
+        masked handoff re-validation, which this path cannot run.
+        """
+        fallback = _usable_admitted_fallback(advisor_review_state or _AdvisorReviewState(), state)
+        if fallback is None or interpretation_sites(state):
+            return None
+        if runtime_preflight is not None and _is_pending_interpretation_handoff(runtime_preflight):
+            return None
+        if session_id is not None:
+            if session_operation_context is None:
+                raise TypeError("advisor disclosure requires the turn's session_operation_context")
+            await self._require_sessions_service().add_message(
+                UUID(session_id),
+                "audit",
+                _advisor_policy.ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE,
+                writer_principal="compose_loop",
+                tool_calls=[advisor_signoff_withheld_control_envelope(_advisor_policy.ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE)],
+                session_operation_context=session_operation_context,
+            )
+        blocked = self._advisor_checkpoint._advisor_blocked_result(
+            reason="flagged_no_repair",
+            verdict=fallback.verdict,
+            state=state,
+            assistant_message=_AdmittedAssistantMessage(content=fallback.reply),
+            recorder=recorder,
+            repair_turns_used=repair_turns_used,
+            persisted_assistant_message_id=persisted_assistant_message_id,
+            persisted_assistant_content=persisted_assistant_content,
+            persisted_tool_call_turn=persisted_tool_call_turn,
+            runtime_preflight=runtime_preflight,
+            # No handoff shape and no interpretation sites (both checked above),
+            # so there is no masked re-validation to report.
+            outstanding_findings=None,
+            publication_binding=fallback.publication_binding,
+        )
+        await self._advisor_checkpoint._persist_advisor_terminal_publication(
+            blocked,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+        )
+        return replace(
+            blocked,
+            graph_review_identity=AdvisorGraphReviewIdentity(
+                binding=fallback.publication_binding,
+                for_graph=fallback.for_graph,
+                source="prescan" if fallback.verdict.findings_backend_authored else "model",
+            ),
+        )
 
     async def _persist_withheld_reply(
         self,
@@ -1762,6 +1843,24 @@ class CompositionCompletion:
                     }
                 )
 
+        # Computed before the gate (as the argument always was) so a deadline
+        # expiry inside the gate can still build the admitted-reply fallback.
+        gate_runtime_preflight = (
+            proof_runtime_preflight
+            if proof_runtime_preflight is not None
+            else await self._preflight.turn_runtime_preflight(
+                state=state,
+                user_id=user_id,
+                session_id=session_id,
+                last_runtime_preflight=last_runtime_preflight,
+                runtime_preflight_cache=runtime_preflight_cache,
+                initial_version=initial_version,
+                session_scope=session_scope,
+                recorder=recorder,
+                plugin_snapshot=plugin_snapshot,
+                session_operation_context=session_operation_context,
+            )
+        )
         try:
             advisor_gate = await self._evaluate_terminal_no_tool_advisor_gate(
                 state=state,
@@ -1780,20 +1879,7 @@ class CompositionCompletion:
                 persisted_tool_call_turn=persisted_tool_call_turn,
                 allow_repair_continue=proof_runtime_preflight is None and not confirmed_stop,
                 user_message=message,
-                runtime_preflight=proof_runtime_preflight
-                if proof_runtime_preflight is not None
-                else await self._preflight.turn_runtime_preflight(
-                    state=state,
-                    user_id=user_id,
-                    session_id=session_id,
-                    last_runtime_preflight=last_runtime_preflight,
-                    runtime_preflight_cache=runtime_preflight_cache,
-                    initial_version=initial_version,
-                    session_scope=session_scope,
-                    recorder=recorder,
-                    plugin_snapshot=plugin_snapshot,
-                    session_operation_context=session_operation_context,
-                ),
+                runtime_preflight=gate_runtime_preflight,
                 user_id=user_id,
                 runtime_preflight_cache=runtime_preflight_cache,
                 initial_version=initial_version,
@@ -1813,6 +1899,22 @@ class CompositionCompletion:
                 session_id=session_id,
                 session_operation_context=session_operation_context,
             )
+            # An extra review round that runs out of time falls back to the
+            # reply the earlier pass admitted, with the block standing.
+            fallback_result = await self._admitted_fallback_result(
+                advisor_review_state=advisor_review_state,
+                state=state,
+                runtime_preflight=gate_runtime_preflight,
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+                recorder=recorder,
+                repair_turns_used=repair_turns_used,
+                persisted_assistant_message_id=persisted_assistant_message_id,
+                persisted_assistant_content=persisted_assistant_content,
+                persisted_tool_call_turn=persisted_tool_call_turn,
+            )
+            if fallback_result is not None:
+                return _TerminateOutcome(action="return", result=fallback_result)
             raise ComposerConvergenceError.capture(
                 max_turns=composition_turns_used + discovery_turns_used,
                 budget_exhausted="timeout",
@@ -2411,9 +2513,13 @@ class CompositionCompletion:
             ).binding
             == publication_review.binding
         )
-        # An admitted explanation can close a turn about an existing graph
-        # block. A new finding still gets the remaining repair/review budget.
-        terminal_block = (graph_already_blocked and verdict.blocking and publication_admitted) or (
+        # Rule (maintainer, 2026-11-20): an admitted reply over a FLAGGED graph
+        # gets one more repair/review round only when the graph is newly
+        # flagged AND this turn's edits changed the saved graph. Every other
+        # admitted reply closes the turn on this pass, as before: one about an
+        # already-blocked graph, and one from a turn that changed nothing.
+        turn_changed_graph = turn_evidence.effects.net_changed is True
+        terminal_block = (verdict.blocking and publication_admitted and (graph_already_blocked or not turn_changed_graph)) or (
             (verdict.blocking or not publication_admitted)
             and (
                 is_last_pass
@@ -2424,6 +2530,7 @@ class CompositionCompletion:
                 or not verdict.retryable
             )
         )
+        publication_binding = publication_review.binding
         if terminal_block:
             if not publication_admitted:
                 await self._persist_withheld_reply(
@@ -2432,8 +2539,19 @@ class CompositionCompletion:
                     session_id=session_id,
                     session_operation_context=session_operation_context,
                 )
-                # The staged-review handoff below also consumes this carrier before a blocked result is built.
-                assistant_message = _AdmittedAssistantMessage(content=turn_evidence.render_saved_scope())
+                fallback = _usable_admitted_fallback(review_state, state)
+                if fallback is not None:
+                    # The extra round ended without an admitted reply. Publish
+                    # the reply the earlier pass admitted for this same graph,
+                    # under that pass's FLAGGED verdict: the block stands and
+                    # the withheld reply stays private.
+                    assistant_message = _AdmittedAssistantMessage(content=fallback.reply)
+                    verdict = fallback.verdict
+                    publication_binding = fallback.publication_binding
+                    publication_admitted = True
+                else:
+                    # The staged-review handoff below also consumes this carrier before a blocked result is built.
+                    assistant_message = _AdmittedAssistantMessage(content=turn_evidence.render_saved_scope())
             runtime_findings = None
             if state.sources and state.outputs and interpretation_sites(state):
                 if deadline is not None and deadline - asyncio.get_running_loop().time() <= 0:
@@ -2584,7 +2702,7 @@ class CompositionCompletion:
                 persisted_tool_call_turn=persisted_tool_call_turn,
                 runtime_preflight=runtime_preflight,
                 outstanding_findings=outstanding_findings,
-                publication_binding=publication_review.binding,
+                publication_binding=publication_binding,
             )
             if not publication_admitted:
                 publication = blocked.advisor_terminal_publication
@@ -2613,6 +2731,19 @@ class CompositionCompletion:
             # Capture the append index BEFORE mutating — a stable, exact
             # handle the driver uses to elide this message later (Step 3)
             # rather than pattern-matching the prefix text.
+            if publication_admitted and _usable_admitted_fallback(review_state, state) is None:
+                # Only the changed-graph rule above continues past an admitted
+                # reply. Keep that reply so the extra round can never leave
+                # the user with less than this pass would have published.
+                review_state = replace(
+                    review_state,
+                    admitted_fallback=_AdmittedReplyFallback(
+                        reply=candidate,
+                        publication_binding=publication_review.binding,
+                        verdict=verdict,
+                        for_graph=completion_gate_fingerprint(state),
+                    ),
+                )
             injection_index = len(llm_messages)
             llm_messages.append(
                 {

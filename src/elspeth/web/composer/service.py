@@ -174,6 +174,7 @@ from elspeth.web.composer.provider_errors import classify_provider_failure, is_c
 from elspeth.web.composer.provider_gateway import (
     ProviderGateway,
     _BadRequestLLMError,
+    _MalformedLLMResponseError,
     advisor_provider_failure_types,
     composer_loop_tool_definitions,
 )
@@ -3142,22 +3143,59 @@ class ComposerServiceImpl:
             # The compose-loop audit path captures the state id observed
             # before the provider call and passes this exact value to
             # persist_compose_turn_async as expected_current_state_id.
-            call_model = await self._call_model_turn(
-                llm_messages=llm_messages,
-                tools=tools,
-                state=state,
-                initial_version=initial_version,
-                deadline=deadline,
-                recorder=recorder,
-                progress=progress,
-                message=message,
-                composition_turns_used=composition_turns_used,
-                discovery_turns_used=discovery_turns_used,
-                failed_turn=failed_turn,
-                budget_frame=budget_frame,
-                provider_owner=provider_owner,
-                turn_evidence=turn_evidence,
-            )
+            try:
+                call_model = await self._call_model_turn(
+                    llm_messages=llm_messages,
+                    tools=tools,
+                    state=state,
+                    initial_version=initial_version,
+                    deadline=deadline,
+                    recorder=recorder,
+                    progress=progress,
+                    message=message,
+                    composition_turns_used=composition_turns_used,
+                    discovery_turns_used=discovery_turns_used,
+                    failed_turn=failed_turn,
+                    budget_frame=budget_frame,
+                    provider_owner=provider_owner,
+                    turn_evidence=turn_evidence,
+                )
+            except (ComposerConvergenceError, OpenAIError, _MalformedLLMResponseError):
+                # The composer call of an extra review round (a newly flagged
+                # graph after this turn changed it) timed out or failed: fall
+                # back to the reply the earlier pass admitted, block standing.
+                # Without a kept reply for this unchanged graph, the failure
+                # stands exactly as before.
+                fallback_result = await self._completion._admitted_fallback_result(
+                    advisor_review_state=advisor_review_state,
+                    state=state,
+                    runtime_preflight=await self._preflight.turn_runtime_preflight(
+                        state=state,
+                        user_id=user_id,
+                        session_id=session_id,
+                        last_runtime_preflight=last_runtime_preflight,
+                        runtime_preflight_cache=runtime_preflight_cache,
+                        initial_version=initial_version,
+                        session_scope=session_scope,
+                        recorder=recorder,
+                        plugin_snapshot=plugin_snapshot,
+                        session_operation_context=session_operation_context,
+                    )
+                    if advisor_review_state.admitted_fallback is not None
+                    else None,
+                    session_id=session_id,
+                    session_operation_context=session_operation_context,
+                    recorder=recorder,
+                    repair_turns_used=repair_turns_used,
+                    persisted_assistant_message_id=persisted_assistant_message_id,
+                    persisted_assistant_content=persisted_assistant_content,
+                    persisted_tool_call_turn=persisted_tool_call_turn,
+                )
+                if fallback_result is None:
+                    raise
+                # An END blocked terminal: the advisor-repair prose replacer
+                # passes it through untouched, so only the receipt is added.
+                return self._completion._append_checkpoint_receipt(fallback_result, turn_evidence=turn_evidence)
             recovery_result = self._terminal_recovery_result(
                 call_model.completion, state, recorder, prior_tools_persisted=persisted_tool_call_turn
             )

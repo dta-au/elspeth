@@ -3129,6 +3129,8 @@ async def drive_try_terminate(
     orphan_sites: tuple[tuple[str, str, InterpretationKind], ...] = (),
     use_real_orphan_gate: bool = False,
     plugin_snapshot=None,
+    turn_evidence=None,
+    advisor_review_state=None,
 ):
     """Drive ``_try_terminate_no_tools`` with the full kwarg set.
 
@@ -3225,13 +3227,17 @@ async def drive_try_terminate(
     kwargs = {}
     if deadline is not None:
         kwargs["deadline"] = deadline
+    if advisor_review_state is not None:
+        kwargs["advisor_review_state"] = advisor_review_state
     session_id = session_operation_context.fence.session_id if session_operation_context is not None else str(uuid.uuid4())
     from elspeth.web.composer.turn_effects import TurnEvidence
 
     context = session_operation_context or _compose_context(session_id)
     return await service._completion._try_terminate_no_tools(
         assistant_message=_AdmittedAssistantMessage(content=candidate),
-        turn_evidence=TurnEvidence(
+        turn_evidence=turn_evidence
+        if turn_evidence is not None
+        else TurnEvidence(
             session_id=session_id,
             session_operation_context=context,
             request_id="advisor-unit-request",
