@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any, Final, Literal, cast
 from uuid import UUID
@@ -753,11 +753,25 @@ class _TerminalNoToolAdvisorGateOutcome:
 
 
 def _usable_admitted_fallback(review_state: _AdvisorReviewState, state: CompositionState) -> _AdmittedReplyFallback | None:
-    """The kept admitted reply, only while the graph is the one it was admitted against."""
+    """The kept admitted reply, only while the graph is the one it was admitted against.
+
+    The compose loop drops the kept reply when the round changes a session
+    file (``_drop_admitted_fallback_after_file_change``), which the graph
+    fingerprint does not cover.
+    """
     fallback = review_state.admitted_fallback
     if fallback is None or fallback.for_graph != completion_gate_fingerprint(state):
         return None
     return fallback
+
+
+def _admitted_fallback_review_identity(fallback: _AdmittedReplyFallback) -> AdvisorGraphReviewIdentity:
+    """The review identity of the published fallback: the earlier pass that admitted it."""
+    return AdvisorGraphReviewIdentity(
+        binding=fallback.publication_binding,
+        for_graph=fallback.for_graph,
+        source="prescan" if fallback.verdict.findings_backend_authored else "model",
+    )
 
 
 def _advance_advisor_review_state(
@@ -911,7 +925,7 @@ class CompositionCompletion:
         *,
         advisor_review_state: _AdvisorReviewState | None,
         state: CompositionState,
-        runtime_preflight: ValidationResult | None,
+        runtime_preflight: Callable[[], Awaitable[ValidationResult | None]],
         session_id: str | None,
         session_operation_context: SessionOperationContext | None,
         recorder: BufferingRecorder,
@@ -930,11 +944,16 @@ class CompositionCompletion:
         the caller's own failure: no kept reply, a changed graph, or a graph
         whose blocked result needs interpretation-review surfacing or the
         masked handoff re-validation, which this path cannot run.
+
+        ``runtime_preflight`` runs only once a usable kept reply exists. A
+        ``ComposerRuntimePreflightError`` from it propagates; the caller, which
+        holds the round's original failure, re-raises that failure instead.
         """
         fallback = _usable_admitted_fallback(advisor_review_state or _AdvisorReviewState(), state)
         if fallback is None or interpretation_sites(state):
             return None
-        if runtime_preflight is not None and _is_pending_interpretation_handoff(runtime_preflight):
+        preflight = await runtime_preflight()
+        if preflight is not None and _is_pending_interpretation_handoff(preflight):
             return None
         if session_id is not None:
             if session_operation_context is None:
@@ -957,7 +976,7 @@ class CompositionCompletion:
             persisted_assistant_message_id=persisted_assistant_message_id,
             persisted_assistant_content=persisted_assistant_content,
             persisted_tool_call_turn=persisted_tool_call_turn,
-            runtime_preflight=runtime_preflight,
+            runtime_preflight=preflight,
             # No handoff shape and no interpretation sites (both checked above),
             # so there is no masked re-validation to report.
             outstanding_findings=None,
@@ -968,14 +987,7 @@ class CompositionCompletion:
             session_id=session_id,
             session_operation_context=session_operation_context,
         )
-        return replace(
-            blocked,
-            graph_review_identity=AdvisorGraphReviewIdentity(
-                binding=fallback.publication_binding,
-                for_graph=fallback.for_graph,
-                source="prescan" if fallback.verdict.findings_backend_authored else "model",
-            ),
-        )
+        return replace(blocked, graph_review_identity=_admitted_fallback_review_identity(fallback))
 
     async def _persist_withheld_reply(
         self,
@@ -1899,12 +1911,16 @@ class CompositionCompletion:
                 session_id=session_id,
                 session_operation_context=session_operation_context,
             )
+
             # An extra review round that runs out of time falls back to the
             # reply the earlier pass admitted, with the block standing.
+            async def known_preflight() -> ValidationResult | None:
+                return gate_runtime_preflight
+
             fallback_result = await self._admitted_fallback_result(
                 advisor_review_state=advisor_review_state,
                 state=state,
-                runtime_preflight=gate_runtime_preflight,
+                runtime_preflight=known_preflight,
                 session_id=session_id,
                 session_operation_context=session_operation_context,
                 recorder=recorder,
@@ -2518,6 +2534,11 @@ class CompositionCompletion:
         # flagged AND this turn's edits changed the saved graph. Every other
         # admitted reply closes the turn on this pass, as before: one about an
         # already-blocked graph, and one from a turn that changed nothing.
+        # If that extra round ends without an admitted reply, the reply the
+        # earlier pass admitted is published with the block standing, except
+        # when this (latest) review was CLEAN: it cleared the graph, so the
+        # turn keeps the plain withheld outcome instead of a FLAGGED block the
+        # advisor no longer holds (lead ruling 2026-11-20, pending maintainer).
         turn_changed_graph = turn_evidence.effects.net_changed is True
         terminal_block = (verdict.blocking and publication_admitted and (graph_already_blocked or not turn_changed_graph)) or (
             (verdict.blocking or not publication_admitted)
@@ -2539,15 +2560,18 @@ class CompositionCompletion:
                     session_id=session_id,
                     session_operation_context=session_operation_context,
                 )
-                fallback = _usable_admitted_fallback(review_state, state)
+                latest_review_cleared = verdict.ok and not verdict.blocking
+                fallback = None if latest_review_cleared else _usable_admitted_fallback(review_state, state)
                 if fallback is not None:
-                    # The extra round ended without an admitted reply. Publish
-                    # the reply the earlier pass admitted for this same graph,
-                    # under that pass's FLAGGED verdict: the block stands and
-                    # the withheld reply stays private.
+                    # The extra round ended without an admitted reply and its
+                    # review did not clear the graph. Publish the reply the
+                    # earlier pass admitted for this same graph, under that
+                    # pass's FLAGGED verdict and review identity: the block
+                    # stands and the withheld reply stays private.
                     assistant_message = _AdmittedAssistantMessage(content=fallback.reply)
                     verdict = fallback.verdict
                     publication_binding = fallback.publication_binding
+                    review_identity = _admitted_fallback_review_identity(fallback)
                     publication_admitted = True
                 else:
                     # The staged-review handoff below also consumes this carrier before a blocked result is built.

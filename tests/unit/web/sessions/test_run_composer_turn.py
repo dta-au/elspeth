@@ -1375,18 +1375,35 @@ async def test_actual_inspection_review_controls_public_and_saved_equivalence_cl
         assert candidate not in json.dumps(_helpers._composer_chat_history(rows))
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ("timeout", "provider_error"))
-async def test_failed_extra_review_round_publishes_the_first_admitted_reply(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
-) -> None:
-    """A turn that changed the graph gets an extra round after a newly FLAGGED, admitted reply.
+_EXTRA_ROUND_FIRST_REPLY = "FIRST_ADMITTED_REPLY: I renamed the pipeline as requested."
+_EXTRA_ROUND_SECOND_REPLY = "SECOND_REPLY_FROM_THE_EXTRA_ROUND: the pipeline is renamed."
+_EXTRA_ROUND_FLAGGED_ADMIT = {
+    "verdict": "FLAGGED",
+    "category": "other",
+    "steps": [],
+    "findings": "The source schema still omits observed columns.",
+    "note": None,
+    "publication_verdict": "ADMIT",
+}
 
-    When that round's composer call times out or fails, the user still gets the
-    reply the first pass admitted, and the advisor block stands.
+
+async def _run_extra_round_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    repair_round: tuple[tuple[str, Any], ...],
+    second_review: dict[str, Any] | BaseException | None = None,
+    preflight_fails_after_composer_failure: bool = False,
+) -> tuple[Any, list[dict[str, Any]], list[Any], list[Any]]:
+    """Drive a real turn: a rename, an admitted reply over a newly FLAGGED graph, then the extra round.
+
+    ``repair_round`` scripts the extra round's composer calls in order:
+    ``("tool", (name, arguments))``, ``("reply", text)`` or ``("raise", exc)``.
+    ``second_review`` is the second END review's verdict, or the exception
+    its provider call raises. ``preflight_fails_after_composer_failure`` makes
+    every runtime preflight after a scripted composer failure raise.
     """
     import litellm
-    from litellm.exceptions import BadGatewayError
 
     from elspeth.web.blobs.service import BlobServiceImpl
     from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -1469,8 +1486,19 @@ async def test_failed_extra_review_round_publishes_the_first_admitted_reply(
         catalog=catalog, settings=app.state.settings, sessions_service=sessions, session_engine=app.state.session_engine
     )
     app.state.composer_service = composer
-    first_reply = "FIRST_ADMITTED_REPLY: I renamed the pipeline as requested."
     calls: list[dict[str, Any]] = []
+    composer_failed: list[BaseException] = []
+    if preflight_fails_after_composer_failure:
+        from elspeth.web.composer.protocol import ComposerRuntimePreflightError
+
+        real_preflight = composer._preflight.turn_runtime_preflight
+
+        async def preflight_after_failure(**kwargs: Any) -> Any:
+            if composer_failed:
+                raise ComposerRuntimePreflightError(original_exc=RuntimeError("validation crashed"), partial_state=kwargs["state"])
+            return await real_preflight(**kwargs)
+
+        monkeypatch.setattr(composer._preflight, "turn_runtime_preflight", preflight_after_failure)
 
     def response(content: str | None, tool_calls: list[Any] | None, model: str) -> SimpleNamespace:
         return SimpleNamespace(
@@ -1483,45 +1511,170 @@ async def test_failed_extra_review_round_publishes_the_first_admitted_reply(
             model=model,
         )
 
+    def tool_call(call_id: str, name: str, arguments: dict[str, Any]) -> SimpleNamespace:
+        return SimpleNamespace(id=call_id, function=SimpleNamespace(name=name, arguments=json.dumps(arguments)))
+
     async def complete(**kwargs):
         calls.append(kwargs)
         if "response_format" in kwargs:
-            verdict = {
-                "verdict": "FLAGGED",
-                "category": "other",
-                "steps": [],
-                "findings": "The draft still has no source.",
-                "note": None,
-                "publication_verdict": "ADMIT",
-            }
+            review_calls = len([call for call in calls if "response_format" in call])
+            verdict = _EXTRA_ROUND_FLAGGED_ADMIT if review_calls == 1 else second_review
+            if isinstance(verdict, BaseException):
+                raise verdict
+            assert verdict is not None, "an unscripted END review ran"
             return response(json.dumps(verdict), None, kwargs["model"])
         composer_calls = len([call for call in calls if "response_format" not in call])
         if composer_calls == 1:
-            rename = SimpleNamespace(
-                id="rename-1",
-                function=SimpleNamespace(name="set_metadata", arguments=json.dumps({"patch": {"name": "Renamed pipeline"}})),
-            )
-            return response(None, [rename], kwargs["model"])
+            return response(None, [tool_call("rename-1", "set_metadata", {"patch": {"name": "Renamed pipeline"}})], kwargs["model"])
         if composer_calls == 2:
-            return response(first_reply, None, kwargs["model"])
-        # The extra round's composer call.
-        if failure == "timeout":
-            raise TimeoutError
-        raise BadGatewayError("upstream gateway failed", model=kwargs["model"], llm_provider="openai")
+            return response(_EXTRA_ROUND_FIRST_REPLY, None, kwargs["model"])
+        kind, value = repair_round[composer_calls - 3]
+        if kind == "raise":
+            composer_failed.append(value)
+            raise value
+        if kind == "tool":
+            name, arguments = value
+            return response(None, [tool_call(f"repair-{composer_calls}", name, arguments)], kwargs["model"])
+        return response(value, None, kwargs["model"])
 
     monkeypatch.setattr(litellm, "acompletion", complete)
     async with _running_job(app, sessions, session.id, kind="compose_message", content="Rename the pipeline to Renamed pipeline.") as job:
-        record = await _run(app, job)
+        # A turn that fails surfaces as the route error it maps to; it is
+        # returned in place of the record so the caller can assert on it.
+        try:
+            record = await _run(app, job)
+        except HTTPException as surfaced:
+            record = surfaced
+    rows = await sessions.get_messages(session.id, limit=None)
+    versions = await sessions.get_state_versions(session.id)
+    return record, calls, rows, versions
+
+
+def _extra_round_composer_failure(failure: str) -> BaseException:
+    from litellm.exceptions import BadGatewayError, BadRequestError
+
+    if failure == "timeout":
+        return TimeoutError()
+    if failure == "bad_request":
+        return BadRequestError("the provider refused the request shape", model="test-model", llm_provider="openai")
+    return BadGatewayError("upstream gateway failed", model="test-model", llm_provider="openai")
+
+
+def _published_assistant_text(rows: list[Any]) -> str:
+    return "\n".join(row.content for row in rows if row.role == "assistant")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "audited_status"),
+    (("timeout", "timeout"), ("provider_error", "api_error"), ("bad_request", "bad_request_error")),
+)
+async def test_failed_extra_review_round_publishes_the_first_admitted_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str, audited_status: str
+) -> None:
+    """A turn that changed the graph gets an extra round after a newly FLAGGED, admitted reply.
+
+    When that round's composer call times out, fails or is refused with a 400,
+    the user still gets the reply the first pass admitted, the advisor block
+    stands, and the failed call stays in the turn's LLM-call audit.
+    """
+    record, calls, rows, versions = await _run_extra_round_turn(
+        tmp_path, monkeypatch, repair_round=(("raise", _extra_round_composer_failure(failure)),)
+    )
 
     assert record.status == "completed"
     response_model = MessageWithStateResponse.model_validate_json(record.result_json)
-    assert first_reply in response_model.message.content
+    assert _EXTRA_ROUND_FIRST_REPLY in response_model.message.content
     assert len([call for call in calls if "response_format" in call]) == 1
     assert len([call for call in calls if "response_format" not in call]) == 3
-    versions = await sessions.get_state_versions(session.id)
     assert any(version.metadata_ is not None and version.metadata_.get("name") == "Renamed pipeline" for version in versions)
-    rows = await sessions.get_messages(session.id, limit=None)
-    assert any(first_reply in row.content for row in rows if row.role == "assistant")
+    assert _EXTRA_ROUND_FIRST_REPLY in _published_assistant_text(rows)
+    audited = [envelope["call"] for _, envelope in _llm_call_audit_rows(rows)]
+    assert audited[-1]["status"] == audited_status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "second_review",
+    (
+        pytest.param({**_EXTRA_ROUND_FLAGGED_ADMIT, "publication_verdict": "WITHHOLD"}, id="flagged-withheld"),
+        pytest.param("provider_error", id="advisor-provider-error"),
+    ),
+)
+async def test_withheld_or_failed_second_review_publishes_the_first_admitted_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, second_review: Any
+) -> None:
+    """The gate fallback, end to end: the extra round's reply is not admitted, so the first reply is published."""
+    if second_review == "provider_error":
+        second_review = _extra_round_composer_failure("provider_error")
+    record, calls, rows, _versions = await _run_extra_round_turn(
+        tmp_path, monkeypatch, repair_round=(("reply", _EXTRA_ROUND_SECOND_REPLY),), second_review=second_review
+    )
+
+    assert record.status == "completed"
+    response_model = MessageWithStateResponse.model_validate_json(record.result_json)
+    assert _EXTRA_ROUND_FIRST_REPLY in response_model.message.content
+    assert _EXTRA_ROUND_SECOND_REPLY not in response_model.message.content
+    assert len([call for call in calls if "response_format" in call]) == 2
+    assert _EXTRA_ROUND_SECOND_REPLY not in _published_assistant_text(rows)
+    assert _EXTRA_ROUND_FIRST_REPLY in _published_assistant_text(rows)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("graph_changed", (False, True), ids=("graph-unchanged", "graph-changed"))
+async def test_failed_preflight_never_replaces_the_extra_round_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, graph_changed: bool
+) -> None:
+    """The composer-failure handler: a preflight that fails while deciding the fallback leaves the original error to surface."""
+    repair_round: tuple[tuple[str, Any], ...] = (("raise", _extra_round_composer_failure("provider_error")),)
+    if graph_changed:
+        repair_round = (("tool", ("set_metadata", {"patch": {"name": "Renamed again"}})), *repair_round)
+    record, _calls, rows, _versions = await _run_extra_round_turn(
+        tmp_path, monkeypatch, repair_round=repair_round, preflight_fails_after_composer_failure=True
+    )
+
+    assert isinstance(record, HTTPException)
+    assert record.detail["error_type"] == "llm_unavailable"
+    assert _EXTRA_ROUND_FIRST_REPLY not in _published_assistant_text(rows)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ("composer_failure", "second_reply_withheld"))
+@pytest.mark.parametrize(
+    "repair_tool",
+    (
+        pytest.param(("set_metadata", {"patch": {"name": "Renamed again"}}), id="graph-changed"),
+        pytest.param(
+            ("create_blob", {"filename": "notes.txt", "mime_type": "text/plain", "content": "a session file written in the repair round"}),
+            id="session-file-created",
+        ),
+    ),
+)
+async def test_no_fallback_when_the_extra_round_changed_the_graph_or_a_session_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repair_tool: tuple[str, dict[str, Any]], ending: str
+) -> None:
+    """The kept reply describes the session before the repair round; after a change there it is not published."""
+    if ending == "composer_failure":
+        repair_round = (("tool", repair_tool), ("raise", _extra_round_composer_failure("provider_error")))
+        second_review = None
+    else:
+        repair_round = (("tool", repair_tool), ("reply", _EXTRA_ROUND_SECOND_REPLY))
+        second_review = {**_EXTRA_ROUND_FLAGGED_ADMIT, "publication_verdict": "WITHHOLD"}
+    record, _calls, rows, _versions = await _run_extra_round_turn(
+        tmp_path, monkeypatch, repair_round=repair_round, second_review=second_review
+    )
+
+    assert _EXTRA_ROUND_FIRST_REPLY not in _published_assistant_text(rows)
+    assert _EXTRA_ROUND_SECOND_REPLY not in _published_assistant_text(rows)
+    if ending == "composer_failure":
+        # The original provider failure surfaces exactly as without a fallback.
+        assert isinstance(record, HTTPException)
+        assert record.status_code == 502
+        assert record.detail["error_type"] == "llm_unavailable"
+    else:
+        assert record.status == "completed"
+        response_model = MessageWithStateResponse.model_validate_json(record.result_json)
+        assert "withheld" in response_model.message.content.lower()
 
 
 @pytest.mark.asyncio
