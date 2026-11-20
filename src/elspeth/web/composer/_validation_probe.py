@@ -173,11 +173,15 @@ def _file_inject_entry_stand_in(entry: object, *, written_field: object, declare
 
     An undeclared json written field is stood in although a JSON null in the
     file would make it nullable. That is sound only because such a field is
-    typed ``any`` and no authoring consumer separates a nullable ``any`` from
+    typed ``any`` and no authoring verdict separates a nullable ``any`` from
     a non-null one; ``test_file_inject_file_content_probe.py::
     test_PIN_undeclared_json_nullability_is_unobservable_at_authoring`` goes
-    red the day one does. A declared field is published from the declaration
-    instead, and execution validation holds the bytes against it.
+    red the day one does. Residue: a ``row_union_schema_incompatible`` error
+    renders the field as ``Any`` and ``nullable: false`` whatever the file
+    holds, where the bytes could make it ``Any | None``; its verdict and code
+    are unaffected, and the runtime preflight in the same round reports the
+    exact type. A declared field is published from the declaration instead,
+    and execution validation holds the bytes against it.
     """
     if type(entry) is not dict:
         return None

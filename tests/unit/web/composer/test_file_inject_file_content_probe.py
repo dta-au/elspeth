@@ -867,81 +867,181 @@ def _pin_shape_coalesce_union(other_type: str) -> Any:
     return build
 
 
+_RENDERED_AS_NON_NULL_TYPE = "message_type"
+_RENDERED_AS_NON_NULL_FLAG = "detail_nullable"
+_RENDERED_AS_NON_NULL_MEMBERSHIP = "conflicting_membership"
+
 _PIN_SHAPES = [
-    pytest.param(_pin_shape_required_field_sink, id="sink-requiring-the-field"),
-    pytest.param(_pin_shape_typed_sink, id="sink-declaring-it-str-non-null"),
-    pytest.param(_pin_shape_pass_through_chain, id="pass-through-chain"),
-    pytest.param(_pin_shape_row_union("any", False), id="row-union-fixed-vs-any-non-null"),
-    pytest.param(_pin_shape_row_union("any", True), id="row-union-fixed-vs-any-nullable"),
-    pytest.param(_pin_shape_row_union("str", False), id="row-union-fixed-vs-str-non-null"),
-    pytest.param(_pin_shape_row_union("str", True), id="row-union-fixed-vs-str-nullable"),
-    pytest.param(_pin_shape_row_union("any", False, item_type="int"), id="row-union-fixed-vs-any-non-null-beside-another-conflict"),
-    pytest.param(_pin_shape_coalesce_union("any"), id="coalesce-union-vs-any"),
-    pytest.param(_pin_shape_coalesce_union("str"), id="coalesce-union-vs-str"),
+    pytest.param(_pin_shape_required_field_sink, frozenset(), id="sink-requiring-the-field"),
+    pytest.param(_pin_shape_typed_sink, frozenset(), id="sink-declaring-it-str-non-null"),
+    pytest.param(_pin_shape_pass_through_chain, frozenset(), id="pass-through-chain"),
+    pytest.param(_pin_shape_row_union("any", False), frozenset(), id="row-union-fixed-vs-any-non-null"),
+    pytest.param(_pin_shape_row_union("any", True), frozenset(), id="row-union-fixed-vs-any-nullable"),
+    pytest.param(
+        _pin_shape_row_union("str", False),
+        frozenset({_RENDERED_AS_NON_NULL_TYPE, _RENDERED_AS_NON_NULL_FLAG}),
+        id="row-union-fixed-vs-str-non-null",
+    ),
+    pytest.param(
+        _pin_shape_row_union("str", True),
+        frozenset({_RENDERED_AS_NON_NULL_TYPE, _RENDERED_AS_NON_NULL_FLAG}),
+        id="row-union-fixed-vs-str-nullable",
+    ),
+    pytest.param(
+        _pin_shape_row_union("any", False, item_type="int"),
+        frozenset({_RENDERED_AS_NON_NULL_MEMBERSHIP, _RENDERED_AS_NON_NULL_FLAG}),
+        id="row-union-fixed-vs-any-non-null-beside-another-conflict",
+    ),
+    pytest.param(_pin_shape_coalesce_union("any"), frozenset(), id="coalesce-union-vs-any"),
+    pytest.param(_pin_shape_coalesce_union("str"), frozenset(), id="coalesce-union-vs-str"),
 ]
 
 
 _ROW_UNION_REPORT = "row_union_schema_incompatible"
-"""The one authoring report that renders the undeclared field's nullability (MEASURED).
-
-Its message prints a nullable ``any`` as ``typing.Any | None``, its
-``row_union_schema`` detail carries each field's ``nullable`` flag, and its
-conflicting-field list compares whole field definitions, so a nullable
-``any`` beside a non-null ``any`` is listed although the two are compatible.
-Its verdict, code, component and severity do not change: an ``any`` arm
-conflicts with a ``str`` arm, and agrees with an ``any`` arm, either way.
-The pin compares those exactly, plus the detail with the ``any`` fields'
-nullability and the conflicting-field list left out; every other report
-is compared whole.
-"""
+_WRITTEN_FIELD = "guide_value"
+_INJECT_BRANCH = "inject_branch"
 
 _GENERATED_SCHEMA_NAME = re.compile(r"(_CoalesceUnionSchema_)\d+")
-"""Each validation numbers its generated union schema classes afresh; the counter carries no fact."""
+"""Each validation numbers its generated union schema classes afresh; the counter carries no fact.
+
+Applied to every message of all three graphs: it is the only text compared
+inexactly outside ``_render_null_twin_as_non_null``.
+"""
+
+_NULLABLE_ANY_MISMATCH = re.compile(rf"({_WRITTEN_FIELD} \(expected [^()]*?, got )typing\.Any \| None\)")
 
 
-def _report_facts(entry: Any) -> dict[str, Any]:
-    facts = entry.to_dict()
-    if entry.error_code != _ROW_UNION_REPORT:
-        facts["message"] = _GENERATED_SCHEMA_NAME.sub(r"\1N", facts["message"])
-        return facts
-    del facts["message"]
-    detail = facts["row_union_schema"]
-    del detail["conflicting_fields"]
+def _render_null_twin_as_non_null(report: dict[str, Any]) -> tuple[dict[str, Any], frozenset[str]]:
+    """Rewrite ONE report of the JSON-null twin as the non-null twin would render it; say what fired.
+
+    Used only by the pin, only on the null twin, only on the
+    ``row_union_schema_incompatible`` report, and only for the undeclared
+    json written field. That report is the one authoring surface that renders
+    the field's nullability (every place a probed ``nullable`` is published
+    is that report's ``row_union_schema`` detail, built once at
+    ``state.py:5896``). Three renderings change and nothing else:
+
+    - ``message_type``: the type-mismatch line prints ``typing.Any | None``
+      where the non-null twin prints ``Any``;
+    - ``detail_nullable``: the field's ``nullable`` flag in the file_inject
+      branch's detail is ``true`` where the non-null twin has ``false``;
+    - ``conflicting_membership``: when the other branch also types the field
+      ``any``, the field is listed as conflicting only because whole field
+      definitions are compared (``core/dag/schema_validation.py:1157-1163``),
+      so it leaves the list (detail and message) as it is absent for the
+      non-null twin. The two ``any`` definitions are compatible on their own.
+    """
+    if report["error_code"] != _ROW_UNION_REPORT:
+        return report, frozenset()
+    report = json.loads(json.dumps(report))
+    fired: set[str] = set()
+    message, count = _NULLABLE_ANY_MISMATCH.subn(r"\1Any)", report["message"])
+    if count:
+        fired.add(_RENDERED_AS_NON_NULL_TYPE)
+    detail = report["row_union_schema"]
     for branch in detail["branches"]:
         for field in branch["fields"]:
-            if field["field_type"] == "any":
-                del field["nullable"]
-    return facts
+            if (
+                branch["branch"] == _INJECT_BRANCH
+                and field["name"] == _WRITTEN_FIELD
+                and field["field_type"] == "any"
+                and field["nullable"]
+            ):
+                field["nullable"] = False
+                fired.add(_RENDERED_AS_NON_NULL_FLAG)
+    other_types = {
+        field["field_type"]
+        for branch in detail["branches"]
+        if branch["branch"] != _INJECT_BRANCH
+        for field in branch["fields"]
+        if field["name"] == _WRITTEN_FIELD
+    }
+    if other_types == {"any"} and _WRITTEN_FIELD in detail["conflicting_fields"]:
+        listed = detail["conflicting_fields"]
+        kept = [name for name in listed if name != _WRITTEN_FIELD]
+        message = message.replace(f"conflicting fields {listed}", f"conflicting fields {kept}")
+        detail["conflicting_fields"] = kept
+        fired.add(_RENDERED_AS_NON_NULL_MEMBERSHIP)
+    report["message"] = message
+    return report, frozenset(fired)
 
 
-def _authoring_facts(summary: ValidationSummary) -> dict[str, Any]:
+def _reports(summary: ValidationSummary) -> dict[str, Any]:
+    def entry(item: Any) -> dict[str, Any]:
+        facts = item.to_dict()
+        facts["error_code"] = item.error_code
+        facts["message"] = _GENERATED_SCHEMA_NAME.sub(r"\1N", facts["message"])
+        return facts
+
     return {
         "is_valid": summary.is_valid,
-        "errors": [_report_facts(entry) for entry in summary.errors],
-        "warnings": [_report_facts(entry) for entry in summary.warnings],
+        "errors": [entry(item) for item in summary.errors],
+        "warnings": [entry(item) for item in summary.warnings],
         "edge_contracts": [contract.to_dict() for contract in summary.edge_contracts],
     }
 
 
-@pytest.mark.parametrize("shape", _PIN_SHAPES)
-def test_PIN_undeclared_json_nullability_is_unobservable_at_authoring(tmp_path: Path, shape: Any) -> None:
+def _null_twin_rendered_as_non_null(reports: dict[str, Any]) -> tuple[dict[str, Any], frozenset[str]]:
+    fired: set[str] = set()
+    errors = []
+    for report in reports["errors"]:
+        rendered, report_fired = _render_null_twin_as_non_null(report)
+        errors.append(rendered)
+        fired |= report_fired
+    return {**reports, "errors": errors}, frozenset(fired)
+
+
+@pytest.mark.parametrize(("shape", "expected_renderings"), _PIN_SHAPES)
+def test_PIN_undeclared_json_nullability_is_unobservable_at_authoring(
+    tmp_path: Path, shape: Any, expected_renderings: frozenset[str]
+) -> None:
     """PIN: the undeclared-json stand-in is sound only while this holds.
 
     A JSON null in the file makes the undeclared written field nullable; any
     other value leaves it non-null. The field is typed ``any``, and no
-    authoring consumer separates a nullable ``any`` from a non-null one, so
-    the two inline twins reach IDENTICAL authoring results in every consumer
-    shape (one report's rendering aside; see ``_ROW_UNION_REPORT``), and the
-    file-held node, whose probe sees a non-null stand-in, equals both. If a consumer ever becomes nullability-aware for ``any``,
-    the twins diverge here and the stand-in for undeclared json must go back
-    to deferring.
+    authoring VERDICT separates a nullable ``any`` from a non-null one. The
+    twins' whole authoring results (verdict, every report's code, component,
+    severity, message text and structured detail, edge contracts) are
+    compared exactly. The one exception is ``_render_null_twin_as_non_null``:
+    three renderings inside the row_union report, applied to the null twin
+    only, asserted to fire exactly where expected and to be the ONLY
+    difference. The file-held node, whose probe sees a non-null stand-in,
+    must equal the non-null twin exactly. If a consumer's verdict ever
+    depends on nullability for ``any``, this goes red and the undeclared
+    json stand-in must go back to deferring.
     """
-    holding_null = _authoring_facts(shape(tmp_path / "null", "null").validate())
-    holding_value = _authoring_facts(shape(tmp_path / "value", '{"a": 1}').validate())
-    file_held = _authoring_facts(shape(tmp_path / "file", _marker(ENTRY_BLOB, "null")).validate())
+    holding_null = _reports(shape(tmp_path / "null", "null").validate())
+    holding_value = _reports(shape(tmp_path / "value", '{"a": 1}').validate())
+    file_held = _reports(shape(tmp_path / "file", _marker(ENTRY_BLOB, "null")).validate())
 
-    assert holding_null == holding_value, "an authoring consumer now separates nullable any from non-null any"
-    assert file_held == holding_null
+    rendered_null, fired = _null_twin_rendered_as_non_null(holding_null)
+
+    assert fired == expected_renderings, "the normalisation fired somewhere other than expected"
+    if expected_renderings:
+        assert holding_null != holding_value, "the normalisation must be needed where it fires"
+    else:
+        assert holding_null == holding_value
+    assert rendered_null == holding_value, "an authoring consumer now separates nullable any from non-null any"
+    assert file_held == holding_value
+
+
+def test_what_the_file_held_node_publishes_for_its_undeclared_json_field(tmp_path: Path) -> None:
+    """Positive pin of the published residue.
+
+    ``nullable: false`` below is the STAND-IN's value, not a fact about the
+    file: with the bytes, a JSON null would make it ``true``. It appears only
+    inside a ``row_union_schema_incompatible`` error, which is an error in
+    both twins; the runtime preflight in the same round reads the bytes and
+    reports the exact type.
+    """
+    summary = _pin_shape_row_union("str", False)(tmp_path, _marker(ENTRY_BLOB, "null")).validate()
+
+    (report,) = [entry.to_dict() for entry in summary.errors if entry.error_code == _ROW_UNION_REPORT]
+    (inject_branch,) = [branch for branch in report["row_union_schema"]["branches"] if branch["branch"] == _INJECT_BRANCH]
+    (published,) = [field for field in inject_branch["fields"] if field["name"] == _WRITTEN_FIELD]
+
+    assert published == {"name": _WRITTEN_FIELD, "field_type": "any", "required": True, "nullable": False}
+    assert f"{_WRITTEN_FIELD} (expected str, got Any)" in report["message"]
 
 
 @pytest.mark.parametrize(
