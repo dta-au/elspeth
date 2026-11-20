@@ -700,15 +700,23 @@ export function AcknowledgementCard({
                   ))}
               </ul>
             )}
+            {/* Each prompt's heading, then the file it is read from (display
+                only: Approve sends the snapshot's anchor, never this text). */}
             {promptDisplay.systemPrompt !== undefined && (
               <>
                 {promptDisplay.systemPrompt !== null && (
                   <>
                     <p className="ack-card-prompt-role">System prompt</p>
+                    {promptDisplay.systemPromptFile !== undefined && (
+                      <p className="ack-card-prompt-file">File: {promptDisplay.systemPromptFile}</p>
+                    )}
                     <pre className="ack-card-prompt-pre">{promptDisplay.systemPrompt}</pre>
                   </>
                 )}
                 <p className="ack-card-prompt-role">User prompt</p>
+                {promptDisplay.promptTemplateFile !== undefined && (
+                  <p className="ack-card-prompt-file">File: {promptDisplay.promptTemplateFile}</p>
+                )}
               </>
             )}
             <pre className="ack-card-prompt-pre">

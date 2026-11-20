@@ -78,6 +78,11 @@ describe("review card", () => {
     expect(declared(CHAT, ".ack-card-view-toggle", "font-family")).toBe("var(--font-sans)");
   });
 
+  it("keeps the prompt box inside the card in a narrow column", () => {
+    expect(declared(CHAT, ".ack-card-value", "min-width")).toBe("0");
+    expect(declared(CHAT, ".ack-card-copy-actions .btn-compact", "white-space")).toBe("normal");
+  });
+
   it("lays the copy controls out as one wrapping row", () => {
     expect(declared(CHAT, ".ack-card-copy-actions", "display")).toBe("flex");
     expect(declared(CHAT, ".ack-card-copy-actions", "flex-wrap")).toBe("wrap");

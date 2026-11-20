@@ -2587,6 +2587,9 @@
   flex-direction: column;
   align-items: flex-start;
   gap: var(--space-xs);
+  /* A flex item may shrink below its longest unbreakable line; without this
+     the prompt box ran past the card's edge in a 390px column. */
+  min-width: 0;
 }
 
 .ack-card-view-toggle {
@@ -2657,6 +2660,14 @@
 .ack-card-prompt-role {
   margin: var(--space-sm) 0 var(--space-xs);
   font-weight: var(--font-weight-semibold);
+}
+
+/* The file a prompt is read from, under that prompt's heading. */
+.ack-card-prompt-file {
+  margin: 0 0 var(--space-xs);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  overflow-wrap: anywhere;
 }
 
 .ack-card-prompt-role:first-child {
@@ -2786,6 +2797,13 @@
   flex-wrap: wrap;
   gap: var(--space-xs);
   margin-top: var(--space-xs);
+}
+
+/* A long query label wraps inside its button rather than widening the card. */
+.ack-card-copy-actions .btn-compact {
+  max-width: 100%;
+  white-space: normal;
+  text-align: start;
 }
 
 .ack-card-original-template {
