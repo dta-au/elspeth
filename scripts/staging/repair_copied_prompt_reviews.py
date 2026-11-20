@@ -82,6 +82,8 @@ from scripts.staging.opslib import (
 PROMPT_KEYS = ("prompt_template", "system_prompt", "queries")
 INLINE_CONTENT = "inline_content"
 CHECKPOINT_KEYS = frozenset({"version", "session_id", "source_session_id", "before", "history_before", "resolved"})
+CHECKPOINT_VERSION = 2
+RESOLVE_WRITTEN_OPTION_KEYS = ("approved_prompt_artifact_hash", "interpretation_requirements")
 
 
 def checkpoint_name(session_id: str) -> str:
@@ -134,13 +136,13 @@ def load_checkpoint(store: CheckpointStore, session_id: str, source_session_id: 
         return None
     valid = (
         set(saved) >= CHECKPOINT_KEYS
-        and saved["version"] == 1
+        and saved["version"] == CHECKPOINT_VERSION
         and saved["session_id"] == session_id
         and saved["source_session_id"] == source_session_id
         and type(saved["before"]) is dict
         and type(saved["history_before"]) is list
         and type(saved["resolved"]) is list
-        and all(type(item) is str for item in saved["resolved"])
+        and all(type(item) is dict and set(item) == {"event_id", "node_id"} for item in saved["resolved"])
         and ("complete" not in saved or type(saved["complete"]) is bool)
     )
     if not valid:
@@ -148,10 +150,35 @@ def load_checkpoint(store: CheckpointStore, session_id: str, source_session_id: 
     return saved
 
 
-def assert_parity(expected: Mapping[str, Any], actual: Mapping[str, Any]) -> None:
-    found = differences(api_projection(expected), api_projection(actual))
-    if found:
-        raise OperationFailed(f"graph content changed: {found[:20]}")
+def assert_parity(expected: Mapping[str, Any], actual: Mapping[str, Any], *, reviewed_nodes: Sequence[str] = ()) -> list[str]:
+    """Refuse any graph change except the fields the server's resolve writes on a reviewed node; return those.
+
+    Resolving a prompt card writes ``options.approved_prompt_artifact_hash`` and
+    settles the node's ``options.interpretation_requirements`` row
+    (``sessions/pending_interpretation.py``). Those two option keys, on nodes
+    whose card this repair resolved, are allowed by name; anything else is a
+    content change.
+    """
+    before, after = api_projection(expected), api_projection(actual)
+    if [node["id"] for node in before["nodes"]] != [node["id"] for node in after["nodes"]]:
+        raise OperationFailed("graph content changed: the node list differs")
+    server_written: list[str] = []
+    other: list[str] = []
+    for path in differences(before, after):
+        parts = path.split("/")[1:]
+        if (
+            len(parts) >= 4
+            and parts[0] == "nodes"
+            and after["nodes"][int(parts[1])]["id"] in reviewed_nodes
+            and parts[2] == "options"
+            and parts[3] in RESOLVE_WRITTEN_OPTION_KEYS
+        ):
+            server_written.append(path)
+        else:
+            other.append(path)
+    if other:
+        raise OperationFailed(f"graph content changed: {other[:20]}")
+    return server_written
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,7 +354,7 @@ def repair(
             ):
                 raise OperationFailed("graph comparison failed its own positive or negative control")
             saved = {
-                "version": 1,
+                "version": CHECKPOINT_VERSION,
                 "session_id": session_id,
                 "source_session_id": source_session_id,
                 "before": before,
@@ -336,7 +363,7 @@ def repair(
             }
             store.write(checkpoint_name(session_id), saved)
         state = require_dict(target.get_json(f"/api/sessions/{session_id}/state"), "state")
-        assert_parity(saved["before"], state)
+        assert_parity(saved["before"], state, reviewed_nodes=[item["node_id"] for item in saved["resolved"]])
         nodes = {node["id"]: node for node in state["nodes"]}
         pending = require_dict(target.get_json(f"/api/sessions/{session_id}/interpretations?status=pending"), "reviews")["events"]
         for event in pending:
@@ -345,28 +372,33 @@ def repair(
             answer = confirm(f"Type approve to accept review {evidence.event_id} as drafted: ")
             if answer.strip() != "approve":
                 raise OperationFailed(f"operator did not approve review {evidence.event_id}; nothing was resolved for it")
+            # Recorded before the call: a stop between the resolve and a later save must not leave
+            # the fields that resolve wrote looking like an outside change to the resumed run.
+            entry = {"event_id": evidence.event_id, "node_id": evidence.node_id}
+            if entry not in saved["resolved"]:
+                saved["resolved"].append(entry)
+                store.write(checkpoint_name(session_id), saved)
             target.post_json(
                 f"/api/sessions/{session_id}/interpretations/{evidence.event_id}/resolve",
                 {"choice": "accepted_as_drafted", "reviewed_anchor": evidence.anchor},
             )
-            saved["resolved"].append(evidence.event_id)
-            store.write(checkpoint_name(session_id), saved)
             emit("copy_prompt_review_reestablished", completed=len(saved["resolved"]), session_id=session_id)
         state = require_dict(target.get_json(f"/api/sessions/{session_id}/state"), "state")
-        assert_parity(saved["before"], state)
+        server_written = assert_parity(saved["before"], state, reviewed_nodes=[item["node_id"] for item in saved["resolved"]])
         if all_messages(target, session_id) != saved["history_before"]:
             raise OperationFailed("chat history changed during the repair")
         remaining = require_dict(target.get_json(f"/api/sessions/{session_id}/interpretations?status=pending"), "reviews")["events"]
         if remaining:
             raise OperationFailed(f"{len(remaining)} reviews are still pending")
         validation = require_dict(target.post_json(f"/api/sessions/{session_id}/validate", {}), "validation")
-        saved.update(complete=True, state=state, validation=validation)
+        saved.update(complete=True, state=state, validation=validation, server_written=server_written)
         store.write(checkpoint_name(session_id), saved)
         emit(
             "copy_review_repair_complete",
             session_id=session_id,
             reviews=len(saved["resolved"]),
-            graph_content_identical=True,
+            graph_content_identical_except_server_written=True,
+            server_written=server_written,
             history_preserved=True,
             runtime_valid=validation["is_valid"],
         )

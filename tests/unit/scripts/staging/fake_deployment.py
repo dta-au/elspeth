@@ -37,6 +37,9 @@ class FakeTurn:
     status: str = "completed"
     error_code: str | None = None
     created_at: tuple[str, str] = ("2026-01-01T00:00:00+00:00", "2026-01-01T00:00:05+00:00")
+    # The provider audit row is stored only after this many later reads of the messages view,
+    # as on a server whose evidence rows land after the operation reports completed.
+    audit_after_reads: int = 0
 
 
 type Provider = Callable[[JsonObject, str], tuple[JsonObject, list[JsonObject]] | FakeTurn]
@@ -79,6 +82,8 @@ class Session:
     messages: list[JsonObject] = field(default_factory=list)
     reviews: dict[str, JsonObject] = field(default_factory=dict)
     operations: dict[str, JsonObject] = field(default_factory=dict)
+    trust_mode: str = "auto_commit"
+    late_rows: list[tuple[int, JsonObject]] = field(default_factory=list)
 
 
 @dataclass
@@ -150,7 +155,16 @@ class FakeDeployment:
         blob_match = re.fullmatch(r"/blobs/([^/]+)/content", rest)
         if method == "GET" and blob_match is not None:
             return HttpResponse(status=200, body=session.blobs[blob_match.group(1)].data)
+        if key == ("GET", "/composer/preferences"):
+            return self._json(200, {"session_id": match.group(1), "trust_mode": session.trust_mode, "density_default": "standard"})
         if key == ("GET", "/messages"):
+            still_late: list[tuple[int, JsonObject]] = []
+            for reads_left, row in session.late_rows:
+                if reads_left <= 0:
+                    session.messages.append(row)
+                else:
+                    still_late.append((reads_left - 1, row))
+            session.late_rows = still_late
             audit = query.get("include_llm_audit") == "true"
             rows = [row for row in session.messages if audit or row["role"] != "audit"]
             return self._page(rows, query)
@@ -164,12 +178,7 @@ class FakeDeployment:
                 return self._json(200, {**review["snapshot"], "is_live_review": review["pending"]})
             assert payload == {"choice": "accepted_as_drafted", "reviewed_anchor": review["snapshot"]["anchor"]}
             review["pending"] = False
-            # As the server does, resolving a prompt card settles the node's pending prompt requirement.
-            for node in session.state["nodes"]:
-                if node["id"] == review["snapshot"]["node_id"] and "interpretation_requirements" in node["options"]:
-                    for requirement in node["options"]["interpretation_requirements"]:
-                        if requirement["kind"] == review["event"]["kind"]:
-                            requirement["status"] = "resolved"
+            self._resolve_prompt_review(session, review)
             return self._json(200, {"event": review["event"]})
         if key == ("POST", "/validate"):
             return self._json(200, {"is_valid": True, "readiness": "ready", "errors": []})
@@ -179,6 +188,32 @@ class FakeDeployment:
         if method == "GET" and operation_match is not None:
             return self._json(200, session.operations[operation_match.group(1)])
         return self._json(404, {"detail": f"no route {method} {rest}"})
+
+    @staticmethod
+    def _resolve_prompt_review(session: Session, review: JsonObject) -> None:
+        """What the server's resolve writes (``sessions/pending_interpretation.py``, prompt-template branch).
+
+        On the reviewed node only: the matching pending requirement becomes
+        resolved with the event id, the accepted value and the resolved
+        template hash, and ``options.approved_prompt_artifact_hash`` is set to
+        the effective artifact hash. Nothing else in the graph changes.
+        """
+        snapshot = review["snapshot"]
+        for node in session.state["nodes"]:
+            if node["id"] != snapshot["node_id"]:
+                continue
+            options = node["options"]
+            artifact = hashlib.sha256(json.dumps(snapshot["authored_surface"], sort_keys=True).encode()).hexdigest()
+            if "interpretation_requirements" in options:
+                for requirement in options["interpretation_requirements"]:
+                    if requirement["kind"] == review["event"]["kind"] and requirement["status"] == "pending":
+                        requirement.update(
+                            status="resolved",
+                            event_id=review["event"]["id"],
+                            accepted_value="accepted",
+                            resolved_prompt_template_hash=snapshot["anchor"],
+                        )
+            options["approved_prompt_artifact_hash"] = artifact
 
     def _admit(self, session: Session, payload: JsonObject) -> HttpResponse:
         operation_id = payload["operation_id"]
@@ -202,9 +237,11 @@ class FakeDeployment:
                         "created_at": first,
                     }
                 )
-            session.messages.append(
-                {"role": "audit", "operation_id": operation_id, "tool_calls": turn.audit, "content": "", "created_at": last}
-            )
+            audit_row = {"role": "audit", "operation_id": operation_id, "tool_calls": turn.audit, "content": "", "created_at": last}
+            if turn.audit_after_reads:
+                session.late_rows.append((turn.audit_after_reads, audit_row))
+            else:
+                session.messages.append(audit_row)
             completed = turn.status == "completed"
             session.operations[operation_id] = {
                 "operation_id": operation_id,

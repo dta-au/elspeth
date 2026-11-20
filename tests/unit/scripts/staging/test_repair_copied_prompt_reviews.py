@@ -120,6 +120,8 @@ def test_review_resolved_through_the_api_after_bytes_match_and_operator_approves
     assert resolves(fake) == [{"choice": "accepted_as_drafted", "reviewed_anchor": "a" * 64}]
     assert {item["text"] for item in shown[0].files} == {SYSTEM.decode(), USER.decode()}
     assert result["complete"] is True and result["validation"]["is_valid"] is True
+    # The server's resolve writes the approval hash on the reviewed node; that, and only that, is allowed and reported.
+    assert result["server_written"] == ["/nodes/0/options/approved_prompt_artifact_hash"]
     writes = {path for verb, path, _ in fake.requests if verb == "POST"}
     assert writes == {
         "/api/auth/login",
@@ -127,6 +129,51 @@ def test_review_resolved_through_the_api_after_bytes_match_and_operator_approves
         f"/api/sessions/{TARGET}/interpretations/event-1/resolve",
         f"/api/sessions/{TARGET}/validate",
     }
+
+
+def test_any_other_change_around_a_resolve_is_refused_after_it(tmp_path: Path) -> None:
+    fake = deployment()
+
+    def beside_the_resolve(method: str, path: str) -> None:
+        if method == "POST" and path.endswith("/resolve"):
+            fake.sessions[TARGET].state["nodes"][0]["options"]["model"] = "changed beside the resolve"
+
+    fake.on_request = beside_the_resolve
+    with pytest.raises(OperationFailed, match="graph content changed: \\['/nodes/0/options/model'\\]"):
+        run(fake, tmp_path)
+
+
+def test_a_resolve_written_key_on_a_node_that_was_not_reviewed_is_refused(tmp_path: Path) -> None:
+    fake = deployment()
+    other = {"id": "other", "node_type": "transform", "plugin": "passthrough", "input": "x", "on_success": "y", "options": {}}
+    fake.sessions[TARGET].state["nodes"].append(other)
+
+    def beside_the_resolve(method: str, path: str) -> None:
+        if method == "POST" and path.endswith("/resolve"):
+            fake.sessions[TARGET].state["nodes"][1]["options"]["approved_prompt_artifact_hash"] = "not from this review"
+
+    fake.on_request = beside_the_resolve
+    with pytest.raises(OperationFailed, match="graph content changed: \\['/nodes/1/options/approved_prompt_artifact_hash'\\]"):
+        run(fake, tmp_path)
+
+
+def test_a_resumed_repair_accepts_what_its_earlier_resolve_wrote(tmp_path: Path) -> None:
+    fake = deployment()
+
+    class Stop(Exception):
+        pass
+
+    def stop_after_resolve(method: str, path: str) -> None:
+        if method == "POST" and path.endswith("/resolve"):
+            raise Stop
+
+    fake.on_request = stop_after_resolve
+    with pytest.raises(Stop):
+        run(fake, tmp_path)
+    fake.on_request = None
+    fake.sessions[TARGET].reviews["event-1"]["pending"] = False
+    assert run(fake, tmp_path)["complete"] is True
+    assert len(resolves(fake)) == 1
 
 
 def with_inline_system(fake: FakeDeployment, *, source_text: str, target_text: str) -> None:
@@ -269,7 +316,14 @@ def test_checkpoint_for_another_session_refuses(tmp_path: Path) -> None:
     store = CheckpointStore(tmp_path / "state", repo_root=tmp_path / "repo")
     store.write(
         repair.checkpoint_name(TARGET),
-        {"version": 1, "session_id": TARGET, "source_session_id": TARGET, "before": {}, "history_before": [], "resolved": []},
+        {
+            "version": repair.CHECKPOINT_VERSION,
+            "session_id": TARGET,
+            "source_session_id": TARGET,
+            "before": {},
+            "history_before": [],
+            "resolved": [],
+        },
     )
     with pytest.raises(OperationFailed, match="not a complete, valid checkpoint"):
         run(fake, tmp_path)
