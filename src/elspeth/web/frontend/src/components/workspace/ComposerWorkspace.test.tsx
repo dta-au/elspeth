@@ -799,13 +799,19 @@ describe("ComposerWorkspace", () => {
     const status = screen.getByRole("status");
     expect(status).toHaveTextContent(text);
     expect(status).toHaveAttribute("data-tone", tone);
-    const badge = show.querySelector(".workspace-pane-toggle-badge--dot");
+    const dotBadge = show.querySelector(".workspace-pane-toggle-badge--dot");
+    const alertBadge = show.querySelector(".workspace-pane-toggle-badge--alert");
+    // Shape and glyph, not colour alone: busy is a bare dot, error a "!" pill.
+    const badge = dot === "error" ? alertBadge : dotBadge;
     if (dot === null) {
-      expect(badge).toBeNull();
+      expect(dotBadge).toBeNull();
+      expect(alertBadge).toBeNull();
       expect(show).toHaveAttribute("title", "Show conversation (Ctrl+\\)");
     } else {
       expect(badge).toHaveAttribute("data-tone", dot);
       expect(badge).toHaveAttribute("aria-hidden", "true");
+      expect(badge).toHaveTextContent(dot === "error" ? /^!$/ : /^$/);
+      expect(dot === "error" ? dotBadge : alertBadge).toBeNull();
       expect(show).toHaveAttribute("title", `Show conversation (Ctrl+\\)\n${text}`);
     }
 
@@ -833,9 +839,7 @@ describe("ComposerWorkspace", () => {
     };
     // busy and error must stay distinguishable (elspeth-7161879770 lineage).
     expect(dotFill(".workspace-pane-toggle-badge--dot")).toBe("var(--color-info)");
-    expect(dotFill('.workspace-pane-toggle-badge--dot[data-tone="error"]')).toBe(
-      "var(--color-error)",
-    );
+    expect(dotFill(".workspace-pane-toggle-badge--alert")).toBe("var(--color-error)");
     expect(dotFill(".workspace-pane-toggle-badge--count")).toBe("var(--color-info)");
   });
 

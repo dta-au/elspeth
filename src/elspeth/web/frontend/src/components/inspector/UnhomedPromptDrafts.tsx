@@ -1,4 +1,4 @@
-import { useId, useMemo, type JSX } from "react";
+import { useId, useMemo, useRef, type JSX } from "react";
 import { AlertBanner, Button } from "@/components/ui";
 import { useBlobFilename } from "@/components/blobs/BlobFileName";
 import { promptFileBindings, promptFileSlots } from "@/lib/blobBindings";
@@ -29,23 +29,54 @@ export function UnhomedPromptDrafts(): JSX.Element | null {
       && !homes.has(JSON.stringify([draft.nodeId, draft.fieldPath])));
   }, [sessionId, state, loaded, drafts]);
   const headingId = useId();
+  const sectionRef = useRef<HTMLElement | null>(null);
+  // Discarding removes the row whose button had focus. Focus moves to the
+  // next row's Discard (else the previous one); after the last row the whole
+  // notice goes, so focus moves to the next control after it (the Files
+  // table's toggle), never to the page body.
+  const discard = (draft: PromptDraft, button: HTMLElement) => {
+    const section = sectionRef.current;
+    const buttons = section === null ? [] : Array.from(section.querySelectorAll<HTMLElement>("[data-unhomed-discard]"));
+    const index = buttons.indexOf(button);
+    const target = buttons[index + 1] ?? buttons[index - 1] ?? nextFocusableAfter(section);
+    usePromptDraftStore.getState().discard(draft);
+    target?.focus();
+  };
   if (state === null || unhomed.length === 0) return null;
   // The banner (a status, so a new arrival is announced) says what this is;
   // the list under it holds one row per draft.
   return (
-    <section className="prompt-drafts-unhomed" aria-labelledby={headingId}>
+    <section ref={sectionRef} className="prompt-drafts-unhomed" aria-labelledby={headingId}>
       <AlertBanner tone="warning" role="status">
         <strong id={headingId} className="prompt-drafts-unhomed-title">Unsaved prompt text with no home ({unhomed.length})</strong>
         {" "}The prompt it was written for no longer reads a file. Copy it to keep it, or discard it.
       </AlertBanner>
       <ul className="prompt-drafts-unhomed-list">
-        {unhomed.map((draft) => <UnhomedDraft key={JSON.stringify([draft.nodeId, draft.fieldPath])} draft={draft} state={state} />)}
+        {unhomed.map((draft) => <UnhomedDraft key={JSON.stringify([draft.nodeId, draft.fieldPath])} draft={draft} state={state} onDiscard={discard} />)}
       </ul>
     </section>
   );
 }
 
-function UnhomedDraft({ draft, state }: { draft: PromptDraft; state: CompositionState }): JSX.Element {
+const FOCUSABLE = "summary, button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex=\"0\"]";
+
+/** The first focusable control after `element` in document order, outside it. */
+function nextFocusableAfter(element: Element | null): HTMLElement | null {
+  for (let from = element; from !== null && from !== document.body; from = from.parentElement) {
+    for (let sibling = from.nextElementSibling; sibling !== null; sibling = sibling.nextElementSibling) {
+      if (sibling instanceof HTMLElement && sibling.matches(FOCUSABLE)) return sibling;
+      const inside = sibling.querySelector<HTMLElement>(FOCUSABLE);
+      if (inside !== null) return inside;
+    }
+  }
+  return null;
+}
+
+function UnhomedDraft({ draft, state, onDiscard }: {
+  draft: PromptDraft;
+  state: CompositionState;
+  onDiscard: (draft: PromptDraft, button: HTMLElement) => void;
+}): JSX.Element {
   const filename = useBlobFilename(draft.blobId);
   const node = state.nodes.find((candidate) => candidate.id === draft.nodeId);
   // The query's own name while its step still exists; the slot path otherwise.
@@ -59,10 +90,15 @@ function UnhomedDraft({ draft, state }: { draft: PromptDraft; state: Composition
         <strong>{slot}</strong>
         <span className="prompt-drafts-unhomed-meta">{reason}{filename !== null && ` · written for ${filename}`}</span>
       </span>
+      {/* Read it before deciding, like "View current file" in the editor. */}
+      <details className="prompt-drafts-unhomed-view">
+        <summary aria-label={`View unsaved text for ${slot}`}>View text</summary>
+        <pre className="prompt-drafts-unhomed-text">{draft.text}</pre>
+      </details>
       <span className="prompt-drafts-unhomed-actions">
         <PromptCopyButton value={draft.text} label={`unsaved text for ${slot}`} />
         <Button type="button" variant="ghost" compact aria-label={`Discard unsaved text for ${slot}`}
-          onClick={() => usePromptDraftStore.getState().discard(draft)}>Discard</Button>
+          data-unhomed-discard="" onClick={(event) => onDiscard(draft, event.currentTarget)}>Discard</Button>
       </span>
     </li>
   );

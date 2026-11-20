@@ -580,6 +580,33 @@
   gap: var(--space-xs);
 }
 
+/* "View text": the whole row width, under the name and the actions. */
+.prompt-drafts-unhomed-view {
+  flex: 1 0 100%;
+  order: 3;
+  font-size: var(--font-size-xs);
+}
+
+.prompt-drafts-unhomed-view > summary {
+  cursor: pointer;
+  font-weight: var(--font-weight-semibold);
+}
+
+.prompt-drafts-unhomed-text {
+  max-height: 12rem;
+  overflow: auto;
+  margin: var(--space-xs) 0 0;
+  padding: var(--space-xs) var(--space-sm);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
 .graph-files-alert {
   margin: 0 var(--space-pane-gutter) var(--space-sm);
 }
@@ -1130,6 +1157,12 @@
 
 .prompt-editor-close {
   margin-inline-start: auto;
+}
+
+/* Under a refused save: the text is kept but unsaved, on its own line. */
+.prompt-editor-kept {
+  display: block;
+  margin-top: var(--space-xs);
 }
 
 /* The stale-draft banner's choice sits on its own line under the message. */

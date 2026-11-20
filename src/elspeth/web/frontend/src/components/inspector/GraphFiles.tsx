@@ -181,7 +181,7 @@ function FileMappings({ state, onShowNode, visibleNodeIds, onCount }: GraphFiles
             hidden={visibleNodeIds !== undefined && !visibleNodeIds.has(row.componentId)}
             binding={binding} unsaved={unsavedFields.length > 0}
             sameSession={sameSession} current={sameSession && currentStateId === state.id}
-            listReady={!loading && blobSessionId === state.session_id} loadError={loadError}
+            listReady={!loading && blobSessionId === state.session_id} loadError={loadError} retryOffered={listLoadFailed}
             blobs={blobSessionId === state.session_id ? blobs : []} pendingEvents={Object.values(pending ?? {})} />;
           })}
           </tbody>
@@ -192,7 +192,7 @@ function FileMappings({ state, onShowNode, visibleNodeIds, onCount }: GraphFiles
   </div>;
 }
 
-function FileMappingRow({ row, state, onShowNode, hidden, binding, unsaved, sameSession, current, listReady, loadError, blobs, pendingEvents }: {
+function FileMappingRow({ row, state, onShowNode, hidden, binding, unsaved, sameSession, current, listReady, loadError, retryOffered, blobs, pendingEvents }: {
   row: FileMapping;
   /** A prompt slot in this row holds unsaved text in the editor. */
   unsaved: boolean;
@@ -204,6 +204,8 @@ function FileMappingRow({ row, state, onShowNode, hidden, binding, unsaved, same
   current: boolean;
   listReady: boolean;
   loadError: string | null;
+  /** The banner above the table offers Retry (the list read failed). */
+  retryOffered: boolean;
   blobs: ReturnType<typeof useBlobStore.getState>["blobs"];
   pendingEvents: Parameters<typeof promptFileEditability>[0]["pendingEvents"];
 }): JSX.Element {
@@ -217,7 +219,7 @@ function FileMappingRow({ row, state, onShowNode, hidden, binding, unsaved, same
     : null;
   const editReason = !current ? "Open the current graph to edit its files."
     : !listReady ? "Wait for the file list to load."
-    : loadError ? "File names are unavailable. Reload the file list."
+    : loadError ? (retryOffered ? "File names are unavailable. Use Retry above." : "File names are unavailable.")
     : binding === undefined ? "Only prompt files can be edited here."
     : editability?.editable === false ? editability.reason : null;
   const editBlocked = binding === undefined || editability === null || (!editability.editable && !editability.opens);

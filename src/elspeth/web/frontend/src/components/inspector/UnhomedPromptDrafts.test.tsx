@@ -68,6 +68,34 @@ describe("unsaved prompt text whose slot is gone", () => {
     expect(unload()).toBe(false);
   });
 
+  it("shows a draft's text on request, before any discard", () => {
+    draftOn("gone", "system_prompt", "line one\n  line two");
+    render(<UnhomedPromptDrafts />);
+    const view = screen.getByText("View text", { selector: "summary" });
+    expect(view).toHaveAccessibleName("View unsaved text for gone, System prompt");
+    const details = view.closest("details");
+    expect(details).not.toHaveAttribute("open");
+    fireEvent.click(view);
+    expect(details).toHaveAttribute("open");
+    expect(details?.querySelector("pre")?.textContent).toBe("line one\n  line two");
+  });
+
+  it("keeps focus in the list after Discard: next row, else the previous, else the next control after the notice", () => {
+    draftOn("gone-1", "system_prompt", "first");
+    draftOn("gone-2", "system_prompt", "second");
+    draftOn("gone-3", "system_prompt", "third");
+    render(<><UnhomedPromptDrafts /><details><summary>Files</summary></details></>);
+    const discard = (n: number) => screen.getByRole("button", { name: `Discard unsaved text for gone-${n}, System prompt` });
+    discard(2).focus();
+    fireEvent.click(discard(2));
+    expect(discard(3)).toHaveFocus();
+    fireEvent.click(discard(3));
+    expect(discard(1)).toHaveFocus();
+    fireEvent.click(discard(1));
+    expect(screen.queryByText(/no home/)).not.toBeInTheDocument();
+    expect(screen.getByText("Files", { selector: "summary" })).toHaveFocus();
+  });
+
   it("lists a draft whose step was removed, and counts every one", () => {
     draftOn("score", "prompt_template", "first");
     draftOn("gone", "system_prompt", "second");

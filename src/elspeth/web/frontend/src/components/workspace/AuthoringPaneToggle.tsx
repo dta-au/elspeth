@@ -129,12 +129,23 @@ function MountedToggle({
             {badgeText(unread)}
           </span>
         )}
-        {dotTone !== null && (
+        {/* Busy and error differ by shape and glyph, not colour alone: busy
+            is a plain dot, error a pill with "!" like the Checks badge. */}
+        {dotTone === "busy" && (
           <span
             className="workspace-pane-toggle-badge workspace-pane-toggle-badge--dot"
-            data-tone={dotTone}
+            data-tone="busy"
             aria-hidden="true"
           />
+        )}
+        {dotTone === "error" && (
+          <span
+            className="workspace-pane-toggle-badge workspace-pane-toggle-badge--alert"
+            data-tone="error"
+            aria-hidden="true"
+          >
+            !
+          </span>
         )}
       </Button>
       {collapsed && (

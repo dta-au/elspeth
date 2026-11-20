@@ -8,6 +8,24 @@ import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore
 import { promptFileEditability } from "@/lib/blobBindings";
 import { usePromptDraft, usePromptDraftStore } from "@/stores/promptDraftStore";
 import { optionLabel } from "./OptionRows";
+import { PromptCopyButton } from "./PromptCopyButton";
+
+/** Under any refused save whose own wording does not already say so: the
+ *  draft lives in memory only, so a reload the refusal may ask for loses it. */
+export const REFUSED_SAVE_KEPT_LINE = "Your text is still here and not saved. Copy it before you reload the page.";
+
+interface EditorStatus {
+  tone: "error" | "success" | "warning";
+  text: string;
+  /** The save landed but the graph refetch after it failed; offer it again. */
+  retryRefresh?: true;
+  /** The save was refused; the unsaved text stays in the editor. */
+  refused?: true;
+  /** Add REFUSED_SAVE_KEPT_LINE (the text does not already say it is kept). */
+  keptLine?: true;
+  /** Offer "Refresh pipeline": the graph read, never a save or page reload. */
+  refreshPipeline?: true;
+}
 
 interface PromptFileEditorProps {
   nodeId: string;
@@ -54,9 +72,7 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
   // What the editor last has to say: a failure (announced as an alert) or a
   // confirmation or caution (announced politely). A save that worked is never
   // sent through the error channel.
-  // retryRefresh: the save landed but the graph refetch after it failed; the
-  // banner offers the same refetch again.
-  const [status, setStatus] = useState<{ tone: "error" | "success" | "warning"; text: string; retryRefresh?: true } | null>(null);
+  const [status, setStatus] = useState<EditorStatus | null>(null);
   const [saving, setSaving] = useState(false);
   // A slot with unsaved text opens with it showing, wherever the editor remounts.
   const [expanded, setExpanded] = useState(() => draft !== undefined);
@@ -199,6 +215,25 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
     void refreshGraphAfterSave(sessionId, captureSessionPublicationGuard(sessionId));
   };
 
+  // After "the prompt no longer reads this file the way it did": read the
+  // graph again (drafts are in memory, so they survive), then let the stale
+  // banner say where the text stands. Never a save, never a page reload.
+  const refreshPipeline = async () => {
+    if (!sessionId) return;
+    const isCurrent = captureSessionPublicationGuard(sessionId);
+    try {
+      const state = await fetchCompositionState(sessionId);
+      if (!isCurrent()) return;
+      useSessionStore.setState({ compositionState: state });
+      setStatus(null);
+    } catch {
+      if (isCurrent()) {
+        setStatus({ tone: "error", refused: true, refreshPipeline: true,
+          text: "Could not refresh the pipeline. Your text is kept. Try Refresh pipeline again." });
+      }
+    }
+  };
+
   const save = async () => {
     if (!slot || !sessionId || !draft || stale || refusal !== null) return;
     const sent = draft.text;
@@ -233,18 +268,30 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
           try {
             current = await reread();
           } catch {
-            setStatus({ tone: "error", text: "Could not read the current version of this file. Try saving again." });
+            setStatus({ tone: "error", refused: true, keptLine: true,
+              text: "Could not read the current version of this file. Try saving again." });
             return;
           }
           if (current === null || current !== draft.baseSha256) return;
         }
-        setStatus({ tone: "error", text: typed.error_type === "prompt_file_review_pending"
-          ? "Complete the existing node review before editing its files."
-          : typed.error_type === "prompt_file_review_pending_inline"
-            ? "Approve the review card first, then edit the file."
-            : typed.error_type === "prompt_file_binding_changed"
-              ? "This prompt file moved since you opened it. Reload the session."
-          : typeof typed.detail === "string" ? typed.detail : "Could not save this prompt file. Reload and retry." });
+        if (typed.error_type === "prompt_file_binding_changed") {
+          setStatus({ tone: "error", refused: true, refreshPipeline: true,
+            text: "The pipeline changed and this prompt no longer reads this file the way it did when you opened it. "
+              + "Your text is kept. Refresh the pipeline to see where the prompt points now." });
+        } else if (typed.error_type === "prompt_file_review_pending" || typed.error_type === "prompt_file_review_pending_inline"
+          || typeof typed.detail === "string") {
+          // Server wording is shown as sent; some of it asks for a page
+          // reload, so the kept-text line follows it.
+          setStatus({ tone: "error", refused: true, keptLine: true, text: typed.error_type === "prompt_file_review_pending"
+            ? "Complete the existing node review before editing its files."
+            : typed.error_type === "prompt_file_review_pending_inline"
+              ? "Approve the review card first, then edit the file."
+              : typed.detail as string });
+        } else {
+          setStatus({ tone: "error", refused: true,
+            text: "Could not save this prompt file. Your text is still here. Try Save again; "
+              + "if it keeps failing, copy your text before you leave this page." });
+        }
       }
     } finally {
       setSaving(false);
@@ -252,6 +299,11 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
   };
 
   const fieldId = `prompt-file-${blobId}-${fieldPath}`;
+  // Re-pointed (or changed) onto a file this editor cannot save: "Put my
+  // text on the current file" would lead to a Save that never enables.
+  const staleReadOnly = stale && refusal !== null;
+  // Copy sits in the button row whenever unsaved text cannot be saved now.
+  const offerCopy = draft !== undefined && (status?.refused === true || staleReadOnly);
   const refusalId = `${fieldId}-refusal`;
   const hintId = `${fieldId}-hint`;
   const staleId = `${fieldId}-stale`;
@@ -312,18 +364,22 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
           {draft.blobId.toLowerCase() !== blobId.toLowerCase()
             ? `This prompt now reads a different file. Your unsaved text from ${draftFilename ?? "the earlier file"} is kept below.`
             : "This file changed since you started editing. Your unsaved text is kept below."}
-          {" "}Put it on the current file to save it there, or discard it to load the current file.
-          <span className="prompt-editor-stale-actions">
-            <Button type="button" variant="ghost" compact disabled={currentBase === null}
-              onClick={() => {
-                if (!slot || !currentBase) return;
-                usePromptDraftStore.getState().rebase(slot, currentBase);
-                // The banner and this button go away; the text the user kept is next.
-                editorRef.current?.focus();
-              }}>
-              Put my text on the current file
-            </Button>
-          </span>
+          {staleReadOnly
+            ? " This file cannot be edited here, so the text cannot be saved to it. Copy it to keep it, or discard it."
+            : " Put it on the current file to save it there, or discard it to load the current file."}
+          {!staleReadOnly && (
+            <span className="prompt-editor-stale-actions">
+              <Button type="button" variant="ghost" compact disabled={currentBase === null}
+                onClick={() => {
+                  if (!slot || !currentBase) return;
+                  usePromptDraftStore.getState().rebase(slot, currentBase);
+                  // The banner and this button go away; the text the user kept is next.
+                  editorRef.current?.focus();
+                }}>
+                Put my text on the current file
+              </Button>
+            </span>
+          )}
           {savedText !== null && (
             // What Save would replace, before the user chooses to replace it.
             <details className="prompt-editor-current">
@@ -353,9 +409,12 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
           action={status.retryRefresh ? (
             // The same graph read the save made, issued again; nothing is resaved.
             <Button type="button" variant="ghost" compact onClick={retryRefresh}>Retry</Button>
+          ) : status.refreshPipeline ? (
+            <Button type="button" variant="ghost" compact onClick={() => void refreshPipeline()}>Refresh pipeline</Button>
           ) : null}
         >
           {status.text}
+          {status.keptLine && <span className="prompt-editor-kept">{REFUSED_SAVE_KEPT_LINE}</span>}
         </AlertBanner>
       )}
       <div className="prompt-editor-actions">
@@ -369,6 +428,7 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
         >
           Save
         </Button>
+        {offerCopy && draft && <PromptCopyButton value={draft.text} label="your unsaved text" showLabel />}
         <Button type="button" variant="ghost" compact onClick={discard} disabled={saving || (savedText === null && !dirty)}>
           Discard changes
         </Button>

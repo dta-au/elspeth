@@ -213,6 +213,17 @@ describe("GraphFiles", () => {
     expect(loadBlobs).toHaveBeenCalledWith(state.session_id);
   });
 
+  it.each([
+    ["a failed list read (Retry offered)", true, "File names are unavailable. Use Retry above."],
+    ["a plain list error (nothing to retry)", false, "File names are unavailable."],
+  ])("says why Edit is blocked after %s, never asking for a reload", async (_case, listLoadFailed, reason) => {
+    useBlobStore.setState({ blobs: [], error: "Failed to load files.", listLoadFailed });
+    render(<GraphFiles state={state} onShowNode={vi.fn()} />);
+    await userEvent.setup().click(screen.getByText(filesSummary()));
+    expect(screen.getByRole("button", { name: "Edit file for solo" })).toHaveAttribute("title", reason);
+    expect(document.body).not.toHaveTextContent(/Reload/i);
+  });
+
   it("lets a long file or step name wrap at its separators, keeping the text whole", async () => {
     render(<GraphFiles state={state} onShowNode={vi.fn()} />);
     await userEvent.setup().click(screen.getByText(filesSummary()));

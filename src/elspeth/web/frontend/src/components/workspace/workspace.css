@@ -681,8 +681,8 @@
 }
 
 /* Collapsed-status badge, top-right of the Show control: a count of unread
-   items, or a dot in the info / error colour while authoring is busy or has
-   failed. Filled pill with the count knocked out in --color-surface, the
+   items, an info-colour dot while authoring is busy, or an error-colour
+   pill with "!" when it has failed (shape and glyph, not colour alone). Filled pill with the count knocked out in --color-surface, the
    Checks tab badge's recipe. The ring in the title-bar fill parts the badge
    from the button's border. aria-hidden: the status node beside the button
    carries the same fact (aria-describedby + live region). */
@@ -695,16 +695,20 @@
   pointer-events: none;
 }
 
-.workspace-pane-toggle-badge--count {
+.workspace-pane-toggle-badge--count,
+.workspace-pane-toggle-badge--alert {
   min-width: 16px;
   height: 16px;
   padding: 0 4px;
-  background-color: var(--color-info);
   color: var(--color-surface);
   font-size: var(--font-size-xs);
   font-weight: var(--font-weight-semibold);
   line-height: 16px;
   text-align: center;
+}
+
+.workspace-pane-toggle-badge--count {
+  background-color: var(--color-info);
 }
 
 .workspace-pane-toggle-badge--dot {
@@ -713,7 +717,7 @@
   background-color: var(--color-info);
 }
 
-.workspace-pane-toggle-badge--dot[data-tone="error"] {
+.workspace-pane-toggle-badge--alert {
   background-color: var(--color-error);
 }
 

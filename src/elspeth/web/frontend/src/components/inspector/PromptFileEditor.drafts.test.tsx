@@ -122,6 +122,25 @@ describe("unsaved prompt text survives the editor unmounting", () => {
     await waitFor(() => expect(usePromptDraftStore.getState().drafts).toEqual({}));
   });
 
+  it("re-pointed onto a file that cannot be edited here, offers Copy instead of a Save that never enables", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    render(<Inspector />);
+    await typeDraft("written for file A");
+    // file-c also backs "other", so the server would refuse a save to it.
+    act(() => useSessionStore.setState({ compositionState: { ...graph("file-c"), id: "state-2" } }));
+    const box = await editor();
+    const banner = await screen.findByText(/This prompt now reads a different file/);
+    expect(banner).toHaveTextContent("This file cannot be edited here, so the text cannot be saved to it. Copy it to keep it, or discard it.");
+    expect(banner).not.toHaveTextContent("Put it on the current file");
+    expect(screen.queryByRole("button", { name: "Put my text on the current file" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Copy your unsaved text" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("written for file A"));
+    expect(box).toHaveValue("written for file A");
+    expect(savePromptFile).not.toHaveBeenCalled();
+  });
+
   it("keeps a draft whose file changed underneath and sends its own base hash, never the new one", async () => {
     render(<Inspector />);
     await typeDraft("based on the old version");
