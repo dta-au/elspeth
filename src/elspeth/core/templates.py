@@ -539,14 +539,19 @@ class Jinja2FieldExtraction:
         return tuple(kind for kind in self.dynamic_accesses if kind not in ROW_API_MISUSE_KINDS)
 
 
-_ANALYSIS_MAX_AST_DEPTH = 64
+# The deepest template tree admitted, counted from the root's children at 1.
+# The sandbox refuses deeper trees before compiling
+# (``plugins/infrastructure/templates.py`` ``_check_template_ast`` imports this
+# number) and the field analysis below refuses the same depth, so the analysis
+# never refuses a template the sandbox compiles.
+MAX_TEMPLATE_AST_DEPTH = 64
 
 
 class TemplateTooDeeplyNestedError(TemplateSourceRefusedError):
     """A template nests deeper than the analysis walks; the analysis recurses, so it refuses first."""
 
     def __init__(self) -> None:
-        super().__init__(f"Template is too deeply nested to analyse (more than {_ANALYSIS_MAX_AST_DEPTH} levels)")
+        super().__init__(f"Template is too deeply nested to analyse (more than {MAX_TEMPLATE_AST_DEPTH} levels)")
 
 
 class _FieldExtractionEnvironment(Environment):
@@ -569,7 +574,7 @@ class _FieldExtractionEnvironment(Environment):
         pending = [(child, 1) for child in ast.iter_child_nodes()]
         while pending:
             node, depth = pending.pop()
-            if depth > _ANALYSIS_MAX_AST_DEPTH:
+            if depth > MAX_TEMPLATE_AST_DEPTH:
                 raise TemplateTooDeeplyNestedError()
             pending.extend((child, depth + 1) for child in node.iter_child_nodes())
         return ast

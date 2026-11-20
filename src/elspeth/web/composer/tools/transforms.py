@@ -13,6 +13,7 @@ from pydantic import ValidationError as PydanticValidationError
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.enums import OutputMode
 from elspeth.core.config import RuntimeNodeName
+from elspeth.core.templates import MAX_JINJA_TEMPLATE_BYTES, template_size_refusal
 from elspeth.web.composer.inventory_response_contracts import (
     PLUGIN_INDEX_DETAILS_TOOL,
     PLUGIN_INDEX_RESPONSE_CONTRACT,
@@ -2369,6 +2370,18 @@ def _execute_change_substring(args: dict[str, object], state: CompositionState, 
     result = _apply_guarded_node_option_patch(target.node_id, patch, state, context)
     if not result.success:
         code = result.validation.errors[0].error_code if result.validation.errors else "node_options_invalid"
+        edited_bytes = _utf8_bytes(new_text)
+        edited_size = -1 if edited_bytes is None else len(edited_bytes)
+        if (
+            code == "plugin_options_invalid"
+            and target.kind == "node_option"
+            and target.option == "prompt_template"
+            and edited_size > MAX_JINJA_TEMPLATE_BYTES
+        ):
+            # The plugin checks a prompt template's size before anything else, so an
+            # edited prompt over the bound was refused for its size: say so, as the
+            # plugin did. Every other cause keeps the generic sentence.
+            return _substring_refusal(state, template_size_refusal("prompt_template", edited_size, MAX_JINJA_TEMPLATE_BYTES), code)
         return _substring_refusal(
             state, "Edited prompt did not pass node validation; inspect the node and retry.", code or "node_options_invalid"
         )

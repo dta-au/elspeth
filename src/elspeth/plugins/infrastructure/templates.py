@@ -50,6 +50,7 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.tier_registry import FrameworkBugError
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.templates import (
+    MAX_TEMPLATE_AST_DEPTH,
     RETIRED_ROW_API_NAMES,
     TEMPLATE_ROW_METHODS,
     TemplateSourceTooLargeError,
@@ -1137,8 +1138,8 @@ def _check_template_ast(ast: nodes.Template) -> None:
         count += 1
         if count > 2048:
             raise TemplateError("Template AST exceeds 2048 nodes")
-        if depth > 64:
-            raise TemplateError("Template AST nesting exceeds 64 levels")
+        if depth > MAX_TEMPLATE_AST_DEPTH:
+            raise TemplateError(f"Template AST nesting exceeds {MAX_TEMPLATE_AST_DEPTH} levels")
         pending.extend((child, depth + 1) for child in node.iter_child_nodes())
     if next(ast.find_all(nodes.Pow), None) is not None:
         raise TemplateError("Power expressions are not supported in pipeline templates")
