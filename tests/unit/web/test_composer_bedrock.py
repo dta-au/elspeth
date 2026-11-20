@@ -31,6 +31,7 @@ from elspeth.web.required_work import (
 )
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.protocol import CompositionStateData
+from tests.helpers.prompt_guard_audit import assert_prompt_guard_wire_payload
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer._helpers import _composer_service_with_session, _make_settings, _mock_catalog
 from tests.unit.web.composer.test_service import _assert_checkpoint_reply
@@ -88,8 +89,8 @@ def _required_bedrock_service(
         assert request.url.path == "/contentsafety/text:shieldPrompt"
         assert request.url.params["api-version"] == "2024-09-01"
         payload = json.loads(request.content)
-        assert type(payload) is dict and set(payload) == {"userPrompt", "documents"}
-        assert payload["userPrompt"] == user_prompt
+        assert type(payload) is dict
+        assert_prompt_guard_wire_payload(payload, user_prompt=user_prompt)
         assert type(payload["documents"]) is list and all(type(document) is str for document in payload["documents"])
         requests.append(request)
         return httpx.Response(

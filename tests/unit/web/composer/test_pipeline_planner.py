@@ -152,6 +152,11 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from elspeth.web.validation import _redact_sensitive_content
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
+from tests.helpers.prompt_guard_audit import (
+    PROMPT_GUARD_AUDIT_SCHEMA_VERSION,
+    assert_prompt_guard_check_shape,
+    unscanned_check_counts,
+)
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -5450,8 +5455,9 @@ def _assert_debug_guard_audit(row: dict[str, Any], context: SessionOperationCont
     assert type(check["duration_ms"]) is int and check["duration_ms"] >= 0
     assert len(check["request_hash"]) == 64
     assert int(check["request_hash"], 16) >= 0
+    assert_prompt_guard_check_shape(check)
     assert check == {
-        "schema_version": 1,
+        "schema_version": PROMPT_GUARD_AUDIT_SCHEMA_VERSION,
         "audit_id": check["audit_id"],
         "operation_id": context.fence.operation_id,
         "operation_epoch": context.fence.operation_epoch,
@@ -5475,6 +5481,7 @@ def _assert_debug_guard_audit(row: dict[str, Any], context: SessionOperationCont
         "reason": "guard_not_configured",
         "started_at": check["started_at"],
         "duration_ms": check["duration_ms"],
+        **unscanned_check_counts(),
     }
     assert row["content"] == json.dumps(envelope, sort_keys=True)
 

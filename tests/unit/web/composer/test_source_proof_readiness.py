@@ -1226,7 +1226,10 @@ async def test_detached_source_stop_reloads_prefix_for_message_and_recompose(
         assert request.url.params["api-version"] == "2024-09-01"
         payload = json.loads(request.content)
         assert type(payload) is dict and set(payload) == {"userPrompt", "documents"}
-        assert payload["userPrompt"] in {"Inspect this saved source.", "Explain the saved draft."}
+        # The prompt is inspected alone; documents are inspected without it.
+        assert (payload["userPrompt"] in {"Inspect this saved source.", "Explain the saved draft."} and payload["documents"] == []) or (
+            payload["userPrompt"] == "" and payload["documents"]
+        )
         assert type(payload["documents"]) is list and all(type(document) is str for document in payload["documents"])
         shield_requests.append(request)
         return httpx.Response(
@@ -1374,6 +1377,7 @@ async def test_detached_source_stop_reloads_prefix_for_message_and_recompose(
     assert {json.loads(request.content)["userPrompt"] for request in shield_requests} == {
         "Inspect this saved source.",
         "Explain the saved draft.",
+        "",
     }
 
 

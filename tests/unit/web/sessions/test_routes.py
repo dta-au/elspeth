@@ -130,6 +130,7 @@ from tests.helpers.composer_operations import (
     settle_sync,
     submit_and_settle,
 )
+from tests.helpers.prompt_guard_audit import assert_prompt_guard_check_shape, assert_prompt_guard_wire_payloads
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -803,8 +804,13 @@ def _install_required_route_prompt_shields(app: FastAPI, monkeypatch: pytest.Mon
         assert request.headers["Ocp-Apim-Subscription-Key"] == "route-shields-fixture-key"
         payload = json.loads(request.content)
         assert type(payload) is dict and set(payload) == {"userPrompt", "documents"}
-        assert type(payload["userPrompt"]) is str and payload["userPrompt"]
+        assert type(payload["userPrompt"]) is str
         assert type(payload["documents"]) is list and all(type(item) is str for item in payload["documents"])
+        # The user prompt and the documents are inspected in separate calls.
+        if payload["userPrompt"]:
+            assert payload["documents"] == []
+        else:
+            assert payload["documents"]
         requests.append(payload)
         return httpx.Response(
             200,
@@ -835,7 +841,7 @@ def _assert_required_route_guard_checks(envelopes: Sequence[Mapping[str, Any]], 
     assert len({check["audit_id"] for check in checks}) == len(roles)
     assert len({(check["operation_id"], check["operation_epoch"]) for check in checks}) == 1
     for check in checks:
-        assert check["schema_version"] == 1
+        assert_prompt_guard_check_shape(check)
         assert check["mode"] == "required"
         assert check["adapter"] == "azure_prompt_shields"
         assert check["policy_fingerprint"] == mount.client.policy_fingerprint
@@ -1122,7 +1128,7 @@ def test_send_message_keeps_assistant_reply_when_auto_title_transport_fails(tmp_
     assert any(row["role"] == "assistant" and row["content"] == "Here is your answer." for row in messages.json())
 
     assert physical_title_calls == 1
-    assert all(request["userPrompt"] == "Build a CSV pipeline" for request in guard_requests)
+    assert_prompt_guard_wire_payloads(guard_requests, user_prompt="Build a CSV pipeline")
     records = asyncio.run(app.state.session_service.get_messages(uuid.UUID(session["id"]), limit=None))
     audit = [record.tool_calls[0] for record in records if record.role == "audit"]
     assert [envelope["_kind"] for envelope in audit] == ["prompt_guard_audit", "llm_call_audit"]
@@ -6242,9 +6248,8 @@ class TestMessageRoutes:
         ]
         _assert_required_route_guard_checks(envelopes, guard_mount, roles=["composer", "advisor", "advisor"])
         assert guard_requests
-        assert all(
-            request["userPrompt"] == f"Build a pipeline that reads {prompt_canary}.csv and writes rows to results.jsonl."
-            for request in guard_requests
+        assert_prompt_guard_wire_payloads(
+            guard_requests, user_prompt=f"Build a pipeline that reads {prompt_canary}.csv and writes rows to results.jsonl."
         )
         assert len(physical) == 3 and len(attempts) == 2 and len(passes) == 1
         planner_cohort = [
@@ -7044,7 +7049,8 @@ class TestLiteLLMErrorRedaction:
             if envelope["_kind"] == DIAGNOSTIC_EVIDENCE_KIND
         ]
         assert [evidence.status for evidence in private] == ["provider_request", "provider_failure", "operation_failure"]
-        assert guard_requests and all(request["userPrompt"] == "Hello" for request in guard_requests)
+        assert guard_requests
+        assert_prompt_guard_wire_payloads(guard_requests, user_prompt="Hello")
         with service._engine.connect() as connection:
             attempts = connection.execute(select(quota_provider_attempts_table)).all()
             usage = connection.execute(select(token_usage_ledger_table)).all()
@@ -11126,7 +11132,8 @@ def test_persisted_empty_assistant_prose_is_omitted_from_provider_history(
         if envelope["_kind"] == DIAGNOSTIC_EVIDENCE_KIND
     ]
     assert [evidence.status for evidence in private] == ["provider_request", "provider_failure", "operation_failure"]
-    assert guard_requests and all(request["userPrompt"] == "Try again" for request in guard_requests)
+    assert guard_requests
+    assert_prompt_guard_wire_payloads(guard_requests, user_prompt="Try again")
 
 
 def test_composer_chat_history_skips_audit_tool_messages() -> None:

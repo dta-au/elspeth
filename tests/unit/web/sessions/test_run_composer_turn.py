@@ -307,9 +307,12 @@ async def _guarded_title_turn_app(tmp_path, monkeypatch, *, title_decision, prim
     events = []
 
     async def inspect(_self, request):
-        title = request.user_prompt.startswith("Conversation excerpt (") or any(
-            "Conversation excerpt (UNTRUSTED USER DATA" in document for document in request.documents
-        )
+        if not request.documents:
+            # The user prompt is inspected in its own call; title and primary
+            # checks are told apart by their documents.
+            events.append(("prompt", request.user_prompt))
+            return PromptGuardDecision("allow", "clean")
+        title = any("Conversation excerpt (UNTRUSTED USER DATA" in document for document in request.documents)
         disposition = title_decision if title else primary_decision
         reason = {"allow": "clean", "blocked": "policy_blocked", "unavailable": "service_error"}[disposition]
         guard_requests.append((title, request))
@@ -403,11 +406,18 @@ async def test_real_worker_title_guard_is_terminal_before_primary(
     refused = title_decision if title_decision != "allow" else primary_decision
     assert payload["error_type"] == f"prompt_guard_{refused}"
     assert len(sdk) == expected_sdk
-    assert guards[0][0] is True and guards[0][1].user_prompt == message
-    assert all(request.user_prompt == message for _title, request in guards)
+    assert guards[0][0] is True and all(request.user_prompt == "" for _title, request in guards)
+    # The title check scans the user prompt; after its allow the primary check
+    # reuses it and sends only its own documents.
+    assert [event for event in events if event[0] == "prompt"] == [("prompt", message)]
     assert len(guards) == (1 if title_decision != "allow" else 2)
     if title_decision == "allow":
-        assert events[:3] == [("guard", "title", "allow"), ("sdk", "title"), ("guard", "primary", primary_decision)]
+        assert events[:4] == [
+            ("prompt", message),
+            ("guard", "title", "allow"),
+            ("sdk", "title"),
+            ("guard", "primary", primary_decision),
+        ]
     rows = await service.get_messages(session.id, limit=None)
     checks = [envelope["check"] for row in rows for envelope in (row.tool_calls or ()) if envelope["_kind"] == "prompt_guard_audit"]
     assert payload["audit_id"] == checks[-1]["audit_id"]
@@ -497,7 +507,12 @@ async def test_real_worker_title_gate_preserves_actual_planner_handoff_audit(tmp
                 [row.content[:100] for row in durable_rows],
             )
         assert len(sdk) == 2 and len(_llm_call_audit_rows(rows)) == 2
-        assert events[0:3] == [("guard", "title", "allow"), ("sdk", "title"), ("guard", "primary", "allow")]
+        assert events[0:4] == [
+            ("prompt", "Build the requested pipeline."),
+            ("guard", "title", "allow"),
+            ("sdk", "title"),
+            ("guard", "primary", "allow"),
+        ]
         assert _user_and_assistant_roles(rows) == ["user", "assistant"]
 
 

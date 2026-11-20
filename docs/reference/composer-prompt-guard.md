@@ -25,7 +25,7 @@ Each guard object has exactly these fields:
 | `adapter` | `azure_prompt_shields`; may be omitted because it is the only 0.8.9 adapter |
 | `endpoint` | HTTPS resource origin, such as `https://example-resource.cognitiveservices.azure.com`; no path, userinfo, query or fragment |
 | `subscription_key` | Required subscription credential, injected from the deployment's secret store |
-| `timeout_seconds` | Positive number, at most 60 seconds; defaults to 10 seconds shared by all Azure batches for one inspection |
+| `timeout_seconds` | Positive number, at most 60 seconds; defaults to 10 seconds. One deadline covers the whole check: the user prompt call and the documents call together, with every Azure batch inside them |
 
 For example, the object shape is:
 
@@ -67,26 +67,57 @@ units of structured context and decoded tool arguments. Their concatenation
 must exactly match the original provider text; the metadata never reaches the
 model provider. ELSPETH packs complete units and history messages into bounded
 documents, requires every batch to pass, and never cuts a string value or
-truncates history to fit. The logical check accepts at most 128 packed documents
-of at most 10,000 characters each, plus the user prompt. Its finite local UTF-8
-envelope is derived from those limits: `(128 + 1) × 10,000 × 4` = **5,160,000
-bytes**, including document framing. This logical envelope is separate from
-Azure's per-call limits; it does not guarantee process memory use or model
-context capacity. An individual oversized user prompt or atomic value,
-unsupported image/audio/file input, invalid Unicode or excessive document count
-is refused, including in debug mode. These are explicit coverage limits, not
-clean verdicts. See
+truncates history to fit. Each packed document and the user prompt must each be
+at most 10,000 characters; ELSPETH sets no limit on how many packed documents one
+check may contain, so the number of Azure calls grows with the untrusted input
+(the credential screen before egress keeps its own size limits). An individual
+oversized user prompt or atomic value, unsupported image/audio/file input or
+invalid Unicode is refused, including in debug mode. These are explicit coverage
+limits, not clean verdicts. See
 [Azure input limits](https://learn.microsoft.com/en-us/azure/ai-services/content-safety/region-availability).
 
-Larger inputs require more sequential Azure batches, each repeating the complete
-user prompt. All Azure batches for one inspection share the configured timeout:
-it defaults to 10 seconds and permits at most 60 seconds. Request preparation
-and required audit settlement are outside that inspection interval. All batches
-must pass within it; a large supported input can still time out and refuse dispatch.
-Inspection can incur Azure work even if later model admission refuses. The
-byte envelope does not alter credential screening or other resource limits.
-Both configured and unconfigured policy fingerprints bind the numerical input
-limits. Historical audits retain their original policy and request hashes.
+The user prompt is inspected in its own call with no documents, and documents
+are inspected in calls with an empty user prompt, so a document's verdict never
+depends on the prompt sent beside it. Larger inputs require more sequential
+Azure batches. One deadline covers the whole check, not each call: the user
+prompt call and the documents call run one after the other inside the configured
+timeout, which defaults to 10 seconds and permits at most 60 seconds. The
+documents are still sent when the prompt is refused. Request preparation and
+required audit settlement are outside that inspection interval. All batches must
+pass within it; a large supported input can still time out and refuse dispatch.
+Inspection can incur Azure work even if later model admission refuses. Both
+configured and unconfigured policy fingerprints bind the numerical input limits.
+Historical audits retain their original policy and request hashes.
+
+### Reuse of earlier allows within a session
+
+Within one session, a unit of text that the same configured service already
+allowed is not sent again. A unit is the user prompt or one document unit before
+packing (a message's remaining evidence, one content part, one tool-argument part
+or one provider-thinking part). Reuse is keyed on the session, the mount's policy
+fingerprint, the guard mode, the guard role (composer or advisor), the slot
+(user prompt or document) and the SHA-256 of the exact text the detector reads.
+The positional label (`Message N, content part M:`) is sent but is not part of
+the key, so a unit that only moved position is not re-sent. Any changed byte,
+another session, a policy change, another mode, role or slot is inspected again.
+Identical units within one check are sent once.
+
+Only a complete allow is reused, and only after its audit record has been
+written. A block, any unavailable result, a timeout, a cancellation, a partial
+set of batches or a failed audit write leaves nothing reusable. Every local
+check (credential screening, size and Unicode support, the request hash) still
+covers the complete request. The record of allowed units holds digests only,
+lives in the web process that made the check, is bounded (least recently used
+units are dropped first) and is lost on restart; a dropped unit is simply
+inspected again. A check with nothing new makes no Azure call.
+
+Each check's audit (`schema_version` 2) states `units_scanned`, the distinct
+units in the Azure calls the check started (a timeout during the user prompt
+call counts only the prompt; a refusal or timeout can end the client's batching
+of the documents before every batch is sent), and `units_reused`, the distinct units
+admitted from an earlier allow in the same session under the same policy. A
+check with `units_scanned: 0` made no service call. Version 1 records, written
+before reuse existed, have neither field and always inspected the whole request.
 
 A detected attack blocks the protected model request. A missing/malformed
 verdict, document-analysis count mismatch, HTTP/network error, timeout or

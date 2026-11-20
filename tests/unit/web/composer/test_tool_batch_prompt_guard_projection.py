@@ -48,6 +48,7 @@ from elspeth.web.required_work import (
 )
 from elspeth.web.sessions.models import chat_messages_table, quota_provider_attempts_table
 from elspeth.web.sessions.service import SessionServiceImpl
+from tests.helpers.prompt_guard_audit import assert_prompt_guard_wire_payload
 from tests.unit.web.composer._helpers import _empty_state, _make_settings, _mock_catalog
 
 _USER = "Explain the neutral schema fields."
@@ -263,7 +264,11 @@ async def _produce_feedback(
     assert checks[-1]["reason"] == "policy_blocked"
     assert [check["role"] for check in checks] == (["composer", "advisor", "composer"] if producer == "advisor" else ["composer"] * 2)
     assert [check["disposition"] for check in checks] == (["allow"] * (len(checks) - 1) + ["blocked"])
-    assert all(request["userPrompt"] == _USER for request in current.azure_requests)
+    for request in current.azure_requests:
+        assert_prompt_guard_wire_payload(request, user_prompt=_USER)
+    # The user prompt is inspected once per guard role in the session, then reused.
+    prompt_calls = [request for request in current.azure_requests if request["userPrompt"]]
+    assert prompt_calls == [{"userPrompt": _USER, "documents": []}] * len({check["role"] for check in checks})
     documents = "\n".join(document for request in current.azure_requests for document in request["documents"])
     assert needle in documents
     assert len(current.histories) == len(current.dispatches) == 1

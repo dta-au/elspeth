@@ -37,6 +37,7 @@ from elspeth.web.composer.service import ComposerAvailability, ComposerServiceIm
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.config import WebSettings
 from elspeth.web.prompt_guard_config import PromptGuardSettings
+from tests.helpers.prompt_guard_audit import assert_prompt_guard_wire_payload
 from tests.unit.web.composer._helpers import (
     FakeChoice,
     FakeFunction,
@@ -98,8 +99,8 @@ def _install_required_azure_guards(monkeypatch: pytest.MonkeyPatch, *, user_prom
         assert request.url.path == "/contentsafety/text:shieldPrompt"
         assert request.url.params["api-version"] == "2024-09-01"
         payload = json.loads(request.content)
-        assert type(payload) is dict and set(payload) == {"userPrompt", "documents"}
-        assert payload["userPrompt"] == user_prompt
+        assert type(payload) is dict
+        assert_prompt_guard_wire_payload(payload, user_prompt=user_prompt)
         assert type(payload["documents"]) is list
         assert all(type(document) is str for document in payload["documents"])
         requests.append(request)

@@ -144,7 +144,9 @@ async def test_private_persistence_guard_refuses_unmocked_sdk_transport(
                 provider_owner=owner,
             )
         coordinator.assert_completed()
-        assert len(guard_requests) == 1 and guard_requests[0]["userPrompt"] == user_message.content
+        # One check: the user prompt alone, then the documents without it.
+        assert [request["userPrompt"] for request in guard_requests] == [user_message.content, ""]
+        assert guard_requests[0]["documents"] == [] and guard_requests[1]["documents"]
     assert forbid_unmocked_sdk_transport.unexpected_calls == 1
     # The teardown gate rejects an attempted call even after a consumer catches
     # its exception. Only this deliberate negative control acknowledges it.
