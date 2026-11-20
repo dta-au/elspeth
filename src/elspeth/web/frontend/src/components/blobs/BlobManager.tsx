@@ -2,7 +2,7 @@
 import { useEffect, useId, useLayoutEffect, useRef, useCallback, useMemo, useState } from "react";
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
-import { Button, Icon, Input } from "@/components/ui";
+import { AlertBanner, Button, Icon, Input } from "@/components/ui";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { BlobRow } from "./BlobRow";
 import { IdentityStorageTotal } from "./IdentityStorageTotal";
@@ -61,7 +61,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   // `seq` re-keys the pad's alert so a repeated refusal is announced again.
   const [wireSendRefusal, setWireSendRefusal] = useState<{ message: string; seq: number } | null>(null);
   const pending = useInterpretationEventsStore((s) => activeSessionId ? s.pendingBySession[activeSessionId] : undefined);
-  const { blobs, isLoading, error, activeSessionId: blobSessionId, loadBlobs, uploadBlob, deleteBlob, downloadBlob } =
+  const { blobs, isLoading, error, listLoadFailed, activeSessionId: blobSessionId, loadBlobs, uploadBlob, deleteBlob, downloadBlob } =
     useBlobStore();
   const revealRequest = useBlobStore((s) => s.revealRequest);
   const focusedBlobId = useBlobStore((s) => s.focusedBlobId);
@@ -249,8 +249,10 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
     >
       {/* Header */}
       <div className="blob-manager-header">
+        {/* No count until the list has been read: "Files (0)" while loading
+            or after a failed read would say the session has no files. */}
         <span className="blob-manager-title">
-          Files ({blobs.length})
+          Files{!isLoading && !listLoadFailed && ` (${blobs.length})`}
         </span>
         <IdentityStorageTotal refreshKey={`${activeSessionId}:${blobs.map((blob) => `${blob.id}:${blob.size_bytes}`).join(",")}`} />
         {/* Label-only, and its accessible name IS its visible text
@@ -294,12 +296,15 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
 
       {/* Error */}
       {error && (
-        <div
-          role="alert"
+        <AlertBanner
           className="blob-manager-error"
+          action={listLoadFailed && activeSessionId ? (
+            // The same list read the panel makes on open, issued again.
+            <Button type="button" variant="ghost" compact onClick={() => void loadBlobs(activeSessionId)}>Retry</Button>
+          ) : null}
         >
           {error}
-        </div>
+        </AlertBanner>
       )}
 
       {!isLoading && blobs.length > 0 && <div className="blob-manager-filter">
@@ -312,8 +317,8 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
       {/* Categorized file list */}
       <div className="blob-manager-list" ref={listRef}>
         {isLoading ? (
-          <div className="blob-manager-loading">
-            Loading...
+          <div className="blob-manager-loading" role="status">
+            Loading files…
           </div>
         ) : blobs.length === 0 ? (
           <div className="blob-manager-empty">

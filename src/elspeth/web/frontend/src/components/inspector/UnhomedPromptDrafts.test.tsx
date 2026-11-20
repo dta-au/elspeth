@@ -51,7 +51,10 @@ describe("unsaved prompt text whose slot is gone", () => {
     act(() => useSessionStore.setState({
       compositionState: graph([{ id: "score", options: { prompt_template: marker("file-a"), queries: [{ name: "C1", template: "now inline" }] } }]),
     }));
-    const notice = screen.getByRole("status", { name: "Unsaved prompt text with no home (1)" });
+    // A named region; its banner is a status, so the arrival is announced.
+    const notice = screen.getByRole("region", { name: "Unsaved prompt text with no home (1)" });
+    expect(notice.querySelector(".alert-banner")).toHaveAttribute("role", "status");
+    expect(notice.querySelector(".alert-banner")).toHaveTextContent(/^Unsaved prompt text with no home \(1\)/);
     const item = within(notice).getByRole("listitem");
     expect(item).toHaveTextContent("score, User prompt, query C1");
     expect(item).toHaveTextContent("Now inline text, not a file · written for score.txt");

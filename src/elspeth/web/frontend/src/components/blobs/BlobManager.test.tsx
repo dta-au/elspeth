@@ -369,6 +369,41 @@ describe("BlobManager upload affordance (elspeth-29eef452a8)", () => {
     vi.clearAllMocks();
   });
 
+  it("shows no file count until the list has been read, and says it is loading", () => {
+    setBlobState([]);
+    useBlobStore.setState({ isLoading: true });
+    const { rerender } = render(<BlobManager onUseAsInput={vi.fn()} />);
+    expect(screen.getByText("Files", { selector: ".blob-manager-title" })).toBeInTheDocument();
+    expect(screen.queryByText(/Files \(0\)/)).not.toBeInTheDocument();
+    expect(screen.getByText("Loading files…")).toHaveAttribute("role", "status");
+    act(() => useBlobStore.setState({ isLoading: false, error: "Failed to load files.", listLoadFailed: true }));
+    rerender(<BlobManager onUseAsInput={vi.fn()} />);
+    expect(screen.getByText("Files", { selector: ".blob-manager-title" })).toBeInTheDocument();
+    act(() => useBlobStore.setState({ error: null, listLoadFailed: false }));
+    rerender(<BlobManager onUseAsInput={vi.fn()} />);
+    expect(screen.getByText("Files (0)", { selector: ".blob-manager-title" })).toBeInTheDocument();
+  });
+
+  it("offers Retry for a failed list read, re-issuing the same read", async () => {
+    setBlobState([]);
+    useBlobStore.setState({ error: "Failed to load files.", listLoadFailed: true });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    const loadBlobs = useBlobStore.getState().loadBlobs;
+    vi.mocked(loadBlobs).mockClear();
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("Failed to load files.");
+    await userEvent.setup().click(within(alert).getByRole("button", { name: "Retry" }));
+    expect(loadBlobs).toHaveBeenCalledWith("session-1");
+  });
+
+  it("offers no Retry for a failed upload or download", () => {
+    setBlobState([]);
+    useBlobStore.setState({ error: "Download failed.", listLoadFailed: false });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    expect(screen.getByRole("alert")).toHaveTextContent("Download failed.");
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+  });
+
   it("closes from a design-system button at the end of the header", async () => {
     setBlobState([]);
     useBlobStore.setState({ fileManagerOpen: true });

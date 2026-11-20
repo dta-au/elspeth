@@ -6,7 +6,8 @@ import { describe, expect, it } from "vitest";
 function rules(path: string): Array<{ selectors: string[]; declarations: string; media: string | null }> {
   const css = readFileSync(path, "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
   const out: Array<{ selectors: string[]; declarations: string; media: string | null }> = [];
-  const media = /@media([^{]+)\{((?:[^{}]*\{[^{}]*\})*)\s*\}/g;
+  // @media and @container blocks; `media` holds the condition either way.
+  const media = /@(?:media|container)([^{]+)\{((?:[^{}]*\{[^{}]*\})*)\s*\}/g;
   for (const block of css.matchAll(media)) {
     for (const rule of block[2].matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
       out.push({ selectors: rule[1].split(",").map((s) => s.trim()), declarations: rule[2], media: block[1].trim() });
@@ -30,11 +31,18 @@ const BLOBS = "src/components/blobs/blobs.css";
 const INSPECTOR = "src/components/inspector/inspector.css";
 const CHAT = "src/components/chat/chat.css";
 
-describe("file manager rows in a narrow pane", () => {
-  it("wraps the actions to a second line instead of squeezing the file name to nothing", () => {
+describe("file manager rows", () => {
+  it("put the actions on their own line at every width, so the name is never cut to look like its neighbours", () => {
     expect(declared(BLOBS, ".blob-row-container", "flex-wrap")).toBe("wrap");
-    expect(declared(BLOBS, ".blob-row-filename", "min-width")).toBe("5rem");
-    expect(declared(BLOBS, ".blob-row-actions", "margin-inline-start")).toBe("auto");
+    expect(declared(BLOBS, ".blob-row-actions", "flex")).toBe("1 0 100%");
+    expect(declared(BLOBS, ".blob-row-filename", "overflow-wrap")).toBe("anywhere");
+    expect(declared(BLOBS, ".blob-row-filename", "text-overflow")).toBeUndefined();
+    expect(declared(BLOBS, ".blob-row-filename", "white-space")).toBeUndefined();
+  });
+
+  it("keep the icons at the end of the line and the text action at the start", () => {
+    expect(declared(BLOBS, ".blob-row-actions", "justify-content")).toBe("flex-end");
+    expect(declared(BLOBS, ".blob-row-edit-prompt", "margin-inline-end")).toBe("auto");
   });
 
   it("puts the title on the left and the header controls together on the right", () => {
@@ -57,9 +65,11 @@ describe("Files table", () => {
     expect(declared(INSPECTOR, ".graph-files-scroll table td", "vertical-align")).toBe("middle");
   });
 
-  it("keeps a readable width and scrolls sideways in a narrow pane", () => {
-    expect(declared(INSPECTOR, ".graph-files-scroll table", "min-width")).toBe("42rem");
-    expect(declared(INSPECTOR, ".graph-files-scroll", "overflow")).toBe("auto");
+  it("stacks each row in a narrow pane instead of cutting columns off", () => {
+    expect(declared(INSPECTOR, ".graph-files-body", "container")).toBe("graph-files / inline-size");
+    expect(declared(INSPECTOR, ".graph-files-scroll table", "min-width")).toBeUndefined();
+    expect(declared(INSPECTOR, ".graph-files-scroll tr", "flex-direction", "graph-files (width < 40rem)")).toBe("column");
+    expect(declared(INSPECTOR, ".graph-files-scroll table td", "display", "graph-files (width < 40rem)")).toBe("block");
   });
 });
 

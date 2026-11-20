@@ -5,6 +5,7 @@ import { Button, Icon, StructuredJsonPreview, type IconName } from "@/components
 import { useShowAdvanced } from "@/stores/preferencesStore";
 import { optionLabel } from "@/components/inspector/OptionRows";
 import type { BlobMetadata } from "@/types/api";
+import { BreakableName } from "./BreakableName";
 import {
   describeStructuralSummary,
   normalizeMimeType,
@@ -232,7 +233,7 @@ export function BlobRow({
           title={blob.filename}
           aria-describedby={attached ? chipId : undefined}
         >
-          {blob.filename}
+          <BreakableName name={blob.filename} />
         </span>
 
         {attached && (
@@ -246,8 +247,16 @@ export function BlobRow({
           {formatBytes(blob.size_bytes)}
         </span>
 
-        {/* Actions */}
+        {/* Actions, on their own line under the name at every width: the
+            text action leads at the start, the icon actions keep the same
+            places at the end of every row. */}
         <div className="blob-row-actions">
+          {(onEditPrompt || editRefusal) && <>
+            <Button type="button" variant="ghost" compact className="blob-row-edit-prompt" onClick={onEditPrompt} aria-disabled={onEditPrompt === undefined} title={editRefusal}
+              aria-label={`Edit prompt ${blob.filename}`}
+              aria-describedby={[attached ? chipId : null, editRefusal ? editRefusalId : null].filter((id) => id !== null).join(" ") || undefined}>Edit prompt</Button>
+            {editRefusal && <span className="sr-only" id={editRefusalId}>{editRefusal}</span>}
+          </>}
           {onWire && (
             <>
               {/* aria-disabled, not disabled: the control stays focusable and
@@ -267,12 +276,6 @@ export function BlobRow({
               {wiringDisabledReason !== null && <span className="sr-only" id={wiringReasonId}>{wiringDisabledReason}</span>}
             </>
           )}
-          {(onEditPrompt || editRefusal) && <>
-            <Button type="button" variant="ghost" compact onClick={onEditPrompt} aria-disabled={onEditPrompt === undefined} title={editRefusal}
-              aria-label={`Edit prompt ${blob.filename}`}
-              aria-describedby={[attached ? chipId : null, editRefusal ? editRefusalId : null].filter((id) => id !== null).join(" ") || undefined}>Edit prompt</Button>
-            {editRefusal && <span className="sr-only" id={editRefusalId}>{editRefusal}</span>}
-          </>}
           {canPreview && blob.status === "ready" && (
             <Button
               variant="bare"

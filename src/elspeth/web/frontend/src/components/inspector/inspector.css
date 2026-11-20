@@ -483,11 +483,50 @@
   vertical-align: middle;
 }
 
-/* Below this width the four columns crushed to a letter each in a narrow
-   pane; the table keeps a readable width and the region (a keyboard-scrollable
-   scroll owner) scrolls sideways instead, with Actions first in view. */
-.graph-files-scroll table {
-  min-width: 42rem;
+/* The Files body measures its own width (the pane, not the viewport). */
+.graph-files-body {
+  container: graph-files / inline-size;
+}
+
+/* A narrow pane: four columns crushed to a letter each, and a fixed table
+   width cut "Used by" off behind a sideways scroll. Each row stacks instead:
+   actions, the file, the step that uses it, its fields. The column headings
+   stay for assistive technology (GraphFiles sets the table roles). */
+@container graph-files (width < 40rem) {
+  .graph-files-scroll table,
+  .graph-files-scroll tbody,
+  .graph-files-scroll tr,
+  .graph-files-scroll table th,
+  .graph-files-scroll table td {
+    display: block;
+  }
+
+  .graph-files-scroll thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .graph-files-scroll tr {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2xs);
+    padding: var(--space-sm) var(--space-pane-gutter);
+    border-top: 1px solid var(--color-border);
+  }
+
+  .graph-files-scroll table th,
+  .graph-files-scroll table td {
+    padding: 0;
+    border-top: 0;
+  }
+
+  .graph-files-scroll .graph-file-actions {
+    margin-bottom: var(--space-2xs);
+  }
 }
 
 /* A field label ("User prompt, query C1") reads as one unit; the long-name
@@ -496,24 +535,19 @@
   white-space: nowrap;
 }
 
-/* Unsaved prompt text whose slot is gone (UnhomedPromptDrafts), above Files. */
+/* Unsaved prompt text whose slot is gone (UnhomedPromptDrafts), above Files:
+   a warning banner, then one row per draft. */
 .prompt-drafts-unhomed {
   margin: var(--space-sm) var(--space-pane-gutter);
 }
 
 .prompt-drafts-unhomed-title {
-  margin: 0;
   font-weight: var(--font-weight-semibold);
-}
-
-.prompt-drafts-unhomed-note {
-  margin: var(--space-2xs) 0 var(--space-xs);
 }
 
 .prompt-drafts-unhomed-list {
   display: flex;
   flex-direction: column;
-  gap: var(--space-xs);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -524,6 +558,8 @@
   flex-wrap: wrap;
   align-items: center;
   gap: var(--space-xs) var(--space-sm);
+  padding: var(--space-xs) 0;
+  border-bottom: 1px solid var(--color-border);
 }
 
 .prompt-drafts-unhomed-name {

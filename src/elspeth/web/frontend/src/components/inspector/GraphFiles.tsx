@@ -123,6 +123,7 @@ function FileMappings({ state, onShowNode, visibleNodeIds, onCount }: GraphFiles
   const blobs = useBlobStore((store) => store.blobs);
   const loading = useBlobStore((store) => store.isLoading);
   const loadError = useBlobStore((store) => store.activeSessionId === state.session_id ? store.error : null);
+  const listLoadFailed = useBlobStore((store) => store.activeSessionId === state.session_id && store.listLoadFailed);
   const pending = useInterpretationEventsStore((store) => store.pendingBySession[state.session_id]);
   const bindings = useMemo(() => promptFileBindings(state), [state]);
   const drafts = usePromptDraftStore((store) => store.drafts);
@@ -144,8 +145,13 @@ function FileMappings({ state, onShowNode, visibleNodeIds, onCount }: GraphFiles
   // Slots of this graph that hold unsaved prompt text, as "<node>\u0000<field>".
   const draftSlots = useMemo(() => new Set(Object.values(drafts)
     .filter((draft) => draft.sessionId === state.session_id).map((draft) => `${draft.nodeId}\u0000${draft.fieldPath}`)), [drafts, state.session_id]);
-  return <>
-    {sameSession && loadError && <AlertBanner className="graph-files-alert">{loadError}</AlertBanner>}
+  // The body is a size container: in a narrow pane each row stacks into a
+  // block (name, then who uses it) instead of cutting columns off.
+  return <div className="graph-files-body">
+    {sameSession && loadError && <AlertBanner className="graph-files-alert" action={listLoadFailed ? (
+      // The same list read the table makes when it opens, issued again.
+      <Button type="button" variant="ghost" compact onClick={() => void useBlobStore.getState().loadBlobs(state.session_id)}>Retry</Button>
+    ) : null}>{loadError}</AlertBanner>}
     {rows.length === 0 ? <p className="graph-config-empty-value">No session files are attached to this graph.</p>
       : <>
       <div className="graph-files-filter">
@@ -157,11 +163,16 @@ function FileMappings({ state, onShowNode, visibleNodeIds, onCount }: GraphFiles
         </span>
       </div>
       <div className="graph-files-scroll" tabIndex={0} role="group" aria-label="File mappings table">
-        <table>
+        {/* Explicit table roles: the narrow layout restyles these elements as
+            blocks, and some browsers drop a table's semantics with its display. */}
+        <table role="table">
           {/* Actions lead each row so an open step panel, which overlays the
               right of the workspace, never covers them. */}
-          <thead><tr><th scope="col">Actions</th><th scope="col">File</th><th scope="col">Used by</th><th scope="col">Fields</th></tr></thead>
-          <tbody>{shown.map((row) => {
+          <thead role="rowgroup"><tr role="row">
+            <th scope="col" role="columnheader">Actions</th><th scope="col" role="columnheader">File</th>
+            <th scope="col" role="columnheader">Used by</th><th scope="col" role="columnheader">Fields</th>
+          </tr></thead>
+          <tbody role="rowgroup">{shown.map((row) => {
             const unsavedFields = row.isNode ? row.fields.filter((field) => draftSlots.has(`${row.componentId}\u0000${field.path}`)) : [];
             const rowBindings = row.isNode ? bindings.filter((item) => item.nodeId === row.componentId && item.blobId === row.blobId) : [];
             // Edit file opens the slot holding unsaved text first, so the user lands on it.
@@ -178,7 +189,7 @@ function FileMappings({ state, onShowNode, visibleNodeIds, onCount }: GraphFiles
         {shown.length === 0 && <p className="graph-config-empty-value">No file or step matches this filter.</p>}
       </div>
       </>}
-  </>;
+  </div>;
 }
 
 function FileMappingRow({ row, state, onShowNode, hidden, binding, unsaved, sameSession, current, listReady, loadError, blobs, pendingEvents }: {
@@ -211,8 +222,8 @@ function FileMappingRow({ row, state, onShowNode, hidden, binding, unsaved, same
     : editability?.editable === false ? editability.reason : null;
   const editBlocked = binding === undefined || editability === null || (!editability.editable && !editability.opens);
   const showReason = hidden ? "This component is hidden by the current graph view." : null;
-  return <tr>
-    <td>
+  return <tr role="row">
+    <td role="cell">
       <div className="graph-file-actions">
         <Button type="button" compact aria-label={`Show node ${row.component}`}
           aria-disabled={hidden} title={showReason ?? undefined} aria-describedby={showReason ? `${id}-show` : undefined}
@@ -228,11 +239,11 @@ function FileMappingRow({ row, state, onShowNode, hidden, binding, unsaved, same
         {editReason && <span id={`${id}-edit`} className="sr-only">{editReason}</span>}
       </div>
     </td>
-    <th scope="row">{sameSession
+    <th scope="row" role="rowheader">{sameSession
       ? <BlobFileName bare blobId={row.blobId} fallback={loadError ? "File name unavailable" : undefined} />
       : <span title={row.blobId}>File reference</span>}</th>
-    <td>{row.kind}: <code><BreakableName name={row.component} /></code>{unsaved && <> <span className="prompt-editor-tag">Unsaved changes</span></>}</td>
-    <td className="graph-files-fields">{row.fields.map((field) => <div key={field.path} title={field.path}>
+    <td role="cell">{row.kind}: <code><BreakableName name={row.component} /></code>{unsaved && <> <span className="prompt-editor-tag">Unsaved changes</span></>}</td>
+    <td role="cell" className="graph-files-fields">{row.fields.map((field) => <div key={field.path} title={field.path}>
       {field.label}{field.entry !== undefined && <>: <code>{field.entry}</code></>}
     </div>)}</td>
   </tr>;

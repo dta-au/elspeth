@@ -54,10 +54,10 @@
    under its row instead of indenting away from it. The BLOCK inset stays on
    the --space-1-5 rung: it sets row height, which the max-height on
    .blob-manager-container is sized against. */
-/* Wraps: in a narrow pane (the chat column ships at 360px) the actions drop
-   to a second line, right-aligned, instead of squeezing the file name to
-   nothing. The name keeps at least 5rem and ellipsises; its full text is the
-   title and the accessible text. */
+/* Two lines at every width: the name (with its status, author and size) on
+   the first, the actions on the second. Seventy files named alike stay
+   distinguishable because the name is never cut; it wraps at its own
+   separators instead. */
 .blob-row-container {
   display: flex;
   flex-wrap: wrap;
@@ -141,11 +141,9 @@
 }
 
 .blob-row-filename {
-  flex: 1 1 5rem;
-  min-width: 5rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  flex: 1 1 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .blob-row-size {
@@ -156,9 +154,17 @@
 
 .blob-row-actions {
   display: flex;
+  flex: 1 0 100%;
+  order: 2;
+  align-items: center;
+  justify-content: flex-end;
   gap: var(--space-xs);
-  flex-shrink: 0;
-  margin-inline-start: auto;
+}
+
+/* The one text action leads its line; the icons keep the end, so each icon
+   sits in the same place in every row with or without it. */
+.blob-row-edit-prompt {
+  margin-inline-end: auto;
 }
 
 
@@ -270,11 +276,10 @@
   min-width: 44px;
 }
 
+/* The design system's error banner (with Retry for a failed list read),
+   inset to the panel's gutter. */
 .blob-manager-error {
-  padding: var(--space-xs) var(--space-md);
-  font-size: var(--font-size-xs);
-  color: var(--color-error);
-  background-color: var(--color-error-bg);
+  margin: var(--space-xs) var(--space-md);
 }
 
 .blob-manager-attached-summary {

@@ -30,16 +30,18 @@ export function UnhomedPromptDrafts(): JSX.Element | null {
   }, [sessionId, state, loaded, drafts]);
   const headingId = useId();
   if (state === null || unhomed.length === 0) return null;
+  // The banner (a status, so a new arrival is announced) says what this is;
+  // the list under it holds one row per draft.
   return (
-    <AlertBanner tone="warning" role="status" className="prompt-drafts-unhomed" aria-labelledby={headingId}>
-      <p id={headingId} className="prompt-drafts-unhomed-title">Unsaved prompt text with no home ({unhomed.length})</p>
-      <p className="prompt-drafts-unhomed-note">
-        The prompt this text was written for no longer reads a file. Copy it to keep it, or discard it.
-      </p>
+    <section className="prompt-drafts-unhomed" aria-labelledby={headingId}>
+      <AlertBanner tone="warning" role="status">
+        <strong id={headingId} className="prompt-drafts-unhomed-title">Unsaved prompt text with no home ({unhomed.length})</strong>
+        {" "}The prompt it was written for no longer reads a file. Copy it to keep it, or discard it.
+      </AlertBanner>
       <ul className="prompt-drafts-unhomed-list">
         {unhomed.map((draft) => <UnhomedDraft key={JSON.stringify([draft.nodeId, draft.fieldPath])} draft={draft} state={state} />)}
       </ul>
-    </AlertBanner>
+    </section>
   );
 }
 

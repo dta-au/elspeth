@@ -204,6 +204,15 @@ describe("GraphFiles", () => {
     expect(within(source).getByTitle("blob_ref")).toHaveTextContent(/^File$/);
   });
 
+  it("offers Retry for a failed list read, re-issuing the same read", async () => {
+    useBlobStore.setState({ blobs: [], error: "Failed to load files.", listLoadFailed: true });
+    render(<GraphFiles state={state} onShowNode={vi.fn()} />);
+    await userEvent.setup().click(screen.getByText(filesSummary()));
+    loadBlobs.mockClear();
+    await userEvent.setup().click(within(screen.getByRole("alert")).getByRole("button", { name: "Retry" }));
+    expect(loadBlobs).toHaveBeenCalledWith(state.session_id);
+  });
+
   it("lets a long file or step name wrap at its separators, keeping the text whole", async () => {
     render(<GraphFiles state={state} onShowNode={vi.fn()} />);
     await userEvent.setup().click(screen.getByText(filesSummary()));
@@ -260,6 +269,8 @@ describe("GraphFiles", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("Failed to load files.");
     // The design system's error banner, not a bare paragraph at the pane edge.
     expect(screen.getByRole("alert")).toHaveClass("alert-banner", "graph-files-alert");
+    // A plain error (no failed read recorded) offers nothing to retry.
+    expect(within(screen.getByRole("alert")).queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
     expect(screen.queryByText("File not in this session")).not.toBeInTheDocument();
     expect(screen.getAllByText("File name unavailable")).toHaveLength(8);
     act(() => useSessionStore.setState({ compositionState: { ...state, id: "new-state" } }));
