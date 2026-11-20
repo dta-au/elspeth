@@ -4,11 +4,12 @@ Use this runbook to measure whether the Composer can make a long series of
 small edits to a very large graph, in a row, through ordinary chat. The
 measure is "longest run in a row: K of N". Gold is a complete attempt: every
 applicable edit judged and passed in one attempt, with at least 50 applicable
-edits. Each passing edit completed, made exactly the change asked for,
-changed nothing else, used one of its acceptable editing tools, and kept
-working when the session's history was shed to fit the context budget. An
-incomplete attempt, or a plan with fewer than 50 applicable edits, is never
-gold.
+edits, that leaves the graph as it found it. Each passing edit completed,
+made exactly the change asked for, changed nothing else, used one of its
+acceptable editing tools, and kept working when the session's history was
+shed to fit the context budget. An incomplete attempt, an attempt with any
+failed edit (`--keep-going` included), a plan with fewer than 50 applicable
+edits, or an attempt that leaves any difference in the graph is never gold.
 
 Written 2026-11-20 for the 0.8.16 release. The tool is
 `scripts/staging/composer_edit_battery.py`. Two plans ship in
@@ -64,9 +65,12 @@ After every turn it records one JSON verdict (`edit_result`):
 Fields the server writes, allowed by name and reported as `server_written`:
 
 - a node's `options.interpretation_requirements` (review requirement rows)
-  and `options.approved_prompt_artifact_hash`;
-- a source's `options.interpretation_requirements` and
-  `options.source_authoring`;
+  and `options.approved_prompt_artifact_hash`, and a source's
+  `options.interpretation_requirements` and `options.source_authoring`, but
+  only on a component the edit names (in an expectation pointer, a chain, a
+  new or renamed step, `may_change` or `edges_touching`) or on the node whose
+  review card the edit approves. The same field changed on any other
+  component is an unrelated change and fails the edit;
 - a deployment-required control the server auto-wired into the turn's
   graph (a new node whose requirement row carries `required_control_auto_wired`),
   its edges and the routes around it. A `chain` expectation steps through such a
@@ -85,7 +89,12 @@ count of server-written changes, `tool_coverage` (below), totals, the
 server-time share, and how many edits ran with history shed and how many of
 those passed. A complete attempt also reports `as_found_differences`: what
 still differs from the graph the attempt started on (prompts are compared by
-text). The process exits 0 only on gold.
+text, and server-written fields are ignored). Gold needs it to be empty. It
+also reports `files_left_in_session`: each file in the session that was not
+there when the attempt started, by id and filename, with `referenced` saying
+whether the final graph still uses it. Prompt-file rounds leave such files
+behind; `cleanup` can delete the unused ones. The process exits 0 only on
+gold.
 
 `tool_coverage` lists the editing tools used at least once against the 22
 editing tools the Composer offers. The list is `EDITING_TOOLS` in the
@@ -164,17 +173,39 @@ attempt without contacting the server.
 ```bash
 python -m scripts.staging.composer_edit_battery cleanup \
   --base-url http://127.0.0.1:8451 --session <session-id> \
-  --account <username> --password-env ELSPETH_BATTERY_PASSWORD --state-dir <state-dir> [--execute]
+  --account <username> --password-env ELSPETH_BATTERY_PASSWORD --state-dir <state-dir> \
+  --attempt <attempt> [--plan <plan>] [--execute]
 ```
 
-Without `--execute`, `cleanup` signs in, reads the graph, reports any
-leftovers and the chat messages it would send, and sends nothing. It exits 1
-when there are leftovers. With `--execute` it asks the Composer, in ordinary
-chat turns, to remove leftover outputs, then leftover steps (reconnecting the
-flow around them), then battery marker sentences in prompts. It then reports
-what remains and exits 0 only when nothing does. A leftover pipeline name is
-reported only: the battery cannot know the name it replaced. Check every
-cleanup turn's change in the Composer before starting a new attempt.
+Without `--execute`, `cleanup` makes no network call at all: it prints what
+it would do (from the saved attempt in `<state-dir>`, if there is one) and
+exits 0. Pass the `--attempt` and `--plan` the attempt ran with so it finds
+that attempt.
+
+With `--execute` it asks the Composer, one ordinary chat turn at a time, to
+remove what a battery attempt left, in this order: `battery_*` outputs,
+`battery_*` steps (reconnecting what fed each one to what it fed), battery
+marker sentences in prompts, the pipeline name, then files the graph no
+longer uses. Every cleanup turn is judged like a battery edit: it must
+complete with a successful provider call, make exactly the removal asked for,
+change nothing else, add no validation error and use an acceptable tool. A
+marker removal opens a prompt review card; cleanup approves it only on a
+clean verdict and only when the card shows the node's current prompt, as a
+battery edit does. The first turn whose verdict is not clean stops the
+cleanup.
+
+Two things need the saved attempt (same `--state-dir`, `--attempt`, `--plan`
+and session). The pipeline name is put back to the name in the attempt's
+starting graph; without the attempt, a battery pipeline name is only reported.
+Files are deleted when they were added since the attempt started and no step
+uses them; without the attempt, only unused files named `battery_*` are.
+
+Cleanup ends with a `cleanup_result` line: the number of turns, the failed
+turn (if any), the leftovers still on the graph, files still left, and any
+review card that is still pending and was not there before the cleanup
+began. It exits 0 only when the cleanup turns all passed and all of those
+lists are empty. Check the cleanup turns in the Composer before starting a new
+attempt.
 
 ## Fitting the plan to the graph
 
