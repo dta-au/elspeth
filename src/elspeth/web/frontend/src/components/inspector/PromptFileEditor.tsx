@@ -6,6 +6,7 @@ import { useBlobStore } from "@/stores/blobStore";
 import { captureSessionPublicationGuard, useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { promptFileEditability } from "@/lib/blobBindings";
+import { usePromptDraft, usePromptDraftStore } from "@/stores/promptDraftStore";
 import { optionLabel } from "./OptionRows";
 
 interface PromptFileEditorProps {
@@ -20,7 +21,12 @@ interface PromptFileEditorProps {
  * The editor for ONE file-backed prompt slot. OptionRows mounts one per slot,
  * inside that prompt's own row (`slotActions.Editor`), so a step with several
  * prompt files edits and saves each on its own; promptFileEditability decides
- * what is refused. Until Edit is pressed it renders nothing.
+ * what is refused. Until Edit is pressed it renders nothing, unless the slot
+ * holds unsaved text, which reopens it.
+ *
+ * Typed text lives in the prompt draft store, not in this component, so it
+ * survives the editor unmounting. A draft written against another file or
+ * an older version of this one is shown as such and is never saved silently.
  */
 export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: PromptFileEditorProps) {
   const filename = useBlobFilename(blobId);
@@ -35,7 +41,9 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
   const compositionState = useSessionStore((state) => state.compositionState);
   const pending = useInterpretationEventsStore((state) => sessionId ? state.pendingBySession[sessionId] : undefined);
   const isComposing = useSessionStore((state) => state.isComposing);
-  const [text, setText] = useState<string | null>(null);
+  const slot = sessionId === null ? null : { sessionId, nodeId, fieldPath };
+  const draft = usePromptDraft(slot);
+  const draftFilename = useBlobFilename(draft?.blobId ?? blobId);
   const [savedText, setSavedText] = useState<string | null>(null);
   const [expectedSha256, setExpectedSha256] = useState<string | null>(null);
   // What the editor last has to say: a failure (announced as an alert) or a
@@ -43,7 +51,8 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
   // sent through the error channel.
   const [status, setStatus] = useState<{ tone: "error" | "success" | "warning"; text: string } | null>(null);
   const [saving, setSaving] = useState(false);
-  const [expanded, setExpanded] = useState(false);
+  // A slot with unsaved text opens with it showing, wherever the editor remounts.
+  const [expanded, setExpanded] = useState(() => draft !== undefined);
   // The seq of the last Edit request this editor took. It re-runs the focus
   // effect for a request that arrives while the editor is already open, where
   // neither `expanded` nor `text` changes and the click would do nothing.
@@ -60,6 +69,13 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
   // Why the server would refuse a save right now. While set, the editor is
   // read-only: the text is shown, Save is disabled and this reason is given.
   const refusal = editability?.editable === false ? editability.reason : null;
+
+  // The draft no longer matches the file this slot reads: re-pointed to another
+  // file, or the file changed underneath. Its text is kept and shown, and Save
+  // waits until the user chooses to put it on the current file (or discards it).
+  const stale = draft !== undefined && (draft.blobId.toLowerCase() !== blobId.toLowerCase()
+    || (expectedSha256 !== null && draft.baseSha256 !== expectedSha256));
+  const text = draft?.text ?? savedText;
 
   useLayoutEffect(() => {
     if (editRequest?.nodeId !== nodeId || editRequest.fieldPath !== fieldPath) return;
@@ -91,9 +107,16 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
     focusEditor();
   }, [expanded, text, focusRequestSeq]);
 
+  // Tell the prompt row this slot's editor is showing, so it does not repeat the tag.
+  useEffect(() => {
+    if (!sessionId || !expanded) return;
+    const open = { sessionId, nodeId, fieldPath };
+    usePromptDraftStore.getState().setEditorOpen(open, true);
+    return () => usePromptDraftStore.getState().setEditorOpen(open, false);
+  }, [sessionId, nodeId, fieldPath, expanded]);
+
   useEffect(() => {
     let live = true;
-    setText(null);
     setSavedText(null);
     setExpectedSha256(null);
     setStatus(null);
@@ -103,7 +126,6 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
           if (!live) return;
           setExpectedSha256(sha256);
           setSavedText(content);
-          setText(content);
         })
         .catch((failure: unknown) => {
           if (live) setStatus({ tone: "error", text: failure instanceof Error ? failure.message : "Could not load this prompt file." });
@@ -113,7 +135,8 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
   }, [sessionId, nodeId, fieldPath, blobId]);
 
   const save = async () => {
-    if (!sessionId || text === null || expectedSha256 === null || refusal !== null) return;
+    if (!slot || !sessionId || !draft || stale || refusal !== null) return;
+    const sent = draft.text;
     setSaving(true);
     setStatus(null);
     // Bound to THIS activation, not only the session id: switching away and
@@ -121,9 +144,12 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
     // cannot overwrite a newer graph published since.
     const isCurrent = captureSessionPublicationGuard(sessionId);
     try {
-      const result = await savePromptFile(sessionId, blobId, text, expectedSha256, nodeId, fieldPath);
+      // The draft's own base hash, never the latest one: the server refuses
+      // the save if the file changed since the text was written.
+      const result = await savePromptFile(sessionId, blobId, sent, draft.baseSha256, nodeId, fieldPath);
+      usePromptDraftStore.getState().settleSaved(slot, sent, result.content_sha256);
       if (!isCurrent()) return;
-      setSavedText(text);
+      setSavedText(sent);
       setExpectedSha256(result.content_sha256);
       setStatus({ tone: "success", text: "Saved. This step now uses the new text." });
       // The save rewrote the blob, so the file manager's hash and size are stale.
@@ -155,18 +181,35 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
   const fieldId = `prompt-file-${blobId}-${fieldPath}`;
   const refusalId = `${fieldId}-refusal`;
   const hintId = `${fieldId}-hint`;
+  const staleId = `${fieldId}-stale`;
   const shownName = filename ?? (filenameLoading ? "Loading file name…" : "File not in this session");
   const loading = text === null && status?.tone !== "error";
-  const dirty = text !== null && text !== savedText;
+  const dirty = draft !== undefined;
   // Why Save is disabled when the server would not refuse: said in one line
   // under the buttons, so a greyed Save is never unexplained.
   const hint = refusal !== null || text === null
     ? (loading ? "Loading the file…" : null)
-    : isComposing
-      ? "Wait for the assistant to finish, then save."
-      : !dirty
-        ? (status?.tone === "success" ? null : "No changes to save.")
-        : null;
+    : stale
+      ? "Choose what to do with your unsaved text above, then save."
+      : isComposing
+        ? "Wait for Composer to finish, then save."
+        : !dirty
+          ? (status?.tone === "success" ? null : "No changes to save.")
+          : null;
+  const currentBase = savedText !== null && expectedSha256 !== null ? { blobId, baseSha256: expectedSha256, baseText: savedText } : null;
+  const onEdit = (value: string) => {
+    if (!slot) return;
+    if (draft) {
+      usePromptDraftStore.getState().edit(slot, { blobId: draft.blobId, baseSha256: draft.baseSha256, baseText: draft.baseText }, value);
+    } else if (currentBase) {
+      usePromptDraftStore.getState().edit(slot, currentBase, value);
+    }
+    if (status?.tone !== "error") setStatus(null);
+  };
+  const discard = () => {
+    if (slot) usePromptDraftStore.getState().discard(slot);
+    setStatus(null);
+  };
   const close = () => {
     setExpanded(false);
     // The button that had focus is about to unmount; hand focus back to the
@@ -186,20 +229,34 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
       <div className="prompt-editor-heading">
         <label className="prompt-editor-label" htmlFor={fieldId}>Edit prompt file {shownName} ({slotLabel})</label>
         {refusal !== null && <span className="prompt-editor-tag">Read only</span>}
-        {refusal === null && dirty && <span className="prompt-editor-tag">Unsaved changes</span>}
+        {dirty && <span className="prompt-editor-tag">Unsaved changes</span>}
       </div>
       {refusal && <AlertBanner tone="warning" role="note" id={refusalId} className="prompt-editor-notice">{refusal}</AlertBanner>}
+      {stale && draft && (
+        <AlertBanner tone="warning" role="note" id={staleId} className="prompt-editor-notice">
+          {draft.blobId.toLowerCase() !== blobId.toLowerCase()
+            ? `This prompt now reads a different file. Your unsaved text from ${draftFilename ?? "the earlier file"} is kept below.`
+            : "This file changed since you started editing. Your unsaved text is kept below."}
+          {" "}Put it on the current file to save it there, or discard it to load the current file.
+          <span className="prompt-editor-stale-actions">
+            <Button type="button" variant="ghost" compact disabled={currentBase === null}
+              onClick={() => { if (slot && currentBase) usePromptDraftStore.getState().rebase(slot, currentBase); }}>
+              Put my text on the current file
+            </Button>
+          </span>
+        </AlertBanner>
+      )}
       <textarea
         ref={editorRef}
         id={fieldId}
         className="textarea input-mono prompt-editor-text"
         value={text ?? ""}
-        onChange={(event) => { setText(event.target.value); if (status?.tone !== "error") setStatus(null); }}
+        onChange={(event) => onEdit(event.target.value)}
         disabled={text === null}
         readOnly={refusal !== null}
         aria-busy={loading || undefined}
         placeholder={loading ? "Loading…" : undefined}
-        aria-describedby={refusal ? refusalId : undefined}
+        aria-describedby={[refusal ? refusalId : null, stale ? staleId : null].filter((id) => id !== null).join(" ") || undefined}
         rows={12}
       />
       {status && <AlertBanner tone={status.tone} className="prompt-editor-notice">{status.text}</AlertBanner>}
@@ -209,12 +266,12 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
           variant="primary"
           compact
           onClick={save}
-          disabled={refusal !== null || saving || isComposing || text === null || text === savedText || expectedSha256 === null}
+          disabled={refusal !== null || saving || isComposing || !dirty || stale || expectedSha256 === null}
           aria-describedby={refusal ? refusalId : hint ? hintId : undefined}
         >
           Save
         </Button>
-        <Button type="button" variant="ghost" compact onClick={() => { setText(savedText); setStatus(null); }} disabled={saving || savedText === null}>
+        <Button type="button" variant="ghost" compact onClick={discard} disabled={saving || (savedText === null && !dirty)}>
           Discard changes
         </Button>
         <Button type="button" variant="ghost" compact className="prompt-editor-close" onClick={close}>Close</Button>

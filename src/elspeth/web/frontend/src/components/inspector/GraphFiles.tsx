@@ -4,6 +4,7 @@ import { optionBlobReferences, promptFileBindings, promptFileEditability, prompt
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
+import { usePromptDraftStore } from "@/stores/promptDraftStore";
 import { sortedSourceEntries, sourceComponentId } from "@/utils/compositionState";
 import { BlobFileName } from "@/components/blobs/BlobFileName";
 import { Button } from "@/components/ui";
@@ -116,27 +117,39 @@ function FileMappings({ state, onShowNode, visibleNodeIds, onCount }: GraphFiles
   const loadError = useBlobStore((store) => store.activeSessionId === state.session_id ? store.error : null);
   const pending = useInterpretationEventsStore((store) => store.pendingBySession[state.session_id]);
   const bindings = useMemo(() => promptFileBindings(state), [state]);
+  const drafts = usePromptDraftStore((store) => store.drafts);
   const sameSession = activeSessionId === state.session_id;
+  // Slots of this graph that hold unsaved prompt text, as "<node>\u0000<field>".
+  const draftSlots = useMemo(() => new Set(Object.values(drafts)
+    .filter((draft) => draft.sessionId === state.session_id).map((draft) => `${draft.nodeId}\u0000${draft.fieldPath}`)), [drafts, state.session_id]);
   return <>
     {sameSession && loadError && <p role="alert">{loadError}</p>}
     {rows.length === 0 ? <p className="graph-config-empty-value">No session files are attached to this graph.</p>
       : <div className="graph-files-scroll" tabIndex={0} role="group" aria-label="File mappings table">
         <table>
           <thead><tr><th scope="col">File</th><th scope="col">Used by</th><th scope="col">Fields</th><th scope="col">Actions</th></tr></thead>
-          <tbody>{rows.map((row) => <FileMappingRow key={row.key} row={row} state={state} onShowNode={onShowNode}
+          <tbody>{rows.map((row) => {
+            const unsavedFields = row.isNode ? row.fields.filter((field) => draftSlots.has(`${row.componentId}\u0000${field.path}`)) : [];
+            const rowBindings = row.isNode ? bindings.filter((item) => item.nodeId === row.componentId && item.blobId === row.blobId) : [];
+            // Edit file opens the slot holding unsaved text first, so the user lands on it.
+            const binding = rowBindings.find((item) => unsavedFields.some((field) => field.path === item.fieldPath)) ?? rowBindings[0];
+            return <FileMappingRow key={row.key} row={row} state={state} onShowNode={onShowNode}
             hidden={visibleNodeIds !== undefined && !visibleNodeIds.has(row.componentId)}
-            binding={row.isNode ? bindings.find((item) => item.nodeId === row.componentId && item.blobId === row.blobId) : undefined}
+            binding={binding} unsaved={unsavedFields.length > 0}
             sameSession={sameSession} current={sameSession && currentStateId === state.id}
             listReady={!loading && blobSessionId === state.session_id} loadError={loadError}
-            blobs={blobSessionId === state.session_id ? blobs : []} pendingEvents={Object.values(pending ?? {})} />)}
+            blobs={blobSessionId === state.session_id ? blobs : []} pendingEvents={Object.values(pending ?? {})} />;
+          })}
           </tbody>
         </table>
       </div>}
   </>;
 }
 
-function FileMappingRow({ row, state, onShowNode, hidden, binding, sameSession, current, listReady, loadError, blobs, pendingEvents }: {
+function FileMappingRow({ row, state, onShowNode, hidden, binding, unsaved, sameSession, current, listReady, loadError, blobs, pendingEvents }: {
   row: FileMapping;
+  /** A prompt slot in this row holds unsaved text in the editor. */
+  unsaved: boolean;
   state: CompositionState;
   onShowNode: (componentId: string) => void;
   hidden: boolean;
@@ -167,7 +180,7 @@ function FileMappingRow({ row, state, onShowNode, hidden, binding, sameSession, 
     <th scope="row">{sameSession
       ? <BlobFileName blobId={row.blobId} fallback={loadError ? "File name unavailable" : undefined} />
       : <span title={row.blobId}>File reference</span>}</th>
-    <td>{row.kind}: <code>{row.component}</code></td>
+    <td>{row.kind}: <code>{row.component}</code>{unsaved && <> <span className="prompt-editor-tag">Unsaved changes</span></>}</td>
     <td>{row.fields.map((field) => <div key={field.path} title={field.path}>
       {field.label}{field.entry !== undefined && <>: <code>{field.entry}</code></>}
     </div>)}</td>

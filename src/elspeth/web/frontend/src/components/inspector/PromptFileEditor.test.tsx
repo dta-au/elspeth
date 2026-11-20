@@ -466,7 +466,7 @@ it("says why Save is disabled when the server would not refuse", async () => {
   expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
   act(() => useSessionStore.setState({ isComposing: true }));
   expect(save).toBeDisabled();
-  expect(save).toHaveAccessibleDescription("Wait for the assistant to finish, then save.");
+  expect(save).toHaveAccessibleDescription("Wait for Composer to finish, then save.");
   // Changed and free to save: no hint, nothing describing the button.
   act(() => useSessionStore.setState({ isComposing: false }));
   expect(save).toBeEnabled();

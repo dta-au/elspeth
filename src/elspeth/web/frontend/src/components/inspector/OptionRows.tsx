@@ -27,6 +27,7 @@ import { useBlobFilename } from "@/components/blobs/BlobFileName";
 import { Button } from "@/components/ui";
 import { promptFileEditability, promptFileSlots, promptQueryCopyName, promptQueryEntries, promptQueryTemplatePath } from "@/lib/blobBindings";
 import { useBlobStore } from "@/stores/blobStore";
+import { usePromptDraftHiddenUnsaved } from "@/stores/promptDraftStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { titleCaseLabel } from "@/components/catalog/pluginDisplayName";
@@ -207,7 +208,9 @@ function BoundPromptActions({ blobId, nodeId, fieldPath, label, sessionId, state
   const rowId = useId();
   const reasonId = `${rowId}-reason`;
   const missingReasonId = `${rowId}-missing`;
+  const unsaved = usePromptDraftHiddenUnsaved({ sessionId, nodeId, fieldPath });
   return <span className="prompt-slot-actions">
+    {unsaved && <span className="prompt-editor-tag">Unsaved changes</span>}
     {showInFiles && <>
       {/* The accessible name STARTS with the visible label (WCAG 2.5.3), so
           "click Show in files" matches for voice-control users. */}
