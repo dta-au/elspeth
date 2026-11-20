@@ -13,8 +13,6 @@ from pathlib import Path
 from typing import Any, Final, Literal, cast
 from uuid import UUID
 
-import yaml
-
 from elspeth.contracts.blobs import AllowedMimeType, BlobCreator, BlobNotFoundError, BlobRecord, BlobStateError
 from elspeth.contracts.blobs_inline import (
     INLINE_BLOB_NOT_TEXT_CODE,
@@ -39,6 +37,7 @@ from elspeth.core.blobs_inline import (
     _validate_blob_content_refs_sync,
 )
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.execution._rendered_pipeline_yaml import RenderedPipelineYaml
 from elspeth.web.execution._validation_model import (
     InterpretationValidatedState,
     MaterializedYaml,
@@ -753,7 +752,7 @@ def materialize_validation_yaml(
                 artifact=MaterializedYaml(
                     authored=interpretation.authored,
                     materialized_state=interpretation.materialized_state,
-                    pipeline_yaml=pipeline_yaml,
+                    pipeline=RenderedPipelineYaml.of_text(pipeline_yaml),
                 ),
                 checks=(
                     ValidationCheck(
@@ -965,15 +964,19 @@ def materialize_validation_yaml(
                 semantic_contracts=interpretation.authored.semantic_contracts,
             )
         check_detail = "All inline-content blob references and bytes are valid"
-        pipeline_yaml = yaml.dump(resolved_config, default_flow_style=False)
+        # The rendered text is what the bounded load judges (byte limit) and
+        # what the runtime phase's substring gate reads; the document stays
+        # in hand so that phase need not parse it back.
+        pipeline = RenderedPipelineYaml.render(resolved_config)
     else:
         check_detail = "No inline-content blob references found"
+        pipeline = RenderedPipelineYaml.of_text(pipeline_yaml)
 
     return PhaseReport(
         artifact=MaterializedYaml(
             authored=interpretation.authored,
             materialized_state=interpretation.materialized_state,
-            pipeline_yaml=pipeline_yaml,
+            pipeline=pipeline,
         ),
         checks=(
             ValidationCheck(

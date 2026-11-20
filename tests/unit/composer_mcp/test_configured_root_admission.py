@@ -490,7 +490,7 @@ async def test_loaded_legacy_null_path_stops_before_materialization_and_plugin_s
 
     def observe_materialization(*args: Any, **kwargs: Any) -> Any:
         result = materialize(*args, **kwargs)
-        reached.append({"phase": "materialization", "yaml": result.artifact.pipeline_yaml if isinstance(result, PhaseReport) else None})
+        reached.append({"phase": "materialization", "yaml": result.artifact.pipeline.text if isinstance(result, PhaseReport) else None})
         return result
 
     def observe_plugin_setup(*args: Any, **kwargs: Any) -> Any:
@@ -577,7 +577,7 @@ def test_missing_source_sink_keys_and_nullable_provider_survive_both_materialize
         mcp_root_authority=authority,
     )
     assert isinstance(materialized, PhaseReport)
-    execution = yaml.safe_load(materialized.artifact.pipeline_yaml)
+    execution = yaml.safe_load(materialized.artifact.pipeline.text)
     identity = _compiled_identity_settings(
         state,
         yaml_generator=yaml_generator,
@@ -699,7 +699,7 @@ def test_mcp_execution_and_compiled_identity_resolve_the_same_private_paths(tmp_
         mcp_root_authority=authority,
     )
     assert isinstance(report, PhaseReport)
-    execution = yaml.safe_load(report.artifact.pipeline_yaml)
+    execution = yaml.safe_load(report.artifact.pipeline.text)
     identity = _compiled_identity_settings(
         state,
         yaml_generator=generator,
@@ -739,7 +739,7 @@ def test_profiled_validation_passes_authority_to_real_compiled_identity(tmp_path
 
     with (
         patch("elspeth.web.execution.validation._compiled_identity_settings", record_identity),
-        patch("elspeth.web.execution.validation.load_settings_from_yaml_string", return_value=_fake_settings()),
+        patch("elspeth.web.execution.validation.load_settings_from_config_dict", return_value=_fake_settings()),
         patch("elspeth.web.execution.validation.instantiate_runtime_plugins", return_value=_FakeRuntimeBundle()),
         patch("elspeth.web.execution.preflight.bind_profiled_s3_source_audit_identities"),
         patch("elspeth.web.execution.validation.build_runtime_graph", return_value=_runtime_graph_mock()),

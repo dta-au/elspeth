@@ -150,7 +150,7 @@ def _record_all_core_passes(ledger: ValidationLedger) -> None:
         (SecretValidatedState, ("policy", "all_secret_refs", "env_ref_names")),
         (AuthoredValidatedState, ("policy", "all_secret_refs", "env_ref_names", "semantic_contracts")),
         (InterpretationValidatedState, ("authored", "materialized_state")),
-        (MaterializedYaml, ("authored", "materialized_state", "pipeline_yaml")),
+        (MaterializedYaml, ("authored", "materialized_state", "pipeline")),
         (LoadedRuntime, ("materialized", "settings")),
         (InstantiatedRuntime, ("loaded", "bundle")),
         (GraphedRuntime, ("instantiated", "graph", "graph_warnings")),

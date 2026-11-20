@@ -12,6 +12,7 @@ from elspeth.contracts import SourceProtocol, TransformProtocol
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.plugins.infrastructure.manager import PluginManager, get_shared_plugin_manager
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
+from elspeth.web.execution._rendered_pipeline_yaml import RenderedPipelineYaml
 from elspeth.web.execution._validation_materialization import (
     validate_llm_base_url_policy,
     validate_llm_retry_budget_policy,
@@ -115,7 +116,7 @@ def _materialized(state: CompositionState) -> MaterializedYaml:
             semantic_contracts=(),
         ),
         materialized_state=state,
-        pipeline_yaml="sources: {}\nsinks: {}\n",
+        pipeline=RenderedPipelineYaml.of_text("sources: {}\nsinks: {}\n"),
     )
 
 

@@ -22,6 +22,7 @@ from elspeth.plugins.infrastructure.manager import PluginNotFoundError
 from elspeth.plugins.infrastructure.runtime_factory import PluginBundle
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.config import WebSettings
+from elspeth.web.execution._rendered_pipeline_yaml import RenderedPipelineYaml
 from elspeth.web.execution._validation_model import (
     GraphedRuntime,
     InstantiatedRuntime,
@@ -62,10 +63,6 @@ if TYPE_CHECKING:
 
 class _YamlLoader(Protocol):
     def __call__(self, yaml_content: str) -> object: ...
-
-
-class _YamlSettingsLoader(Protocol):
-    def __call__(self, yaml_content: str, *, expand_env_vars: bool = False) -> ElspethSettings: ...
 
 
 class _DictSettingsLoader(Protocol):
@@ -139,9 +136,9 @@ def _semantic_contracts(materialized: MaterializedYaml) -> tuple[SemanticEdgeCon
     return materialized.authored.semantic_contracts
 
 
-def _load_yaml_mapping(load_yaml: _YamlLoader, pipeline_yaml: str) -> dict[str, object]:
+def _load_yaml_mapping(pipeline: RenderedPipelineYaml) -> dict[str, object]:
     """Admit only the owned concrete mapping shape produced by bounded YAML loading."""
-    loaded = load_yaml(pipeline_yaml)
+    loaded = pipeline.load()
     if type(loaded) is not dict:
         raise TypeError(f"generate_yaml() produced non-dict YAML (got {type(loaded).__name__}) — this is a bug in the YAML generator")
     return cast(dict[str, object], loaded)
@@ -182,16 +179,21 @@ def load_runtime_settings(
     operator_settings: WebSettings | None,
     secret_service: WebSecretResolver | None,
     user_id: str | None,
-    load_yaml: _YamlLoader,
-    load_settings_yaml: _YamlSettingsLoader,
     load_settings_dict: _DictSettingsLoader,
     reframe_missing_parts: Callable[[PydanticValidationError], list[ValidationError]],
 ) -> PhaseReport[LoadedRuntime] | PhaseFailure:
-    """Load the exact materialized YAML through the execution settings path."""
-    pipeline_yaml = materialized.pipeline_yaml
+    """Load the exact materialized YAML through the execution settings path.
+
+    ``materialized.pipeline.load()`` is the bounded load of the materialized
+    text (answered from the rendered document when that is provably the same
+    result), and settings always load from that one mapping: re-parsing the
+    identical text through ``load_settings_from_yaml_string`` would only
+    repeat the same bounded load.
+    """
+    pipeline = materialized.pipeline
     authored = materialized.authored
     try:
-        config_dict = _load_yaml_mapping(load_yaml, pipeline_yaml)
+        config_dict = _load_yaml_mapping(pipeline)
         if "run_mode" in config_dict and (type(config_dict["run_mode"]) is not str or config_dict["run_mode"] != "live"):
             raise ValueError("Web execution does not support nonlive run invocation")
         if "replay_from" in config_dict and config_dict["replay_from"] is not None:
@@ -205,7 +207,7 @@ def load_runtime_settings(
                 env_ref_names=set(authored.env_ref_names),
             )
             settings_config = resolved_dict
-        elif secret_service is None and "secret_ref" in pipeline_yaml:
+        elif secret_service is None and "secret_ref" in pipeline.text:
             settings_config = redact_secret_refs_for_validation(config_dict)
 
         if operator_settings is not None:
@@ -214,10 +216,7 @@ def load_runtime_settings(
             if marked_config is not authored_config or settings_config is not None:
                 settings_config = marked_config
 
-        if settings_config is None:
-            runtime_settings = load_settings_yaml(pipeline_yaml, expand_env_vars=False)
-        else:
-            runtime_settings = load_settings_dict(settings_config, expand_env_vars=False)
+        runtime_settings = load_settings_dict(config_dict if settings_config is None else settings_config, expand_env_vars=False)
     except PydanticValidationError as exc:
         return _settings_failure(materialized, exc, reframed=tuple(reframe_missing_parts(exc)))
     except (ValueError, TypeError) as exc:

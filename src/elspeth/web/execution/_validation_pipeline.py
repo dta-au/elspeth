@@ -19,7 +19,6 @@ from elspeth.web.execution._validation_runtime import (
     _PluginInstantiator,
     _RouteValidator,
     _YamlLoader,
-    _YamlSettingsLoader,
 )
 from elspeth.web.execution.protocol import ValidationSettings, YamlGenerator
 from elspeth.web.execution.schemas import ValidationResult
@@ -57,7 +56,6 @@ class ValidationDependencies:
     """Runtime functions captured from the compatibility facade per call."""
 
     load_yaml: _YamlLoader
-    load_settings_yaml: _YamlSettingsLoader
     load_settings_dict: _DictSettingsLoader
     instantiate_plugins: _PluginInstantiator
     build_graph: _GraphBuilder

@@ -622,7 +622,7 @@ class TestExecutionFlow:
 
         with (
             patch("elspeth.web.execution.validation.validate_pipeline", side_effect=_real_validate_pipeline),
-            patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load,
+            patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load,
             patch("elspeth.web.execution.validation.instantiate_runtime_plugins") as mock_instantiate,
             patch.object(service._executor, "submit") as mock_submit,
             pytest.raises(PipelineValidationError) as exc_info,
