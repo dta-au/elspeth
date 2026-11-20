@@ -27,7 +27,7 @@ import asyncio
 import hashlib
 import os
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -126,13 +126,19 @@ class _BlobRows:
 
     ``transient`` replaces the row returned by exactly one read (by 1-based
     read number), which models a change that happens and reverts while a
-    compute is running.
+    compute is running. Reads are numbered per RECORD across both paths: a
+    ``get_blobs_sync`` batch (the evidence read, one fenced transaction in
+    the real service) gives each of its records the next number, in
+    ascending id order, as the compute's single reads do. ``batches`` lists
+    each batch's ids, so a test can tell the evidence reads from the
+    compute's own.
     """
 
     records: dict[UUID, BlobRecord]
     reads: int = 0
     transient: dict[int, BlobRecord] = field(default_factory=dict)
     contexts: list[SessionOperationContext] = field(default_factory=list)
+    batches: list[tuple[UUID, ...]] = field(default_factory=list)
     # When set, every read first waits (bounded) for the event: a slow store.
     gate: threading.Event | None = None
     # When True, the content read finds no stored content.
@@ -148,6 +154,14 @@ class _BlobRows:
         if blob_id not in self.records:
             raise BlobNotFoundError(str(blob_id))
         return self.records[blob_id]
+
+    def get_blobs_sync(self, blob_ids: Iterable[UUID], context: SessionOperationContext) -> tuple[BlobRecord, ...]:
+        """The real service's batch: ascending ids, the first miss fails the whole read, no ids no read."""
+        ordered = tuple(sorted(set(blob_ids)))
+        if not ordered:
+            return ()
+        self.batches.append(ordered)
+        return tuple(self.get_blob_sync(blob_id, context) for blob_id in ordered)
 
     def read_blob_content_sync(self, blob_id: UUID, context: SessionOperationContext) -> tuple[BlobRecord, bytes]:
         """The real service's content read: the row plus the stored bytes, hash-checked."""
@@ -491,7 +505,10 @@ async def test_evidence_that_changes_during_the_compute_is_not_stored(rig: _Rig,
     rig.blobs.transient[2] = replace(original, status="pending")
 
     await rig.preflight()
+    # Sequence: read 1 is the before-batch, read 2 the after-batch; each
+    # bracket is one ``get_blobs_sync`` (one fenced transaction for all ids).
     assert rig.blobs.reads == 2
+    assert rig.blobs.batches == [(rig.blob_id,), (rig.blob_id,)]
     second = await rig.preflight()
 
     assert fake.calls == 2
@@ -728,7 +745,10 @@ async def test_a_row_that_changes_and_reverts_inside_the_compute_is_not_stored(
     rig.blobs.transient[2] = replace(rig.blobs.records[rig.blob_id], status="pending")
 
     await rig.preflight()
+    # Sequence: read 1 the before-batch, read 2 the compute's own single
+    # read, read 3 the after-batch; only reads 1 and 3 are batches.
     assert rig.blobs.reads == 3
+    assert rig.blobs.batches == [(rig.blob_id,), (rig.blob_id,)]
     await rig.preflight()
 
     assert fake.calls == 2

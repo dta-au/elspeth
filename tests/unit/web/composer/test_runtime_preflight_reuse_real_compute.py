@@ -409,8 +409,14 @@ async def test_a_row_change_seen_only_by_the_content_read_is_not_stored(real: _R
     blob_id = next(iter(real.blobs.records))
     changed = replace(real.blobs.records[blob_id], mime_type="text/plain")
     real.blobs.transient = {real.blobs.reads + 3: changed}
+    batches_before = len(real.blobs.batches)
     first = await real.cached()
+    # Sequence (reads are numbered per record): 1 the before-batch, 2 the
+    # metadata read, 3 the content read, 4 the after-batch. The two brackets
+    # are ``get_blobs_sync`` batches (one fenced transaction each); the
+    # compute's own two reads stay single, as on base.
     assert real.blobs.reads == 4
+    assert real.blobs.batches[batches_before:] == [(blob_id,), (blob_id,)]
     assert first.is_valid is False
     assert any("changed during validation" in message for message in _error_messages(first))
 
