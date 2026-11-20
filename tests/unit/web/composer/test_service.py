@@ -943,7 +943,10 @@ async def test_guard_refusal_retains_committed_effect_integrity(
                     provider_owner=owner,
                 )
             assert len(guard_refusals) == len(committed_snapshots) == len(evidence_owners) == 1
-            assert len(primary_guard.requests) == len(advisor_guard.requests) == len(sdk_calls) == 1
+            # One check per guard; each inspects the prompt and documents separately.
+            assert len({request.request_hash for request in primary_guard.requests}) == 1
+            assert len({request.request_hash for request in advisor_guard.requests}) == 1
+            assert len(sdk_calls) == 1
             assert len(integrity_failures) == int(verification_fails)
             projection = project_composer_operation_error(caught.value, request_id="controlled-advisor-request")
             assert projection.http_status == (500 if verification_fails else 422)
@@ -5802,7 +5805,10 @@ class TestComposerSamplingConfig:
         kwargs = mock_acomp.call_args_list[0].kwargs
         assert "temperature" not in kwargs
         assert "seed" not in kwargs
-        assert guard_requests == [{"userPrompt": "Hello", "documents": ['{"cache_control":{"type":"ephemeral"}}']}]
+        assert guard_requests == [
+            {"userPrompt": "Hello", "documents": []},
+            {"userPrompt": "", "documents": ['{"cache_control":{"type":"ephemeral"}}']},
+        ]
 
     @pytest.mark.asyncio
     async def test_call_text_llm_sends_configured_temperature_and_seed(self) -> None:

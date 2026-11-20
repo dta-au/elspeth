@@ -590,7 +590,8 @@ async def test_one_turn_obeys_actual_persisted_daily_cap(tmp_path: Path, first_u
         assert len(refusals) == 1
         assert len(recorder.llm_calls) == expected_calls
         assert len(_checks(engine)) == expected_calls + 1
-        assert len(guard_requests) == expected_calls + 1
+        # Each repeated identical turn reuses the first check's allow in this session.
+        assert len(guard_requests) == 1
         assert custody.attempt is None and custody.call is None
         coordinator.assert_completed()
     finally:

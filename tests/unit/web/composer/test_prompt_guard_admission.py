@@ -106,12 +106,16 @@ async def test_allow_commits_sanitized_check_under_exact_family_before_return(au
     assert len(checks) == 1
     assert checks[0]["disposition"] == "allow"
     assert checks[0]["operation_id"] == custody.context.fence.operation_id
-    assert checks[0]["request_hash"] == client.requests[0].request_hash
+    prompt_request, document_request = client.requests
+    assert checks[0]["request_hash"] == prompt_request.request_hash == document_request.request_hash
+    assert (checks[0]["units_scanned"], checks[0]["units_reused"]) == (2, 0)
     serialized = json.dumps(checks)
     assert "TOOL-EVIDENCE-CANARY" not in serialized and "TRUSTED-RUBRIC-CANARY" not in serialized
-    assert client.requests[0].user_prompt == messages[-1]["content"]
-    assert "TOOL-EVIDENCE-CANARY" in client.requests[0].documents[0]
-    assert "TRUSTED-RUBRIC-CANARY" not in json.dumps(client.requests[0].documents)
+    # The user prompt and the documents are inspected in separate calls.
+    assert (prompt_request.user_prompt, prompt_request.documents) == (messages[-1]["content"], ())
+    assert document_request.user_prompt == ""
+    assert "TOOL-EVIDENCE-CANARY" in document_request.documents[0]
+    assert "TRUSTED-RUBRIC-CANARY" not in json.dumps(document_request.documents)
     with engine.connect() as connection:
         assert connection.execute(select(quota_provider_attempts_table)).all() == []
     assert custody.attempt is None
@@ -360,7 +364,9 @@ async def test_guard_hash_binds_trusted_provenance_as_well_as_wire_bytes(authori
     engine, _service, owner, coordinator = authority
     client = _GuardClient(PromptGuardDecision("allow", "clean"))
     messages = [{"role": "system", "content": "Same bytes, different trust"}, {"role": "user", "content": "Hello"}]
+    per_check: list[list[PromptGuardRequest]] = []
     for trusted in (frozenset(), frozenset({0})):
+        mark = len(client.requests)
         await enforce_prompt_guard(
             mount=PromptGuardMount(client),
             mode="required",
@@ -370,9 +376,10 @@ async def test_guard_hash_binds_trusted_provenance_as_well_as_wire_bytes(authori
             user_prompt="Hello",
             trusted_message_indexes=trusted,
         )
-    first, second = client.requests
-    assert first.documents != second.documents
-    assert first.request_hash != second.request_hash
+        per_check.append(client.requests[mark:])
+    first, second = ([document for request in requests for document in request.documents] for requests in per_check)
+    assert first == ['{"content":"Same bytes, different trust","role":"system"}'] and second == []
+    assert {request.request_hash for request in per_check[0]} != {request.request_hash for request in per_check[1]}
     assert _checks(engine)[0]["request_hash"] != _checks(engine)[1]["request_hash"]
     coordinator.assert_completed()
 

@@ -32,6 +32,7 @@ from elspeth.web.composer.provider_gateway import ProviderGateway, _litellm_acom
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily
 from elspeth.web.composer.service import _reply_only_messages
 from elspeth.web.sessions.models import quota_provider_attempts_table, token_usage_ledger_table
+from tests.helpers.prompt_guard_audit import assert_prompt_guard_wire_payload
 from tests.unit.web.composer._helpers import _make_settings
 from tests.unit.web.composer.test_prompt_guard_admission import _checks
 from tests.unit.web.composer.test_prompt_guard_admission import authority as _authority
@@ -293,9 +294,14 @@ async def test_complete_large_reply_context_uses_real_guard_before_fenced_sdk(au
     monkeypatch.setattr(prompt_guard, "_request", observe_request)
     inspected = []
 
+    prompt_calls = []
+
     def serve(sent):
         body = json.loads(sent.content)
-        assert body["userPrompt"] == user
+        assert_prompt_guard_wire_payload(body, user_prompt=user)
+        if not body["documents"]:
+            prompt_calls.append(body)
+            return _allow(sent)
         assert 1 <= len(body["documents"]) <= 5
         assert sum(len(document) for document in body["documents"]) <= 10_000
         inspected.append(body)
@@ -341,7 +347,13 @@ async def test_complete_large_reply_context_uses_real_guard_before_fenced_sdk(au
         else:
             await operation
 
-    assert len(requests) == len(units) == len(request_evidence) == 1
+    # The complete request is packed once for evidence and the size policy,
+    # and its not-yet-allowed units once to send: on a first check every
+    # distinct inspected text, each once (repeated JSON punctuation collapses).
+    assert len(requests) == len(request_evidence) == 1 and len(units) == 2
+    assert set(units[1]) <= set(units[0])
+    assert {unit.split(":\n", 1)[-1] for unit in units[1]} == {unit.split(":\n", 1)[-1] for unit in units[0]}
+    assert prompt_calls == [{"userPrompt": user, "documents": []}]
     request, supported = requests[0]
     assert supported
     assert request.user_prompt == user
@@ -370,14 +382,15 @@ async def test_complete_large_reply_context_uses_real_guard_before_fenced_sdk(au
     with engine.connect() as connection:
         attempts = connection.execute(select(quota_provider_attempts_table)).all()
         ledger = connection.execute(select(token_usage_ledger_table)).all()
+    sent_documents = original_pack(units[1])
     if blocked:
         assert len(inspected) == 2
-        assert actual_documents == request.documents[: len(actual_documents)]
-        assert len(actual_documents) < len(request.documents)
+        assert actual_documents == sent_documents[: len(actual_documents)]
+        assert len(actual_documents) < len(sent_documents)
         assert (checks[0]["disposition"], checks[0]["reason"]) == ("blocked", "policy_blocked")
         assert sdk_calls == [] and recorder.llm_calls == () and attempts == [] and ledger == []
     else:
-        assert actual_documents == request.documents
+        assert actual_documents == sent_documents
         assert len(sdk_calls) == len(recorder.llm_calls) == len(attempts) == len(ledger) == 1
         assert sdk_calls[0]["messages"] == evidence.messages
         assert PROMPT_GUARD_CONTENT_PARTS_KEY not in json.dumps(sdk_calls[0])
@@ -481,7 +494,8 @@ async def test_later_azure_batch_prevents_sdk_and_durably_settles_one_check(auth
 
     async def serve(sent):
         observed.append(json.loads(sent.content))
-        if len(observed) == 1:
+        # The user prompt is inspected alone; the first document batch passes.
+        if not observed[-1]["documents"] or sum(1 for body in observed if body["documents"]) == 1:
             return _allow(sent)
         if outcome == "service_error":
             return httpx.Response(503)
@@ -527,7 +541,9 @@ async def test_later_azure_batch_prevents_sdk_and_durably_settles_one_check(auth
     else:
         with pytest.raises(PromptGuardRefused):
             await task
-    assert len(observed) == 2
+    assert len(observed) == 3
+    assert observed[0] == {"userPrompt": "Build a graph", "documents": []}
+    assert all(body["userPrompt"] == "" for body in observed[1:])
     sent_documents = "".join(document for body in observed for document in body["documents"])
     assert "registered catalog" not in sent_documents
     assert "node 0:" in sent_documents and "node 1:" in sent_documents
