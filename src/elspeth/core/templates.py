@@ -440,7 +440,16 @@ def _field_usage_bytes(usage: Jinja2FieldExtraction) -> int:
     return sys.getsizeof(usage) + _name_set_bytes(usage.fields) + sys.getsizeof(usage.dynamic_accesses)
 
 
-class TemplateSourceTooLargeError(ValueError):
+class TemplateSourceRefusedError(ValueError):
+    """Template text refused before or during analysis: over a source bound, or nested too deeply to analyse.
+
+    A ``ValueError``, so every caller that handled these refusals as
+    ``ValueError`` still does; a caller that must not catch every
+    ``ValueError`` (the advisor summary) catches this type.
+    """
+
+
+class TemplateSourceTooLargeError(TemplateSourceRefusedError):
     """A template's source is over ``MAX_JINJA_TEMPLATE_BYTES``; carries both figures.
 
     A ``ValueError``, so every caller that already handles the size refusal
@@ -452,6 +461,20 @@ class TemplateSourceTooLargeError(ValueError):
         self.size_bytes = size_bytes
         self.limit_bytes = limit_bytes
         super().__init__(f"Template exceeds {limit_bytes} UTF-8 bytes")
+
+
+class PromptTemplateRefusal(ValueError):
+    """A template refused for its size or nesting, in a sentence that names its position and quotes no template text.
+
+    The plugin validators raise it, so pydantic reports it as a validation
+    error; authoring validation shows it as written, where it shows other
+    plugin option errors only in a generic sentence.
+    """
+
+
+def template_nesting_refusal(position: str) -> str:
+    """The refusal for a template whose loops or blocks nest deeper than Python's compiler allows."""
+    return f"{position} is too deeply nested to compile: its loops or blocks nest deeper than Python allows. Flatten the nesting."
 
 
 def template_size_refusal(position: str, size_bytes: int, limit_bytes: int) -> str:
@@ -473,13 +496,13 @@ def validate_jinja_source(source: str) -> None:
 def _validate_bounded_jinja_source(source: str) -> None:
     """Reuse pure checks of exact bounded text; size admission runs first."""
     if source.count("{%") > 64 or source.count("{{") > 256:
-        raise ValueError("Template has too many Jinja expressions or blocks")
+        raise TemplateSourceRefusedError("Template has too many Jinja expressions or blocks")
     depth = 0
     for character in source:
         if character in "([":
             depth += 1
             if depth > 64:
-                raise ValueError("Template expression nesting exceeds 64")
+                raise TemplateSourceRefusedError("Template expression nesting exceeds 64")
         elif character in ")]":
             depth = max(0, depth - 1)
 
@@ -516,8 +539,44 @@ class Jinja2FieldExtraction:
         return tuple(kind for kind in self.dynamic_accesses if kind not in ROW_API_MISUSE_KINDS)
 
 
+_ANALYSIS_MAX_AST_DEPTH = 64
+
+
+class TemplateTooDeeplyNestedError(TemplateSourceRefusedError):
+    """A template nests deeper than the analysis walks; the analysis recurses, so it refuses first."""
+
+    def __init__(self) -> None:
+        super().__init__(f"Template is too deeply nested to analyse (more than {_ANALYSIS_MAX_AST_DEPTH} levels)")
+
+
+class _FieldExtractionEnvironment(Environment):
+    """Plain parse for analysis, with the depth bound the sandbox applies before compiling.
+
+    The analysis visitors and Jinja's own scope analysis recurse over the
+    tree, and the parser recurses over the text, so a deep chain could raise
+    ``RecursionError`` here. Both become :class:`TemplateTooDeeplyNestedError`,
+    a ``ValueError`` like the size refusal, which callers already handle. The
+    depth is measured without recursion. The sandbox refuses the same depth
+    (``plugins/infrastructure/templates.py`` ``_check_template_ast``), so no
+    template that compiles is refused here.
+    """
+
+    def parse(self, source: str, name: str | None = None, filename: str | None = None) -> Template:
+        try:
+            ast = super().parse(source, name=name, filename=filename)
+        except RecursionError as exc:
+            raise TemplateTooDeeplyNestedError() from exc
+        pending = [(child, 1) for child in ast.iter_child_nodes()]
+        while pending:
+            node, depth = pending.pop()
+            if depth > _ANALYSIS_MAX_AST_DEPTH:
+                raise TemplateTooDeeplyNestedError()
+            pending.extend((child, depth + 1) for child in node.iter_child_nodes())
+        return ast
+
+
 def _create_field_extraction_environment() -> Environment:
-    return Environment(autoescape=True)
+    return _FieldExtractionEnvironment(autoescape=True)
 
 
 def extract_jinja2_field_usage(

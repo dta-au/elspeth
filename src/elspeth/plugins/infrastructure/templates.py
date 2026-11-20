@@ -73,6 +73,13 @@ class TemplateSourceTooLarge(TemplateError):
         super().__init__(f"Template exceeds {limit_bytes} UTF-8 bytes")
 
 
+class TemplateTooDeeplyNested(TemplateError):
+    """Python's compiler refused the code Jinja generated for the template's nested loops or blocks."""
+
+    def __init__(self) -> None:
+        super().__init__("Template blocks are too deeply nested to compile")
+
+
 class TemplateWorkerLostError(PluginRetryableError):
     """The render worker was ended mid-request by a signal the row did not cause.
 
@@ -1105,7 +1112,14 @@ class _BoundedEnvironment(_LocalSandboxedEnvironment):
         # Jinja's stock compiler folds authored constants here. This
         # environment disables that path, so syntax validation is bounded by
         # the source/AST limits and does not wait for a child on the web loop.
-        compiled = super().from_string(ast)
+        try:
+            compiled = super().from_string(ast)
+        except SyntaxError as exc:
+            # Python's own compiler refuses the code Jinja generates for more than
+            # 20 nested loops ("too many statically nested blocks"): a few hundred
+            # bytes pass every source and AST bound above. The builtin SyntaxError
+            # is not a TemplateError, so without this it escapes every validator.
+            raise TemplateTooDeeplyNested() from exc
         # Static text has a fixed output no larger than its bounded source.
         # Keep it in-process so ordinary blob paths need no worker startup.
         if all(type(node) is nodes.Output and all(type(child) is nodes.TemplateData for child in node.nodes) for node in ast.body):

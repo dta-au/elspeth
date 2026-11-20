@@ -17,9 +17,15 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validat
 
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
-from elspeth.core.templates import template_size_refusal
+from elspeth.core.templates import PromptTemplateRefusal, template_nesting_refusal, template_size_refusal
 from elspeth.plugins.infrastructure.config_base import PluginConfig
-from elspeth.plugins.infrastructure.templates import RowProjection, TemplateError, TemplateRow, TemplateSourceTooLarge
+from elspeth.plugins.infrastructure.templates import (
+    RowProjection,
+    TemplateError,
+    TemplateRow,
+    TemplateSourceTooLarge,
+    TemplateTooDeeplyNested,
+)
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
 
 
@@ -133,6 +139,17 @@ def _validate_structured_output_prefix(value: str | None) -> str | None:
     if value is not None and (not isinstance(value, str) or (value != "" and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", value) is None)):
         raise ValueError("structured_output_prefix must be null, empty, or an ASCII identifier of at most 64 characters")
     return value
+
+
+def _query_template_position(info: ValidationInfo) -> str:
+    """Name a query's template for a refusal: ``queries.<name>.template``.
+
+    ``name`` is declared before ``template``, so pydantic has validated it by
+    the time the template validator runs; it is absent only when its own
+    validation failed.
+    """
+    name = info.data["name"] if "name" in info.data else None
+    return f"queries.{name}.template" if type(name) is str else "queries entry template"
 
 
 class QueryDefinition(BaseModel):
@@ -253,11 +270,9 @@ class QueryDefinition(BaseModel):
         try:
             PromptTemplate(v)
         except TemplateSourceTooLarge as exc:
-            # ``name`` is declared before ``template``, so pydantic has validated
-            # it by now; it is absent only when its own validation failed.
-            name = info.data["name"] if "name" in info.data else None
-            position = f"queries.{name}.template" if type(name) is str else "queries entry template"
-            raise ValueError(template_size_refusal(position, exc.size_bytes, exc.limit_bytes)) from exc
+            raise PromptTemplateRefusal(template_size_refusal(_query_template_position(info), exc.size_bytes, exc.limit_bytes)) from exc
+        except TemplateTooDeeplyNested as exc:
+            raise PromptTemplateRefusal(template_nesting_refusal(_query_template_position(info))) from exc
         except TemplateError as exc:
             raise ValueError(f"Invalid Jinja2 template in queries entry: {exc}") from exc
         return v

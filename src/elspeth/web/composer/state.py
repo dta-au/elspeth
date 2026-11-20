@@ -84,7 +84,7 @@ from elspeth.core.dag.coalesce_merge import merge_coalesce_schema, merge_guarant
 from elspeth.core.dag.guarantees import ResolutionMode
 from elspeth.core.dag.models import GraphValidationError
 from elspeth.core.expression_types import UNRESOLVED, ResultKinds, SchemaFieldType, expression_kinds, input_kinds
-from elspeth.core.templates import extract_jinja2_field_usage
+from elspeth.core.templates import PromptTemplateRefusal, extract_jinja2_field_usage
 from elspeth.plugins.infrastructure.base import aggregation_trigger_count_cap_error
 from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment, find_runtime_unbound_variables
 from elspeth.plugins.sources.field_normalization import (
@@ -4600,6 +4600,20 @@ def _validate_multi_query_required_input_columns(node: NodeSpec) -> tuple[Valida
     return tuple(errors)
 
 
+def _prompt_template_refusal(exc: Exception) -> str | None:
+    """The first template size or nesting refusal inside a pydantic error, or ``None``.
+
+    Those sentences name the template's position and quote none of its text,
+    so they are shown as written; other option errors keep the generic text.
+    """
+    if type(exc) is not PydanticValidationError:
+        return None
+    for error in exc.errors():
+        if "ctx" in error and "error" in error["ctx"] and type(error["ctx"]["error"]) is PromptTemplateRefusal:
+            return str(error["ctx"]["error"])
+    return None
+
+
 @observation_boundary(
     tier=3,
     source="NodeSpec carrying web-authored multi-query input and output declarations",
@@ -4672,12 +4686,15 @@ def _validate_multi_query_generated_input_requirements(node: NodeSpec) -> tuple[
             )
             return ()
     except (ValueError, TemplateSyntaxError) as exc:
+        template_refusal = _prompt_template_refusal(exc)
         return (
             ValidationEntry(
                 component=f"node:{node.id}",
                 message=(
                     str(exc)
                     if isinstance(exc, OrderedQueryPlanError)
+                    else template_refusal
+                    if template_refusal is not None
                     else "Invalid multi-query options. Check queries, input declarations, schema, image_inputs and prompt templates against the plugin schema."
                 ),
                 severity="high",

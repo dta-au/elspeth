@@ -17,7 +17,7 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.prompt_guard import PromptGuardContentPart
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.trust_boundary import observation_boundary
-from elspeth.core.templates import extract_jinja2_fields
+from elspeth.core.templates import TemplateSourceRefusedError, extract_jinja2_fields
 from elspeth.web.composer._validation_probe import inline_content_reference
 from elspeth.web.composer.advisor_prompt_files import (
     UNREAD_PROMPT_FILES,
@@ -1687,6 +1687,13 @@ def _render_interpolated_row_fields_parts(node: NodeSpec, prompt_files: AdvisorP
             fields.update(_interpolated_row_fields(prompt))
         except TemplateSyntaxError:
             return ("named row field references: UNKNOWN (invalid template syntax)",)
+        except TemplateSourceRefusedError:
+            # Over a source bound, or nested too deeply to analyse: inline text
+            # saved before the bounds (older state, YAML import) reaches here
+            # without the plugin's validation having run first, and so does
+            # the text of a file the composer wrote, which may be larger than
+            # one template may be.
+            return ("named row field references: UNKNOWN (the prompt could not be analysed)",)
     not_analysed = (f"; not analysed (text in file): {unshown} prompt(s)",) if unshown else ()
     if not fields:
         if unshown:
