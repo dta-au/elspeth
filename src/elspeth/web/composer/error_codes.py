@@ -78,6 +78,7 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "collector_scope_policy_invalid",
         "connection_sink_name_overlap",
         "contract_config_invalid",
+        "contract_probe_deferred",
         "credential_material_rejected",
         "credential_literal_forbidden",
         "deferred_intent_claim",
