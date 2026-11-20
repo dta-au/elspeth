@@ -22,6 +22,7 @@ import importlib.util
 import inspect
 import json
 import threading
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -117,6 +118,17 @@ class _PromptFileStore:
         if blob_id not in self.records:
             raise BlobNotFoundError(str(blob_id))
         return self.records[blob_id]
+
+    def get_blobs_sync(self, blob_ids: Iterable[UUID], context: SessionOperationContext) -> tuple[BlobRecord, ...]:
+        """One fenced transaction, ascending ids; the first missing id fails the whole read (the contract)."""
+        self.metadata_reads += 1
+        self.threads.add(threading.get_ident())
+        self.contexts.append(context)
+        ordered = sorted(set(blob_ids))
+        for blob_id in ordered:
+            if blob_id not in self.records:
+                raise BlobNotFoundError(str(blob_id))
+        return tuple(self.records[blob_id] for blob_id in ordered)
 
     def read_blob_content_sync(self, blob_id: UUID, context: SessionOperationContext) -> tuple[BlobRecord, bytes]:
         self.content_reads += 1
@@ -466,6 +478,35 @@ async def test_an_unreadable_file_says_why_and_never_claims_its_text_was_sent(tm
 
 
 @pytest.mark.asyncio
+async def test_a_missing_blob_is_not_found_and_the_rest_are_read_in_one_more_batch(tmp_path: Path) -> None:
+    """The batch fails whole on a missing id; that file is stated not_found and the others still reach the advisor."""
+    store = _PromptFileStore(root=tmp_path)
+    service, advisor = _service(store)
+    present = [
+        store.add(f"Composer text {index}".encode(), filename=f"p{index}.md", created_by="assistant", source_description=None)
+        for index in range(2)
+    ]
+    gone = store.add(b"Removed", filename="gone.md", created_by="assistant", source_description=None)
+    del store.records[gone.id]
+    node = _llm_node(
+        {
+            "queries": {
+                "a": {"input_fields": {"colour": "colour"}, "template": _marker(present[0])},
+                "b": {"input_fields": {"colour": "colour"}, "template": _marker(gone)},
+                "c": {"input_fields": {"colour": "colour"}, "template": _marker(present[1])},
+            }
+        }
+    )
+    _arguments, message = await _checkpoint(service, advisor, _state(node), context=_context())
+    line = _node_line(message)
+
+    assert f"queries.b.template={_fact(file=None, size=None, author='unknown', text='unavailable:not_found')}" in line
+    assert 'queries.a.template=(prompt held in a file: file="p0.md"' in line and "Composer text 0" in line
+    assert 'queries.c.template=(prompt held in a file: file="p1.md"' in line and "Composer text 1" in line
+    assert (store.metadata_reads, store.content_reads) == (2, 2)
+
+
+@pytest.mark.asyncio
 async def test_a_sessionless_checkpoint_states_that_no_reader_was_available(tmp_path: Path) -> None:
     store = _PromptFileStore(root=tmp_path)
     service, advisor = _service(store)
@@ -558,12 +599,12 @@ async def test_each_file_is_read_once_per_operation_off_the_event_loop(tmp_path:
     first = (store.metadata_reads, store.content_reads)
     await _checkpoint(service, advisor, state, context=context, phase="end")
 
-    assert first == (32, 32 if composer else 0)
+    assert first == (1, 32 if composer else 0), "one batched metadata transaction, then one content read per sent file"
     assert (store.metadata_reads, store.content_reads) == first, "a second call in the same operation reads nothing"
     assert loop_thread not in store.threads
     assert set(store.contexts) == {context}
     await _checkpoint(service, advisor, state, context=_context(), phase="end")
-    assert store.metadata_reads == 64, "a new operation reads again"
+    assert store.metadata_reads == 2, "a new operation reads again"
 
 
 @pytest.mark.asyncio

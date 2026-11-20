@@ -216,24 +216,58 @@ def _read_prompt_text(
     return _facts(content_record, text=text)
 
 
-def _read_blob_prompt_files(
-    blob_service: BlobServiceProtocol, blob_id: UUID, keys: Sequence[PromptFileKey], context: SessionOperationContext
-) -> tuple[dict[PromptFileKey, AdvisorPromptFile], int]:
-    """Facts for every marker that selects one blob, and the custody transactions spent.
+def _batched_records(
+    blob_service: BlobServiceProtocol, blob_ids: frozenset[UUID], context: SessionOperationContext
+) -> tuple[tuple[BlobRecord, ...], UUID | None]:
+    """One fenced ``get_blobs_sync``: every record, or no record and the id that failed the read.
 
-    One fenced ``get_blob_sync`` per blob (the seam a batched metadata read
-    replaces), then one content read per marker whose file the user did not
-    write. A blob missing or out of this session's custody is ``not_found``.
+    The batch fails whole on its first missing or out-of-custody id and names
+    it. An id outside the requested set would make the caller's retry loop
+    unbounded, so it is a contract breach and raises.
     """
     try:
-        record = blob_service.get_blob_sync(blob_id, context)
-    except BlobNotFoundError:
-        return dict.fromkeys(keys, _NOT_FOUND), 1
+        return blob_service.get_blobs_sync(blob_ids, context), None
+    except BlobNotFoundError as exc:
+        missing = UUID(exc.blob_id)
+        if missing not in blob_ids:
+            raise InvariantError(f"get_blobs_sync named blob {missing}, which was not requested") from exc
+        return (), missing
+
+
+def _read_prompt_file_metadata(
+    blob_service: BlobServiceProtocol, blob_ids: Iterable[UUID], context: SessionOperationContext
+) -> tuple[dict[UUID, BlobRecord], int]:
+    """Fenced metadata for every blob in one ``get_blobs_sync`` transaction, and the transactions spent.
+
+    The seam for the metadata read. A blob that is missing or out of this
+    session's custody fails the whole batch and names itself; it is left out
+    of the result (stated ``not_found``) and the rest are read again, so each
+    such blob costs one more transaction. The usual case is exactly one.
+    """
+    remaining = frozenset(blob_ids)
+    transactions = 0
+    while remaining:
+        records, missing = _batched_records(blob_service, remaining, context)
+        transactions += 1
+        if missing is None:
+            return {record.id: record for record in records}, transactions
+        remaining = remaining - {missing}
+    return {}, transactions
+
+
+def _record_prompt_files(
+    blob_service: BlobServiceProtocol, record: BlobRecord, keys: Sequence[PromptFileKey], context: SessionOperationContext
+) -> tuple[dict[PromptFileKey, AdvisorPromptFile], int]:
+    """Facts for every marker that selects one read blob, and the content transactions spent.
+
+    One content read per marker whose file is not recorded as the user's own
+    writing; a user-written file is never content-read.
+    """
     author = advisor_prompt_file_author(
         created_by=record.created_by, creation_modality=record.creation_modality, source_description=record.source_description
     )
     files: dict[PromptFileKey, AdvisorPromptFile] = {}
-    transactions = 1
+    transactions = 0
     for key in keys:
         if record.status != "ready":
             files[key] = _facts(record, unavailable="not_ready")
@@ -257,16 +291,21 @@ def read_advisor_prompt_files(
 ) -> PromptFileRead:
     """Read the facts, and the text of every file not recorded as the user's own writing, under the caller's fence.
 
-    Synchronous custody I/O: call it in a worker thread. Metadata first (no
-    byte read for a user-written file), then the hash-verified content read
-    for the rest. The row's hash must equal the marker's, as the review card
-    requires; the bytes decode strictly with the marker's encoding, as the
-    runtime resolver decodes them.
+    Synchronous custody I/O: call it in a worker thread. One batched metadata
+    read for every blob (no byte read for a user-written file), then the
+    hash-verified content read for the rest, one per marker. The row's hash
+    must equal the marker's, as the review card requires; the bytes decode
+    strictly with the marker's encoding, as the runtime resolver decodes them.
+    A blob the metadata read does not return is ``not_found``.
     """
+    wanted = sorted(set(keys))
+    records, transactions = _read_prompt_file_metadata(blob_service, (key[0] for key in wanted), context)
     files: dict[PromptFileKey, AdvisorPromptFile] = {}
-    transactions = 0
-    for blob_id, blob_keys in groupby(sorted(set(keys)), key=itemgetter(0)):
-        blob_files, spent = _read_blob_prompt_files(blob_service, blob_id, tuple(blob_keys), context)
+    for blob_id, blob_keys in groupby(wanted, key=itemgetter(0)):
+        if blob_id not in records:
+            files.update(dict.fromkeys(blob_keys, _NOT_FOUND))
+            continue
+        blob_files, spent = _record_prompt_files(blob_service, records[blob_id], tuple(blob_keys), context)
         files.update(blob_files)
         transactions += spent
     return PromptFileRead(files=files, transactions=transactions)
