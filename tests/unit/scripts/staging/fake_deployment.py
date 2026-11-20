@@ -43,6 +43,11 @@ class FakeTurn:
     # Session files the turn created (filename -> content) or deleted (by filename), as create_blob and delete_blob do.
     created_files: dict[str, bytes] = field(default_factory=dict)
     deleted_files: tuple[str, ...] = ()
+    # The published reply on the completed operation's result message, and its rejection.
+    reply_segments: list[JsonObject] = field(default_factory=lambda: [{"kind": "text", "content": "Done."}])
+    rejection: JsonObject | None = None
+    # role="tool" rows the turn stores (each a list of tool_calls envelopes).
+    tool_rows: list[list[JsonObject]] = field(default_factory=list)
 
 
 type Provider = Callable[[JsonObject, str], tuple[JsonObject, list[JsonObject]] | FakeTurn]
@@ -245,6 +250,10 @@ class FakeDeployment:
                         "created_at": first,
                     }
                 )
+            for envelopes in turn.tool_rows:
+                session.messages.append(
+                    {"role": "tool", "operation_id": operation_id, "tool_calls": envelopes, "content": "", "created_at": first}
+                )
             audit_row = {"role": "audit", "operation_id": operation_id, "tool_calls": turn.audit, "content": "", "created_at": last}
             if turn.audit_after_reads:
                 session.late_rows.append((turn.audit_after_reads, audit_row))
@@ -255,7 +264,7 @@ class FakeDeployment:
                 "operation_id": operation_id,
                 "status": turn.status,
                 "poll_after_ms": 0,
-                "result": {"message": {}} if completed else None,
+                "result": {"message": {"segments": turn.reply_segments, "rejection": turn.rejection}} if completed else None,
                 "error": None if completed else {"code": turn.error_code},
             }
         return self._json(202, {"operation_id": operation_id, "status": "queued", "poll_after_ms": 1000})

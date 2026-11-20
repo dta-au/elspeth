@@ -121,17 +121,130 @@ view. Nothing is estimated; a figure the rows do not carry is `null`.
 | `server_ms` | `span_ms - provider_busy_ms`: time in the turn with no provider call in flight. `null`, never negative, when the span is shorter than the provider time (a call that began before the turn's first stored row) |
 | `provider_calls`, `budgeted_provider_calls` | Calls recorded for the turn, and those that carried a context-budget decision |
 | `tool_calls_by_name`, `tool_outcomes` | Assistant tool calls by name, with the server-stamped outcome (`applied`, `rejected`, `failed`, `cancelled`, `completed`) |
+| `tool_timings` | Each tool call with a timed invocation record on its tool row: tool name, status and `latency_ms` only |
+| `tool_timings_complete`, `tool_busy_ms` | Whether every tool call had a timed record; if so, the union of their `started_at`..`finished_at`, else `null` |
+| `server_ms_outside_provider_and_tools` | `span_ms` less the union of provider and tool intervals; `null` unless both are known |
+| `calls` | Each provider call, sanitised: the usage, latency, finish-reason, model-label and cost fields, `request_byte_split` (message, tools and total bytes) and the numeric `context_budget` fields with the shed history indices and a count of stubbed tool results |
+| `end_reviews` | Each END-phase advisor checkpoint record the view returned: `phase`, `verdict`, `publication_verdict`, `source` |
 
-The summary gives `server_time_share_of_span` (server time over span) and
-`non_provider_share_of_wall`.
+The summary gives `server_time_share_of_span` (server time over span),
+`non_provider_share_of_wall`, the totals of `tool_busy_ms` and
+`server_ms_outside_provider_and_tools` (`null` if any edit lacks them),
+`edits_with_complete_tool_timings` and `end_reviews_recorded`.
+
+The sanitising rule for `calls` is the customer's: a text field is kept only
+when it is a short token of letters, digits and `_ . / : -` that is not a
+path or a URL; any other value drops the field. No prompt or reply text,
+tool argument or result, hash, request id, call id or tool-call id is ever
+written to the checkpoint.
 
 Not available from the API, so not reported:
 
 - queue wait before the worker started the turn: the operation status
   carries no admission or start timestamp;
-- where server time went inside a turn (tool execution, validation,
-  persistence): no per-phase timing is exposed;
+- where server time went inside a turn (validation, persistence, advisor
+  work): no per-phase timing is exposed;
+- tool time on current servers: a primary tool row carries only a visible
+  companion record with no timing, so `tool_timings_complete` is false and
+  `tool_busy_ms` null; `server_ms` then still bounds all non-provider time;
+- advisor end reviews on current servers: the messages view returns
+  only provider-call and planner-attempt audit rows, so `end_reviews` is
+  empty (see the structural-cycle workload below);
 - advisor time versus planner time when their calls overlap.
+
+## Structural-cycle workload
+
+`--workload structural-cycle` sends the customer's large-graph stress
+workload instead of a plan file, and judges it with their verifier and error
+codes. It repeats a ten-step cycle around one LLM node: add two passthrough
+nodes before it and two after it, swap each pair, remove all four, and on the
+tenth step restore the original route names. Cycle 1 names its nodes
+`compact_*`, later cycles `cycle1_*`, `cycle2_*` and so on. The wording of
+every step is pinned by a test; do not edit it.
+
+```bash
+python -m scripts.staging.composer_edit_battery plan --workload structural-cycle --steps 50
+python -m scripts.staging.composer_edit_battery run --workload structural-cycle --steps 50 \
+  --source source --anchor capacity_probe --sink results \
+  --base-url "$URL" --session "$SESSION" --account "$ACCOUNT" --state-dir "$STATE" --execute
+```
+
+The `plan` action prints the tenth step's restore values as
+`{was:/nodes/<anchor>/...}` fields; `run` fills them from the fixture as JSON
+text, as the customer's runner does.
+
+`--steps` is 1 to 60 (default 30). `--source`, `--anchor` and `--sink` name
+the fixture's components (defaults `source`, `capacity_probe`, `results`).
+The step count and names are part of the attempt's identity: resuming with
+others is refused.
+
+**The run changes the test graph.** Every step is a real, auto-committed
+edit. Run it only on a copy made for the run, never on a graph anyone uses.
+A complete cycle ends with the fixture's original wiring; an attempt stopped
+mid-cycle leaves passthrough nodes in place. `cleanup` does not apply to a
+workload: restore the fixture from a fresh copy.
+
+### Preparing the fixture
+
+The battery refuses to start unless the session's graph is exactly:
+
+- one source, named by `--source`;
+- one node, an LLM transform with the id given by `--anchor`;
+- the sink named by `--sink` among the outputs (other sinks, such as an
+  error sink, may be present);
+- the source routed straight through the LLM node to that sink;
+- valid, with its prompt and file reviews resolved, and auto-commit on.
+
+The graph's size comes from the LLM node's prompt and query configuration.
+The customer's recorded fixture had 32 LLM queries and two sinks. The summary
+reports the fixture's counts as `baseline_graph_counts`, and each step's
+result its `graph_counts`.
+
+### How a step is judged
+
+Each step must pass all of these. The codes are the customer's.
+
+| Code | Fails when |
+| --- | --- |
+| `node_inventory_mismatch` | The node ids are not exactly the ones the step should leave |
+| `original_llm_content_changed` | Anything on the LLM node other than its `input` and `on_success` changed |
+| `source_content_changed` | Anything on the source other than `on_success` changed, or another source appeared |
+| `sink_content_changed` | Any output changed |
+| `metadata_changed` | The graph metadata changed |
+| `routing_mismatch` | The chain from the source does not visit the step's nodes in order |
+| `unexpected_auxiliary_plugin` | A node other than the LLM node is not a passthrough transform |
+| `routing_does_not_reach_sink` | The chain does not end at the sink |
+| `baseline_routing_not_restored` | At the end of a cycle, the original route names are not back |
+| `runtime_validation_failed` | The graph is not valid |
+| `operation_not_completed` | The turn did not complete |
+| `operation_result_unavailable` | The completed turn has no result |
+| `publication_rejected` | The reply was rejected at publication |
+| `no_published_reply` | The reply has no non-blank text |
+| `additional_system_notice_requires_review` | The reply carries a trusted system notice other than the checkpoint save status |
+| `end_review_not_clean_and_admitted` | The turn's last end review is not verdict `clean` with publication verdict `ADMIT` |
+
+The battery also keeps two of its own findings: `evidence_not_settled_*`
+(the turn's audit rows never settled) and `no_successful_provider_call`. The
+second holds the rule that the LLM does the job: a step the provider took no
+part in is never a pass. Plan expectations, unrelated-change and tool-call
+findings do not apply to the workload; the verifier's state check covers the
+whole graph instead.
+
+Plan-file edits never required an end review. They required a completed
+turn, a successful provider call, settled evidence, the plan's expectations,
+no unrelated change, no new validation error and no refused tool call.
+
+`--end-review-evidence required` (the default, as the customer's runner)
+fails a step whose clean, admitted end review is not in the turn's rows.
+On a server whose messages view does not return advisor rows, every step
+then fails with `end_review_not_clean_and_admitted`. `if-recorded` turns a
+missing review into the warning `end_review_not_recorded`, and still fails
+a recorded review that is not clean and admitted. Report which mode a run
+used.
+
+The first failing step stops the attempt; `--keep-going` judges every step.
+A workload run exits 0 when every requested step passed. The summary still
+reports `gold` (50 or more steps, all passed, fixture as found).
 
 ## Run it against a local server
 

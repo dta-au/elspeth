@@ -78,6 +78,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from scripts.staging import structural_cycle
 from scripts.staging.edit_plan import (
     DEFAULT_PLAN,
     MARKER_TEXTS,
@@ -225,6 +226,11 @@ def _total(results: Sequence[Mapping[str, Any]], key: str) -> int | None:
     return sum(values) if values and all(type(value) is int for value in values) else None
 
 
+def _evidence_total(results: Sequence[Mapping[str, Any]], key: str) -> int | None:
+    values = [result["evidence"][key] for result in results]
+    return sum(values) if values and all(type(value) is int for value in values) else None
+
+
 def _used_tools(results: Sequence[Mapping[str, Any]]) -> set[str]:
     return {
         name
@@ -275,6 +281,7 @@ def summarise(checkpoint: Mapping[str, Any]) -> JsonObject:
         if warning.startswith("tool_call_")
     )
     as_found = checkpoint["as_found_differences"] if "as_found_differences" in checkpoint else None
+    all_passed = complete and passed == len(applicable)
     gold = complete and passed == len(applicable) and len(applicable) >= GOLD_MINIMUM_EDITS and as_found == []
     return {
         "plan": checkpoint["plan_name"],
@@ -288,6 +295,7 @@ def summarise(checkpoint: Mapping[str, Any]) -> JsonObject:
         "passed": passed,
         "longest_run": longest,
         "gold": gold,
+        "all_passed": all_passed,
         "gold_requires": (
             f"every applicable edit judged and passed in one attempt, at least {GOLD_MINIMUM_EDITS} applicable, "
             "and the graph left as it was found"
@@ -306,6 +314,8 @@ def summarise(checkpoint: Mapping[str, Any]) -> JsonObject:
             "provider_busy_ms": busy,
             "provider_latency_ms_sum": _total(sent, "provider_latency_ms_sum"),
             "server_ms": server,
+            "tool_busy_ms": _evidence_total(sent, "tool_busy_ms"),
+            "server_ms_outside_provider_and_tools": _evidence_total(sent, "server_ms_outside_provider_and_tools"),
             "provider_calls": sum(result["evidence"]["provider_calls"] for result in sent),
             "tool_calls": sum(tools.values()),
             "tool_calls_by_name": dict(sorted(tools.items())),
@@ -314,6 +324,9 @@ def summarise(checkpoint: Mapping[str, Any]) -> JsonObject:
         "server_time_share_of_span": round(server / span, 4) if server is not None and span else None,
         "non_provider_share_of_wall": round((wall - busy) / wall, 4) if wall is not None and busy is not None and wall else None,
         "history_shed": {"edits": len(shed), "passed": sum(1 for result in shed if result["passed"])},
+        "edits_with_complete_tool_timings": sum(1 for result in sent if result["evidence"]["tool_timings_complete"]),
+        "end_reviews_recorded": sum(len(result["evidence"]["end_reviews"]) for result in sent),
+        "baseline_graph_counts": checkpoint["baseline_graph_counts"] if "baseline_graph_counts" in checkpoint else None,
         "not_available_from_api": list(UNAVAILABLE_FROM_API),
     }
 
@@ -352,6 +365,7 @@ class EditBattery:
     settle_reads: int = 6
     refresh_margin_seconds: float = 420.0
     prompt_secret: Callable[[str], str] = getpass.getpass
+    end_review_evidence: structural_cycle.EndReviewEvidence = "required"
 
     @property
     def name(self) -> str:
@@ -456,6 +470,10 @@ class EditBattery:
                 + ", ".join(leftovers)
                 + ". Run the cleanup action to report or remove them, then start again."
             )
+        counts: JsonObject | None = None
+        if self.plan.verifier == structural_cycle.VERIFIER:
+            args = self.plan.verifier_args
+            counts = structural_cycle.check_fixture(baseline, source=args["source"], anchor=args["anchor"], sink=args["sink"])
         targets = resolve_targets(self.plan, baseline, self.overrides)
         rows = self.rows_from(0)
         baseline_files = sorted(item["id"] for item in self.session_files())
@@ -475,6 +493,8 @@ class EditBattery:
             "rows_seen": len(rows),
             "shed_history": shed_state(rows),
         }
+        if counts is not None:
+            checkpoint["baseline_graph_counts"] = counts
         self.store.write(self.name, checkpoint)
         emit(
             "edit_battery_started",
@@ -561,40 +581,40 @@ class EditBattery:
         rows, rows_seen, evidence_reads, settled = self.settled_rows(rows_offset, operation_id)
         after_state = self.state()
         evidence = turn_evidence(rows, operation_id, shed_before=shed_before)
-        completed = operation["status"] == "completed" and operation["result"] is not None
-        failures, unrelated, server_written = self.judge(edit, baseline_state, before_state, after_state)
         findings: list[str] = []
-        if not completed:
-            error = operation["error"] if "error" in operation else None
-            findings.append(
-                "turn_not_completed:"
-                + str(operation["status"])
-                + (":" + str(error["code"]) if type(error) is dict and "code" in error else "")
-            )
         if not settled:
             findings.append(f"evidence_not_settled_after_{evidence_reads}_reads")
         if evidence["successful_provider_calls"] == 0:
             findings.append("no_successful_provider_call")
-        findings.extend(failures)
-        findings.extend("unrelated_change:" + path for path in unrelated)
-        findings.extend("new_validation_error:" + key for key in new_validation_errors(before_state, after_state))
-        findings.extend(tool_findings(edit, evidence, self.plan.forbidden_tools))
-        if "delete_files" in edit:
-            present = {item["id"] for item in self.session_files()}
-            findings.extend(f"file_not_deleted:{blob_id}" for blob_id in edit["delete_files"] if blob_id in present)
         warnings = tool_warnings(evidence)
-        if edit["approve"] is not None and not findings:
-            # Only a turn with a clean verdict earns an approval; the approval may change server-written fields only.
-            self.approve_reviews(edit, after_state, approved, save)
-            if not approved:
-                warnings.append("no_pending_review_card_to_approve")
-            approved_state = self.state()
-            approval = classify_changes(graph_view(after_state), graph_view(approved_state), [], named={edit["approve"]["node"]})
-            findings.extend("approval_changed:" + path for path in approval.unrelated)
-            server_written = [*server_written, *approval.server_written]
-            after_state = approved_state
-            failures, _, _ = self.judge(edit, baseline_state, before_state, after_state)
-            findings.extend("after_approval:" + failure for failure in failures)
+        extra: JsonObject = {}
+        if self.plan.verifier == structural_cycle.VERIFIER:
+            # The workload's own verifier judges the turn, with the customer's codes, in place of the plan expectations.
+            args = self.plan.verifier_args
+            state_codes = structural_cycle.verify_state(
+                baseline_state, after_state, edit["order"], source=args["source"], anchor=args["anchor"], sink=args["sink"]
+            )
+            turn_codes, review_warnings = structural_cycle.operation_codes(
+                operation, evidence["end_reviews"], end_review_evidence=self.end_review_evidence
+            )
+            findings.extend(sorted({*state_codes, *turn_codes}))
+            warnings.extend(review_warnings)
+            server_written: list[str] = []
+            extra["graph_counts"] = structural_cycle.graph_counts(after_state)
+        else:
+            server_written = self.judge_plan_edit(edit, operation, evidence, findings, before_state, after_state, baseline_state)
+            if edit["approve"] is not None and not findings:
+                # Only a turn with a clean verdict earns an approval; the approval may change server-written fields only.
+                self.approve_reviews(edit, after_state, approved, save)
+                if not approved:
+                    warnings.append("no_pending_review_card_to_approve")
+                approved_state = self.state()
+                approval = classify_changes(graph_view(after_state), graph_view(approved_state), [], named={edit["approve"]["node"]})
+                findings.extend("approval_changed:" + path for path in approval.unrelated)
+                server_written = [*server_written, *approval.server_written]
+                after_state = approved_state
+                failures, _, _ = self.judge(edit, baseline_state, before_state, after_state)
+                findings.extend("after_approval:" + failure for failure in failures)
         fields: JsonObject = {
             "status": operation["status"],
             "passed": not findings,
@@ -604,8 +624,38 @@ class EditBattery:
             "evidence": evidence,
             "history_shed": shed_this_turn(evidence),
             "evidence_reads": evidence_reads,
+            **extra,
         }
         return fields, after_state, rows_seen
+
+    def judge_plan_edit(
+        self,
+        edit: Mapping[str, Any],
+        operation: Mapping[str, Any],
+        evidence: Mapping[str, Any],
+        findings: list[str],
+        before_state: Mapping[str, Any],
+        after_state: Mapping[str, Any],
+        baseline_state: Mapping[str, Any],
+    ) -> list[str]:
+        """Add a plan edit's findings (turn, expectations, unrelated changes, validation, tools, files); return server-written paths."""
+        if operation["status"] != "completed" or operation["result"] is None:
+            error = operation["error"] if "error" in operation else None
+            findings.insert(
+                0,
+                "turn_not_completed:"
+                + str(operation["status"])
+                + (":" + str(error["code"]) if type(error) is dict and "code" in error else ""),
+            )
+        failures, unrelated, server_written = self.judge(edit, baseline_state, before_state, after_state)
+        findings.extend(failures)
+        findings.extend("unrelated_change:" + path for path in unrelated)
+        findings.extend("new_validation_error:" + key for key in new_validation_errors(before_state, after_state))
+        findings.extend(tool_findings(edit, evidence, self.plan.forbidden_tools))
+        if "delete_files" in edit:
+            present = {item["id"] for item in self.session_files()}
+            findings.extend(f"file_not_deleted:{blob_id}" for blob_id in edit["delete_files"] if blob_id in present)
+        return server_written
 
     def not_sent(self, checkpoint: JsonObject, edit: Mapping[str, Any], live: Mapping[str, Any], findings: list[str]) -> JsonObject:
         result: JsonObject = {
@@ -680,10 +730,14 @@ class EditBattery:
                 "provider_busy_ms": evidence["provider_busy_ms"],
                 "provider_latency_ms_sum": evidence["provider_latency_ms_sum"],
                 "server_ms": evidence["server_ms"],
+                "tool_busy_ms": evidence["tool_busy_ms"],
+                "server_ms_outside_provider_and_tools": evidence["server_ms_outside_provider_and_tools"],
                 "non_provider_wall_ms": wall - evidence["provider_busy_ms"] if evidence["provider_busy_ms"] is not None else None,
             },
             state_id_after=after_state["id"],
         )
+        if "graph_counts" in fields:
+            result["graph_counts"] = fields["graph_counts"]
         checkpoint["last_state"] = after_state
         checkpoint["rows_seen"] = rows_seen
         if evidence["history"]["shed_history_after"] is not None:
@@ -700,6 +754,7 @@ class EditBattery:
             },
             tools=evidence["tool_calls_by_name"],
             provider_calls=evidence["provider_calls"],
+            **({"graph_counts": result["graph_counts"]} if "graph_counts" in result else {}),
         )
         return result
 
@@ -1054,6 +1109,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--attempt", default="1", help="attempt label; a stopped attempt never continues, start a new one after diagnosis")
     parser.add_argument("--keep-going", action="store_true", help="judge every edit instead of stopping at the first failure")
     parser.add_argument(
+        "--workload",
+        choices=["structural-cycle"],
+        help=(
+            "run a workload built in code instead of --plan: structural-cycle is the ten-step add/swap/remove cycle around "
+            "one LLM node, judged by its own verifier (see the runbook)"
+        ),
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=structural_cycle.DEFAULT_STEPS,
+        help=f"structural-cycle: steps to request, 1-{structural_cycle.MAX_STEPS} (default {structural_cycle.DEFAULT_STEPS})",
+    )
+    for role, default in structural_cycle.DEFAULT_NAMES.items():
+        parser.add_argument(f"--{role}", default=default, help=f"structural-cycle: the fixture's {role} component (default {default})")
+    parser.add_argument(
+        "--end-review-evidence",
+        choices=["required", "if-recorded"],
+        default="required",
+        help=(
+            "structural-cycle: required (default) fails a step whose clean, admitted end review is not in the turn's "
+            "evidence; if-recorded fails only a recorded review that is not clean and admitted"
+        ),
+    )
+    parser.add_argument(
         "--poll-seconds",
         type=float,
         default=2.0,
@@ -1072,7 +1152,12 @@ def main(
     prompt_secret: Callable[[str], str] = getpass.getpass,
 ) -> int:
     args = build_parser().parse_args(argv)
-    plan = load_plan(args.plan)
+    if args.workload == "structural-cycle":
+        plan = structural_cycle.structural_cycle_plan(steps=args.steps, source=args.source, anchor=args.anchor, sink=args.sink)
+    else:
+        plan = load_plan(args.plan)
+    if args.action == "cleanup" and plan.verifier is not None:
+        raise UsageError("cleanup removes the battery_* leftovers of a plan file; restore a workload fixture from a fresh copy")
     overrides = parse_targets(args.target)
     if args.action == "plan":
         emit(
@@ -1139,10 +1224,13 @@ def main(
         now=now,
         poll_seconds=args.poll_seconds,
         prompt_secret=prompt_secret,
+        end_review_evidence=args.end_review_evidence,
     )
     if args.action == "cleanup":
         return cleanup(battery)
-    return 0 if battery.run()["gold"] else 1
+    summary = battery.run()
+    # A plan file passes on gold; a workload passes, as the customer's runner does, when every requested step passed.
+    return 0 if (summary["all_passed"] if plan.verifier is not None else summary["gold"]) else 1
 
 
 if __name__ == "__main__":
