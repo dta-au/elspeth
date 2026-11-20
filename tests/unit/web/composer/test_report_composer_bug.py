@@ -23,20 +23,25 @@ assertion.
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import importlib.util
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
 from typing import Any
+from uuid import UUID, uuid4
 
 import pytest
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import select
 
+from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.composer import protocol, redaction
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import redact_tool_call_arguments
@@ -48,7 +53,7 @@ from elspeth.web.composer.tools.discovery import (
     is_blob_store_only_mutation_tool,
 )
 from elspeth.web.credential_guard import CredentialMaterialRefused
-from elspeth.web.sessions.models import blobs_table
+from elspeth.web.sessions.models import blobs_table, sessions_table
 from tests.unit.web.composer.test_tools import (
     _aws_s3_source_state,
     _blob_operation,
@@ -135,30 +140,58 @@ def _blob_rows(engine: Any) -> list[Any]:
 
 
 @contextmanager
-def _report_session(tmp_path: Path) -> Iterator[tuple[Any, dict[str, Any]]]:
-    """A real session, user message and operation fence, as the compose loop supplies them."""
-    engine, session_id = _session_engine_with_session()
+def _compose_operation(engine: Any, session_id: str, tmp_path: Path) -> Iterator[dict[str, Any]]:
+    """A user message and a compose operation fence in ``session_id``, as the compose loop supplies them."""
     message_id = _insert_user_message(engine, session_id, "Reconnect the scoring prompt file.")
+    with _blob_operation(engine, session_id) as (authority, operation):
+        yield {
+            "data_dir": str(tmp_path),
+            "session_engine": engine,
+            "session_id": session_id,
+            "session_operation_authority": authority,
+            "session_operation_context": operation,
+            "user_message_id": message_id,
+            "composer_model_identifier": "openai/sonnet",
+            "composer_model_version": "synthetic-test-model",
+            "composer_provider": "test-provider",
+            "composer_skill_hash": _SKILL_HASH,
+            "tool_arguments_hash": _ARGUMENTS_HASH,
+        }
+
+
+@contextmanager
+def _report_session(tmp_path: Path, *, prepare: Callable[[Any, str], None] | None = None) -> Iterator[tuple[Any, dict[str, Any]]]:
+    """A real session in a compose operation; ``prepare`` runs first, outside that operation."""
+    engine, session_id = _session_engine_with_session()
     try:
-        with _blob_operation(engine, session_id) as (authority, operation):
-            yield (
-                engine,
-                {
-                    "data_dir": str(tmp_path),
-                    "session_engine": engine,
-                    "session_id": session_id,
-                    "session_operation_authority": authority,
-                    "session_operation_context": operation,
-                    "user_message_id": message_id,
-                    "composer_model_identifier": "openai/sonnet",
-                    "composer_model_version": "synthetic-test-model",
-                    "composer_provider": "test-provider",
-                    "composer_skill_hash": _SKILL_HASH,
-                    "tool_arguments_hash": _ARGUMENTS_HASH,
-                },
-            )
+        if prepare is not None:
+            prepare(engine, session_id)
+        with _compose_operation(engine, session_id, tmp_path) as kwargs:
+            yield engine, kwargs
     finally:
         engine.dispose()
+
+
+def _add_session(engine: Any) -> str:
+    """A second session for the same user in the same store."""
+    session_id = str(uuid4())
+    now = datetime.now(UTC)
+    with engine.begin() as conn:
+        conn.execute(
+            sessions_table.insert().values(
+                id=session_id,
+                user_id="test-user",
+                auth_provider_type="local",
+                title="Other Session",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    return session_id
+
+
+def _session_report_rows(engine: Any, session_id: str, description: str) -> list[Any]:
+    return [row for row in _blob_rows(engine) if row.session_id == session_id and row.source_description == description]
 
 
 def test_report_persists_one_bounded_session_file_and_leaves_the_pipeline_unchanged(tmp_path: Path) -> None:
@@ -325,6 +358,85 @@ def test_session_report_limit_refuses_the_next_report_and_continues(tmp_path: Pa
     assert "not saved" in message
     assert "continue the user's task" in message
     assert len(rows) == limit + 1
+
+
+def test_reports_in_another_session_do_not_use_up_this_sessions_limit(tmp_path: Path) -> None:
+    """The count is per session: another session at the limit leaves this one free to report."""
+    impl = _impl()
+    limit = vars(impl.reports)["COMPOSER_BUG_REPORTS_PER_SESSION_MAX"]
+    description = vars(impl.reports)["_REPORT_DESCRIPTION"]
+    state = _empty_state()
+    other: dict[str, str] = {}
+
+    def fill_another_session(engine: Any, _session_id: str) -> None:
+        other["session_id"] = _add_session(engine)
+        with _compose_operation(engine, other["session_id"], tmp_path) as other_kwargs:
+            for _ in range(limit):
+                assert execute_tool("report_composer_bug", _arguments(), state, _mock_catalog(), **other_kwargs).success
+            assert not execute_tool("report_composer_bug", _arguments(), state, _mock_catalog(), **other_kwargs).success
+
+    with _report_session(tmp_path, prepare=fill_another_session) as (engine, kwargs):
+        result = execute_tool("report_composer_bug", _arguments(), state, _mock_catalog(), **kwargs)
+        assert result.success
+        assert len(_session_report_rows(engine, other["session_id"], description)) == limit
+        assert len(_session_report_rows(engine, kwargs["session_id"], description)) == 1
+
+
+def test_user_uploaded_lookalike_file_does_not_use_up_the_limit(tmp_path: Path) -> None:
+    """Only files the assistant created count: a user upload with the report's name prefix and description does not."""
+    impl = _impl()
+    limit = vars(impl.reports)["COMPOSER_BUG_REPORTS_PER_SESSION_MAX"]
+    description = vars(impl.reports)["_REPORT_DESCRIPTION"]
+    state = _empty_state()
+
+    def upload_lookalike(engine: Any, session_id: str) -> None:
+        with _blob_operation(engine, session_id, kind=SessionOperationKind.CREATE) as (_authority, create_context):
+            record = asyncio.run(
+                BlobServiceImpl(engine, tmp_path).create_blob(
+                    session_id=UUID(session_id),
+                    filename="composer-bug-report-uploaded.json",
+                    content=b"{}",
+                    mime_type="application/json",
+                    created_by="user",
+                    source_description=description,
+                    session_operation_context=create_context,
+                )
+            )
+        assert record.created_by == "user"
+
+    with _report_session(tmp_path, prepare=upload_lookalike) as (engine, kwargs):
+        for _ in range(limit):
+            assert execute_tool("report_composer_bug", _arguments(), state, _mock_catalog(), **kwargs).success
+        refused = execute_tool("report_composer_bug", _arguments(), state, _mock_catalog(), **kwargs)
+        rows = _session_report_rows(engine, kwargs["session_id"], description)
+
+    assert not refused.success
+    assert sorted(row.created_by for row in rows) == ["assistant"] * limit + ["user"]
+
+
+def test_deleting_a_report_removes_its_row_and_frees_one_slot(tmp_path: Path) -> None:
+    """``delete_blob`` removes a report's row and file, so the session can report once more, up to the limit."""
+    impl = _impl()
+    limit = vars(impl.reports)["COMPOSER_BUG_REPORTS_PER_SESSION_MAX"]
+    state = _empty_state()
+    with _report_session(tmp_path) as (engine, kwargs):
+        report_ids = [
+            execute_tool("report_composer_bug", _arguments(), state, _mock_catalog(), **kwargs).data["blob_id"] for _ in range(limit)
+        ]
+        assert not execute_tool("report_composer_bug", _arguments(), state, _mock_catalog(), **kwargs).success
+        deleted_path = Path(next(row.storage_path for row in _blob_rows(engine) if row.id == report_ids[0]))
+
+        deleted = execute_tool("delete_blob", {"blob_id": report_ids[0]}, state, _mock_catalog(), **kwargs)
+        assert deleted.success
+        assert deleted.data == {"blob_id": report_ids[0], "deleted": True}
+        remaining = {row.id for row in _blob_rows(engine)}
+        assert report_ids[0] not in remaining
+        assert len(remaining) == limit - 1
+        assert not deleted_path.exists()
+
+        assert execute_tool("report_composer_bug", _arguments(), state, _mock_catalog(), **kwargs).success
+        assert not execute_tool("report_composer_bug", _arguments(), state, _mock_catalog(), **kwargs).success
+        assert len(_blob_rows(engine)) == limit
 
 
 def test_report_over_the_session_quota_fails_without_a_file(tmp_path: Path) -> None:
