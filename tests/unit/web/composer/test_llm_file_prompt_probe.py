@@ -16,12 +16,14 @@ refused by execution validation once the authorized bytes are materialized.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
 import pytest
@@ -34,13 +36,28 @@ from elspeth.web.composer import yaml_generator
 from elspeth.web.composer._validation_probe import prepare_validation_probe_options
 from elspeth.web.composer.state import CompositionState, NodeSpec, ValidationSummary
 from elspeth.web.execution.schemas import ValidationResult
+from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.execution.validation import validate_pipeline_for_trained_operator
+from elspeth.web.sessions.routes._helpers import _composer_persisted_validation
+from tests.helpers.execution_custody import ExecutionTestCustody
+from tests.unit.web.execution import test_deferred_contract_runtime_refusal as runtime_proofs
+from tests.unit.web.execution import test_service as _service_tests
+from tests.unit.web.execution.test_service import _WebSettingsStub
 from tests.unit.web.execution.test_validate_blob_inline import (
     BLOB_ID,
     _ready_blob_record,
     _state_with_inline_prompt,
     _state_with_reference_join,
 )
+
+# Run-admission fixtures, requested by name only (none of them is autouse here).
+broadcaster = _service_tests.broadcaster
+execution_fixture = _service_tests.execution_fixture
+mock_loop = _service_tests.mock_loop
+mock_session_service = _service_tests.mock_session_service
+mock_settings = _service_tests.mock_settings
+real_loop = _service_tests.real_loop
+service = _service_tests.service
 
 # The probe's stand-in text, restated so a change to it is a deliberate edit here.
 PROBE_PROMPT_FILE_PLACEHOLDER = "validation-probe-prompt-file-placeholder"
@@ -334,7 +351,9 @@ def test_an_explicit_null_queries_key_is_single_prompt_mode(tmp_path: Path) -> N
     assert _codes(summary) == ([], [])
 
 
-def test_a_marker_at_a_non_prompt_llm_option_still_defers_with_zero_guarantees(tmp_path: Path) -> None:
+# Formerly test_a_marker_at_a_non_prompt_llm_option_still_defers_with_zero_guarantees (stage 2a, vote arm (a)).
+def test_a_marker_at_a_non_prompt_llm_option_defers_and_forwards_only_upstream_guarantees(tmp_path: Path) -> None:
+    """``llm`` is a known pass-through: deferring, it votes with what it forwards (``review``), never with what it adds."""
     _, state = _state(tmp_path, prompt_template=GOOD_PROMPT, options={"response_field": _marker()})
 
     prepared = prepare_validation_probe_options(state.nodes[0].options, plugin="llm")
@@ -344,7 +363,11 @@ def test_a_marker_at_a_non_prompt_llm_option_still_defers_with_zero_guarantees(t
     assert prepared["response_field"] == _marker()
     assert errors == ["sink_contract_violation"]
     assert warnings == ["contract_probe_deferred"]
-    assert "guarantees: [(none)]" in summary.errors[0].message
+    assert "guarantees: [review]. Missing fields: [summary]." in summary.errors[0].message
+    assert [warning.message for warning in summary.warnings if warning.error_code == "contract_probe_deferred"] == [
+        "Node 'classify' (llm) reads an attached file that this check does not open, so the fields this step adds, "
+        "their types and whether they can be empty are checked before the run starts. No change is needed."
+    ]
 
 
 _SYSTEM_PROMPT = "You summarise customer reviews."
@@ -461,10 +484,15 @@ def test_no_other_plugin_receives_probe_text(plugin: str | None) -> None:
     assert PROBE_PROMPT_FILE_PLACEHOLDER not in json.dumps(prepared)
 
 
-def test_non_llm_blob_producer_still_defers_with_zero_guarantees(tmp_path: Path) -> None:
-    """``reference_join``'s output fields are read from the table bytes: unknown bytes prove nothing."""
-    state = _state_with_reference_join(tmp_path, session_id=uuid4(), reference_format="csv", content=_marker("sku,description\n"))
-    state = replace(
+_JOIN_NOTICE = (
+    "Node 'enrich' (reference_join) reads an attached file that this check does not open, so the fields it adds (description), "
+    "their types and whether they can be empty are checked before the run starts. No change is needed."
+)
+
+
+def _join_with_authored_guarantee(tmp_path: Path, session_id: UUID, table: str) -> CompositionState:
+    state = _state_with_reference_join(tmp_path, session_id=session_id, reference_format="csv", content=_marker(table))
+    return replace(
         state,
         nodes=(
             replace(
@@ -480,14 +508,69 @@ def test_non_llm_blob_producer_still_defers_with_zero_guarantees(tmp_path: Path)
         ),
     )
 
-    summary = state.validate()
+
+# Rewritten in stage 2a from the 5bc4b56c9 pin of the same name; the name is kept so ``git log -S`` finds the change.
+def test_non_llm_blob_producer_still_defers_with_zero_guarantees(tmp_path: Path) -> None:
+    """``reference_join``'s output fields are read from the table bytes: unknown bytes prove nothing the node adds.
+
+    What moved where, and why. The old pin asserted the graph INVALID with
+    ``guarantees: [(none)]`` and ``Missing fields: [description]``: an
+    authoring refusal standing in for a check only the bytes can make. The
+    deferral still promotes nothing (asserted here: ``description``, which
+    the node itself authors as guaranteed, reaches no edge contract), but the
+    verdict on the bytes moved to the runtime gates, proven next door by
+    ``test_the_join_over_a_table_without_the_column_is_refused_before_a_run``:
+    the WEB save-path runtime preflight and run admission both refuse this
+    graph over a table lacking the column, before any run exists.
+    """
+    summary = _join_with_authored_guarantee(tmp_path, uuid4(), "sku,description\n").validate()
     errors, warnings = _codes(summary)
 
-    assert not summary.is_valid
+    assert summary.is_valid, [entry.to_dict() for entry in summary.errors]
+    assert errors == []
     assert warnings == ["contract_probe_deferred"]
-    assert errors == ["sink_contract_violation"]
-    assert "guarantees: [(none)]" in summary.errors[0].message
-    assert "Missing fields: [description]" in summary.errors[0].message
+    assert summary.warnings[0].component == "node:enrich"
+    assert summary.warnings[0].message == _JOIN_NOTICE
+    for contract in summary.edge_contracts:
+        assert "description" not in contract.producer_guarantees, contract.to_dict()
+
+
+@pytest.mark.asyncio
+async def test_the_join_over_a_table_without_the_column_is_refused_before_a_run(
+    tmp_path: Path,
+    service: ExecutionServiceImpl,
+    mock_session_service: MagicMock,
+    mock_settings: _WebSettingsStub,
+    execution_fixture: ExecutionTestCustody,
+) -> None:
+    """Condition (iii) for the pin above: the save path and run admission refuse it on the bytes."""
+    session_id = uuid4()
+    table = "sku,label\nhats,A fine hat\n"
+    state = _join_with_authored_guarantee(tmp_path, session_id, table)
+    refusal = "output fields ['description'] resolved against none of the 1 reference entries"
+
+    authoring = state.validate()
+    runtime = await asyncio.to_thread(
+        runtime_proofs.save_path_preflight, tmp_path, state, table, blob_id=BLOB_ID, session_id=session_id, mime_type="text/csv"
+    )
+    persisted_valid, persisted_errors = _composer_persisted_validation(authoring, runtime)
+    admission = await runtime_proofs.run_admission_refusal(
+        service,
+        mock_session_service,
+        mock_settings,
+        execution_fixture,
+        tmp_path,
+        state,
+        table,
+        blob_id=BLOB_ID,
+        session_id=session_id,
+        mime_type="text/csv",
+    )
+
+    assert authoring.is_valid
+    assert persisted_valid is False
+    assert persisted_errors is not None and any(refusal in error.message for error in persisted_errors), persisted_errors
+    assert any(refusal in error.message for error in admission.errors), [error.message for error in admission.errors]
 
 
 # ---------------------------------------------------------------------------
