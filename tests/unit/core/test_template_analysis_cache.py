@@ -101,13 +101,37 @@ def test_source_admission_runs_before_any_analysis_cache_lookup(monkeypatch, wra
     assert cache.cache_info() == warm
 
 
+def test_all_three_caches_share_the_sized_entry_bound():
+    assert templates._TEMPLATE_ANALYSIS_CACHE_ENTRIES == 8192
+    for cache in (templates._validate_bounded_jinja_source, templates._cached_jinja2_field_usage, templates._cached_jinja2_context_fields):
+        assert cache.cache_info().maxsize == templates._TEMPLATE_ANALYSIS_CACHE_ENTRIES
+
+
+def test_a_repeated_walk_larger_than_the_old_bound_hits_on_its_second_pass():
+    """Validation walks a graph's templates in the same order each time; an LRU smaller than the walk never hits."""
+    walk = [f"Query {index}: classify {{{{ row.customer_{index} }}}} by {{{{ row.source_row.region }}}}." for index in range(400)]
+    for _ in range(2):
+        for text in walk:
+            templates.extract_jinja2_field_usage(text)
+            templates.extract_jinja2_field_usage(text, row_attribute="source_row")
+            templates.extract_jinja2_context_fields(text, row_attribute="source_row")
+    field = templates._cached_jinja2_field_usage.cache_info()
+    context = templates._cached_jinja2_context_fields.cache_info()
+    source = templates._validate_bounded_jinja_source.cache_info()
+    assert (field.misses, field.hits) == (800, 800)
+    assert (context.misses, context.hits) == (400, 400)
+    # validate_jinja_source runs on all three calls per text; only the first per text misses.
+    assert (source.misses, source.hits) == (400, 2000)
+
+
 def test_both_caches_evict_old_entries():
-    for index in range(129):
+    entries = templates._TEMPLATE_ANALYSIS_CACHE_ENTRIES
+    for index in range(entries + 1):
         text = "{{ row.field_" + str(index) + " }}"
         templates.extract_jinja2_field_usage(text)
         templates.extract_jinja2_context_fields(text, row_attribute="source_row")
-    assert templates._cached_jinja2_field_usage.cache_info().currsize == 128
-    assert templates._cached_jinja2_context_fields.cache_info().currsize == 128
+    assert templates._cached_jinja2_field_usage.cache_info().currsize == entries
+    assert templates._cached_jinja2_context_fields.cache_info().currsize == entries
 
 
 def test_source_guard_reuses_exact_text_but_rejects_new_resource_violations():
@@ -127,6 +151,7 @@ def test_source_guard_reuses_exact_text_but_rejects_new_resource_violations():
 
 
 def test_source_guard_cache_retention_is_bounded():
-    for index in range(129):
+    entries = templates._TEMPLATE_ANALYSIS_CACHE_ENTRIES
+    for index in range(entries + 1):
         templates.validate_jinja_source(f"bounded text {index}")
-    assert templates._validate_bounded_jinja_source.cache_info().currsize == 128
+    assert templates._validate_bounded_jinja_source.cache_info().currsize == entries
