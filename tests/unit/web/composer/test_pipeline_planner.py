@@ -357,6 +357,16 @@ _CDA24_MILESTONE_GUIDANCE_CANONICAL_BYTES = -19
 # assertion's ceiling lowered to 1, live and small catalog alike: the scaffold
 # is 142,045 B before and 142,280 B after, +235 B. Price only that growth.
 _SKILL_REVIEW_A4_CAPABILITY_SCOPE_CANONICAL_BYTES = 235
+# Advisor scope carry (2026-11-20): the step-description field description
+# now says when to supply, preserve and refresh it, and pipeline_capabilities.md
+# teaches preserving description, options and unrelated routes in a
+# full-replacement edit. Measured with this assertion's ceiling lowered to 1 on
+# exported trees, live and small catalog alike: 142,832 B on the base, 143,247 B
+# with only the skill text (+415 B), 143,663 B with the description too
+# (+416 B: four 104 B copies in the canonical pipeline schema). Price only that
+# +831 B growth, preserving the prior 802 B headroom and the exact-boundary /
+# +1-byte overflow control.
+_ADVISOR_SCOPE_DESCRIPTION_GUIDANCE_CANONICAL_BYTES = 831
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
@@ -377,6 +387,7 @@ _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     + _CONTENT_UNDERSTANDING_CATALOG_CANONICAL_BYTES
     + _CDA24_MILESTONE_GUIDANCE_CANONICAL_BYTES
     + _SKILL_REVIEW_A4_CAPABILITY_SCOPE_CANONICAL_BYTES
+    + _ADVISOR_SCOPE_DESCRIPTION_GUIDANCE_CANONICAL_BYTES
 )
 
 
