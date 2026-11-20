@@ -755,3 +755,134 @@ async def test_response_thinking_blocks_at_the_bound_are_returned(client):
     response = await service.complete(_chat_request(reasoning_effort="low"), "req-thinking-at-bound")
 
     assert response["choices"][0]["message"]["thinking_blocks"] == [{"type": "thinking", "thinking": "t" * 40, "signature": "s" * 40}]
+
+
+# --- upstream_result and response_validation_rejected events ---------------------
+
+PROMPT_CANARY = "PROMPT-CANARY-5d1e"
+UPSTREAM_CANARY = "UPSTREAM-CANARY-a93c"
+
+
+def _events(caplog) -> list[dict]:
+    return [json.loads(record.getMessage()) for record in caplog.records if record.name == "test.service"]
+
+
+def _assert_no_canary(caplog) -> None:
+    for record in caplog.records:
+        text = record.getMessage()
+        assert PROMPT_CANARY not in text
+        assert UPSTREAM_CANARY not in text
+
+
+@pytest.mark.parametrize(
+    ("status", "status_class", "adapter"),
+    [
+        (200, "2xx", FakeAdapter(parse_success_result=CanonicalResponse(text=f"ok {UPSTREAM_CANARY}", finish_reason=FinishReason.STOP))),
+        (400, "4xx", FakeAdapter(classify_result=ErrorClassification(code="upstream_response_invalid", retryable=False))),
+        (500, "5xx", FakeAdapter(classify_result=ErrorClassification(code="upstream_unavailable", retryable=True))),
+    ],
+)
+@respx.mock
+async def test_each_upstream_exchange_logs_one_upstream_result(client, caplog, status, status_class, adapter):
+    caplog.set_level(logging.INFO, logger="test.service")
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(status, json={"detail": UPSTREAM_CANARY}))
+    service = _service(_config(), adapter, client)
+
+    if status == 200:
+        await service.complete(_chat_request(messages=[{"role": "user", "content": PROMPT_CANARY}]), "req-upstream")
+    else:
+        with pytest.raises(GatewayError):
+            await service.complete(_chat_request(messages=[{"role": "user", "content": PROMPT_CANARY}]), "req-upstream")
+
+    upstream = [event for event in _events(caplog) if event["event"] == "upstream_result"]
+    assert upstream == [
+        {"event": "upstream_result", "request_id": "req-upstream", "upstream_status_class": status_class, "upstream_status_code": status}
+    ]
+    assert type(upstream[0]["upstream_status_code"]) is int
+    _assert_no_canary(caplog)
+
+
+@pytest.mark.parametrize(
+    ("raised", "category"),
+    [
+        (KeyError(UPSTREAM_CANARY), "missing_field"),
+        (TypeError(UPSTREAM_CANARY), "invalid_type"),
+        (ValueError(UPSTREAM_CANARY), "invalid_value"),
+        (json.JSONDecodeError(UPSTREAM_CANARY, UPSTREAM_CANARY, 0), "invalid_value"),
+        (RuntimeError(UPSTREAM_CANARY), "other"),
+    ],
+)
+@respx.mock
+async def test_an_adapter_parse_failure_logs_its_category_and_raises_the_same_error(client, caplog, raised, category):
+    caplog.set_level(logging.INFO, logger="test.service")
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"detail": UPSTREAM_CANARY}))
+    service = _service(_config(), FakeAdapter(parse_success_error=raised), client)
+
+    with pytest.raises(GatewayError) as exc_info:
+        await service.complete(_chat_request(messages=[{"role": "user", "content": PROMPT_CANARY}]), "req-adapter")
+
+    assert exc_info.value.code == GatewayErrorCode.UPSTREAM_RESPONSE_INVALID
+    assert exc_info.value.__cause__ is None
+    rejected = [event for event in _events(caplog) if event["event"] == "response_validation_rejected"]
+    assert rejected == [
+        {
+            "event": "response_validation_rejected",
+            "request_id": "req-adapter",
+            "validation_stage": "adapter",
+            "exception_category": category,
+        }
+    ]
+    _assert_no_canary(caplog)
+
+
+@respx.mock
+async def test_a_canonical_contract_failure_logs_the_canonical_stage(client, caplog):
+    caplog.set_level(logging.INFO, logger="test.service")
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"ok": True}))
+    adapter = FakeAdapter(parse_success_result=CanonicalResponse(text=UPSTREAM_CANARY * 10, finish_reason=FinishReason.STOP))
+    service = _service(_config(ELSPETH_LLM_GATEWAY_MAX_STRING_CHARS="40"), adapter, client)
+
+    with pytest.raises(GatewayError) as exc_info:
+        await service.complete(_chat_request(), "req-canonical")
+
+    assert exc_info.value.code == GatewayErrorCode.UPSTREAM_RESPONSE_INVALID
+    rejected = [event for event in _events(caplog) if event["event"] == "response_validation_rejected"]
+    assert rejected == [
+        {
+            "event": "response_validation_rejected",
+            "request_id": "req-canonical",
+            "validation_stage": "canonical",
+            "exception_category": "contract_rejected",
+        }
+    ]
+    _assert_no_canary(caplog)
+
+
+@respx.mock
+async def test_a_successful_call_logs_upstream_result_then_completion_only(client, caplog):
+    caplog.set_level(logging.INFO, logger="test.service")
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"ok": True}))
+    adapter = FakeAdapter(parse_success_result=CanonicalResponse(text=UPSTREAM_CANARY, finish_reason=FinishReason.STOP))
+    service = _service(_config(), adapter, client)
+
+    await service.complete(_chat_request(messages=[{"role": "user", "content": PROMPT_CANARY}]), "req-ok")
+
+    assert [event["event"] for event in _events(caplog)] == ["upstream_result", "completion"]
+    _assert_no_canary(caplog)
+
+
+def test_the_rejection_vocabularies_are_closed():
+    from elspeth_llm_gateway.core.service import ResponseRejectionCategory, ResponseValidationStage
+
+    assert {stage.value for stage in ResponseValidationStage} == {"adapter", "canonical"}
+    assert {category.value for category in ResponseRejectionCategory} == {
+        "missing_field",
+        "invalid_type",
+        "invalid_value",
+        "other",
+        "contract_rejected",
+    }
