@@ -792,7 +792,8 @@ async def test_six_schema_batch_costs_the_same_with_and_without_producer_labels(
 # P3 (2026-11-20): +23 tokens = the +69 B list_transforms/get_plugin_assistance description change / 3.0;
 # +37 tokens = the +111 B get_plugin_schema description (usage_when_not_to_use) / 3.0.
 # Candidate 4 stack (2026-11-20): 54,107 measured on the stacked tree (the P1 and P2/P3 lanes together), not summed.
-@pytest.mark.parametrize(("anchor_tokens", "minimum"), [(100_000, 100_000), (40_000, 54_107)])
+# Re-measured on the candidate 4 stack with the inline prompt limit: 54,186 (+79 = +237 B set_pipeline description / 3.0).
+@pytest.mark.parametrize(("anchor_tokens", "minimum"), [(100_000, 100_000), (40_000, 54_186)])
 async def test_planner_estimate_is_never_below_the_providers_count_and_uses_the_cheaper_arm(
     tmp_path: Path, tool_context: ToolContext, anchor_tokens: int, minimum: int
 ) -> None:

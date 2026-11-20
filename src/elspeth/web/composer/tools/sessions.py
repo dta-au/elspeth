@@ -21,11 +21,16 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.contracts.enums import OutputMode, is_llm_authored_creation_modality
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.sink import FILE_SINK_PLUGIN_SLASH_TEXT
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
+from elspeth.core.blobs_inline import BLOB_INLINE_AGGREGATE_BYTE_CAP, BLOB_INLINE_PER_REF_BYTE_CAP
 from elspeth.core.canonical import stable_hash
+from elspeth.web.blobs.protocol import BlobQuotaExceededError
+from elspeth.web.composer.inline_prompt_limit import inline_prompt_refusal_message, new_long_inline_prompt
 from elspeth.web.composer.path_canonicalization import canonical_sink_local_paths
+from elspeth.web.composer.pipeline_custody import finalize_pipeline_custody_sync, prepare_pipeline_custody, prompt_call_arguments_hash
 from elspeth.web.composer.protocol import (
     INTERPRETATION_RATE_CAP_PER_SESSION_DAY_EXPECTATION,
     INTERPRETATION_RATE_CAP_PER_TERM_EXPECTATION,
@@ -43,6 +48,7 @@ from elspeth.web.composer.protocol import (
 )
 from elspeth.web.composer.redaction import (
     SetPipelineArgumentsModel,
+    _InlineBlobModel,
     _OmittableString,
     redact_source_storage_path,
 )
@@ -130,6 +136,7 @@ from elspeth.web.composer.tools.blobs import (
     _prepare_blob_create,
     _PreparedBlobCreate,
     _PromptReplacement,
+    _resolve_blob_quota_bytes,
     _structured_prompt_template_refusal,
     _whole_prompt_text_replacement,
     _written_options_for_prompt_replacement,
@@ -170,6 +177,7 @@ from elspeth.web.credential_guard import (
     CredentialMaterialRefused,
     require_no_credential_material_in_state,
 )
+from elspeth.web.execution._validation_materialization import llm_prompt_file_scalar_field
 from elspeth.web.interpretation_state import (
     BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX,
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -611,6 +619,7 @@ class SetPipelineCandidate:
 
     result: ToolResult
     prepared_inline_blob: _PreparedBlobCreate | None
+    prepared_prompt_blobs: tuple[tuple[str, _PreparedBlobCreate], ...] = ()
 
     @property
     def acceptable(self) -> bool:
@@ -714,10 +723,42 @@ def build_set_pipeline_candidate(
     user_message_id = context.user_message_id
     interpretation_requirements_are_internal = context._interpretation_requirements_are_internal
     prepared_inline_blob: _PreparedBlobCreate | None = None
+    prepared_prompt_blobs: list[tuple[str, _PreparedBlobCreate]] = []
 
     def _candidate(result: ToolResult) -> SetPipelineCandidate:
         normalized = normalize_tool_result_validation(result, context.catalog)
-        return SetPipelineCandidate(result=normalized, prepared_inline_blob=prepared_inline_blob)
+        prepared_files = [item for _, item in prepared_prompt_blobs]
+        if normalized.success and (
+            any(len(item.content_bytes) > BLOB_INLINE_PER_REF_BYTE_CAP for item in prepared_files)
+            or sum(len(item.content_bytes) for item in prepared_files) > BLOB_INLINE_AGGREGATE_BYTE_CAP
+        ):
+            normalized = normalize_tool_result_validation(
+                _candidate_rejection_result(
+                    state,
+                    "Inline files exceed the per-file or combined size limit.",
+                    error_code="BLOB_QUOTA_EXCEEDED",
+                    rejected_component=None,
+                ),
+                context.catalog,
+            )
+        if session_id is not None and context.executing_proposal_id is None and normalized.success:
+            long_prompt = new_long_inline_prompt(state, normalized.updated_state)
+            if long_prompt is not None:
+                node_id, field, words, characters = long_prompt
+                normalized = normalize_tool_result_validation(
+                    _candidate_rejection_result(
+                        state,
+                        inline_prompt_refusal_message(field, words, characters),
+                        error_code="inline_prompt_too_long",
+                        rejected_component=f"node:{node_id}",
+                    ),
+                    context.catalog,
+                )
+        return SetPipelineCandidate(
+            result=normalized,
+            prepared_inline_blob=prepared_inline_blob,
+            prepared_prompt_blobs=tuple(prepared_prompt_blobs),
+        )
 
     def _failure_result(
         rejected_state: CompositionState,
@@ -1539,6 +1580,112 @@ def build_set_pipeline_candidate(
         node_type = node.node_type
         node_plugin = node.plugin
         node_options: Mapping[str, Any] = node.options
+        if node_plugin == "llm":
+            authored_options = dict(node_options)
+            prompt_sites: list[tuple[str, dict[str, Any], str]] = [
+                (name, authored_options, name) for name in ("prompt_template", "system_prompt")
+            ]
+            queries = authored_options.get("queries")
+            if isinstance(queries, list):
+                copied_queries = [dict(query) if isinstance(query, Mapping) else query for query in queries]
+                authored_options["queries"] = copied_queries
+                for query_index, query in enumerate(copied_queries):
+                    if isinstance(query, dict):
+                        query_name = query.get("name")
+                        query_key = query_name if type(query_name) is str and query_name else query_index
+                        prompt_sites.append((f"queries.{query_key}.template", query, "template"))
+            elif isinstance(queries, dict):
+                copied_named_queries = {name: dict(query) if isinstance(query, Mapping) else query for name, query in queries.items()}
+                authored_options["queries"] = copied_named_queries
+                for query_name, query in copied_named_queries.items():
+                    if isinstance(query, dict):
+                        prompt_sites.append((f"queries.{query_name}.template", query, "template"))
+            for field_path, container, key in prompt_sites:
+                value = container.get(key)
+                if type(value) is not dict or "inline_blob" not in value:
+                    continue
+                path = f"node:{node_id}.options.{field_path}"
+                if llm_prompt_file_scalar_field(path) is None:
+                    _record_component_rejection(
+                        _failure_result(
+                            state,
+                            "File-backed LLM prompts bind only to scalar prompt fields.",
+                            error_code="inline_blob_field_path_invalid",
+                            rejected_component=node_ref,
+                        )
+                    )
+                    continue
+                if set(value) != {"inline_blob"}:
+                    _record_component_rejection(
+                        _failure_result(
+                            state,
+                            f"{field_path} requires only the inline_blob member.",
+                            error_code="inline_blob_field_path_invalid",
+                            rejected_component=node_ref,
+                        )
+                    )
+                    continue
+                if node_options.get("prompt_template_parts") is not None and field_path == "prompt_template":
+                    _record_component_rejection(
+                        _failure_result(
+                            state,
+                            "A structured prompt must use its prompt_template_parts or a separate file binding.",
+                            error_code="prompt_template_parts_required",
+                            rejected_component=node_ref,
+                        )
+                    )
+                    continue
+                if session_engine is None or session_id is None or data_dir is None:
+                    _record_component_rejection(
+                        _failure_result(
+                            state,
+                            f"{field_path} inline_blob requires session storage context.",
+                            error_code="source_binding_context_unavailable",
+                            rejected_component=node_ref,
+                        )
+                    )
+                    continue
+                try:
+                    blob = _InlineBlobModel.model_validate(value["inline_blob"])
+                except PydanticValidationError:
+                    _record_component_rejection(
+                        _failure_result(
+                            state,
+                            f"{field_path} requires inline_blob filename, text/plain mime_type and content.",
+                            error_code="inline_blob_field_path_invalid",
+                            rejected_component=node_ref,
+                        )
+                    )
+                    continue
+                if blob.mime_type != "text/plain":
+                    _record_component_rejection(
+                        _failure_result(
+                            state,
+                            f"{field_path} inline_blob requires text/plain.",
+                            error_code="inline_blob_not_text",
+                            rejected_component=node_ref,
+                        )
+                    )
+                    continue
+                provenance = _blob_creation_provenance(blob.content, context)
+                prepared = _prepare_blob_create(
+                    filename=blob.filename,
+                    mime_type=blob.mime_type,
+                    content=blob.content,
+                    description=blob.description,
+                    data_dir=data_dir,
+                    session_id=session_id,
+                    creation_modality=provenance.creation_modality,
+                    created_from_message_id=user_message_id,
+                    creating_model_identifier=provenance.creating_model_identifier,
+                    creating_model_version=provenance.creating_model_version,
+                    creating_provider=provenance.creating_provider,
+                    creating_composer_skill_hash=provenance.creating_composer_skill_hash,
+                    creating_arguments_hash=provenance.creating_arguments_hash,
+                )
+                prepared_prompt_blobs.append((path, prepared))
+                container[key] = {"blob_ref": prepared.blob_id, "mode": "inline_content", "sha256": prepared.content_hash}
+            node_options = authored_options
         # Echo tolerance (elspeth-c67fbbbd83): requirement rows echoed
         # verbatim from the stored node reduce to author shells; the
         # reconciliation pass below restores the server rows.
@@ -2189,6 +2336,29 @@ def build_set_pipeline_candidate(
     )
 
 
+def _custody_arguments(
+    arguments: Mapping[str, JsonValue],
+    prepared_inline_blob: _PreparedBlobCreate | None,
+) -> dict[str, JsonValue]:
+    """Copy the direct call's arguments for pipeline custody.
+
+    This is the only place the direct ``set_pipeline`` path copies the whole
+    tool input. When the source file was already stored, the copy names it by
+    ``blob_id`` instead of carrying its bytes inline; every other argument is
+    kept as the caller sent it.
+    """
+    custody_args = dict(arguments)
+    if prepared_inline_blob is not None:
+        original_source = arguments["source"]
+        if type(original_source) is not dict:
+            raise AuditIntegrityError("set_pipeline candidate lost its original source")
+        source_args = dict(original_source)
+        del source_args["inline_blob"]
+        source_args["blob_id"] = prepared_inline_blob.blob_id
+        custody_args["source"] = source_args
+    return custody_args
+
+
 def _execute_set_pipeline(
     args: dict[str, Any],
     state: CompositionState,
@@ -2198,7 +2368,7 @@ def _execute_set_pipeline(
     candidate = build_set_pipeline_candidate(args, state, context)
     result = candidate.result
     prepared_inline_blob = candidate.prepared_inline_blob
-    if not result.success or prepared_inline_blob is None:
+    if not result.success or (prepared_inline_blob is None and not candidate.prepared_prompt_blobs):
         return result
 
     session_engine = context.session_engine
@@ -2210,23 +2380,83 @@ def _execute_set_pipeline(
             error_code="source_binding_context_unavailable",
             rejected_component="source",
         )
-    quota_error = _persist_prepared_blob_create(
-        prepared_inline_blob,
-        session_engine=session_engine,
-        session_id=session_id,
-        max_blob_storage_per_session_bytes=context.max_blob_storage_per_session_bytes,
-        session_operation_context=context.session_operation_context,
-        session_operation_authority=context.session_operation_authority,
+    original_arguments = cast(dict[str, JsonValue], args)
+    prompt_arguments_hash = (
+        prompt_call_arguments_hash(original_arguments, prepared_inline_blob)
+        if prepared_inline_blob is not None and candidate.prepared_prompt_blobs
+        else None
     )
-    if quota_error is not None:
-        return _candidate_rejection_result(state, quota_error, error_code="BLOB_QUOTA_EXCEEDED", rejected_component="source")
-
-    inline_payload = {"inline_blob": _blob_create_payload(prepared_inline_blob)}
-    if result.data is None:
-        data: dict[str, Any] = inline_payload
+    if prepared_inline_blob is not None:
+        quota_error = _persist_prepared_blob_create(
+            prepared_inline_blob,
+            session_engine=session_engine,
+            session_id=session_id,
+            max_blob_storage_per_session_bytes=context.max_blob_storage_per_session_bytes,
+            session_operation_context=context.session_operation_context,
+            session_operation_authority=context.session_operation_authority,
+        )
+        if quota_error is not None:
+            return _candidate_rejection_result(state, quota_error, error_code="BLOB_QUOTA_EXCEEDED", rejected_component="source")
+    if not candidate.prepared_prompt_blobs:
+        if prepared_inline_blob is None:
+            raise AuditIntegrityError("inline source preparation missing after candidate acceptance")
+        inline_payload = {"inline_blob": _blob_create_payload(prepared_inline_blob)}
+        if result.data is not None and not isinstance(result.data, Mapping):
+            raise AuditIntegrityError("set_pipeline candidate returned non-object data")
+        data = inline_payload if result.data is None else {**result.data, **inline_payload}
+        return replace(result, data=data)
+    if context.data_dir is None:
+        raise AuditIntegrityError("inline pipeline custody requires data_dir")
+    custody_args = _custody_arguments(original_arguments, prepared_inline_blob)
+    max_storage = _resolve_blob_quota_bytes(context.max_blob_storage_per_session_bytes)
+    preparation = prepare_pipeline_custody(
+        custody_args,
+        None,
+        session_id=session_id,
+        max_storage_per_session=max_storage,
+        prompt_blobs=candidate.prepared_prompt_blobs,
+        prompt_arguments_hash=prompt_arguments_hash,
+    )
+    try:
+        finalize_pipeline_custody_sync(
+            preparation,
+            engine=session_engine,
+            data_dir=context.data_dir,
+            max_storage_per_session=max_storage,
+            session_operation_context=context.session_operation_context,
+            session_operation_authority=context.session_operation_authority,
+        )
+    except BlobQuotaExceededError as exc:
+        return _candidate_rejection_result(
+            state,
+            f"Session blob quota exceeded: {exc.current_bytes} bytes would exceed {exc.limit_bytes} byte limit.",
+            error_code="BLOB_QUOTA_EXCEEDED",
+            rejected_component=None,
+        )
+    safe_candidate = build_set_pipeline_candidate(preparation.arguments, state, context)
+    if (
+        (candidate.acceptable and not safe_candidate.acceptable)
+        or safe_candidate.prepared_inline_blob is not None
+        or safe_candidate.prepared_prompt_blobs
+    ):
+        raise AuditIntegrityError("custody-safe pipeline failed canonical revalidation")
+    safe_result = safe_candidate.result if safe_candidate.result.success else result
+    if prepared_inline_blob is not None:
+        rebound_sources = dict(safe_result.updated_state.sources)
+        for name, source in result.updated_state.sources.items():
+            if source.options.get("blob_ref") == prepared_inline_blob.blob_id:
+                rebound_sources[name] = source
+        safe_result = replace(safe_result, updated_state=replace(safe_result.updated_state, sources=rebound_sources))
+    inline_payload = {"inline_blob": _blob_create_payload(prepared_inline_blob)} if prepared_inline_blob is not None else {}
+    if prepared_inline_blob is not None or not candidate.acceptable:
+        if result.data is not None and not isinstance(result.data, Mapping):
+            raise AuditIntegrityError("set_pipeline candidate returned non-object data")
+        data = inline_payload if result.data is None else {**result.data, **inline_payload}
     else:
-        data = {**cast(Mapping[str, Any], result.data), **inline_payload}
-    return replace(result, data=data)
+        if safe_result.data is not None and not isinstance(safe_result.data, Mapping):
+            raise AuditIntegrityError("set_pipeline custody returned non-object data")
+        data = {} if safe_result.data is None else {**safe_result.data}
+    return replace(safe_result, data=data)
 
 
 def _handle_set_pipeline(
@@ -2242,6 +2472,18 @@ def _set_pipeline_effects(arguments: Mapping[str, Any]) -> ToolEffects:
     validated = _validate_mutation_arguments(SetPipelineArgumentsModel, arguments, "set_pipeline arguments")
     if validated.source is not None and validated.source.inline_blob is not None:
         return ToolEffects((*GRAPH_EFFECTS.domains, EffectDomain.BLOB_STORE))
+    for node in validated.nodes:
+        if node.plugin == "llm":
+            options = node.options
+            if any(type(options.get(field)) is dict and "inline_blob" in options[field] for field in ("prompt_template", "system_prompt")):
+                return ToolEffects((*GRAPH_EFFECTS.domains, EffectDomain.BLOB_STORE))
+            queries = options.get("queries")
+            entries = queries.values() if isinstance(queries, Mapping) else queries if isinstance(queries, list) else ()
+            if any(
+                isinstance(query, Mapping) and type(query.get("template")) is dict and "inline_blob" in query["template"]
+                for query in entries
+            ):
+                return ToolEffects((*GRAPH_EFFECTS.domains, EffectDomain.BLOB_STORE))
     return GRAPH_EFFECTS
 
 
@@ -2389,7 +2631,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         },
                         "options": {
                             "type": "object",
-                            "description": "Plugin-specific node config. Row-column options use the field name carried by upstream rows, normally a normalized header or source field_mapping target."
+                            "description": 'Plugin-specific node config. Row-column options use the field name carried by upstream rows, normally a normalized header or source field_mapping target. For an LLM prompt_template, system_prompt or query template longer than 100 words or 1,000 prose characters, use {"inline_blob": {"filename": "prompt.txt", "mime_type": "text/plain", "content": "full text"}} at that field.'
                             + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
                         },
                         "condition": {"type": ["string", "null"]},

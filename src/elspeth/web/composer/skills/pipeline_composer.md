@@ -754,7 +754,7 @@ rejoins:
 ### Blob Source
 
 Treat `create_blob` plus source binding as one operation. If you call
-`create_blob`, your immediate next build/edit action in the same turn is
+`create_blob` for source data, your immediate next build/edit action in the same turn is
 `set_source_from_blob`, `set_pipeline` with `source.blob_id`, or an equivalent
 source-binding patch. `create_blob` alone is not progress on pipeline state.
 
@@ -809,6 +809,19 @@ with the blob's id and `content_hash`. `default_content` is not accepted either:
 use `on_miss: null` or `on_miss: fail` and handle the miss downstream. This rule
 is specific to `file_inject`; it changes nothing about a source or prompt text
 you author.
+
+**Prompt text over 100 words goes in a file.** As text in the node options,
+`prompt_template`, `system_prompt`, each query `template` and a structured
+prompt's compiled text hold at most that, whoever wrote it (`{{ ... }}` and
+`{% ... %}` tags are not counted). Put longer text in a text file with
+`create_blob` and bind the file as described next; on a step the call creates,
+set the option to the file marker shown above, filled from the `create_blob`
+result. Where you have no `create_blob`, set the field to
+`{"inline_blob": {"filename": "<name>.txt", "mime_type": "text/plain", "content": "<the text>"}}`
+instead. Text the user supplied goes in whole and word for word, never
+shortened or reworded to fit; say in your reply that it is in a file. A write
+that adds or changes text over the limit is refused (`inline_prompt_too_long`),
+whichever tool makes it.
 For a file-backed LLM prompt, wire a ready UTF-8 text session blob into
 `prompt_template`, `system_prompt`, or one existing query template. The file
 may be user-created or agent-authored. Binding opens a mandatory

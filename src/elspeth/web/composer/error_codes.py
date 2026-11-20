@@ -159,6 +159,7 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "part_not_found",
         "power_automate_origin_not_allowed",
         "prompt_template_parts_required",
+        "inline_prompt_too_long",
         "inline_blob_not_text",
         "inline_blob_missing",
         "inline_blob_not_ready",

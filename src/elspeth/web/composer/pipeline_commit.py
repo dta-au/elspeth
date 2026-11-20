@@ -539,7 +539,7 @@ async def prepare_pipeline_proposal_commit(
         )
     except ToolArgumentError as exc:
         raise PipelineCommitError(exc.safe_message, code="ARGUMENT_ERROR", dispatch=recovery_dispatch) from exc
-    if not candidate.acceptable or candidate.prepared_inline_blob is not None:
+    if not candidate.acceptable or candidate.prepared_inline_blob is not None or candidate.prepared_prompt_blobs:
         raise PipelineCommitError("pipeline proposal failed current candidate validation", code="VALIDATION_FAILED")
     candidate_hash = composition_content_hash(candidate.result.updated_state)
     if proposed_content_hash is not None and candidate_hash != proposed_content_hash:
