@@ -201,6 +201,7 @@ from elspeth.web.composer.tools._common import (
     RuntimePreflight,
     ToolContext,
     ToolResult,
+    _failure_result,
 )
 from elspeth.web.composer.tools._dispatch import _schema_violation_loc, execute_discovery_tool_with_context
 from elspeth.web.composer.tools._generation_schema_response import AdmittedPluginSchemaResponse
@@ -228,6 +229,7 @@ from elspeth.web.credential_guard import (
     require_no_credential_material_for_tool,
     require_no_credential_material_in_tool_wire,
 )
+from elspeth.web.interpretation_state import server_staged_review_preservation_error
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.resource_identity import canonical_resource_uuid
 from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
@@ -3251,6 +3253,9 @@ async def _build_valid_pipeline_plan(
     )
     if not candidate.acceptable:
         raise AuditIntegrityError("canonical interpretation requirements failed candidate revalidation")
+    review_error = server_staged_review_preservation_error(current_state, candidate.result.updated_state)
+    if review_error is not None:
+        raise _PipelineCandidateRejected(_failure_result(current_state, review_error, error_code="server_owned_review_protected"))
 
     safe_pipeline: Mapping[str, Any] = pipeline
     # The candidate state that corresponds to ``safe_pipeline``. Custody

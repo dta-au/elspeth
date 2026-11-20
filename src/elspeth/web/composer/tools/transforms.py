@@ -732,6 +732,13 @@ def _execute_upsert_node(
     # Echo tolerance (elspeth-c67fbbbd83): requirement rows echoed verbatim
     # from the stored node reduce to author shells; the reconciliation pass
     # below restores the server rows. Non-matching values still reject.
+    from elspeth.web.composer.tools._common import _server_staged_requirement_boundary
+
+    node_options, review_refusal = _server_staged_requirement_boundary(
+        node_options, stored_options=existing_node.options if existing_node is not None else None, node_id=node_id
+    )
+    if review_refusal is not None:
+        return _saved_graph_rejection_result(state, review_refusal, error_code="server_owned_review_protected", rejected_component=node_ref)
     node_options, requirement_echo = _normalize_echoed_interpretation_requirements(
         node_options,
         stored_options=existing_node.options if existing_node is not None else None,
@@ -1945,6 +1952,11 @@ def _apply_guarded_node_option_patch(
     # Echo tolerance (elspeth-c67fbbbd83): requirement rows echoed verbatim
     # from the stored node reduce to author shells; the reconciliation pass
     # below restores the server rows. Non-matching values still reject.
+    from elspeth.web.composer.tools._common import _server_staged_requirement_boundary
+
+    patch, review_refusal = _server_staged_requirement_boundary(patch, stored_options=current.options, node_id=node_id)
+    if review_refusal is not None:
+        return _saved_graph_rejection_result(state, review_refusal, error_code="server_owned_review_protected", rejected_component=node_ref)
     patch, requirement_echo = _normalize_echoed_interpretation_requirements(
         patch,
         stored_options=current.options,

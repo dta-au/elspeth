@@ -921,7 +921,7 @@ files:
     dict[str, Any]: 1
   src/elspeth/web/composer/tools/_common.py:
     Mapping[str, Any]: 41
-    Mapping[str, object]: 2
+    Mapping[str, object]: 5
     dict[str, Any]: 28
   src/elspeth/web/composer/tools/_dispatch.py:
     Mapping[str, Any]: 12
@@ -1122,9 +1122,9 @@ files:
     dict[str, object]: 1
 totals:
   Mapping[str, Any]: 819
-  Mapping[str, object]: 316
+  Mapping[str, object]: 319
   MutableMapping[str, Any]: 9
   boundary: 69
   dict[str, Any]: 1124
   dict[str, object]: 406
-  soft: 2674
+  soft: 2677

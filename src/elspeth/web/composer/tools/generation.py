@@ -1612,6 +1612,11 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "Declare the intended quarantine output and reference its name in on_validation_failure, "
         "or choose 'discard' only if discarding invalid source rows is intended.",
     ),
+    DirectValidationGuidance(
+        "server_owned_review_protected",
+        "A change would have removed, cleared or replaced a review the server staged on a node. Only the user resolves it, on its card.",
+        "Re-send the node without interpretation_requirements (the review is kept), keep its node type and plugin, and do not remove the node while the review is pending.",
+    ),
     # elspeth-d2e3f29d10: the aggregation error edge is wired, so a ghost
     # aggregation on_error sink is refused by the DAG builder too.
     DirectValidationGuidance(
