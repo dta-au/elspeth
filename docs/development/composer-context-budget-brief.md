@@ -15,33 +15,39 @@ escape hatch included), a pure budgeter in
 ceilings, records what it shed on the call record (`context_budget`), or
 refuses with `context_budget_exceeded` before any provider call.
 
-Advisor requests (hints, the EARLY/END checkpoints, abandonment review) use
-the same policy for their visible transcript, the only part of an Advisor
-request that grows with the session
-(`fit_advisor_transcript_to_context_budget` in
+Advisor requests (hints, the EARLY/END checkpoints, abandonment review) show
+the earlier turns of their visible transcript by age, on every request,
+whatever its size (`AdvisorVisibleTranscript.by_age` in
 `src/elspeth/web/composer/advisor_transcript.py`, applied once in
-`AdvisorCheckpointOwner._call_advisor_with_audit_body`). Under `shed_above` the
-request is unchanged. Above it, tool results from earlier turns are replaced by
-`[Result omitted by ELSPETH to fit the context budget.]` and then earlier
-events are left out, oldest first, toward `shed_to` (only to `shed_above` when
-this turn's own evidence makes `shed_to` unreachable). Only if those two
-steps cannot bring the request under `shed_above` are earlier user requests
-shortened, oldest first, to their first 2,000 characters plus a marker giving
-the original length, until it is under. User requests are never left out, and
-the current request and this turn's events are never reduced. The sent
-transcript carries exact counts (`context_budget_reduction`), the gaps
-`oldest_events_omitted_for_context_budget`,
-`older_tool_results_stubbed_for_context_budget` and
-`older_user_requests_shortened_for_context_budget`, and a header that says it
-is the most recent part. An Advisor request is never refused for size here: it
-is sent with everything eligible reduced, and the provider judges its own
-limit. A request still too large (one oversized turn, or a graph and skill
-that alone exceed the window) ends as a `context_length_exceeded` request
-rejection, whose blocker suggests a new session or a shorter request. Publication, abandonment and repair bindings are taken on the complete
-transcript before the reduction. The Advisor call record carries no
-`context_budget`, so it never becomes the compose loop's shed state. This
-assumes the Advisor model's window is at least
-`composer_context_max_prompt_tokens`.
+`AdvisorCheckpointOwner._call_advisor_with_audit_body`). A turn starts at each
+human request. This turn goes whole. The previous three turns go as the
+request and the reply the user was shown (the turn's last published composer
+reply, prose only). Older turns go as the request only, newest first, as one
+unbroken run within 8,000 tokens at 3.0 bytes per token; a request over 2,000
+characters goes as its first 1,500 and last 500 characters with one fixed mark
+between and a server-written `shortened` field. Tool calls, tool results, call
+metadata and backend events of earlier turns are never sent. The sent
+transcript carries the counts (`earlier_turns_shown_by_age`), one availability
+gap per kind of omission, and a header stating the counts. With no earlier
+turn the request is unchanged.
+
+The request is then priced (`estimate_advisor_prompt_tokens`), measured as the
+call record measures it (`request_byte_split.total_bytes`): from the newest
+successful earlier call with the Advisor's model and no tools (its prompt
+tokens plus added bytes at 3.0, or scaled down) that is at least half the
+request's size (a smaller one, such as an auto-title call, is passed over),
+else from this turn's
+budgeted compose-loop call (its bytes per token), else at 3.0 bytes per token.
+Only an estimate from a real call can be over `composer_context_max_prompt_tokens`:
+then older requests go, oldest first, then the previous three turns, oldest
+first. A checkpoint still over the limit is not sent and ends as
+`budget_exhausted` with the estimate, the limit and the setting named; a hint
+is sent. A cold-start estimate never stops a request, and the byte ceiling is
+not applied. A request the provider still rejects for length ends as a
+`context_length_exceeded` request rejection, whose blocker suggests a new
+session or a shorter request. Publication, abandonment and repair bindings are
+taken on the complete transcript before the reduction. The Advisor call record
+carries no `context_budget`, so it never becomes the compose loop's shed state.
 
 Settings (`WebSettings`, `src/elspeth/web/config.py`):
 

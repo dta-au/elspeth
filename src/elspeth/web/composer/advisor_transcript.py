@@ -16,17 +16,11 @@ from uuid import UUID
 
 from pydantic import JsonValue
 
+from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import is_lower_sha256_hex, stable_hash
 from elspeth.contracts.prompt_guard import PromptGuardContentPart
-from elspeth.web.composer.context_budget import (
-    ContextBudgetPolicy,
-    ContextBudgetRefusal,
-    SheddableKind,
-    SheddableSegment,
-    decide_context_budget,
-    escaped_bytes,
-)
+from elspeth.web.composer.context_budget import CONTEXT_BUDGET_FALLBACK_BYTES_PER_TOKEN, escaped_bytes
 from elspeth.web.composer.control_messages import replay_composer_control_message
 from elspeth.web.composer.prompt_guard_rendering import JsonPath, _json_inspection_text, json_content_parts
 from elspeth.web.composer.visible_tool_event import (
@@ -122,6 +116,73 @@ def _wire_event(message: Mapping[str, Any], event_id: str) -> dict[str, Any]:
 
 @final
 @dataclass(frozen=True, slots=True)
+class AdvisorAnchorCall:
+    """What a size estimate needs from one earlier model call: identity, outcome, usage and request size.
+
+    ``request_bytes`` is the call record's ``request_byte_split.total_bytes``:
+    each sent message's content bytes plus the tool list's, without wire
+    framing. An estimate measures the request it prices the same way.
+    """
+
+    model_requested: str
+    succeeded: bool
+    prompt_tokens: int | None
+    request_bytes: int | None
+    carries_tools: bool
+    budgeted: bool
+
+    @property
+    def usable(self) -> bool:
+        return self.succeeded and self.prompt_tokens is not None and self.prompt_tokens > 0 and bool(self.request_bytes)
+
+    @classmethod
+    def from_call(cls, call: ComposerLLMCall) -> AdvisorAnchorCall:
+        """A live call of this turn, as the exchange recorder holds it."""
+        return cls(
+            model_requested=call.model_requested,
+            succeeded=call.status is ComposerLLMCallStatus.SUCCESS,
+            prompt_tokens=call.prompt_tokens,
+            request_bytes=call.request_byte_split.total_bytes if call.request_byte_split is not None else None,
+            carries_tools=call.tools_spec_hash is not None,
+            budgeted=call.context_budget is not None,
+        )
+
+    @classmethod
+    def from_public_fields(
+        cls,
+        *,
+        model_requested: object,
+        status: object,
+        prompt_tokens: object,
+        request_bytes: object,
+        carries_tools: bool,
+        budgeted: bool,
+    ) -> AdvisorAnchorCall:
+        """A stored public call projection's fields (Tier 1): a malformed one is corruption and raises."""
+        if (
+            type(model_requested) is not str
+            or type(status) is not str
+            or (prompt_tokens is not None and type(prompt_tokens) is not int)
+            or (request_bytes is not None and type(request_bytes) is not int)
+        ):
+            raise AuditIntegrityError("Stored composer call lacks a well-formed model, status, prompt token count or request size")
+        return cls(
+            model_requested=model_requested,
+            succeeded=status == ComposerLLMCallStatus.SUCCESS.value,
+            prompt_tokens=prompt_tokens,
+            request_bytes=request_bytes,
+            carries_tools=carries_tools,
+            budgeted=budgeted,
+        )
+
+
+# The stored public call fields an anchor reads; a call stored before any of
+# them existed prices nothing.
+_ANCHOR_CALL_FIELDS: Final[tuple[str, ...]] = ("model_requested", "status", "prompt_tokens", "tools_spec_hash", "request_byte_split")
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class AdvisorTranscriptHistory:
     """A session/actor/request-bound snapshot of authenticated stored rows."""
 
@@ -130,6 +191,10 @@ class AdvisorTranscriptHistory:
     request_id: str
     request_hash: str
     events_json: str = field(repr=False)
+    # Earlier provider calls of this session, oldest first, from the public
+    # call audit rows already loaded; they price the Advisor request, never
+    # enter it.
+    anchor_calls: tuple[AdvisorAnchorCall, ...] = field(default=(), repr=False)
 
     @classmethod
     def from_records(
@@ -146,6 +211,7 @@ class AdvisorTranscriptHistory:
         prior_sequence: int | None = None
         found_current = False
         public_call_records: dict[str, tuple[Mapping[str, Any], dict[str, Any]]] = {}
+        anchor_calls: list[AdvisorAnchorCall] = []
         for row in records:
             if type(row) is not ChatMessageRecord or str(row.session_id) != session_id or str(row.id) in row_ids:
                 raise AuditIntegrityError("Advisor history contains a foreign or duplicate session row")
@@ -276,6 +342,20 @@ class AdvisorTranscriptHistory:
                     raise AuditIntegrityError("Advisor public call history repeats a physical identity")
                 if public_metadata.get("call_id") is not None:
                     public_call_records[public_metadata["call_id"]] = (public_calls[0], event)
+                if all(key in public_metadata for key in _ANCHOR_CALL_FIELDS):
+                    split = public_metadata["request_byte_split"]
+                    if split is not None and "total_bytes" not in split:
+                        raise AuditIntegrityError("Stored composer call request_byte_split lacks its total")
+                    anchor_calls.append(
+                        AdvisorAnchorCall.from_public_fields(
+                            model_requested=public_metadata["model_requested"],
+                            status=public_metadata["status"],
+                            prompt_tokens=public_metadata["prompt_tokens"],
+                            request_bytes=None if split is None else split["total_bytes"],
+                            carries_tools=public_metadata["tools_spec_hash"] is not None,
+                            budgeted="context_budget" in public_metadata and public_metadata["context_budget"] is not None,
+                        )
+                    )
             if row.raw_content is not None and row.raw_content != row.content:
                 if row.content.startswith(row.raw_content):
                     event["provider_visible_prose_char_range"] = [0, len(row.raw_content)]
@@ -404,7 +484,14 @@ class AdvisorTranscriptHistory:
             events.append(event)
         if not found_current:
             raise AuditIntegrityError("Advisor history is missing its exact current human request")
-        return cls(session_id, actor_user_id, current_request_id, stable_hash(request), json.dumps(events, ensure_ascii=False))
+        return cls(
+            session_id,
+            actor_user_id,
+            current_request_id,
+            stable_hash(request),
+            json.dumps(events, ensure_ascii=False),
+            tuple(anchor_calls),
+        )
 
     def validate_for(self, *, session_id: str | None, actor_user_id: str | None, request_id: str, request: str) -> None:
         if (self.session_id, self.actor_user_id, self.request_id, self.request_hash) != (
@@ -583,28 +670,33 @@ def _recover_read_bodies(events: list[dict[str, Any]], reader: TranscriptBlobRea
 
 # The availability gap a transcript reduced to fit the context budget carries.
 CONTEXT_BUDGET_TRANSCRIPT_OMISSION_GAP: Final[str] = "oldest_events_omitted_for_context_budget"
-# The gap an Advisor transcript carries when it sends earlier tool results as a stub.
-CONTEXT_BUDGET_TRANSCRIPT_STUB_GAP: Final[str] = "older_tool_results_stubbed_for_context_budget"
-# What an earlier tool result reads once the Advisor's context budget stubs it.
-# The compose loop's stub tells the model to call the tool again; the Advisor
-# has no tools, so its stub states only the omission.
-ADVISOR_TRANSCRIPT_TOOL_RESULT_STUB: Final[str] = "[Result omitted by ELSPETH to fit the context budget.]"
-# The gap an Advisor transcript carries when it shortens earlier user requests.
-CONTEXT_BUDGET_TRANSCRIPT_USER_REQUEST_GAP: Final[str] = "older_user_requests_shortened_for_context_budget"
-# How much of an earlier user request the last reduction tier keeps, in characters.
-ADVISOR_TRANSCRIPT_USER_REQUEST_KEEP_CHARS: Final[int] = 2_000
-# What follows the kept start of a shortened earlier user request; it carries
-# the request's original length so the Advisor knows how much it cannot see.
-ADVISOR_TRANSCRIPT_USER_REQUEST_MARKER: Final[str] = (
-    "\n[ELSPETH shortened this earlier user request to its first {kept:,} of {length:,} characters to fit the context budget.]"
-)
-# Worst-case wire bytes a reduced Advisor request adds that the event savings do
-# not count: the longer reduced transcript header with its counts, the
-# ``context_budget_reduction`` object and the three gaps, all JSON-escaped
-# inside the user message, and the separator a saving over-counts when the last
-# earlier event goes. Those are under 850; the rest is margin. A shortened
-# request's own marker is counted in its saving.
-ADVISOR_TRANSCRIPT_REDUCTION_ALLOWANCE_BYTES: Final[int] = 1024
+# The Advisor's view of earlier turns, by age (the same on every request; never by size):
+# the previous turns shown whole, as the user's request and the reply the user was shown;
+ADVISOR_HISTORY_WHOLE_TURNS: Final[int] = 3
+# older requests, newest first, as one unbroken run within this many tokens,
+# priced at the context budget's fallback rate on each event's wire bytes;
+ADVISOR_HISTORY_OLDER_REQUESTS_TOKENS: Final[int] = 8_000
+# an older request up to this many characters whole, a longer one as its first
+# and last characters with one fixed mark between.
+ADVISOR_HISTORY_REQUEST_WHOLE_CHARS: Final[int] = 2_000
+ADVISOR_HISTORY_REQUEST_HEAD_CHARS: Final[int] = 1_500
+ADVISOR_HISTORY_REQUEST_TAIL_CHARS: Final[int] = 500
+# The fixed mark between a shortened request's head and tail. The counts are
+# in the event's server-written ``shortened`` field, which a user's own text
+# cannot write; text that merely contains this mark carries no such field.
+ADVISOR_HISTORY_SHORTENED_MARK: Final[str] = "\n[... ELSPETH left out the middle of this earlier request ...]\n"
+# One availability gap per kind of earlier evidence the age rule leaves out.
+# An earlier Advisor call anchors an estimate only when it is at least this
+# fraction (1 / divisor) of the request being priced: the bytes added beyond
+# it are priced at the 3.0 fallback rate, so a much smaller call (an
+# auto-title call, an old small review) would make a cold-start price look
+# anchored and could stop a request that fits.
+ADVISOR_ANCHOR_MIN_SIZE_DIVISOR: Final[int] = 2
+
+ADVISOR_HISTORY_TOOL_TRAFFIC_GAP: Final[str] = "earlier_turn_tool_calls_and_results_not_shown"
+ADVISOR_HISTORY_REPLIES_GAP: Final[str] = "older_turn_replies_not_shown"
+ADVISOR_HISTORY_SHORTENED_GAP: Final[str] = "older_requests_shortened_in_the_middle"
+ADVISOR_HISTORY_TURNS_GAP: Final[str] = "oldest_turns_not_shown"
 
 # Where the current request's full text lives; the event carrying one of these
 # as its ``content_ref`` stands for the current request.
@@ -614,19 +706,92 @@ _REQUEST_REFERENCES: Final[frozenset[str]] = frozenset(get_args(AdvisorRequestRe
 
 @final
 @dataclass(frozen=True, slots=True)
-class AdvisorTranscriptReduction:
-    """Exact counts an Advisor transcript reduced to fit the context budget discloses."""
+class AdvisorHistoryByAge:
+    """Exact counts of how an Advisor request shows the earlier turns of its session."""
 
-    events_omitted: int
-    tool_results_stubbed: int
-    user_requests_shortened: int = 0
+    earlier_turns: int
+    whole: int
+    request_only: int
+    shortened: int
 
     def __post_init__(self) -> None:
-        counts = (self.events_omitted, self.tool_results_stubbed, self.user_requests_shortened)
+        counts = (self.earlier_turns, self.whole, self.request_only, self.shortened)
         if any(type(count) is not int for count in counts):
-            raise TypeError("Advisor transcript reduction counts must be exact integers")
-        if min(counts) < 0 or sum(counts) == 0:
-            raise ValueError("Advisor transcript reduction must omit, stub or shorten at least one earlier event")
+            raise TypeError("Advisor history counts must be exact integers")
+        if min(counts) < 0 or self.earlier_turns == 0 or self.whole + self.request_only > self.earlier_turns:
+            raise ValueError("Advisor history counts must describe at least one earlier turn")
+        if self.shortened > self.request_only:
+            raise ValueError("only a request-only turn can be shortened")
+
+    @property
+    def not_shown(self) -> int:
+        return self.earlier_turns - self.whole - self.request_only
+
+    def payload(self) -> dict[str, JsonValue]:
+        return {
+            "earlier_turns": self.earlier_turns,
+            "shown_whole_request_and_reply": self.whole,
+            "shown_request_only": self.request_only,
+            "request_only_shortened": self.shortened,
+            "not_shown": self.not_shown,
+        }
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class AdvisorPromptEstimate:
+    """An Advisor request's estimated prompt tokens and the anchor that priced it.
+
+    ``source``: ``advisor_call`` (an earlier successful call of this session
+    with the Advisor's model and no tools), ``composer_ratio`` (this turn's
+    budgeted composer call's bytes per token) or ``fallback`` (the context
+    budget's cold-start rate). Only the first two come from a real call.
+    """
+
+    tokens: int
+    source: Literal["advisor_call", "composer_ratio", "fallback"]
+    request_bytes: int
+
+    @property
+    def anchored(self) -> bool:
+        return self.source != "fallback"
+
+
+def estimate_advisor_prompt_tokens(
+    *, request_bytes: int, advisor_model: str, earlier: Sequence[AdvisorAnchorCall], this_turn: Sequence[AdvisorAnchorCall]
+) -> AdvisorPromptEstimate:
+    """Price an Advisor request of ``request_bytes`` (measured as a call record's ``request_byte_split``).
+
+    1. The newest successful call, this turn or earlier in the session, with
+       the Advisor's ``model_requested`` and no tools: its prompt tokens, plus
+       bytes added since at the fallback rate, or scaled down by its own
+       bytes when the request is smaller. A call with another model, a failed
+       or cancelled call, one without usage, or one smaller than half the
+       request (``ADVISOR_ANCHOR_MIN_SIZE_DIVISOR``) is passed over and older
+       calls are tried. The added bytes are still priced at the fallback
+       rate, so with a half-size anchor the estimate can be up to about a
+       third over (all added bytes at 3.0 where the content runs nearer 5).
+    2. Otherwise the newest successful budgeted composer call of this turn
+       (it carries tools): the request's bytes at that call's bytes per token.
+    3. Otherwise the fallback rate.
+    """
+    for call in reversed((*earlier, *this_turn)):
+        if call.usable and call.model_requested == advisor_model and not call.carries_tools:
+            tokens, size = cast(int, call.prompt_tokens), cast(int, call.request_bytes)
+            if ADVISOR_ANCHOR_MIN_SIZE_DIVISOR * size < request_bytes:
+                continue
+            if request_bytes >= size:
+                estimate = tokens + math.ceil((request_bytes - size) / CONTEXT_BUDGET_FALLBACK_BYTES_PER_TOKEN)
+            else:
+                estimate = math.ceil(tokens * request_bytes / size)
+            return AdvisorPromptEstimate(tokens=estimate, source="advisor_call", request_bytes=request_bytes)
+    for call in reversed(this_turn):
+        if call.usable and call.carries_tools and call.budgeted:
+            ratio = cast(int, call.request_bytes) / cast(int, call.prompt_tokens)
+            return AdvisorPromptEstimate(tokens=math.ceil(request_bytes / ratio), source="composer_ratio", request_bytes=request_bytes)
+    return AdvisorPromptEstimate(
+        tokens=math.ceil(request_bytes / CONTEXT_BUDGET_FALLBACK_BYTES_PER_TOKEN), source="fallback", request_bytes=request_bytes
+    )
 
 
 def _earlier_event_limit(events: Sequence[dict[str, JsonValue]]) -> int:
@@ -642,74 +807,59 @@ def _earlier_event_limit(events: Sequence[dict[str, JsonValue]]) -> int:
     )
 
 
-def _stubbed_tool_event(event: dict[str, JsonValue]) -> dict[str, JsonValue] | None:
-    """The event with every tool-result body replaced by the Advisor stub; None when it carries none.
-
-    The event is this module's own projection (see ``from_records``):
-    ``legacy_invocations`` is a list of objects and ``recovered_read`` an
-    object with a string ``content``.
-    """
-    if event["role"] != "tool":
-        return None
-    stubbed = dict(event)
-    changed = False
-    if "content" in event and type(event["content"]) is str and event["content"] != ADVISOR_TRANSCRIPT_TOOL_RESULT_STUB:
-        stubbed["content"] = ADVISOR_TRANSCRIPT_TOOL_RESULT_STUB
-        changed = True
-    if "legacy_invocations" in event:
-        invocations: list[JsonValue] = []
-        for invocation in cast(list[dict[str, JsonValue]], event["legacy_invocations"]):
-            if (
-                "result_canonical" in invocation
-                and type(invocation["result_canonical"]) is str
-                and invocation["result_canonical"] != ADVISOR_TRANSCRIPT_TOOL_RESULT_STUB
-            ):
-                invocation = dict(invocation) | {"result_canonical": ADVISOR_TRANSCRIPT_TOOL_RESULT_STUB}
-                changed = True
-            invocations.append(invocation)
-        stubbed["legacy_invocations"] = invocations
-    if "recovered_read" in event:
-        recovered = cast(dict[str, JsonValue], event["recovered_read"])
-        if recovered["content"] != ADVISOR_TRANSCRIPT_TOOL_RESULT_STUB:
-            stubbed["recovered_read"] = recovered | {"content": ADVISOR_TRANSCRIPT_TOOL_RESULT_STUB}
-            changed = True
-    return stubbed if changed else None
-
-
 def _event_wire_bytes(event: dict[str, JsonValue]) -> int:
     """An event's escaped share of the transcript inside a request message, plus its separator."""
     return escaped_bytes(json.dumps(event, ensure_ascii=False)) + 1
 
 
-def _shortened_user_event(event: dict[str, JsonValue]) -> dict[str, JsonValue] | None:
-    """A human event cut to its first characters plus a marker with its original length; None when it is short enough."""
+def _older_request_event(event: dict[str, JsonValue]) -> tuple[dict[str, JsonValue], bool]:
+    """An older human request as sent: whole up to the kept length, else head and tail with the fixed mark.
+
+    The event's text is already redacted (``snapshot`` redacts before any
+    cut), so a cut can never split a secret out of the redactor's reach. A
+    shortened event carries the server-written ``shortened`` counts.
+    """
     content = event["content"] if "content" in event else None
-    if type(content) is not str or len(content) <= ADVISOR_TRANSCRIPT_USER_REQUEST_KEEP_CHARS:
-        return None
-    marker = ADVISOR_TRANSCRIPT_USER_REQUEST_MARKER.format(kept=ADVISOR_TRANSCRIPT_USER_REQUEST_KEEP_CHARS, length=len(content))
-    return event | {"content": content[:ADVISOR_TRANSCRIPT_USER_REQUEST_KEEP_CHARS] + marker}
+    if type(content) is not str or len(content) <= ADVISOR_HISTORY_REQUEST_WHOLE_CHARS:
+        return event, False
+    head, tail = content[:ADVISOR_HISTORY_REQUEST_HEAD_CHARS], content[-ADVISOR_HISTORY_REQUEST_TAIL_CHARS:]
+    shortened: dict[str, JsonValue] = {
+        "kept_head_chars": ADVISOR_HISTORY_REQUEST_HEAD_CHARS,
+        "kept_tail_chars": ADVISOR_HISTORY_REQUEST_TAIL_CHARS,
+        "original_chars": len(content),
+    }
+    return event | {"content": head + ADVISOR_HISTORY_SHORTENED_MARK + tail, "shortened": shortened}, True
 
 
-def _within_shed_above(policy: ContextBudgetPolicy, request_bytes: int) -> bool:
-    """Whether a request of this many wire bytes is at or under the high mark, priced as the budgeter prices it with no anchor."""
+def _shown_reply(event: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    """A reply the user was shown, as prose only: its tool-call arguments are tool traffic."""
+    return {key: value for key, value in event.items() if key != "tool_calls"}
+
+
+def _is_shown_reply(event: dict[str, JsonValue]) -> bool:
+    """A published composer reply: never a withheld candidate (``publication_status``) or a backend control event."""
     return (
-        math.ceil(request_bytes / policy.fallback_bytes_per_token) <= policy.shed_above * policy.max_prompt_tokens
-        and request_bytes <= policy.max_request_bytes
+        event["role"] == "assistant"
+        and event["authorship"] == "composer"
+        and event["source"] == "persisted_session"
+        and "publication_status" not in event
     )
 
 
 @final
 @dataclass(frozen=True, slots=True)
 class AdvisorVisibleTranscript:
-    """Immutable available visible chronology, possibly reduced to fit a context budget (see ``availability_gaps``); all text is untrusted."""
+    """Immutable available visible chronology, possibly shown by age or reduced (see ``availability_gaps``); all text is untrusted."""
 
     request: str = field(repr=False)
     binding: str
     provider_json: str = field(repr=False)
     semantic_binding: str
-    # Set only on the transcript an Advisor request sends after its context
-    # budget reduced it; the header that introduces it states these counts.
-    reduction: AdvisorTranscriptReduction | None = None
+    # Set only on the transcript an Advisor request sends after the age rule
+    # shaped its earlier turns; the header that introduces it states these counts.
+    history_by_age: AdvisorHistoryByAge | None = None
+    # Earlier calls that price the request (see ``estimate_advisor_prompt_tokens``); never rendered.
+    anchor_calls: tuple[AdvisorAnchorCall, ...] = field(default=(), repr=False, compare=False)
 
     def with_request_reference(
         self,
@@ -726,8 +876,9 @@ class AdvisorVisibleTranscript:
             stable_hash({"transcript": self.binding, "request_reference": reference}),
             json.dumps(payload, ensure_ascii=False),
             self.semantic_binding,
-            # Renaming the reference changes no event, so a reduction's counts stay exact.
-            self.reduction,
+            # Renaming the reference changes no event, so the age counts stay exact.
+            self.history_by_age,
+            self.anchor_calls,
         )
 
     def event_bytes(self) -> tuple[int, ...]:
@@ -776,8 +927,8 @@ class AdvisorVisibleTranscript:
         """
         if not indices:
             return self
-        if self.reduction is not None:
-            raise ValueError("a transcript already reduced for an Advisor request cannot be reduced again")
+        if self.history_by_age is not None:
+            raise ValueError("a transcript already shaped for an Advisor request cannot be reduced again")
         if not indices <= frozenset(self.sheddable_event_indices()):
             raise ValueError("only sheddable transcript events can be omitted")
         payload = json.loads(self.provider_json)
@@ -789,117 +940,145 @@ class AdvisorVisibleTranscript:
             stable_hash({"transcript": self.binding, "omitted_events": sorted(indices)}),
             json.dumps(payload, ensure_ascii=False),
             self.semantic_binding,
+            anchor_calls=self.anchor_calls,
         )
 
-    def context_budget_segments(self) -> tuple[SheddableSegment, ...]:
-        """What an Advisor request may leave out of this transcript, oldest first, as context-budget segments.
-
-        Only events before the current request's reference are eligible, and
-        never a human-authored one. A tool event with a result body yields a
-        ``stub:<index>`` segment (its saving: the body's bytes less the
-        stub's) and every eligible event a ``drop:<index>`` segment (its
-        saving: what remains of it once stubbed). Stubs rank before drops, so
-        a decision stubs every eligible result before it drops any event, and
-        a dropped event's two savings add up to its whole size.
-        """
+    def earlier_turn_count(self) -> int:
+        """How many earlier turns this transcript holds: one per human request before the current one."""
         events = json.loads(self.provider_json)["events"]
-        stubs: list[SheddableSegment] = []
-        drops: list[SheddableSegment] = []
-        for index, event in enumerate(events[: _earlier_event_limit(events)]):
-            if event["authorship"] == "human":
-                continue
-            size = _event_wire_bytes(event)
-            stubbed = _stubbed_tool_event(event)
-            stubbed_size = _event_wire_bytes(stubbed) if stubbed is not None else size
-            if stubbed_size < size:
-                stubs.append(SheddableSegment(kind=SheddableKind.TOOL_RESULT, key=f"stub:{index}", saving_bytes=size - stubbed_size))
-                size = stubbed_size
-            drops.append(SheddableSegment(kind=SheddableKind.HATCH_EVENT, key=f"drop:{index}", saving_bytes=size))
-        return (*stubs, *drops)
+        return sum(1 for event in events[: _earlier_event_limit(events)] if event["authorship"] == "human")
 
-    def user_request_segments(self) -> tuple[SheddableSegment, ...]:
-        """Earlier user requests the last reduction tier may shorten, oldest first, as ``shorten:<index>`` segments.
+    def by_age(self, *, older_left_out: int = 0, whole_left_out: int = 0) -> AdvisorVisibleTranscript:
+        """The transcript an Advisor request sends: earlier turns shown by age, this turn whole.
 
-        Only a human event before the current request's reference whose text
-        is longer than the kept start is eligible; its saving is its size less
-        the shortened event's, marker included. The current request and this
-        turn's events are never eligible.
+        A turn starts at each human request. A recompose writes no new one,
+        so its events stay in the original request's turn; rows written
+        between turns (a revert notice, run diagnostics, a fork's notice) fall
+        in the turn before them, and rows before the first request in none.
+
+        - The previous :data:`ADVISOR_HISTORY_WHOLE_TURNS` turns: the request
+          whole, and the reply the user was shown (the turn's last published
+          composer reply, prose only).
+        - Older turns, newest first, as one unbroken run within
+          :data:`ADVISOR_HISTORY_OLDER_REQUESTS_TOKENS`: the request only,
+          shortened in the middle above :data:`ADVISOR_HISTORY_REQUEST_WHOLE_CHARS`.
+          The run stops at the first request that does not fit; none is
+          skipped and none is pinned.
+        - Nothing else from an earlier turn: no tool call, tool result,
+          call metadata or backend event.
+
+        Under size pressure the caller leaves out ``older_left_out`` of the
+        oldest older requests that would otherwise go, and then
+        ``whole_left_out`` of the oldest whole turns (only once every older
+        request is out), so what goes is always a contiguous recent run.
+        ``binding`` covers this transcript's binding plus exactly what was
+        left out, shortened or cut to prose; ``request`` and
+        ``semantic_binding`` are unchanged. With no earlier turn this
+        transcript is returned unchanged.
         """
-        events = json.loads(self.provider_json)["events"]
-        segments: list[SheddableSegment] = []
-        for index, event in enumerate(events[: _earlier_event_limit(events)]):
-            shortened = _shortened_user_event(event) if event["authorship"] == "human" else None
-            if shortened is not None:
-                saving = _event_wire_bytes(event) - _event_wire_bytes(shortened)
-                segments.append(SheddableSegment(kind=SheddableKind.USER_REQUEST, key=f"shorten:{index}", saving_bytes=saving))
-        return tuple(segments)
-
-    def reduced(
-        self, *, stubbed: frozenset[int], omitted: frozenset[int], shortened: frozenset[int] = frozenset()
-    ) -> AdvisorVisibleTranscript:
-        """Stub earlier tool results, leave earlier events out and shorten earlier user requests, disclosing exact counts.
-
-        ``binding`` covers this transcript's binding plus the index sets;
-        ``request`` and ``semantic_binding`` are unchanged, so leaving evidence
-        out is never mistaken for new or lost repair progress. No indices
-        returns this transcript.
-        """
-        if not stubbed and not omitted and not shortened:
-            return self
-        if self.reduction is not None:
-            # Indices name this transcript's events and the counts would restart.
-            raise ValueError("a transcript already reduced for an Advisor request cannot be reduced again")
+        if self.history_by_age is not None:
+            raise ValueError("a transcript already shaped for an Advisor request cannot be shaped again")
         payload = json.loads(self.provider_json)
-        events = payload["events"]
-        earlier = list(enumerate(events[: _earlier_event_limit(events)]))
-        eligible = {index for index, event in earlier if event["authorship"] != "human"}
-        if not omitted <= eligible or not stubbed <= eligible:
-            raise ValueError("only earlier, non-human transcript events can be reduced")
-        if not shortened <= {index for index, event in earlier if event["authorship"] == "human"}:
-            raise ValueError("only earlier user requests can be shortened")
-        projected: list[JsonValue] = []
-        stubs_sent = 0
-        for index, event in enumerate(events):
-            if index in omitted:
+        events: list[dict[str, JsonValue]] = payload["events"]
+        limit = _earlier_event_limit(events)
+        starts = [index for index, event in enumerate(events[:limit]) if event["authorship"] == "human"]
+        turns = len(starts)
+        if turns == 0:
+            return self
+        if min(older_left_out, whole_left_out) < 0:
+            raise ValueError("left-out counts are never negative")
+        whole_turns = max(0, min(ADVISOR_HISTORY_WHOLE_TURNS, turns) - whole_left_out)
+        # Older requests, newest first, while the unbroken run fits its budget.
+        budget_bytes = ADVISOR_HISTORY_OLDER_REQUESTS_TOKENS * CONTEXT_BUDGET_FALLBACK_BYTES_PER_TOKEN
+        older: dict[int, tuple[dict[str, JsonValue], bool]] = {}
+        spent = 0
+        for start in reversed(starts[: turns - min(ADVISOR_HISTORY_WHOLE_TURNS, turns)]):
+            shown, cut = _older_request_event(events[start])
+            spent += _event_wire_bytes(shown)
+            if spent > budget_bytes:
+                break
+            older[start] = (shown, cut)
+        if whole_left_out and older_left_out < len(older):
+            raise ValueError("a whole earlier turn goes only after every older request")
+        for start in sorted(older)[:older_left_out]:
+            del older[start]
+        whole_starts = starts[turns - whole_turns :] if whole_turns else []
+        replies: set[int] = set()
+        for position, start in enumerate(starts):
+            if start not in whole_starts:
                 continue
-            if index in stubbed:
-                replacement = _stubbed_tool_event(event)
-                if replacement is None:
-                    raise ValueError("only an earlier tool result with a body can be stubbed")
-                event = replacement
-                stubs_sent += 1
-            if index in shortened:
-                replacement = _shortened_user_event(event)
-                if replacement is None:
-                    raise ValueError("only an earlier user request longer than the kept start can be shortened")
-                event = replacement
-            projected.append(event)
-        payload["events"] = projected
+            end = starts[position + 1] if position + 1 < turns else limit
+            reply = next((index for index in range(end - 1, start, -1) if _is_shown_reply(events[index])), None)
+            if reply is not None:
+                replies.add(reply)
+        sent: list[JsonValue] = []
+        left_out: list[int] = []
+        shortened: list[int] = []
+        prose_only: list[int] = []
+        for index, event in enumerate(events):
+            if index >= limit or index in whole_starts:
+                sent.append(event)
+            elif index in older:
+                shown, cut = older[index]
+                sent.append(shown)
+                if cut:
+                    shortened.append(index)
+            elif index in replies:
+                shown = _shown_reply(event)
+                sent.append(shown)
+                if shown != event:
+                    prose_only.append(index)
+            else:
+                left_out.append(index)
+        counts = AdvisorHistoryByAge(earlier_turns=turns, whole=whole_turns, request_only=len(older), shortened=len(shortened))
+        payload["events"] = sent
         for gap, applies in (
-            (CONTEXT_BUDGET_TRANSCRIPT_OMISSION_GAP, bool(omitted)),
-            (CONTEXT_BUDGET_TRANSCRIPT_STUB_GAP, stubs_sent > 0),
-            (CONTEXT_BUDGET_TRANSCRIPT_USER_REQUEST_GAP, bool(shortened)),
+            (ADVISOR_HISTORY_TOOL_TRAFFIC_GAP, True),
+            (ADVISOR_HISTORY_REPLIES_GAP, counts.request_only > 0),
+            (ADVISOR_HISTORY_SHORTENED_GAP, counts.shortened > 0),
+            (ADVISOR_HISTORY_TURNS_GAP, counts.not_shown > 0),
         ):
             if applies and gap not in payload["availability_gaps"]:
                 payload["availability_gaps"].append(gap)
-        reduction = AdvisorTranscriptReduction(
-            events_omitted=len(omitted), tool_results_stubbed=stubs_sent, user_requests_shortened=len(shortened)
-        )
-        payload["context_budget_reduction"] = {
-            "older_events_omitted": reduction.events_omitted,
-            "older_tool_results_stubbed": reduction.tool_results_stubbed,
-            "older_user_requests_shortened": reduction.user_requests_shortened,
-        }
+        payload["earlier_turns_shown_by_age"] = counts.payload()
         return AdvisorVisibleTranscript(
             self.request,
             stable_hash(
-                {"transcript": self.binding, "omitted_events": sorted(omitted)}
-                | ({"stubbed_events": sorted(stubbed)} if stubbed else {})
-                | ({"shortened_events": sorted(shortened)} if shortened else {})
+                {
+                    "transcript": self.binding,
+                    "left_out_events": left_out,
+                    "shortened_events": shortened,
+                    "prose_only_events": prose_only,
+                }
             ),
             json.dumps(payload, ensure_ascii=False),
             self.semantic_binding,
-            reduction,
+            counts,
+            self.anchor_calls,
+        )
+
+    def with_prompt_estimate(self, estimate: AdvisorPromptEstimate, *, limit_tokens: int) -> AdvisorVisibleTranscript:
+        """Record, inside a transcript already shaped by age, the estimate that priced the request and the limit it met.
+
+        The estimate was taken on the request without this record (a few
+        dozen bytes). ``binding`` is unchanged: the record states a price, not
+        evidence.
+        """
+        if self.history_by_age is None:
+            raise ValueError("only a transcript shaped by age carries the request's size estimate")
+        payload = json.loads(self.provider_json)
+        payload["earlier_turns_shown_by_age"]["request_size"] = {
+            "estimated_prompt_tokens": estimate.tokens,
+            "estimate_source": estimate.source,
+            "declared_limit_tokens": limit_tokens,
+        }
+        return AdvisorVisibleTranscript(
+            self.request,
+            self.binding,
+            json.dumps(payload, ensure_ascii=False),
+            self.semantic_binding,
+            self.history_by_age,
+            self.anchor_calls,
         )
 
     def untrusted_content_parts(self) -> tuple[PromptGuardContentPart, ...]:
@@ -939,52 +1118,6 @@ class AdvisorVisibleTranscript:
 
         walk(payload)
         return json_content_parts(self.provider_json, ensure_ascii=False, string_parts=partitions)
-
-
-def fit_advisor_transcript_to_context_budget(
-    transcript: AdvisorVisibleTranscript, *, policy: ContextBudgetPolicy, request_wire_bytes: int
-) -> AdvisorVisibleTranscript:
-    """Reduce an Advisor request's transcript to the compose loop's context budget, or return it unchanged.
-
-    ``request_wire_bytes`` is the wire size of the whole Advisor request as it
-    would be sent with ``transcript`` unreduced. Under ``shed_above`` of the
-    window nothing changes, byte for byte. Above it, earlier tool results are
-    stubbed and then earlier events dropped, oldest first, toward ``shed_to``.
-    Only when those two tiers cannot bring the request under ``shed_above``
-    are earlier user requests shortened, oldest first, to their first
-    characters, until it is under. The current request and this turn's events
-    are never reduced. Each request decides afresh: the Advisor replays no
-    cached conversation, so there is no shed state to keep stable. Nothing is
-    ever refused here: a request still over the window, or over the byte
-    maximum, is sent with everything eligible reduced, and the provider judges
-    its own limit.
-    """
-    segments = transcript.context_budget_segments()
-    remaining = request_wire_bytes + ADVISOR_TRANSCRIPT_REDUCTION_ALLOWANCE_BYTES
-    shed: tuple[str, ...] = ()
-    if segments:
-        try:
-            decision = decide_context_budget(
-                policy=policy, request_bytes=remaining, segments=segments, previously_shed=frozenset(), on_over_estimate="send"
-            )
-            shed, remaining = decision.shed_keys, decision.request_bytes_after
-        except ContextBudgetRefusal as refusal:
-            # With on_over_estimate="send" the budgeter never raises its "tokens"
-            # refusal (that one is raised only for "refuse"), so a refusal here
-            # is the byte ceiling, raised only once every segment is shed. Any
-            # other ceiling would be a new budgeter contract, not an Advisor fault.
-            if refusal.ceiling != "bytes":
-                raise
-            shed, remaining = tuple(segment.key for segment in segments), refusal.request_bytes
-    shortened: set[int] = set()
-    for segment in transcript.user_request_segments():
-        if _within_shed_above(policy, remaining):
-            break
-        shortened.add(int(segment.key.removeprefix("shorten:")))
-        remaining -= segment.saving_bytes
-    stubbed = frozenset(int(key.removeprefix("stub:")) for key in shed if key.startswith("stub:"))
-    omitted = frozenset(int(key.removeprefix("drop:")) for key in shed if key.startswith("drop:"))
-    return transcript.reduced(stubbed=stubbed, omitted=omitted, shortened=frozenset(shortened))
 
 
 @dataclass(slots=True)
@@ -1166,6 +1299,7 @@ class AdvisorTranscriptOwner:
             stable_hash({"events": events, "gaps": gaps}),
             json.dumps(payload, ensure_ascii=False),
             stable_hash({"history": history_facts, "facts": sorted(facts), "files": file_facts, "gaps": gaps}),
+            anchor_calls=self._history.anchor_calls if self._history is not None else (),
         )
 
     def use_blob_reader(self, reader: TranscriptBlobReader) -> None:

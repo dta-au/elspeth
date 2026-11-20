@@ -7,6 +7,7 @@ advisor checkpoint owner.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Any, Final, Literal
@@ -248,6 +249,19 @@ def _advisor_signoff_fully_blocking_validation(*, detail: str, suggestion: str, 
 # guaranteed-unique BEGIN/END pair.
 # ---------------------------------------------------------------------------
 _ADVISOR_FINDINGS_MAX_CHARS: Final[int] = 4_000
+# A completion review that was not sent because its anchored size estimate is
+# over the declared prompt-token limit (``advisor_checkpoint``). Backend copy:
+# it names only the estimate, the limit and the setting.
+ADVISOR_REQUEST_OVER_LIMIT_FINDINGS: Final[str] = (
+    "The review request was not sent: it is estimated at {tokens:,} prompt tokens, over the declared limit of {limit:,} "
+    "(composer_context_max_prompt_tokens). Earlier conversation was already left out of it; what remains is the "
+    "pipeline's own content and this turn's evidence."
+)
+_ADVISOR_REQUEST_OVER_LIMIT_SHAPE: Final[re.Pattern[str]] = re.compile(
+    r"[0-9][0-9,]*".join(
+        re.escape(part) for part in ADVISOR_REQUEST_OVER_LIMIT_FINDINGS.replace("{limit:,}", "{tokens:,}").split("{tokens:,}")
+    )
+)
 _ADVISOR_FINDINGS_UNTRUSTED_BEGIN: Final[str] = "BEGIN_UNTRUSTED_ADVISOR_FINDINGS"
 _ADVISOR_FINDINGS_UNTRUSTED_END: Final[str] = "END_UNTRUSTED_ADVISOR_FINDINGS"
 
@@ -450,8 +464,14 @@ def advisor_signoff_blocked_wording(
     """
     if reason == "budget_exhausted":
         rejection_detail = " " + request_rejection.explanation if request_rejection is not None else ""
+        # A review stopped at the declared limit states its estimate after the
+        # unchanged sentence. Every budget_exhausted ``findings`` is backend
+        # copy; only the closed stop shape is shown.
+        stop_detail = " " + findings if _ADVISOR_REQUEST_OVER_LIMIT_SHAPE.fullmatch(findings) else ""
         return (
-            "The reply was withheld because the completion review could not run within the existing request limits." + rejection_detail,
+            "The reply was withheld because the completion review could not run within the existing request limits."
+            + rejection_detail
+            + stop_detail,
             "Saved draft progress remains available; continue in a new message.",
         )
     if reason == "publication_withheld":
