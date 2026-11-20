@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useState, type JSX } from "react";
+import { useCallback, useDeferredValue, useEffect, useId, useLayoutEffect, useMemo, useState, type JSX } from "react";
 import type { CompositionState } from "@/types";
 import { optionBlobReferences, promptFileBindings, promptFileEditability, promptFileSlots, type PromptFileBinding } from "@/lib/blobBindings";
 import { useBlobStore } from "@/stores/blobStore";
@@ -7,7 +7,7 @@ import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore
 import { usePromptDraftStore } from "@/stores/promptDraftStore";
 import { sortedSourceEntries, sourceComponentId } from "@/utils/compositionState";
 import { BlobFileName } from "@/components/blobs/BlobFileName";
-import { Button } from "@/components/ui";
+import { Button, Input } from "@/components/ui";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 import { NODE_LABELS } from "./GraphOutputs";
 import { optionLabel, promptSlotLabel } from "./OptionRows";
@@ -30,6 +30,13 @@ interface FileMapping {
   isNode: boolean;
   /** `entry` is the rest of the path inside a multi-key option (e.g. `criteria.content` in `files.criteria.content`). */
   fields: Array<{ path: string; label: string; entry?: string }>;
+}
+
+/** Option keys that hold a file reference read as "File", never as "Blob Ref". */
+const FILE_REFERENCE_OPTIONS: ReadonlySet<string> = new Set(["blob_ref", "blob_id"]);
+
+function referenceLabel(option: string): string {
+  return FILE_REFERENCE_OPTIONS.has(option) || option.endsWith("_blob_id") ? "File" : optionLabel(option);
 }
 
 /** One row per (component, file): every option field of that component that references the file. */
@@ -63,7 +70,7 @@ function fileMappings(state: CompositionState): FileMapping[] {
         const prompt = promptLabels.get(reference.fieldPath);
         const [option, ...rest] = reference.fieldPath.split(".");
         mapping.fields.push(prompt !== undefined ? { path: reference.fieldPath, label: prompt }
-          : { path: reference.fieldPath, label: optionLabel(option), ...(rest.length > 0 ? { entry: rest.join(".") } : {}) });
+          : { path: reference.fieldPath, label: referenceLabel(option), ...(rest.length > 0 ? { entry: rest.join(".") } : {}) });
       }
       mappings.set(key, mapping);
     }
@@ -119,16 +126,41 @@ function FileMappings({ state, onShowNode, visibleNodeIds, onCount }: GraphFiles
   const bindings = useMemo(() => promptFileBindings(state), [state]);
   const drafts = usePromptDraftStore((store) => store.drafts);
   const sameSession = activeSessionId === state.session_id;
+  const [filter, setFilter] = useState("");
+  const query = useDeferredValue(filter.trim().toLowerCase());
+  const filenames = useMemo(() => new Map(sameSession && blobSessionId === state.session_id
+    ? blobs.map((blob) => [blob.id.toLowerCase(), blob.filename]) : []), [sameSession, blobSessionId, state.session_id, blobs]);
+  // Stable order: file name (the id when the name is unknown), then the
+  // component's place in the graph (sources, steps, sinks as authored).
+  const shown = useMemo(() => {
+    const order = new Map(rows.map((row, index) => [row.key, index]));
+    const name = (row: FileMapping) => filenames.get(row.blobId) ?? row.blobId;
+    return rows
+      .filter((row) => query === "" || name(row).toLowerCase().includes(query) || row.component.toLowerCase().includes(query))
+      .sort((left, right) => name(left).localeCompare(name(right)) || (order.get(left.key) ?? 0) - (order.get(right.key) ?? 0));
+  }, [rows, filenames, query]);
+  const filterId = useId();
   // Slots of this graph that hold unsaved prompt text, as "<node>\u0000<field>".
   const draftSlots = useMemo(() => new Set(Object.values(drafts)
     .filter((draft) => draft.sessionId === state.session_id).map((draft) => `${draft.nodeId}\u0000${draft.fieldPath}`)), [drafts, state.session_id]);
   return <>
     {sameSession && loadError && <p role="alert">{loadError}</p>}
     {rows.length === 0 ? <p className="graph-config-empty-value">No session files are attached to this graph.</p>
-      : <div className="graph-files-scroll" tabIndex={0} role="group" aria-label="File mappings table">
+      : <>
+      <div className="graph-files-filter">
+        <label htmlFor={filterId}>Filter by file or step</label>
+        <Input id={filterId} type="search" value={filter} onChange={(event) => setFilter(event.target.value)}
+          autoComplete="off" spellCheck={false} aria-describedby={`${filterId}-count`} />
+        <span id={`${filterId}-count`} className="graph-files-filter-count" role="status">
+          {query === "" ? `${rows.length} ${rows.length === 1 ? "row" : "rows"}` : `${shown.length} of ${rows.length} rows`}
+        </span>
+      </div>
+      <div className="graph-files-scroll" tabIndex={0} role="group" aria-label="File mappings table">
         <table>
-          <thead><tr><th scope="col">File</th><th scope="col">Used by</th><th scope="col">Fields</th><th scope="col">Actions</th></tr></thead>
-          <tbody>{rows.map((row) => {
+          {/* Actions lead each row so an open step panel, which overlays the
+              right of the workspace, never covers them. */}
+          <thead><tr><th scope="col">Actions</th><th scope="col">File</th><th scope="col">Used by</th><th scope="col">Fields</th></tr></thead>
+          <tbody>{shown.map((row) => {
             const unsavedFields = row.isNode ? row.fields.filter((field) => draftSlots.has(`${row.componentId}\u0000${field.path}`)) : [];
             const rowBindings = row.isNode ? bindings.filter((item) => item.nodeId === row.componentId && item.blobId === row.blobId) : [];
             // Edit file opens the slot holding unsaved text first, so the user lands on it.
@@ -142,7 +174,9 @@ function FileMappings({ state, onShowNode, visibleNodeIds, onCount }: GraphFiles
           })}
           </tbody>
         </table>
-      </div>}
+        {shown.length === 0 && <p className="graph-config-empty-value">No file or step matches this filter.</p>}
+      </div>
+      </>}
   </>;
 }
 
@@ -177,13 +211,6 @@ function FileMappingRow({ row, state, onShowNode, hidden, binding, unsaved, same
   const editBlocked = binding === undefined || editability === null || (!editability.editable && !editability.opens);
   const showReason = hidden ? "This component is hidden by the current graph view." : null;
   return <tr>
-    <th scope="row">{sameSession
-      ? <BlobFileName blobId={row.blobId} fallback={loadError ? "File name unavailable" : undefined} />
-      : <span title={row.blobId}>File reference</span>}</th>
-    <td>{row.kind}: <code>{row.component}</code>{unsaved && <> <span className="prompt-editor-tag">Unsaved changes</span></>}</td>
-    <td>{row.fields.map((field) => <div key={field.path} title={field.path}>
-      {field.label}{field.entry !== undefined && <>: <code>{field.entry}</code></>}
-    </div>)}</td>
     <td>
       <div className="graph-file-actions">
         <Button type="button" compact aria-label={`Show node ${row.component}`}
@@ -200,5 +227,12 @@ function FileMappingRow({ row, state, onShowNode, hidden, binding, unsaved, same
         {editReason && <span id={`${id}-edit`} className="sr-only">{editReason}</span>}
       </div>
     </td>
+    <th scope="row">{sameSession
+      ? <BlobFileName bare blobId={row.blobId} fallback={loadError ? "File name unavailable" : undefined} />
+      : <span title={row.blobId}>File reference</span>}</th>
+    <td>{row.kind}: <code>{row.component}</code>{unsaved && <> <span className="prompt-editor-tag">Unsaved changes</span></>}</td>
+    <td>{row.fields.map((field) => <div key={field.path} title={field.path}>
+      {field.label}{field.entry !== undefined && <>: <code>{field.entry}</code></>}
+    </div>)}</td>
   </tr>;
 }

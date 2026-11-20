@@ -10,7 +10,8 @@ export function useBlobFilename(blobId: string): string | null {
   );
 }
 
-export function BlobFileName({ blobId, sha256, fallback }: { blobId: string; sha256?: string; fallback?: string }) {
+/** `bare` drops the "File:" prefix where a column header already says it. */
+export function BlobFileName({ blobId, sha256, fallback, bare = false }: { blobId: string; sha256?: string; fallback?: string; bare?: boolean }) {
   const sessionId = useSessionStore((state) => state.activeSessionId);
   const blob = useBlobStore((state) =>
     state.activeSessionId === sessionId
@@ -24,7 +25,7 @@ export function BlobFileName({ blobId, sha256, fallback }: { blobId: string; sha
   const changed = sha256 !== undefined && blob.content_hash !== null && sha256.toLowerCase() !== blob.content_hash.toLowerCase();
   return (
     <span title={`File id ${blobId}${sha256 ? ` · SHA-256 ${sha256.slice(0, 12)}…` : ""}`} data-blob-id={blobId}>
-      File: {blob.filename}{changed && <span> (changed since attached)</span>}
+      {bare ? null : "File: "}{blob.filename}{changed && <span> (changed since attached)</span>}
     </span>
   );
 }
