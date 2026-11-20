@@ -10,7 +10,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal, Protocol, Self, final
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, Self, final
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator, model_validator
 
@@ -580,6 +580,7 @@ class _LLMProfileResolver:
             description=full_schema.description,
             json_schema=public_json_schema,
             knob_schema={"fields": fields},
+            usage_when_not_to_use=full_schema.usage_when_not_to_use,
             composer_hints=full_schema.composer_hints,
             secret_requirements=(),
             web_config_authority=full_schema.web_config_authority,
@@ -781,6 +782,7 @@ class _BedrockGuardrailProfileResolver:
             description=full_schema.description,
             json_schema=public_json_schema,
             knob_schema={"fields": fields},
+            usage_when_not_to_use=full_schema.usage_when_not_to_use,
             composer_hints=full_schema.composer_hints,
             secret_requirements=(),
             web_config_authority=full_schema.web_config_authority,
@@ -861,6 +863,18 @@ class _BedrockGuardrailProfileResolver:
             return self._profiles[alias]
         except KeyError:
             raise ValueError("profile_unavailable") from None
+
+
+# Profiled prohibitions, published on the public schema and copied from it onto
+# the public summary, so both discovery surfaces state the same text.
+_S3_PROFILED_USAGE_WHEN_NOT_TO_USE: Final[str] = (
+    "Do not use when no matching operator-approved profile is available, the object is outside the "
+    "approved prefix, or the workflow needs to enumerate or stream multiple objects."
+)
+_AZURE_SEARCH_PROFILED_USAGE_WHEN_NOT_TO_USE: Final[str] = (
+    "Do not use when no operator-approved profile admits the index you need, for indexing documents, "
+    "or for generating answers; use rag_retrieval for Chroma collections."
+)
 
 
 class _S3SourceProfileResolver:
@@ -975,6 +989,7 @@ class _S3SourceProfileResolver:
             description=full_schema.description,
             json_schema=public_json_schema,
             knob_schema={"fields": fields},
+            usage_when_not_to_use=_S3_PROFILED_USAGE_WHEN_NOT_TO_USE,
             composer_hints=(
                 "Select an operator-approved S3 source profile and provide only a relative object key.",
                 "The server supplies the profile's private runtime binding.",
@@ -1168,6 +1183,7 @@ class _TextractProfileResolver:
             description=full_schema.description,
             json_schema=public_json_schema,
             knob_schema={"fields": fields},
+            usage_when_not_to_use=full_schema.usage_when_not_to_use,
             composer_hints=(
                 "Select an operator-approved Textract document profile; the server supplies the private storage binding.",
                 "Rows carry relative object keys in key_field — never bucket names or document locations.",
@@ -1363,6 +1379,7 @@ class _AzureSearchProfileResolver:
             description=full_schema.description,
             json_schema=public_json_schema,
             knob_schema={"fields": fields},
+            usage_when_not_to_use=_AZURE_SEARCH_PROFILED_USAGE_WHEN_NOT_TO_USE,
             composer_hints=(
                 "This is the Azure RAG plugin: select an operator-approved Azure AI Search profile; the server supplies the private service binding.",
                 "Name an index the chosen profile admits.",
@@ -1627,6 +1644,8 @@ class OperatorProfileRegistry:
             "config_fields": config_fields,
             "composer_hints": public_schema.composer_hints,
             "secret_requirements": public_schema.secret_requirements,
+            # One owner: get_plugin_schema and list discovery state the same prohibition.
+            "usage_when_not_to_use": public_schema.usage_when_not_to_use,
         }
         # Exact-type dispatch over the module-private resolver classes:
         # each arm publishes the guidance for ONE operator-profile contract, so a
@@ -1636,10 +1655,6 @@ class OperatorProfileRegistry:
             updates["usage_when_to_use"] = (
                 "Use in Web Composer when an operator-approved S3 source profile is available and the workflow "
                 "needs one bounded CSV, JSON-array, or JSONL object selected by relative object key."
-            )
-            updates["usage_when_not_to_use"] = (
-                "Do not use when no matching operator-approved profile is available, the object is outside the "
-                "approved prefix, or the workflow needs to enumerate or stream multiple objects."
             )
             updates["example_use"] = (
                 "sources:\n"
@@ -1670,10 +1685,6 @@ class OperatorProfileRegistry:
             updates["usage_when_to_use"] = (
                 "Use in Web Composer for Azure RAG: retrieving ranked, cited chunks from an Azure AI Search index "
                 "through an operator-approved profile, to ground a downstream llm transform."
-            )
-            updates["usage_when_not_to_use"] = (
-                "Do not use when no operator-approved profile admits the index you need, for indexing documents, "
-                "or for generating answers; use rag_retrieval for Chroma collections."
             )
             updates["example_use"] = (
                 "transform:\n"

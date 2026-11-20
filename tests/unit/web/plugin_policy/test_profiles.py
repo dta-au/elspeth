@@ -1868,7 +1868,11 @@ def test_public_llm_schema_exposes_alias_not_private_provider_binding() -> None:
         full,
         available_aliases=("tutorial",),
     )
-    rendered = public.model_dump_json()
+    # usage_when_not_to_use is the plugin's public prohibition prose, the same
+    # text list discovery already shows; it names "endpoints" as words, not as
+    # a binding. The private-binding check applies to everything else.
+    assert public.usage_when_not_to_use == full.usage_when_not_to_use
+    rendered = public.model_dump_json(exclude={"usage_when_not_to_use"})
 
     assert '"profile"' in rendered
     assert '"tutorial"' in rendered
@@ -2418,7 +2422,11 @@ def test_gateway_public_schema_excludes_private_fields() -> None:
         full,
         available_aliases=("gateway-task",),
     )
-    rendered = public.model_dump_json()
+    # usage_when_not_to_use is the plugin's public prohibition prose, the same
+    # text list discovery already shows; it names "endpoints" as words, not as
+    # a binding. The private-binding check applies to everything else.
+    assert public.usage_when_not_to_use == full.usage_when_not_to_use
+    rendered = public.model_dump_json(exclude={"usage_when_not_to_use"})
 
     assert '"profile"' in rendered
     assert '"gateway-task"' in rendered

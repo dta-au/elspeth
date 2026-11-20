@@ -330,7 +330,8 @@ _GET_PLUGIN_SCHEMA_DECLARATION = ToolDeclaration(
     kind=ToolKind.DISCOVERY,
     description=(
         "Get the full configuration schema for a plugin. Result `data` carries `name`, `plugin_type`, "
-        "`description`, `json_schema`, `knob_schema`, `composer_hints`, `secret_requirements`, and "
+        "`description`, `json_schema`, `knob_schema`, `usage_when_not_to_use` (the plugin's own stated "
+        "prohibition, binding on selection; null when it states none), `composer_hints`, `secret_requirements`, and "
         "`web_config_authority` (`user_configurable` — author raw `options` directly; "
         "`user_configurable_with_policy` — author raw `options` the same way; `operator_profiled` — do not "
         "author raw options, author `options.profile` instead)."
@@ -2352,7 +2353,8 @@ def _execute_get_plugin_assistance(
 
     * ``issue_code is None`` (or absent) — discovery-time guidance. The
       plugin returns a one-line ``summary`` and ``composer_hints``
-      (same surface that list_* and get_plugin_schema already carry).
+      (same surface that list_sources, list_sinks and get_plugin_schema
+      already carry; the list_transforms index does not).
       ``examples`` may also be populated here — it is plugin-defined,
       not exclusive to failure mode (e.g. ``llm`` publishes a worked
       ``queries`` exemplar in discovery mode).
@@ -2426,7 +2428,7 @@ _GET_PLUGIN_ASSISTANCE_DECLARATION = ToolDeclaration(
         "Two modes by ``issue_code``:\n"
         "  * Omit ``issue_code`` (or pass null) to get discovery-time guidance "
         "    — a `summary` of the plugin and its `composer_hints`. (The same hints "
-        "    are also carried on list_sources / list_transforms / list_sinks / "
+        "    are also carried on list_sources / list_sinks / "
         "    get_plugin_schema responses; this tool is the explicit path.) `examples` "
         "    may also be populated in this mode — it is plugin-defined, not exclusive "
         "    to failure mode.\n"

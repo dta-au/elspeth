@@ -358,6 +358,16 @@ _CDA24_MILESTONE_GUIDANCE_CANONICAL_BYTES = -19
 # is 142,045 B before and 142,280 B after, +235 B. Price only that growth.
 _SKILL_REVIEW_A4_CAPABILITY_SCOPE_CANONICAL_BYTES = 235
 _P2_READ_GUIDANCE_CANONICAL_BYTES = 237
+# P3 (2026-11-20): list_transforms becomes a selection index. Canonical JSON of
+# its description 629 -> 716 B (+87); get_plugin_assistance stops naming
+# list_transforms as a hints carrier, 905 -> 887 B (-18). Net +69 B, equal to
+# the measured scaffold overshoot (143,940 against a 143,871 ceiling).
+_P3_LISTING_INDEX_CANONICAL_BYTES = 69
+# P3 (2026-11-20, lead ruling option 1): get_plugin_schema returns and names
+# `usage_when_not_to_use`; its description's canonical JSON grows 420 -> 531 B
+# (+111), equal to the measured scaffold overshoot (144,051 against 143,940).
+# The pipeline_composer.md teaching line is not in the planner scaffold.
+_P3_SCHEMA_PROHIBITION_CANONICAL_BYTES = 111
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
@@ -379,6 +389,8 @@ _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     + _CDA24_MILESTONE_GUIDANCE_CANONICAL_BYTES
     + _SKILL_REVIEW_A4_CAPABILITY_SCOPE_CANONICAL_BYTES
     + _P2_READ_GUIDANCE_CANONICAL_BYTES
+    + _P3_LISTING_INDEX_CANONICAL_BYTES
+    + _P3_SCHEMA_PROHIBITION_CANONICAL_BYTES
 )
 
 
@@ -1882,6 +1894,39 @@ async def test_digest_omission_keeps_inventory_available_after_details_close(
     assert tool_result["success"] is True
     assert tool_result.get("error_code") != "DISCOVERY_NO_GAIN"
     assert [invocation.tool_name for invocation in recorder.invocations] == ["list_sources"]
+
+
+@pytest.mark.asyncio
+async def test_omitted_transform_prohibition_gap_closes_only_on_that_plugins_schema_read(
+    tmp_path: Path, tool_context: ToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An oversized transform ``not_for`` is a per-plugin schema gap: list_transforms leaves it open."""
+    from elspeth.plugins.infrastructure.manager import PluginManager
+    from elspeth.web.catalog.service import CatalogServiceImpl
+
+    manager = PluginManager()
+    manager.register_builtin_plugins()
+    prohibition = "Do not use this plugin for synthetic oversized prohibition probes. " * 40
+    monkeypatch.setattr(manager.get_transform_by_name("passthrough"), "usage_when_not_to_use", prohibition)
+    catalog = CatalogServiceImpl(manager)
+    completion = _ScriptedCompletion(
+        _response_with_call_id("index", "list_transforms", {}),
+        _response_with_call_id("schema", "get_plugin_schema", {"plugin_type": "transform", "name": "passthrough"}),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, information_aware=True, catalog_service=catalog)
+
+    reference = json.loads(completion.requests[0]["messages"][1]["content"])
+    entry = next(item for item in reference["authoring_aids"]["discovery_digest"]["plugins"]["transforms"] if item["name"] == "passthrough")
+    assert "not_for_omitted" in entry and entry["not_for_omitted"]["details_via"] == "get_plugin_schema"
+    payload = json.loads(completion.requests[0]["messages"][-1]["content"])
+    assert payload["information_manifest"]["unresolved"] == ["plugin.schema:transform/passthrough"]
+    closure = "All declared information gaps are closed; emit the terminal proposal now."
+    assert len(completion.requests) == 3
+    # After the index read the gap is still open; after the plugin's schema read it closes.
+    assert not any(message.get("content") == closure for message in completion.requests[1]["messages"])
+    assert sum(message.get("content") == closure for message in completion.requests[2]["messages"]) == 1
 
 
 @pytest.mark.asyncio

@@ -479,10 +479,13 @@ async def test_instrument_the_real_discovery_result_sizes(every_plugin: bool) ->
 
     assert result is not None
     sizes = _tool_result_sizes(provider.requests[1])
+    # list_transforms is a selection index. MEASURED on this tree: 2,990 characters (default
+    # allowlist) and 10,079 (every plugin), against 60,448 and 164,957 when it echoed every
+    # PluginSummary (exported base 7ac78737e, same instrument).
     if every_plugin:
-        assert sizes["call-list"] >= 150_000, sizes
+        assert 5_000 <= sizes["call-list"] < 20_000, sizes
     else:
-        assert 20_000 <= sizes["call-list"] < 100_000, sizes
+        assert 1_000 <= sizes["call-list"] < 5_000, sizes
 
 
 @pytest.mark.asyncio
@@ -498,15 +501,15 @@ async def test_default_allowlist_one_list_transforms_result_in_the_latest_round_
 async def test_every_plugin_allowlisted_one_list_transforms_result_in_the_latest_round_is_sent() -> None:
     """EVERY PLUGIN ALLOW-LISTED, small pipeline, setting 200,000.
 
-    The result is about three times the default deployment's. Priced at one token per byte it takes the
-    estimate past the setting and the turn ends after one provider call; at 3.0 bytes per token the same
-    request is estimated under the setting and nothing is shed.
+    The selection index is about three times the default deployment's (10,079 against 2,990
+    characters, measured). It was 164,957 characters while the listing echoed every PluginSummary;
+    the dispatch after it is sent either way.
     """
     provider, result = await _discovery_run(every_plugin=True, max_prompt_tokens=_SETTING, calls=(_LIST_TRANSFORMS,))
 
     assert result is not None
     assert len(provider.requests) == 2
-    assert _tool_result_sizes(provider.requests[1])["call-list"] >= 150_000
+    assert 5_000 <= _tool_result_sizes(provider.requests[1])["call-list"] < 20_000
     budget = result.llm_calls[1].context_budget
     assert budget is not None
     assert budget.over_estimate is (budget.estimated_tokens_after > _SETTING)

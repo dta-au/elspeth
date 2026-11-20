@@ -326,22 +326,25 @@ class TestStep3DiscoveryTierMigration:
         assert self._get("list_transforms") == {
             "name": "list_transforms",
             "description": (
-                "List available transform plugins. Each entry carries its full `config_fields` "
-                "(name, type, required, description, default per option), usage guidance, "
-                "`composer_hints`, and `secret_requirements` — not just a name and blurb. "
+                "List available transform plugins as a selection index: each entry carries only `name`, "
+                "`description`, `capability_tags`, `web_config_authority` and `policy_capabilities` "
+                "(`capability`, `control_role`, `blocks_positive_detection`), with no configuration. "
+                "Use `details_tool` (get_plugin_schema) for one plugin's configuration and "
+                "get_plugin_assistance for its guidance. "
                 "The result's `prohibited` array names any transform categorically banned from "
-                "the web authoring surface by security policy, with its closed reason and "
-                "explanation — cite it when a user asks why a specific plugin is unavailable. "
+                "the web authoring surface by security policy, with its closed `reason` and "
+                "`explanation` — cite it when a user asks why a specific plugin is unavailable. "
                 "The request's `authoring_aids.discovery_digest` is the plugin index: call this listing "
-                "only for a fact it lacks. get_plugin_schema gives a chosen plugin's option contract."
+                "only for a fact it lacks."
             ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
 
-    def test_list_transforms_description_states_config_fields_not_name_and_summary(self) -> None:
+    def test_list_transforms_description_states_an_index_without_configuration(self) -> None:
         description = self._get("list_transforms")["description"]
-        assert "config_fields" in description
-        assert "with name and summary" not in description
+        assert "selection index" in description
+        assert "config_fields" not in description
+        assert "`details_tool` (get_plugin_schema)" in description
 
     def test_list_sinks(self) -> None:
         assert self._get("list_sinks") == {
@@ -369,7 +372,8 @@ class TestStep3DiscoveryTierMigration:
             "name": "get_plugin_schema",
             "description": (
                 "Get the full configuration schema for a plugin. Result `data` carries `name`, `plugin_type`, "
-                "`description`, `json_schema`, `knob_schema`, `composer_hints`, `secret_requirements`, and "
+                "`description`, `json_schema`, `knob_schema`, `usage_when_not_to_use` (the plugin's own stated "
+                "prohibition, binding on selection; null when it states none), `composer_hints`, `secret_requirements`, and "
                 "`web_config_authority` (`user_configurable` — author raw `options` directly; "
                 "`user_configurable_with_policy` — author raw `options` the same way; `operator_profiled` — do not "
                 "author raw options, author `options.profile` instead)."
@@ -427,7 +431,7 @@ class TestStep3DiscoveryTierMigration:
                 "Two modes by ``issue_code``:\n"
                 "  * Omit ``issue_code`` (or pass null) to get discovery-time guidance "
                 "    — a `summary` of the plugin and its `composer_hints`. (The same hints "
-                "    are also carried on list_sources / list_transforms / list_sinks / "
+                "    are also carried on list_sources / list_sinks / "
                 "    get_plugin_schema responses; this tool is the explicit path.) `examples` "
                 "    may also be populated in this mode — it is plugin-defined, not exclusive "
                 "    to failure mode.\n"

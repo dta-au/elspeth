@@ -575,10 +575,11 @@ A top-level `validation_guidance` maps each
 `message` when it has none.
 <!-- taught:end -->
 
-<!-- taught:begin envelope * plugin_schemas; plugin-schema * plugin_schemas.<kind/plugin>.name; plugin-schema * plugin_schemas.<kind/plugin>.description; plugin-schema * plugin_schemas.<kind/plugin>.plugin_type; plugin-schema * plugin_schemas.<kind/plugin>.json_schema; plugin-schema * plugin_schemas.<kind/plugin>.knob_schema; plugin-schema * plugin_schemas.<kind/plugin>.web_config_authority; plugin-schema * plugin_schemas.<kind/plugin>.composer_hints; plugin-schema * plugin_schemas.<kind/plugin>.secret_requirements -->
+<!-- taught:begin envelope * plugin_schemas; plugin-schema * plugin_schemas.<kind/plugin>.name; plugin-schema * plugin_schemas.<kind/plugin>.description; plugin-schema * plugin_schemas.<kind/plugin>.plugin_type; plugin-schema * plugin_schemas.<kind/plugin>.json_schema; plugin-schema * plugin_schemas.<kind/plugin>.knob_schema; plugin-schema * plugin_schemas.<kind/plugin>.usage_when_not_to_use; plugin-schema * plugin_schemas.<kind/plugin>.web_config_authority; plugin-schema * plugin_schemas.<kind/plugin>.composer_hints; plugin-schema * plugin_schemas.<kind/plugin>.secret_requirements -->
 A top-level `plugin_schemas` (when present) is
 the option schema for each plugin a rejected component uses, keyed
 `<kind>/<name>`, each with `name` (the plugin identifier), `description` (its purpose), `plugin_type`, `json_schema`, `knob_schema`,
+`usage_when_not_to_use` (its own stated prohibition, or null),
 `web_config_authority`, `composer_hints`, and `secret_requirements` (the
 credential fields YOU must wire; empty when there are none — an
 `operator_profiled` plugin's credentials live in its profile, not in your

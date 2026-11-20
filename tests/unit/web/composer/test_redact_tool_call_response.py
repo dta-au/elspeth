@@ -820,7 +820,7 @@ def test_get_blob_content_populated_validation_envelope_redacts_external_scalars
                 {
                     "code": "duplicate_connection_consumer",
                     "connection": "shared",
-                    "reason": "One connection can feed one processing node; every node listed reads this one.",
+                    "reason": "One connection can feed one processing node; every node listed reads this one. Change only the input bindings; preserve existing node options.",
                     "affected_consumers": [{"id": "t1"}, {"id": "t2"}],
                 },
             ],

@@ -97,11 +97,11 @@ List available source plugins with their full catalog summaries.
 
 ### `list_transforms`
 
-List available transform plugins with their full catalog summaries.
+List available transform plugins as a selection index.
 
 **Parameters:** None
 
-**Returns:** Array of full `PluginSummary` entries — `name`, `description`, `config_fields` (name, type, required, description, default per option), usage guidance, `composer_hints`, and `secret_requirements` — plus a `prohibited` array naming any transform banned from the web authoring surface, with its closed reason. `get_plugin_schema` is needed only for enum values, nested option shapes, or the raw JSON schema.
+**Returns:** `available`, one entry per transform carrying only `name`, `description`, `capability_tags`, `web_config_authority` and `policy_capabilities` (`capability`, `control_role`, `blocks_positive_detection`); a `prohibited` array naming any transform banned from the web authoring surface, with its closed reason; and `details_tool` (`"get_plugin_schema"`). No configuration is listed: call `get_plugin_schema` for a chosen plugin's options and `get_plugin_assistance` for its guidance.
 
 **When to use:** When exploring what processing steps are available — field mapping, LLM classification, content safety, RAG retrieval, etc.
 
@@ -128,7 +128,7 @@ Get the full configuration schema for a specific plugin.
 | `plugin_type` | string | **Yes** | `"source"`, `"transform"`, or `"sink"` |
 | `name` | string | **Yes** | Plugin name (e.g. `"csv"`, `"llm"`, `"database"`) |
 
-**Returns:** Full JSON Schema for the plugin's `options` configuration — field names, types, defaults, enums, and descriptions.
+**Returns:** Full JSON Schema for the plugin's `options` configuration — field names, types, defaults, enums, and descriptions — plus `usage_when_not_to_use`, the plugin's own stated prohibition (null when it states none). The discovery digest points an omitted transform prohibition here.
 
 **When to use:** Before configuring any plugin. The schema is the source of truth for what options a plugin accepts. Do not guess option names — always check the schema first.
 

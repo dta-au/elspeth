@@ -60,7 +60,7 @@ from elspeth.web.composer import provider_discovery_response, redaction, state, 
 from elspeth.web.composer import tool_result_envelope as env
 from elspeth.web.composer.prompts import build_system_prompt
 from elspeth.web.composer.tools import _common as common
-from elspeth.web.composer.tools import _dispatch, _registry, blobs, secrets, state_responses
+from elspeth.web.composer.tools import _dispatch, _registry, blobs, secrets, state_responses, transforms
 from elspeth.web.composer.tools._dispatch import get_tool_definitions
 from elspeth.web.composer.tools.prompt_target_responses import PromptTargetMetadata
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
@@ -172,6 +172,7 @@ _DATA_HELPER_PAYLOADS: dict[str, type | _ListPayload | _Literal | None] = {
     "diff_states": _Literal(COMMON, "diff_states"),
     "pipeline_state_changes": state_responses.StateChangesPayload,
     "state_inspection_page_payload": state_responses.StateInspectionPagePayload,
+    "_transform_index_payload": transforms._TransformIndexPayload,
     # Element builders of a shipped container. Unreachable from a ``data=`` site directly —
     # each is called once per item inside a comprehension or splatted into one — and
     # unattributed until ``_nested_value_keys`` stopped declining containers (RED2-2 residue).

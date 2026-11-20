@@ -106,6 +106,11 @@ class PluginSchemaInfo(_StrictResponse):
     json_schema: dict[str, Any]
     knob_schema: dict[str, Any]
     """Lowered composer knob schema, computed once at catalog load."""
+    # The plugin's own stated prohibition, the same text (and the same
+    # operator-profile projection) as PluginSummary.usage_when_not_to_use.
+    # Carried here because the list_transforms selection index does not carry
+    # it: the discovery digest points an omitted transform prohibition here.
+    usage_when_not_to_use: str | None = None
 
     # JIT-hints Phase 1: same semantics as PluginSummary.composer_hints.
     # Carried on the full-schema response so an LLM that asked for the
