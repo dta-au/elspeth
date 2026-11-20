@@ -70,12 +70,13 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from scripts.staging import structural_cycle
@@ -183,6 +184,10 @@ CHECKPOINT_KEYS = frozenset(
     }
 )
 _MESSAGE_PAGE = 500
+# Set by a server whose audit-grade messages view returns END review rows: the
+# count of stored END review rows it left out because they did not parse.
+END_REVIEW_VIEW_HEADER = "X-Elspeth-End-Review-Rows-Omitted"
+type EndReviewMode = Literal["auto", "required", "if-recorded"]
 _USED_OUTCOMES = ("applied", "completed")
 
 
@@ -339,19 +344,28 @@ def end_review_summary(sent: Sequence[Mapping[str, Any]]) -> JsonObject:
     """How many sent steps had an end review the server returned, and whether those were clean and admitted.
 
     A run with no end review in its evidence says so in words: it never reads
-    as clean end reviews when none were seen.
+    as clean end reviews when none were seen. A server that has the END review
+    view (it sets :data:`END_REVIEW_VIEW_HEADER` on the audit-grade messages
+    view) is told apart from one that has none.
     """
     reviewed = [result["evidence"]["end_reviews"][-1] for result in sent if result["evidence"]["end_reviews"]]
     clean = sum(1 for review in reviewed if review["verdict"] == "clean" and review["publication_verdict"] == "ADMIT")
     unseen = len(sent) - len(reviewed)
-    if not reviewed:
+    views = [result["end_review_view"] for result in sent if "end_review_view" in result]
+    exposed = any(view["exposed"] for view in views)
+    omitted = max((view["rows_omitted"] for view in views), default=0)
+    if not reviewed and not exposed:
         line = "end reviews: none exposed by this server; not verified"
     else:
         line = f"end reviews: {len(reviewed)} of {len(sent)} steps recorded one, {clean} clean and admitted"
         if unseen:
             line += f"; {unseen} steps not verified"
+        if omitted:
+            line += f"; the server left out {omitted} end review rows it could not read"
     return {
         "line": line,
+        "server_exposes_end_reviews": exposed,
+        "rows_omitted_by_server": omitted,
         "steps_sent": len(sent),
         "steps_with_end_review": len(reviewed),
         "clean_and_admitted": clean,
@@ -394,7 +408,17 @@ class EditBattery:
     settle_reads: int = 6
     refresh_margin_seconds: float = 420.0
     prompt_secret: Callable[[str], str] = getpass.getpass
-    end_review_evidence: structural_cycle.EndReviewEvidence = "if-recorded"
+    end_review_evidence: EndReviewMode = "auto"
+    # From the last read of the audit-grade messages view: whether the server
+    # set END_REVIEW_VIEW_HEADER, and the count it carried.
+    server_end_review_view: bool = field(default=False, init=False)
+    end_review_rows_omitted: int = field(default=0, init=False)
+
+    def resolved_end_review_evidence(self) -> structural_cycle.EndReviewEvidence:
+        """``auto`` is ``required`` on a server that has the END review view and ``if-recorded`` on one without."""
+        if self.end_review_evidence == "auto":
+            return "required" if self.server_end_review_view else "if-recorded"
+        return self.end_review_evidence
 
     @property
     def name(self) -> str:
@@ -419,16 +443,32 @@ class EditBattery:
     def rows_from(self, offset: int) -> list[JsonObject]:
         rows: list[JsonObject] = []
         while True:
-            page = require_list(
-                self.client.get_json(
-                    f"/api/sessions/{self.session_id}/messages?include_llm_audit=true&include_tool_rows=true"
-                    f"&limit={_MESSAGE_PAGE}&offset={offset + len(rows)}"
-                ),
-                "messages",
+            path = (
+                f"/api/sessions/{self.session_id}/messages?include_llm_audit=true&include_tool_rows=true"
+                f"&limit={_MESSAGE_PAGE}&offset={offset + len(rows)}"
             )
+            response = self.client.request("GET", path)
+            self.note_end_review_view(response.headers)
+            try:
+                body = json.loads(response.body)
+            except ValueError:
+                raise OperationFailed("the messages view did not return JSON") from None
+            page = require_list(body, "messages")
             rows.extend(require_dict(row, "message") for row in page)
             if len(page) < _MESSAGE_PAGE:
                 return rows
+
+    def note_end_review_view(self, headers: Mapping[str, str]) -> None:
+        """Record whether the server has the END review view, from the header it sets on the view."""
+        values = [value for name, value in headers.items() if name.lower() == END_REVIEW_VIEW_HEADER.lower()]
+        if not values:
+            self.server_end_review_view = False
+            self.end_review_rows_omitted = 0
+            return
+        if len(values) != 1 or not values[0].isdigit():
+            raise OperationFailed(f"the messages view sent {END_REVIEW_VIEW_HEADER} as {values!r}, not one count")
+        self.server_end_review_view = True
+        self.end_review_rows_omitted = int(values[0])
 
     def settled_rows(self, offset: int, operation_id: str) -> tuple[list[JsonObject], int, int, bool]:
         """``(rows, new offset, reads, settled)``: the turn's rows once two reads agree and its provider audit is present.
@@ -621,7 +661,7 @@ class EditBattery:
             # The workload's own verifier judges the turn, with the customer's codes, in place of the plan expectations.
             state_codes = structural_cycle.verify_state(baseline_state, after_state, edit["order"], Position.from_json(edit["position"]))
             turn_codes, review_warnings = structural_cycle.operation_codes(
-                operation, evidence["end_reviews"], end_review_evidence=self.end_review_evidence
+                operation, evidence["end_reviews"], end_review_evidence=self.resolved_end_review_evidence()
             )
             findings.extend(sorted({*state_codes, *turn_codes}))
             warnings.extend(review_warnings)
@@ -650,6 +690,7 @@ class EditBattery:
             "evidence": evidence,
             "history_shed": shed_this_turn(evidence),
             "evidence_reads": evidence_reads,
+            "end_review_view": {"exposed": self.server_end_review_view, "rows_omitted": self.end_review_rows_omitted},
             **extra,
         }
         return fields, after_state, rows_seen
@@ -761,6 +802,7 @@ class EditBattery:
                 "non_provider_wall_ms": wall - evidence["provider_busy_ms"] if evidence["provider_busy_ms"] is not None else None,
             },
             state_id_after=after_state["id"],
+            end_review_view=fields["end_review_view"],
         )
         if "graph_counts" in fields:
             result["graph_counts"] = fields["graph_counts"]
@@ -1161,12 +1203,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--end-review-evidence",
-        choices=["required", "if-recorded"],
-        default="if-recorded",
+        choices=["auto", "required", "if-recorded"],
+        default="auto",
         help=(
-            "structural-cycle: if-recorded (default) fails a recorded end review that is not clean and admitted and "
-            "warns when none is recorded; required also fails a step with no recorded end review. No current server "
-            "returns end reviews through the API, so required fails every step there (see the runbook)"
+            "structural-cycle: if-recorded fails a recorded end review that is not clean and admitted and warns when "
+            "none is recorded; required also fails a step with no recorded end review; auto (default) is required "
+            f"when the server's audit-grade messages view sets {END_REVIEW_VIEW_HEADER} and if-recorded when it does "
+            "not (see the runbook)"
         ),
     )
     parser.add_argument(

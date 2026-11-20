@@ -94,6 +94,14 @@ class Session:
     late_rows: list[tuple[int, JsonObject]] = field(default_factory=list)
 
 
+def _without_checkpoint_passes(row: JsonObject) -> JsonObject:
+    """The row as an older server returns it: its audit view carries no advisor checkpoint pass records."""
+    calls = row["tool_calls"] if "tool_calls" in row else None
+    if row["role"] != "audit" or type(calls) is not list:
+        return row
+    return {**row, "tool_calls": [call for call in calls if call["_kind"] != "advisor_checkpoint_pass_audit"]}
+
+
 @dataclass
 class FakeDeployment:
     passwords: dict[str, str]
@@ -104,6 +112,10 @@ class FakeDeployment:
     on_request: Callable[[str, str], None] | None = None
     requests: list[tuple[str, str, object]] = field(default_factory=list)
     tokens: dict[str, str] = field(default_factory=dict)
+    # A server with the END review view returns END pass rows under include_llm_audit and
+    # sets X-Elspeth-End-Review-Rows-Omitted; an older server returns neither.
+    end_review_view: bool = True
+    end_review_rows_omitted: int = 0
 
     # -- transport -------------------------------------------------------
 
@@ -174,8 +186,17 @@ class FakeDeployment:
                     still_late.append((reads_left - 1, row))
             session.late_rows = still_late
             audit = query.get("include_llm_audit") == "true"
-            rows = [row for row in session.messages if audit or row["role"] != "audit"]
-            return self._page(rows, query)
+            rows = [
+                row if self.end_review_view else _without_checkpoint_passes(row)
+                for row in session.messages
+                if audit or row["role"] != "audit"
+            ]
+            page = self._page(rows, query)
+            if audit and self.end_review_view:
+                return HttpResponse(
+                    status=page.status, body=page.body, headers={"x-elspeth-end-review-rows-omitted": str(self.end_review_rows_omitted)}
+                )
+            return page
         if key == ("GET", "/interpretations"):
             assert query["status"] == "pending"
             return self._json(200, {"events": [review["event"] for review in session.reviews.values() if review["pending"]]})

@@ -199,14 +199,21 @@ def make(
     composer: CycleComposer | None = None,
     *,
     keep_going: bool = False,
-    end_review_evidence: cycle.EndReviewEvidence = "required",
+    end_review_evidence: battery.EndReviewMode = "required",
     state: State | None = None,
     positions: list[cycle.Position] | None = None,
+    end_review_view: bool = True,
+    end_review_rows_omitted: int = 0,
 ) -> tuple[battery.EditBattery, FakeDeployment, CycleComposer]:
     composer = composer or CycleComposer(orders_for(steps))
     clock = Clock()
     fake = FakeDeployment(
-        passwords={"tester": "pw"}, sessions={SESSION: Session(owner="tester", state=state or fixture())}, provider=composer, clock=clock
+        passwords={"tester": "pw"},
+        sessions={SESSION: Session(owner="tester", state=state or fixture())},
+        provider=composer,
+        clock=clock,
+        end_review_view=end_review_view,
+        end_review_rows_omitted=end_review_rows_omitted,
     )
     run = battery.EditBattery(
         client=WebClient(BASE_URL, transport=fake),
@@ -541,7 +548,7 @@ def test_a_step_without_its_end_review_fails_under_required_and_stops_the_attemp
 def test_if_recorded_end_review_evidence_passes_a_step_whose_review_was_not_returned(tmp_path: Path) -> None:
     composer = CycleComposer(orders_for(10))
     composer.end_review = dict.fromkeys(range(1, 11))
-    run, _, _ = make(tmp_path, composer=composer, end_review_evidence="if-recorded")
+    run, _, _ = make(tmp_path, composer=composer, end_review_evidence="if-recorded", end_review_view=False)
     summary = run.run()
     assert summary["all_passed"] is True
     assert results(run)[0]["warnings"] == ["end_review_not_recorded"]
@@ -560,10 +567,66 @@ def test_the_summary_counts_steps_whose_end_review_was_not_returned(tmp_path: Pa
     assert (review["verified"], review["steps_with_end_review"]) == (False, 8)
 
 
-def test_if_recorded_is_the_default_because_no_api_route_returns_end_reviews() -> None:
+def test_auto_is_the_default_end_review_evidence() -> None:
     args = battery.build_parser().parse_args(["plan", "--workload", "structural-cycle"])
-    assert args.end_review_evidence == "if-recorded"
-    assert next(field for field in dataclasses.fields(battery.EditBattery) if field.name == "end_review_evidence").default == "if-recorded"
+    assert args.end_review_evidence == "auto"
+    assert next(field for field in dataclasses.fields(battery.EditBattery) if field.name == "end_review_evidence").default == "auto"
+
+
+def test_auto_requires_end_reviews_from_a_server_with_the_end_review_view(tmp_path: Path) -> None:
+    composer = CycleComposer(orders_for(10))
+    composer.end_review = {3: None}
+    run, _, _ = make(tmp_path, composer=composer, end_review_evidence="auto")
+    summary = run.run()
+    assert results(run)[2]["findings"] == ["end_review_not_clean_and_admitted"]
+    assert results(run)[2]["end_review_view"] == {"exposed": True, "rows_omitted": 0}
+    assert summary["stopped_reason"] == "edit 3 (cycle-step-3) failed verification"
+    assert summary["end_reviews"]["server_exposes_end_reviews"] is True
+
+
+def test_auto_falls_back_to_if_recorded_on_a_server_without_the_view(tmp_path: Path) -> None:
+    # The Composer records every end review, but an older server never returns them.
+    run, _, _ = make(tmp_path, end_review_evidence="auto", end_review_view=False)
+    summary = run.run()
+    assert summary["all_passed"] is True
+    assert results(run)[0]["warnings"] == ["end_review_not_recorded"]
+    assert results(run)[0]["end_review_view"] == {"exposed": False, "rows_omitted": 0}
+    assert summary["end_reviews"]["line"] == "end reviews: none exposed by this server; not verified"
+    assert summary["end_reviews"]["server_exposes_end_reviews"] is False
+    assert summary["end_reviews"]["verified"] is False
+
+
+def test_a_server_with_the_view_but_no_reviews_is_not_reported_as_having_none_exposed(tmp_path: Path) -> None:
+    composer = CycleComposer(orders_for(10))
+    composer.end_review = dict.fromkeys(range(1, 11))
+    run, _, _ = make(tmp_path, composer=composer, end_review_evidence="if-recorded")
+    review = run.run()["end_reviews"]
+    assert review["line"] == "end reviews: 0 of 10 steps recorded one, 0 clean and admitted; 10 steps not verified"
+    assert review["server_exposes_end_reviews"] is True
+
+
+def test_the_summary_reports_end_review_rows_the_server_left_out(tmp_path: Path) -> None:
+    run, _, _ = make(tmp_path, end_review_evidence="auto", end_review_rows_omitted=2)
+    review = run.run()["end_reviews"]
+    assert review["line"] == (
+        "end reviews: 10 of 10 steps recorded one, 10 clean and admitted; the server left out 2 end review rows it could not read"
+    )
+    assert review["rows_omitted_by_server"] == 2
+
+
+@pytest.mark.parametrize("headers", [{"X-Elspeth-End-Review-Rows-Omitted": "two"}, {"X-Elspeth-End-Review-Rows-Omitted": "-1"}])
+def test_a_malformed_end_review_header_stops_the_run(tmp_path: Path, headers: dict[str, str]) -> None:
+    run, _, _ = make(tmp_path, end_review_evidence="auto")
+    with pytest.raises(OperationFailed, match="X-Elspeth-End-Review-Rows-Omitted"):
+        run.note_end_review_view(headers)
+
+
+def test_the_header_name_is_read_in_any_case(tmp_path: Path) -> None:
+    run, _, _ = make(tmp_path, end_review_evidence="auto")
+    run.note_end_review_view({"X-ELSPETH-END-REVIEW-ROWS-OMITTED": "3"})
+    assert (run.server_end_review_view, run.end_review_rows_omitted, run.resolved_end_review_evidence()) == (True, 3, "required")
+    run.note_end_review_view({})
+    assert (run.server_end_review_view, run.end_review_rows_omitted, run.resolved_end_review_evidence()) == (False, 0, "if-recorded")
 
 
 def test_keep_going_records_a_failed_step_and_judges_the_rest(tmp_path: Path) -> None:

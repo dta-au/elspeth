@@ -147,9 +147,9 @@ Not available from the API, so not reported:
 - tool time on current servers: a primary tool row carries only a visible
   companion record with no timing, so `tool_timings_complete` is false and
   `tool_busy_ms` null; `server_ms` then still bounds all non-provider time;
-- advisor end reviews on current servers: the messages view returns
-  only provider-call and planner-attempt audit rows, so `end_reviews` is
-  empty (see the structural-cycle workload below);
+- advisor end reviews on a server without the END review view: its
+  messages view returns only provider-call and planner-attempt audit rows,
+  so `end_reviews` is empty (see the structural-cycle workload below);
 - advisor time versus planner time when their calls overlap.
 
 ## Structural-cycle workload
@@ -237,23 +237,34 @@ Plan-file edits never required an end review. They required a completed
 turn, a successful provider call, settled evidence, the plan's expectations,
 no unrelated change, no new validation error and no refused tool call.
 
-The customer's runner read each turn's end review from the database. No
-API route returns it today: the END-phase `advisor_checkpoint_pass_audit`
-rows are stored with the session's messages, but the audit-grade messages
-view admits only provider-call and planner-attempt rows, and no other route
-(state, composer progress, operation status, diagnostic evidence, export)
-carries the verdict. `composer_meta.completion_gates` on the state shows a
-blocking advisor gate, never a pass, so it cannot tell a clean review from
-none.
+The customer's runner read each turn's end review from the database. A
+server with the END review view returns it through the audit-grade messages
+view: under `include_llm_audit=true` each END-phase
+`advisor_checkpoint_pass_audit` row comes back as a `role="audit"` row with
+the fields `phase`, `pass_index`, `verdict`, `source`, `provider_attempts`
+and `publication_verdict`, and the response carries the header
+`X-Elspeth-End-Review-Rows-Omitted`: the count of stored END rows left out
+because they did not parse. An older server returns no END rows and no
+header; there no route carries the verdict, and
+`composer_meta.completion_gates` on the state shows a blocking advisor gate,
+never a pass, so it cannot tell a clean review from none.
 
-So `--end-review-evidence if-recorded` is the default: a recorded review
-that is not clean and admitted fails the step, and a step with none gets
-the warning `end_review_not_recorded`. The summary's `end_reviews.line`
-says in words how many steps were verified; with none it reads
-"end reviews: none exposed by this server; not verified", and
-`end_reviews.verified` is false. `--end-review-evidence required` (the
-customer's rule) fails a step with no recorded review, which on today's
-servers is every step. Report which mode a run used, and quote the line.
+`--end-review-evidence`:
+
+| Mode | A recorded review that is not clean and admitted | A step with no recorded review |
+| --- | --- | --- |
+| `required` (the customer's rule) | fails the step | fails the step |
+| `if-recorded` | fails the step | warning `end_review_not_recorded` |
+| `auto` (default) | fails the step | `required` when the messages view sets the header, `if-recorded` when it does not |
+
+`auto` decides from the response, never from a version string. Each step's
+result records what the battery saw as `end_review_view`
+(`exposed`, `rows_omitted`). The summary's `end_reviews.line` says in words
+how many steps were verified; on a server without the view and with no
+review seen it reads "end reviews: none exposed by this server; not
+verified", and `end_reviews.verified` is false. A server that left rows out
+adds "the server left out N end review rows it could not read". Report which
+mode a run used, and quote the line.
 
 The first failing step stops the attempt; `--keep-going` judges every step.
 A workload run exits 0 when every requested step passed. The summary still
