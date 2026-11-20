@@ -9,7 +9,7 @@ from typing import Any, Final, cast
 
 from pydantic_core import ErrorDetails
 
-from elspeth.contracts.blobs_inline import is_widened_blob_ref
+from elspeth.contracts.blobs_inline import WidenedBlobRefShape, is_widened_blob_ref
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.core.llm_profiles import LLM_PROFILE_PRIVATE_FIELDS
@@ -20,10 +20,20 @@ class DeferredBlobContractProbe(Exception):
     """A constructor needs blob bytes unavailable to a resolver-free probe."""
 
 
+def inline_content_reference(value: object) -> WidenedBlobRefShape | None:
+    """The parsed marker of a valid ``inline_content`` reference, or ``None``.
+
+    The composer's one reading of a file-held option value: anything that is
+    not a valid ``inline_content`` marker (a string, a malformed mapping, a
+    ``bind_source`` marker) is ``None``. ``value`` must be thawed option data.
+    """
+    marker = is_widened_blob_ref(value)
+    return marker if marker is not None and marker.mode == "inline_content" else None
+
+
 def is_inline_content_reference(value: object) -> bool:
     """Recognize an unresolved value only when it is a valid inline marker."""
-    marker = is_widened_blob_ref(value)
-    return marker is not None and marker.mode == "inline_content"
+    return inline_content_reference(value) is not None
 
 
 def holds_inline_content_reference(value: object) -> bool:

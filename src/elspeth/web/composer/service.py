@@ -940,6 +940,7 @@ class ComposerServiceImpl:
             sessions_service=sessions_service,
             chargeable_admission=self._chargeable_admission,
             prompt_guard_mount=self._advisor_prompt_guard_mount,
+            blob_service=blob_service,
         )
         self._composer_skill_name: str = PIPELINE_COMPOSER_SKILL_NAME
         self._interpretation_surfacing = InterpretationSurfacing(

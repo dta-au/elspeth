@@ -7084,7 +7084,7 @@ async def test_checkpoint_unrepresentable_graph_is_unavailable_without_provider_
 
     service = make_service()
 
-    def refuse(_state):
+    def refuse(_state, _prompt_files):
         raise AdvisorGraphCoverageUnavailable("Redaction made distinct authored keys ambiguous")
 
     monkeypatch.setattr("elspeth.web.composer.advisor_context.summarize_pipeline_for_advisor", refuse)
