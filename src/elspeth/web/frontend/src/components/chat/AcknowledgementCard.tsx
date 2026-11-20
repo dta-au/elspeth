@@ -732,19 +732,21 @@ export function AcknowledgementCard({
             </pre>
             {promptReview.status === "ready" && (() => {
               const surface = promptReview.snapshot.authored_surface;
-              return <>
+              const queries = promptQueryEntries(surface.queries).filter((query) => typeof query.entry.template === "string");
+              if (typeof surface.system_prompt !== "string" && typeof surface.prompt_template !== "string" && queries.length === 0) return null;
+              // One wrapping row under the text, so several copy controls
+              // line up instead of running on as inline buttons.
+              return <div className="ack-card-copy-actions">
                 {typeof surface.system_prompt === "string" && (
                   <PromptCopyButton value={surface.system_prompt} label="system prompt" showLabel />
                 )}
                 {typeof surface.prompt_template === "string" && (
                   <PromptCopyButton value={surface.prompt_template} label="user prompt template" showLabel />
                 )}
-                {promptQueryEntries(surface.queries).map((query) =>
-                  typeof query.entry.template === "string" ? (
-                    <PromptCopyButton key={query.selector} value={query.entry.template} label={`prompt template for query ${promptQueryCopyName(query)}`} showLabel />
-                  ) : null,
-                )}
-              </>;
+                {queries.map((query) => (
+                  <PromptCopyButton key={query.selector} value={String(query.entry.template)} label={`prompt template for query ${promptQueryCopyName(query)}`} showLabel />
+                ))}
+              </div>;
             })()}
             {promptHasSlot && (
               <p className="ack-card-prompt-pending-note">

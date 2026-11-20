@@ -2608,6 +2608,7 @@
   background: none;
   border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-sm);
+  font-family: var(--font-sans);
   font-size: var(--font-size-xs);
   color: var(--color-text-secondary);
   cursor: pointer;
@@ -2780,6 +2781,13 @@
 
 /* Secondary disclosure for the frozen staging-time template, shown only
    when it differs from the resolved render. */
+.ack-card-copy-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-xs);
+  margin-top: var(--space-xs);
+}
+
 .ack-card-original-template {
   margin-top: var(--space-2xs);
 }

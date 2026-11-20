@@ -1331,6 +1331,27 @@ describe("AcknowledgementCard prompt copying", () => {
     expect(within(region).queryByRole("button", { name: "Copy system prompt" })).not.toBeInTheDocument();
     expect(within(region).queryByRole("button", { name: /Copy prompt template for query/ })).not.toBeInTheDocument();
   });
+
+  it("lines the copy controls up in one row under the text, and adds no empty row when nothing can be copied", async () => {
+    vi.mocked(api.getPromptReviewSnapshot).mockResolvedValue(inlineSnapshot({
+      prompt_template: "Display", queries: [{ name: "a", template: "A" }, { name: "b", template: "B" }],
+    }, ANCHOR_1));
+    const { unmount } = renderCard(makeEvent({ kind: "llm_prompt_template", llm_draft: "bounded draft" }), { showAmend: false });
+    fireEvent.click(screen.getByRole("button", { name: "View prompt" }));
+    const region = await screen.findByRole("region", { name: /prompt template review/i });
+    await within(region).findByRole("button", { name: "Copy user prompt template" });
+    const row = region.querySelector(".ack-card-copy-actions");
+    expect(row).not.toBeNull();
+    expect(within(row as HTMLElement).getAllByRole("button").map((button) => button.textContent))
+      .toEqual(["Copy user prompt template", "Copy prompt template for query a (position 1)", "Copy prompt template for query b (position 2)"]);
+    unmount();
+    vi.mocked(api.getPromptReviewSnapshot).mockResolvedValue(inlineSnapshot({ system_prompt: { mode: "inline_content", blob_ref: "file-1" } }, ANCHOR_2));
+    renderCard(makeEvent({ kind: "llm_prompt_template", llm_draft: "bounded draft" }), { showAmend: false });
+    fireEvent.click(screen.getByRole("button", { name: "View prompt" }));
+    const fileOnly = await screen.findByRole("region", { name: /prompt template review/i });
+    await waitFor(() => expect(fileOnly.querySelector("pre")).not.toBeNull());
+    expect(fileOnly.querySelector(".ack-card-copy-actions")).toBeNull();
+  });
 });
 
 function vagueEvent(id: string, term: string, overrides: Partial<InterpretationEvent> = {}): InterpretationEvent {
