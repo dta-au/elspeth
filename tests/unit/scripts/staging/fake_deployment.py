@@ -40,6 +40,9 @@ class FakeTurn:
     # The provider audit row is stored only after this many later reads of the messages view,
     # as on a server whose evidence rows land after the operation reports completed.
     audit_after_reads: int = 0
+    # Session files the turn created (filename -> content) or deleted (by filename), as create_blob and delete_blob do.
+    created_files: dict[str, bytes] = field(default_factory=dict)
+    deleted_files: tuple[str, ...] = ()
 
 
 type Provider = Callable[[JsonObject, str], tuple[JsonObject, list[JsonObject]] | FakeTurn]
@@ -223,6 +226,11 @@ class FakeDeployment:
             turn = produced if isinstance(produced, FakeTurn) else FakeTurn(state=produced[0], audit=produced[1])
             session.state = turn.state
             session.reviews.update(turn.reviews)
+            for filename, data in turn.created_files.items():
+                blob_id = str(uuid4())
+                session.blobs[blob_id] = Blob(id=blob_id, filename=filename, data=data)
+            for blob_id in [blob.id for blob in session.blobs.values() if blob.filename in turn.deleted_files]:
+                del session.blobs[blob_id]
             first, last = turn.created_at
             session.messages.append(
                 {"role": "user", "operation_id": operation_id, "tool_calls": None, "content": payload["content"], "created_at": first}

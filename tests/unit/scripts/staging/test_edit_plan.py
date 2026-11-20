@@ -452,6 +452,52 @@ def test_server_written_review_fields_are_allowed_by_name_only() -> None:
     ]
 
 
+def test_server_written_review_fields_count_only_on_the_components_named() -> None:
+    before = graph()
+    after = copy.deepcopy(before)
+    for node in after["nodes"]:
+        node["options"]["interpretation_requirements"] = [{"id": "q1", "kind": "llm_prompt_template", "status": "pending"}]
+        node["options"]["approved_prompt_artifact_hash"] = "abc"
+    after["sources"]["rows"]["options"]["source_authoring"] = {"hash": "h"}
+    changes = edit_plan.classify_changes(edit_plan.graph_view(before), edit_plan.graph_view(after), [], named={"summarise"})
+    assert changes.server_written == [
+        "/nodes/summarise/options/approved_prompt_artifact_hash",
+        "/nodes/summarise/options/interpretation_requirements",
+    ]
+    assert changes.unrelated == [
+        "/nodes/classify/options/approved_prompt_artifact_hash",
+        "/nodes/classify/options/interpretation_requirements",
+        "/sources/rows/options/source_authoring",
+    ]
+    nobody = edit_plan.classify_changes(edit_plan.graph_view(before), edit_plan.graph_view(after), [], named=set())
+    assert nobody.server_written == []
+
+
+def test_an_edit_names_the_components_in_its_pointers_chains_new_and_renamed_steps_and_edge_list() -> None:
+    edit = {
+        "expect": [
+            {"equals": "/nodes/classify/options/max_tokens", "value": 1237},
+            {"chain": {"from": "rows", "to": "summarise", "via": ["battery_a"]}},
+            {"renamed_node": {"from": "battery_b", "to": "battery_d"}},
+            {"new_output": "battery_out", "fields": {}, "option_keys": []},
+            {"equals": "/metadata/name", "value": "x"},
+        ],
+        "may_change": ["/outputs/out/options"],
+        "edges_touching": ["battery_e"],
+    }
+    assert edit_plan.named_components(edit) == {
+        "classify",
+        "rows",
+        "summarise",
+        "battery_a",
+        "battery_b",
+        "battery_d",
+        "battery_out",
+        "out",
+        "battery_e",
+    }
+
+
 def control(node_id: str, input_: str, on_success: str) -> dict[str, Any]:
     return {
         "id": node_id,

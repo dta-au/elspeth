@@ -10,17 +10,18 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 from scripts.staging import composer_edit_battery as battery
-from scripts.staging.edit_plan import DEFAULT_PLAN, PLAN_FORMAT, load_plan
+from scripts.staging.edit_plan import DEFAULT_PLAN, PLAN_FORMAT, graph_view, load_plan
 from scripts.staging.opslib import AccountAuth, CheckpointStore, OperationFailed, WebClient
 from scripts.staging.repair_copied_prompt_reviews import prompt_surface
 
-from tests.unit.scripts.staging.fake_deployment import BASE_URL, FakeDeployment, FakeTurn, Session
+from tests.unit.scripts.staging.fake_deployment import BASE_URL, Blob, FakeDeployment, FakeTurn, Session
 
 SESSION = "11111111-2222-4333-8444-555555555555"
 type State = dict[str, Any]
@@ -92,16 +93,46 @@ PLAN_EDITS: list[dict[str, Any]] = [
         "approve": {"kind": "llm_prompt_template", "node": "{llm_inline}"},
     },
 ]
-# Enough further one-setting edits to make a plan that can be gold (GOLD_MINIMUM_EDITS applicable edits).
-LONG_PLAN_EDITS: list[dict[str, Any]] = PLAN_EDITS + [
+# A plan that can be gold: GOLD_MINIMUM_EDITS applicable edits that leave the graph as they found it.
+LONG_PLAN_EDITS: list[dict[str, Any]] = [
+    *PLAN_EDITS[:2],
+    PLAN_EDITS[3],
+    *(
+        {
+            "id": f"max-tokens-{value}",
+            "message": f"Set max_tokens on {{llm_inline}} to {value}.",
+            "expect": [{"equals": "/nodes/{llm_inline}/options/max_tokens", "value": value}],
+            "tools_any": ["patch_node_options"],
+        }
+        for value in range(1001, 1001 + battery.GOLD_MINIMUM_EDITS - 7)
+    ),
     {
-        "id": f"max-tokens-{value}",
-        "message": f"Set max_tokens on {{llm_inline}} to {value}.",
-        "expect": [{"equals": "/nodes/{llm_inline}/options/max_tokens", "value": value}],
+        "id": "remove-marker",
+        "message": 'Remove the sentence "Battery marker one." from the prompt of {llm_inline}.',
+        "expect": [{"text": "/nodes/{llm_inline}/options/prompt_template", "remove": "Battery marker one.", "form": "inline"}],
+        "tools_any": ["change_substring", "patch_node_options"],
+        "approve": {"kind": "llm_prompt_template", "node": "{llm_inline}"},
+    },
+    {
+        "id": "remove-a",
+        "message": "Remove the step battery_a and connect {source} directly to {head}.",
+        "expect": [{"absent": "/nodes/battery_a"}, {"chain": {"from": "{source}", "to": "{head}", "via": []}}],
+        "tools_any": ["remove_node"],
+    },
+    {
+        "id": "restore-max-tokens",
+        "message": "Put max_tokens on {llm_inline} back to {was:/nodes/{llm_inline}/options/max_tokens}.",
+        "expect": [{"restored": "/nodes/{llm_inline}/options/max_tokens"}],
         "tools_any": ["patch_node_options"],
-    }
-    for value in range(1001, 1001 + battery.GOLD_MINIMUM_EDITS - len(PLAN_EDITS))
+    },
+    {
+        "id": "restore-name",
+        "message": "Put the pipeline name back to {was:/metadata/name}.",
+        "expect": [{"restored": "/metadata/name"}],
+        "tools_any": ["set_metadata"],
+    },
 ]
+assert len(LONG_PLAN_EDITS) == battery.GOLD_MINIMUM_EDITS
 
 
 def rename(state: State) -> None:
@@ -129,39 +160,93 @@ def node(state: State, node_id: str) -> State:
     return found
 
 
+def mark_prompt_pending(state: State) -> None:
+    node(state, "classify")["options"]["interpretation_requirements"] = [
+        {"id": "req-1", "kind": "llm_prompt_template", "status": "pending"}
+    ]
+
+
 def prompt(state: State) -> None:
-    options = node(state, "classify")["options"]
-    options["prompt_template"] += "\nBattery marker one."
-    options["interpretation_requirements"] = [{"id": "req-1", "kind": "llm_prompt_template", "status": "pending"}]
+    node(state, "classify")["options"]["prompt_template"] += "\nBattery marker one."
+    mark_prompt_pending(state)
 
 
 def remove_leftovers(state: State) -> None:
     for item in [item for item in state["nodes"] if item["id"].startswith("battery_")]:
         state["nodes"].remove(item)
-        for other in state["nodes"]:
-            if other["input"] == item["on_success"]:
-                other["input"] = item["input"]
-        for source in state["sources"].values():
-            if source["on_success"] == item["input"]:
-                source["on_success"] = item["on_success"]
+        state["edges"] = [edge for edge in state["edges"] if item["id"] not in (edge["from_node"], edge["to_node"])]
+        # Whatever fed the step now feeds what it fed.
+        for feeder in [*state["sources"].values(), *state["nodes"]]:
+            if feeder["on_success"] == item["input"]:
+                feeder["on_success"] = item["on_success"]
 
 
-def change_for(message: str) -> tuple[Change, str]:
-    """The obedient Composer's change and tool for a battery message."""
+def add_output(state: State) -> None:
+    """A leftover battery output fed by classify's errors."""
+    state["outputs"].append({"name": "battery_out", "plugin": "json", "options": {"path": "b.jsonl"}, "on_write_failure": "discard"})
+    node(state, "classify")["on_error"] = "battery_out"
+    state["edges"].append({"id": "e3", "from_node": "classify", "to_node": "battery_out", "edge_type": "on_error", "label": None})
+
+
+def quoted(message: str, after: str) -> str:
+    match = re.search(re.escape(after) + r'("(?:[^"\\]|\\.)*")', message)
+    assert match is not None, message
+    value: str = json.loads(match.group(1))
+    return value
+
+
+def change_for(message: str) -> tuple[Change, str, bool]:
+    """The obedient Composer's change and tool for a battery message, and whether it opens a prompt review card."""
     if message.startswith("Rename the pipeline"):
-        return rename, "set_metadata"
+        return rename, "set_metadata", False
     if message.startswith("Insert a passthrough"):
-        return insert, "splice_transform"
+        return insert, "splice_transform", False
     if message.startswith("Add the sentence"):
-        return prompt, "change_substring"
+        return prompt, "change_substring", True
     if message.startswith("Remove the step"):
-        return remove_leftovers, "remove_node"
+        return remove_leftovers, "remove_node", False
+    if message.startswith("Remove the sentence"):
+        sentence = quoted(message, "Remove the sentence ")
+
+        def remove_sentence(state: State) -> None:
+            options = node(state, "classify")["options"]
+            options["prompt_template"] = options["prompt_template"].replace("\n" + sentence, "").replace(sentence, "")
+            mark_prompt_pending(state)
+
+        return remove_sentence, "change_substring", True
+    if message.startswith("Remove the output"):
+        name = message.removeprefix("Remove the output ").split(";")[0]
+
+        def remove_output(state: State) -> None:
+            state["outputs"] = [item for item in state["outputs"] if item["name"] != name]
+            state["edges"] = [edge for edge in state["edges"] if edge["to_node"] != name]
+            for item in state["nodes"]:
+                for key in ("on_success", "on_error"):
+                    if item[key] == name:
+                        item[key] = "discard"
+
+        return remove_output, "remove_output", False
+    if message.startswith("Put the pipeline name back to"):
+        name = quoted(message, "back to ")
+
+        def restore_name(state: State) -> None:
+            state["metadata"]["name"] = name
+
+        return restore_name, "set_metadata", False
+    if message.startswith("Delete the files"):
+        return (lambda state: None), "delete_blob", False
+    if message.startswith("Put max_tokens on classify back to no value"):
+
+        def unset(state: State) -> None:
+            del node(state, "classify")["options"]["max_tokens"]
+
+        return unset, "patch_node_options", False
     value = int(message.removeprefix("Set max_tokens on classify to ").removesuffix("."))
 
     def max_tokens(state: State) -> None:
         node(state, "classify")["options"]["max_tokens"] = value
 
-    return max_tokens, "patch_node_options"
+    return max_tokens, "patch_node_options", False
 
 
 class FakeComposer:
@@ -176,11 +261,16 @@ class FakeComposer:
         self.status: dict[int, str] = {}
         self.review_surface: dict[int, Change] = {}
         self.audit_after_reads: dict[int, int] = {}
+        self.created_files: dict[int, dict[str, bytes]] = {}
+        self.keep_files: set[int] = set()
+        self.open_card: set[int] = set()
+        self.messages: list[str] = []
 
     def __call__(self, state: State, message: str) -> FakeTurn:
         self.turn += 1
+        self.messages.append(message)
         number = self.turn
-        change, tool = change_for(message)
+        change, tool, reviewed = change_for(message)
         outcome = "applied"
         if number in self.tool_override:
             tool, outcome = self.tool_override[number]
@@ -190,7 +280,7 @@ class FakeComposer:
             self.extra[number](state)
         state["id"] = f"state-{number}"
         reviews: dict[str, Any] = {}
-        if change is prompt and number not in self.skip:
+        if (reviewed or number in self.open_card) and number not in self.skip:
             surface = prompt_surface(node(state, "classify")["options"])
             if number in self.review_surface:
                 self.review_surface[number](surface)
@@ -226,7 +316,18 @@ class FakeComposer:
         ]
         status = self.status[number] if number in self.status else "completed"
         late = self.audit_after_reads[number] if number in self.audit_after_reads else 0
-        return FakeTurn(state=state, audit=audit, assistant_tool_calls=calls, reviews=reviews, status=status, audit_after_reads=late)
+        deleting = tool == "delete_blob" and number not in self.keep_files
+        deleted = tuple(message.removeprefix("Delete the files ").split(" from this session")[0].split(", ")) if deleting else ()
+        return FakeTurn(
+            state=state,
+            audit=audit,
+            assistant_tool_calls=calls,
+            reviews=reviews,
+            status=status,
+            audit_after_reads=late,
+            created_files=self.created_files[number] if number in self.created_files else {},
+            deleted_files=deleted,
+        )
 
 
 def plan_file(tmp_path: Path, edits: list[dict[str, Any]] | None = None, targets: dict[str, Any] | None = None) -> Path:
@@ -322,17 +423,63 @@ def test_every_edit_is_an_ordinary_chat_message_and_a_complete_obedient_run_of_f
     assert summary["line"] == "longest run in a row: 50 of 50"
     assert summary["complete"] is True
     assert summary["gold"] is True
+    assert summary["as_found_differences"] == []
+    assert summary["files_left_in_session"] == []
     session_writes = [path for _, path in writes(fake)]
     assert session_writes.count(f"/api/sessions/{SESSION}/messages") == 50
-    assert set(session_writes) == {f"/api/sessions/{SESSION}/messages", f"/api/sessions/{SESSION}/interpretations/review-4/resolve"}
+    assert set(session_writes) == {
+        f"/api/sessions/{SESSION}/messages",
+        f"/api/sessions/{SESSION}/interpretations/review-3/resolve",
+        f"/api/sessions/{SESSION}/interpretations/review-47/resolve",
+    }
+
+
+def test_a_complete_keep_going_attempt_of_fifty_with_one_failed_edit_is_not_gold(tmp_path: Path) -> None:
+    composer = FakeComposer()
+    composer.skip = {10}
+    run, _, _ = make(tmp_path, composer, keep_going=True, edits=LONG_PLAN_EDITS)
+    summary = run.run()
+    assert summary["complete"] is True
+    assert summary["judged"] == summary["applicable"] == 50
+    assert summary["passed"] == 49
+    assert summary["first_failure"] == 10
+    assert summary["as_found_differences"] == []
+    assert summary["gold"] is False
+
+
+def test_a_complete_passing_attempt_that_leaves_the_graph_changed_is_not_gold(tmp_path: Path) -> None:
+    # Every edit passes, but the plan never puts the pipeline name back.
+    edits = [*LONG_PLAN_EDITS[:-1], {**LONG_PLAN_EDITS[3], "id": "max-tokens-last", "message": "Set max_tokens on {llm_inline} to 1999."}]
+    edits[-1]["expect"] = [{"equals": "/nodes/{llm_inline}/options/max_tokens", "value": 1999}]
+    edits[-2], edits[-1] = edits[-1], edits[-2]
+    run, _, _ = make(tmp_path, edits=edits)
+    summary = run.run()
+    assert summary["complete"] is True
+    assert summary["passed"] == summary["applicable"] == 50
+    assert summary["as_found_differences"] == ["/metadata/name"]
+    assert summary["gold"] is False
+
+
+def test_files_the_attempt_created_are_listed_by_name_with_whether_the_graph_uses_them(tmp_path: Path) -> None:
+    composer = FakeComposer()
+    composer.created_files = {3: {"battery_prompt_1.txt": b"Classify the row."}}
+    state = baseline()
+    run, fake, _ = make(tmp_path, composer, edits=LONG_PLAN_EDITS, state=state)
+    fake.sessions[SESSION].blobs["pre-existing"] = Blob(id="pre-existing", filename="notes.txt", data=b"kept")
+    summary = run.run()
+    left = summary["files_left_in_session"]
+    assert [(item["filename"], item["referenced"]) for item in left] == [("battery_prompt_1.txt", False)]
+    assert summary["gold"] is True
 
 
 def test_a_short_plan_is_never_gold_even_when_every_edit_passes(tmp_path: Path) -> None:
-    run, _, _ = make(tmp_path)
+    # Rename and put the name back: every edit passes and the graph is left as found, but two edits are too few.
+    run, _, _ = make(tmp_path, edits=[PLAN_EDITS[0], LONG_PLAN_EDITS[-1]])
     summary = run.run()
-    assert summary["line"] == "longest run in a row: 4 of 4"
+    assert summary["line"] == "longest run in a row: 2 of 2"
     assert summary["complete"] is True
-    assert summary["passed"] == 4
+    assert summary["passed"] == 2
+    assert summary["as_found_differences"] == []
     assert summary["gold"] is False
 
 
@@ -482,6 +629,60 @@ def test_server_written_review_rows_and_approval_hash_are_allowed_by_name_and_re
     assert options["interpretation_requirements"][0]["status"] == "resolved"
 
 
+@pytest.mark.parametrize("key", ["interpretation_requirements", "approved_prompt_artifact_hash"])
+def test_a_server_written_field_on_a_node_the_edit_does_not_name_is_an_unrelated_change(tmp_path: Path, key: str) -> None:
+    composer = FakeComposer()
+
+    def elsewhere(state: State) -> None:
+        node(state, "audit_copy")["options"][key] = "written on a step the prompt edit does not name"
+
+    composer.extra = {4: elsewhere}
+    run, fake, _ = make(tmp_path, composer)
+    run.run()
+    result = saved(run)["results"][3]
+    assert result["findings"] == [f"unrelated_change:/nodes/audit_copy/options/{key}"]
+    assert not [path for _, path in writes(fake) if path.endswith("/resolve")]
+
+
+def test_an_edit_that_names_no_node_allows_no_server_written_node_field(tmp_path: Path) -> None:
+    composer = FakeComposer()
+
+    def hash_on_classify(state: State) -> None:
+        node(state, "classify")["options"]["approved_prompt_artifact_hash"] = "not this edit's"
+
+    composer.extra = {1: hash_on_classify}
+    run, _, _ = make(tmp_path, composer)
+    run.run()
+    assert saved(run)["results"][0]["findings"] == ["unrelated_change:/nodes/classify/options/approved_prompt_artifact_hash"]
+
+
+def test_the_node_whose_card_the_edit_approves_may_carry_server_written_fields(tmp_path: Path) -> None:
+    # The edit's expectations name no node; only its approval names classify.
+    edits = [{**PLAN_EDITS[0], "approve": {"kind": "llm_prompt_template", "node": "{llm_inline}"}}]
+    composer = FakeComposer()
+    composer.extra = {1: mark_prompt_pending}
+    run, _, _ = make(tmp_path, composer, edits=edits)
+    summary = run.run()
+    result = saved(run)["results"][0]
+    assert result["passed"] is True
+    assert result["server_written"] == ["/nodes/classify/options/interpretation_requirements"]
+    # A warning that is not a refused tool call is not counted as a corrected call.
+    assert result["warnings"] == ["no_pending_review_card_to_approve"]
+    assert summary["tool_calls_rejected_then_corrected"] == 0
+
+
+def test_an_approval_that_writes_review_fields_on_another_node_fails_the_edit(tmp_path: Path) -> None:
+    run, fake, _ = make(tmp_path)
+
+    def resolve_side_effect(method: str, path: str) -> None:
+        if method == "POST" and path.endswith("/resolve"):
+            node(fake.sessions[SESSION].state, "audit_copy")["options"]["approved_prompt_artifact_hash"] = "other node"
+
+    fake.on_request = resolve_side_effect
+    run.run()
+    assert saved(run)["results"][3]["findings"] == ["approval_changed:/nodes/audit_copy/options/approved_prompt_artifact_hash"]
+
+
 def test_id_keyed_rows_reordered_by_a_whole_step_resend_are_not_a_change(tmp_path: Path) -> None:
     # Not a server-written key: the pass comes from comparing rows by id, not from the server-written allowance.
     state = baseline()
@@ -623,25 +824,175 @@ def test_a_new_attempt_on_a_graph_with_battery_leftovers_is_refused(tmp_path: Pa
     assert writes(fake) == []
 
 
-def test_cleanup_reports_leftovers_and_sends_nothing_without_execute(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    state = baseline()
-    insert(state)
-    run, fake, _ = make(tmp_path, state=state)
-    assert battery.cleanup(run, execute=False) == 1
-    assert writes(fake) == []
-    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert events[0]["found"] == ["/nodes/battery_a"]
-    assert events[1]["would_send"][0].startswith("Remove the step battery_a from the pipeline")
+def cleanup_events(capsys: pytest.CaptureFixture[str]) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in capsys.readouterr().out.splitlines()]
 
 
-def test_cleanup_with_execute_removes_leftovers_through_chat_turns(tmp_path: Path) -> None:
-    state = baseline()
-    insert(state)
-    run, fake, composer = make(tmp_path, state=state)
-    assert battery.cleanup(run, execute=True) == 0
+def test_cleanup_without_execute_makes_no_network_call_and_prints_what_it_would_do(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def no_client(base_url: str) -> WebClient:
+        raise AssertionError("cleanup without --execute built a client")
+
+    argv = ["cleanup", "--base-url", "http://localhost:8451", "--session", SESSION, "--account", "tester"]
+    assert battery.main([*argv, "--state-dir", str(tmp_path / "s")], client_factory=no_client) == 0
+    event = cleanup_events(capsys)[-1]
+    assert event["event"] == "dry_run"
+    assert event["saved_attempt"] is None
+    assert any("without changing it" in line for line in event["would"])
+    # With a saved attempt, the name it would restore comes from the attempt's starting graph, read from disk.
+    run, _, _ = make(tmp_path)
+    run.run()
+    capsys.readouterr()
+    plan = ["--plan", str(tmp_path / "plan.json")]
+    assert battery.main([*argv, "--state-dir", str(tmp_path / "state"), *plan], client_factory=no_client) == 0
+    event = cleanup_events(capsys)[-1]
+    assert event["saved_attempt"] == "1"
+    assert 'ask for the pipeline name to be put back to "Pipeline" (the saved attempt\'s starting graph)' in event["would"]
+
+
+def cleanup_after_a_stopped_attempt(
+    tmp_path: Path, composer: FakeComposer | None = None
+) -> tuple[battery.EditBattery, FakeDeployment, FakeComposer]:
+    """An attempt that stopped at edit 3 (its change did not land), leaving a name, a step and a file; then cleanup."""
+    first = FakeComposer()
+    first.skip = {3}
+    first.created_files = {2: {"battery_prompt_1.txt": b"unused"}}
+    run, fake, _ = make(tmp_path, first)
+    fake.sessions[SESSION].blobs["pre-existing"] = Blob(id="pre-existing", filename="notes.txt", data=b"kept")
+    assert run.run()["stopped_reason"] == "edit 3 (max-tokens) failed verification"
+    left = fake.sessions[SESSION]
+    again, fake2, composer = make(tmp_path, composer, state=copy.deepcopy(left.state))
+    fake2.sessions[SESSION].blobs = copy.deepcopy(left.blobs)
+    return again, fake2, composer
+
+
+def test_cleanup_removes_a_stopped_attempt_s_leftovers_in_judged_turns(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    run, fake, composer = cleanup_after_a_stopped_attempt(tmp_path)
+    capsys.readouterr()
+    assert battery.cleanup(run) == 0
+    assert composer.messages == [
+        "Remove the step battery_a and connect what fed it directly to what it fed, so the flow is as it was before it was added. "
+        "Change nothing else.",
+        'Put the pipeline name back to "Pipeline". Change nothing else.',
+        "Delete the files battery_prompt_1.txt from this session; no step uses them. Change nothing else.",
+    ]
+    assert {path for _, path in writes(fake)} == {f"/api/sessions/{SESSION}/messages"}
+    session = fake.sessions[SESSION]
+    assert graph_view(session.state) == graph_view({**baseline(), "id": session.state["id"]})
+    assert [blob.filename for blob in session.blobs.values()] == ["notes.txt"]
+    events = cleanup_events(capsys)
+    assert [event["passed"] for event in events if event["event"] == "cleanup_turn"] == [True, True, True]
+    result = events[-1]
+    assert result["event"] == "cleanup_result"
+    assert result["failed_turn"] is None
+    assert result["leftovers"] == result["files_left"] == result["new_pending_review_cards"] == []
+
+
+def test_a_cleanup_turn_that_changes_anything_else_fails_and_stops_the_cleanup(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    composer = FakeComposer()
+
+    def drift(state: State) -> None:
+        node(state, "audit_copy")["description"] = "changed by a cleanup turn"
+
+    composer.extra = {1: drift}
+    run, _, _ = cleanup_after_a_stopped_attempt(tmp_path, composer)
+    capsys.readouterr()
+    assert battery.cleanup(run) == 1
     assert composer.turn == 1
-    assert [path for _, path in writes(fake)] == [f"/api/sessions/{SESSION}/messages"]
-    assert [item["id"] for item in fake.sessions[SESSION].state["nodes"]] == ["classify", "audit_copy"]
+    events = cleanup_events(capsys)
+    turn = next(event for event in events if event["event"] == "cleanup_turn")
+    assert turn["findings"] == ["unrelated_change:/nodes/audit_copy/description"]
+    assert events[-1]["failed_turn"] == 1
+    assert events[-1]["leftovers"] == ["/metadata/name"]
+
+
+def test_cleanup_removes_a_marker_sentence_and_approves_the_card_only_on_a_clean_turn(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = baseline()
+    node(state, "classify")["options"]["prompt_template"] += "\nBattery marker two."
+    run, fake, composer = make(tmp_path, state=state)
+    assert battery.cleanup(run) == 0
+    assert composer.messages == [
+        'Remove the sentence "Battery marker two." from the prompt of the step classify, keeping the rest exactly as it is. '
+        "Change nothing else."
+    ]
+    assert node(fake.sessions[SESSION].state, "classify")["options"]["prompt_template"] == "Classify the row."
+    assert [path for _, path in writes(fake) if path.endswith("/resolve")] == [f"/api/sessions/{SESSION}/interpretations/review-1/resolve"]
+    assert cleanup_events(capsys)[-1]["new_pending_review_cards"] == []
+
+
+def test_a_cleanup_turn_that_fails_leaves_its_card_unapproved_and_reports_it(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    state = baseline()
+    node(state, "classify")["options"]["prompt_template"] += "\nBattery marker two."
+    composer = FakeComposer()
+
+    def drift(state: State) -> None:
+        node(state, "audit_copy")["options"]["note"] = "changed beside the marker removal"
+
+    composer.extra = {1: drift}
+    run, fake, _ = make(tmp_path, composer, state=state)
+    assert battery.cleanup(run) == 1
+    assert not [path for _, path in writes(fake) if path.endswith("/resolve")]
+    result = cleanup_events(capsys)[-1]
+    assert result["failed_turn"] == 1
+    assert result["new_pending_review_cards"] == [{"id": "review-1", "kind": "llm_prompt_template"}]
+
+
+def test_a_review_card_a_clean_cleanup_turn_opened_is_reported_and_fails_the_cleanup(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = baseline()
+    insert(state)
+    composer = FakeComposer()
+    composer.open_card = {1}
+    run, fake, _ = make(tmp_path, composer, state=state)
+    assert battery.cleanup(run) == 1
+    assert not [path for _, path in writes(fake) if path.endswith("/resolve")]
+    result = cleanup_events(capsys)[-1]
+    assert result["failed_turn"] is None
+    assert result["leftovers"] == result["files_left"] == []
+    assert result["new_pending_review_cards"] == [{"id": "review-1", "kind": "llm_prompt_template"}]
+
+
+def test_cleanup_removes_a_leftover_output_and_reports_a_name_it_cannot_restore(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    state = baseline()
+    add_output(state)
+    rename(state)
+    run, fake, composer = make(tmp_path, state=state)
+    assert battery.cleanup(run) == 1
+    assert composer.messages == ["Remove the output battery_out; anything sent there should be discarded instead. Change nothing else."]
+    assert node(fake.sessions[SESSION].state, "classify")["on_error"] == "discard"
+    result = cleanup_events(capsys)[-1]
+    assert result["failed_turn"] is None
+    assert result["leftovers"] == ["/metadata/name"]
+    assert result["pipeline_name_reported_only"] is True
+
+
+def test_a_delete_turn_that_leaves_the_file_fails(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    composer = FakeComposer()
+    composer.keep_files = {1}
+    run, fake, _ = make(tmp_path, composer)
+    fake.sessions[SESSION].blobs["b1"] = Blob(id="b1", filename="battery_prompt_1.txt", data=b"unused")
+    assert battery.cleanup(run) == 1
+    turn = next(event for event in cleanup_events(capsys) if event["event"] == "cleanup_turn")
+    assert turn["findings"] == ["file_not_deleted:b1"]
+
+
+def test_without_a_saved_attempt_cleanup_deletes_only_unused_battery_files(tmp_path: Path) -> None:
+    state = baseline()
+    run, fake, composer = make(tmp_path, state=state)
+    blobs = fake.sessions[SESSION].blobs
+    blobs["b1"] = Blob(id="b1", filename="battery_prompt_1.txt", data=b"unused")
+    blobs["b2"] = Blob(id="b2", filename="notes.txt", data=b"not the battery's")
+    blobs["b3"] = Blob(id="b3", filename="battery_prompt_2.txt", data=b"used")
+    node(fake.sessions[SESSION].state, "audit_copy")["options"]["template"] = {"blob_ref": "b3"}
+    fake.sessions[SESSION].state["sources"]["rows"]["options"]["blob_id"] = "b4"
+    blobs["b4"] = Blob(id="b4", filename="battery_rows.csv", data=b"a source's file")
+    assert battery.cleanup(run) == 0
+    assert composer.messages == ["Delete the files battery_prompt_1.txt from this session; no step uses them. Change nothing else."]
+    assert sorted(blobs) == ["b2", "b3", "b4"]
 
 
 # ── review approval ────────────────────────────────────────────────────────

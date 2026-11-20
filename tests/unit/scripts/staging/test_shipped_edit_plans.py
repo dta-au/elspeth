@@ -325,6 +325,13 @@ def test_a_shipped_plan_can_be_gold_and_leaves_the_graph_as_found(
     assert summary["applicable"] == (54 if optional_roles else 50)
     assert len(summary["skipped_not_applicable"]) == (0 if optional_roles else 4)
     assert summary["as_found_differences"] == []
+    # Prompt files the plan made are named in the summary, with whether the final graph still uses each.
+    left = summary["files_left_in_session"]
+    session = fake.sessions[SESSION]
+    assert left, "the plan's file rounds create prompt files"
+    assert {item["id"] for item in left} == set(session.blobs) - {"prompt-file"}
+    assert all(item["filename"].startswith("battery_") for item in left)
+    assert {item["id"] for item in left if item["referenced"]} == battery.referenced_files(session.state) - {"prompt-file"}
 
     def read_text(marker: Mapping[str, Any]) -> str:
         return fake.sessions[SESSION].blobs[marker["blob_ref"]].data.decode()

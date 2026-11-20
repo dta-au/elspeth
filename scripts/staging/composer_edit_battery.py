@@ -17,7 +17,8 @@ the configured provider; the battery never writes the graph itself. Per edit:
   expected change landed; nothing else changed (every difference is covered
   by an expectation, the edit's ``may_change`` prefixes or its
   ``edges_touching`` components, or is a field the server writes itself,
-  which is allowed by name and listed as server-written); no new validation
+  allowed by name, only on a component the edit names or the node whose card
+  it approves, and listed as server-written); no new validation
   error; one of the edit's acceptable tools was used; no forbidden tool was
   called without being rejected.
 * A tool call the server rejected inside a passing edit is a warning, counted
@@ -27,7 +28,9 @@ the configured provider; the battery never writes the graph itself. Per edit:
   remainder and provider-call counts (see :mod:`scripts.staging.turn_evidence`).
 
 Gold is a COMPLETE attempt: every applicable plan edit judged and passed, in
-one attempt, with at least ``GOLD_MINIMUM_EDITS`` applicable edits. An edit
+one attempt, with at least ``GOLD_MINIMUM_EDITS`` applicable edits, leaving
+no difference from the graph it started on. Files the attempt added to the
+session are listed by name ("files left in the session"). An edit
 whose optional graph role is absent is skipped as not applicable: reported,
 not judged, and it neither extends nor breaks the run in a row. The summary
 also reports tool coverage: the editing tools used at least once against the
@@ -42,8 +45,9 @@ Safety properties (named by tests in
   battery does not give on their behalf, so it refuses to start.
 * A new attempt refuses to start on a graph holding leftovers of an earlier
   attempt (``battery_*`` steps or outputs, battery marker text in a prompt, the
-  battery's pipeline name); ``cleanup`` reports them and, with ``--execute``,
-  asks the Composer to remove them in ordinary chat turns.
+  battery's pipeline name). ``cleanup --execute`` asks the Composer to remove
+  them in ordinary chat turns, each judged like a battery edit; without
+  ``--execute`` it makes no network call.
 * Each edit's operation id is saved BEFORE it is submitted; a resumed run polls
   that operation instead of submitting again.
 * A run resumes only from a checkpoint that is valid for the same session,
@@ -66,6 +70,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -81,13 +86,17 @@ from scripts.staging.edit_plan import (
     as_found_differences,
     check_expectations,
     classify_changes,
+    escape,
     graph_view,
     leftover_findings,
     load_plan,
+    named_components,
     new_validation_errors,
     preconditions,
+    render_was,
     resolve_edits,
     resolve_targets,
+    text_at,
     tool_findings,
     tool_warnings,
 )
@@ -104,6 +113,7 @@ from scripts.staging.opslib import (
     blob_markers,
     differences,
     emit,
+    list_pages,
     require_dict,
     require_list,
     require_uuid,
@@ -117,7 +127,7 @@ from scripts.staging.repair_copied_prompt_reviews import prompt_surface
 from scripts.staging.turn_evidence import UNAVAILABLE_FROM_API, operation_rows, shed_state, shed_this_turn, turn_evidence
 
 LIVE_STATUSES = ("queued", "running")
-CHECKPOINT_VERSION = 2
+CHECKPOINT_VERSION = 3
 GOLD_MINIMUM_EDITS = 50
 AUTO_COMMIT = "auto_commit"
 # The Composer's graph-editing tools (registry kinds MUTATION, BLOB_MUTATION and
@@ -155,6 +165,7 @@ CHECKPOINT_KEYS = frozenset(
         "plan_sha256",
         "targets",
         "baseline",
+        "baseline_files",
         "last_state",
         "edits",
         "results",
@@ -186,6 +197,7 @@ def load_checkpoint(store: CheckpointStore, name: str, *, session_id: str, attem
         and saved["session_id"] == session_id
         and saved["attempt"] == attempt
         and type(saved["baseline"]) is dict
+        and type(saved["baseline_files"]) is list
         and type(saved["last_state"]) is dict
         and type(saved["edits"]) is list
         and type(saved["results"]) is list
@@ -250,8 +262,15 @@ def summarise(checkpoint: Mapping[str, Any]) -> JsonObject:
     wall = _total(sent, "wall_ms")
     busy = _total(sent, "provider_busy_ms")
     shed = [result for result in sent if result["history_shed"]]
-    corrected = sum(int(warning.rsplit(":", 1)[1]) for result in judged if result["passed"] for warning in result["warnings"])
-    gold = complete and passed == len(applicable) and len(applicable) >= GOLD_MINIMUM_EDITS
+    corrected = sum(
+        int(warning.rsplit(":", 1)[1])
+        for result in judged
+        if result["passed"]
+        for warning in result["warnings"]
+        if warning.startswith("tool_call_")
+    )
+    as_found = checkpoint["as_found_differences"] if "as_found_differences" in checkpoint else None
+    gold = complete and passed == len(applicable) and len(applicable) >= GOLD_MINIMUM_EDITS and as_found == []
     return {
         "plan": checkpoint["plan_name"],
         "edits": len(checkpoint["edits"]),
@@ -264,11 +283,15 @@ def summarise(checkpoint: Mapping[str, Any]) -> JsonObject:
         "passed": passed,
         "longest_run": longest,
         "gold": gold,
-        "gold_requires": f"every applicable edit judged and passed in one attempt, at least {GOLD_MINIMUM_EDITS} applicable",
+        "gold_requires": (
+            f"every applicable edit judged and passed in one attempt, at least {GOLD_MINIMUM_EDITS} applicable, "
+            "and the graph left as it was found"
+        ),
         "line": f"longest run in a row: {longest} of {len(applicable)}" + ("" if complete else f" (incomplete: {len(judged)} judged)"),
         "first_failure": first_failure,
         "stopped_reason": checkpoint["stopped_reason"] if "stopped_reason" in checkpoint else None,
-        "as_found_differences": checkpoint["as_found_differences"] if "as_found_differences" in checkpoint else None,
+        "as_found_differences": as_found,
+        "files_left_in_session": checkpoint["files_left_in_session"] if "files_left_in_session" in checkpoint else None,
         "tool_calls_rejected_then_corrected": corrected,
         "server_written_changes": sum(len(result["server_written"]) for result in sent),
         "tool_coverage": tool_coverage(_used_tools(sent)),
@@ -430,6 +453,7 @@ class EditBattery:
             )
         targets = resolve_targets(self.plan, baseline, self.overrides)
         rows = self.rows_from(0)
+        baseline_files = sorted(item["id"] for item in self.session_files())
         edits = resolve_edits(self.plan, targets, baseline)
         checkpoint = {
             "version": CHECKPOINT_VERSION,
@@ -439,6 +463,7 @@ class EditBattery:
             "plan_sha256": self.plan.sha256,
             "targets": {"resolved": targets, "overrides": dict(self.overrides)},
             "baseline": baseline,
+            "baseline_files": baseline_files,
             "last_state": baseline,
             "edits": edits,
             "results": [],
@@ -456,16 +481,15 @@ class EditBattery:
         return checkpoint
 
     def approve_reviews(
-        self, edit: Mapping[str, Any], state: Mapping[str, Any], checkpoint: JsonObject, approved: list[JsonObject]
+        self, edit: Mapping[str, Any], state: Mapping[str, Any], approved: list[JsonObject], save: Callable[[], None]
     ) -> None:
         """Resolve the edit's own prompt review cards, each checked against the node's current prompt.
 
-        Each approval is saved as soon as it is made, so a resumed run counts it.
+        Each approval is saved (``save``) as soon as it is made, so a resumed run counts it.
         """
         approve = edit["approve"]
         nodes = {node["id"]: node for node in state["nodes"]}
-        pending = require_dict(self.client.get_json(f"/api/sessions/{self.session_id}/interpretations?status=pending"), "reviews")["events"]
-        for event in pending:
+        for event in self.pending_reviews():
             if event["kind"] != approve["kind"]:
                 continue
             snapshot = require_dict(
@@ -489,16 +513,94 @@ class EditBattery:
                 {"choice": "accepted_as_drafted", "reviewed_anchor": snapshot["anchor"]},
             )
             approved.append({"event_id": event["id"], "kind": event["kind"], "node_id": approve["node"]})
-            self.store.write(self.name, checkpoint)
+            save()
+
+    def pending_reviews(self) -> list[JsonObject]:
+        events = require_dict(self.client.get_json(f"/api/sessions/{self.session_id}/interpretations?status=pending"), "reviews")["events"]
+        return [require_dict(event, "review") for event in require_list(events, "reviews")]
+
+    def session_files(self) -> list[JsonObject]:
+        return [require_dict(item, "file") for item in list_pages(self.client, f"/api/sessions/{self.session_id}/blobs")]
 
     def judge(
-        self, edit: Mapping[str, Any], checkpoint: Mapping[str, Any], before_state: Mapping[str, Any], after_state: Mapping[str, Any]
+        self, edit: Mapping[str, Any], baseline_state: Mapping[str, Any], before_state: Mapping[str, Any], after_state: Mapping[str, Any]
     ) -> tuple[list[str], list[str], list[str]]:
-        """``(expectation failures, unrelated changes, server-written changes)``."""
+        """``(expectation failures, unrelated changes, server-written changes)``.
+
+        Server-written review fields count only on the components the edit names
+        and the node whose card it approves.
+        """
         before, after = graph_view(before_state), graph_view(after_state)
-        failures, covered = check_expectations(edit, before, after, graph_view(checkpoint["baseline"]), self.read_text)
-        changes = classify_changes(before, after, [*covered, *edit["may_change"]])
+        failures, covered = check_expectations(edit, before, after, graph_view(baseline_state), self.read_text)
+        named = named_components(edit) | ({edit["approve"]["node"]} if edit["approve"] is not None else set())
+        changes = classify_changes(before, after, [*covered, *edit["may_change"]], named=named)
         return failures, changes.unrelated, changes.server_written
+
+    def verdict(
+        self,
+        edit: Mapping[str, Any],
+        before_state: Mapping[str, Any],
+        operation: Mapping[str, Any],
+        operation_id: str,
+        *,
+        baseline_state: Mapping[str, Any],
+        rows_offset: int,
+        shed_before: Sequence[int] | None,
+        approved: list[JsonObject],
+        save: Callable[[], None],
+    ) -> tuple[JsonObject, JsonObject, int]:
+        """Judge one finished turn: ``(verdict fields, the state it left, rows read so far)``.
+
+        Battery edits and cleanup turns are judged by this same rule.
+        """
+        rows, rows_seen, evidence_reads, settled = self.settled_rows(rows_offset, operation_id)
+        after_state = self.state()
+        evidence = turn_evidence(rows, operation_id, shed_before=shed_before)
+        completed = operation["status"] == "completed" and operation["result"] is not None
+        failures, unrelated, server_written = self.judge(edit, baseline_state, before_state, after_state)
+        findings: list[str] = []
+        if not completed:
+            error = operation["error"] if "error" in operation else None
+            findings.append(
+                "turn_not_completed:"
+                + str(operation["status"])
+                + (":" + str(error["code"]) if type(error) is dict and "code" in error else "")
+            )
+        if not settled:
+            findings.append(f"evidence_not_settled_after_{evidence_reads}_reads")
+        if evidence["successful_provider_calls"] == 0:
+            findings.append("no_successful_provider_call")
+        findings.extend(failures)
+        findings.extend("unrelated_change:" + path for path in unrelated)
+        findings.extend("new_validation_error:" + key for key in new_validation_errors(before_state, after_state))
+        findings.extend(tool_findings(edit, evidence, self.plan.forbidden_tools))
+        if "delete_files" in edit:
+            present = {item["id"] for item in self.session_files()}
+            findings.extend(f"file_not_deleted:{blob_id}" for blob_id in edit["delete_files"] if blob_id in present)
+        warnings = tool_warnings(evidence)
+        if edit["approve"] is not None and not findings:
+            # Only a turn with a clean verdict earns an approval; the approval may change server-written fields only.
+            self.approve_reviews(edit, after_state, approved, save)
+            if not approved:
+                warnings.append("no_pending_review_card_to_approve")
+            approved_state = self.state()
+            approval = classify_changes(graph_view(after_state), graph_view(approved_state), [], named={edit["approve"]["node"]})
+            findings.extend("approval_changed:" + path for path in approval.unrelated)
+            server_written = [*server_written, *approval.server_written]
+            after_state = approved_state
+            failures, _, _ = self.judge(edit, baseline_state, before_state, after_state)
+            findings.extend("after_approval:" + failure for failure in failures)
+        fields: JsonObject = {
+            "status": operation["status"],
+            "passed": not findings,
+            "findings": findings,
+            "warnings": warnings,
+            "server_written": server_written,
+            "evidence": evidence,
+            "history_shed": shed_this_turn(evidence),
+            "evidence_reads": evidence_reads,
+        }
+        return fields, after_state, rows_seen
 
     def not_sent(self, checkpoint: JsonObject, edit: Mapping[str, Any], live: Mapping[str, Any], findings: list[str]) -> JsonObject:
         result: JsonObject = {
@@ -541,58 +643,33 @@ class EditBattery:
             emit("edit_submitted", number=edit["number"], id=edit["id"], operation_id=result["operation_id"])
         operation, polls = self.wait_for(result["operation_id"], result["poll_after_ms"])
         observed_at = self.now()
-        before_state = checkpoint["last_state"]
-        rows, rows_seen, evidence_reads, settled = self.settled_rows(checkpoint["rows_seen"], result["operation_id"])
-        after_state = self.state()
-        evidence = turn_evidence(rows, result["operation_id"], shed_before=checkpoint["shed_history"])
-        completed = operation["status"] == "completed" and operation["result"] is not None
-        failures, unrelated, server_written = self.judge(edit, checkpoint, before_state, after_state)
-        validation = new_validation_errors(before_state, after_state)
-        tools = tool_findings(edit, evidence, self.plan.forbidden_tools)
-        findings: list[str] = []
-        if not completed:
-            error = operation["error"] if "error" in operation else None
-            findings.append(
-                "turn_not_completed:"
-                + str(operation["status"])
-                + (":" + str(error["code"]) if type(error) is dict and "code" in error else "")
-            )
-        if not settled:
-            findings.append(f"evidence_not_settled_after_{evidence_reads}_reads")
-        if evidence["successful_provider_calls"] == 0:
-            findings.append("no_successful_provider_call")
-        findings.extend(failures)
-        findings.extend("unrelated_change:" + path for path in unrelated)
-        findings.extend("new_validation_error:" + key for key in validation)
-        findings.extend(tools)
         if "approvals" not in result:
             result["approvals"] = []
-        warnings = tool_warnings(evidence)
-        if edit["approve"] is not None and not findings:
-            # Only a turn with a clean verdict earns an approval; the approval may change server-written fields only.
-            self.approve_reviews(edit, after_state, checkpoint, result["approvals"])
-            if not result["approvals"]:
-                warnings.append("no_pending_review_card_to_approve")
-            approved_state = self.state()
-            approval = classify_changes(graph_view(after_state), graph_view(approved_state), [])
-            findings.extend("approval_changed:" + path for path in approval.unrelated)
-            server_written = [*server_written, *approval.server_written]
-            after_state = approved_state
-            failures, _, _ = self.judge(edit, checkpoint, before_state, after_state)
-            findings.extend("after_approval:" + failure for failure in failures)
+        fields, after_state, rows_seen = self.verdict(
+            edit,
+            checkpoint["last_state"],
+            operation,
+            result["operation_id"],
+            baseline_state=checkpoint["baseline"],
+            rows_offset=checkpoint["rows_seen"],
+            shed_before=checkpoint["shed_history"],
+            approved=result["approvals"],
+            save=lambda: self.store.write(self.name, checkpoint),
+        )
+        evidence = fields["evidence"]
         wall = round((observed_at - result["submitted_at"]) * 1000)
         result.update(
-            status=operation["status"],
-            passed=not findings,
-            findings=findings,
-            warnings=warnings,
-            server_written=server_written,
+            status=fields["status"],
+            passed=fields["passed"],
+            findings=fields["findings"],
+            warnings=fields["warnings"],
+            server_written=fields["server_written"],
             evidence=evidence,
-            history_shed=shed_this_turn(evidence),
+            history_shed=fields["history_shed"],
             timing={
                 "wall_ms": wall,
                 "polls": polls,
-                "evidence_reads": evidence_reads,
+                "evidence_reads": fields["evidence_reads"],
                 "poll_interval_s": self.poll_seconds,
                 "span_ms": evidence["span_ms"],
                 "provider_busy_ms": evidence["provider_busy_ms"],
@@ -606,7 +683,7 @@ class EditBattery:
         checkpoint["rows_seen"] = rows_seen
         if evidence["history"]["shed_history_after"] is not None:
             checkpoint["shed_history"] = evidence["history"]["shed_history_after"]
-        if findings and not self.keep_going:
+        if result["findings"] and not self.keep_going:
             checkpoint["stopped_reason"] = f"edit {edit['number']} ({edit['id']}) failed verification"
         self.store.write(self.name, checkpoint)
         self.store.write(f"{self.name}-edit-{edit['number']}", {"result": result, "state": after_state, "operation": operation})
@@ -620,6 +697,15 @@ class EditBattery:
             provider_calls=evidence["provider_calls"],
         )
         return result
+
+    def files_left(self, baseline_files: Sequence[str], state: Mapping[str, Any]) -> list[JsonObject]:
+        """Files in the session that were not there when the attempt started, and whether the graph still uses each."""
+        referenced = referenced_files(state)
+        return [
+            {"id": item["id"], "filename": item["filename"], "referenced": item["id"] in referenced}
+            for item in self.session_files()
+            if item["id"] not in baseline_files
+        ]
 
     def run(self) -> JsonObject:
         sign_in(self.client, self.auth, prompt_secret=self.prompt_secret)
@@ -641,8 +727,10 @@ class EditBattery:
                     continue
                 self.run_edit(checkpoint, index)
             if "stopped_reason" not in checkpoint and "as_found_differences" not in checkpoint:
-                # A plan leaves the graph as it found it; any difference left is reported, not judged.
-                checkpoint["as_found_differences"] = as_found_differences(checkpoint["baseline"], self.state(), self.read_text)
+                # A plan leaves the graph as it found it; gold needs no difference left.
+                final = self.state()
+                checkpoint["as_found_differences"] = as_found_differences(checkpoint["baseline"], final, self.read_text)
+                checkpoint["files_left_in_session"] = self.files_left(checkpoint["baseline_files"], final)
                 self.store.write(self.name, checkpoint)
         finally:
             self.client.close()
@@ -652,56 +740,255 @@ class EditBattery:
         return summary
 
 
+def referenced_files(state: Mapping[str, Any]) -> set[str]:
+    """Ids of every file a graph's sources, nodes or outputs point at: prompt file markers and source file bindings."""
+    found: set[str] = set()
+
+    def walk(value: object) -> None:
+        if type(value) is dict:
+            for key, child in value.items():
+                if key in ("blob_ref", "blob_id") and type(child) is str:
+                    found.add(child)
+                else:
+                    walk(child)
+        elif type(value) is list:
+            for child in value:
+                walk(child)
+
+    walk([state["sources"], state["nodes"], state["outputs"]])
+    return found
+
+
 # ── cleanup ────────────────────────────────────────────────────────────────
 
-
-def cleanup_messages(findings: Sequence[str]) -> list[str]:
-    """Ordinary chat requests that would remove the leftovers ``findings`` names; a pipeline name is only reported."""
-    steps = [path.split("/", 2)[2] for path in findings if path.startswith("/nodes/") and path.count("/") == 2]
-    outputs = [path.split("/", 2)[2] for path in findings if path.startswith("/outputs/")]
-    prompts = sorted({path.split("/")[2] for path in findings if path.startswith("/nodes/") and path.count("/") == 4})
-    messages: list[str] = []
-    if outputs:
-        messages.append(
-            f"Remove the output{'s' if len(outputs) > 1 else ''} {', '.join(outputs)}; anything sent there "
-            "should be discarded instead. Change nothing else."
-        )
-    if steps:
-        messages.append(
-            f"Remove the step{'s' if len(steps) > 1 else ''} {', '.join(steps)} from the pipeline, connecting what fed "
-            "each one directly to what it fed, so the flow is as it was before they were added. Change nothing else."
-        )
-    for node_id in prompts:
-        kinds = " or ".join(f'"{marker}"' for marker in MARKER_TEXTS)
-        messages.append(
-            f"In the prompts of the step {node_id}, remove every sentence that starts with {kinds}, "
-            "keeping the rest of each prompt exactly as it is. Change nothing else."
-        )
-    return messages
+CLEANUP_TURN_LIMIT = 60
+_MARKER_SENTENCE = re.compile("(?:" + "|".join(re.escape(marker) for marker in MARKER_TEXTS) + r")[^.]*\.")
 
 
-def cleanup(battery: EditBattery, *, execute: bool) -> int:
-    """Report the graph's battery leftovers and, with ``execute``, ask the Composer to remove them."""
+def _cleanup_edit(number: int, edit_id: str, message: str, expect: list[JsonObject], tools: list[str], **extra: Any) -> JsonObject:
+    edit: JsonObject = {
+        "number": number,
+        "id": edit_id,
+        "applicable": True,
+        "message": message + " Change nothing else.",
+        "expect": expect,
+        "may_change": [],
+        "edges_touching": [],
+        "tools_any": tools,
+        "tools_all": [],
+        "approve": None,
+    }
+    edit.update(extra)
+    return edit
+
+
+def _routes_into(view: Mapping[str, Any], name: str) -> list[tuple[str, str]]:
+    """``(collection, id)`` of every source or node whose routing names ``name``."""
+    found: list[tuple[str, str]] = [("sources", source) for source, spec in view["sources"].items() if spec["on_success"] == name]
+    for node_id, node in view["nodes"].items():
+        targets = [node["on_success"], node["on_error"]]
+        if "routes" in node and type(node["routes"]) is dict:
+            targets.extend(node["routes"].values())
+        if "fork_to" in node and type(node["fork_to"]) is list:
+            targets.extend(node["fork_to"])
+        if name in targets:
+            found.append(("nodes", node_id))
+    return found
+
+
+def next_cleanup_edit(
+    state: Mapping[str, Any],
+    read_text: Callable[[Mapping[str, Any]], str],
+    files: Sequence[Mapping[str, Any]],
+    baseline_state: Mapping[str, Any] | None,
+    baseline_files: Sequence[str] | None,
+    number: int,
+) -> JsonObject | None:
+    """The next cleanup turn for the graph as it is now, as a judgeable edit; ``None`` when nothing is left to ask for.
+
+    Order: leftover outputs, leftover steps, battery marker sentences, the
+    pipeline name (only when the attempt's starting graph is known), then
+    leftover files the graph no longer uses.
+    """
+    view = graph_view(state)
+    for name in view["outputs"]:
+        if name.startswith(TEMPORARY_PREFIX):
+            routers = _routes_into(view, name)
+            return _cleanup_edit(
+                number,
+                f"remove-output-{name}",
+                f"Remove the output {name}; anything sent there should be discarded instead.",
+                [{"absent": f"/outputs/{escape(name)}"}],
+                ["remove_output"],
+                may_change=[
+                    f"/{kind}/{escape(item)}/{field}" for kind, item in routers for field in ("on_success", "on_error", "routes", "fork_to")
+                ],
+                edges_touching=[name, *(item for _, item in routers)],
+            )
+    for node_id, node in view["nodes"].items():
+        if node_id.startswith(TEMPORARY_PREFIX):
+            feeders = [(kind, item) for kind, item in _routes_into(view, node["input"]) if item != node_id]
+            consumers = [
+                other for other, spec in view["nodes"].items() if node["on_success"] is not None and spec["input"] == node["on_success"]
+            ]
+            expect: list[JsonObject] = [{"absent": f"/nodes/{escape(node_id)}"}]
+            may_change: list[str] = []
+            if len(feeders) == 1 and len(consumers) == 1:
+                expect.append({"chain": {"from": feeders[0][1], "to": consumers[0], "via": []}})
+            else:
+                may_change = [f"/{kind}/{escape(item)}/on_success" for kind, item in feeders]
+                may_change += [f"/nodes/{escape(item)}/input" for item in consumers]
+            return _cleanup_edit(
+                number,
+                f"remove-step-{node_id}",
+                f"Remove the step {node_id} and connect what fed it directly to what it fed, so the flow is as it was before it was added.",
+                expect,
+                ["remove_node"],
+                may_change=may_change,
+                edges_touching=[node_id, *(item for _, item in feeders), *consumers],
+            )
+    for node_id in view["nodes"]:
+        for key, label in (("prompt_template", "prompt"), ("system_prompt", "system prompt")):
+            pointer = f"/nodes/{escape(node_id)}/options/{key}"
+            _, text = text_at(view, pointer, read_text)
+            if text is None:
+                continue
+            for sentence in _MARKER_SENTENCE.findall(text):
+                if text.count(sentence) == 1:
+                    return _cleanup_edit(
+                        number,
+                        f"remove-marker-{node_id}-{key}",
+                        f'Remove the sentence "{sentence}" from the {label} of the step {node_id}, keeping the rest exactly as it is.',
+                        [{"text": pointer, "remove": sentence}],
+                        ["change_substring", "patch_node_options", "wire_blob_inline_ref"],
+                        approve={"kind": "llm_prompt_template", "node": node_id},
+                    )
+    name = view["metadata"]["name"] if "name" in view["metadata"] else None
+    if baseline_state is not None and type(name) is str and name.startswith("Battery check"):
+        return _cleanup_edit(
+            number,
+            "restore-pipeline-name",
+            f"Put the pipeline name back to {render_was(graph_view(baseline_state), '/metadata/name')}.",
+            [{"restored": "/metadata/name"}],
+            ["set_metadata"],
+        )
+    stale = leftover_files(files, state, baseline_files)
+    if stale:
+        return _cleanup_edit(
+            number,
+            "delete-files",
+            f"Delete the files {', '.join(item['filename'] for item in stale)} from this session; no step uses them.",
+            [],
+            ["delete_blob"],
+            delete_files=[item["id"] for item in stale],
+        )
+    return None
+
+
+def leftover_files(files: Sequence[Mapping[str, Any]], state: Mapping[str, Any], baseline_files: Sequence[str] | None) -> list[JsonObject]:
+    """Files the graph no longer uses that a battery attempt left: new since the attempt began, or (with no attempt) named battery_*."""
+    referenced = referenced_files(state)
+    return [
+        {"id": item["id"], "filename": item["filename"]}
+        for item in files
+        if item["id"] not in referenced
+        and (item["id"] not in baseline_files if baseline_files is not None else item["filename"].startswith(TEMPORARY_PREFIX))
+    ]
+
+
+def cleanup_dry_run(saved: Mapping[str, Any] | None, *, base_url: str, session_id: str, account: str) -> JsonObject:
+    """What ``cleanup --execute`` would do, from local files only: no network call is made."""
+    name = render_was(graph_view(saved["baseline"]), "/metadata/name") if saved is not None else None
+    return {
+        "base_url": base_url,
+        "session_id": session_id,
+        "account": account,
+        "saved_attempt": saved["attempt"] if saved is not None else None,
+        "would": [
+            "sign in and read the graph, its pending review cards and the session's files",
+            f"ask the Composer, one judged chat turn at a time (at most {CLEANUP_TURN_LIMIT}), to remove each {TEMPORARY_PREFIX}* "
+            f"output, then each {TEMPORARY_PREFIX}* step (reconnecting what fed it to what it fed), then each battery marker "
+            "sentence in a prompt (approving that prompt's review card only on a clean verdict)",
+            (
+                f"ask for the pipeline name to be put back to {name} (the saved attempt's starting graph)"
+                if saved is not None
+                else "report a battery pipeline name without changing it (no saved attempt gives the name to restore)"
+            ),
+            (
+                "ask for files added since the saved attempt began that no step uses to be deleted"
+                if saved is not None
+                else f"ask for {TEMPORARY_PREFIX}* files that no step uses to be deleted"
+            ),
+            "stop at the first turn whose verdict is not clean, then report leftovers, files left and new review cards",
+        ],
+        "note": "nothing was contacted; pass --execute to run the cleanup",
+    }
+
+
+def cleanup(battery: EditBattery) -> int:
+    """Ask the Composer, one judged chat turn at a time, to remove a battery attempt's leftovers; report what remains.
+
+    Each turn is judged like a battery edit (and its prompt review card
+    approved only on a clean verdict). The first failing turn stops the
+    cleanup. With a saved attempt for this session, ``--attempt`` and
+    ``--plan``, its starting graph gives the pipeline name to restore and the
+    files that were already there.
+    """
     sign_in(battery.client, battery.auth, prompt_secret=battery.prompt_secret)
     try:
-        state = battery.state()
-        found = leftover_findings(state, battery.read_text)
-        emit("battery_leftovers", found=found, prefix=TEMPORARY_PREFIX)
-        if not found:
-            return 0
-        messages = cleanup_messages(found)
-        if not execute:
-            emit("dry_run", would_send=messages, note="nothing was sent; pass --execute to ask the Composer to remove them")
-            return 1
         battery.require_auto_commit()
-        for message in messages:
+        saved = load_checkpoint(battery.store, battery.name, session_id=battery.session_id, attempt=battery.attempt, plan=battery.plan)
+        baseline_state = saved["baseline"] if saved is not None else None
+        baseline_files = saved["baseline_files"] if saved is not None else None
+        cards_before = {event["id"] for event in battery.pending_reviews()}
+        rows_offset = len(battery.rows_from(0))
+        turns: list[JsonObject] = []
+        for number in range(1, CLEANUP_TURN_LIMIT + 1):
+            battery.keep_token_fresh()
+            state = battery.state()
+            edit = next_cleanup_edit(state, battery.read_text, battery.session_files(), baseline_state, baseline_files, number)
+            if edit is None:
+                break
             operation_id = str(uuid4())
-            accepted = battery.send(operation_id, battery.state()["id"], message)
+            accepted = battery.send(operation_id, state["id"], edit["message"])
             operation, _ = battery.wait_for(operation_id, accepted["poll_after_ms"] if "poll_after_ms" in accepted else None)
-            emit("cleanup_turn", operation_id=operation_id, status=operation["status"], message=message)
-        remaining = leftover_findings(battery.state(), battery.read_text)
-        emit("battery_leftovers_remaining", found=remaining)
-        return 1 if remaining else 0
+            approved: list[JsonObject] = []
+            fields, _, rows_offset = battery.verdict(
+                edit,
+                state,
+                operation,
+                operation_id,
+                baseline_state=baseline_state or state,
+                rows_offset=rows_offset,
+                shed_before=None,
+                approved=approved,
+                save=lambda: None,
+            )
+            turn = {"number": number, "id": edit["id"], "message": edit["message"], "approvals": approved}
+            turn.update({key: fields[key] for key in ("status", "passed", "findings", "warnings", "server_written")})
+            turns.append(turn)
+            emit("cleanup_turn", **turn)
+            if not fields["passed"]:
+                break
+        final = battery.state()
+        report = {
+            "turns": len(turns),
+            "failed_turn": next((turn["number"] for turn in turns if not turn["passed"]), None),
+            "leftovers": leftover_findings(final, battery.read_text),
+            "files_left": leftover_files(battery.session_files(), final, baseline_files),
+            "new_pending_review_cards": [
+                {"id": event["id"], "kind": event["kind"]} for event in battery.pending_reviews() if event["id"] not in cards_before
+            ],
+            "pipeline_name_reported_only": baseline_state is None and "/metadata/name" in leftover_findings(final, battery.read_text),
+        }
+        emit("cleanup_result", **report)
+        clean = (
+            report["failed_turn"] is None
+            and not report["leftovers"]
+            and not report["files_left"]
+            and not report["new_pending_review_cards"]
+        )
+        return 0 if clean else 1
     finally:
         battery.client.close()
 
@@ -736,8 +1023,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["run", "plan", "report", "cleanup"],
         help=(
             "run the battery; plan: validate and list the plan with its tool coverage; report: summarise a saved attempt "
-            "(no network); cleanup: report battery_* leftovers on the graph and, with --execute, ask the Composer to "
-            "remove them in ordinary chat turns"
+            "(no network); cleanup: with --execute, ask the Composer in judged chat turns to remove a battery attempt's "
+            "leftovers and report what remains (without --execute it only prints what it would do, with no network call)"
         ),
     )
     parser.add_argument(
@@ -830,6 +1117,10 @@ def main(
             note="nothing was contacted; pass --execute to send the edits",
         )
         return 0
+    if args.action == "cleanup" and not args.execute:
+        saved = load_checkpoint(store, checkpoint_name(args.attempt, session_id), session_id=session_id, attempt=args.attempt, plan=plan)
+        emit("dry_run", **cleanup_dry_run(saved, base_url=base_url, session_id=session_id, account=auth.username))
+        return 0
     battery = EditBattery(
         client=client_factory(base_url),
         auth=auth,
@@ -845,7 +1136,7 @@ def main(
         prompt_secret=prompt_secret,
     )
     if args.action == "cleanup":
-        return cleanup(battery, execute=args.execute)
+        return cleanup(battery)
     return 0 if battery.run()["gold"] else 1
 
 

@@ -572,20 +572,50 @@ def auto_wired_controls(before: Mapping[str, Any], after: Mapping[str, Any]) -> 
     return found
 
 
-def server_written_paths(before: Mapping[str, Any], after: Mapping[str, Any], paths: Sequence[str]) -> list[str]:
-    """The difference paths that are fields the server writes itself, allowed by name."""
+def named_components(edit: Mapping[str, Any]) -> set[str]:
+    """The sources, nodes and outputs an edit names: in its pointers, chains, new or renamed components and edge list."""
+    named: set[str] = set(edit["edges_touching"])
+    pointers: list[str] = list(edit["may_change"])
+    for expectation in edit["expect"]:
+        if "chain" in expectation:
+            named.update(_members(expectation["chain"]))
+        elif "renamed_node" in expectation:
+            named.update(expectation["renamed_node"].values())
+        elif "new_node" in expectation or "new_output" in expectation:
+            named.add(expectation["new_node"] if "new_node" in expectation else expectation["new_output"])
+        else:
+            pointers.append(expectation[next(key for key in OPERATORS if key in expectation)])
+    for pointer in pointers:
+        parts = _segments(pointer)
+        if len(parts) >= 2 and parts[0] in ("sources", "nodes", "outputs"):
+            named.add(parts[1])
+    return named
+
+
+def server_written_paths(
+    before: Mapping[str, Any], after: Mapping[str, Any], paths: Sequence[str], *, named: set[str] | None = None
+) -> list[str]:
+    """The difference paths that are fields the server writes itself, allowed by name.
+
+    Review requirement rows, approval hashes and source authoring marks count
+    only on the components in ``named`` (the ones the edit names, and the node
+    whose card was approved); on any other component they are unrelated
+    changes. ``named=None`` allows them anywhere (the as-found comparison).
+    """
     auto = auto_wired_controls(before, after)
     auto_routes = {route for node_id in auto for route in (after["nodes"][node_id]["input"], after["nodes"][node_id]["on_success"])}
 
     def server_written(path: str) -> bool:
         parts = _segments(path)
         collection = parts[0]
+        if collection == "nodes" and len(parts) >= 2 and parts[1] in auto:
+            return True
         if len(parts) >= 4 and parts[2] == "options":
+            if named is not None and parts[1] not in named:
+                return False
             if collection == "nodes":
                 return parts[3] in SERVER_NODE_OPTION_KEYS
             return collection == "sources" and parts[3] in SERVER_SOURCE_OPTION_KEYS
-        if collection == "nodes" and len(parts) >= 2 and parts[1] in auto:
-            return True
         if collection == "edges" and len(parts) == 2:
             return bool(set(parts[1].split("|")[:2]) & auto)
         if len(parts) == 3 and collection in ("nodes", "sources") and parts[2] in ("input", "on_success"):
@@ -802,15 +832,19 @@ class Changes:
     server_written: list[str]
 
 
-def classify_changes(before: Mapping[str, Any], after: Mapping[str, Any], allowed: Sequence[str]) -> Changes:
+def classify_changes(
+    before: Mapping[str, Any], after: Mapping[str, Any], allowed: Sequence[str], *, named: set[str] | None = None
+) -> Changes:
     """Split the difference paths no expectation covers into server-written ones and unrelated ones."""
     rest = [path for path in differences(dict(before), dict(after)) if not any(covers(prefix, path) for prefix in allowed)]
-    server = server_written_paths(before, after, rest)
+    server = server_written_paths(before, after, rest, named=named)
     return Changes(unrelated=[path for path in rest if path not in server], server_written=server)
 
 
-def unrelated_changes(before: Mapping[str, Any], after: Mapping[str, Any], allowed: Sequence[str]) -> list[str]:
-    return classify_changes(before, after, allowed).unrelated
+def unrelated_changes(
+    before: Mapping[str, Any], after: Mapping[str, Any], allowed: Sequence[str], *, named: set[str] | None = None
+) -> list[str]:
+    return classify_changes(before, after, allowed, named=named).unrelated
 
 
 def new_validation_errors(before_state: Mapping[str, Any], after_state: Mapping[str, Any]) -> list[str]:
