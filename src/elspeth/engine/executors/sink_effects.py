@@ -1144,7 +1144,12 @@ class SinkEffectCoordinator:
                     member_effect_id=durable.member_effect_id,
                 )
             )
-            current_finalization.append(replace(finalization, ordinal=durable.ordinal))
+            # The durable ordinal is authoritative and differs whenever a batch
+            # spans several effects (each restarts at zero): rebind it then. An
+            # equal ordinal would only re-run the constructor on the same values.
+            current_finalization.append(
+                finalization if finalization.ordinal == durable.ordinal else replace(finalization, ordinal=durable.ordinal)
+            )
         members = tuple(current_members)
         if any(member.routing_context is not None for member in members):
             if any(member.routing_context is None for member in members):

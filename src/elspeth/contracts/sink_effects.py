@@ -747,7 +747,8 @@ class SinkEffectFinalizationMember:
         object.__setattr__(self, "output_data", deep_freeze(self.output_data))
         if self.context is not None:
             object.__setattr__(self, "context", _freeze_bounded_evidence(self.context, "evidence"))
-        freeze_fields(self, "output_data", "context")
+        # output_data is already a fresh detached deep_freeze copy (above).
+        freeze_fields(self, "context")
 
 
 @dataclass(frozen=True, slots=True)

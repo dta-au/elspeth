@@ -69,7 +69,7 @@ from elspeth.core.clock import Clock
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution.sink_effect_attempt_results import decode_sink_effect_returned_result
-from elspeth.core.landscape.execution.sink_effect_identity import compute_pipeline_effect_identity, resolve_sink_effect_members
+from elspeth.core.landscape.execution.sink_effect_identity import compute_pipeline_effect_request_hashes, resolve_sink_effect_members
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.core.operations import _render_exception
 from elspeth.engine._error_hash import compute_error_hash
@@ -864,7 +864,7 @@ class SinkExecutor:
         candidates = tuple(candidates_list)
         members = resolve_sink_effect_members(self._factory, candidates)  # type: ignore[arg-type]
         target_config = dict(sink.config)
-        identity = compute_pipeline_effect_identity(
+        config_hash, requested_target_hash = compute_pipeline_effect_request_hashes(
             run_id=self._run_id,
             sink_node_id=sink_node_id,
             role=SinkEffectRole.PRIMARY,
@@ -881,10 +881,10 @@ class SinkExecutor:
             sink_node_id=sink_node_id,
             role=SinkEffectRole.PRIMARY,
             input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
-            requested_target_hash=identity.requested_target_hash,
-            members=identity.members,
+            requested_target_hash=requested_target_hash,
+            members=members,
             audit_export_snapshot_id=None,
-            config_hash=identity.config_hash,
+            config_hash=config_hash,
             replacing_target=True,
             primary_effect_id=None,
         )
@@ -899,7 +899,7 @@ class SinkExecutor:
                 join_group_id=(join_group_id_by_token[member.token_id] if pending_outcome.path is TerminalPath.COALESCED else None),
                 error_hash=pending_outcome.error_hash,
             )
-            for member in identity.members
+            for member in members
         )
         sink._reset_diversion_log()
         effect_adapter: SinkProtocol | VirtualReplaySinkEffect
@@ -929,18 +929,18 @@ class SinkExecutor:
             SinkEffectExecutionRequest(
                 reservation=reservation,
                 effect_input=SinkEffectPipelineMembersInput(
-                    members=identity.members,
-                    target_snapshot_members=identity.members,
+                    members=members,
+                    target_snapshot_members=members,
                     # Placeholder like the snapshot beside it: the coordinator
                     # re-derives both from durable records per effect
                     # (_request_for_effect) before any sink sees them.
-                    target_delivered_member_count=len(identity.members),
+                    target_delivered_member_count=len(members),
                 ),
                 finalization_members=finalization_members,
             ),
             cast(_SinkEffectAdapter, effect_adapter),  # live capability was admitted; replay adapter is owned
         )
-        requested_token_ids = tuple(member.token_id for member in identity.members)
+        requested_token_ids = tuple(member.token_id for member in members)
         durable_members = self._execution.sink_effects.get_members_for_tokens(
             run_id=self._run_id,
             sink_node_id=sink_node_id,
@@ -1243,7 +1243,7 @@ class SinkExecutor:
             for token, index, _state in primary_divert_states
         )
         members = resolve_sink_effect_members(self._factory, candidates)  # type: ignore[arg-type]
-        identity = compute_pipeline_effect_identity(
+        config_hash, requested_target_hash = compute_pipeline_effect_request_hashes(
             run_id=self._run_id,
             sink_node_id=failsink_node_id,
             role=SinkEffectRole.FAILSINK,
@@ -1260,10 +1260,10 @@ class SinkExecutor:
             sink_node_id=failsink_node_id,
             role=SinkEffectRole.FAILSINK,
             input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
-            requested_target_hash=identity.requested_target_hash,
-            members=identity.members,
+            requested_target_hash=requested_target_hash,
+            members=members,
             audit_export_snapshot_id=None,
-            config_hash=identity.config_hash,
+            config_hash=config_hash,
             replacing_target=True,
             primary_effect_id=None,
         )
@@ -1278,7 +1278,7 @@ class SinkExecutor:
                 sink_name=failsink_name,
                 error_hash=diversion_error_hashes[caller_index_by_token[member.token_id]],
             )
-            for member in identity.members
+            for member in members
         )
         failsink._reset_diversion_log()
         effect_adapter: SinkProtocol | VirtualReplaySinkEffect
@@ -1310,9 +1310,9 @@ class SinkExecutor:
             SinkEffectExecutionRequest(
                 reservation=reservation,
                 effect_input=SinkEffectPipelineMembersInput(
-                    members=identity.members,
-                    target_snapshot_members=identity.members,
-                    target_delivered_member_count=len(identity.members),
+                    members=members,
+                    target_snapshot_members=members,
+                    target_delivered_member_count=len(members),
                 ),
                 finalization_members=finalization_members,
             ),
