@@ -23,9 +23,14 @@ Two presets:
     for the structural-cycle workload to rotate through.
 ``single-node``
     A like-for-like copy of the shape measured on a customer deployment: one
-    source ``source``, one LLM node ``capacity_probe`` with 32 queries, a main
-    sink ``results`` and an error sink. Its query templates carry most of the
-    text inline, as that fixture's did.
+    source ``source``, one LLM node ``capacity_probe`` with 32 queries of
+    15,600 bytes each held inline (about 500 KB, as that fixture's were), a
+    small system prompt file, a main sink ``results`` and an error sink.
+
+``--queries-per-llm-step`` (and, for ``single-node``, ``--query-bytes``)
+builds graphs of several hundred queries on purpose. The manifest's ``state_scan_values`` is the number of values the
+server's whole-state credential scan visits for the imported graph, measured
+with that scan; the server refuses a state over 4,096 of them.
 
 The output directory holds ``pipeline.yaml`` (the import document),
 ``files/`` (each file to upload) and ``manifest.json`` (what to upload, where
@@ -53,14 +58,20 @@ import random
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import yaml
 
-from scripts.staging.opslib import REPO_ROOT, JsonObject, UsageError, emit, run_tool
+from scripts.staging.opslib import REPO_ROOT, JsonObject, OperationFailed, UsageError, emit, run_tool
+
+if TYPE_CHECKING:
+    from elspeth.web.composer.state import CompositionState
 from scripts.staging.structural_cycle import Position
 
 MANIFEST_VERSION = 1
+# Under the credential scan's width limit (512 entries in one mapping), so only its value count is in play.
+MAX_QUERIES = 500
+SCAN_CEILING = 1_000_000
 type InjectHolding = Literal["file", "omit"]
 type Preset = Literal["acceptance", "single-node"]
 
@@ -159,14 +170,26 @@ class FixtureFile:
     content: bytes
 
 
+class _BlockDumper(yaml.SafeDumper):
+    """Writes multi-line text as literal blocks (``|``), as a person writes prompts in YAML, not as wrapped quoted strings."""
+
+
+def _represent_text(dumper: yaml.SafeDumper, value: str) -> yaml.ScalarNode:
+    return dumper.represent_scalar("tag:yaml.org,2002:str", value, style="|" if "\n" in value else None)
+
+
+_BlockDumper.add_representer(str, _represent_text)
+
+
 @dataclass(frozen=True, slots=True)
 class FixtureSpec:
     preset: Preset = "acceptance"
     seed: int = 1
     steps: int = 27
     llm_steps: int = 12
-    queries_per_step: int = 3
+    queries_per_llm_step: int = 3
     large_queries: int = 8
+    query_bytes: int = 15_600
     prompt_bytes: int = 200_000
     inject_files: int = 2
     file_inject: InjectHolding = "file"
@@ -188,7 +211,7 @@ class Fixture:
 
     @property
     def yaml_text(self) -> str:
-        text: str = yaml.safe_dump(self.pipeline, sort_keys=False, allow_unicode=False, width=120)
+        text: str = yaml.dump(self.pipeline, Dumper=_BlockDumper, sort_keys=False, allow_unicode=False, width=120)
         return text
 
     def import_body(self, blob_ids: Mapping[str, str]) -> JsonObject:
@@ -222,18 +245,23 @@ class Fixture:
 # ── text ───────────────────────────────────────────────────────────────────
 
 
-def _text(rng: random.Random, size: int, head: str) -> str:
-    """``head`` then synthetic paragraphs, exactly ``size`` bytes of ASCII ending in a newline."""
+def _text(rng: random.Random, size: int, head: str, *, sentences_per_line: int = 1) -> str:
+    """``head`` then synthetic sentences, ``sentences_per_line`` to a line; exactly ``size`` bytes of ASCII ending in a newline."""
     parts = [head.rstrip("\n"), ""]
     length = len(parts[0]) + 1
     while length < size:
-        sentence = " ".join(rng.choice(_WORDS) for _ in range(rng.randint(8, 18))).capitalize() + "."
-        parts.append(sentence)
-        length += len(sentence) + 1
+        sentences = [" ".join(rng.choice(_WORDS) for _ in range(rng.randint(8, 18))).capitalize() + "." for _ in range(sentences_per_line)]
+        line = " ".join(sentences)
+        parts.append(line)
+        length += len(line) + 1
     text = "\n".join(parts)
     if len(head) + 1 > size:
         raise UsageError(f"a prompt of {size} bytes cannot hold its {len(head)}-byte header; raise --prompt-bytes")
-    return text[: size - 1] + "\n"
+    body = text[: size - 1]
+    # Never end a line on a space: YAML cannot hold such text as a literal block.
+    if body.endswith(" "):
+        body = body[:-1] + "."
+    return body + "\n"
 
 
 def _refs(fields: Sequence[str]) -> str:
@@ -284,14 +312,22 @@ def _roles(count: int) -> list[_Role]:
     return roles
 
 
+def _query_names(prefix: str, count: int) -> list[str]:
+    """``count`` query names: the criteria in order, then numbered rounds of them."""
+    return [
+        f"{prefix}_{CRITERIA[index % len(CRITERIA)]}" + ("" if index < len(CRITERIA) else f"_{index // len(CRITERIA) + 1}")
+        for index in range(count)
+    ]
+
+
 def _multi_query_options(role: _Role, queries: int) -> tuple[JsonObject, list[str], int]:
-    names = [f"{role.prefix}_{criterion}" for criterion in CRITERIA[:queries]]
+    names = _query_names(role.prefix, queries)
     inputs = {f"input_{index + 1}": name for index, name in enumerate(role.reads)}
     placeholders = " ".join(f"{{{{ row.input_{index + 1} }}}}" for index in range(len(role.reads)))
     definitions: JsonObject = {}
     inline = 0
     for name in names:
-        criterion = name.removeprefix(role.prefix + "_").replace("_", " ")
+        criterion = name.removeprefix(role.prefix + "_").rstrip("_0123456789").replace("_", " ")
         template = f"Score the {criterion} criterion from 0 to 100 using the rubric. Material: {placeholders}\n"
         inline += len(template.encode())
         definitions[name] = {
@@ -402,7 +438,7 @@ def _acceptance(spec: FixtureSpec) -> Fixture:
             options.update({"required_input_fields": list(role.reads), "response_field": role.name})
             produced[role.name] = role.name
         else:
-            queries = spec.large_queries if role.kind == "large" else spec.queries_per_step
+            queries = spec.large_queries if role.kind == "large" else spec.queries_per_llm_step
             query_options, outputs, query_bytes = _multi_query_options(role, queries)
             options.update(query_options)
             options["response_field"] = f"{role.name}_summary"
@@ -542,9 +578,9 @@ def _source_csv(rng: random.Random, rows: int, name: str) -> FixtureFile:
 
 def _single_node(spec: FixtureSpec) -> Fixture:
     rng = random.Random(spec.seed)
-    queries = spec.large_queries
+    queries = spec.queries_per_llm_step
     fields = ("case_text", "case_history", "reviewer_notes")
-    system_size = max(2000, spec.prompt_bytes // 10)
+    system_size = spec.prompt_bytes
     files = [
         FixtureFile(
             name="capacity_probe.system.md",
@@ -553,13 +589,13 @@ def _single_node(spec: FixtureSpec) -> Fixture:
             content=_text(rng, system_size, "# Capacity probe instructions\n").encode(),
         )
     ]
-    per_query = max(400, (spec.prompt_bytes - system_size) // queries)
     definitions: JsonObject = {}
     inline = 0
     for index in range(queries):
         name = f"q{index + 1:02d}_{CRITERIA[index % len(CRITERIA)]}"
         head = "Score this criterion from 0 to 100. Case: {{ row.input_1 }} History: {{ row.input_2 }} Notes: {{ row.input_3 }}\n"
-        template = _text(rng, per_query, head)
+        # Paragraphs, as real prompts are; each YAML line carries indentation, so line count is import size.
+        template = _text(rng, spec.query_bytes, head, sentences_per_line=6)
         inline += len(template.encode())
         definitions[name] = {
             "input_fields": {"input_1": fields[0], "input_2": fields[1], "input_3": fields[2]},
@@ -614,22 +650,61 @@ def preset_spec(preset: Preset, **overrides: Any) -> FixtureSpec:
     base = (
         FixtureSpec(preset=preset)
         if preset == "acceptance"
-        else FixtureSpec(preset=preset, steps=1, llm_steps=1, large_queries=32, prompt_bytes=317_000)
+        else FixtureSpec(preset=preset, steps=1, llm_steps=1, queries_per_llm_step=32, prompt_bytes=4_000)
     )
     return replace(base, **overrides)
+
+
+def state_scan_values(yaml_text: str) -> int:
+    """Values the server's whole-state credential scan visits for this graph as imported (the YAML importer's state)."""
+    from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+    return scan_values_of_state(composition_state_from_runtime_yaml(yaml_text))
+
+
+def scan_values_of_state(state: CompositionState) -> int:
+    """Values the server's whole-state credential scan visits for ``state``.
+
+    Measured with the server's own code: the ``set_pipeline`` projection the
+    state guard scans, and the detector run with ever smaller node limits
+    until it reports the traversal limit. The server's limit is
+    ``CredentialTraversalPolicy.max_nodes`` (4,096).
+    """
+    from elspeth.contracts.credential_material import CredentialTraversalPolicy, find_credential_material
+    from elspeth.web.credential_guard import credential_material_tool_arguments_projection
+
+    tree = credential_material_tool_arguments_projection("set_pipeline", state.to_dict())
+
+    def fits(limit: int) -> bool:
+        finding = find_credential_material(tree, CredentialTraversalPolicy(max_nodes=limit))
+        if finding is None:
+            return True
+        if finding.category == "traversal_limit" and limit < SCAN_CEILING:
+            return False
+        raise OperationFailed(f"the generated graph fails the credential scan for another reason: {finding.category}")
+
+    low, high = 1, SCAN_CEILING
+    fits(high)
+    while low < high:
+        middle = (low + high) // 2
+        if fits(middle):
+            high = middle
+        else:
+            low = middle + 1
+    return low
 
 
 def build_fixture(spec: FixtureSpec) -> Fixture:
     if spec.prompt_bytes < 4000 or spec.prompt_bytes > 4_000_000:
         raise UsageError("--prompt-bytes must be between 4000 and 4000000")
-    if not 1 <= spec.queries_per_step <= len(CRITERIA) or not 1 <= spec.large_queries <= 64:
-        raise UsageError(f"--queries-per-step must be 1-{len(CRITERIA)} and --large-queries 1-64")
+    if not 1 <= spec.queries_per_llm_step <= MAX_QUERIES or not 1 <= spec.large_queries <= MAX_QUERIES:
+        raise UsageError(f"--queries-per-llm-step and --large-queries must be 1-{MAX_QUERIES}")
+    if not 200 <= spec.query_bytes <= 262_144:
+        raise UsageError("--query-bytes must be between 200 and 262144")
     if not 1 <= spec.inject_files <= 8:
         raise UsageError("--inject-files must be between 1 and 8")
     if spec.preset == "single-node":
         return _single_node(spec)
-    if spec.large_queries > len(CRITERIA):
-        raise UsageError(f"--large-queries must be at most {len(CRITERIA)} for the acceptance preset")
     return _acceptance(spec)
 
 
@@ -643,8 +718,14 @@ def manifest(fixture: Fixture) -> JsonObject:
         "sink_paths": dict(fixture.sink_paths),
         "positions": [position.as_json() for position in fixture.positions],
         "llm_steps": list(fixture.llm_steps),
-        "measures": fixture.measures(),
+        "measures": {**fixture.measures(), "state_scan_values": state_scan_values(fixture.yaml_text), "state_scan_limit": _scan_limit()},
     }
+
+
+def _scan_limit() -> int:
+    from elspeth.contracts.credential_material import CredentialTraversalPolicy
+
+    return CredentialTraversalPolicy().max_nodes
 
 
 def _file_entry(file: FixtureFile) -> JsonObject:
@@ -729,9 +810,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, help="seed for every generated name-independent choice (default 1)")
     parser.add_argument("--steps", type=int, help="acceptance: transforms and gates in the chain (default 27)")
     parser.add_argument("--llm-steps", type=int, help="acceptance: LLM steps (default 12)")
-    parser.add_argument("--queries-per-step", type=int, help="acceptance: queries per multi-query scoring step (default 3)")
-    parser.add_argument("--large-queries", type=int, help="queries in the larger multi-query step (acceptance default 8; single-node 32)")
-    parser.add_argument("--prompt-bytes", type=int, help="prompt text bytes to generate (acceptance default 200000; single-node 317000)")
+    parser.add_argument(
+        "--queries-per-llm-step",
+        type=int,
+        help=f"queries in each multi-query LLM step: acceptance's scoring steps (default 3), single-node's one step (default 32); up to {MAX_QUERIES}",
+    )
+    parser.add_argument("--large-queries", type=int, help="acceptance: queries in the larger multi-query step (default 8)")
+    parser.add_argument("--query-bytes", type=int, help="single-node: bytes of each inline query template (default 15600)")
+    parser.add_argument(
+        "--prompt-bytes",
+        type=int,
+        help="acceptance: prompt text bytes held in files (default 200000); single-node: its system prompt file (default 4000)",
+    )
     parser.add_argument("--inject-files", type=int, help="acceptance: file_inject entries, one file each (default 2)")
     parser.add_argument(
         "--file-inject",
@@ -748,8 +838,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "seed": args.seed,
         "steps": args.steps,
         "llm_steps": args.llm_steps,
-        "queries_per_step": args.queries_per_step,
+        "queries_per_llm_step": args.queries_per_llm_step,
         "large_queries": args.large_queries,
+        "query_bytes": args.query_bytes,
         "prompt_bytes": args.prompt_bytes,
         "inject_files": args.inject_files,
         "file_inject": args.file_inject,

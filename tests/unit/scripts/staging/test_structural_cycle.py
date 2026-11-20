@@ -8,6 +8,7 @@ graph to the order each step asks for, as an obedient Composer would.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import re
 from pathlib import Path
@@ -508,6 +509,8 @@ def test_an_obedient_ten_step_cycle_passes_every_step_and_leaves_the_fixture_as_
     assert summary["gold"] is False  # ten edits are too few for gold
     assert summary["baseline_graph_counts"] == {"sources": 1, "nodes": 1, "llm_nodes": 1, "sinks": 2, "prompt_queries": 3}
     assert summary["end_reviews_recorded"] == 10
+    assert summary["end_reviews"]["line"] == "end reviews: 10 of 10 steps recorded one, 10 clean and admitted"
+    assert summary["end_reviews"]["verified"] is True
     expected = [message + SUFFIX for message in CYCLE_ONE]
     assert composer.messages == expected
     assert [message["content"] for message in fake.sessions[SESSION].messages if message["role"] == "user"] == expected
@@ -524,10 +527,10 @@ def test_fifty_obedient_steps_are_gold(tmp_path: Path) -> None:
     assert summary["all_passed"] is True
 
 
-def test_a_step_without_its_end_review_fails_by_default_and_stops_the_attempt(tmp_path: Path) -> None:
+def test_a_step_without_its_end_review_fails_under_required_and_stops_the_attempt(tmp_path: Path) -> None:
     composer = CycleComposer(orders_for(10))
     composer.end_review = {3: None}
-    run, _, _ = make(tmp_path, composer=composer)
+    run, _, _ = make(tmp_path, composer=composer, end_review_evidence="required")
     summary = run.run()
     assert results(run)[2]["findings"] == ["end_review_not_clean_and_admitted"]
     assert summary["judged"] == 3
@@ -542,6 +545,25 @@ def test_if_recorded_end_review_evidence_passes_a_step_whose_review_was_not_retu
     summary = run.run()
     assert summary["all_passed"] is True
     assert results(run)[0]["warnings"] == ["end_review_not_recorded"]
+    # A run that saw no end review never reads as clean end reviews.
+    assert summary["end_reviews"]["line"] == "end reviews: none exposed by this server; not verified"
+    assert summary["end_reviews"]["verified"] is False
+    assert summary["end_reviews"]["steps_not_verified"] == 10
+
+
+def test_the_summary_counts_steps_whose_end_review_was_not_returned(tmp_path: Path) -> None:
+    composer = CycleComposer(orders_for(10))
+    composer.end_review = {2: None, 7: None}
+    run, _, _ = make(tmp_path, composer=composer, end_review_evidence="if-recorded")
+    review = run.run()["end_reviews"]
+    assert review["line"] == "end reviews: 8 of 10 steps recorded one, 8 clean and admitted; 2 steps not verified"
+    assert (review["verified"], review["steps_with_end_review"]) == (False, 8)
+
+
+def test_if_recorded_is_the_default_because_no_api_route_returns_end_reviews() -> None:
+    args = battery.build_parser().parse_args(["plan", "--workload", "structural-cycle"])
+    assert args.end_review_evidence == "if-recorded"
+    assert next(field for field in dataclasses.fields(battery.EditBattery) if field.name == "end_review_evidence").default == "if-recorded"
 
 
 def test_keep_going_records_a_failed_step_and_judges_the_rest(tmp_path: Path) -> None:

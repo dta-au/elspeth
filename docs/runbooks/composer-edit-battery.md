@@ -237,13 +237,23 @@ Plan-file edits never required an end review. They required a completed
 turn, a successful provider call, settled evidence, the plan's expectations,
 no unrelated change, no new validation error and no refused tool call.
 
-`--end-review-evidence required` (the default, as the customer's runner)
-fails a step whose clean, admitted end review is not in the turn's rows.
-On a server whose messages view does not return advisor rows, every step
-then fails with `end_review_not_clean_and_admitted`. `if-recorded` turns a
-missing review into the warning `end_review_not_recorded`, and still fails
-a recorded review that is not clean and admitted. Report which mode a run
-used.
+The customer's runner read each turn's end review from the database. No
+API route returns it today: the END-phase `advisor_checkpoint_pass_audit`
+rows are stored with the session's messages, but the audit-grade messages
+view admits only provider-call and planner-attempt rows, and no other route
+(state, composer progress, operation status, diagnostic evidence, export)
+carries the verdict. `composer_meta.completion_gates` on the state shows a
+blocking advisor gate, never a pass, so it cannot tell a clean review from
+none.
+
+So `--end-review-evidence if-recorded` is the default: a recorded review
+that is not clean and admitted fails the step, and a step with none gets
+the warning `end_review_not_recorded`. The summary's `end_reviews.line`
+says in words how many steps were verified; with none it reads
+"end reviews: none exposed by this server; not verified", and
+`end_reviews.verified` is false. `--end-review-evidence required` (the
+customer's rule) fails a step with no recorded review, which on today's
+servers is every step. Report which mode a run used, and quote the line.
 
 The first failing step stops the attempt; `--keep-going` judges every step.
 A workload run exits 0 when every requested step passed. The summary still
@@ -279,16 +289,41 @@ rubric (query templates cannot be file-held, so they are short and inline).
 | Graph document once imported | about 32 KB: the prompt text stays in the bound files |
 | Positions | after the source, mid-chain between two LLM steps, at the final mapper |
 
-`--steps`, `--llm-steps`, `--queries-per-step`, `--large-queries`,
-`--prompt-bytes`, `--inject-files` and `--seed` change the size; the counts
-and prompt bytes are met exactly. `--profile` names the LLM profile the
-steps use on the target server (default `task-role`).
+`--steps`, `--llm-steps`, `--queries-per-llm-step` (3 scoring steps),
+`--large-queries` (the overall rubric), `--prompt-bytes`, `--inject-files`
+and `--seed` change the size; the counts and prompt bytes are met exactly.
+`--profile` names the LLM profile the steps use on the target server
+(default `task-role`).
 
-The `single-node` preset reproduces the customer's recorded shape for a
-like-for-like comparison with their telemetry: source `source`, one LLM node
-`capacity_probe` with 32 queries, sinks `results` and `errors`, and query
-text inline as theirs was. Its graph document is within 5% of their recorded
-298,161 authored bytes.
+The `single-node` preset reproduces the customer's shape for a like-for-like
+comparison with their telemetry: source `source`, one LLM node
+`capacity_probe` with 32 queries of 15,600 bytes held inline (499,200 bytes,
+as theirs), a 4,000-byte system prompt file, and sinks `results` and
+`errors`. `--queries-per-llm-step` and `--query-bytes` change the query count
+and size, `--prompt-bytes` the system prompt file. Multi-line text is written
+as YAML literal blocks; even so the default preset's YAML is 518,741
+characters, 5,547 under the import limit of 524,288, so larger queries do
+not import.
+
+### Graphs near the state scan limit
+
+The server scans the whole state for credential material and refuses a state
+whose scan visits more than 4,096 values (`CredentialTraversalPolicy.max_nodes`).
+The manifest's `state_scan_values` is that count for the graph as imported,
+measured with the server's own importer and scan. Each query adds 13 values
+in this generator's query shape, so the boundary is set by values, not by a
+query count: measured,
+
+| Fixture | Scan values at import | Stored, prompt file bound | Import |
+| --- | --- | --- | --- |
+| `--preset single-node --queries-per-llm-step 309 --query-bytes 400` | 4,085 | 4,094 | accepted, valid |
+| `--preset single-node --queries-per-llm-step 310 --query-bytes 400` | 4,098 | - | HTTP 422 |
+
+The refusal is `credential_material_rejected` with category
+`traversal_limit`, and its text tells the user the content "appears to
+contain a credential". A graph refused for its size is reported as a
+credential problem. The stored 309-query graph is 2 values under the limit,
+so the first edit that adds a node may cross it.
 
 ### File-held `file_inject` and the validation defect
 

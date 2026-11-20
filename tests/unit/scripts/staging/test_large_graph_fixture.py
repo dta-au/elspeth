@@ -9,22 +9,28 @@ real server secret store, set in the environment for each test.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import pytest
+import yaml
 from scripts.staging import composer_edit_battery as battery
 from scripts.staging import large_graph_fixture as lgf
 from scripts.staging import structural_cycle as cycle
 from scripts.staging.fixture_setup import graph_document_bytes, setup_fixture
-from scripts.staging.opslib import REPO_ROOT, HttpResponse, OperationFailed, UsageError, WebClient
+from scripts.staging.opslib import REPO_ROOT, ApiError, HttpResponse, OperationFailed, UsageError, WebClient
 
+from elspeth.contracts.credential_material import CredentialTraversalPolicy
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.blobs.routes import create_blobs_router
 from elspeth.web.blobs.service import BlobServiceImpl
+from elspeth.web.composer.yaml_importer import MAX_RUNTIME_YAML_IMPORT_CHARS, composition_state_from_runtime_yaml
 from elspeth.web.config import WebSettings
+from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material_in_state
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
@@ -32,14 +38,15 @@ from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeW
 from elspeth.web.secrets.server_store import ServerSecretStore
 from elspeth.web.secrets.service import ScopedSecretResolver, WebSecretService
 from elspeth.web.secrets.user_store import UserSecretStore
+from elspeth.web.sessions.converters import state_from_record
 from tests.fixtures.composer_fakes import StaticPluginSnapshotFactory
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
 from tests.unit.web.sessions.test_routes import _make_app
 
 BASE = "http://127.0.0.1:8451"
 PROFILE = "task-role"
-# The customer's recorded single-node graph: authored bytes on every planner call of the 25-step run.
-THEIR_AUTHORED_BYTES = 298_161
+# The server's whole-state credential scan limit, read from the policy rather than restated.
+SCAN_LIMIT = CredentialTraversalPolicy().max_nodes
 
 
 SECRET_NAME = "TEST_LLM_KEY"
@@ -225,7 +232,35 @@ def test_the_single_node_preset_is_the_customer_s_shape() -> None:
     fixture = lgf.build_fixture(lgf.preset_spec("single-node"))
     measures = fixture.measures()
     assert (measures["steps"], measures["llm_steps"], measures["queries"], measures["sinks"], measures["sources"]) == (1, 1, 32, 2, 1)
+    # 32 inline queries of 15,600 bytes, about 500 KB, as the customer's.
+    assert measures["inline_prompt_bytes"] == 32 * 15_600
     assert fixture.positions == (cycle.Position("source", "capacity_probe", "results", True),)
+    # Written as a person writes YAML (literal blocks), it fits under the import limit; the YAML reads back exactly.
+    assert len(fixture.yaml_text) <= MAX_RUNTIME_YAML_IMPORT_CHARS
+    assert yaml.safe_load(fixture.yaml_text) == fixture.pipeline
+
+
+def test_query_names_go_past_the_criteria_without_repeating() -> None:
+    fixture = lgf.build_fixture(lgf.preset_spec("acceptance", queries_per_llm_step=lgf.MAX_QUERIES))
+    queries = next(step for step in fixture.pipeline["transforms"] if step["name"] == "cs1_scoring")["options"]["queries"]
+    assert len(queries) == lgf.MAX_QUERIES
+    assert list(queries)[:2] == ["cs1_accuracy", "cs1_reasoning"]
+    assert "cs1_accuracy_2" in queries
+    with pytest.raises(UsageError, match="must be 1-500"):
+        lgf.build_fixture(lgf.preset_spec("acceptance", queries_per_llm_step=lgf.MAX_QUERIES + 1))
+
+
+@pytest.mark.parametrize(("queries", "values"), [(309, 4085), (310, 4098)])
+def test_the_scan_count_is_measured_with_the_server_s_own_scan(queries: int, values: int) -> None:
+    yaml_text = lgf.build_fixture(lgf.preset_spec("single-node", queries_per_llm_step=queries, query_bytes=400)).yaml_text
+    assert lgf.state_scan_values(yaml_text) == values
+    # Control: the server's state guard agrees with the measure on which side of its limit the graph is.
+    state = composition_state_from_runtime_yaml(yaml_text)
+    if values <= SCAN_LIMIT:
+        require_no_credential_material_in_state(state, surface="fixture_test")
+    else:
+        with pytest.raises(CredentialMaterialRefused):
+            require_no_credential_material_in_state(state, surface="fixture_test")
 
 
 def test_the_acceptance_positions_rotate_through_the_graph() -> None:
@@ -290,21 +325,44 @@ def test_the_acceptance_fixture_imports_validates_and_passes_its_reviews(tmp_pat
     assert [event for event, _ in events.seen] == ["fixture_files_uploaded", "fixture_setup"]
 
 
-def test_the_single_node_fixture_validates_and_is_the_size_of_the_customer_s_graph(tmp_path: Path) -> None:
+def test_the_single_node_fixture_imports_and_validates_at_the_customer_s_size(tmp_path: Path) -> None:
     client, session, _, summary = _set_up(tmp_path, lgf.preset_spec("single-node"))
     assert type(summary) is dict, summary
     assert summary["valid"] is True and summary["prompt_reviews_approved"] == ["capacity_probe"]
     state = client.get_json(f"/api/sessions/{session}/state")
-    # Measured tolerance: within 5% of the recorded authored size.
-    assert abs(graph_document_bytes(state) - THEIR_AUTHORED_BYTES) <= THEIR_AUTHORED_BYTES * 0.05
+    # The query text is the graph: about 500 KB of it in the graph document.
+    assert graph_document_bytes(state) > 32 * 15_600
     assert cycle.check_fixture(state, positions=[cycle.Position("source", "capacity_probe", "results", True)])["prompt_queries"] == 32
 
 
-def test_a_file_held_file_inject_fails_validation_only_with_the_known_guarantee_defect(tmp_path: Path) -> None:
-    """Pins the live defect: downstream of a file-held ``file_inject`` authoring validation sees no guarantees.
+def test_a_graph_just_under_the_scan_limit_imports_and_one_just_over_is_refused(tmp_path: Path) -> None:
+    server = _server(tmp_path / "server")
+    client = _client(server)
+    session = client.post_json("/api/sessions", {"title": "under"})["id"]
+    under = _written(tmp_path, lgf.preset_spec("single-node", queries_per_llm_step=309, query_bytes=400), "under")
+    summary = setup_fixture(client, session, under, emit=Events())
+    assert summary["valid"] is True
+    assert summary["measures"]["state_scan_values"] == 4085
+    # The state as the server stores it, the bound system prompt included, measured with the same scan.
+    record = asyncio.run(server.app.state.session_service.get_current_state(UUID(session)))
+    stored = lgf.scan_values_of_state(state_from_record(record))
+    assert 4085 <= stored <= SCAN_LIMIT, stored
+    other = client.post_json("/api/sessions", {"title": "over"})["id"]
+    over = _written(tmp_path, lgf.preset_spec("single-node", queries_per_llm_step=310, query_bytes=400), "over")
+    # The size refusal arrives as a credential refusal (category traversal_limit); the message says "credential".
+    with pytest.raises(ApiError, match=r'/state/yaml returned HTTP 422.*"category":"traversal_limit"') as refused:
+        setup_fixture(client, other, over, emit=Events())
+    assert refused.value.status == 422
+    assert "credential_material_rejected" in str(refused.value)
 
-    When the fix lands this test goes red; then the default fixture validates
-    as it stands and this test should assert that instead.
+
+def test_file_held_file_inject_is_red_until_fix_0816_file_inject_probe_lands_false_none_guarantees(tmp_path: Path) -> None:
+    """Expected red on this base: downstream of a file-held ``file_inject`` authoring validation sees no guarantees.
+
+    The fix is on ``fix/0816-file-inject-probe``. When it lands this test goes
+    red; the default fixture then validates as it stands, and this test should
+    assert that instead. ``--file-inject omit`` is the variant pinned valid
+    meanwhile (the composer refuses inline ``file_inject`` content).
     """
     client, session, _, outcome = _set_up(tmp_path, lgf.preset_spec("acceptance"))
     assert isinstance(outcome, OperationFailed)

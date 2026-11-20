@@ -329,8 +329,34 @@ def summarise(checkpoint: Mapping[str, Any]) -> JsonObject:
         "history_shed": {"edits": len(shed), "passed": sum(1 for result in shed if result["passed"])},
         "edits_with_complete_tool_timings": sum(1 for result in sent if result["evidence"]["tool_timings_complete"]),
         "end_reviews_recorded": sum(len(result["evidence"]["end_reviews"]) for result in sent),
+        "end_reviews": end_review_summary(sent),
         "baseline_graph_counts": checkpoint["baseline_graph_counts"] if "baseline_graph_counts" in checkpoint else None,
         "not_available_from_api": list(UNAVAILABLE_FROM_API),
+    }
+
+
+def end_review_summary(sent: Sequence[Mapping[str, Any]]) -> JsonObject:
+    """How many sent steps had an end review the server returned, and whether those were clean and admitted.
+
+    A run with no end review in its evidence says so in words: it never reads
+    as clean end reviews when none were seen.
+    """
+    reviewed = [result["evidence"]["end_reviews"][-1] for result in sent if result["evidence"]["end_reviews"]]
+    clean = sum(1 for review in reviewed if review["verdict"] == "clean" and review["publication_verdict"] == "ADMIT")
+    unseen = len(sent) - len(reviewed)
+    if not reviewed:
+        line = "end reviews: none exposed by this server; not verified"
+    else:
+        line = f"end reviews: {len(reviewed)} of {len(sent)} steps recorded one, {clean} clean and admitted"
+        if unseen:
+            line += f"; {unseen} steps not verified"
+    return {
+        "line": line,
+        "steps_sent": len(sent),
+        "steps_with_end_review": len(reviewed),
+        "clean_and_admitted": clean,
+        "steps_not_verified": unseen,
+        "verified": bool(sent) and unseen == 0,
     }
 
 
@@ -368,7 +394,7 @@ class EditBattery:
     settle_reads: int = 6
     refresh_margin_seconds: float = 420.0
     prompt_secret: Callable[[str], str] = getpass.getpass
-    end_review_evidence: structural_cycle.EndReviewEvidence = "required"
+    end_review_evidence: structural_cycle.EndReviewEvidence = "if-recorded"
 
     @property
     def name(self) -> str:
@@ -1136,10 +1162,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--end-review-evidence",
         choices=["required", "if-recorded"],
-        default="required",
+        default="if-recorded",
         help=(
-            "structural-cycle: required (default) fails a step whose clean, admitted end review is not in the turn's "
-            "evidence; if-recorded fails only a recorded review that is not clean and admitted"
+            "structural-cycle: if-recorded (default) fails a recorded end review that is not clean and admitted and "
+            "warns when none is recorded; required also fails a step with no recorded end review. No current server "
+            "returns end reviews through the API, so required fails every step there (see the runbook)"
         ),
     )
     parser.add_argument(
