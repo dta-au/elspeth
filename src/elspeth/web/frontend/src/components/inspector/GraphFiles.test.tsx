@@ -130,7 +130,7 @@ describe("GraphFiles", () => {
     // shared.txt is also a source and a sink file: the editor refuses the save but still opens with the reason.
     const shared = within(within(table).getByRole("row", { name: /shared.txt Transform: score/ })).getByRole("button", { name: "Edit file for score" });
     expect(shared).toHaveAttribute("aria-disabled", "false");
-    expect(shared).toHaveAccessibleDescription("This file is also used outside a prompt. Ask the assistant to give this prompt its own file.");
+    expect(shared).toHaveAccessibleDescription("This file is also used outside a prompt. Ask Composer to give this prompt its own file.");
     await user.click(shared);
     expect(useBlobStore.getState().editRequest).toMatchObject({ nodeId: "score", fieldPath: "system_prompt" });
     // A file not in this session has no prompt text to show.

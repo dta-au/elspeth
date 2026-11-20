@@ -17,7 +17,9 @@ export function PromptCopyButton({ value, label, showLabel = false }: { value: s
   }
 
   return <>
-    <Button type="button" variant="bare" className="prompt-slot-actions"
+    {/* The design system's ghost compact button: a real 36px target (the
+        bare button was 21px high, under WCAG 2.5.8's 24px). */}
+    <Button type="button" variant="ghost" compact
       aria-label={`Copy ${label}`} onClick={() => void copy()}>
       {status === "copied" ? "Copied" : status === "failed" ? "Copy failed" : showLabel ? `Copy ${label}` : "Copy"}
     </Button>

@@ -22,10 +22,19 @@
     border-color var(--transition-fast),
     color var(--transition-fast);
 }
-.blob-action-btn:hover {
+.blob-action-btn:hover:where(:not(:disabled)):where(:not([aria-disabled="true"])) {
   background-color: var(--color-surface-hover);
   border-color: var(--color-border-strong);
   color: var(--color-text);
+}
+
+/* The same tokenised disabled treatment as .btn-compact (well fill, muted
+   ink, not-allowed), so an unavailable icon action never reads as live. */
+.blob-action-btn:disabled,
+.blob-action-btn[aria-disabled="true"] {
+  background-color: var(--color-well);
+  color: var(--color-text-muted);
+  cursor: not-allowed;
 }
 
 /* Per-selector reduced-motion guard, following the chat.css idiom
@@ -145,13 +154,6 @@
   flex-shrink: 0;
 }
 
-/* A bare button gets no shared disabled treatment; mark the Edit prompt
-   control that cannot open so it does not look live. */
-.blob-row-actions > button[aria-disabled="true"] {
-  color: var(--color-text-muted);
-  cursor: not-allowed;
-  text-decoration: line-through;
-}
 
 .blob-row-preview {
   padding: var(--space-sm) var(--space-md);

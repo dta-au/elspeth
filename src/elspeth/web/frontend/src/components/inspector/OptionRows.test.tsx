@@ -601,6 +601,8 @@ describe("llm prompt roles", () => {
     const labels = buttons.map((button) => button.getAttribute("aria-label"));
     expect(labels).toEqual(names.map((name, index) => `Copy prompt template for query ${name} (position ${index + 1})`));
     expect(new Set(labels).size).toBe(labels.length);
+    // Ghost compact: a 36px target (WCAG 2.5.8), not a 21px raw button.
+    buttons.forEach((button) => expect(button).toHaveClass("btn-compact", "btn-ghost"));
     buttons.forEach((button) => fireEvent.click(button));
     await waitFor(() => expect(writeText.mock.calls.map((call) => call[0])).toEqual(queries.map((query) => query.template)));
   });

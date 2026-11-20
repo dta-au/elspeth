@@ -152,7 +152,7 @@ export function promptFileEditability({ state, blobs, pendingEvents, nodeId, fie
     || state.outputs.some((output) => optionBlobReferences(output.options).some((ref) => ref.blobId === id))
     || state.nodes.some((node) => optionBlobReferences(node.options).some((ref) =>
       ref.blobId === id && !promptReferences.has(`${node.id}:${ref.fieldPath}:${id}`)));
-  if (mixed) return refuse("prompt_file_mixed_use", "This file is also used outside a prompt. Ask the assistant to give this prompt its own file.");
+  if (mixed) return refuse("prompt_file_mixed_use", "This file is also used outside a prompt. Ask Composer to give this prompt its own file.");
   const matches = bindings.filter((binding) => binding.blobId === id);
   if (matches.length > 1) return refuse("prompt_file_shared_binding", "This file backs more than one prompt. Give each prompt its own file before editing it here.");
   const node = state.nodes.find((candidate) => candidate.id === nodeId);

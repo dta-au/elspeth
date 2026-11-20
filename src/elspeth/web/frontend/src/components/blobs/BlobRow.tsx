@@ -39,7 +39,8 @@ interface BlobRowProps {
   editRefusal?: string;
   /** Opens the file wiring pad; absent for a file that cannot hold prompt text. */
   onWire?: () => void;
-  wiringDisabled?: boolean;
+  /** Why the wiring pad cannot open for this file right now; null or absent when it can. */
+  wiringDisabledReason?: string | null;
   onSelect?: () => void;
 }
 
@@ -73,7 +74,7 @@ function creatorBadgeLabel(createdBy: BlobMetadata["created_by"]): string {
     case "user":
       return "Created by user";
     case "assistant":
-      return "Created by assistant";
+      return "Created by Composer";
     case "pipeline":
       return "Created by pipeline";
   }
@@ -113,11 +114,12 @@ export function BlobRow({
   onEditPrompt,
   editRefusal,
   onWire,
-  wiringDisabled = false,
+  wiringDisabledReason = null,
   onSelect,
 }: BlobRowProps) {
   const chipId = useId();
   const editRefusalId = useId();
+  const wiringReasonId = useId();
   const attached = selectedNodeLabel !== null && selectedNodeLabel !== undefined && (attachedFields?.length ?? 0) > 0;
   const status = statusIndicator(blob.status);
   const creatorLabel = creatorBadgeLabel(blob.created_by);
@@ -247,20 +249,26 @@ export function BlobRow({
         {/* Actions */}
         <div className="blob-row-actions">
           {onWire && (
-            <Button
-              variant="bare"
-              onClick={onWire}
-              title="Open file wiring pad"
-              aria-label={`Wiring ${blob.filename}`}
-              className="blob-action-btn"
-              aria-describedby={attached ? chipId : undefined}
-              disabled={wiringDisabled}
-            >
-              <Icon name="pipeline" />
-            </Button>
+            <>
+              {/* aria-disabled, not disabled: the control stays focusable and
+                  says why it is unavailable, like Edit prompt beside it. */}
+              <Button
+                variant="bare"
+                onClick={() => { if (wiringDisabledReason === null) onWire(); }}
+                title={wiringDisabledReason ?? "Open file wiring pad"}
+                aria-label={`Wiring ${blob.filename}`}
+                className="blob-action-btn"
+                aria-disabled={wiringDisabledReason !== null}
+                aria-describedby={[attached ? chipId : null, wiringDisabledReason !== null ? wiringReasonId : null]
+                  .filter((id) => id !== null).join(" ") || undefined}
+              >
+                <Icon name="pipeline" />
+              </Button>
+              {wiringDisabledReason !== null && <span className="sr-only" id={wiringReasonId}>{wiringDisabledReason}</span>}
+            </>
           )}
           {(onEditPrompt || editRefusal) && <>
-            <Button type="button" variant="bare" onClick={onEditPrompt} aria-disabled={onEditPrompt === undefined} title={editRefusal}
+            <Button type="button" variant="ghost" compact onClick={onEditPrompt} aria-disabled={onEditPrompt === undefined} title={editRefusal}
               aria-label={`Edit prompt ${blob.filename}`}
               aria-describedby={[attached ? chipId : null, editRefusal ? editRefusalId : null].filter((id) => id !== null).join(" ") || undefined}>Edit prompt</Button>
             {editRefusal && <span className="sr-only" id={editRefusalId}>{editRefusal}</span>}

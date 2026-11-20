@@ -415,7 +415,7 @@ describe("BlobRow status indicator (WCAG 1.4.1 non-colour cue)", () => {
 describe("BlobRow creator badge", () => {
   it.each([
     ["user", "Created by user", "user"],
-    ["assistant", "Created by assistant", "assistant"],
+    ["assistant", "Created by Composer", "assistant"],
     ["pipeline", "Created by pipeline", "pipeline"],
   ] as const)(
     "exposes the %s creator cue to assistive tech",

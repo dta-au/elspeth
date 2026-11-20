@@ -231,6 +231,8 @@ describe("BlobManager reveal request", () => {
     render(<BlobManager onUseAsInput={vi.fn()} />);
     const edit = screen.getByRole("button", { name: "Edit prompt user.txt" });
     expect(edit).toHaveAttribute("aria-disabled", "false");
+    // The design system's ghost compact button, not a raw browser button.
+    expect(edit).toHaveClass("btn-compact", "btn-ghost");
     act(() => edit.click());
     expect(useSessionStore.getState().selectedNodeId).toBe("llm");
     expect(useBlobStore.getState().editRequest).toMatchObject({ nodeId: "llm", fieldPath: "prompt_template" });
@@ -672,12 +674,19 @@ describe("BlobManager file wiring", () => {
   });
 
   it.each([
-    ["the file is still processing", () => setBlobState([makeBlob({ id: "replacement", filename: "prompt.txt", mime_type: "text/plain", status: "pending" })])],
-    ["the file list belongs to another session", () => useBlobStore.setState({ activeSessionId: "session-2" })],
-  ])("disables the wiring control while %s", (_case, arrange) => {
+    ["the file is still processing", "This file is not ready yet. Wait for it to finish processing.",
+      () => setBlobState([makeBlob({ id: "replacement", filename: "prompt.txt", mime_type: "text/plain", status: "pending" })])],
+    ["the file list belongs to another session", "Wait for the file list to load.", () => useBlobStore.setState({ activeSessionId: "session-2" })],
+  ])("refuses the wiring control while %s, saying why, and stays focusable", async (_case, reason, arrange) => {
     arrange();
     render(<BlobManager onUseAsInput={vi.fn()} />);
-    expect(screen.getByRole("button", { name: "Wiring prompt.txt" })).toBeDisabled();
+    const wiring = screen.getByRole("button", { name: "Wiring prompt.txt" });
+    expect(wiring).toHaveAttribute("aria-disabled", "true");
+    expect(wiring).toBeEnabled();
+    expect(wiring).toHaveAccessibleDescription(reason);
+    expect(wiring).toHaveAttribute("title", reason);
+    await userEvent.setup().click(wiring);
+    expect(screen.queryByRole("dialog", { name: "File wiring pad" })).not.toBeInTheDocument();
   });
 
   it("offers no wiring control for a file that cannot hold prompt text", () => {

@@ -356,7 +356,8 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
                         setWireSendRefusal(null);
                         setPendingWire({ blob, sessionId: activeSessionId, stateId: compositionState?.id ?? null });
                       } : undefined}
-                    wiringDisabled={blob.status !== "ready" || !listBelongsToSession || isLoading}
+                    wiringDisabledReason={!listBelongsToSession || isLoading ? "Wait for the file list to load."
+                      : blob.status !== "ready" ? "This file is not ready yet. Wait for it to finish processing." : null}
                     onEditPrompt={binding && opensEditor ? () => {
                       useSessionStore.getState().selectNode(binding.nodeId);
                       useBlobStore.getState().requestPromptEdit(binding.nodeId, binding.fieldPath);
