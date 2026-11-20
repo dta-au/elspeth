@@ -147,7 +147,7 @@ _OPTION_TOOLS: frozenset[str] = frozenset(
     }
 )
 
-# The 17 promoted positions: S-optional properties of the 34.
+# The 21 promoted positions: S-optional properties of the strict tools.
 _PROMOTED: frozenset[tuple[str, tuple[str, ...]]] = frozenset(
     {
         ("get_blob_content", ("offset_chars",)),
@@ -158,6 +158,10 @@ _PROMOTED: frozenset[tuple[str, tuple[str, ...]]] = frozenset(
         ("clear_source", ("source_name",)),
         ("inspect_source", ("encoding",)),
         ("get_pipeline_state", ("component",)),
+        ("get_pipeline_state", ("since_start",)),
+        ("get_pipeline_state", ("field_path",)),
+        ("get_pipeline_state", ("offset_chars",)),
+        ("get_pipeline_state", ("expected_sha256",)),
         ("get_plugin_assistance", ("issue_code",)),
         ("list_models", ("provider",)),
         ("list_models", ("limit",)),
@@ -189,9 +193,10 @@ _UPSERT_EDGE_EXAMPLE: dict[str, Any] = {
     "label": "LLM failures",
 }
 
-# The 18 ledger entries on the 34: (tool, JSON pointer of the owner node, keyword, value).
+# The 19 ledger entries: (tool, JSON pointer of the owner node, keyword, value).
 _LEDGER: frozenset[tuple[str, str, str, Any]] = frozenset(
     {
+        ("get_pipeline_state", "/properties/field_path", "maxLength", 512),
         ("get_blob_content", "/properties/offset_chars", "default", 0),
         ("clear_source", "/properties/source_name", "minLength", 1),
         ("clear_source", "/properties/source_name", "default", "source"),
@@ -332,11 +337,11 @@ def test_option_tools_keep_their_none_parameters_on_openai_strict() -> None:
 # ---------------------------------------------------------------- promotion
 
 
-def test_strip_null_paths_are_exactly_the_17_promoted_positions() -> None:
+def test_strip_null_paths_are_exactly_the_21_promoted_positions() -> None:
     strict = _WIRE_TOOL_DEFS[STRICT]
     got = {(name, node.path) for name, tool in strict.items() for node in tool.decode_plan if type(node) is StripNull}
     assert got == _PROMOTED
-    assert len(got) == 17
+    assert len(got) == 21
     for name, tool in strict.items():
         assert tool.promoted_paths == frozenset(path for tool_name, path in _PROMOTED if tool_name == name)
     for tool in _WIRE_TOOL_DEFS[NONE].values():
@@ -344,9 +349,9 @@ def test_strip_null_paths_are_exactly_the_17_promoted_positions() -> None:
         assert not any(type(node) is StripNull for node in tool.decode_plan)
 
 
-def test_flat_s_rejects_null_at_the_12_omission_only_positions() -> None:
+def test_flat_s_rejects_null_at_the_16_omission_only_positions() -> None:
     assert len(_ALREADY_NULLABLE) == 5
-    assert len(_PROMOTED - _ALREADY_NULLABLE) == 12
+    assert len(_PROMOTED - _ALREADY_NULLABLE) == 16
     definitions = {definition["name"]: definition["parameters"] for definition in _definitions()}
     for name, path in _PROMOTED:
         flat = _property_node(definitions[name], path)
@@ -499,7 +504,7 @@ def test_unknown_keyword_fails_closed() -> None:
         _build(definitions)
 
 
-def test_ledger_is_exactly_the_18_entries() -> None:
+def test_ledger_is_exactly_the_19_entries() -> None:
     got = set()
     for name, tool in _WIRE_TOOL_DEFS[STRICT].items():
         for entry in tool.ledger:
@@ -507,7 +512,7 @@ def test_ledger_is_exactly_the_18_entries() -> None:
             value = json.dumps(deep_thaw(entry.value), sort_keys=True) if entry.keyword == "examples" else entry.value
             got.add((name, entry.path, entry.keyword, value))
     assert got == _LEDGER
-    assert len(got) == 18
+    assert len(got) == 19
     assert all(tool.ledger == () for tool in _WIRE_TOOL_DEFS[NONE].values())
 
 

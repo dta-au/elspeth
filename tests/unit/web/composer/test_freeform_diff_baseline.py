@@ -99,7 +99,7 @@ async def test_zero_change_diff_teaches_provider_what_to_report(
 
     with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as provider:
         provider.side_effect = [
-            _response(_call("diff_pipeline", {}, "zero_diff")),
+            _response(_call("diff_pipeline", {}, "zero_diff"), _call("get_pipeline_state", {"since_start": True}, "turn_changes")),
             _admit_composer_llm_completion(_make_llm_response(content="No changes.")),
         ]
         result = await service.compose("What changed?", [], state, session_id=session_id, current_state_id=current_state_id)
@@ -109,6 +109,16 @@ async def test_zero_change_diff_teaches_provider_what_to_report(
     assert payload["data"]["baseline_kind"] == baseline_kind
     assert payload["data"]["from_version"] == expected_from_version
     assert payload["version"] == state.version
+    [turn_changes] = [
+        json.loads(invocation.result_canonical)
+        for invocation in result.tool_invocations
+        if invocation.tool_name == "get_pipeline_state" and invocation.result_canonical is not None
+    ]
+    assert "success" in turn_changes, turn_changes
+    assert turn_changes["success"]
+    assert turn_changes["data"]["from_version"] == state.version
+    assert turn_changes["data"]["baseline_kind"] == "request_start"
+    assert turn_changes["data"]["changes"] == []
     description = next(
         tool["function"]["description"] for tool in provider.call_args_list[0].args[1] if tool["function"]["name"] == "diff_pipeline"
     )
@@ -176,7 +186,8 @@ async def test_diff_uses_request_start_and_resets_for_next_request(
     start = _call("diff_pipeline", {}, "diff_start")
     mutation = _call("set_metadata", {"patch": {"description": "Provider-authored edit"}}, "edit")
     after = _call("diff_pipeline", {}, "diff_after")
-    responses = [_response(start, mutation), _response(after)] if later_round else [_response(start, mutation, after)]
+    refresh = _call("get_pipeline_state", {"since_start": True}, "turn_changes")
+    responses = [_response(start, mutation), _response(after, refresh)] if later_round else [_response(start, mutation, after, refresh)]
     responses.append(_admit_composer_llm_completion(_make_llm_response(content="Changes inspected.")))
     with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as provider:
         provider.side_effect = responses
@@ -192,6 +203,18 @@ async def test_diff_uses_request_start_and_resets_for_next_request(
     assert payloads[1]["data"]["baseline_kind"] == ("last_validated" if strict_start and not explicit_approval else "request_start")
     assert payloads[1]["data"]["metadata_changed"] is (not explicit_approval)
     assert payloads[1]["data"]["total_changes"] == (0 if explicit_approval else 1)
+    [turn_changes] = [
+        json.loads(invocation.result_canonical)
+        for invocation in result.tool_invocations
+        if invocation.tool_name == "get_pipeline_state" and invocation.result_canonical is not None
+    ]
+    assert "success" in turn_changes, turn_changes
+    assert turn_changes["success"]
+    assert turn_changes["data"]["from_version"] == state.version
+    assert turn_changes["data"]["baseline_kind"] == "request_start"
+    assert turn_changes["data"]["changes"] == (
+        [] if explicit_approval else [{"operation": "set", "path": ["metadata", "description"], "value": "Provider-authored edit"}]
+    )
     # Held (staged, unapplied) edits are invisible to the diff: say so truthfully, and only then.
     assert "post_call_hints" not in payloads[0]
     if explicit_approval:
@@ -204,7 +227,9 @@ async def test_diff_uses_request_start_and_resets_for_next_request(
     current_record = await service._require_sessions_service().get_current_state(UUID(session_id))
     with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as provider:
         provider.side_effect = [
-            _response(_call("diff_pipeline", {}, "diff_next_request")),
+            _response(
+                _call("diff_pipeline", {}, "diff_next_request"), _call("get_pipeline_state", {"since_start": True}, "next_turn_changes")
+            ),
             _admit_composer_llm_completion(_make_llm_response(content="No changes this request.")),
         ]
         next_result = await service.compose(
@@ -219,6 +244,15 @@ async def test_diff_uses_request_start_and_resets_for_next_request(
     assert next_payloads[0]["success"]
     assert next_payloads[0]["data"]["from_version"] == result.state.version
     assert next_payloads[0]["data"]["total_changes"] == 0
+    [next_changes] = [
+        json.loads(invocation.result_canonical)
+        for invocation in next_result.tool_invocations
+        if invocation.tool_name == "get_pipeline_state" and invocation.result_canonical is not None
+    ]
+    assert "success" in next_changes, next_changes
+    assert next_changes["success"]
+    assert next_changes["data"]["from_version"] == result.state.version
+    assert next_changes["data"]["changes"] == []
 
 
 @pytest.mark.asyncio

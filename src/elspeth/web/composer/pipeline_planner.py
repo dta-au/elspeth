@@ -139,6 +139,7 @@ from elspeth.web.composer.planner_authoring_aids import (
     build_planner_authoring_aids,
     build_schema_contract_evidence,
     discovery_digest_detail_tools,
+    discovery_digest_schema_reads,
     planner_plugin_contract,
     planner_plugin_contract_from_snapshot,
 )
@@ -240,9 +241,11 @@ _TERMINAL_TOOL_NAME: Final[str] = PLANNER_TERMINAL_TOOL_NAME
 
 _PIPELINE_CURRENT_INFORMATION: Final[str] = "pipeline.current"
 _CATALOG_SELECTION_INFORMATION: Final[str] = "catalog.selection"
+# list_transforms is a selection index (no configuration), so its key is an
+# inventory key recorded as catalog.selection, never as catalog details.
 _CATALOG_DETAIL_INFORMATION_BY_TOOL: Final[Mapping[str, str]] = {
     "list_sources": "catalog.details.source",
-    "list_transforms": "catalog.details.transform",
+    "list_transforms": "catalog.inventory.transform",
     "list_sinks": "catalog.details.sink",
 }
 # The only manifest keys the authoring aids may close. Their palette tools
@@ -260,6 +263,7 @@ def _valid_information_key(key: str) -> bool:
         _CATALOG_SELECTION_INFORMATION,
         *_CATALOG_DETAIL_INFORMATION_BY_TOOL.values(),
         "pipeline.full",
+        "pipeline.structure",
         "pipeline.source",
         "model.catalog",
         "blob.index.session",
@@ -272,6 +276,7 @@ def _valid_information_key(key: str) -> bool:
     } or key.startswith(
         (
             "pipeline.component:",
+            "pipeline.field:",
             "plugin.schema:",
             "plugin.assistance:",
             "blob.metadata:",
@@ -394,15 +399,24 @@ class PlannerDiscoveryPolicy:
         cls,
         *,
         required_catalog_detail_tools: tuple[str, ...] = (),
+        required_transform_schema_reads: tuple[str, ...] = (),
         aid_supplied_information: frozenset[str] = frozenset(),
     ) -> PlannerDiscoveryPolicy:
         unknown_detail_tools = set(required_catalog_detail_tools) - set(_CATALOG_DETAIL_INFORMATION_BY_TOOL)
         if unknown_detail_tools:
             raise ValueError("planner discovery policy contains an unknown catalog detail tool")
+        if any(type(name) is not str or not name for name in required_transform_schema_reads):
+            raise ValueError("planner discovery policy contains an invalid transform schema read")
         if set(aid_supplied_information) - _AID_SUPPLIED_INFORMATION_KEYS:
             raise ValueError("planner discovery policy contains an unknown aid-supplied information key")
         unavailable: frozenset[str] = frozenset()
-        detail_gaps = frozenset(_CATALOG_DETAIL_INFORMATION_BY_TOOL[tool] for tool in required_catalog_detail_tools)
+        # An omitted transform prohibition is returned only by that plugin's
+        # get_plugin_schema read (the list_transforms index does not carry it),
+        # so the gap is the exact key that read produces.
+        detail_gaps = frozenset(_CATALOG_DETAIL_INFORMATION_BY_TOOL[tool] for tool in required_catalog_detail_tools) | frozenset(
+            _tool_information_keys("get_plugin_schema", {"plugin_type": "transform", "name": name})[0]
+            for name in required_transform_schema_reads
+        )
         manifest = PlannerInformationManifest(
             supplied=frozenset({_PIPELINE_CURRENT_INFORMATION, _CATALOG_SELECTION_INFORMATION}) | aid_supplied_information,
             unavailable=unavailable,
@@ -437,6 +451,10 @@ class PlannerDiscoveryPolicy:
 
 def _tool_information_keys(name: str, arguments: Mapping[str, Any]) -> tuple[str, ...]:
     if name == "get_pipeline_state":
+        if "field_path" in arguments and arguments["field_path"] is not None:
+            return ("pipeline.field:" + canonical_json(dict(arguments)),)
+        if "since_start" in arguments and arguments["since_start"] is True:
+            return ("pipeline.diff",)
         component = arguments["component"] if "component" in arguments else None
         normalized = component.strip().lower() if type(component) is str else ""
         if normalized in _FULL_STATE_ALIASES or component is None or normalized == "set_pipeline_arguments":
@@ -572,6 +590,15 @@ def _resolved_discovery_information_keys(call: _ParsedToolCall, discovery: Admit
     inventory key stays pending, so the gaps-closed notice cannot follow it.
     """
     keys = planner_discovery_information_keys(call)
+    if call.name == "get_pipeline_state" and discovery.result.success:
+        assert discovery.response is not None
+        data = discovery.response.to_wire()
+        assert type(data) is dict
+        if "view" in data:
+            if data["offset_chars"] != 0 or data["next_offset_chars"] is not None:
+                return ()
+            if data["view"] == "structure":
+                return ("pipeline.structure",)
     if call.name in {"list_blobs", "list_composer_blobs"} and discovery.result.success:
         return () if blob_list_is_incomplete(discovery.result) else keys
     if call.name != "list_models" or not discovery.result.success:
@@ -1289,10 +1316,14 @@ _PLANNER_INFORMATION_EXACT: Final[Mapping[str, ComposerPlannerInformationClass]]
         ComposerPlannerInformationClass.SECRET_REFERENCE,
         ComposerPlannerInformationClass.VALIDATION_CODE,
     }
+} | {
+    "catalog.inventory.transform": ComposerPlannerInformationClass.CATALOG_SELECTION,
+    "pipeline.structure": ComposerPlannerInformationClass.PIPELINE_COMPONENT,
 }
 _PLANNER_INFORMATION_PREFIXES: Final[tuple[tuple[str, ComposerPlannerInformationClass], ...]] = (
     ("model.catalog.", ComposerPlannerInformationClass.MODEL_CATALOG),
     ("pipeline.component:", ComposerPlannerInformationClass.PIPELINE_COMPONENT),
+    ("pipeline.field:", ComposerPlannerInformationClass.PIPELINE_COMPONENT),
     ("plugin.schema:", ComposerPlannerInformationClass.PLUGIN_SCHEMA),
     ("plugin.assistance:", ComposerPlannerInformationClass.PLUGIN_ASSISTANCE),
     ("blob.metadata:", ComposerPlannerInformationClass.BLOB_METADATA),
@@ -3915,6 +3946,7 @@ async def _plan_pipeline_inner(
     )
     discovery_policy = PlannerDiscoveryPolicy.initial(
         required_catalog_detail_tools=discovery_digest_detail_tools(authoring_aids),
+        required_transform_schema_reads=discovery_digest_schema_reads(authoring_aids),
         aid_supplied_information=_aid_supplied_information(authoring_aids),
     )
     information_manifest = discovery_policy.manifest
@@ -5392,6 +5424,13 @@ async def _plan_pipeline_inner(
                 if call_to_execute.wire_error is not None:
                     raise call_to_execute.wire_error
                 execution_arguments = cast(dict[str, Any], deep_thaw(call_to_execute.arguments))
+                discovery_context = (
+                    replace(request_context, baseline=turn_evidence.effects.initial_state if turn_evidence is not None else None)
+                    if call_to_execute.name == "get_pipeline_state"
+                    and "since_start" in execution_arguments
+                    and execution_arguments["since_start"] is True
+                    else request_context
+                )
                 result = cast(
                     ToolResult,
                     await run_planner_sync(
@@ -5399,7 +5438,7 @@ async def _plan_pipeline_inner(
                         call_to_execute.name,
                         execution_arguments,
                         current_state,
-                        request_context,
+                        discovery_context,
                     ),
                 )
                 if result.updated_state != current_state:

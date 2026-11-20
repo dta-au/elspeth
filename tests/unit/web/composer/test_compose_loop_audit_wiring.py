@@ -1087,7 +1087,9 @@ def _assert_payload_preserved(payload: dict[str, Any], tool_name: str) -> None:
         assert len(data["available"]) == 1
         assert data["available"][0]["name"] == "csv"
         assert data["available"][0]["plugin_type"] == "source"
-    elif tool_name in ("list_transforms", "list_sinks"):
+    elif tool_name == "list_transforms":
+        assert data == {"available": [], "prohibited": [], "details_tool": "get_plugin_schema"}
+    elif tool_name == "list_sinks":
         assert data == {"available": [], "prohibited": []}
     elif tool_name == "get_plugin_schema":
         assert isinstance(data, dict)

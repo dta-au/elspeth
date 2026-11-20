@@ -2830,9 +2830,9 @@ _GET_AUDIT_INFO_REASON = HandlesNoSensitiveDataReason(
 _GET_PIPELINE_STATE_REASON = HandlesNoSensitiveDataReason(
     sensitive_data_locations=("in-memory composition state — structural metadata about the session pipeline",),
     why_arguments_safe=(
-        "get_pipeline_state accepts only an optional component selector string (a node id, "
-        "an output name, 'source', or a full-state alias); the handler indexes into the "
-        "composer state by this name and never echoes LLM-supplied payload into the result."
+        "get_pipeline_state accepts component and JSON-pointer selectors, a since_start boolean, "
+        "a non-negative page offset and a content hash. It reads existing composer state; "
+        "the only echoed selector is the bounded field_path, and no caller-supplied configuration is returned."
     ),
     why_responses_safe=(
         "Response mirrors the operator's own composition — plugin names, node ids, and "
@@ -3830,7 +3830,7 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
         ),
         "get_pipeline_state": ToolRedaction(
             policy=ToolRedactionPolicy(
-                known_argument_keys=("component",),
+                known_argument_keys=("component", "since_start", "field_path", "offset_chars", "expected_sha256"),
                 handles_no_sensitive_data=True,
                 handles_no_sensitive_data_reason_struct=_GET_PIPELINE_STATE_REASON,
             )

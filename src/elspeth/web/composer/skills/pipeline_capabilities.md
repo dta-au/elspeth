@@ -69,6 +69,13 @@ the user requests their change. `upsert_node` replaces the whole node: an
 omitted `description` is dropped and the supplied `options` replace the old
 ones, so resupply both; an omitted `on_error` keeps the existing choice.
 
+Use `get_pipeline_state(since_start=true)` for the net changes since this turn
+began: exact values, components keyed by identity, their order reported
+separately. A whole-graph read too large to return becomes a structural `view`
+without option values or descriptions. Read an exact value with `field_path`;
+continue a page from `next_offset_chars`, passing the returned `sha256` as
+`expected_sha256`. A structural view or a partial page is not the whole graph.
+
 An absent policy-visible plugin is different from an unsupported pipeline
 shape. Say that a plugin is unavailable or policy-denied only when live
 discovery proves it — use the supplied discovery digest's `prohibited` entries

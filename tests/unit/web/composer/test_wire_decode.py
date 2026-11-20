@@ -8,7 +8,7 @@ dialect's wire schema W back into the flat semantic arguments S admits:
 * the set_pipeline ``{"pipeline": ...}`` envelope is unwrapped, and a
   malformed envelope is the one rejection (``ToolArgumentError``,
   category ``wire_envelope``);
-* on ``openai_strict`` only, a ``null`` at one of the 17 promoted positions
+* on ``openai_strict`` only, a ``null`` at one of the 21 promoted positions
   becomes the omission S expects. Nothing else is touched.
 
 ``encode_semantic_arguments`` is the inverse of the envelope only in S1; the
@@ -171,7 +171,7 @@ _SEEDS: dict[str, dict[str, Any]] = {
     "wire_secret_ref": {"name": "OPENROUTER_API_KEY", "target": "node", "option_key": "api_key"},
 }
 
-# A valid (non-null) value for each of the 17 promoted positions, valid under
+# A valid (non-null) value for each of the 21 promoted positions, valid under
 # both S and the strict W.
 _PROMOTED_VALUES: dict[tuple[str, tuple[str, ...]], Any] = {
     # Offset zero keeps every independent presence combination valid; actual
@@ -184,6 +184,13 @@ _PROMOTED_VALUES: dict[tuple[str, tuple[str, ...]], Any] = {
     ("clear_source", ("source_name",)): "source",
     ("inspect_source", ("encoding",)): "utf-8-sig",
     ("get_pipeline_state", ("component",)): "nodes",
+    # since_start=false and offset zero keep every presence combination
+    # admissible at S: since_start=true with a component, and a positive
+    # offset without its hash, are refused later by the handler.
+    ("get_pipeline_state", ("since_start",)): False,
+    ("get_pipeline_state", ("field_path",)): "/options/system_prompt",
+    ("get_pipeline_state", ("offset_chars",)): 0,
+    ("get_pipeline_state", ("expected_sha256",)): "a" * 64,
     ("get_plugin_assistance", ("issue_code",)): "no_help",
     ("list_models", ("provider",)): "openrouter/",
     ("list_models", ("limit",)): 5,
@@ -240,12 +247,12 @@ def _semantic(decoded: DecodedArguments) -> dict[str, Any]:
 # ---------------------------------------------------------------- the seeds
 
 
-def test_the_seeds_cover_exactly_the_34_strict_capable_tools_and_17_promoted_positions() -> None:
+def test_the_seeds_cover_exactly_the_34_strict_capable_tools_and_21_promoted_positions() -> None:
     assert set(_SEEDS) == _strict_capable_names()
     assert len(_SEEDS) == 34
     promoted = {(name, path) for name in _SEEDS for path in _WIRE_TOOL_DEFS[STRICT][name].promoted_paths}
     assert set(_PROMOTED_VALUES) == promoted
-    assert len(promoted) == 17
+    assert len(promoted) == 21
 
 
 @pytest.mark.parametrize("tool", sorted(_SEEDS))

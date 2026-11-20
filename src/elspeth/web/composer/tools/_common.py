@@ -774,7 +774,10 @@ def _reserved_connection_names(state: CompositionState) -> set[str]:
     return names
 
 
-_DUPLICATE_CONSUMER_REASON: Final = "One connection can feed one processing node; every node listed reads this one."
+_DUPLICATE_CONSUMER_REASON: Final = (
+    "One connection can feed one processing node; every node listed reads this one. "
+    "Change only the input bindings; preserve existing node options."
+)
 
 
 def _duplicate_consumer_repair_suggestions(

@@ -37,6 +37,7 @@ from elspeth.web.composer.planner_authoring_aids import (
     PLACEHOLDER_BLOB_ID,
     build_planner_authoring_aids,
     discovery_digest,
+    discovery_digest_detail_tools,
     fork_coalesce_exemplar_args,
     planner_expression_grammar,
     planner_model_catalog,
@@ -1471,7 +1472,87 @@ class TestDiscoveryDigest:
                 assert entry["purpose_omitted"]["details_via"] == f"list_{kind}s"
                 assert "not_for" not in entry
                 assert entry["not_for_omitted"]["sha256"]
-                assert entry["not_for_omitted"]["details_via"] == f"list_{kind}s"
+                # The list_transforms selection index carries no prohibition; that
+                # plugin's get_plugin_schema result does.
+                assert entry["not_for_omitted"]["details_via"] == ("get_plugin_schema" if kind == "transform" else f"list_{kind}s")
+
+    def test_over_cap_fallback_keeps_every_transform_prohibition_inline(self) -> None:
+        """The all-prose fallback never turns the catalog into per-transform schema reads.
+
+        Every text is under the 1 KiB per-text limit, so only the over-cap
+        fallback omits anything: transform purposes go (one list_transforms
+        call returns them), transform prohibitions stay inline.
+        """
+        from elspeth.core.canonical import canonical_json
+        from elspeth.web.composer import planner_authoring_aids as aids_module
+
+        view, _snapshot = _trained_view()
+        summaries: dict[str, list[PluginSummary]] = {
+            "source": [PluginSummary(name="synthetic_source", description="Reads rows.", plugin_type="source", config_fields=[])],
+            "transform": [
+                PluginSummary(
+                    name=f"synthetic_transform_{index:02d}",
+                    description=f"purpose-{index}-" + ("p" * 900),
+                    plugin_type="transform",
+                    config_fields=[],
+                    usage_when_not_to_use=f"prohibition-{index}-" + ("n" * 300),
+                    capability_tags=("synthetic",),
+                )
+                for index in range(30)
+            ],
+            "sink": [PluginSummary(name="synthetic_sink", description="Writes rows.", plugin_type="sink", config_fields=[])],
+        }
+        inline = {
+            "sources": [],
+            "transforms": [
+                {"name": item.name, "purpose": item.description, "not_for": item.usage_when_not_to_use} for item in summaries["transform"]
+            ],
+            "sinks": [],
+        }
+        assert len(canonical_json(inline).encode("utf-8")) > 28 * 1024
+
+        digest = discovery_digest(view, summaries=summaries)
+
+        assert digest["budget"]["canonical_bytes_used"] <= digest["budget"]["max_canonical_bytes"] == 28 * 1024
+        # The 30 long transform purposes only. The short source and sink
+        # purposes stay inline: their stubs would be larger than the text.
+        assert digest["budget"]["omitted_public_text_count"] == 30
+        for kind in ("sources", "sinks"):
+            [short] = digest[kind]
+            assert "purpose_omitted" not in short
+            assert "purpose" in short
+            assert short["purpose"] in {"Reads rows.", "Writes rows."}
+        for entry, summary in zip(digest["transforms"], summaries["transform"], strict=True):
+            assert "not_for_omitted" not in entry
+            assert "not_for" in entry
+            assert entry["not_for"] == summary.usage_when_not_to_use
+            assert "purpose" not in entry
+            assert entry["purpose_omitted"]["details_via"] == "list_transforms"
+        aids = {"discovery_digest": {"plugins": digest}}
+        assert discovery_digest_detail_tools(aids) == ("list_transforms",)
+        assert "discovery_digest_schema_reads" in aids_module.__all__
+        assert aids_module.discovery_digest_schema_reads(aids) == ()
+
+    def test_over_cap_fallback_on_the_live_catalog_shrinks_without_schema_gaps(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Forced just under the live size, the fallback must shrink the digest and keep prohibitions inline."""
+        from elspeth.web.composer import planner_authoring_aids as aids_module
+
+        view, _snapshot = _trained_view()
+        live = discovery_digest(view)
+        live_bytes = live["budget"]["canonical_bytes_used"]
+        assert live["budget"]["omitted_public_text_count"] == 0
+        monkeypatch.setattr(aids_module, "_DISCOVERY_DIGEST_MAX_CANONICAL_BYTES", live_bytes - 1)
+
+        digest = discovery_digest(view)
+
+        assert digest["budget"]["canonical_bytes_used"] < live_bytes
+        assert digest["budget"]["canonical_bytes_used"] <= digest["budget"]["max_canonical_bytes"] == live_bytes - 1
+        assert digest["budget"]["omitted_public_text_count"] > 0
+        for entry in digest["transforms"]:
+            assert "not_for_omitted" not in entry
+        aids = {"discovery_digest": {"plugins": digest}}
+        assert "discovery_digest_schema_reads" in aids_module.__all__
+        assert aids_module.discovery_digest_schema_reads(aids) == ()
 
     def test_digest_omission_hash_is_literal_utf8_sha256(self) -> None:
         view, _snapshot = _trained_view()

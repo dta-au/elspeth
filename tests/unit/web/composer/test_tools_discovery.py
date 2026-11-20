@@ -86,7 +86,8 @@ class TestDiscoveryTools:
         )
 
         assert result.success is True
-        names = {item.name for item in result.data["available"]}
+        wire = json.loads(serialize_admitted_discovery_result(admit_discovery_result("list_transforms", result)))
+        names = {item["name"] for item in wire["data"]["available"]}
         assert "passthrough" in names
         assert "azure_prompt_shield" not in names
 
@@ -101,7 +102,8 @@ class TestDiscoveryTools:
         )
 
         assert result.success is True
-        names = {item.name for item in result.data["available"]}
+        wire = json.loads(serialize_admitted_discovery_result(admit_discovery_result("list_transforms", result)))
+        names = {item["name"] for item in wire["data"]["available"]}
         assert "azure_prompt_shield" in names
 
     def test_get_plugin_schema_rejects_snapshot_unavailable_plugin(self) -> None:

@@ -787,9 +787,12 @@ async def test_six_schema_batch_costs_the_same_with_and_without_producer_labels(
 
 
 @pytest.mark.asyncio
-# 40,000: the byte arm at 3.0 (53,700) is below the anchored arm (57,407 measured 2026-11-20: the 40,000 anchor tokens
+# 40,000: the byte arm at 3.0 is below the anchored arm (57,407 measured 2026-11-20: the 40,000 anchor tokens
 # plus 17,407 unshared bytes, a difference that request growth leaves unchanged), so it is the estimate.
-@pytest.mark.parametrize(("anchor_tokens", "minimum"), [(100_000, 100_000), (40_000, 53_700)])
+# P3 (2026-11-20): +23 tokens = the +69 B list_transforms/get_plugin_assistance description change / 3.0;
+# +37 tokens = the +111 B get_plugin_schema description (usage_when_not_to_use) / 3.0.
+# Candidate 4 stack (2026-11-20): 54,107 measured on the stacked tree (the P1 and P2/P3 lanes together), not summed.
+@pytest.mark.parametrize(("anchor_tokens", "minimum"), [(100_000, 100_000), (40_000, 54_107)])
 async def test_planner_estimate_is_never_below_the_providers_count_and_uses_the_cheaper_arm(
     tmp_path: Path, tool_context: ToolContext, anchor_tokens: int, minimum: int
 ) -> None:
