@@ -693,7 +693,10 @@
   position: absolute;
   top: var(--space-md);
   right: var(--space-md);
-  z-index: 2;
+  /* Above the canvas's floating Controls / MiniMap (@xyflow's
+     .react-flow__panel, z-index 5, in the same stacking context): at 2 the
+     minimap drew over the open step panel (UX review finding 7). */
+  z-index: var(--z-panel-controls);
   display: grid;
   gap: var(--space-md);
   width: min(720px, calc(100% - 2 * var(--space-md)));
