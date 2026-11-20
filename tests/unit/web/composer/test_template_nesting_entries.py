@@ -20,8 +20,10 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from elspeth.web.composer._validation_probe import inline_content_reference
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.advisor_context import summarize_pipeline_for_advisor
+from elspeth.web.composer.advisor_prompt_files import AdvisorPromptFile, AdvisorPromptFiles, prompt_file_key
 from tests.unit.web.composer._helpers import (
     _clean_advisor_checkpoint,
     _composer_service_with_session,
@@ -114,6 +116,21 @@ def test_advisor_summary_says_the_prompt_could_not_be_analysed(tmp_path: Path, t
     _session_id, state = _state(tmp_path, prompt_template=text)
 
     summary = summarize_pipeline_for_advisor(state)
+
+    assert UNKNOWN_LINE in summary
+
+
+@pytest.mark.parametrize("text", [CHAIN, OVER_BOUND], ids=["deep-chain", "over-the-byte-bound"])
+def test_advisor_summary_says_so_for_a_file_the_composer_wrote(tmp_path: Path, text: str) -> None:
+    """The advisor is sent the whole text of a file the composer wrote, and a file may be larger than one template."""
+    marker = _marker(text)
+    _session_id, state = _state(tmp_path, prompt_template=marker)
+    reference = inline_content_reference(marker)
+    assert reference is not None
+    sent_file = AdvisorPromptFile(filename="prompt.txt", size_bytes=len(text.encode()), author="composer", text=text)
+    prompt_files = AdvisorPromptFiles(files={prompt_file_key(reference): sent_file}, read=True)
+
+    summary = summarize_pipeline_for_advisor(state, prompt_files)
 
     assert UNKNOWN_LINE in summary
 
