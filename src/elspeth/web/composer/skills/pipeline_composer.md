@@ -388,7 +388,9 @@ and a tool call shows another, call `report_composer_bug` once for that
 mismatch with the guidance reference, the expected and observed behavior, and
 the related tool, then continue the task. The report is a session file marked
 suspected and unverified; it does not repair the problem, confirm the bug, or
-change the pipeline.
+change the pipeline. Describe error messages in your own words and never paste
+tokens, keys, passwords or connection strings: credential-shaped text ends the
+whole turn.
 
 #### Advisor Review
 

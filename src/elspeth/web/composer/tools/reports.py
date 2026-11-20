@@ -234,8 +234,11 @@ _REPORT_COMPOSER_BUG_DECLARATION: Final = ToolDeclaration(
         "Reporting does not change the pipeline, repair the problem or confirm the bug. "
         "Report each distinct mismatch once, then continue the user's task; "
         f"a session keeps at most {COMPOSER_BUG_REPORTS_PER_SESSION_MAX} reports. "
+        "It counts as a file change, so call it after any reads in the same batch. "
         f"The saved report is at most {COMPOSER_BUG_REPORT_MAX_BYTES:,} bytes of UTF-8 JSON. "
-        "State factual observations only; never include credentials or document content the mismatch does not need."
+        "State factual observations only, and quote document content only where the mismatch needs it. "
+        "Name error codes, describe error messages in your own words, and never paste tokens, keys, passwords "
+        "or connection strings: credential-shaped text ends the whole turn."
     ),
     json_schema={
         "type": "object",
@@ -256,7 +259,7 @@ _REPORT_COMPOSER_BUG_DECLARATION: Final = ToolDeclaration(
                 "type": "string",
                 "minLength": 1,
                 "maxLength": REPORT_BEHAVIOR_MAX_CHARS,
-                "description": "What the tool call actually did, including the relevant error text.",
+                "description": "What the tool call actually did, with any error described in your own words.",
             },
             "guidance_reference": {
                 "type": "string",
