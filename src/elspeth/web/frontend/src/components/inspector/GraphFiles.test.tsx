@@ -204,6 +204,16 @@ describe("GraphFiles", () => {
     expect(within(source).getByTitle("blob_ref")).toHaveTextContent(/^File$/);
   });
 
+  it("lets a long file or step name wrap at its separators, keeping the text whole", async () => {
+    render(<GraphFiles state={state} onShowNode={vi.fn()} />);
+    await userEvent.setup().click(screen.getByText(filesSummary()));
+    const row = within(screen.getByRole("table")).getByRole("row", { name: /criteria\.txt Transform: inject/ });
+    const name = within(row).getByRole("rowheader");
+    expect(name).toHaveTextContent(/^criteria\.txt$/);
+    expect(name.querySelectorAll("wbr")).toHaveLength(1);
+    expect(row.querySelector(".graph-files-fields")).not.toBeNull();
+  });
+
   it("sorts rows by file name, keeping graph order within a file", async () => {
     render(<GraphFiles state={state} onShowNode={vi.fn()} />);
     await userEvent.setup().click(screen.getByText(filesSummary()));
@@ -248,6 +258,8 @@ describe("GraphFiles", () => {
     const user = userEvent.setup();
     await user.click(screen.getByText(filesSummary()));
     expect(screen.getByRole("alert")).toHaveTextContent("Failed to load files.");
+    // The design system's error banner, not a bare paragraph at the pane edge.
+    expect(screen.getByRole("alert")).toHaveClass("alert-banner", "graph-files-alert");
     expect(screen.queryByText("File not in this session")).not.toBeInTheDocument();
     expect(screen.getAllByText("File name unavailable")).toHaveLength(8);
     act(() => useSessionStore.setState({ compositionState: { ...state, id: "new-state" } }));

@@ -7,7 +7,8 @@ import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore
 import { usePromptDraftStore } from "@/stores/promptDraftStore";
 import { sortedSourceEntries, sourceComponentId } from "@/utils/compositionState";
 import { BlobFileName } from "@/components/blobs/BlobFileName";
-import { Button, Input } from "@/components/ui";
+import { BreakableName } from "@/components/blobs/BreakableName";
+import { AlertBanner, Button, Input } from "@/components/ui";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 import { NODE_LABELS } from "./GraphOutputs";
 import { optionLabel, promptSlotLabel } from "./OptionRows";
@@ -144,7 +145,7 @@ function FileMappings({ state, onShowNode, visibleNodeIds, onCount }: GraphFiles
   const draftSlots = useMemo(() => new Set(Object.values(drafts)
     .filter((draft) => draft.sessionId === state.session_id).map((draft) => `${draft.nodeId}\u0000${draft.fieldPath}`)), [drafts, state.session_id]);
   return <>
-    {sameSession && loadError && <p role="alert">{loadError}</p>}
+    {sameSession && loadError && <AlertBanner className="graph-files-alert">{loadError}</AlertBanner>}
     {rows.length === 0 ? <p className="graph-config-empty-value">No session files are attached to this graph.</p>
       : <>
       <div className="graph-files-filter">
@@ -230,8 +231,8 @@ function FileMappingRow({ row, state, onShowNode, hidden, binding, unsaved, same
     <th scope="row">{sameSession
       ? <BlobFileName bare blobId={row.blobId} fallback={loadError ? "File name unavailable" : undefined} />
       : <span title={row.blobId}>File reference</span>}</th>
-    <td>{row.kind}: <code>{row.component}</code>{unsaved && <> <span className="prompt-editor-tag">Unsaved changes</span></>}</td>
-    <td>{row.fields.map((field) => <div key={field.path} title={field.path}>
+    <td>{row.kind}: <code><BreakableName name={row.component} /></code>{unsaved && <> <span className="prompt-editor-tag">Unsaved changes</span></>}</td>
+    <td className="graph-files-fields">{row.fields.map((field) => <div key={field.path} title={field.path}>
       {field.label}{field.entry !== undefined && <>: <code>{field.entry}</code></>}
     </div>)}</td>
   </tr>;

@@ -475,6 +475,31 @@
   overflow-wrap: anywhere;
 }
 
+/* Cells centre on the row: the Actions buttons are 36px tall, and top-aligned
+   text beside them read as misaligned. The extra `table` step outranks the
+   shared .graph-detail-table cell rule (top), which comes later in this file. */
+.graph-files-scroll table th,
+.graph-files-scroll table td {
+  vertical-align: middle;
+}
+
+/* Below this width the four columns crushed to a letter each in a narrow
+   pane; the table keeps a readable width and the region (a keyboard-scrollable
+   scroll owner) scrolls sideways instead, with Actions first in view. */
+.graph-files-scroll table {
+  min-width: 42rem;
+}
+
+/* A field label ("User prompt, query C1") reads as one unit; the long-name
+   columns beside it wrap at their separators instead. */
+.graph-files-fields > div {
+  white-space: nowrap;
+}
+
+.graph-files-alert {
+  margin: 0 var(--space-pane-gutter) var(--space-sm);
+}
+
 .graph-files-filter {
   display: flex;
   flex-wrap: wrap;

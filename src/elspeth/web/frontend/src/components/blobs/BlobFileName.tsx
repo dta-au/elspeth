@@ -1,5 +1,6 @@
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
+import { BreakableName } from "./BreakableName";
 
 export function useBlobFilename(blobId: string): string | null {
   const sessionId = useSessionStore((state) => state.activeSessionId);
@@ -10,7 +11,7 @@ export function useBlobFilename(blobId: string): string | null {
   );
 }
 
-/** `bare` drops the "File:" prefix where a column header already says it. */
+/** `bare` drops the "File:" prefix where a column header already says it, and lets a long name wrap at its separators. */
 export function BlobFileName({ blobId, sha256, fallback, bare = false }: { blobId: string; sha256?: string; fallback?: string; bare?: boolean }) {
   const sessionId = useSessionStore((state) => state.activeSessionId);
   const blob = useBlobStore((state) =>
@@ -25,7 +26,7 @@ export function BlobFileName({ blobId, sha256, fallback, bare = false }: { blobI
   const changed = sha256 !== undefined && blob.content_hash !== null && sha256.toLowerCase() !== blob.content_hash.toLowerCase();
   return (
     <span title={`File id ${blobId}${sha256 ? ` · SHA-256 ${sha256.slice(0, 12)}…` : ""}`} data-blob-id={blobId}>
-      {bare ? null : "File: "}{blob.filename}{changed && <span> (changed since attached)</span>}
+      {bare ? null : "File: "}{bare ? <BreakableName name={blob.filename} /> : blob.filename}{changed && <span> (changed since attached)</span>}
     </span>
   );
 }
