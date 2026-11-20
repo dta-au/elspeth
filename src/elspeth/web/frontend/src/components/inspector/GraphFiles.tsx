@@ -27,8 +27,8 @@ interface FileMapping {
   componentId: string;
   /** Only an LLM step's prompt slots can be edited here. */
   isNode: boolean;
-  /** `key` names the entry inside a multi-key option (e.g. `criteria` in `files.criteria.content`). */
-  fields: Array<{ path: string; label: string; key?: string }>;
+  /** `entry` is the rest of the path inside a multi-key option (e.g. `criteria.content` in `files.criteria.content`). */
+  fields: Array<{ path: string; label: string; entry?: string }>;
 }
 
 /** One row per (component, file): every option field of that component that references the file. */
@@ -57,12 +57,12 @@ function fileMappings(state: CompositionState): FileMapping[] {
       };
       if (!mapping.fields.some((field) => field.path === reference.fieldPath)) {
         // Copy-register rule: the raw option path stays in the title; visible
-        // text is the option's label, plus the entry key (as code) when the
-        // option holds several entries, so two entries never read the same.
+        // text is the option's label, plus the rest of the path (as code) when
+        // the option holds entries, so two entries never read the same.
         const prompt = promptLabels.get(reference.fieldPath);
-        const [option, key] = reference.fieldPath.split(".");
+        const [option, ...rest] = reference.fieldPath.split(".");
         mapping.fields.push(prompt !== undefined ? { path: reference.fieldPath, label: prompt }
-          : { path: reference.fieldPath, label: optionLabel(option), key });
+          : { path: reference.fieldPath, label: optionLabel(option), ...(rest.length > 0 ? { entry: rest.join(".") } : {}) });
       }
       mappings.set(key, mapping);
     }
@@ -169,7 +169,7 @@ function FileMappingRow({ row, state, onShowNode, hidden, binding, sameSession, 
       : <span title={row.blobId}>File reference</span>}</th>
     <td>{row.kind}: <code>{row.component}</code></td>
     <td>{row.fields.map((field) => <div key={field.path} title={field.path}>
-      {field.label}{field.key !== undefined && <>: <code>{field.key}</code></>}
+      {field.label}{field.entry !== undefined && <>: <code>{field.entry}</code></>}
     </div>)}</td>
     <td>
       <div className="graph-file-actions">

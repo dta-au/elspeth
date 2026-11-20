@@ -557,6 +557,70 @@ describe("BlobManager file wiring", () => {
     expect(slot).toBeChecked();
   });
 
+  it("refuses while another request for the session is in flight", async () => {
+    const composeRequest = vi.fn();
+    useSessionStore.setState({ composeRequest });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Wiring prompt.txt" }));
+    await user.click(screen.getByRole("checkbox", { name: /llm — User prompt/ }));
+    act(() => useSessionStore.setState({ composeRequests: new Map([["session-1", { current: null }]]) }));
+    expect(screen.getByRole("button", { name: "Connect selected prompts" })).toBeDisabled();
+    expect(screen.getByText("Wait for Composer to finish before connecting this file.")).toBeInTheDocument();
+    expect(composeRequest).not.toHaveBeenCalled();
+  });
+
+  it("stays open when a request registered after the last render makes the real gate refuse", async () => {
+    // Another surface registers a request between the pad's render and the
+    // click: the click still runs (old render), the real composeRequest
+    // refuses, and the earlier owner must not be read as acceptance.
+    const storeSend = vi.fn<(content: string, signal?: AbortSignal) => Promise<void>>().mockResolvedValue(undefined);
+    useSessionStore.setState({ sendMessage: storeSend });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Wiring prompt.txt" }));
+    await user.click(screen.getByRole("checkbox", { name: /llm — User prompt/ }));
+    const connect = screen.getByRole("button", { name: "Connect selected prompts" });
+    act(() => {
+      useSessionStore.setState({ composeRequests: new Map([["session-1", { current: null }]]) });
+      connect.click();
+    });
+    expect(storeSend).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "File wiring pad" })).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: /llm — User prompt/ })).toBeChecked();
+  });
+
+  it("re-announces a repeated refusal and clears it when the pad is reopened", async () => {
+    const composeRequest = vi.fn().mockResolvedValue(undefined);
+    useSessionStore.setState({ composeRequest });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Wiring prompt.txt" }));
+    await user.click(screen.getByRole("checkbox", { name: /llm — User prompt/ }));
+    await user.click(screen.getByRole("button", { name: "Connect selected prompts" }));
+    const first = screen.getByRole("alert");
+    await user.click(screen.getByRole("button", { name: "Connect selected prompts" }));
+    const second = screen.getByRole("alert");
+    expect(second).toHaveTextContent("Composer did not take this request.");
+    expect(second).not.toBe(first);
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await user.click(screen.getByRole("button", { name: "Wiring prompt.txt" }));
+    expect(screen.getByRole("dialog", { name: "File wiring pad" })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("keeps Shift+Tab inside the pad after a click on its text", async () => {
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Wiring prompt.txt" }));
+    await user.click(screen.getByText(/Choose the connections yourself/));
+    const dialog = screen.getByRole("dialog", { name: "File wiring pad" });
+    expect(document.activeElement).toBe(dialog);
+    await user.tab({ shift: true });
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).not.toBe(dialog);
+  });
+
   it("refuses a connection if the file changes while the pad is open", async () => {
     const composeRequest = vi.fn();
     useSessionStore.setState({ composeRequest });

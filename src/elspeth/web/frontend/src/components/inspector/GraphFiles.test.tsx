@@ -93,7 +93,7 @@ describe("GraphFiles", () => {
     // Copy-register rule: the raw option path is only a title; the visible text is the option's label.
     const inject = within(table).getByRole("row", { name: /File: criteria.txt Transform: inject/ });
     expect(inject).not.toHaveTextContent("files.criteria.content");
-    expect(within(inject).getByTitle("files.criteria.content")).toHaveTextContent(/^Files: criteria$/);
+    expect(within(inject).getByTitle("files.criteria.content")).toHaveTextContent(/^Files: criteria\.content$/);
     expect(within(table).getByRole("row", { name: /File: input.csv Source: main/ })).toBeInTheDocument();
     expect(within(table).getByRole("row", { name: /File: shared.txt Sink: out/ })).toBeInTheDocument();
     expect(screen.getByText("File not in this session")).toBeInTheDocument();
@@ -189,8 +189,8 @@ describe("GraphFiles", () => {
     render(<GraphFiles state={twoEntries} onShowNode={vi.fn()} />);
     await userEvent.setup().click(screen.getByText(filesSummary()));
     const row = within(screen.getByRole("table")).getByRole("row", { name: /File: criteria.txt Transform: inject/ });
-    expect(within(row).getByTitle("files.alpha.content")).toHaveTextContent(/^Files: alpha$/);
-    expect(within(row).getByTitle("files.beta.content")).toHaveTextContent(/^Files: beta$/);
+    expect(within(row).getByTitle("files.alpha.content")).toHaveTextContent(/^Files: alpha\.content$/);
+    expect(within(row).getByTitle("files.beta.content")).toHaveTextContent(/^Files: beta\.content$/);
   });
 
   it("does not borrow another session's filenames or edit its files", async () => {

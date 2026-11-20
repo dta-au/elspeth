@@ -58,7 +58,8 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   // The file wiring pad is bound to the session, file and graph state it was
   // opened on; a change to any of them refuses the connection until reopened.
   const [pendingWire, setPendingWire] = useState<{ blob: BlobMetadata; sessionId: string; stateId: string | null } | null>(null);
-  const [wireSendRefusal, setWireSendRefusal] = useState<string | null>(null);
+  // `seq` re-keys the pad's alert so a repeated refusal is announced again.
+  const [wireSendRefusal, setWireSendRefusal] = useState<{ message: string; seq: number } | null>(null);
   const pending = useInterpretationEventsStore((s) => activeSessionId ? s.pendingBySession[activeSessionId] : undefined);
   const { blobs, isLoading, error, activeSessionId: blobSessionId, loadBlobs, uploadBlob, deleteBlob, downloadBlob } =
     useBlobStore();
@@ -377,7 +378,10 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
             if (owner !== undefined && owner !== prior) {
               setPendingWire(null);
             } else {
-              setWireSendRefusal("Composer did not take this request. Your choices are kept; try again.");
+              setWireSendRefusal((previous) => ({
+                message: "Composer did not take this request. Your choices are kept; try again.",
+                seq: (previous?.seq ?? 0) + 1,
+              }));
             }
           }}
         />

@@ -13,7 +13,7 @@ interface FileWiringPadProps {
   /** Why connecting is refused right now (session loading, Composer busy, file or graph changed); null when allowed. */
   disabledReason: string | null;
   /** Set when Composer did not take the last request; the pad stays open with the user's input intact. */
-  sendRefusal?: string | null;
+  sendRefusal?: { message: string; seq: number } | null;
   /** Receives the user's chat request. The pad never writes the graph itself. */
   onConnect: (request: string) => void;
   onClose: () => void;
@@ -124,7 +124,8 @@ export function FileWiringPad({ blob, state, blobs, disabledReason, sendRefusal 
             value={instructions} onChange={(event) => setInstructions(event.target.value)} />
         </label>}
         {disabledReason && <p role="status">{disabledReason}</p>}
-        {sendRefusal && disabledReason === null && <p role="alert">{sendRefusal}</p>}
+        {/* Keyed by seq: a new node per refusal, so assistive tech announces a repeat. */}
+        {sendRefusal && disabledReason === null && <p key={sendRefusal.seq} role="alert">{sendRefusal.message}</p>}
       </div>
       <footer className="confirm-dialog-actions">
         <Button className="confirm-dialog-btn" onClick={onClose}>Cancel</Button>
