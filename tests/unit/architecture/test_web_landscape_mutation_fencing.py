@@ -9875,7 +9875,7 @@ def _reserve_sink_effect_disjoint_receipts(units):
         (
             "src/elspeth/engine/executors/sink_effects.py",
             "SinkEffectCoordinator",
-            "e02b95605111afa607819b7a84b05bbe3481df8586d0a5577e8081e63fcda8c3",
+            "e52c26d3d24ea19cd357e3f24e10493187b99fdcf501d2d7d5037052c78f0a3a",
         ),
     )
     indexed = {unit.path: unit for unit in units}
