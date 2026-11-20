@@ -4,19 +4,31 @@ import {
   type ReactNode,
   useCallback,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
 
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
-import { Button, Icon } from "@/components/ui";
+import { Button } from "@/components/ui";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useBlobStore } from "@/stores/blobStore";
 import { hasCompositionContent } from "@/utils/compositionState";
 import {
   FOCUS_AUTHORING_EVENT,
+  TOGGLE_AUTHORING_EVENT,
   claimWorkspaceViewIntent,
 } from "@/lib/composer-events";
+import {
+  AUTHORING_TOGGLE_SELECTOR,
+  AuthoringPaneToggle,
+  AuthoringToggleProvider,
+  type AuthoringToggleState,
+} from "./AuthoringPaneToggle";
+import {
+  type CollapsedAuthoringStatus,
+  useCollapsedAuthoringStatus,
+} from "./useCollapsedAuthoringStatus";
 import { WorkspacePaneProvider } from "./WorkspacePaneContext";
 import { WorkspaceSeparator } from "./WorkspaceSeparator";
 import { useWorkspacePaneState } from "./useWorkspacePaneState";
@@ -38,23 +50,10 @@ export interface ComposerWorkspaceProps {
   /** The authoring pane's title-bar heading. Hosts whose authoring content
    *  is not a conversation (the tutorial run turn) name it for what it holds. */
   authoringTitle?: string;
-  collapsedStatus?: ReactNode | {
-    text: string;
-    tone: "neutral" | "busy" | "error";
-  };
-}
-
-function isCollapsedStatusProjection(
-  value: ComposerWorkspaceProps["collapsedStatus"],
-): value is { text: string; tone: "neutral" | "busy" | "error" } {
-  if (typeof value !== "object" || value === null) return false;
-  const projection = value as { text?: unknown; tone?: unknown };
-  return (
-    typeof projection.text === "string" &&
-    (projection.tone === "neutral" ||
-      projection.tone === "busy" ||
-      projection.tone === "error")
-  );
+  /** Overrides the collapsed-pane status the workspace otherwise projects
+   *  from the session store (useCollapsedAuthoringStatus). Every production
+   *  host, the tutorial included, uses the live projection. */
+  collapsedStatus?: CollapsedAuthoringStatus;
 }
 
 function layoutMode(workspaceWidth: number):
@@ -73,10 +72,7 @@ export function ComposerWorkspace({
   artifact,
   actionBar,
   authoringTitle = "Conversation",
-  collapsedStatus = {
-    text: "Authoring pane collapsed",
-    tone: "neutral",
-  },
+  collapsedStatus,
 }: ComposerWorkspaceProps) {
   const activeSessionId = useSessionStore((state) => state.activeSessionId);
   const compositionHasContent = useSessionStore((state) =>
@@ -110,7 +106,6 @@ export function ComposerWorkspace({
   const artifactSlotRef = useRef<HTMLDivElement | null>(null);
   const authoringPaneRef = useRef<HTMLElement | null>(null);
   const artifactPaneRef = useRef<HTMLElement | null>(null);
-  const toggleControlRef = useRef<HTMLButtonElement | null>(null);
   const paneState = useWorkspacePaneState({
     workspaceWidth,
     sessionId: activeSessionId,
@@ -119,18 +114,29 @@ export function ComposerWorkspace({
   const { setAuthoringCollapsed, selectArtifactTab } = paneState;
   const mode = layoutMode(workspaceWidth);
   const narrow = mode === "narrow";
+  // Under 960px there is no hide/show toggle: the Compose / Pipeline tabs
+  // switch views. A collapsed preference stored on a wide window would
+  // otherwise leave Compose empty with nothing to restore it, so narrow
+  // layouts ignore it (and keep it for the next wide layout).
+  const authoringCollapsed = paneState.authoringCollapsed && !narrow;
   const authoringViewHidden = narrow && narrowView === "pipeline";
   const artifactViewHidden = narrow && narrowView === "compose";
-  const authoringHidden = paneState.authoringCollapsed || authoringViewHidden;
+  const authoringHidden = authoringCollapsed || authoringViewHidden;
   const showPipeline = useCallback(() => setNarrowView("pipeline"), []);
   const showCompose = useCallback(() => setNarrowView("compose"), []);
   const previousNarrowRef = useRef(narrow);
-  const projectedCollapsedStatus = isCollapsedStatusProjection(collapsedStatus)
-    ? collapsedStatus
-    : null;
-  const collapsedStatusContent: ReactNode = projectedCollapsedStatus
-    ? projectedCollapsedStatus.text
-    : (collapsedStatus as ReactNode);
+  const liveCollapsedStatus = useCollapsedAuthoringStatus({
+    activeSessionId,
+    authoringCollapsed,
+  });
+  const status = collapsedStatus ?? liveCollapsedStatus;
+  const [toggleFocusRequest, setToggleFocusRequest] = useState(0);
+  // Set by a toggle instance that unmounts while focused; read by the layout
+  // effects of the same commit and cleared at its end.
+  const toggleFocusDroppedRef = useRef(false);
+  const toggleFocusDropped = useCallback((): void => {
+    toggleFocusDroppedRef.current = true;
+  }, []);
 
   useLayoutEffect(() => {
     const root = rootRef.current;
@@ -160,10 +166,13 @@ export function ComposerWorkspace({
         activeElement instanceof HTMLElement &&
         rootRef.current?.contains(activeElement) &&
         activeElement.closest("[hidden], [inert]") !== null;
+      // The hide/show toggle does not render under 960px, so a focused one
+      // is gone by now; the selected view tab takes focus instead.
       if (
         !hiddenSlot?.contains(activeElement) &&
         !separatorSlotRef.current?.contains(activeElement) &&
-        !activeControlHidden
+        !activeControlHidden &&
+        !toggleFocusDroppedRef.current
       ) {
         return;
       }
@@ -180,11 +189,11 @@ export function ComposerWorkspace({
       return;
     }
     const target =
-      narrowView === "compose" && !paneState.authoringCollapsed
+      narrowView === "compose" && !authoringCollapsed
         ? authoringPaneRef
         : artifactPaneRef;
     target.current?.focus({ preventScroll: true });
-  }, [narrow, narrowView, paneState.authoringCollapsed]);
+  }, [narrow, narrowView, authoringCollapsed]);
 
   useLayoutEffect(() => {
     if (authoringFocusRequest === 0 || authoringHidden) return;
@@ -256,26 +265,86 @@ export function ComposerWorkspace({
     focusAuthoring();
   }, [authoringFocusRequested, consumeAuthoringFocusRequest, focusAuthoring]);
 
-  const collapseAuthoring = (): void => {
-    claimWorkspaceViewIntent();
-    toggleControlRef.current?.focus({ preventScroll: true });
-    paneState.setAuthoringCollapsed(true);
-  };
+  const selectNarrowView = useCallback(
+    (view: NarrowView, moveFocus: boolean): void => {
+      claimWorkspaceViewIntent();
+      setNarrowView(view);
+      if (moveFocus) {
+        const target = view === "compose" ? composeTabRef : pipelineTabRef;
+        target.current?.focus({ preventScroll: true });
+      }
+    },
+    [],
+  );
 
-  const restoreAuthoring = (): void => {
+  // The toggle lives in two title bars (the conversation's while open, the
+  // pipeline's while collapsed), so the instance that had focus unmounts or
+  // goes inert on every flip. Focus moves to the instance now mounted —
+  // unless focus already sits somewhere live (Ctrl+\ pressed from the
+  // canvas stays on the canvas; Ctrl+/ lands in the chat input).
+  const toggleAuthoring = useCallback((): void => {
     claimWorkspaceViewIntent();
-    toggleControlRef.current?.focus({ preventScroll: true });
-    paneState.setAuthoringCollapsed(false);
-  };
+    setAuthoringCollapsed(!paneState.authoringCollapsed);
+    setToggleFocusRequest((current) => current + 1);
+  }, [paneState.authoringCollapsed, setAuthoringCollapsed]);
 
-  const selectNarrowView = (view: NarrowView, moveFocus: boolean): void => {
-    claimWorkspaceViewIntent();
-    setNarrowView(view);
-    if (moveFocus) {
-      const target = view === "compose" ? composeTabRef : pipelineTabRef;
-      target.current?.focus({ preventScroll: true });
+  useLayoutEffect(() => {
+    if (toggleFocusRequest === 0) return;
+    const root = rootRef.current;
+    const active = document.activeElement;
+    const focusLost =
+      !(active instanceof HTMLElement) ||
+      active === document.body ||
+      !active.isConnected ||
+      (root?.contains(active) === true &&
+        active.closest("[hidden], [inert]") !== null);
+    if (!focusLost) return;
+    root
+      ?.querySelector<HTMLButtonElement>(AUTHORING_TOGGLE_SELECTOR)
+      ?.focus({ preventScroll: true });
+  }, [toggleFocusRequest]);
+
+  // Ctrl+\ (App's global keymap) and the palette's command. Narrow layouts
+  // have no collapsed state, so the shortcut switches between the views.
+  const handleToggleIntent = useCallback((): void => {
+    if (narrow) {
+      selectNarrowView(narrowView === "compose" ? "pipeline" : "compose", true);
+      return;
     }
-  };
+    toggleAuthoring();
+  }, [narrow, narrowView, selectNarrowView, toggleAuthoring]);
+
+  useLayoutEffect(() => {
+    window.addEventListener(TOGGLE_AUTHORING_EVENT, handleToggleIntent);
+    return () =>
+      window.removeEventListener(TOGGLE_AUTHORING_EVENT, handleToggleIntent);
+  }, [handleToggleIntent]);
+
+  const toggleState = useMemo<AuthoringToggleState | null>(
+    () =>
+      narrow
+        ? null
+        : {
+            collapsed: authoringCollapsed,
+            title: authoringTitle,
+            status,
+            toggle: toggleAuthoring,
+            focusDropped: toggleFocusDropped,
+          },
+    [
+      narrow,
+      authoringCollapsed,
+      authoringTitle,
+      status,
+      toggleAuthoring,
+      toggleFocusDropped,
+    ],
+  );
+
+  // Last layout effect of the commit: the dropped-focus signal is per commit.
+  useLayoutEffect(() => {
+    toggleFocusDroppedRef.current = false;
+  });
 
   const handleViewTabKeyDown = (
     event: KeyboardEvent<HTMLButtonElement>,
@@ -306,17 +375,19 @@ export function ComposerWorkspace({
   return (
     <WorkspacePaneProvider
       paneState={paneState}
+      authoringCollapsed={authoringCollapsed}
       artifactVisible={!artifactViewHidden}
       authoringVisible={!authoringHidden}
       showPipeline={showPipeline}
       showCompose={showCompose}
     >
+      <AuthoringToggleProvider value={toggleState}>
       <div
         ref={rootRef}
         className="composer-workspace"
         data-testid="composer-workspace"
         data-layout-mode={mode}
-        data-authoring-collapsed={paneState.authoringCollapsed || undefined}
+        data-authoring-collapsed={authoringCollapsed || undefined}
         style={rootStyle}
       >
         <div
@@ -373,9 +444,11 @@ export function ComposerWorkspace({
             hidden={authoringHidden}
             tabIndex={-1}
           >
-            {/* The title bar names the pane; its toggle follows the slot in
-                DOM order and sits in the pipeline's bottom action row. */}
+            {/* The title bar opens with the Hide control; while collapsed the
+                Show control takes the same spot in the pipeline's title bar
+                (ArtifactWorkspace). */}
             <header className="workspace-pane-header">
+              <AuthoringPaneToggle placement="authoring" />
               <h2 className="workspace-pane-title">{authoringTitle}</h2>
             </header>
             <div
@@ -389,50 +462,22 @@ export function ComposerWorkspace({
           </section>
         </div>
 
-        {/* DOM order keeps the toggle next after the conversation controls.
-            Grid placement puts this content-sized row under the pipeline,
-            while the conversation card spans both desktop rows. */}
+        {/* Workflow actions only. Grid placement puts this content-sized row
+            under the pipeline, while the conversation card spans both
+            desktop rows; narrow Compose has no row at all. */}
         <div
           className="workspace-action-bar-slot"
           data-workspace-part="action-bar"
+          hidden={artifactViewHidden}
         >
-          <div
-            className={`workspace-pane-controls${paneState.authoringCollapsed ? " workspace-collapsed-affordance" : ""}`}
-            data-tone={paneState.authoringCollapsed ? projectedCollapsedStatus?.tone : undefined}
-            hidden={authoringViewHidden}
-          >
-            <Button
-              ref={toggleControlRef}
-              variant="bare"
-              className={`workspace-pane-toggle ${paneState.authoringCollapsed ? "workspace-restore-control" : "workspace-collapse-control"}`}
-              title={paneState.authoringCollapsed ? "Restore authoring pane" : "Collapse authoring pane"}
-              aria-label={paneState.authoringCollapsed ? "Restore authoring pane" : "Collapse authoring pane"}
-              aria-expanded={!paneState.authoringCollapsed}
-              aria-controls="workspace-authoring-pane"
-              aria-describedby={paneState.authoringCollapsed ? "workspace-collapsed-status" : undefined}
-              onClick={paneState.authoringCollapsed ? restoreAuthoring : collapseAuthoring}
-            >
-              <Icon
-                name={paneState.authoringCollapsed ? "chevrons-right" : "chevrons-left"}
-                className="workspace-pane-toggle-icon"
-              />
-            </Button>
-            {paneState.authoringCollapsed && (
-              <div id="workspace-collapsed-status" role="status">
-                {collapsedStatusContent}
-              </div>
-            )}
-          </div>
-          <div className="workspace-action-bar-main" hidden={artifactViewHidden}>
-            {actionBar}
-          </div>
+          <div className="workspace-action-bar-main">{actionBar}</div>
         </div>
 
         <div
           ref={separatorSlotRef}
           className="workspace-separator-slot"
           data-workspace-part="separator"
-          hidden={narrow || paneState.authoringCollapsed}
+          hidden={narrow || authoringCollapsed}
         >
           <WorkspaceSeparator
             value={paneState.effectiveAuthoringWidth}
@@ -440,7 +485,7 @@ export function ComposerWorkspace({
             max={paneState.paneBounds.max}
             disabled={
               narrow ||
-              paneState.authoringCollapsed ||
+              authoringCollapsed ||
               !paneState.paneBounds.resizable
             }
             onResize={paneState.resizeTransient}
@@ -476,6 +521,7 @@ export function ComposerWorkspace({
         </div>
 
       </div>
+      </AuthoringToggleProvider>
     </WorkspacePaneProvider>
   );
 }

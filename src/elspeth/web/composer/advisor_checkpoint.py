@@ -57,11 +57,18 @@ from elspeth.web.composer.advisor_output import (
     sanitize_advisor_note,
 )
 from elspeth.web.composer.advisor_request import build_advisor_request_options
-from elspeth.web.composer.advisor_transcript import AdvisorTranscriptOwner, AdvisorVisibleTranscript
+from elspeth.web.composer.advisor_transcript import (
+    AdvisorAnchorCall,
+    AdvisorPromptEstimate,
+    AdvisorTranscriptOwner,
+    AdvisorVisibleTranscript,
+    estimate_advisor_prompt_tokens,
+)
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.llm_response_parsing import (
+    _hash_and_measure_request,
     attach_llm_calls,
     build_llm_call_record,
     safe_response_model,
@@ -90,7 +97,7 @@ from elspeth.web.composer.progress import advisor_checkpoint_progress_event, emi
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount
 from elspeth.web.composer.protocol import ComposerResult, ComposerSettings, ToolArgumentError
 from elspeth.web.composer.provider_context import capture_provider_context
-from elspeth.web.composer.provider_errors import ProviderRequestFailure, classify_provider_failure
+from elspeth.web.composer.provider_errors import ProviderRequestFailure, classify_provider_failure, is_context_length_rejection
 from elspeth.web.composer.provider_gateway import (
     _capture_composer_llm_completion_fields,
     _MalformedLLMResponseError,
@@ -134,6 +141,19 @@ class _AdvisorCheckpointComposeDeadlineExpired(Exception):
     it to the existing ``ComposerConvergenceError(timeout)`` only after they
     have the authoritative state, turn counters, and persisted-audit status.
     """
+
+
+class AdvisorRequestOverDeclaredLimit(Exception):
+    """A checkpoint request still over ``composer_context_max_prompt_tokens`` with every earlier turn left out.
+
+    Raised before any provider call, and only on an estimate anchored on a
+    real call; a cold-start estimate never stops a request.
+    """
+
+    def __init__(self, estimate: AdvisorPromptEstimate, limit: int) -> None:
+        super().__init__(f"Advisor request estimated at {estimate.tokens} prompt tokens is over the declared limit of {limit}")
+        self.estimate = estimate
+        self.limit = limit
 
 
 @dataclass(frozen=True, slots=True)
@@ -493,6 +513,44 @@ class AdvisorCheckpointOwner:
                 {"type": "text", "text": self._composer_skill_text, "cache_control": {"type": "ephemeral"}},
                 {"type": "text", "text": trigger_instructions},
             ]
+        # The visible transcript is the only part of an Advisor request that
+        # grows with the session: its earlier turns go by age, on every request
+        # (see ``AdvisorVisibleTranscript.by_age``). Every binding was taken on
+        # the complete transcript before this point; the request sent states
+        # what it leaves out. With no earlier turn nothing changes.
+        transcript = _advisor_context.advisor_request_transcript(arguments)
+        if transcript is not None:
+            unshaped = arguments
+
+            def bound(shaped: AdvisorVisibleTranscript) -> tuple[str, object]:
+                # Where this request carries its transcript: its publication review, or its own argument.
+                if "publication_review" in unshaped:
+                    return "publication_review", replace(unshaped["publication_review"], transcript=shaped)
+                return "advisor_transcript", shaped
+
+            def rendered(shaped: AdvisorVisibleTranscript) -> str:
+                key, value = bound(shaped)
+                return _advisor_context.build_advisor_user_message({**unshaped, key: value})
+
+            sent_transcript = self._advisor_transcript_by_age(
+                transcript,
+                render=rendered,
+                # Every message but the user message is fixed; sized once, as the call record sizes it.
+                fixed_bytes=_hash_and_measure_request(
+                    detach_prompt_guard_evidence([message for index, message in enumerate(messages) if index != 1]).messages, None
+                )[2].total_bytes,
+                recorder=recorder,
+                stop_over_limit=checkpoint_phase is not None,
+            )
+            if sent_transcript is not transcript:
+                key, value = bound(sent_transcript)
+                arguments = {**unshaped, key: value}
+                user_msg = _advisor_context.build_advisor_user_message(arguments)
+                messages[1] = {
+                    "role": "user",
+                    "content": user_msg,
+                    PROMPT_GUARD_CONTENT_PARTS_KEY: _advisor_context.advisor_user_content_parts(arguments),
+                }
 
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
@@ -609,7 +667,8 @@ class AdvisorCheckpointOwner:
             failure = classify_provider_failure(exc)
             status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
-            error_message = type(exc).__name__
+            # As the provider gateway records it: a context-length rejection is named.
+            error_message = "context_length_exceeded" if is_context_length_rejection(exc) else error_class
             raise
         except _MalformedLLMResponseError as exc:
             status = ComposerLLMCallStatus.MALFORMED_RESPONSE
@@ -677,6 +736,71 @@ class AdvisorCheckpointOwner:
         if type(provider_owner) is not ProviderInvocationOwner or provider_owner.service is not self._require_sessions_service():
             raise AuditIntegrityError("Advisor invocation owner belongs to another exact service")
         return provider_owner.mint(ProviderInvocationFamily.ADVISOR)
+
+    def _advisor_transcript_by_age(
+        self,
+        transcript: AdvisorVisibleTranscript,
+        *,
+        render: Callable[[AdvisorVisibleTranscript], str],
+        fixed_bytes: int,
+        recorder: BufferingRecorder | None,
+        stop_over_limit: bool,
+    ) -> AdvisorVisibleTranscript:
+        """The transcript to send: earlier turns by age, priced; under pressure fewer, or a stop.
+
+        ``render`` gives the user message a transcript would be sent in;
+        ``fixed_bytes`` sizes every other message. Together they measure the
+        request as the call record will (``request_byte_split.total_bytes`` of
+        the detached messages), priced against the earlier calls of this
+        session and the live calls of this turn
+        (:func:`estimate_advisor_prompt_tokens`). Only an estimate anchored on
+        a real call can be over ``composer_context_max_prompt_tokens``: then
+        the oldest older requests go first, then the oldest whole turns, until
+        it fits. A checkpoint still over the limit with nothing left to leave
+        out is stopped before any provider call
+        (:class:`AdvisorRequestOverDeclaredLimit`); a hint is sent. A
+        transcript shaped by age records the estimate, its source and the
+        limit in its own payload, which the retained request keeps. With no
+        earlier turn the transcript is returned unchanged.
+        """
+        limit = self._settings.composer_context_max_prompt_tokens
+        this_turn = tuple(AdvisorAnchorCall.from_call(call) for call in recorder.llm_calls) if recorder is not None else ()
+
+        def priced(shaped: AdvisorVisibleTranscript) -> AdvisorPromptEstimate:
+            return estimate_advisor_prompt_tokens(
+                request_bytes=fixed_bytes + len(render(shaped).encode("utf-8")),
+                advisor_model=self._settings.composer_advisor_model,
+                earlier=transcript.anchor_calls,
+                this_turn=this_turn,
+            )
+
+        shaped = transcript.by_age()
+        estimate = priced(shaped)
+        counts = shaped.history_by_age
+        if estimate.anchored and estimate.tokens > limit and counts is not None:
+            # Leaving out one more request or turn only ever shrinks the request,
+            # so the fewest steps that fit are found by bisection.
+            older = counts.request_only
+
+            def step(index: int) -> AdvisorVisibleTranscript:
+                return transcript.by_age(older_left_out=min(index, older), whole_left_out=max(0, index - older))
+
+            low, high = 1, older + counts.whole
+            shaped = step(high)
+            estimate = priced(shaped)
+            while low < high and estimate.tokens <= limit:
+                middle = (low + high) // 2
+                candidate = step(middle)
+                candidate_estimate = priced(candidate)
+                if candidate_estimate.tokens <= limit:
+                    shaped, estimate, high = candidate, candidate_estimate, middle
+                else:
+                    low = middle + 1
+        if stop_over_limit and estimate.anchored and estimate.tokens > limit:
+            raise AdvisorRequestOverDeclaredLimit(estimate, limit)
+        if shaped is transcript:
+            return transcript
+        return shaped.with_prompt_estimate(estimate, limit_tokens=limit)
 
     @quota_provider_calls
     async def _call_advisor_with_audit_legacy(
@@ -1418,6 +1542,16 @@ class AdvisorCheckpointOwner:
                 ) from exc
             except PlannerContinuationUnavailable:
                 return continuation_withheld()
+            except AdvisorRequestOverDeclaredLimit as exc:
+                # Nothing was sent, so no model decision exists to record as a
+                # pass; an unchanged request would be stopped again.
+                return AdvisorCheckpointVerdict(
+                    ok=False,
+                    blocking=False,
+                    findings_text=_advisor_policy.ADVISOR_REQUEST_OVER_LIMIT_FINDINGS.format(tokens=exc.estimate.tokens, limit=exc.limit),
+                    failure_class="budget_exhausted",
+                    retryable=False,
+                )
             except _MalformedLLMResponseError as exc:
                 if continuation_budget is not None and not continuation_budget.has_cost_headroom():
                     return continuation_withheld()

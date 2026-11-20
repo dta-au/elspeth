@@ -7,10 +7,12 @@ advisor checkpoint owner.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Any, Final, Literal
 
+from elspeth.contracts.composer_progress import CONTEXT_BUDGET_REFUSAL_DETAIL
 from elspeth.contracts.provider_rejection import SafeRequestRejection
 from elspeth.web.composer import no_tool_policy as _no_tool_policy
 from elspeth.web.composer.state import CompositionState
@@ -247,6 +249,19 @@ def _advisor_signoff_fully_blocking_validation(*, detail: str, suggestion: str, 
 # guaranteed-unique BEGIN/END pair.
 # ---------------------------------------------------------------------------
 _ADVISOR_FINDINGS_MAX_CHARS: Final[int] = 4_000
+# A completion review that was not sent because its anchored size estimate is
+# over the declared prompt-token limit (``advisor_checkpoint``). Backend copy:
+# it names only the estimate, the limit and the setting.
+ADVISOR_REQUEST_OVER_LIMIT_FINDINGS: Final[str] = (
+    "The review request was not sent: it is estimated at {tokens:,} prompt tokens, over the declared limit of {limit:,} "
+    "(composer_context_max_prompt_tokens). Earlier conversation was already left out of it; what remains is the "
+    "pipeline's own content and this turn's evidence."
+)
+_ADVISOR_REQUEST_OVER_LIMIT_SHAPE: Final[re.Pattern[str]] = re.compile(
+    r"[0-9][0-9,]*".join(
+        re.escape(part) for part in ADVISOR_REQUEST_OVER_LIMIT_FINDINGS.replace("{limit:,}", "{tokens:,}").split("{tokens:,}")
+    )
+)
 _ADVISOR_FINDINGS_UNTRUSTED_BEGIN: Final[str] = "BEGIN_UNTRUSTED_ADVISOR_FINDINGS"
 _ADVISOR_FINDINGS_UNTRUSTED_END: Final[str] = "END_UNTRUSTED_ADVISOR_FINDINGS"
 
@@ -266,10 +281,12 @@ _ADVISOR_FINDINGS_UNTRUSTED_END: Final[str] = "END_UNTRUSTED_ADVISOR_FINDINGS"
 ADVISOR_FINAL_REPLY_CONTRACT_CLAUSE: Final[str] = (
     "The end user has not read these findings: write your final reply to stand on its own and do not quote the fenced text."
 )
-ADVISOR_OUTPUT_CONTRACT_CLAUSE: Final[str] = "Fix the findings via tool calls. " + ADVISOR_FINAL_REPLY_CONTRACT_CLAUSE
+ADVISOR_OUTPUT_CONTRACT_CLAUSE: Final[str] = (
+    "Fix applicable findings via tools, or explain evidence that no edit is needed. " + ADVISOR_FINAL_REPLY_CONTRACT_CLAUSE
+)
 
 # elspeth-71617f1d21: the END-gate repair-continue message must state that
-# MUTATIONS are expected. In session 2e0c8ea3 both advisor repair turns were
+# MUTATIONS are expected for actual graph defects. In session 2e0c8ea3 both advisor repair turns were
 # spent entirely on get_pipeline_state lookups — the injection carried only
 # the output-contract clause, and nothing said a read-only turn is a wasted
 # pass. END-gate only: the EARLY advisory injection deliberately keeps its
@@ -280,10 +297,13 @@ ADVISOR_OUTPUT_CONTRACT_CLAUSE: Final[str] = "Fix the findings via tool calls. "
 # a large remaining graph must not become a self-selected checkpoint.
 # Trailing space is load-bearing: the two clauses concatenate.
 ADVISOR_MUTATION_EXPECTATION_CLAUSE: Final[str] = (
-    "If the user's active request authorizes changes, resolve graph findings through pipeline MUTATIONS via tool calls "
+    "If the user's active request authorizes changes, resolve applicable graph findings through pipeline MUTATIONS via tool calls "
     "(e.g. patch_node_options, upsert_node, patch_source_options, "
     "patch_output_options). Re-reading state (get_pipeline_state) or other "
-    "lookup-only calls is not a fix, though they can supply evidence. If the user asks for explanation or says not to make changes, "
+    "lookup-only calls is not a fix, though they can supply evidence. If a finding contradicts supplied evidence or binding contracts, "
+    "state that evidence in a reply that stands on its own for the user; do not change correct content or make no-op edits "
+    "to obtain another pass. "
+    "If the user asks for explanation or says not to make changes, "
     "answer that request without changing the pipeline; the advisor block still prevents completion. "
     "For a specific missing decision or suspected technical inability, call request_advisor_hint alone "
     "with trigger=cannot_complete and the observed evidence. On CONTINUE, take the supported next action; "
@@ -444,8 +464,14 @@ def advisor_signoff_blocked_wording(
     """
     if reason == "budget_exhausted":
         rejection_detail = " " + request_rejection.explanation if request_rejection is not None else ""
+        # A review stopped at the declared limit states its estimate after the
+        # unchanged sentence. Every budget_exhausted ``findings`` is backend
+        # copy; only the closed stop shape is shown.
+        stop_detail = " " + findings if _ADVISOR_REQUEST_OVER_LIMIT_SHAPE.fullmatch(findings) else ""
         return (
-            "The reply was withheld because the completion review could not run within the existing request limits." + rejection_detail,
+            "The reply was withheld because the completion review could not run within the existing request limits."
+            + rejection_detail
+            + stop_detail,
             "Saved draft progress remains available; continue in a new message.",
         )
     if reason == "publication_withheld":
@@ -500,9 +526,15 @@ def advisor_signoff_blocked_wording(
             if request_rejection is not None
             else SafeRequestRejection(reason_code=None, reason_disposition="unavailable", reason_source="unavailable")
         )
+        # A request too large for the model's context: the recourse is the
+        # context budget's own (a new session or a shorter request). The
+        # suggestion is stored on the blocker but never matched against stored
+        # text; only its length is bounded (advisor_audit).
         return (
             rejection.public_detail,
-            "An unchanged rejected request will not be retried automatically. Review the rejection reason before sending another message.",
+            CONTEXT_BUDGET_REFUSAL_DETAIL
+            if rejection.reason_code == "context_length_exceeded"
+            else "An unchanged rejected request will not be retried automatically. Review the rejection reason before sending another message.",
         )
     if reason == "unavailable":
         return (

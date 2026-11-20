@@ -5,6 +5,7 @@ import { Button, Icon, StructuredJsonPreview, type IconName } from "@/components
 import { useShowAdvanced } from "@/stores/preferencesStore";
 import { optionLabel } from "@/components/inspector/OptionRows";
 import type { BlobMetadata } from "@/types/api";
+import { BreakableName } from "./BreakableName";
 import {
   describeStructuralSummary,
   normalizeMimeType,
@@ -27,7 +28,8 @@ interface BlobRowProps {
   onDelete: (blobId: string) => void;
   onUseAsInput: (blob: BlobMetadata) => void;
   /** Disables the Use-as-input compose entry point while a freeform compose
-   *  is in flight (elspeth-3f38ebb1b5). Preview/download/delete stay live. */
+   *  is in flight (elspeth-3f38ebb1b5) or the session is still loading.
+   *  Preview/download/delete stay live. */
   useAsInputDisabled?: boolean;
   attachedFields?: readonly string[];
   selectedNodeLabel?: string | null;
@@ -36,6 +38,10 @@ interface BlobRowProps {
   onEditPrompt?: () => void;
   /** Why a save of this prompt file would be refused, or why it cannot be opened at all. */
   editRefusal?: string;
+  /** Opens the file wiring pad; absent for a file that cannot hold prompt text. */
+  onWire?: () => void;
+  /** Why the wiring pad cannot open for this file right now; null or absent when it can. */
+  wiringDisabledReason?: string | null;
   onSelect?: () => void;
 }
 
@@ -69,7 +75,7 @@ function creatorBadgeLabel(createdBy: BlobMetadata["created_by"]): string {
     case "user":
       return "Created by user";
     case "assistant":
-      return "Created by assistant";
+      return "Created by Composer";
     case "pipeline":
       return "Created by pipeline";
   }
@@ -108,10 +114,13 @@ export function BlobRow({
   focused = false,
   onEditPrompt,
   editRefusal,
+  onWire,
+  wiringDisabledReason = null,
   onSelect,
 }: BlobRowProps) {
   const chipId = useId();
   const editRefusalId = useId();
+  const wiringReasonId = useId();
   const attached = selectedNodeLabel !== null && selectedNodeLabel !== undefined && (attachedFields?.length ?? 0) > 0;
   const status = statusIndicator(blob.status);
   const creatorLabel = creatorBadgeLabel(blob.created_by);
@@ -224,7 +233,7 @@ export function BlobRow({
           title={blob.filename}
           aria-describedby={attached ? chipId : undefined}
         >
-          {blob.filename}
+          <BreakableName name={blob.filename} />
         </span>
 
         {attached && (
@@ -238,14 +247,35 @@ export function BlobRow({
           {formatBytes(blob.size_bytes)}
         </span>
 
-        {/* Actions */}
+        {/* Actions, on their own line under the name at every width: the
+            text action leads at the start, the icon actions keep the same
+            places at the end of every row. */}
         <div className="blob-row-actions">
           {(onEditPrompt || editRefusal) && <>
-            <Button type="button" variant="bare" onClick={onEditPrompt} aria-disabled={onEditPrompt === undefined} title={editRefusal}
+            <Button type="button" variant="ghost" compact className="blob-row-edit-prompt" onClick={onEditPrompt} aria-disabled={onEditPrompt === undefined} title={editRefusal}
               aria-label={`Edit prompt ${blob.filename}`}
               aria-describedby={[attached ? chipId : null, editRefusal ? editRefusalId : null].filter((id) => id !== null).join(" ") || undefined}>Edit prompt</Button>
             {editRefusal && <span className="sr-only" id={editRefusalId}>{editRefusal}</span>}
           </>}
+          {onWire && (
+            <>
+              {/* aria-disabled, not disabled: the control stays focusable and
+                  says why it is unavailable, like Edit prompt beside it. */}
+              <Button
+                variant="bare"
+                onClick={() => { if (wiringDisabledReason === null) onWire(); }}
+                title={wiringDisabledReason ?? "Open file wiring pad"}
+                aria-label={`Wiring ${blob.filename}`}
+                className="blob-action-btn"
+                aria-disabled={wiringDisabledReason !== null}
+                aria-describedby={[attached ? chipId : null, wiringDisabledReason !== null ? wiringReasonId : null]
+                  .filter((id) => id !== null).join(" ") || undefined}
+              >
+                <Icon name="pipeline" />
+              </Button>
+              {wiringDisabledReason !== null && <span className="sr-only" id={wiringReasonId}>{wiringDisabledReason}</span>}
+            </>
+          )}
           {canPreview && blob.status === "ready" && (
             <Button
               variant="bare"

@@ -15,6 +15,8 @@ interface BlobState {
   blobs: BlobMetadata[];
   isLoading: boolean;
   error: string | null;
+  /** `error` is a failed file-list read, which a retry of the same read can clear. */
+  listLoadFailed: boolean;
   /** Session whose rows may be published into this store instance. */
   activeSessionId: string | null;
   /** Monotonic generation for session-bound async completion fences. */
@@ -63,6 +65,7 @@ const initialState = {
   blobs: [] as BlobMetadata[],
   isLoading: false,
   error: null as string | null,
+  listLoadFailed: false,
   activeSessionId: null as string | null,
   activationEpoch: 0,
   fileManagerOpen: false,
@@ -171,6 +174,7 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       blobs: [],
       isLoading: false,
       error: null,
+      listLoadFailed: false,
       activeSessionId: sessionId,
       activationEpoch: state.activationEpoch + 1,
       fileManagerOpen: false,
@@ -208,7 +212,7 @@ export const useBlobStore = create<BlobState>((set, get) => ({
   async loadBlobs(sessionId: string) {
     get().activateSession(sessionId);
     const requestSeq = ++blobLoadRequestSeq;
-    set({ isLoading: true, error: null });
+    set({ isLoading: true, error: null, listLoadFailed: false });
     try {
       const blobs = await api.listBlobs(sessionId);
       if (requestSeq !== blobLoadRequestSeq) {
@@ -225,7 +229,7 @@ export const useBlobStore = create<BlobState>((set, get) => ({
         set({ blobs: err.blobs, error: err.message, isLoading: false });
         return;
       }
-      set({ error: "Failed to load files.", isLoading: false });
+      set({ error: "Failed to load files.", listLoadFailed: true, isLoading: false });
     }
   },
 
@@ -247,7 +251,7 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       ownsStore: ownerState.activeSessionId === sessionId,
     };
     if (ownership.ownsStore) {
-      set({ error: null });
+      set({ error: null, listLoadFailed: false });
     }
     try {
       const blob = await api.uploadBlob(sessionId, file);
@@ -284,7 +288,7 @@ export const useBlobStore = create<BlobState>((set, get) => ({
         current.activeSessionId === ownership.sessionId &&
         current.activationEpoch === ownership.ownerEpoch
       ) {
-        set({ error: detail });
+        set({ error: detail, listLoadFailed: false });
       }
       throw err;
     }
@@ -326,7 +330,7 @@ export const useBlobStore = create<BlobState>((set, get) => ({
         current.activeSessionId === ownership.sessionId &&
         current.activationEpoch === ownership.ownerEpoch
       ) {
-        set({ error: detail });
+        set({ error: detail, listLoadFailed: false });
       }
     }
   },
@@ -347,7 +351,7 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
     } catch {
-      set({ error: "Download failed." });
+      set({ error: "Download failed.", listLoadFailed: false });
     }
   },
 
@@ -357,6 +361,7 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       blobs: [],
       isLoading: false,
       error: null,
+      listLoadFailed: false,
       activeSessionId: null,
       activationEpoch: state.activationEpoch + 1,
       fileManagerOpen: false,

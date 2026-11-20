@@ -224,6 +224,46 @@ class TestGateExecutor:
         assert factory.execution.begin_node_state.call_args.kwargs["attempt"] == expected_attempt
         assert factory.execution.begin_node_state.call_args.kwargs["resume_checkpoint_id"] == checkpoint_id
 
+    @pytest.mark.parametrize("handled_error", [False, True], ids=["routed", "handled_error"])
+    def test_config_gate_hands_on_the_same_frozen_token(self, handled_error: bool) -> None:
+        """Gates never change row data: the outcome carries the input token
+        itself (base 019a98e15 returned an identical copy), with its resume
+        provenance intact on both the routed and the handled-error path."""
+        factory = _make_factory()
+        executor = GateExecutor(
+            factory.execution,
+            _make_span_factory(),
+            _make_step_resolver(),
+            edge_map={(NodeID("cg_1"), "true"): "edge_true"},
+            route_resolution_map={(NodeID("cg_1"), "true"): RouteDestination.processing_node(NodeID("next_node"))},
+            error_edge_ids={NodeID("cg_1"): "edge_gate_error"},
+        )
+        config = GateSettings(
+            name="my_gate",
+            input="in_conn",
+            condition="row['nonexistent_field'] > 0" if handled_error else "True",
+            routes={"true": "next_conn", "false": "error_sink"},
+            on_error="gate_errors",
+        )
+        base = _make_token(contract=_make_contract())
+        token = TokenInfo(
+            row_id=base.row_id,
+            token_id=base.token_id,
+            row_data=base.row_data,
+            resume_attempt_offset=3,
+            resume_checkpoint_id="cp-recovery",
+        )
+
+        outcome = executor.execute_config_gate(config, "cg_1", token, make_context(), attempt_offset=0)
+
+        assert outcome.updated_token is token
+        assert outcome.updated_token.resume_attempt_offset == 3
+        assert outcome.updated_token.resume_checkpoint_id == "cp-recovery"
+        if handled_error:
+            assert outcome.error is not None and outcome.sink_name == "gate_errors"
+        else:
+            assert outcome.error is None and outcome.next_node_id == NodeID("next_node")
+
     def test_config_gate_boolean_true_routes_via_true_label(self) -> None:
         """Boolean True condition evaluates to 'true' label."""
         factory = _make_factory()

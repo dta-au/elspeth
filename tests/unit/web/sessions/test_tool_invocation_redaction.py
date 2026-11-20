@@ -459,7 +459,7 @@ async def test_legacy_persistence_summarizes_duplicate_consumer_facts(
                 {
                     "code": "duplicate_connection_consumer",
                     "connection": "source_to_transform",
-                    "reason": "One connection can feed one processing node; every node listed reads this one.",
+                    "reason": "One connection can feed one processing node; every node listed reads this one. Change only the input bindings; preserve existing node options.",
                     "affected_consumers": [{"id": key_canary}, {"id": "t2"}],
                 }
             ],

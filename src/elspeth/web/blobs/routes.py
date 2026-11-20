@@ -362,7 +362,7 @@ def create_blobs_router() -> APIRouter:
         session_id: UUID,
         request: Request,
         user: Annotated[UserIdentity, Depends(require_pipeline_user)],
-        limit: int = Query(50, ge=1, le=500),
+        limit: int = Query(100, ge=1, le=500),
         offset: int = Query(0, ge=0),
     ) -> list[BlobMetadataResponse]:
         """List blobs for a session, newest first."""

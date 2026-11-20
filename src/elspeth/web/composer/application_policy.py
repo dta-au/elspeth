@@ -21,20 +21,26 @@ class PluginPolicyContextFactory:
         profile_registry: OperatorProfileRegistry | None,
         *,
         trained_operator_mode: bool,
+        validation_reuse_enabled: bool = False,
     ) -> None:
         self._catalog = catalog
         self._snapshot_factory = snapshot_factory
         self._profile_registry = profile_registry
         self._trained_operator_mode = trained_operator_mode
+        self._validation_reuse_enabled = validation_reuse_enabled
 
     def build(self, user_id: str | None) -> tuple[PluginAvailabilitySnapshot, PolicyCatalogView]:
         """Return the current authenticated or trained-operator policy context."""
         if self._trained_operator_mode:
             snapshot = self._snapshot_factory(user_id or "trained-operator")
-            return snapshot, PolicyCatalogView.for_trained_operator(self._catalog, snapshot)
+            return snapshot, PolicyCatalogView.for_trained_operator(
+                self._catalog, snapshot, validation_memo_enabled=self._validation_reuse_enabled
+            )
         if user_id is None:
             raise ComposerServiceError("Authenticated plugin policy context is required.")
         if self._profile_registry is None:
             raise RuntimeError("operator_profile_registry not wired")
         snapshot = self._snapshot_factory(user_id)
-        return snapshot, PolicyCatalogView(self._catalog, snapshot, self._profile_registry)
+        return snapshot, PolicyCatalogView(
+            self._catalog, snapshot, self._profile_registry, validation_memo_enabled=self._validation_reuse_enabled
+        )

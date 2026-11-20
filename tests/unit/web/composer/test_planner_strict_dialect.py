@@ -196,7 +196,12 @@ async def test_get_pipeline_state_in_the_freeform_palette_is_decoded_and_dispatc
 
     monkeypatch.setattr(planner_module, "planner_discovery_information_keys", capture_keys)
     completion = _ScriptedCompletion(
-        _response(("get_pipeline_state", {"component": None})),
+        _response(
+            (
+                "get_pipeline_state",
+                {"component": None, "since_start": None, "field_path": None, "offset_chars": None, "expected_sha256": None},
+            )
+        ),
         _response((_TERMINAL, {"pipeline": _pipeline(tmp_path)})),
     )
     recorder = BufferingRecorder()

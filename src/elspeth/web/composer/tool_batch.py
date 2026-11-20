@@ -192,6 +192,7 @@ from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     ServerStagedRequiredControlUserTerm,
     interpretation_sites,
+    server_staged_review_preservation_error,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.converters import state_from_record
@@ -1865,9 +1866,11 @@ async def run_tool_batch(
             and turn_preferences is not None
             and turn_preferences.trust_mode == "explicit_approve"
             and is_mutation_tool(tool_name)
-            # create_blob stays immediate because it allocates the blob id a
-            # later composition proposal may reference. Destructive blob-only
-            # writes such as update_blob/delete_blob still require approval.
+            # Additive blob creates (create_blob, report_composer_bug) stay
+            # immediate: create_blob allocates the blob id a later composition
+            # proposal may reference, and neither overwrites nor removes
+            # anything. Destructive blob-only writes such as
+            # update_blob/delete_blob still require approval.
             and (not is_blob_store_only_mutation_tool(tool_name) or is_approval_required_blob_store_only_mutation_tool(tool_name))
         )
 
@@ -1922,7 +1925,7 @@ async def run_tool_batch(
                     decoded_args_by_call_id[tool_call.id] = audit_arguments
                     transcript_arguments = (
                         redact_tool_call_arguments(tool_name, arguments, telemetry=ctx.redaction_telemetry)
-                        if candidate.prepared_inline_blob is not None
+                        if candidate.prepared_inline_blob is not None or candidate.prepared_prompt_blobs
                         else audit_arguments
                     )
                     _replace_llm_tool_call_arguments(
@@ -1936,6 +1939,7 @@ async def run_tool_batch(
                 if (
                     candidate.acceptable
                     and candidate.prepared_inline_blob is None
+                    and not candidate.prepared_prompt_blobs
                     and composition_content_hash(candidate.result.updated_state) == composition_content_hash(state)
                 ):
                     finalized_candidate_result = finalize_tool_result(
@@ -2049,22 +2053,35 @@ async def run_tool_batch(
                             _replace_llm_tool_call_arguments(
                                 llm_messages,
                                 tool_call_id=tool_call.id,
-                                arguments=redacted_arguments if candidate.prepared_inline_blob is not None else audit_arguments,
+                                arguments=redacted_arguments
+                                if candidate.prepared_inline_blob is not None or candidate.prepared_prompt_blobs
+                                else audit_arguments,
                                 dialect=ctx.tool_contract_dialect,
                                 semantic=True,
                             )
                             interpretation_requirements_are_internal = True
+                        candidate_result = candidate.result
+                        if candidate.acceptable:
+                            review_error = server_staged_review_preservation_error(state, candidate_result.updated_state)
+                            if review_error is not None:
+                                candidate_result = _candidate_rejection_result(
+                                    state,
+                                    review_error,
+                                    error_code="server_owned_review_protected",
+                                    rejected_component="pipeline",
+                                )
                         finalized_candidate_result = finalize_tool_result(
-                            candidate.result,
+                            candidate_result,
                             tool_name=tool_name,
                             catalog=ctx.policy_catalog,
                             context=candidate_context,
                             prior_validation=candidate_prior_validation,
                         )
-                        proposal_acceptable = candidate.acceptable
+                        proposal_acceptable = candidate.acceptable and candidate_result.success
                         if (
                             proposal_acceptable
                             and candidate.prepared_inline_blob is None
+                            and not candidate.prepared_prompt_blobs
                             and composition_content_hash(finalized_candidate_result.updated_state) == composition_content_hash(state)
                         ):
                             unapplied_admission = _unapplied_admission(
@@ -2075,7 +2092,7 @@ async def run_tool_batch(
                                 runtime_preflight=last_runtime_preflight,
                             )
                             redacted_arguments = None
-                        if proposal_acceptable and candidate.prepared_inline_blob is not None:
+                        if proposal_acceptable and (candidate.prepared_inline_blob is not None or candidate.prepared_prompt_blobs):
                             if proposals_this_turn >= _MAX_PENDING_PROPOSALS_PER_TURN:
                                 raise _pending_proposal_cap_error(
                                     proposals_this_turn + 1,
@@ -2090,6 +2107,7 @@ async def run_tool_batch(
                                 candidate.prepared_inline_blob,
                                 session_id=session_id,
                                 max_storage_per_session=ctx.custody.max_blob_storage_per_session_bytes,
+                                prompt_blobs=candidate.prepared_prompt_blobs,
                             )
 
                             # From this point forward every authority-bearing
@@ -3340,6 +3358,9 @@ async def run_tool_batch(
                 if ctx.turn_evidence is not None:
                     ctx.turn_evidence.diff_baseline = (diff_baseline, diff_baseline_kind)
             call_baseline, call_baseline_kind = diff_baseline, diff_baseline_kind
+            if _tool_name == "get_pipeline_state" and ctx.turn_evidence is not None:
+                call_baseline = ctx.turn_evidence.effects.initial_state
+                call_baseline_kind = "request_start"
             if (
                 _tool_name == "diff_pipeline"
                 and ctx.turn_evidence is not None

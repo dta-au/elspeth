@@ -9,6 +9,7 @@ from dataclasses import FrozenInstanceError, asdict, fields, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from types import MappingProxyType
+from typing import cast
 
 import pytest
 
@@ -34,6 +35,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectCommitResult,
     SinkEffectDescriptorMode,
     SinkEffectErrorReason,
+    SinkEffectFinalizationMember,
     SinkEffectGateRouteReason,
     SinkEffectIdentity,
     SinkEffectInputKind,
@@ -1355,3 +1357,56 @@ class TestSinkEffectIdentityMemberIdTypes:
     def test_malformed_string_digest_raises_value_error(self) -> None:
         with pytest.raises(ValueError, match="lowercase SHA-256 digests"):
             SinkEffectIdentity(member_ids=("NOT-A-DIGEST",), **self._identity_kwargs())
+
+
+def _top_level_deep_freeze_calls(build: Callable[[], object]) -> int:
+    """Count non-recursive ``deep_freeze`` entries while ``build`` runs (cProfile, no doubles)."""
+    import cProfile
+
+    from elspeth.contracts.freeze import deep_freeze
+
+    profiler = cProfile.Profile()
+    profiler.enable()
+    try:
+        build()
+    finally:
+        profiler.disable()
+    return sum(entry.callcount - entry.reccallcount for entry in profiler.getstats() if entry.code is deep_freeze.__code__)
+
+
+@pytest.mark.parametrize(("context", "expected"), [(None, 2), ({"reason": "kept"}, 3)], ids=["no-context", "context"])
+def test_finalization_member_freezes_output_data_once_and_detaches_it(context: Mapping[str, object] | None, expected: int) -> None:
+    """``output_data`` is frozen and detached by its one ``deep_freeze``; the
+    ``freeze_fields`` pass no longer re-copies it (base 019a98e15: one more call).
+    ``context`` keeps both of its passes, so the context case counts one more."""
+    values: list[object] = [1, 2]
+    item: dict[str, object] = {"k": "v"}
+    caller_row: dict[str, object] = {"name": "a", "nested": {"values": values}, "items": [item]}
+
+    def build() -> SinkEffectFinalizationMember:
+        return SinkEffectFinalizationMember(
+            ordinal=0,
+            output_data=caller_row,
+            duration_ms=1,
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.DEFAULT_FLOW,
+            context=context,
+        )
+
+    assert _top_level_deep_freeze_calls(build) == expected
+
+    member = build()
+    caller_row["name"] = "changed"
+    caller_row["added"] = True
+    values.append(3)
+    item["k"] = "changed"
+
+    assert type(member.output_data) is MappingProxyType
+    assert deep_thaw(member.output_data) == {"name": "a", "nested": {"values": [1, 2]}, "items": [{"k": "v"}]}
+    assert type(member.output_data["nested"]) is MappingProxyType
+    assert member.output_data["nested"]["values"] == (1, 2)
+    assert type(member.output_data["items"]) is tuple and type(member.output_data["items"][0]) is MappingProxyType
+    with pytest.raises(TypeError):
+        cast(dict[str, object], member.output_data)["name"] = "x"
+    if context is not None:
+        assert type(member.context) is MappingProxyType and member.context == {"reason": "kept"}

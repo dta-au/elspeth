@@ -309,10 +309,20 @@ test("Build keeps its chrome out of the authoring pane and its Continue reachabl
   // bar is the only chrome allowed above it.
   expect(geometry.transcriptTop, "only the pane's title bar sits above the conversation").toBe(geometry.titleBarBottom);
   expect(geometry.transcript, "the conversation keeps its 160px floor").toBeGreaterThanOrEqual(160);
+  // Same shell as the app (no tutorial branch): the Hide control opens the
+  // conversation's title bar here too (2026-11-20).
+  const hide = page.getByRole("button", { name: "Hide conversation", exact: true });
+  await expect(hide).toBeVisible();
+  expect(
+    await page.locator(".workspace-pane-header").evaluate(
+      (header) => header.firstElementChild?.getAttribute("data-authoring-toggle"),
+    ),
+  ).toBe("hide");
 
   // Narrow Compose view hides the workspace bar's artifact cell, which is why
   // Continue lives in the step header: it stays beside the composer here.
   await page.setViewportSize({ width: 390, height: 700 });
+  await expect(page.locator("[data-authoring-toggle]")).toHaveCount(0);
   await expect(page.getByRole("tab", { name: "Compose" })).toHaveAttribute("aria-selected", "true");
   await expect(page.getByLabel("Message input")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Stop composing" })).toBeVisible();

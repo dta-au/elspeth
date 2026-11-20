@@ -114,8 +114,10 @@ from elspeth.plugins.transforms.llm.multi_query import (
 )
 from elspeth.web.composer._validation_probe import (
     DeferredBlobContractProbe,
-    is_deferred_blob_error,
+    deferred_created_fields,
+    holds_inline_content_reference,
     is_inline_content_reference,
+    only_marker_errors,
     prepare_query_definition_probe,
     prepare_validation_probe_options,
 )
@@ -2276,9 +2278,11 @@ class ValidationProbeCache:
                         raise
                     # A marker can live in an unused option while construction
                     # still computes a valid contract. Defer only after failure,
-                    # and only when every typed error rejects an unresolved
-                    # marker in a string field. Unknown fields and mixed config
-                    # errors remain failures, even if their values are markers.
+                    # and only when every typed error is explained by a valid
+                    # marker (``only_marker_errors``: at or under its path, the
+                    # other branch of its union, or a min_length container
+                    # holding it). Unknown fields and mixed config errors
+                    # remain failures, even if their values are markers.
                     try:
                         config_model = get_transform_config_model(plugin, probe_options)
                     except ValueError:
@@ -2291,8 +2295,8 @@ class ValidationProbeCache:
                         except (PluginConfigError, PydanticValidationError) as config_error:
                             cause = config_error if isinstance(config_error, PydanticValidationError) else config_error.__cause__
                             if isinstance(cause, PydanticValidationError):
-                                details = cause.errors(include_url=False, include_context=False)
-                                if details and all(is_deferred_blob_error(detail, details) for detail in details):
+                                details = cause.errors(include_url=False)
+                                if only_marker_errors(details, probe_options):
                                     raise DeferredBlobContractProbe from exc
                     raise
         except Exception as exc:
@@ -5392,6 +5396,13 @@ def _check_schema_contracts(
             return declared_required
         try:
             transform = probe_cache.transform(node.plugin, node)
+        except DeferredBlobContractProbe:
+            # The constructed model would demote every declared field the node
+            # CREATES; without the file only the names its config shape fixes
+            # are known to be created, and only those are dropped. Everything
+            # else keeps the raw declaration.
+            created = deferred_created_fields(node.plugin, deep_thaw(node.options))
+            return declared_required if created is None else declared_required - created
         except Exception as exc:
             if not _is_config_probe_exception(exc):
                 raise
@@ -5526,21 +5537,22 @@ def _check_schema_contracts(
             if not _is_config_probe_exception(exc):
                 raise
             if isinstance(exc, DeferredBlobContractProbe):
-                if producer.producer_id not in contract_probe_failed_producers:
-                    contract_probe_failed_producers.add(producer.producer_id)
-                    contract_warnings.append(
-                        _warn(
-                            f"node:{producer.producer_id}",
-                            f"Contract preview for node '{producer.producer_id}' is deferred until authorized blob materialization. "
-                            "Inline-content bytes are not available to this authoring probe; execution validation must resolve "
-                            "them and validate the plugin contract before the pipeline can run.",
-                            "medium",
-                            "contract_probe_deferred",
-                        )
-                    )
-                # Unknown content proves no guarantees. In particular, never
-                # promote authored guaranteed_fields into a verified contract.
-                return True, frozenset()
+                # The node's contract is checked before the run starts, once
+                # its file is read; the notice is emitted once per node at the
+                # end of this walk (``_deferred_contract_notice``). Unknown
+                # content proves nothing the node ADDS: its own authored
+                # guaranteed_fields are never promoted to a verified contract.
+                # A known pass-through still forwards its input, so it votes
+                # with exactly the guarantees it inherits (and abstains when
+                # its upstream abstains). Any other plugin abstains wholly:
+                # its output is its own, and none of it is known.
+                if not is_known_pass_through:
+                    return False, frozenset()
+                inherited_participates, inherited_fields = _connection_propagation_vote(
+                    producer_node.input,
+                    visited_fan_in_ids=visited_fan_in_ids,
+                )
+                return inherited_participates, inherited_fields if inherited_participates else frozenset()
             # Keep Stage 1 tolerant of partially configured draft nodes for
             # non-pass-through transforms — constructor-time errors must not
             # crash preview/export endpoints. For known pass-through plugins
@@ -8188,7 +8200,57 @@ def _check_schema_contracts(
     for sweep_output in outputs:
         _sweep_schema_syntax(f"output:{sweep_output.name}", sweep_output.options)
 
+    # One notice per node whose contract this walk could not read because it
+    # sits in a file the authoring check does not open. Every check above that
+    # met such a node abstained on what the file decides (the vote, the edge
+    # type check, the coalesce and row_union comparisons, the value_transform
+    # binding); this is where that abstention is said, whichever check met it.
+    # Asked of every plugin node holding a valid marker, not only those a check
+    # happened to consult, so the notice does not depend on which checks a
+    # graph shape triggers. Only a marker can defer a probe, so a node without
+    # one is never constructed here (a construction no check asked for could
+    # raise what no check would have met). The cache makes this a lookup for
+    # every node already probed.
+    def _probe_defers(node: NodeSpec, plugin: str) -> bool:
+        """Whether ``node``'s probe deferred on a file; other config failures belong to the config rules."""
+        try:
+            probe_cache.transform(plugin, node)
+        except DeferredBlobContractProbe:
+            return True
+        except Exception as exc:
+            if not _is_config_probe_exception(exc):
+                raise
+        return False
+
+    for deferred_node in nodes:
+        if deferred_node.node_type not in {"transform", "aggregation"} or deferred_node.plugin is None:
+            continue
+        if not holds_inline_content_reference(deep_thaw(deferred_node.options)):
+            continue
+        if _probe_defers(deferred_node, deferred_node.plugin):
+            contract_warnings.append(_deferred_contract_notice(deferred_node))
+
     return tuple(errors), tuple(contract_warnings), tuple(edge_contracts)
+
+
+def _deferred_contract_notice(node: NodeSpec) -> ValidationEntry:
+    """The ``contract_probe_deferred`` notice: node, fields and fact, in two sentences, no content.
+
+    Names come from the node's config shape (``deferred_created_fields``)
+    only where they are certain; otherwise the notice says "the fields this
+    step adds" without naming any. It carries no repair hint: nothing on the
+    node is wrong, and the runtime preflight decides the question.
+    """
+    plugin = node.plugin if node.plugin is not None else node.node_type
+    created = deferred_created_fields(plugin, deep_thaw(node.options))
+    fields = f"the fields it adds ({', '.join(sorted(created))})" if created else "the fields this step adds"
+    return ValidationEntry(
+        f"node:{node.id}",
+        f"Node '{node.id}' ({plugin}) reads an attached file that this check does not open, so {fields}, "
+        "their types and whether they can be empty are checked before the run starts. No change is needed.",
+        "medium",
+        "contract_probe_deferred",
+    )
 
 
 @dataclass(frozen=True, slots=True, init=False)

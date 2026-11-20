@@ -373,7 +373,9 @@ class GateExecutor:
                 )
                 result.input_hash = guard.state.input_hash
                 result.duration_ms = duration_ms
-                updated_token = token.with_updated_data(token.row_data)
+                # Gates never change row data and TokenInfo is frozen: hand the
+                # same token on rather than an identical copy.
+                updated_token = token
                 return GateOutcome(
                     result=result,
                     updated_token=updated_token,
@@ -456,9 +458,9 @@ class GateExecutor:
                 context_after=gate_context,
             )
 
-        # Token row_data is unchanged (config gates don't modify data)
-        # PipelineRow is already set on token, so just preserve it
-        updated_token = token.with_updated_data(token.row_data)
+        # Token row_data is unchanged (config gates don't modify data) and
+        # TokenInfo is frozen, so the token itself is the updated token.
+        updated_token = token
 
         return GateOutcome(
             result=result,

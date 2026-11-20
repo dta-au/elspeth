@@ -6,7 +6,6 @@ import json
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -126,7 +125,7 @@ def _exact_arguments(state: CompositionState):
     return _execute_get_pipeline_state(
         {"component": "set_pipeline_arguments"},
         state,
-        MagicMock(spec=ToolContext),
+        _trained_context(),
     )
 
 

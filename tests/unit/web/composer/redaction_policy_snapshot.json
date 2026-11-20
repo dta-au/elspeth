@@ -50,7 +50,7 @@
     "shape": "declarative"
   },
   "get_pipeline_state": {
-    "hash": "1c4b9ac198b3ec0c2b1b842c3ed8088f1b38231cc9a1b0a946fc4dd6108c0964",
+    "hash": "187936b3ffed5efd5fb3004994b3734c071e85f9047a00007970d7681cf79004",
     "sensitive_path_count": 0,
     "shape": "declarative"
   },
@@ -148,6 +148,11 @@
     "hash": "0e732abc16d1581ff843259a99e97c7c56e70bb6ed825fa1503a52182dc273ea",
     "sensitive_path_count": 0,
     "shape": "declarative"
+  },
+  "report_composer_bug": {
+    "hash": "6e511c917631aef55b8eecfb548416f32615cf22595d86d45f4b08c3d100cb73",
+    "sensitive_path_count": 12,
+    "shape": "type_driven"
   },
   "request_advisor_hint": {
     "hash": "f9f515b1d4ad3c958f95adbb8be5cf559f8e41b2a39aa8eb7dee2eea618812b1",

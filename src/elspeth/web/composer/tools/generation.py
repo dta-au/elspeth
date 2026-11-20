@@ -330,7 +330,8 @@ _GET_PLUGIN_SCHEMA_DECLARATION = ToolDeclaration(
     kind=ToolKind.DISCOVERY,
     description=(
         "Get the full configuration schema for a plugin. Result `data` carries `name`, `plugin_type`, "
-        "`description`, `json_schema`, `knob_schema`, `composer_hints`, `secret_requirements`, and "
+        "`description`, `json_schema`, `knob_schema`, `usage_when_not_to_use` (the plugin's own stated "
+        "prohibition, binding on selection; null when it states none), `composer_hints`, `secret_requirements`, and "
         "`web_config_authority` (`user_configurable` — author raw `options` directly; "
         "`user_configurable_with_policy` — author raw `options` the same way; `operator_profiled` — do not "
         "author raw options, author `options.profile` instead)."
@@ -1580,6 +1581,11 @@ def _direct_plugin_policy_guidance() -> tuple[DirectValidationGuidance, ...]:
 
 _DIRECT_VALIDATION_GUIDANCE: Final = (
     DirectValidationGuidance(
+        "inline_prompt_too_long",
+        "New or changed inline LLM prompt text exceeds 100 words or 1,000 prose characters.",
+        "Put the complete text in a UTF-8 text file and bind the file. In set_pipeline, use an inline_blob member at the prompt field.",
+    ),
+    DirectValidationGuidance(
         "edge_not_found",
         "The requested edge is not present in the saved composition. No removal was applied.",
         "Inspect the current edges and retry the intended exact edge ID. Preserve unrelated nodes, routes and edges; do not remove a different edge to silence this refusal.",
@@ -1611,6 +1617,11 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "The source on_validation_failure names an output that is not declared.",
         "Declare the intended quarantine output and reference its name in on_validation_failure, "
         "or choose 'discard' only if discarding invalid source rows is intended.",
+    ),
+    DirectValidationGuidance(
+        "server_owned_review_protected",
+        "A change would have removed, cleared or replaced a review the server staged on a node. Only the user resolves it, on its card.",
+        "Re-send the node without interpretation_requirements (the review is kept), keep its node type and plugin, and do not remove the node while the review is pending.",
     ),
     # elspeth-d2e3f29d10: the aggregation error edge is wired, so a ghost
     # aggregation on_error sink is refused by the DAG builder too.
@@ -2352,7 +2363,8 @@ def _execute_get_plugin_assistance(
 
     * ``issue_code is None`` (or absent) — discovery-time guidance. The
       plugin returns a one-line ``summary`` and ``composer_hints``
-      (same surface that list_* and get_plugin_schema already carry).
+      (same surface that list_sources, list_sinks and get_plugin_schema
+      already carry; the list_transforms index does not).
       ``examples`` may also be populated here — it is plugin-defined,
       not exclusive to failure mode (e.g. ``llm`` publishes a worked
       ``queries`` exemplar in discovery mode).
@@ -2426,7 +2438,7 @@ _GET_PLUGIN_ASSISTANCE_DECLARATION = ToolDeclaration(
         "Two modes by ``issue_code``:\n"
         "  * Omit ``issue_code`` (or pass null) to get discovery-time guidance "
         "    — a `summary` of the plugin and its `composer_hints`. (The same hints "
-        "    are also carried on list_sources / list_transforms / list_sinks / "
+        "    are also carried on list_sources / list_sinks / "
         "    get_plugin_schema responses; this tool is the explicit path.) `examples` "
         "    may also be populated in this mode — it is plugin-defined, not exclusive "
         "    to failure mode.\n"

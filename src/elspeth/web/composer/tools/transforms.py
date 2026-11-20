@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from hashlib import sha256
-from typing import Annotated, Any, Final, Literal, cast
+from typing import Annotated, Any, Final, Literal, TypedDict, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, StrictFloat, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
@@ -13,7 +13,12 @@ from pydantic import ValidationError as PydanticValidationError
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.enums import OutputMode
 from elspeth.core.config import RuntimeNodeName
-from elspeth.web.composer.inventory_response_contracts import PLUGIN_INVENTORY_RESPONSE_CONTRACT
+from elspeth.web.composer.inventory_response_contracts import (
+    PLUGIN_INDEX_DETAILS_TOOL,
+    PLUGIN_INDEX_RESPONSE_CONTRACT,
+    PLUGIN_INVENTORY_RESPONSE_CONTRACT,
+)
+from elspeth.web.composer.plugin_policy_disclosure import ProhibitedPluginDisclosure
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
     ChangeSubstringArgumentsModel,
@@ -182,35 +187,76 @@ class _SetMetadataArgumentsModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class _TransformPolicyCapabilityPayload(TypedDict):
+    capability: str
+    control_role: str | None
+    blocks_positive_detection: bool
+
+
+class _TransformIndexEntryPayload(TypedDict):
+    name: str
+    description: str
+    capability_tags: list[str]
+    web_config_authority: str
+    policy_capabilities: list[_TransformPolicyCapabilityPayload]
+
+
+class _TransformIndexPayload(TypedDict):
+    available: list[_TransformIndexEntryPayload]
+    prohibited: tuple[ProhibitedPluginDisclosure, ...]
+    details_tool: Literal["get_plugin_schema"]
+
+
+def _transform_index_payload(context: ToolContext) -> _TransformIndexPayload:
+    """Project the policy-visible transforms to selection facts; configuration stays with get_plugin_schema."""
+    return {
+        "available": [
+            {
+                "name": item.name,
+                "description": item.description,
+                "capability_tags": list(item.capability_tags),
+                "web_config_authority": item.web_config_authority.value,
+                "policy_capabilities": [
+                    {
+                        "capability": declaration.capability.value,
+                        "control_role": declaration.control_role.value if declaration.control_role is not None else None,
+                        "blocks_positive_detection": declaration.blocks_positive_detection,
+                    }
+                    for declaration in item.policy_capabilities
+                ],
+            }
+            for item in context.catalog.list_transforms()
+        ],
+        "prohibited": _prohibited_section(context.catalog.list_prohibited_transforms()),
+        "details_tool": PLUGIN_INDEX_DETAILS_TOOL,
+    }
+
+
 def _handle_list_transforms(
     arguments: dict[str, Any],
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
     _validate_mutation_arguments(EmptyToolArgumentsModel, arguments, "list_transforms arguments")
-    return _discovery_result(
-        state,
-        {
-            "available": context.catalog.list_transforms(),
-            "prohibited": _prohibited_section(context.catalog.list_prohibited_transforms()),
-        },
-    )
+    return _discovery_result(state, _transform_index_payload(context))
 
 
 _LIST_TRANSFORMS_DECLARATION = ToolDeclaration(
     name="list_transforms",
-    response_contract=PLUGIN_INVENTORY_RESPONSE_CONTRACT,
+    response_contract=PLUGIN_INDEX_RESPONSE_CONTRACT,
     handler=_handle_list_transforms,
     kind=ToolKind.DISCOVERY,
     description=(
-        "List available transform plugins. Each entry carries its full `config_fields` "
-        "(name, type, required, description, default per option), usage guidance, "
-        "`composer_hints`, and `secret_requirements` — not just a name and blurb. "
+        "List available transform plugins as a selection index: each entry carries only `name`, "
+        "`description`, `capability_tags`, `web_config_authority` and `policy_capabilities` "
+        "(`capability`, `control_role`, `blocks_positive_detection`), with no configuration. "
+        "Use `details_tool` (get_plugin_schema) for one plugin's configuration and "
+        "get_plugin_assistance for its guidance. "
         "The result's `prohibited` array names any transform categorically banned from "
-        "the web authoring surface by security policy, with its closed reason and "
-        "explanation — cite it when a user asks why a specific plugin is unavailable. "
+        "the web authoring surface by security policy, with its closed `reason` and "
+        "`explanation` — cite it when a user asks why a specific plugin is unavailable. "
         "The request's `authoring_aids.discovery_digest` is the plugin index: call this listing "
-        "only for a fact it lacks. get_plugin_schema gives a chosen plugin's option contract."
+        "only for a fact it lacks."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=True,
@@ -732,6 +778,13 @@ def _execute_upsert_node(
     # Echo tolerance (elspeth-c67fbbbd83): requirement rows echoed verbatim
     # from the stored node reduce to author shells; the reconciliation pass
     # below restores the server rows. Non-matching values still reject.
+    from elspeth.web.composer.tools._common import _server_staged_requirement_boundary
+
+    node_options, review_refusal = _server_staged_requirement_boundary(
+        node_options, stored_options=existing_node.options if existing_node is not None else None, node_id=node_id
+    )
+    if review_refusal is not None:
+        return _saved_graph_rejection_result(state, review_refusal, error_code="server_owned_review_protected", rejected_component=node_ref)
     node_options, requirement_echo = _normalize_echoed_interpretation_requirements(
         node_options,
         stored_options=existing_node.options if existing_node is not None else None,
@@ -1945,6 +1998,11 @@ def _apply_guarded_node_option_patch(
     # Echo tolerance (elspeth-c67fbbbd83): requirement rows echoed verbatim
     # from the stored node reduce to author shells; the reconciliation pass
     # below restores the server rows. Non-matching values still reject.
+    from elspeth.web.composer.tools._common import _server_staged_requirement_boundary
+
+    patch, review_refusal = _server_staged_requirement_boundary(patch, stored_options=current.options, node_id=node_id)
+    if review_refusal is not None:
+        return _saved_graph_rejection_result(state, review_refusal, error_code="server_owned_review_protected", rejected_component=node_ref)
     patch, requirement_echo = _normalize_echoed_interpretation_requirements(
         patch,
         stored_options=current.options,

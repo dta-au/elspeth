@@ -15,6 +15,9 @@ Operational procedures for ELSPETH pipeline management.
 | [Database Maintenance](database-maintenance.md) | Audit DB growing large, need cleanup |
 | [Incident Response](incident-response.md) | Production issue needs investigation |
 | [Backup and Recovery](backup-and-recovery.md) | Backup audit trail, restore from backup |
+| [Staging Hardware Upgrade Recovery](staging-hardware-upgrade-recovery.md) | Capture a verified full recovery set of a single-host Docker deployment, recover after a VM resize or replacement, and resume Composer tests on a copied graph with the `scripts/staging/` tools |
+| [Composer Edit Battery](composer-edit-battery.md) | Measure a long run of small Composer edits on a very large graph through ordinary chat: per-edit verdicts, history shedding, provider and server time, and the K-of-N gold measure |
+| [VM Live-Container Composer Hotfix](vm-live-container-composer-hotfix.md) | Proposed, reviewed method for installing a small tested Python change into a stopped container's writable layer, with code-only rollback |
 | [Deployment Platforms](../reference/deployment-platforms.md) | Choose Compose, AWS ECS, native Linux, Azure Ubuntu VM, or Azure Container Apps; ACA has desktop acceptance for Single/sticky with local PostgreSQL runtime evidence; Kubernetes is BYO |
 | [Native Linux and Azure Ubuntu VM Deployment](ansible-ubuntu-deployment.md) | Install one systemd-managed web process on Ubuntu; Azure may use one VM behind Front Door |
 | [Caddy Development Install Refresh](caddy-development-refresh.md) | Rebuild the frontend and restart the repository-specific source-checkout service behind Caddy |

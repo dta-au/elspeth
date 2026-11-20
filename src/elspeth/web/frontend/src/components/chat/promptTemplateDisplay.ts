@@ -53,6 +53,13 @@ export interface PromptDisplayResult {
   text: string;
   /** Single-prompt nodes expose the separate system message; undefined for multi-query. */
   systemPrompt?: string | null;
+  /**
+   * Single-prompt nodes: the file each prompt is read from, shown under that
+   * prompt's own heading. A multi-query surface names its files in its text,
+   * under each section's line.
+   */
+  systemPromptFile?: string;
+  promptTemplateFile?: string;
   /** The text shows an interpretation slot that is reviewed in its own card. */
   hasPendingSlot?: boolean;
 }
@@ -142,6 +149,8 @@ const INVALID_QUERY_TEMPLATE = Symbol("invalid query template");
 
 interface SurfaceQuery {
   name: string;
+  /** The server's slot selector: the list index, or the mapping key. */
+  selector: string;
   /** Own template text; null = uses the node-level template; or not text. */
   override: string | null | typeof INVALID_QUERY_TEMPLATE;
 }
@@ -201,23 +210,24 @@ function surfaceWithBindingText(snapshot: PromptReviewSnapshotResponse): Record<
  */
 function wellFormedQueryEntries(
   queries: unknown,
-): [string, Record<string, unknown>][] {
+): [string, Record<string, unknown>, string][] {
   if (Array.isArray(queries)) {
-    const entries: [string, Record<string, unknown>][] = [];
+    const entries: [string, Record<string, unknown>, string][] = [];
     queries.forEach((item, index) => {
       if (!isJsonObject(item)) return;
       const name = item.name;
       entries.push([
         typeof name === "string" && name !== "" ? name : `#${index}`,
         item,
+        String(index),
       ]);
     });
     return entries;
   }
   if (isJsonObject(queries)) {
-    const entries: [string, Record<string, unknown>][] = [];
+    const entries: [string, Record<string, unknown>, string][] = [];
     for (const [name, entry] of Object.entries(queries)) {
-      if (isJsonObject(entry)) entries.push([name, entry]);
+      if (isJsonObject(entry)) entries.push([name, entry, name]);
     }
     return entries;
   }
@@ -246,13 +256,14 @@ function multiQuerySurfaceFromOptions(
   }
   const entries = wellFormedQueryEntries(rawQueries);
   if (entries.length === 0) return null;
-  const queries = entries.map(([name, entry]): SurfaceQuery => {
+  const queries = entries.map(([name, entry, selector]): SurfaceQuery => {
     const override = entry.template;
     if (override === undefined || override === null) {
-      return { name, override: null };
+      return { name, selector, override: null };
     }
     return {
       name,
+      selector,
       override: typeof override === "string" ? override : INVALID_QUERY_TEMPLATE,
     };
   });
@@ -278,14 +289,21 @@ function multiQuerySurfaceFromOptions(
 function renderMultiQuerySurface(
   surface: MultiQuerySurface,
   templateSegments: PromptSegment[] | null,
+  files: FileNames,
 ): RenderedSurface {
+  // A bound file's name sits on the line under its own section's heading.
+  const fileLine = (fieldPath: string): string[] => {
+    const filename = files.take(fieldPath);
+    return filename === undefined ? [] : [`File: ${filename}`];
+  };
   const lines: string[] = [
     "Multi-query LLM node: for every row the model receives one call per query below.",
     "",
     "System prompt (sent with every query):",
+    ...fileLine("system_prompt"),
     surface.systemPrompt !== null ? surface.systemPrompt : "(none)",
   ];
-  for (const { name, override } of surface.queries) {
+  for (const { name, selector, override } of surface.queries) {
     lines.push("");
     if (override === null) {
       lines.push(`Query '${name}': uses the node-level prompt_template (below).`);
@@ -294,7 +312,7 @@ function renderMultiQuerySurface(
         `Query '${name}': (template value is not text; plugin validation rejects this node)`,
       );
     } else {
-      lines.push(`Query '${name}':`, override);
+      lines.push(`Query '${name}':`, ...fileLine(`queries.${selector}.template`), override);
     }
   }
   lines.push("");
@@ -314,6 +332,7 @@ function renderMultiQuerySurface(
       "Node-level prompt_template: not used (every query supplies its own template).",
     );
   }
+  lines.push(...fileLine("prompt_template"));
 
   if (surface.nodePromptTemplate === null) {
     // No shared template: the per-query templates are the whole surface, as
@@ -338,6 +357,33 @@ interface RenderedSurface {
   reviewAvailable: boolean;
   segments: PromptSegment[];
   systemPrompt?: string | null;
+  systemPromptFile?: string;
+  promptTemplateFile?: string;
+}
+
+/**
+ * The snapshot's bound file names by slot path. A render `take`s each name
+ * where it shows it; any it did not place are listed above the prompt, so no
+ * file the review covers goes unnamed.
+ */
+interface FileNames {
+  take: (fieldPath: string) => string | undefined;
+  rest: () => PromptSegment[];
+}
+
+function fileNames(snapshot: PromptReviewSnapshotResponse): FileNames {
+  const remaining = new Map(snapshot.bindings.map((binding) => [binding.field_path, binding.filename]));
+  return {
+    take(fieldPath) {
+      const filename = remaining.get(fieldPath);
+      remaining.delete(fieldPath);
+      return filename;
+    },
+    rest() {
+      if (remaining.size === 0) return [];
+      return [{ kind: "text", text: `${[...remaining].map(([fieldPath, filename]) => `File: ${filename} (${fieldPath})`).join("\n")}\n\n` }];
+    },
+  };
 }
 
 function unavailable(message: string): RenderedSurface {
@@ -401,23 +447,27 @@ function renderSnapshot(
     return unavailable("The prompt files behind this review have changed. Open the current review card.");
   }
   const surface = surfaceWithBindingText(snapshot);
-  const fileLabels: PromptSegment[] = fileBacked
-    ? [{ kind: "text", text: `${snapshot.bindings.map((binding) => `File: ${binding.filename} (${binding.field_path})`).join("\n")}\n\n` }]
-    : [];
+  // Display only: which file each prompt is read from. The approval names the
+  // snapshot's anchor, which the server computes; none of this text is sent.
+  const files = fileNames(snapshot);
   // A file-bound node-level template has no inline skeleton to mark.
   const templateBound = snapshot.bindings.some((binding) => binding.field_path === "prompt_template");
   const templateSegments = templateBound ? null : slotSegmentsFromSurface(surface);
   const multiQuery = multiQuerySurfaceFromOptions(surface);
   if (multiQuery !== null) {
-    const rendered = renderMultiQuerySurface(multiQuery, templateSegments);
-    return { ...rendered, segments: [...fileLabels, ...rendered.segments] };
+    const rendered = renderMultiQuerySurface(multiQuery, templateSegments, files);
+    return { ...rendered, segments: [...files.rest(), ...rendered.segments] };
   }
   const template = surface.prompt_template;
   if (typeof template !== "string" && templateSegments === null) return unavailable(UNAVAILABLE_MESSAGE);
   const systemPrompt = surface.system_prompt;
+  const systemPromptFile = typeof systemPrompt === "string" ? files.take("system_prompt") : undefined;
+  const promptTemplateFile = files.take("prompt_template");
   return {
-    segments: [...fileLabels, ...(templateSegments ?? [{ kind: "text" as const, text: template as string }])],
+    segments: [...files.rest(), ...(templateSegments ?? [{ kind: "text" as const, text: template as string }])],
     systemPrompt: typeof systemPrompt === "string" ? systemPrompt : null,
+    ...(systemPromptFile !== undefined ? { systemPromptFile } : {}),
+    ...(promptTemplateFile !== undefined ? { promptTemplateFile } : {}),
     reviewAvailable: true,
   };
 }

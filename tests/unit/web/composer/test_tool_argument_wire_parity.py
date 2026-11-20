@@ -44,6 +44,13 @@ _TYPE_DRIVEN_INPUTS: dict[str, dict[str, Any]] = {
     },
     "create_blob": {"filename": "data.csv", "mime_type": "text/csv", "content": "x\n1\n"},
     "update_blob": {"blob_id": "blob", "content": "x\n2\n"},
+    "report_composer_bug": {
+        "summary": "summary",
+        "expected_behavior": "expected",
+        "observed_behavior": "observed",
+        "guidance_reference": "reference",
+        "related_tool": "create_blob",
+    },
     "set_source_from_blob": {"blob_id": "blob", "on_success": "rows"},
     "set_source_from_blobs": {"blob_ids": ["blob"], "on_success": "rows"},
     "set_pipeline": {

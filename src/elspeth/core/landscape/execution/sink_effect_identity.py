@@ -336,16 +336,14 @@ def compute_pipeline_membership_hash(members: Sequence[SinkEffectMember]) -> str
     return _labeled_hash("sink-effect-membership-v1", _pipeline_membership(members))
 
 
-def compute_pipeline_effect_identity(
+def _checked_pipeline_members(
     *,
     run_id: str,
     sink_node_id: str,
     role: SinkEffectRole,
-    sink_config: Mapping[str, object],
-    target_config: Mapping[str, object],
     members: Sequence[SinkEffectMember],
-) -> SinkEffectIdentity:
-    """Compute the complete pipeline-member identity without attempt state."""
+) -> tuple[SinkEffectMember, ...]:
+    """Run the pipeline identity's input checks, in its refusal order."""
     if type(role) is not SinkEffectRole:
         raise TypeError("role must be exact SinkEffectRole")
     if not run_id or not sink_node_id:
@@ -355,11 +353,22 @@ def compute_pipeline_effect_identity(
         raise ValueError("pipeline identity requires exact non-empty members")
     if [member.ordinal for member in member_tuple] != list(range(len(member_tuple))):
         raise ValueError("pipeline members must be dense and ordered")
-    config_hash = _credential_free_hash("sink-effect-config-v1", sink_config, "sink_config")
-    requested_target_hash = compute_sink_effect_target_hash(target_config)
-    membership = _pipeline_membership(member_tuple)
+    return member_tuple
+
+
+def _pipeline_effect_hashes(
+    *,
+    run_id: str,
+    sink_node_id: str,
+    role: SinkEffectRole,
+    config_hash: str,
+    requested_target_hash: str,
+    members: tuple[SinkEffectMember, ...],
+) -> tuple[str, str, str, str]:
+    """Return the membership, group-payload, effect and stream hashes, in encoding order."""
+    membership = _pipeline_membership(members)
     membership_hash = _labeled_hash("sink-effect-membership-v1", membership)
-    group_payload_hash = _labeled_hash("sink-effect-group-payload-v1", [member.payload_hash for member in member_tuple])
+    group_payload_hash = _labeled_hash("sink-effect-group-payload-v1", [member.payload_hash for member in members])
     effect_id = _labeled_hash(
         "sink-effect-pipeline-v1",
         {
@@ -382,6 +391,86 @@ def compute_pipeline_effect_identity(
             "run_id": run_id,
             "sink_node_id": sink_node_id,
         },
+    )
+    return membership_hash, group_payload_hash, effect_id, stream_id
+
+
+def _is_plain_utf8_text(value: object) -> bool:
+    """An exact ``str`` RFC 8785 can encode: Python text fails UTF-8 only on a lone surrogate."""
+    return type(value) is str and (value.isascii() or not any("\ud800" <= char <= "\udfff" for char in value))
+
+
+def _pipeline_hashes_encodable(*, run_id: str, sink_node_id: str, members: tuple[SinkEffectMember, ...]) -> bool:
+    """True when ``_pipeline_effect_hashes`` cannot refuse these checked inputs.
+
+    Its only free values are the run and node ids and each member's ingest
+    sequence, row id and token id; every other value it encodes is a validated
+    hex digest, a small ordinal or a constant.
+    """
+    return (
+        _is_plain_utf8_text(run_id)
+        and _is_plain_utf8_text(sink_node_id)
+        and all(
+            member.ingest_sequence <= _SAFE_INTEGER_MAX and _is_plain_utf8_text(member.row_id) and _is_plain_utf8_text(member.token_id)
+            for member in members
+        )
+    )
+
+
+def compute_pipeline_effect_request_hashes(
+    *,
+    run_id: str,
+    sink_node_id: str,
+    role: SinkEffectRole,
+    sink_config: Mapping[str, object],
+    target_config: Mapping[str, object],
+    members: Sequence[SinkEffectMember],
+) -> tuple[str, str]:
+    """Return ``(config_hash, requested_target_hash)`` for a pipeline reservation request.
+
+    Same validation, refusals and hashes as ``compute_pipeline_effect_identity``,
+    without the effect, stream, artifact and member identities: the reservation
+    request clears member ids and the reservation derives every identity itself
+    from the request (``sink_effect_reservation._pipeline_identity``).
+    """
+    member_tuple = _checked_pipeline_members(run_id=run_id, sink_node_id=sink_node_id, role=role, members=members)
+    config_hash = _credential_free_hash("sink-effect-config-v1", sink_config, "sink_config")
+    requested_target_hash = compute_sink_effect_target_hash(target_config)
+    if not _pipeline_hashes_encodable(run_id=run_id, sink_node_id=sink_node_id, members=member_tuple):
+        # An input the identity encodings refuse (an ingest sequence past 2**53-1,
+        # a lone surrogate): encode them so the caller gets that same refusal,
+        # here, before any member payload is persisted.
+        _pipeline_effect_hashes(
+            run_id=run_id,
+            sink_node_id=sink_node_id,
+            role=role,
+            config_hash=config_hash,
+            requested_target_hash=requested_target_hash,
+            members=member_tuple,
+        )
+    return config_hash, requested_target_hash
+
+
+def compute_pipeline_effect_identity(
+    *,
+    run_id: str,
+    sink_node_id: str,
+    role: SinkEffectRole,
+    sink_config: Mapping[str, object],
+    target_config: Mapping[str, object],
+    members: Sequence[SinkEffectMember],
+) -> SinkEffectIdentity:
+    """Compute the complete pipeline-member identity without attempt state."""
+    member_tuple = _checked_pipeline_members(run_id=run_id, sink_node_id=sink_node_id, role=role, members=members)
+    config_hash = _credential_free_hash("sink-effect-config-v1", sink_config, "sink_config")
+    requested_target_hash = compute_sink_effect_target_hash(target_config)
+    membership_hash, group_payload_hash, effect_id, stream_id = _pipeline_effect_hashes(
+        run_id=run_id,
+        sink_node_id=sink_node_id,
+        role=role,
+        config_hash=config_hash,
+        requested_target_hash=requested_target_hash,
+        members=member_tuple,
     )
     artifact_id, idempotency_key, member_ids = _derived_ids(effect_id, len(member_tuple))
     bound_members = tuple(replace(member, member_effect_id=member_ids[member.ordinal]) for member in member_tuple)
@@ -483,6 +572,7 @@ __all__ = [
     "compute_audit_export_effect_identity",
     "compute_effect_identity",
     "compute_pipeline_effect_identity",
+    "compute_pipeline_effect_request_hashes",
     "compute_pipeline_membership_hash",
     "compute_sink_effect_target_hash",
     "resolve_sink_effect_members",

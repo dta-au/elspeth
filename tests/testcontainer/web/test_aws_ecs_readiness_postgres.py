@@ -362,12 +362,12 @@ def test_repeated_failed_refreshes_do_not_grow_probe_work(
     release = threading.Event()
     calls = 0
 
-    def held(*args: object) -> tuple[readiness_module.ReadinessCheck, ...]:
+    def held(*args: object, **kwargs: object) -> tuple[readiness_module.ReadinessCheck, ...]:
         nonlocal calls
         calls += 1
         entered.set()
         release.wait()
-        return original(*args)  # type: ignore[arg-type]
+        return original(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(readiness_module, "_check_session_database", held)
     client = TestClient(app)

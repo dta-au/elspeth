@@ -353,6 +353,16 @@ class WebSettings(BaseModel):
     composer_seed: int | None = None
     # Tests/offline development can disable the real provider boot probe.
     composer_boot_probe_enabled: bool = True
+    # Within one compose call, hand back a validation verdict already computed
+    # for the same state object instead of recomputing it: the runtime
+    # preflight of a blob-bearing state and the policy view's authoring
+    # validation. Before every runtime-preflight reuse the blob records, the
+    # stored files' stat (size, mtime, ctime, inode) and the user's secret
+    # inventory are read again and must be unchanged; a state that wires a
+    # secret is never reused; any mutation-kind tool call ends every reuse.
+    # Set ELSPETH_WEB__COMPOSER_VALIDATION_REUSE_ENABLED=false and restart to
+    # turn reuse off. Read once when the composer service is built.
+    composer_validation_reuse_enabled: bool = True
     composer_strict_tools: StrictToolsSetting = Field(
         default="preferred",
         description=(
@@ -371,7 +381,10 @@ class WebSettings(BaseModel):
     composer_max_tool_calls_per_turn: int = Field(default=16, ge=1)
     # Context budget: the operator's gateway prompt-token limit has no safe
     # default, so it is required. The budgeter sheds history above
-    # ``shed_above`` of this cap down to ``shed_to`` of it.
+    # ``shed_above`` of this cap down to ``shed_to`` of it. An Advisor
+    # checkpoint whose estimate, anchored on a real call at least half its
+    # size, is over this cap is not sent, so it assumes the Advisor model's
+    # window is at least this cap.
     composer_context_max_prompt_tokens: int = Field(..., strict=True, ge=1)
     composer_context_shed_above: float = Field(default=0.85, strict=True, gt=0, le=1)
     composer_context_shed_to: float = Field(default=0.60, strict=True, gt=0, lt=1)

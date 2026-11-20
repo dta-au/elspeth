@@ -309,6 +309,7 @@ class CatalogServiceImpl:
             description=description,
             json_schema=json_schema,
             knob_schema=cast(dict[str, Any], knob_schema),
+            usage_when_not_to_use=plugin_cls.usage_when_not_to_use,
             composer_hints=self._discovery_composer_hints(plugin_cls),
             secret_requirements=self._secret_requirements(plugin_cls, schema=json_schema),
             web_config_authority=plugin_cls.web_config_authority,

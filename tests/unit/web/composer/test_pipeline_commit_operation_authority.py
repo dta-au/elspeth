@@ -537,6 +537,30 @@ async def test_equal_content_with_failed_authored_validation_remains_validation_
 
 
 @pytest.mark.asyncio
+async def test_commit_refuses_candidate_with_unsettled_prompt_file(proposal: _Proposal, monkeypatch: pytest.MonkeyPatch) -> None:
+    original = pipeline_commit.build_set_pipeline_candidate
+
+    def unsettled(*args: Any, **kwargs: Any) -> Any:
+        candidate = original(*args, **kwargs)
+        return replace(candidate, prepared_prompt_blobs=(("node:classify.options.prompt_template", object()),))
+
+    monkeypatch.setattr(pipeline_commit, "build_set_pipeline_candidate", unsettled)
+    operations = proposal.service.session_operation_authority
+    context = operations.acquire(
+        session_id=proposal.authority.row.session_id,
+        operation_kind=SessionOperationKind.PROPOSAL,
+        owner_instance_id=proposal.service.session_operation_owner_instance_id,
+        lease_seconds=300,
+    )
+    try:
+        with pytest.raises(PipelineCommitError) as caught:
+            await _prepare(proposal, context)
+        assert caught.value.code == "VALIDATION_FAILED"
+    finally:
+        operations.release(context)
+
+
+@pytest.mark.asyncio
 async def test_real_candidate_malformed_arguments_are_safe_argument_failure(proposal: _Proposal) -> None:
     from elspeth.contracts.freeze import deep_thaw
 

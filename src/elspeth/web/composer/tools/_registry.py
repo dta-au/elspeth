@@ -74,6 +74,9 @@ from elspeth.web.composer.tools.generation import (
 from elspeth.web.composer.tools.outputs import (
     TOOLS_IN_MODULE as _OUTPUTS_TOOLS_IN_MODULE,
 )
+from elspeth.web.composer.tools.reports import (
+    TOOLS_IN_MODULE as _REPORTS_TOOLS_IN_MODULE,
+)
 from elspeth.web.composer.tools.secrets import (
     TOOLS_IN_MODULE as _SECRETS_TOOLS_IN_MODULE,
 )
@@ -99,6 +102,7 @@ _REGISTERED_TOOLS: Final[tuple[ToolDeclaration, ...]] = (
     *_TRANSFORMS_TOOLS_IN_MODULE,
     *_OUTPUTS_TOOLS_IN_MODULE,
     *_SECRETS_TOOLS_IN_MODULE,
+    *_REPORTS_TOOLS_IN_MODULE,
 )
 assert_unique_names(_REGISTERED_TOOLS)
 

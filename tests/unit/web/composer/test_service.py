@@ -1750,6 +1750,90 @@ class TestComposerSingleToolCall:
         assert "set_pipeline" in proposal_tools
 
     @pytest.mark.asyncio
+    async def test_explicit_approve_runs_report_composer_bug_immediately(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A suspected-bug report only adds a session file, so approval mode runs it at once.
+
+        No proposal is staged (none would advance composition state), the
+        report file exists after the turn, and the pipeline is unchanged.
+        """
+        engine, session_id = _session_engine_with_session()
+        sessions_service = _test_sessions_service(engine, tmp_path)
+        service = ComposerServiceImpl.for_trained_operator(
+            catalog=_mock_catalog(),
+            settings=_make_settings(data_dir=tmp_path),
+            sessions_service=sessions_service,
+            session_engine=engine,
+        )
+        session_uuid = UUID(session_id)
+        await sessions_service.update_composer_preferences(
+            session_uuid,
+            trust_mode="explicit_approve",
+            density_default="high",
+            actor="user:alice",
+        )
+        turn = _make_llm_response(
+            tool_calls=[
+                {
+                    "id": "call_report_composer_bug",
+                    "name": "report_composer_bug",
+                    "arguments": {
+                        "summary": "File binding disagrees with the skill",
+                        "expected_behavior": "The skill says a query template can use a text file.",
+                        "observed_behavior": "wire_blob_inline_ref rejected the query template path.",
+                        "related_tool": "wire_blob_inline_ref",
+                    },
+                }
+            ],
+        )
+        done = _make_llm_response(content="Reported the mismatch.")
+        responses = [turn, done]
+
+        async def _llm(
+            _messages: Any,
+            _tools: Any,
+            *,
+            provider_custody: object | None = None,
+            credential_state: object | None = None,
+            prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+            prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+            prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        ) -> Any:
+            return responses.pop(0)
+
+        message = "Wire the query template file."
+        message_id = _insert_user_message(engine, session_id, message)
+        source_path = tmp_path / "input.csv"
+        source_path.write_text("customer_id\n1\n")
+        state = replace(
+            _empty_state(),
+            sources={
+                "source": SourceSpec(plugin="csv", options={"path": str(source_path)}, on_success="rows", on_validation_failure="discard")
+            },
+        )
+        monkeypatch.setattr(service._provider_gateway, "_call_llm", _llm)
+        result = await service.compose(
+            message,
+            [],
+            state,
+            session_id=session_id,
+            user_id="test-user",
+            user_message_id=message_id,
+        )
+
+        assert await sessions_service.list_composition_proposals(session_uuid) == []
+        assert result.state is state
+        assert [inv.tool_call_id for inv in result.tool_invocations] == ["call_report_composer_bug"]
+        with engine.connect() as conn:
+            rows = conn.execute(select(blobs_table)).all()
+        assert len(rows) == 1
+        assert rows[0].filename.startswith("composer-bug-report-")
+        assert json.loads(Path(rows[0].storage_path).read_text())["status"] == "suspected_unverified"
+
+    @pytest.mark.asyncio
     async def test_explicit_approve_intercepts_update_blob_without_mutating_blob(
         self,
         tmp_path: Path,
