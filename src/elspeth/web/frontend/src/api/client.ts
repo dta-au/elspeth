@@ -1592,7 +1592,7 @@ export async function uploadBlob(
 /**
  * List every blob for a session, newest first.
  *
- * The route returns one page per request (50 by default, 500 at most), so
+ * The route returns one page per request (100 by default, 500 at most), so
  * this pages until the session is exhausted. Every "is this file in the
  * session?" check reads the result as the whole session; a single default
  * page made files older than the newest 50 read as absent.
