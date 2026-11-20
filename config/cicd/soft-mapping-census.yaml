@@ -182,7 +182,7 @@ files:
   src/elspeth/core/landscape/execution/sink_effect_finalization.py:
     dict[str, object]: 1
   src/elspeth/core/landscape/execution/sink_effect_identity.py:
-    Mapping[str, object]: 6
+    Mapping[str, object]: 8
     dict[str, object]: 1
   src/elspeth/core/landscape/execution/sink_effect_lifecycle.py:
     dict[str, object]: 1
@@ -1122,9 +1122,9 @@ files:
     dict[str, object]: 1
 totals:
   Mapping[str, Any]: 819
-  Mapping[str, object]: 316
+  Mapping[str, object]: 318
   MutableMapping[str, Any]: 9
   boundary: 69
   dict[str, Any]: 1124
   dict[str, object]: 406
-  soft: 2674
+  soft: 2676
