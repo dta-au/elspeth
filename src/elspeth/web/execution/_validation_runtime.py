@@ -184,11 +184,11 @@ def load_runtime_settings(
 ) -> PhaseReport[LoadedRuntime] | PhaseFailure:
     """Load the exact materialized YAML through the execution settings path.
 
-    ``materialized.pipeline.load()`` is the bounded load of the materialized
-    text (answered from the rendered document when that is provably the same
-    result), and settings always load from that one mapping: re-parsing the
-    identical text through ``load_settings_from_yaml_string`` would only
-    repeat the same bounded load.
+    ``materialized.pipeline.load()`` is the bounded load of the supplied
+    YAML, or the resolved configuration materialization judged and kept
+    (thawed afresh, or parsed from its rendering when it is not plain data).
+    Settings load from that one mapping: re-parsing its text through
+    ``load_settings_from_yaml_string`` would only repeat the same load.
     """
     pipeline = materialized.pipeline
     authored = materialized.authored
@@ -207,7 +207,7 @@ def load_runtime_settings(
                 env_ref_names=set(authored.env_ref_names),
             )
             settings_config = resolved_dict
-        elif secret_service is None and "secret_ref" in pipeline.text:
+        elif secret_service is None and pipeline.mentions("secret_ref"):
             settings_config = redact_secret_refs_for_validation(config_dict)
 
         if operator_settings is not None:
