@@ -54,8 +54,13 @@
    under its row instead of indenting away from it. The BLOCK inset stays on
    the --space-1-5 rung: it sets row height, which the max-height on
    .blob-manager-container is sized against. */
+/* Wraps: in a narrow pane (the chat column ships at 360px) the actions drop
+   to a second line, right-aligned, instead of squeezing the file name to
+   nothing. The name keeps at least 5rem and ellipsises; its full text is the
+   title and the accessible text. */
 .blob-row-container {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--space-sm);
   padding: var(--space-1-5) var(--space-md);
@@ -136,7 +141,8 @@
 }
 
 .blob-row-filename {
-  flex: 1;
+  flex: 1 1 5rem;
+  min-width: 5rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -152,6 +158,7 @@
   display: flex;
   gap: var(--space-xs);
   flex-shrink: 0;
+  margin-inline-start: auto;
 }
 
 
@@ -231,16 +238,18 @@
   font-size: var(--font-size-sm);
 }
 
+/* Title on the left; storage total, Upload and Close grouped on the right. */
 .blob-manager-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: var(--space-xs);
   padding: var(--space-1-5) var(--space-md);
   border-bottom: 1px solid var(--color-border);
   flex-shrink: 0;
 }
 
 .blob-manager-title {
+  margin-inline-end: auto;
   font-weight: 600;
   font-size: var(--font-size-xs);
   color: var(--color-text-secondary);
@@ -346,6 +355,19 @@
   padding: var(--space-xs);
 }
 
+/* A long generated file name wraps at its separators (BreakableName), and
+   anywhere as a last resort, rather than overflowing the dialog. */
+.file-wiring-filename {
+  color: var(--color-text);
+  overflow-wrap: anywhere;
+}
+
+/* Native controls in the brand accent, as in the header's toggles. */
+.file-wiring-pad input[type="checkbox"],
+.file-wiring-pad input[type="radio"] {
+  accent-color: var(--color-accent);
+}
+
 .file-wiring-target small {
   display: block;
   color: var(--color-text-muted);
@@ -392,6 +414,15 @@
   flex: 1 1 12rem;
   margin: 0;
   color: var(--color-text-secondary);
+}
+
+/* On a narrow dialog the status takes its own line and the two buttons stack
+   full width, in their reading order, instead of wrapping ragged-right. */
+@media (max-width: 480px) {
+  .file-wiring-status,
+  .file-wiring-actions .confirm-dialog-btn {
+    flex: 1 1 100%;
+  }
 }
 
 .file-wiring-instructions {

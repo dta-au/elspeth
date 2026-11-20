@@ -2,7 +2,7 @@
 import { useEffect, useId, useLayoutEffect, useRef, useCallback, useMemo, useState } from "react";
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
-import { Button, Input } from "@/components/ui";
+import { Button, Icon, Input } from "@/components/ui";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { BlobRow } from "./BlobRow";
 import { IdentityStorageTotal } from "./IdentityStorageTotal";
@@ -252,7 +252,6 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
         <span className="blob-manager-title">
           Files ({blobs.length})
         </span>
-        <Button type="button" variant="bare" onClick={close}>Close file manager</Button>
         <IdentityStorageTotal refreshKey={`${activeSessionId}:${blobs.map((blob) => `${blob.id}:${blob.size_bytes}`).join(",")}`} />
         {/* Label-only, and its accessible name IS its visible text
             (elspeth-29eef452a8). The label used to read "+ Upload" against an
@@ -268,6 +267,12 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
           className="blob-manager-upload-btn"
         >
           Upload
+        </Button>
+        {/* The design system's ghost compact button, last in the header like
+            every panel's close control. The accessible name starts with the
+            visible label (WCAG 2.5.3). */}
+        <Button type="button" variant="ghost" compact aria-label="Close file manager" onClick={close}>
+          <Icon name="cross" /> Close
         </Button>
         <Input
           ref={fileInputRef}

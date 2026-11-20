@@ -132,6 +132,16 @@ describe("FileWiringPad", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
+  it("names the file in bold and lets a long name wrap at its separators", () => {
+    const long = { id: "long", filename: "quarterly_programme_eligibility_criteria_v7.txt", content_hash: "h" } as BlobMetadata;
+    render(<FileWiringPad blob={long} state={state} blobs={[long]} disabledReason={null} onConnect={vi.fn()} onClose={vi.fn()} />);
+    const name = screen.getByRole("dialog").querySelector(".file-wiring-filename");
+    expect(name).toHaveTextContent("quarterly_programme_eligibility_criteria_v7.txt");
+    expect(name?.tagName).toBe("STRONG");
+    expect(name?.querySelectorAll("wbr")).toHaveLength(5);
+    expect(screen.getByRole("dialog")).toHaveAccessibleDescription(/^Connect quarterly_programme_eligibility_criteria_v7\.txt to prompts\./);
+  });
+
   it("closes on Escape without requesting a connection", async () => {
     const { onConnect, onClose, user } = setup();
     await user.keyboard("{Escape}");

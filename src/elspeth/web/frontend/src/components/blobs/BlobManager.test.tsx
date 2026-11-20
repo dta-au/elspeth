@@ -369,6 +369,20 @@ describe("BlobManager upload affordance (elspeth-29eef452a8)", () => {
     vi.clearAllMocks();
   });
 
+  it("closes from a design-system button at the end of the header", async () => {
+    setBlobState([]);
+    useBlobStore.setState({ fileManagerOpen: true });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    const close = screen.getByRole("button", { name: "Close file manager" });
+    expect(close).toHaveClass("btn-compact", "btn-ghost");
+    // Visible "Close" leads the accessible name (WCAG 2.5.3).
+    expect(close.textContent?.trim()).toBe("Close");
+    const header = close.parentElement as HTMLElement;
+    expect(within(header).getAllByRole("button").at(-1)).toBe(close);
+    await userEvent.setup().click(close);
+    expect(useBlobStore.getState().fileManagerOpen).toBe(false);
+  });
+
   it("names the upload control by its own visible text", () => {
     setBlobState([]);
     render(<BlobManager onUseAsInput={vi.fn()} />);

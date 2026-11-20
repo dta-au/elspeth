@@ -4,6 +4,7 @@ import { Button, Input } from "@/components/ui";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 import { inlineContentMarker, promptFileSlots } from "@/lib/blobBindings";
 import { promptSlotLabel } from "@/components/inspector/OptionRows";
+import { BreakableName } from "./BreakableName";
 
 interface FileWiringPadProps {
   blob: BlobMetadata;
@@ -119,7 +120,7 @@ export function FileWiringPad({ blob, state, blobs, disabledReason, sendRefusal 
       </header>
       <div className="confirm-dialog-body">
         <p id={`${id}-description`} className="confirm-dialog-message">
-          Connect {blob.filename} to prompts. Choose the prompts yourself, or ask Composer to choose them.
+          Connect <strong className="file-wiring-filename"><BreakableName name={blob.filename} /></strong> to prompts. Choose the prompts yourself, or ask Composer to choose them.
           Either way Composer makes the connection as a chat request.
         </p>
         <fieldset className="file-wiring-mode">
