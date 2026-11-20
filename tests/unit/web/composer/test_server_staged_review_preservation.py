@@ -378,14 +378,60 @@ def test_same_plugin_aggregation_retype_is_refused(tmp_path: Path, resolved: boo
     assert CODE in {entry.error_code for entry in result.validation.errors}
 
 
-def test_non_list_proposed_review_rows_are_integrity_failure(tmp_path: Path) -> None:
+NON_ROW_VALUES = pytest.mark.parametrize("value", [None, "not rows", {"user_term": TERM}, 7], ids=["null", "string", "mapping", "number"])
+
+
+@NON_ROW_VALUES
+def test_non_list_proposed_review_rows_are_integrity_failure(tmp_path: Path, value: Any) -> None:
+    """A retained node keeps a stored server-staged review; if its proposed value is not rows, nothing can show the review was kept."""
     from elspeth.web.interpretation_state import server_staged_review_preservation_error
 
     state, _, _, node_id = _build(tmp_path, resolved=False, kind="content_safety")
     node = next(item for item in state.nodes if item.id == node_id)
-    proposed = state.with_node(replace(node, options={**deep_thaw(node.options), KEY: "not rows"}))
-    with pytest.raises(AuditIntegrityError, match="are not rows"):
+    proposed = state.with_node(replace(node, options={**deep_thaw(node.options), KEY: value}))
+    with pytest.raises(AuditIntegrityError, match=f"node {node_id!r} are not rows"):
         server_staged_review_preservation_error(state, proposed)
+
+
+@NON_ROW_VALUES
+@pytest.mark.parametrize("site", ["added", "untouched"])
+def test_non_row_value_without_stored_review_is_not_this_checks_concern(tmp_path: Path, value: Any, site: str) -> None:
+    """A non-row value on a node with no stored server-staged review neither raises nor refuses.
+
+    Not every caller has admitted the proposed state: the dispatcher admits
+    only graph-effect tools, and an untouched node may hold a value read back
+    from storage or a YAML import. Only a node that keeps a stored review is checked.
+    """
+    from elspeth.web.interpretation_state import server_staged_review_preservation_error
+
+    state, _, _, _ = _build(tmp_path, resolved=False, kind="content_safety")
+    odd = _node("odd", plugin="passthrough", input="assessed", on_success="odd_out", options={KEY: value})
+    if site == "added":
+        previous, proposed = state, state.with_node(odd)
+    else:
+        previous = state.with_node(odd)
+        proposed = previous.with_node(_node("other", plugin="passthrough", input="odd_out", on_success="other_out"))
+    assert server_staged_review_preservation_error(previous, proposed) is None
+
+
+@NON_ROW_VALUES
+def test_dispatcher_gate_passes_untouched_non_row_value_for_non_graph_tool(tmp_path: Path, value: Any) -> None:
+    """The dispatcher's real path: a tool without graph effects that returns a new state skips canonical admission.
+
+    An untouched stored node with a non-row value must not turn that call into
+    an integrity failure.
+    """
+    state, _, _, _ = _build(tmp_path, resolved=False, kind="content_safety")
+    prior = state.with_node(_node("odd", plugin="passthrough", input="assessed", on_success="odd_out", options={KEY: value}))
+    updated = replace(prior, version=prior.version + 1)
+    result = _enforce_composition_interpretation_gate(
+        ToolResult(success=True, updated_state=updated, validation=updated.validate(), affected_nodes=()),
+        tool_name="non_graph_writer",
+        effects=ToolEffects((EffectDomain.BLOB_STORE,)),
+        prior_state=prior,
+    )
+    assert result.success
+    assert result.updated_state is updated
 
 
 def _stored_non_owned_review(tmp_path: Path, *, kind: str, term: str, resolved: bool = False) -> tuple[CompositionState, str]:
