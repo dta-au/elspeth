@@ -2439,9 +2439,10 @@ def _sink_probe_defers(output: OutputSpec) -> bool:
         if config_model is not None:
             config_model.from_dict(probe_options, plugin_name=output.plugin)
     except PluginConfigError as config_error:
-        # ``from_dict`` chains the pydantic error it wraps; a pre-check refusal has none.
+        # ``from_dict`` chains the error ``model_validate`` raised, always pydantic's own
+        # class; a pre-check refusal has no cause. Anything else is a config failure.
         cause = config_error.__cause__
-        return isinstance(cause, PydanticValidationError) and only_marker_errors(cause.errors(include_url=False), probe_options)
+        return type(cause) is PydanticValidationError and only_marker_errors(cause.errors(include_url=False), probe_options)
     except Exception as exc:
         if not _is_sink_config_probe_exception(exc):
             raise

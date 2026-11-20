@@ -30,10 +30,14 @@ from unittest.mock import MagicMock, create_autospec, patch
 from uuid import UUID
 
 import pytest
+from pydantic import ValidationError as PydanticValidationError
 
+from elspeth.plugins.infrastructure import validation as plugin_validation
+from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.blobs.protocol import BlobServiceProtocol
 from elspeth.web.composer import yaml_generator as composer_yaml_generator
+from elspeth.web.composer._validation_probe import prepare_validation_probe_options
 from elspeth.web.composer.state import CompositionState, OutputSpec, ValidationSummary
 from elspeth.web.execution.errors import PipelineValidationError
 from elspeth.web.execution.service import ExecutionServiceImpl
@@ -339,3 +343,72 @@ def test_a_sink_refused_before_pydantic_runs_carries_no_notice(tmp_path: Path, f
     broken = replace(state, outputs=(replace(sink, options={**dict(sink.options), "schema": "observed"}),))
 
     assert _notices(broken.validate()) == []
+
+
+class _ValidationErrorSubclass(PydanticValidationError):
+    """A subclass of pydantic's error carrying exactly the marker errors of a real deferral."""
+
+
+def _real_marker_cause(state: CompositionState) -> PydanticValidationError:
+    """The pydantic error the text sink's own ``from_dict`` chains for a file-held ``field``."""
+    output = state.outputs[0]
+    model = plugin_validation.get_sink_config_model(output.plugin)
+    assert model is not None
+    with pytest.raises(PluginConfigError) as refused:
+        model.from_dict(prepare_validation_probe_options(output.options, plugin=output.plugin), plugin_name=output.plugin)
+    cause = refused.value.__cause__
+    assert type(cause) is PydanticValidationError
+    return cause
+
+
+def _subclass_with_the_same_errors(cause: PydanticValidationError) -> PydanticValidationError:
+    line_errors = [
+        {key: value for key, value in error.items() if key in ("type", "loc", "input", "ctx")} for error in cause.errors(include_url=False)
+    ]
+    built = _ValidationErrorSubclass.from_exception_data(cause.title, line_errors)
+    assert type(built) is _ValidationErrorSubclass
+    assert built.errors(include_url=False) == cause.errors(include_url=False)
+    return built
+
+
+def _sink_model_refusing_with(monkeypatch: pytest.MonkeyPatch, cause: BaseException | None) -> None:
+    """Every sink config model's ``from_dict`` refuses, chained from ``cause`` (or from nothing)."""
+
+    class _Refusing:
+        @staticmethod
+        def from_dict(config: object, *, plugin_name: str) -> None:
+            error = PluginConfigError(f"Invalid configuration for sink '{plugin_name}'", plugin_name=plugin_name, component_type="sink")
+            if cause is None:
+                raise error
+            raise error from cause
+
+    monkeypatch.setattr(plugin_validation, "get_sink_config_model", lambda plugin: _Refusing)
+
+
+@pytest.mark.parametrize("cause_kind", ["pydantic_subclass", "other_exception", "no_cause"])
+def test_only_pydantics_own_error_class_can_defer_a_sink(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cause_kind: str) -> None:
+    """``from_dict`` chains pydantic's own class or nothing; any other cause is a config failure, not a deferral."""
+    state = _text_sink_graph(tmp_path, "text", path=_sink_path(tmp_path, "text"), field=graphs._marker(ABSENT))
+    authored = state.validate()
+    real = _real_marker_cause(state)
+    causes: dict[str, BaseException | None] = {
+        "pydantic_subclass": _subclass_with_the_same_errors(real),
+        "other_exception": ValueError("schema: expected a mapping"),
+        "no_cause": None,
+    }
+    _sink_model_refusing_with(monkeypatch, causes[cause_kind])
+
+    summary = state.validate()
+
+    assert _notices(summary) == []
+    assert [entry.to_dict() for entry in summary.errors] == [entry.to_dict() for entry in authored.errors]
+
+
+def test_pydantics_own_error_with_only_marker_errors_still_defers_through_the_same_harness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Control: the harness above yields the notice when the cause is the real, exact-class error."""
+    state = _text_sink_graph(tmp_path, "text", path=_sink_path(tmp_path, "text"), field=graphs._marker(ABSENT))
+    _sink_model_refusing_with(monkeypatch, _real_marker_cause(state))
+
+    assert [component for component, _ in _notices(state.validate())] == ["output:output"]
