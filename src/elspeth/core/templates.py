@@ -36,6 +36,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 from jinja2 import Environment, meta
@@ -216,6 +217,12 @@ def validate_jinja_source(source: str) -> None:
     """Bound parser input before Jinja sees a web or YAML authored template."""
     if len(source) > MAX_JINJA_TEMPLATE_BYTES or len(source.encode("utf-8")) > MAX_JINJA_TEMPLATE_BYTES:
         raise ValueError(f"Template exceeds {MAX_JINJA_TEMPLATE_BYTES} UTF-8 bytes")
+    _validate_bounded_jinja_source(source)
+
+
+@lru_cache(maxsize=128)
+def _validate_bounded_jinja_source(source: str) -> None:
+    """Reuse pure checks of exact bounded text; size admission runs first."""
     if source.count("{%") > 64 or source.count("{{") > 256:
         raise ValueError("Template has too many Jinja expressions or blocks")
     depth = 0
@@ -292,6 +299,12 @@ def extract_jinja2_field_usage(
     ``row.source_row`` / ``row['source_row']`` as the row.
     """
     validate_jinja_source(template_string)
+    return _cached_jinja2_field_usage(template_string, namespace, row_attribute)
+
+
+@lru_cache(maxsize=128)
+def _cached_jinja2_field_usage(template_string: str, namespace: str, row_attribute: str | None) -> Jinja2FieldExtraction:
+    """Reuse immutable analysis of exact text and parameters."""
     env = _create_field_extraction_environment()
     ast = env.parse(template_string)
     if row_attribute is not None:
@@ -316,6 +329,12 @@ def extract_jinja2_context_fields(template_string: str, namespace: str = "row", 
     between them.
     """
     validate_jinja_source(template_string)
+    return _cached_jinja2_context_fields(template_string, namespace, row_attribute)
+
+
+@lru_cache(maxsize=128)
+def _cached_jinja2_context_fields(template_string: str, namespace: str, row_attribute: str) -> frozenset[str]:
+    """Keep row and context analyses distinct after source admission."""
     ast = _create_field_extraction_environment().parse(template_string)
     ast = _NestedRowRoot(namespace, row_attribute, _nested_row_root(namespace, row_attribute)).visit(ast)
     return _field_usage(ast, namespace).fields
