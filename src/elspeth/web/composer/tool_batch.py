@@ -1865,9 +1865,11 @@ async def run_tool_batch(
             and turn_preferences is not None
             and turn_preferences.trust_mode == "explicit_approve"
             and is_mutation_tool(tool_name)
-            # create_blob stays immediate because it allocates the blob id a
-            # later composition proposal may reference. Destructive blob-only
-            # writes such as update_blob/delete_blob still require approval.
+            # Additive blob creates (create_blob, report_composer_bug) stay
+            # immediate: create_blob allocates the blob id a later composition
+            # proposal may reference, and neither overwrites nor removes
+            # anything. Destructive blob-only writes such as
+            # update_blob/delete_blob still require approval.
             and (not is_blob_store_only_mutation_tool(tool_name) or is_approval_required_blob_store_only_mutation_tool(tool_name))
         )
 

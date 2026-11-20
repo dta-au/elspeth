@@ -8,7 +8,7 @@ dialect's wire schema W back into the flat semantic arguments S admits:
 * the set_pipeline ``{"pipeline": ...}`` envelope is unwrapped, and a
   malformed envelope is the one rejection (``ToolArgumentError``,
   category ``wire_envelope``);
-* on ``openai_strict`` only, a ``null`` at one of the 17 promoted positions
+* on ``openai_strict`` only, a ``null`` at one of the 19 promoted positions
   becomes the omission S expects. Nothing else is touched.
 
 ``encode_semantic_arguments`` is the inverse of the envelope only in S1; the
@@ -126,7 +126,7 @@ def test_decode_rejects_malformed_framing_and_preserves_null_semantics(
     assert _semantic(decode_wire_arguments("list_models", STRICT, {"provider": None, "x": None})) == {"x": None}
 
 
-# One minimal S-valid call for each of the 34 strict-capable tools: the
+# One minimal S-valid call for each of the 35 strict-capable tools: the
 # flat-required keys only. The promoted positions are filled from
 # ``_PROMOTED_VALUES`` below.
 _SEEDS: dict[str, dict[str, Any]] = {
@@ -139,6 +139,11 @@ _SEEDS: dict[str, dict[str, Any]] = {
     "update_blob": {"blob_id": "blob-1", "content": "a,b\n3,4\n"},
     "delete_blob": {"blob_id": "blob-1"},
     "wire_blob_inline_ref": {"field_path": "document", "blob_id": "00000000-0000-4000-8000-000000000000"},
+    "report_composer_bug": {
+        "summary": "binding refused",
+        "expected_behavior": "the skill says a text file can back the prompt",
+        "observed_behavior": "the tool refused the file",
+    },
     "list_sources": {},
     "clear_source": {},
     "inspect_source": {"blob_id": "blob-1"},
@@ -171,7 +176,7 @@ _SEEDS: dict[str, dict[str, Any]] = {
     "wire_secret_ref": {"name": "OPENROUTER_API_KEY", "target": "node", "option_key": "api_key"},
 }
 
-# A valid (non-null) value for each of the 17 promoted positions, valid under
+# A valid (non-null) value for each of the 19 promoted positions, valid under
 # both S and the strict W.
 _PROMOTED_VALUES: dict[tuple[str, tuple[str, ...]], Any] = {
     # Offset zero keeps every independent presence combination valid; actual
@@ -181,6 +186,8 @@ _PROMOTED_VALUES: dict[tuple[str, tuple[str, ...]], Any] = {
     ("read_attachment", ("expected_content_hash",)): "a" * 64,
     ("create_blob", ("description",)): "sample rows",
     ("wire_blob_inline_ref", ("encoding",)): "utf-16",
+    ("report_composer_bug", ("guidance_reference",)): "pipeline_composer.md / File-backed prompts",
+    ("report_composer_bug", ("related_tool",)): "wire_blob_inline_ref",
     ("clear_source", ("source_name",)): "source",
     ("inspect_source", ("encoding",)): "utf-8-sig",
     ("get_pipeline_state", ("component",)): "nodes",
@@ -240,12 +247,12 @@ def _semantic(decoded: DecodedArguments) -> dict[str, Any]:
 # ---------------------------------------------------------------- the seeds
 
 
-def test_the_seeds_cover_exactly_the_34_strict_capable_tools_and_17_promoted_positions() -> None:
+def test_the_seeds_cover_exactly_the_35_strict_capable_tools_and_19_promoted_positions() -> None:
     assert set(_SEEDS) == _strict_capable_names()
-    assert len(_SEEDS) == 34
+    assert len(_SEEDS) == 35
     promoted = {(name, path) for name in _SEEDS for path in _WIRE_TOOL_DEFS[STRICT][name].promoted_paths}
     assert set(_PROMOTED_VALUES) == promoted
-    assert len(promoted) == 17
+    assert len(promoted) == 19
 
 
 @pytest.mark.parametrize("tool", sorted(_SEEDS))

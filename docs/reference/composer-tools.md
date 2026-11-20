@@ -527,6 +527,26 @@ The session owner can edit a bound prompt file in the graph node inspector; Save
 
 ---
 
+### `report_composer_bug`
+
+Record a suspected mismatch between the composer's guidance (the skill or a tool description) and what a tool call actually did.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `summary` | string | **Yes** | One-line summary, 1–240 characters |
+| `expected_behavior` | string | **Yes** | What the skill or tool description says should happen, 1–4,000 characters |
+| `observed_behavior` | string | **Yes** | What the tool call actually did, including the relevant error text, 1–4,000 characters |
+| `guidance_reference` | string | No | The skill section or tool description being contradicted, 1–1,000 characters |
+| `related_tool` | string | No | Name of the composer tool involved: a lowercase letter, then lowercase letters, digits or `_`; at most 100 characters |
+
+**Returns:** `blob_id`, `filename` and `status` (always `suspected_unverified`). The report prose is not echoed in the result, and the chat tool-call record keeps a length placeholder in place of each prose field.
+
+**Behaviour:** Saves one JSON file (`application/json`, named `composer-bug-report-<uuid>.json`) in the session's files, created by the assistant with the usual composer provenance. The file holds `report_type` `suspected_composer_bug`, `status` `suspected_unverified`, the time of the report, the observations as supplied, and the context that produced them: session, state id and version, user message, composer model, version and provider, skill hash and tool-arguments hash. The pipeline state is returned unchanged; nothing is repaired or verified. Blank, over-length, mistyped or extra fields are refused, and so is a report whose saved file would exceed 16,384 bytes (possible only with heavily escaped text, since the file is written as ASCII JSON); a refused report writes nothing. The session file quota applies. Credential-shaped text is refused before anything is written. Like `create_blob`, it runs immediately when the session requires approval for changes, because it only adds a file; `update_blob` and `delete_blob` still need approval.
+
+**When to use:** Once per distinct mismatch, then continue the user's task.
+
+---
+
 ## Secret Tools
 
 These tools manage API keys and credentials without exposing secret values.
