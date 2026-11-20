@@ -2270,6 +2270,22 @@ class ValidationProbeCache:
         from elspeth.plugins.infrastructure.validation import get_transform_config_model
 
         try:
+            # A batch-aware transform refuses ADR-013 declared input fields in its
+            # constructor with FrameworkBugError, which no probe site tolerates, so
+            # an authored option would crash validate(). The node rules report it
+            # typed (``batch_required_fields_invalid``); to the probe it is a
+            # config failure. Only whether the helper refuses is read here, and
+            # the registry is consulted only when the option is present.
+            if (
+                _declared_input_fields_option(holder.options) is not _MISSING_DECLARED_INPUT_FIELDS
+                and _batch_aware_required_input_fields_error(plugin, plugin, holder.options) is not None
+            ):
+                raise PluginConfigError(
+                    f"Invalid configuration for transform '{plugin}': required_input_fields on a batch-aware transform",
+                    cause="batch_aware_declared_input_fields",
+                    plugin_name=plugin,
+                    component_type="transform",
+                )
             probe_options = prepare_validation_probe_options(holder.options, plugin=plugin)
             with plugin_preflight_mode(True):
                 try:
