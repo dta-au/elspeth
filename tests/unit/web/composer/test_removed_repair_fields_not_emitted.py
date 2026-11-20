@@ -14,10 +14,12 @@ from sqlalchemy import insert
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.core.canonical import canonical_json
+from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.prompts import history_message_indices
 from elspeth.web.composer.redaction import redact_tool_call_response
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._common import _duplicate_consumer_repair_suggestions
 from elspeth.web.sessions.models import chat_messages_table
 from elspeth.web.sessions.routes._helpers import _composer_chat_history
@@ -77,12 +79,40 @@ def _invocation(tool: str, response: dict[str, object]) -> ComposerToolInvocatio
     )
 
 
+def _exact_set_pipeline_arguments(state: CompositionState, catalog: CatalogService) -> dict[str, Any]:
+    """Read the exact authoring document through get_pipeline_state, following its pages.
+
+    This graph's exact arguments exceed the state-inspection byte budget, so a
+    plain read returns a structural view. ``field_path=""`` selects the whole
+    document as exact JSON pages bound to one content hash.
+    """
+    arguments: dict[str, Any] = {"component": "set_pipeline_arguments", "field_path": ""}
+    chunks: list[str] = []
+    while True:
+        page = execute_tool("get_pipeline_state", arguments, state, catalog).to_dict()["data"]
+        assert (page["view"], page["encoding"]) == ("field", "json")
+        chunks.append(page["content"])
+        if page["next_offset_chars"] is None:
+            return json.loads("".join(chunks))
+        arguments = {**arguments, "offset_chars": page["next_offset_chars"], "expected_sha256": page["sha256"]}
+
+
 def test_duplicate_consumer_producer_and_shared_tool_validation_have_only_facts() -> None:
     state = chain(steps=2, shared=2, llm_count=2)
     suggestions = _duplicate_consumer_repair_suggestions(state, state.validate())
-    assert len(suggestions) == 1
-    assert set(suggestions[0]) == {"code", "connection", "reason", "affected_consumers"}
-    assert all(set(consumer) == {"id"} for consumer in suggestions[0]["affected_consumers"])
+    # Facts plus one direction sentence: the connection, every consumer id,
+    # and the reason. No node data, strategy, or ready-made tool call.
+    assert suggestions == [
+        {
+            "code": "duplicate_connection_consumer",
+            "connection": "shared",
+            "reason": (
+                "One connection can feed one processing node; every node listed reads this one. "
+                "Change only the input bindings; preserve existing node options."
+            ),
+            "affected_consumers": [{"id": "llm_00"}, {"id": "llm_01"}],
+        }
+    ]
 
     catalog = _mock_catalog()
     cases = {
@@ -99,7 +129,7 @@ def test_duplicate_consumer_producer_and_shared_tool_validation_have_only_facts(
 
     # set_pipeline refuses an unchanged invalid candidate. Its response uses
     # the same ToolResult validation serializer and shadow as these tools.
-    candidate = execute_tool("get_pipeline_state", {"component": "set_pipeline_arguments"}, state, catalog).to_dict()["data"]
+    candidate = _exact_set_pipeline_arguments(state, catalog)
     set_result = execute_tool("set_pipeline", candidate, state, catalog, validate_arguments=True).to_dict()
     assert set_result["validation"]["graph_repair_suggestions"] == []
 

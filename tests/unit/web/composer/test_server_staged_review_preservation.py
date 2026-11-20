@@ -805,6 +805,7 @@ def test_t16_registered_mutations_keep_review(tmp_path: Path) -> None:
         "change_substring": "needs an exact-text target",
         "create_blob": "needs blob custody",
         "delete_blob": "needs a blob record",
+        "report_composer_bug": "needs blob custody",
         "set_source_from_blob": "needs a blob record",
         "set_source_from_blobs": "needs blob records",
         "splice_transform": "needs a splice target",
