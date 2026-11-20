@@ -204,6 +204,9 @@ A turn that fails verification stops the attempt for good: inspect the saved
 step receipt in `<state-dir>`, diagnose the failure, and start a new
 `--attempt`.
 
+For the planned series of small edits used as the release acceptance
+measure, see the [Composer edit battery](composer-edit-battery.md).
+
 ## Direct Bedrock streaming probe
 
 To check that a direct Bedrock route can stream a single response for longer
