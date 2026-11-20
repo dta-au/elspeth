@@ -177,6 +177,25 @@ describe("the blob panel keeps one content edge (elspeth-350d5a8b0e)", () => {
   });
 });
 
+describe("unavailable row actions use the tokenised disabled style (UX review finding 6)", () => {
+  it("never marks a disabled action by strikethrough alone", () => {
+    expect(rules.some((rule) => /text-decoration\s*:\s*line-through/.test(rule.declarations))).toBe(false);
+  });
+
+  it("gives an aria-disabled icon action the well fill, muted ink and not-allowed cursor", () => {
+    const selector = '.blob-action-btn[aria-disabled="true"]';
+    expect(declaredValue(selector, "background-color")).toBe("var(--color-well)");
+    expect(declaredValue(selector, "color")).toBe("var(--color-text-muted)");
+    expect(declaredValue(selector, "cursor")).toBe("not-allowed");
+  });
+});
+
+describe("file manager height (UX review finding 8)", () => {
+  it("shows more than four rows: at least 280px, growing to half the viewport", () => {
+    expect(declaredValue(".blob-manager-container", "max-height")).toBe("max(280px, 50vh)");
+  });
+});
+
 describe("blob row dividers live in CSS, not on the element (elspeth-a1a1b62aa9)", () => {
   beforeEach(() => {
     useSessionStore.setState({ activeSessionId: "session-1", isComposing: false });

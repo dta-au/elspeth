@@ -106,10 +106,13 @@
    (ARGO's .paneHeader: a 46px bar with a bottom rule on a tinted fill).
    The authoring pane's title bar. Same band, fill and rule as the artifact
    toolbar (the pipeline pane's title bar), so the two bars register across
-   the gutter. Name only: the pane toggles stay in the bar row. */
+   the gutter. The bar opens with the Hide control; collapsed, the Show
+   control opens the pipeline's bar at the same spot (same inline padding,
+   same gap to the title). */
 .workspace-pane-header {
   display: flex;
   flex: 0 0 auto;
+  gap: var(--space-sm);
   align-items: center;
   min-height: var(--size-pane-header);
   padding: 0 var(--artifact-gutter);
@@ -136,8 +139,8 @@
   overflow: hidden;
 }
 
-/* One content-sized row under the pipeline holds the toggle and workflow
-   actions. The conversation needs no mirrored band or measured bar height. */
+/* One content-sized row under the pipeline holds the workflow actions. The
+   conversation needs no mirrored band or measured bar height. */
 .workspace-action-bar-slot {
   display: flex;
   grid-row: 2;
@@ -633,19 +636,23 @@
    verbs one gutter away). Focus ring comes from base.css's global
    :focus-visible. */
 .workspace-pane-toggle {
+  position: relative;
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   justify-content: center;
-  min-width: var(--size-control);
-  min-height: var(--size-control);
+  /* 36px, the title bars' control register (the tab pills and Plugin
+     catalog), centred in the 46px band. */
+  min-width: var(--size-control-compact);
+  min-height: var(--size-control-compact);
   padding: var(--space-xs);
-  /* --color-input-border, NOT --color-border-strong: with a transparent
-     fill the border is the toggle's only resting boundary, so WCAG 1.4.11's
-     3:1 floor applies to it directly. border-strong is ~1.7:1 on
-     --color-surface in both themes — the exact defect M04 minted
-     --color-input-border to fix on form inputs (2026-08-15 a11y audit;
-     pinned by workspaceChrome.test.ts + colorContrast.test.ts). */
-  border: 1px solid var(--color-input-border);
+  /* With a transparent fill the border is the toggle's only resting
+     boundary, so WCAG 1.4.11's 3:1 floor applies to it directly, on the
+     title bar it sits in. --color-input-border (the 2026-08-15 choice, when
+     the toggle sat on the canvas) is 2.96:1 on the light title bar, hence a
+     token of its own (pinned by workspaceChrome.test.ts +
+     colorContrast.test.ts). */
+  border: 1px solid var(--color-pane-toggle-border);
   border-radius: var(--radius-md);
   background-color: transparent;
   color: var(--color-text);
@@ -673,60 +680,45 @@
   pointer-events: none;
 }
 
-/* The same in-flow control survives both states, centred beside the action
-   bar even when a block reason makes that bar taller. */
-.workspace-pane-controls {
-  display: flex;
-  flex: 0 0 auto;
-  gap: var(--workspace-bar-gap);
-  align-items: center;
-  margin: var(--workspace-bar-inset) 0;
+/* Collapsed-status badge, top-right of the Show control: a count of unread
+   items, an info-colour dot while authoring is busy, or an error-colour
+   pill with "!" when it has failed (shape and glyph, not colour alone). Filled pill with the count knocked out in --color-surface, the
+   Checks tab badge's recipe. The ring in the title-bar fill parts the badge
+   from the button's border. aria-hidden: the status node beside the button
+   carries the same fact (aria-describedby + live region). */
+.workspace-pane-toggle-badge {
+  position: absolute;
+  top: calc(-1 * var(--space-xs));
+  right: calc(-1 * var(--space-xs));
+  border-radius: var(--radius-pill);
+  box-shadow: 0 0 0 2px var(--color-pane-header);
+  pointer-events: none;
 }
 
-.workspace-collapsed-affordance {
-  border-color: var(--color-border, currentcolor);
+.workspace-pane-toggle-badge--count,
+.workspace-pane-toggle-badge--alert {
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  color: var(--color-surface);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+  line-height: 16px;
+  text-align: center;
 }
 
-/* Same busy/warning split the retired status chips used (elspeth-7161879770).
-   TWO tone sources, both live, per ComposerWorkspace's collapsedStatus prop
-   contract: a {text, tone} projection stamps data-tone on the affordance
-   wrapper itself, while the production App-owned ReactNode carries its tone
-   on the .workspace-collapsed-status span inside (App.tsx
-   CollapsedAuthoringStatus), reached via :has(). And TWO tone surfaces: the
-   narrow-mode badge's own box border, and the restore button's border for
-   the desktop state, where the box chrome is stripped and the icon button
-   sits alone on the action bar's line — with no visible status text there,
-   the button border IS the tone signal. */
-.workspace-collapsed-affordance[data-tone="busy"] {
-  border-color: var(--color-info, currentcolor);
+.workspace-pane-toggle-badge--count {
+  background-color: var(--color-info);
 }
 
-.workspace-collapsed-affordance:has(.workspace-collapsed-status[data-tone="busy"]) {
-  border-color: var(--color-info, currentcolor);
+.workspace-pane-toggle-badge--dot {
+  width: 10px;
+  height: 10px;
+  background-color: var(--color-info);
 }
 
-.workspace-collapsed-affordance[data-tone="busy"] .workspace-restore-control {
-  border-color: var(--color-info, currentcolor);
-}
-
-.workspace-collapsed-affordance:has(.workspace-collapsed-status[data-tone="busy"]) .workspace-restore-control {
-  border-color: var(--color-info, currentcolor);
-}
-
-.workspace-collapsed-affordance[data-tone="error"] {
-  border-color: var(--color-error, currentcolor);
-}
-
-.workspace-collapsed-affordance:has(.workspace-collapsed-status[data-tone="error"]) {
-  border-color: var(--color-error, currentcolor);
-}
-
-.workspace-collapsed-affordance[data-tone="error"] .workspace-restore-control {
-  border-color: var(--color-error, currentcolor);
-}
-
-.workspace-collapsed-affordance:has(.workspace-collapsed-status[data-tone="error"]) .workspace-restore-control {
-  border-color: var(--color-error, currentcolor);
+.workspace-pane-toggle-badge--alert {
+  background-color: var(--color-error);
 }
 
 .composer-workspace[data-authoring-collapsed="true"] {
@@ -747,26 +739,8 @@
   padding-left: var(--space-pane-gutter);
 }
 
-/* The status text goes sr-only on desktop (base.css .sr-only recipe): the
-   operator wants no visible label, but the live region must keep announcing
-   unread/busy/error to AT, and the restore button's aria-describedby still
-   points here — clipping keeps the node in the accessibility tree where
-   display:none would remove it. Narrow mode keeps the visible badge text. */
-.composer-workspace[data-authoring-collapsed="true"]:not([data-layout-mode="narrow"])
-  #workspace-collapsed-status {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
-  white-space: nowrap;
-  border: 0;
-}
-
 /* Stop the separator above the action row so its pointer target stays clear
-   of the toggle at the pipeline's bottom-left. */
+   of the workflow actions at the pipeline's bottom-left. */
 .workspace-separator-slot {
   position: relative;
   z-index: var(--z-panel-controls);
@@ -948,8 +922,8 @@
   padding: var(--space-pane-gutter);
 }
 
-/* Compose shows the toggle (and collapsed status); Pipeline shows actions.
-   The same content-sized row serves either view in the single column. */
+/* Pipeline shows the workflow actions in a content-sized row under the view;
+   Compose has no row (the slot is hidden). */
 .composer-workspace[data-layout-mode="narrow"] .workspace-action-bar-slot {
   grid-row: 3;
   grid-column: 1;
@@ -958,17 +932,6 @@
 
 .composer-workspace[data-layout-mode="narrow"] .workspace-separator-slot {
   display: none;
-}
-
-.composer-workspace[data-layout-mode="narrow"]
-  .workspace-collapsed-affordance {
-  flex-wrap: wrap;
-  max-width: 100%;
-  padding: var(--space-sm);
-  border-width: 1px;
-  border-style: solid;
-  border-radius: var(--radius-md);
-  background: var(--color-surface, Canvas);
 }
 
 /* Component display rules outrank the user-agent [hidden] rule. Keep this
@@ -981,15 +944,12 @@
 .composer-workspace .workspace-authoring-pane[hidden],
 .composer-workspace .workspace-artifact-pane[hidden],
 .composer-workspace .workspace-action-bar-slot[hidden],
-.composer-workspace .workspace-pane-controls[hidden],
-.composer-workspace .workspace-collapse-control[hidden],
 .composer-workspace .workspace-action-bar-main[hidden] {
   display: none;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .composer-workspace,
-  .workspace-collapsed-affordance {
+  .composer-workspace {
     scroll-behavior: auto;
   }
 
@@ -1021,7 +981,8 @@
     --workspace-bar-inset: var(--space-xs);
   }
 
-  .artifact-workspace-toolbar {
+  .artifact-workspace-toolbar,
+  .workspace-pane-header {
     gap: var(--space-xs);
   }
 }

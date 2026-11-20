@@ -83,6 +83,10 @@
      ARGO's line-strong: 3.32:1 on --color-surface-elevated, 3.65:1 on
      --color-surface. */
   --color-input-border:      #5f8a7d;
+  /* The hide/show conversation toggle's resting boundary. It sits on the
+     pane title bar (--color-pane-header) with a transparent fill, so the
+     border is its only edge (WCAG 1.4.11, 3:1). Dark: 3.96:1. */
+  --color-pane-toggle-border: #5f8a7d;
 
   /* ── Chat bubbles ────────────────────────────────────────────────────────── */
   /* The user bubble is a 16% DTA-green tint; the assistant/reply bubble is an
@@ -477,6 +481,9 @@
   --color-chip-border:       var(--color-accent);
   /* ARGO's line-strong: 3.27:1 on white elevated, 3.17:1 on --color-surface. */
   --color-input-border:      #7a9487;
+  /* --color-input-border is 2.96:1 on the light title bar, a step darker
+     clears it: 3.38:1 on --color-pane-header, 3.62:1 on --color-surface. */
+  --color-pane-toggle-border: #708a7d;
 
   /* ── Chat bubbles ────────────────────────────────────────────────────────── */
   /* Light-theme mirror of the dark split: an opaque pale-green user bubble and

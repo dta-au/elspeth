@@ -22,10 +22,19 @@
     border-color var(--transition-fast),
     color var(--transition-fast);
 }
-.blob-action-btn:hover {
+.blob-action-btn:hover:where(:not(:disabled)):where(:not([aria-disabled="true"])) {
   background-color: var(--color-surface-hover);
   border-color: var(--color-border-strong);
   color: var(--color-text);
+}
+
+/* The same tokenised disabled treatment as .btn-compact (well fill, muted
+   ink, not-allowed), so an unavailable icon action never reads as live. */
+.blob-action-btn:disabled,
+.blob-action-btn[aria-disabled="true"] {
+  background-color: var(--color-well);
+  color: var(--color-text-muted);
+  cursor: not-allowed;
 }
 
 /* Per-selector reduced-motion guard, following the chat.css idiom
@@ -43,10 +52,15 @@
    is --space-md, matching .blob-manager-header, .blob-manager-category-header
    and .blob-row-preview; only then does an expanded preview read as nested
    under its row instead of indenting away from it. The BLOCK inset stays on
-   the --space-1-5 rung: it sets row height, which the 280px max-height on
+   the --space-1-5 rung: it sets row height, which the max-height on
    .blob-manager-container is sized against. */
+/* Two lines at every width: the name (with its status, author and size) on
+   the first, the actions on the second. Seventy files named alike stay
+   distinguishable because the name is never cut; it wraps at its own
+   separators instead. */
 .blob-row-container {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--space-sm);
   padding: var(--space-1-5) var(--space-md);
@@ -127,10 +141,9 @@
 }
 
 .blob-row-filename {
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  flex: 1 1 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .blob-row-size {
@@ -141,17 +154,19 @@
 
 .blob-row-actions {
   display: flex;
+  flex: 1 0 100%;
+  order: 2;
+  align-items: center;
+  justify-content: flex-end;
   gap: var(--space-xs);
-  flex-shrink: 0;
 }
 
-/* A bare button gets no shared disabled treatment; mark the Edit prompt
-   control that cannot open so it does not look live. */
-.blob-row-actions > button[aria-disabled="true"] {
-  color: var(--color-text-muted);
-  cursor: not-allowed;
-  text-decoration: line-through;
+/* The one text action leads its line; the icons keep the end, so each icon
+   sits in the same place in every row with or without it. */
+.blob-row-edit-prompt {
+  margin-inline-end: auto;
 }
+
 
 .blob-row-preview {
   padding: var(--space-sm) var(--space-md);
@@ -219,24 +234,28 @@
 /* ---------------------------------------------------------------------------
    BlobManager
    --------------------------------------------------------------------------- */
+/* Taller than the 280px it was (UX review finding 8: four of 73 files
+   showed), but never more than half the viewport, so the chat stays usable. */
 .blob-manager-container {
   border-top: 1px solid var(--color-border);
-  max-height: 280px;
+  max-height: max(280px, 50vh);
   display: flex;
   flex-direction: column;
   font-size: var(--font-size-sm);
 }
 
+/* Title on the left; storage total, Upload and Close grouped on the right. */
 .blob-manager-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: var(--space-xs);
   padding: var(--space-1-5) var(--space-md);
   border-bottom: 1px solid var(--color-border);
   flex-shrink: 0;
 }
 
 .blob-manager-title {
+  margin-inline-end: auto;
   font-weight: 600;
   font-size: var(--font-size-xs);
   color: var(--color-text-secondary);
@@ -257,11 +276,10 @@
   min-width: 44px;
 }
 
+/* The design system's error banner (with Retry for a failed list read),
+   inset to the panel's gutter. */
 .blob-manager-error {
-  padding: var(--space-xs) var(--space-md);
-  font-size: var(--font-size-xs);
-  color: var(--color-error);
-  background-color: var(--color-error-bg);
+  margin: var(--space-xs) var(--space-md);
 }
 
 .blob-manager-attached-summary {
@@ -277,6 +295,31 @@
 .blob-manager-list {
   flex: 1;
   overflow-y: auto;
+}
+
+.blob-manager-filter {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-xs) var(--space-md);
+  border-bottom: 1px solid var(--color-border);
+}
+
+/* The label keeps to one line; the field takes the remaining width. */
+.blob-manager-filter label {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.blob-manager-filter .input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.blob-manager-filter-count {
+  flex-shrink: 0;
+  color: var(--color-text-muted);
 }
 
 .blob-manager-loading,
@@ -317,9 +360,74 @@
   padding: var(--space-xs);
 }
 
+/* A long generated file name wraps at its separators (BreakableName), and
+   anywhere as a last resort, rather than overflowing the dialog. */
+.file-wiring-filename {
+  color: var(--color-text);
+  overflow-wrap: anywhere;
+}
+
+/* Native controls in the brand accent, as in the header's toggles. */
+.file-wiring-pad input[type="checkbox"],
+.file-wiring-pad input[type="radio"] {
+  accent-color: var(--color-accent);
+}
+
 .file-wiring-target small {
   display: block;
   color: var(--color-text-muted);
+}
+
+.file-wiring-filter {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-xs);
+}
+
+.file-wiring-filter .input {
+  flex: 1 1 12rem;
+}
+
+.file-wiring-selected {
+  color: var(--color-text-muted);
+}
+
+.file-wiring-step {
+  margin: var(--space-sm) 0 0;
+  border: 0;
+  border-top: 1px solid var(--color-border);
+  padding: var(--space-xs) 0 0;
+}
+
+.file-wiring-step legend {
+  padding: 0 var(--space-xs);
+  font-weight: var(--font-weight-semibold);
+}
+
+/* The status shares the button band: it takes the free space to the left of
+   Cancel / Connect, and wraps above them on a narrow dialog. */
+.file-wiring-actions {
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+/* Never display:none while empty: a live region must already be in the
+   accessibility tree when its text arrives, or the change is not announced. */
+.file-wiring-status {
+  flex: 1 1 12rem;
+  margin: 0;
+  color: var(--color-text-secondary);
+}
+
+/* On a narrow dialog the status takes its own line and the two buttons stack
+   full width, in their reading order, instead of wrapping ragged-right. */
+@media (max-width: 480px) {
+  .file-wiring-status,
+  .file-wiring-actions .confirm-dialog-btn {
+    flex: 1 1 100%;
+  }
 }
 
 .file-wiring-instructions {

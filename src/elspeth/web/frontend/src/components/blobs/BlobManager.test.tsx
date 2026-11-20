@@ -231,6 +231,8 @@ describe("BlobManager reveal request", () => {
     render(<BlobManager onUseAsInput={vi.fn()} />);
     const edit = screen.getByRole("button", { name: "Edit prompt user.txt" });
     expect(edit).toHaveAttribute("aria-disabled", "false");
+    // The design system's ghost compact button, not a raw browser button.
+    expect(edit).toHaveClass("btn-compact", "btn-ghost");
     act(() => edit.click());
     expect(useSessionStore.getState().selectedNodeId).toBe("llm");
     expect(useBlobStore.getState().editRequest).toMatchObject({ nodeId: "llm", fieldPath: "prompt_template" });
@@ -269,6 +271,38 @@ describe("BlobManager reveal request", () => {
     expect(edit).toHaveAccessibleDescription(/This file is still being processed\./);
     act(() => edit.click());
     expect(useBlobStore.getState().editRequest).toBeNull();
+  });
+});
+
+describe("BlobManager file filter", () => {
+  beforeEach(() => {
+    useSessionStore.setState({ activeSessionId: "session-1", selectedNodeId: null, compositionState: null });
+    setBlobState([makeBlob({ id: "one", filename: "system.txt" }), makeBlob({ id: "two", filename: "User-Prompt.txt" }),
+      makeBlob({ id: "three", filename: "data.csv" })]);
+  });
+
+  it("narrows the list by file name and says when nothing matches", async () => {
+    const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+    const user = userEvent.setup();
+    const filter = screen.getByRole("searchbox", { name: "Filter files" });
+    await user.type(filter, "prompt");
+    expect(Array.from(container.querySelectorAll(".blob-row-item")).map((row) => row.getAttribute("data-blob-id"))).toEqual(["two"]);
+    expect(screen.getByText("1 of 3")).toBeInTheDocument();
+    await user.clear(filter);
+    await user.type(filter, "zzz");
+    expect(container.querySelector(".blob-row-item")).toBeNull();
+    expect(screen.getByText("No file name matches this filter.")).toBeInTheDocument();
+    await user.clear(filter);
+    expect(container.querySelectorAll(".blob-row-item")).toHaveLength(3);
+  });
+
+  it("clears the filter to reveal a file it hides, instead of calling it missing", async () => {
+    const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+    await userEvent.setup().type(screen.getByRole("searchbox", { name: "Filter files" }), "csv");
+    act(() => useBlobStore.getState().revealBlob("session-1", "two", "User-Prompt.txt"));
+    expect(screen.getByRole("searchbox", { name: "Filter files" })).toHaveValue("");
+    expect(document.activeElement).toBe(container.querySelector('[data-blob-id="two"]'));
+    expect(screen.getByRole("status")).not.toHaveTextContent("no longer in this session");
   });
 });
 
@@ -333,6 +367,56 @@ describe("BlobManager upload affordance (elspeth-29eef452a8)", () => {
   beforeEach(() => {
     useSessionStore.setState({ activeSessionId: "session-1" });
     vi.clearAllMocks();
+  });
+
+  it("shows no file count until the list has been read, and says it is loading", () => {
+    setBlobState([]);
+    useBlobStore.setState({ isLoading: true });
+    const { rerender } = render(<BlobManager onUseAsInput={vi.fn()} />);
+    expect(screen.getByText("Files", { selector: ".blob-manager-title" })).toBeInTheDocument();
+    expect(screen.queryByText(/Files \(0\)/)).not.toBeInTheDocument();
+    expect(screen.getByText("Loading files…")).toHaveAttribute("role", "status");
+    act(() => useBlobStore.setState({ isLoading: false, error: "Failed to load files.", listLoadFailed: true }));
+    rerender(<BlobManager onUseAsInput={vi.fn()} />);
+    expect(screen.getByText("Files", { selector: ".blob-manager-title" })).toBeInTheDocument();
+    act(() => useBlobStore.setState({ error: null, listLoadFailed: false }));
+    rerender(<BlobManager onUseAsInput={vi.fn()} />);
+    expect(screen.getByText("Files (0)", { selector: ".blob-manager-title" })).toBeInTheDocument();
+  });
+
+  it("offers Retry for a failed list read, re-issuing the same read", async () => {
+    setBlobState([]);
+    useBlobStore.setState({ error: "Failed to load files.", listLoadFailed: true });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    const loadBlobs = useBlobStore.getState().loadBlobs;
+    vi.mocked(loadBlobs).mockClear();
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("Failed to load files.");
+    await userEvent.setup().click(within(alert).getByRole("button", { name: "Retry" }));
+    expect(loadBlobs).toHaveBeenCalledWith("session-1");
+  });
+
+  it("offers no Retry for a failed upload or download", () => {
+    setBlobState([]);
+    useBlobStore.setState({ error: "Download failed.", listLoadFailed: false });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    expect(screen.getByRole("alert")).toHaveTextContent("Download failed.");
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+  });
+
+  it("closes from a design-system button at the end of the header", async () => {
+    setBlobState([]);
+    useBlobStore.setState({ fileManagerOpen: true });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    const close = screen.getByRole("button", { name: "Close file manager" });
+    expect(close).toHaveClass("btn-compact", "btn-ghost");
+    // Visible "Close" leads the accessible name (WCAG 2.5.3).
+    expect(close.textContent?.trim()).toBe("Close");
+    const header = close.parentElement as HTMLElement;
+    const buttons = within(header).getAllByRole("button");
+    expect(buttons[buttons.length - 1]).toBe(close);
+    await userEvent.setup().click(close);
+    expect(useBlobStore.getState().fileManagerOpen).toBe(false);
   });
 
   it("names the upload control by its own visible text", () => {
@@ -510,7 +594,7 @@ describe("BlobManager file wiring", () => {
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Wiring prompt.txt" }));
     expect(storeSend).not.toHaveBeenCalled();
-    await user.click(screen.getByRole("checkbox", { name: /llm — User prompt/ }));
+    await user.click(screen.getByRole("checkbox", { name: /User prompt/ }));
     await user.click(screen.getByRole("button", { name: "Connect selected prompts" }));
     expect(storeSend).toHaveBeenCalledOnce();
     expect(storeSend.mock.calls[0][0]).toContain("node:llm.options.prompt_template");
@@ -524,10 +608,10 @@ describe("BlobManager file wiring", () => {
     render(<BlobManager onUseAsInput={vi.fn()} />);
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Wiring prompt.txt" }));
-    await user.click(screen.getByRole("radio", { name: "Ask AI" }));
-    const box = screen.getByRole("textbox", { name: "What should AI connect?" });
+    await user.click(screen.getByRole("radio", { name: "Ask Composer" }));
+    const box = screen.getByRole("textbox", { name: "What should Composer connect?" });
     await user.type(box, "Use this file for the scoring prompt.");
-    const connect = screen.getByRole("button", { name: "Ask AI to connect" });
+    const connect = screen.getByRole("button", { name: "Ask Composer to connect" });
     expect(connect).toBeDisabled();
     expect(screen.getByText(COMPOSE_LOADING_SESSION_MESSAGE)).toBeInTheDocument();
     await user.click(connect);
@@ -536,7 +620,7 @@ describe("BlobManager file wiring", () => {
     expect(box).toHaveValue("Use this file for the scoring prompt.");
     // Once the session loads the same pad sends the kept text.
     act(() => useSessionStore.setState({ compositionStateLoaded: true }));
-    await user.click(screen.getByRole("button", { name: "Ask AI to connect" }));
+    await user.click(screen.getByRole("button", { name: "Ask Composer to connect" }));
     expect(storeSend).toHaveBeenCalledWith(expect.stringContaining("Use this file for the scoring prompt."), expect.anything());
     expect(screen.queryByRole("dialog", { name: "File wiring pad" })).not.toBeInTheDocument();
   });
@@ -548,12 +632,16 @@ describe("BlobManager file wiring", () => {
     render(<BlobManager onUseAsInput={vi.fn()} />);
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Wiring prompt.txt" }));
-    const slot = screen.getByRole("checkbox", { name: /llm — User prompt/ });
+    const slot = screen.getByRole("checkbox", { name: /User prompt/ });
     await user.click(slot);
     await user.click(screen.getByRole("button", { name: "Connect selected prompts" }));
     expect(composeRequest).toHaveBeenCalledOnce();
     expect(screen.getByRole("dialog", { name: "File wiring pad" })).toBeInTheDocument();
-    expect(screen.getByRole("alert")).toHaveTextContent("Composer did not take this request.");
+    const status = within(screen.getByRole("dialog", { name: "File wiring pad" })).getByRole("status");
+    expect(status).toHaveTextContent("Composer did not take this request.");
+    // Beside the button it explains, which names it as its description.
+    expect(status.closest("footer")).toBe(screen.getByRole("button", { name: "Connect selected prompts" }).closest("footer"));
+    expect(screen.getByRole("button", { name: "Connect selected prompts" })).toHaveAccessibleDescription(/^Composer did not take this request\./);
     expect(slot).toBeChecked();
   });
 
@@ -563,10 +651,10 @@ describe("BlobManager file wiring", () => {
     render(<BlobManager onUseAsInput={vi.fn()} />);
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Wiring prompt.txt" }));
-    await user.click(screen.getByRole("checkbox", { name: /llm — User prompt/ }));
+    await user.click(screen.getByRole("checkbox", { name: /User prompt/ }));
     act(() => useSessionStore.setState({ composeRequests: new Map([["session-1", { current: null }]]) }));
     expect(screen.getByRole("button", { name: "Connect selected prompts" })).toBeDisabled();
-    expect(screen.getByText("Wait for Composer to finish before connecting this file.")).toBeInTheDocument();
+    expect(within(screen.getByRole("dialog", { name: "File wiring pad" })).getByRole("status")).toHaveTextContent("Wait for Composer to finish before connecting this file.");
     expect(composeRequest).not.toHaveBeenCalled();
   });
 
@@ -579,7 +667,7 @@ describe("BlobManager file wiring", () => {
     render(<BlobManager onUseAsInput={vi.fn()} />);
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Wiring prompt.txt" }));
-    await user.click(screen.getByRole("checkbox", { name: /llm — User prompt/ }));
+    await user.click(screen.getByRole("checkbox", { name: /User prompt/ }));
     const connect = screen.getByRole("button", { name: "Connect selected prompts" });
     act(() => {
       useSessionStore.setState({ composeRequests: new Map([["session-1", { current: null }]]) });
@@ -587,7 +675,7 @@ describe("BlobManager file wiring", () => {
     });
     expect(storeSend).not.toHaveBeenCalled();
     expect(screen.getByRole("dialog", { name: "File wiring pad" })).toBeInTheDocument();
-    expect(screen.getByRole("checkbox", { name: /llm — User prompt/ })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: /User prompt/ })).toBeChecked();
   });
 
   it("re-announces a repeated refusal and clears it when the pad is reopened", async () => {
@@ -596,24 +684,25 @@ describe("BlobManager file wiring", () => {
     render(<BlobManager onUseAsInput={vi.fn()} />);
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Wiring prompt.txt" }));
-    await user.click(screen.getByRole("checkbox", { name: /llm — User prompt/ }));
+    await user.click(screen.getByRole("checkbox", { name: /User prompt/ }));
     await user.click(screen.getByRole("button", { name: "Connect selected prompts" }));
-    const first = screen.getByRole("alert");
+    const padStatus = () => within(screen.getByRole("dialog", { name: "File wiring pad" })).getByRole("status");
+    const first = padStatus().firstElementChild;
     await user.click(screen.getByRole("button", { name: "Connect selected prompts" }));
-    const second = screen.getByRole("alert");
+    const second = padStatus().firstElementChild;
     expect(second).toHaveTextContent("Composer did not take this request.");
     expect(second).not.toBe(first);
     await user.click(screen.getByRole("button", { name: "Cancel" }));
     await user.click(screen.getByRole("button", { name: "Wiring prompt.txt" }));
     expect(screen.getByRole("dialog", { name: "File wiring pad" })).toBeInTheDocument();
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(padStatus()).toBeEmptyDOMElement();
   });
 
   it("keeps Shift+Tab inside the pad after a click on its text", async () => {
     render(<BlobManager onUseAsInput={vi.fn()} />);
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Wiring prompt.txt" }));
-    await user.click(screen.getByText(/Choose the connections yourself/));
+    await user.click(screen.getByText(/Choose the prompts yourself/));
     const dialog = screen.getByRole("dialog", { name: "File wiring pad" });
     expect(document.activeElement).toBe(dialog);
     await user.tab({ shift: true });
@@ -627,7 +716,7 @@ describe("BlobManager file wiring", () => {
     render(<BlobManager onUseAsInput={vi.fn()} />);
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Wiring prompt.txt" }));
-    await user.click(screen.getByRole("checkbox", { name: /llm — User prompt/ }));
+    await user.click(screen.getByRole("checkbox", { name: /User prompt/ }));
     act(() => useBlobStore.setState({ blobs: [makeBlob({ id: "replacement", filename: "prompt.txt", mime_type: "text/plain", content_hash: "new-hash" })] }));
     expect(screen.getByRole("button", { name: "Connect selected prompts" })).toBeDisabled();
     expect(screen.getByText("This file changed or is unavailable. Close the wiring pad and reopen it.")).toBeInTheDocument();
@@ -635,12 +724,19 @@ describe("BlobManager file wiring", () => {
   });
 
   it.each([
-    ["the file is still processing", () => setBlobState([makeBlob({ id: "replacement", filename: "prompt.txt", mime_type: "text/plain", status: "pending" })])],
-    ["the file list belongs to another session", () => useBlobStore.setState({ activeSessionId: "session-2" })],
-  ])("disables the wiring control while %s", (_case, arrange) => {
+    ["the file is still processing", "This file is not ready yet. Wait for it to finish processing.",
+      () => setBlobState([makeBlob({ id: "replacement", filename: "prompt.txt", mime_type: "text/plain", status: "pending" })])],
+    ["the file list belongs to another session", "Wait for the file list to load.", () => useBlobStore.setState({ activeSessionId: "session-2" })],
+  ])("refuses the wiring control while %s, saying why, and stays focusable", async (_case, reason, arrange) => {
     arrange();
     render(<BlobManager onUseAsInput={vi.fn()} />);
-    expect(screen.getByRole("button", { name: "Wiring prompt.txt" })).toBeDisabled();
+    const wiring = screen.getByRole("button", { name: "Wiring prompt.txt" });
+    expect(wiring).toHaveAttribute("aria-disabled", "true");
+    expect(wiring).toBeEnabled();
+    expect(wiring).toHaveAccessibleDescription(reason);
+    expect(wiring).toHaveAttribute("title", reason);
+    await userEvent.setup().click(wiring);
+    expect(screen.queryByRole("dialog", { name: "File wiring pad" })).not.toBeInTheDocument();
   });
 
   it("offers no wiring control for a file that cannot hold prompt text", () => {
@@ -668,7 +764,7 @@ describe("BlobManager file wiring", () => {
     render(<BlobManager onUseAsInput={vi.fn()} />);
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Wiring prompt.txt" }));
-    await user.click(screen.getByRole("checkbox", { name: /llm — User prompt/ }));
+    await user.click(screen.getByRole("checkbox", { name: /User prompt/ }));
     act(() => useSessionStore.setState({ compositionState: { ...selectedState({ prompt_template: "New prompt." }), id: "state-2" } }));
     expect(screen.getByRole("button", { name: "Connect selected prompts" })).toBeDisabled();
     expect(screen.getByText("The graph changed. Close the wiring pad and reopen it.")).toBeInTheDocument();
@@ -681,10 +777,10 @@ describe("BlobManager file wiring", () => {
     render(<BlobManager onUseAsInput={vi.fn()} />);
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Wiring prompt.txt" }));
-    await user.click(screen.getByRole("checkbox", { name: /llm — User prompt/ }));
+    await user.click(screen.getByRole("checkbox", { name: /User prompt/ }));
     act(() => useSessionStore.setState({ isComposing: true }));
     expect(screen.getByRole("button", { name: "Connect selected prompts" })).toBeDisabled();
-    expect(screen.getByText("Wait for Composer to finish before connecting this file.")).toBeInTheDocument();
+    expect(within(screen.getByRole("dialog", { name: "File wiring pad" })).getByRole("status")).toHaveTextContent("Wait for Composer to finish before connecting this file.");
     expect(composeRequest).not.toHaveBeenCalled();
   });
 
@@ -693,7 +789,7 @@ describe("BlobManager file wiring", () => {
     render(<BlobManager onUseAsInput={vi.fn()} />);
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Wiring prompt.txt" }));
-    await user.click(screen.getByText(/Choose the connections yourself/));
+    await user.click(screen.getByText(/Choose the prompts yourself/));
     expect(document.activeElement).toBe(screen.getByRole("dialog", { name: "File wiring pad" }));
     await user.keyboard("{Escape}");
     expect(screen.queryByRole("dialog", { name: "File wiring pad" })).not.toBeInTheDocument();

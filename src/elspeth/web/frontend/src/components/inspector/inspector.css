@@ -470,9 +470,162 @@
 .graph-files-scroll {
   --scroll-owner: graph-files;
 
-  max-height: 12rem;
+  max-height: 40vh;
   overflow: auto;
   overflow-wrap: anywhere;
+}
+
+/* Cells centre on the row: the Actions buttons are 36px tall, and top-aligned
+   text beside them read as misaligned. The extra `table` step outranks the
+   shared .graph-detail-table cell rule (top), which comes later in this file. */
+.graph-files-scroll table th,
+.graph-files-scroll table td {
+  vertical-align: middle;
+}
+
+/* The Files body measures its own width (the pane, not the viewport). */
+.graph-files-body {
+  container: graph-files / inline-size;
+}
+
+/* A narrow pane: four columns crushed to a letter each, and a fixed table
+   width cut "Used by" off behind a sideways scroll. Each row stacks instead:
+   actions, the file, the step that uses it, its fields. The column headings
+   stay for assistive technology (GraphFiles sets the table roles). */
+@container graph-files (width < 40rem) {
+  .graph-files-scroll table,
+  .graph-files-scroll tbody,
+  .graph-files-scroll tr,
+  .graph-files-scroll table th,
+  .graph-files-scroll table td {
+    display: block;
+  }
+
+  .graph-files-scroll thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .graph-files-scroll tr {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2xs);
+    padding: var(--space-sm) var(--space-pane-gutter);
+    border-top: 1px solid var(--color-border);
+  }
+
+  .graph-files-scroll table th,
+  .graph-files-scroll table td {
+    padding: 0;
+    border-top: 0;
+  }
+
+  .graph-files-scroll .graph-file-actions {
+    margin-bottom: var(--space-2xs);
+  }
+}
+
+/* A field label ("User prompt, query C1") reads as one unit; the long-name
+   columns beside it wrap at their separators instead. */
+.graph-files-fields > div {
+  white-space: nowrap;
+}
+
+/* Unsaved prompt text whose slot is gone (UnhomedPromptDrafts), above Files:
+   a warning banner, then one row per draft. */
+.prompt-drafts-unhomed {
+  margin: var(--space-sm) var(--space-pane-gutter);
+}
+
+.prompt-drafts-unhomed-title {
+  font-weight: var(--font-weight-semibold);
+}
+
+.prompt-drafts-unhomed-list {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.prompt-drafts-unhomed-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-xs) var(--space-sm);
+  padding: var(--space-xs) 0;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.prompt-drafts-unhomed-name {
+  display: flex;
+  flex: 1 1 14rem;
+  flex-direction: column;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.prompt-drafts-unhomed-meta {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.prompt-drafts-unhomed-actions {
+  display: flex;
+  gap: var(--space-xs);
+}
+
+/* "View text": the whole row width, under the name and the actions. */
+.prompt-drafts-unhomed-view {
+  flex: 1 0 100%;
+  order: 3;
+  font-size: var(--font-size-xs);
+}
+
+.prompt-drafts-unhomed-view > summary {
+  cursor: pointer;
+  font-weight: var(--font-weight-semibold);
+}
+
+.prompt-drafts-unhomed-text {
+  max-height: 12rem;
+  overflow: auto;
+  margin: var(--space-xs) 0 0;
+  padding: var(--space-xs) var(--space-sm);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.graph-files-alert {
+  margin: 0 var(--space-pane-gutter) var(--space-sm);
+}
+
+.graph-files-filter {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: 0 var(--space-pane-gutter) var(--space-sm);
+}
+
+.graph-files-filter .input {
+  flex: 1 1 14rem;
+  max-width: 24rem;
+}
+
+.graph-files-filter-count {
+  color: var(--color-text-muted);
 }
 
 .graph-files-scroll:focus-visible {
@@ -482,9 +635,10 @@
 
 .graph-file-actions {
   display: flex;
-  flex-direction: column;
-  align-items: flex-start;
+  flex-wrap: nowrap;
+  align-items: center;
   gap: var(--space-xs);
+  white-space: nowrap;
 }
 
 .graph-detail-table table {
@@ -675,7 +829,10 @@
   position: absolute;
   top: var(--space-md);
   right: var(--space-md);
-  z-index: 2;
+  /* Above the canvas's floating Controls / MiniMap (@xyflow's
+     .react-flow__panel, z-index 5, in the same stacking context): at 2 the
+     minimap drew over the open step panel (UX review finding 7). */
+  z-index: var(--z-panel-controls);
   display: grid;
   gap: var(--space-md);
   width: min(720px, calc(100% - 2 * var(--space-md)));
@@ -795,6 +952,27 @@
   color: var(--color-text);
   font-size: var(--font-size-xs);
   word-break: break-word;
+}
+
+/* A source or sink file row: the file's name, the stored path one click away. */
+.option-file-path {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  min-width: 0;
+}
+
+.option-file-path-full > summary {
+  width: fit-content;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+
+.option-file-path-full > code {
+  display: block;
+  margin-top: var(--space-2xs);
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
 }
 
 /* Nested objects: indent + left rule so a nested group still reads as belonging
@@ -1000,6 +1178,43 @@
 
 .prompt-editor-close {
   margin-inline-start: auto;
+}
+
+/* Under a refused save: the text is kept but unsaved, on its own line. */
+.prompt-editor-kept {
+  display: block;
+  margin-top: var(--space-xs);
+}
+
+/* The stale-draft banner's choice sits on its own line under the message. */
+.prompt-editor-stale-actions {
+  display: flex;
+  margin-top: var(--space-xs);
+}
+
+/* "View current file" in the stale banner: the text Save would replace. */
+.prompt-editor-current {
+  margin-top: var(--space-xs);
+}
+
+.prompt-editor-current > summary {
+  cursor: pointer;
+  font-weight: var(--font-weight-semibold);
+}
+
+.prompt-editor-current-text {
+  max-height: 12rem;
+  overflow: auto;
+  margin: var(--space-xs) 0 0;
+  padding: var(--space-xs) var(--space-sm);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
 }
 
 .prompt-editor-hint {

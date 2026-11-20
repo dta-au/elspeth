@@ -1,8 +1,8 @@
 // src/components/blobs/BlobManager.tsx
-import { useEffect, useLayoutEffect, useRef, useCallback, useMemo, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useCallback, useMemo, useState } from "react";
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
-import { Button, Input } from "@/components/ui";
+import { AlertBanner, Button, Icon, Input } from "@/components/ui";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { BlobRow } from "./BlobRow";
 import { IdentityStorageTotal } from "./IdentityStorageTotal";
@@ -61,7 +61,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   // `seq` re-keys the pad's alert so a repeated refusal is announced again.
   const [wireSendRefusal, setWireSendRefusal] = useState<{ message: string; seq: number } | null>(null);
   const pending = useInterpretationEventsStore((s) => activeSessionId ? s.pendingBySession[activeSessionId] : undefined);
-  const { blobs, isLoading, error, activeSessionId: blobSessionId, loadBlobs, uploadBlob, deleteBlob, downloadBlob } =
+  const { blobs, isLoading, error, listLoadFailed, activeSessionId: blobSessionId, loadBlobs, uploadBlob, deleteBlob, downloadBlob } =
     useBlobStore();
   const revealRequest = useBlobStore((s) => s.revealRequest);
   const focusedBlobId = useBlobStore((s) => s.focusedBlobId);
@@ -70,6 +70,9 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   const previousSelectedNode = useRef(selectedNodeId);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  // Narrows the list by file name; in memory, per mount.
+  const [fileFilter, setFileFilter] = useState("");
+  const filterId = useId();
   const lastScrolledSelection = useRef<string | null>(null);
 
   const attached = useMemo(() => {
@@ -135,6 +138,12 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
     }
     const row = Array.from(listRef.current?.querySelectorAll<HTMLElement>(".blob-row-item") ?? [])
       .find((item) => item.dataset.blobId?.toLowerCase() === revealRequest.blobId.toLowerCase());
+    // A file the filter hides is still in the session: clear the filter and
+    // reveal it on the next pass instead of reporting it missing.
+    if (!row && fileFilter !== "" && blobs.some((blob) => blob.id.toLowerCase() === revealRequest.blobId.toLowerCase())) {
+      setFileFilter("");
+      return;
+    }
     if (row) {
       setMissingRevealName(null);
       row.scrollIntoView?.({ block: "nearest" });
@@ -145,7 +154,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
       statusRef.current?.focus({ preventScroll: true });
     }
     useBlobStore.getState().consumeRevealRequest(revealRequest.seq);
-  }, [revealRequest, activeSessionId, isLoading, listBelongsToSession, blobs]);
+  }, [revealRequest, activeSessionId, isLoading, listBelongsToSession, blobs, fileFilter]);
 
   useEffect(() => {
     if (selectedNodeId === null) {
@@ -166,17 +175,20 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   // whichever session happens to be active at confirmation time.
   const [pendingDelete, setPendingDelete] = useState<{ blob: BlobMetadata; sessionId: string } | null>(null);
 
+  const fileQuery = fileFilter.trim().toLowerCase();
+  const visibleBlobs = useMemo(() => fileQuery === "" ? blobs
+    : blobs.filter((blob) => blob.filename.toLowerCase().includes(fileQuery)), [blobs, fileQuery]);
   const grouped = useMemo(() => {
     const groups: Record<BlobCategory, BlobMetadata[]> = {
       source: [],
       sink: [],
       other: [],
     };
-    for (const blob of blobs) {
+    for (const blob of visibleBlobs) {
       groups[categorizeBlob(blob)].push(blob);
     }
     return groups;
-  }, [blobs]);
+  }, [visibleBlobs]);
 
   const handleUpload = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -237,10 +249,11 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
     >
       {/* Header */}
       <div className="blob-manager-header">
+        {/* No count until the list has been read: "Files (0)" while loading
+            or after a failed read would say the session has no files. */}
         <span className="blob-manager-title">
-          Files ({blobs.length})
+          Files{!isLoading && !listLoadFailed && ` (${blobs.length})`}
         </span>
-        <Button type="button" variant="bare" onClick={close}>Close file manager</Button>
         <IdentityStorageTotal refreshKey={`${activeSessionId}:${blobs.map((blob) => `${blob.id}:${blob.size_bytes}`).join(",")}`} />
         {/* Label-only, and its accessible name IS its visible text
             (elspeth-29eef452a8). The label used to read "+ Upload" against an
@@ -256,6 +269,12 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
           className="blob-manager-upload-btn"
         >
           Upload
+        </Button>
+        {/* The design system's ghost compact button, last in the header like
+            every panel's close control. The accessible name starts with the
+            visible label (WCAG 2.5.3). */}
+        <Button type="button" variant="ghost" compact aria-label="Close file manager" onClick={close}>
+          <Icon name="cross" /> Close
         </Button>
         <Input
           ref={fileInputRef}
@@ -277,23 +296,37 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
 
       {/* Error */}
       {error && (
-        <div
-          role="alert"
+        <AlertBanner
           className="blob-manager-error"
+          action={listLoadFailed && activeSessionId ? (
+            // The same list read the panel makes on open, issued again.
+            <Button type="button" variant="ghost" compact onClick={() => void loadBlobs(activeSessionId)}>Retry</Button>
+          ) : null}
         >
           {error}
-        </div>
+        </AlertBanner>
       )}
+
+      {!isLoading && blobs.length > 0 && <div className="blob-manager-filter">
+        <label htmlFor={`${filterId}-input`}>Filter files</label>
+        <Input id={`${filterId}-input`} type="search" value={fileFilter} onChange={(event) => setFileFilter(event.target.value)}
+          autoComplete="off" spellCheck={false} />
+        {fileQuery !== "" && <span className="blob-manager-filter-count">{visibleBlobs.length} of {blobs.length}</span>}
+      </div>}
 
       {/* Categorized file list */}
       <div className="blob-manager-list" ref={listRef}>
         {isLoading ? (
-          <div className="blob-manager-loading">
-            Loading...
+          <div className="blob-manager-loading" role="status">
+            Loading files…
           </div>
         ) : blobs.length === 0 ? (
           <div className="blob-manager-empty">
             No files yet. Upload a file to get started.
+          </div>
+        ) : visibleBlobs.length === 0 ? (
+          <div className="blob-manager-empty">
+            No file name matches this filter.
           </div>
         ) : (
           CATEGORY_ORDER.map((category) => {
@@ -333,7 +366,8 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
                         setWireSendRefusal(null);
                         setPendingWire({ blob, sessionId: activeSessionId, stateId: compositionState?.id ?? null });
                       } : undefined}
-                    wiringDisabled={blob.status !== "ready" || !listBelongsToSession || isLoading}
+                    wiringDisabledReason={!listBelongsToSession || isLoading ? "Wait for the file list to load."
+                      : blob.status !== "ready" ? "This file is not ready yet. Wait for it to finish processing." : null}
                     onEditPrompt={binding && opensEditor ? () => {
                       useSessionStore.getState().selectNode(binding.nodeId);
                       useBlobStore.getState().requestPromptEdit(binding.nodeId, binding.fieldPath);

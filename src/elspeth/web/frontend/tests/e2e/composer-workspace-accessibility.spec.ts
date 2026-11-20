@@ -100,8 +100,8 @@ test.describe("Composer workspace browser accessibility", () => {
         .evaluateAll((elements) =>
           elements.map((element) => element.getAttribute("data-workspace-part")),
         );
-      // The toggle follows authoring in keyboard order while grid placement
-      // puts its action row below the pipeline, to the right of the fold.
+      // The action row follows authoring in keyboard order while grid
+      // placement puts it below the pipeline, to the right of the fold.
       expect(parts).toEqual([
         "view-tabs",
         "authoring",
@@ -133,9 +133,18 @@ test.describe("Composer workspace browser accessibility", () => {
         artifact!.x + artifact!.width,
       );
       expect(authoring!.y + authoring!.height).toBeGreaterThan(bottomBar!.y);
+      // The Hide control opens the conversation's title bar (2026-11-20).
       const collapseBox = await composer.collapseAuthoring().boundingBox();
       expect(collapseBox).not.toBeNull();
-      expect(collapseBox!.x).toBeGreaterThanOrEqual(separator!.x);
+      expect(collapseBox!.x + collapseBox!.width).toBeLessThanOrEqual(separator!.x);
+      expect(
+        await composer.authoringPane().evaluate((pane) => {
+          const first = pane.querySelector<HTMLElement>(
+            'button:enabled, textarea:enabled, input:enabled, select:enabled, a[href], [tabindex="0"], summary',
+          );
+          return first?.getAttribute("data-authoring-toggle") ?? null;
+        }),
+      ).toBe("hide");
 
       await composer.authoringPane().evaluate((pane) => {
         const focusable = Array.from(pane.querySelectorAll<HTMLElement>(
@@ -145,8 +154,6 @@ test.describe("Composer workspace browser accessibility", () => {
         if (last === undefined) throw new Error("authoring pane has no focusable controls");
         last.focus();
       });
-      await page.keyboard.press("Tab");
-      await expect(composer.collapseAuthoring()).toBeFocused();
       await page.keyboard.press("Tab");
       await expect(page.getByRole("button", { name: "Share inspect link" })).toBeFocused();
     } finally {
@@ -223,17 +230,16 @@ test.describe("Composer workspace browser accessibility", () => {
       "populated-long-transcript",
     );
     try {
+      // Two instances (one per title bar): focus moves to the counterpart.
       const collapse = composer.collapseAuthoring();
-      const button = await collapse.elementHandle();
-      expect(button).not.toBeNull();
       await expect(collapse).toHaveAttribute("aria-expanded", "true");
+      await expect(collapse).toHaveAttribute("aria-keyshortcuts", "Control+Backslash");
       await expect(collapse).toHaveAttribute("aria-controls", "workspace-authoring-pane");
       await expect(collapse.locator("svg")).toHaveAttribute("data-icon", "chevrons-left");
       await collapse.focus();
       await collapse.press("Enter");
       const restore = composer.restoreAuthoring();
       await expect(restore).toBeFocused();
-      expect(await restore.evaluate((element, original) => element === original, button!)).toBe(true);
       await expect(restore).toHaveAttribute("aria-expanded", "false");
       await expect(restore).toHaveAttribute("aria-controls", "workspace-authoring-pane");
       await expect(restore).toHaveAttribute("aria-describedby", "workspace-collapsed-status");
@@ -242,7 +248,6 @@ test.describe("Composer workspace browser accessibility", () => {
       await expect(composer.separator()).toBeHidden();
       await restore.press("Enter");
       await expect(composer.collapseAuthoring()).toBeFocused();
-      expect(await composer.collapseAuthoring().evaluate((element, original) => element === original, button!)).toBe(true);
       await expect(composer.collapseAuthoring().locator("svg")).toHaveAttribute("data-icon", "chevrons-left");
       await expect(composer.authoringPane()).toBeVisible();
       await expect(composer.separator()).toBeVisible();

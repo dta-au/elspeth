@@ -148,6 +148,7 @@ export const useAuthStore = create<AuthState>((set) => ({
       import("./secretsStore"),
       import("./shareableReviewStore"),
       import("./interpretationEventsStore"),
+      import("./promptDraftStore"),
     ]).then(([
       { useSessionStore },
       { useExecutionStore },
@@ -155,6 +156,7 @@ export const useAuthStore = create<AuthState>((set) => ({
       { useSecretsStore },
       { useShareableReviewStore },
       { useInterpretationEventsStore },
+      { usePromptDraftStore },
     ]) => {
       useSessionStore.getState().reset?.();
       useExecutionStore.getState().reset?.();
@@ -162,6 +164,8 @@ export const useAuthStore = create<AuthState>((set) => ({
       useSecretsStore.getState().reset();
       useShareableReviewStore.getState().reset();
       useInterpretationEventsStore.setState(useInterpretationEventsStore.getInitialState(), true);
+      // Unsaved prompt text belongs to the signed-out principal.
+      usePromptDraftStore.getState().reset();
       usePreferencesStore.getState().reset();
     });
     const cleanup = Promise.all([storeCleanup, revocation]).then(() => undefined);

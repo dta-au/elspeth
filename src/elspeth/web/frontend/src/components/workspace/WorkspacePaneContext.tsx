@@ -52,6 +52,10 @@ const NOOP_SHOW_COMPOSE = (): void => undefined;
 
 interface WorkspacePaneProviderProps {
   paneState: WorkspacePaneState;
+  /** The collapsed state the layout actually shows. Narrow layouts ignore
+   *  the stored preference, so ComposerWorkspace passes its effective value;
+   *  defaults to the stored one. */
+  authoringCollapsed?: boolean;
   artifactVisible?: boolean;
   authoringVisible?: boolean;
   showPipeline?: () => void;
@@ -61,6 +65,7 @@ interface WorkspacePaneProviderProps {
 
 export function WorkspacePaneProvider({
   paneState,
+  authoringCollapsed: effectiveAuthoringCollapsed,
   artifactVisible = true,
   authoringVisible = true,
   showPipeline = NOOP_SHOW_PIPELINE,
@@ -68,7 +73,7 @@ export function WorkspacePaneProvider({
   children,
 }: WorkspacePaneProviderProps) {
   const {
-    authoringCollapsed,
+    authoringCollapsed: storedAuthoringCollapsed,
     availableArtifactTabs,
     activeArtifactTab,
     resizeTransient,
@@ -77,6 +82,8 @@ export function WorkspacePaneProvider({
     selectArtifactTab,
   } = paneState;
 
+  const authoringCollapsed =
+    effectiveAuthoringCollapsed ?? storedAuthoringCollapsed;
   const state = useMemo<WorkspaceControllerState>(
     () => ({
       authoringCollapsed,

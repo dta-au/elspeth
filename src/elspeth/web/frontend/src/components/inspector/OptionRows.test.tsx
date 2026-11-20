@@ -53,6 +53,116 @@ function seedFile(overrides: Partial<BlobMetadata> = {}) {
   });
 }
 
+// The state route masks a blob-backed source's storage path with this
+// placeholder (web/composer/redaction.py); the step's blob_ref names the file.
+const MASKED_PATH = "<redacted-blob-source-path>";
+
+describe("source and sink file names", () => {
+  it.each([
+    ["source", "path"], ["source", "file"], ["sink", "path"], ["sink", "file"],
+  ] as const)("names the %s %s file from its file reference, never the placeholder or the id", (kind, field) => {
+    seedFile({ filename: "evaluation.csv" });
+    const options = { [field]: MASKED_PATH, blob_ref: FILE_ID };
+    render(<OptionRows options={options} ariaLabel="file settings" plugin={{ kind, name: "csv" }} />);
+    const region = screen.getByRole("region", { name: "file settings" });
+    expect(within(region).getByText("File: evaluation.csv")).toBeInTheDocument();
+    expect(region.textContent).not.toContain("redacted");
+    expect(region.textContent).not.toContain(FILE_ID);
+    expect(options[field]).toBe(MASKED_PATH);
+  });
+
+  it.each([
+    ["source", "inputs/evaluation.csv", "evaluation.csv"],
+    ["sink", "/private/output/final_evaluation.csv", "final_evaluation.csv"],
+    ["sink", "C:\\output\\final_evaluation.csv", "final_evaluation.csv"],
+  ] as const)("shows a %s path's file name, with the whole path one disclosure away", (kind, path, name) => {
+    const options = { path };
+    render(<OptionRows options={options} ariaLabel="file settings" plugin={{ kind, name: "csv" }} />);
+    const region = screen.getByRole("region", { name: "file settings" });
+    const shown = within(region).getByText(name);
+    expect(shown).toHaveAttribute("title", path);
+    // Two folders can hold files of the same name: the path stays reachable.
+    const full = within(region).getByText("Full path", { selector: "summary" });
+    const details = full.closest("details");
+    expect(details).not.toHaveAttribute("open");
+    expect(details?.querySelector("code")).toHaveTextContent(path);
+    // Outside the closed disclosure, only the name shows.
+    const visible = region.cloneNode(true) as HTMLElement;
+    visible.querySelectorAll("details").forEach((node) => node.remove());
+    expect(visible.textContent).not.toContain(path);
+    expect(options.path).toBe(path);
+  });
+
+  it("shows a bare file name as it is, with no disclosure", () => {
+    render(<OptionRows options={{ path: "evaluation.csv" }} ariaLabel="file settings" plugin={{ kind: "source", name: "csv" }} />);
+    expect(screen.getByText("evaluation.csv")).toBeInTheDocument();
+    expect(screen.queryByText("Full path")).not.toBeInTheDocument();
+  });
+
+  it("keeps a transform's path setting verbatim", () => {
+    render(<OptionRows options={{ path: "configured/path/value" }} ariaLabel="transform settings" plugin={{ kind: "transform", name: "custom" }} />);
+    expect(screen.getByText("configured/path/value")).toBeInTheDocument();
+  });
+
+  it("says the file reference is unavailable for a masked path with no file reference", () => {
+    render(<OptionRows options={{ path: MASKED_PATH }} ariaLabel="source settings" plugin={{ kind: "source", name: "csv" }} />);
+    const region = screen.getByRole("region", { name: "source settings" });
+    expect(within(region).getByText("File reference unavailable")).toBeInTheDocument();
+    expect(region.textContent).not.toContain("redacted");
+  });
+
+  it("reads this session's file list once when it was never read, never showing another session's name or the raw id", () => {
+    seedFile({ filename: "other-session.csv" });
+    const loadBlobs = vi.fn().mockResolvedValue(undefined);
+    useBlobStore.setState({ activeSessionId: "other-session", loadBlobs });
+    const element = <OptionRows options={{ path: MASKED_PATH, blob_ref: FILE_ID }} ariaLabel="source settings" plugin={{ kind: "source", name: "csv" }} />;
+    const view = render(element);
+    view.rerender(element);
+    view.rerender(<OptionRows options={{ path: MASKED_PATH, blob_ref: FILE_ID }} ariaLabel="source settings" plugin={{ kind: "source", name: "csv" }} />);
+    expect(loadBlobs).toHaveBeenCalledTimes(1);
+    expect(loadBlobs).toHaveBeenCalledWith("session-1");
+    const region = screen.getByRole("region", { name: "source settings" });
+    expect(screen.queryByText(/other-session.csv/)).not.toBeInTheDocument();
+    expect(within(region).getByText("Loading file name…")).toBeInTheDocument();
+    expect(region.textContent).not.toContain(FILE_ID);
+    act(() => seedFile({ filename: "this-session.csv" }));
+    expect(screen.getByText("File: this-session.csv")).toBeInTheDocument();
+    expect(loadBlobs).toHaveBeenCalledTimes(1);
+  });
+
+  it("issues one list read for two views of the same step (inspector and Spec tab)", () => {
+    const loadBlobs = vi.fn(async (sessionId: string) => { useBlobStore.getState().activateSession(sessionId); });
+    useBlobStore.setState({ activeSessionId: null, loadBlobs });
+    const props = { options: { path: MASKED_PATH, blob_ref: FILE_ID }, plugin: { kind: "source", name: "csv" } } as const;
+    render(<><OptionRows {...props} ariaLabel="inspector" /><OptionRows {...props} ariaLabel="spec" /></>);
+    expect(loadBlobs).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not read the list again when this session's list is already read and lacks the file", () => {
+    const loadBlobs = vi.fn().mockResolvedValue(undefined);
+    useBlobStore.setState({ activeSessionId: "session-1", blobs: [], isLoading: false, loadBlobs });
+    render(<OptionRows options={{ path: MASKED_PATH, blob_ref: FILE_ID }} ariaLabel="source settings" plugin={{ kind: "source", name: "csv" }} />);
+    expect(loadBlobs).not.toHaveBeenCalled();
+    expect(screen.getByText("File not in this session")).toBeInTheDocument();
+  });
+
+  it("says the name is unavailable when the list read failed, not that the file is gone", () => {
+    useBlobStore.setState({ activeSessionId: "session-1", blobs: [], isLoading: false, error: "Failed to load files.", listLoadFailed: true });
+    render(<OptionRows options={{ path: MASKED_PATH, blob_ref: FILE_ID }} ariaLabel="source settings" plugin={{ kind: "source", name: "csv" }} />);
+    expect(screen.getByText("File name unavailable")).toBeInTheDocument();
+    expect(screen.queryByText("File not in this session")).not.toBeInTheDocument();
+  });
+
+  it("writes nothing to browser storage", () => {
+    seedFile({ filename: "evaluation.csv" });
+    window.localStorage.clear();
+    window.sessionStorage.clear();
+    render(<OptionRows options={{ path: MASKED_PATH, blob_ref: FILE_ID }} ariaLabel="source settings" plugin={{ kind: "source", name: "csv" }} />);
+    expect(window.localStorage.length).toBe(0);
+    expect(window.sessionStorage.length).toBe(0);
+  });
+});
+
 describe("file-backed option values", () => {
   beforeEach(() => {
     // A file-manager host (ChatPanel outside script mode) is mounted.
@@ -601,6 +711,8 @@ describe("llm prompt roles", () => {
     const labels = buttons.map((button) => button.getAttribute("aria-label"));
     expect(labels).toEqual(names.map((name, index) => `Copy prompt template for query ${name} (position ${index + 1})`));
     expect(new Set(labels).size).toBe(labels.length);
+    // Ghost compact: a 36px target (WCAG 2.5.8), not a 21px raw button.
+    buttons.forEach((button) => expect(button).toHaveClass("btn-compact", "btn-ghost"));
     buttons.forEach((button) => fireEvent.click(button));
     await waitFor(() => expect(writeText.mock.calls.map((call) => call[0])).toEqual(queries.map((query) => query.template)));
   });

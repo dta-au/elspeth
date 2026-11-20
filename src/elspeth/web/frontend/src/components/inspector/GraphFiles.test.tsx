@@ -86,16 +86,16 @@ describe("GraphFiles", () => {
     expect(screen.getByText(filesSummary(5))).toBeInTheDocument();
     const table = screen.getByRole("table");
     expect(within(table).getAllByRole("row")).toHaveLength(9);
-    const score = within(table).getByRole("row", { name: /File: shared.txt Transform: score/ });
+    const score = within(table).getByRole("row", { name: /shared.txt Transform: score/ });
     expect(score).toHaveTextContent("System prompt");
     expect(score).toHaveTextContent("User prompt, query CS1");
-    expect(within(table).getByRole("row", { name: /File: shared.txt Transform: rationale/ })).toHaveTextContent("User prompt, query comments");
+    expect(within(table).getByRole("row", { name: /shared.txt Transform: rationale/ })).toHaveTextContent("User prompt, query comments");
     // Copy-register rule: the raw option path is only a title; the visible text is the option's label.
-    const inject = within(table).getByRole("row", { name: /File: criteria.txt Transform: inject/ });
+    const inject = within(table).getByRole("row", { name: /criteria.txt Transform: inject/ });
     expect(inject).not.toHaveTextContent("files.criteria.content");
     expect(within(inject).getByTitle("files.criteria.content")).toHaveTextContent(/^Files: criteria\.content$/);
-    expect(within(table).getByRole("row", { name: /File: input.csv Source: main/ })).toBeInTheDocument();
-    expect(within(table).getByRole("row", { name: /File: shared.txt Sink: out/ })).toBeInTheDocument();
+    expect(within(table).getByRole("row", { name: /input.csv Source: main/ })).toBeInTheDocument();
+    expect(within(table).getByRole("row", { name: /shared.txt Sink: out/ })).toBeInTheDocument();
     expect(screen.getByText("File not in this session")).toBeInTheDocument();
     expect(screen.getByRole("group", { name: "File mappings table" })).toHaveAttribute("tabindex", "0");
     expect(JSON.stringify(state)).toBe(before);
@@ -128,9 +128,9 @@ describe("GraphFiles", () => {
     await user.click(screen.getByText(filesSummary()));
     const table = screen.getByRole("table");
     // shared.txt is also a source and a sink file: the editor refuses the save but still opens with the reason.
-    const shared = within(within(table).getByRole("row", { name: /File: shared.txt Transform: score/ })).getByRole("button", { name: "Edit file for score" });
+    const shared = within(within(table).getByRole("row", { name: /shared.txt Transform: score/ })).getByRole("button", { name: "Edit file for score" });
     expect(shared).toHaveAttribute("aria-disabled", "false");
-    expect(shared).toHaveAccessibleDescription("This file is also used outside a prompt. Ask the assistant to give this prompt its own file.");
+    expect(shared).toHaveAccessibleDescription("This file is also used outside a prompt. Ask Composer to give this prompt its own file.");
     await user.click(shared);
     expect(useBlobStore.getState().editRequest).toMatchObject({ nodeId: "score", fieldPath: "system_prompt" });
     // A file not in this session has no prompt text to show.
@@ -188,9 +188,78 @@ describe("GraphFiles", () => {
     ] };
     render(<GraphFiles state={twoEntries} onShowNode={vi.fn()} />);
     await userEvent.setup().click(screen.getByText(filesSummary()));
-    const row = within(screen.getByRole("table")).getByRole("row", { name: /File: criteria.txt Transform: inject/ });
+    const row = within(screen.getByRole("table")).getByRole("row", { name: /criteria.txt Transform: inject/ });
     expect(within(row).getByTitle("files.alpha.content")).toHaveTextContent(/^Files: alpha\.content$/);
     expect(within(row).getByTitle("files.beta.content")).toHaveTextContent(/^Files: beta\.content$/);
+  });
+
+  it("leads with the actions, names files without a repeated prefix, and labels a file reference 'File'", async () => {
+    render(<GraphFiles state={state} onShowNode={vi.fn()} />);
+    await userEvent.setup().click(screen.getByText(filesSummary()));
+    const table = screen.getByRole("table");
+    expect(within(table).getAllByRole("columnheader").map((cell) => cell.textContent)).toEqual(["Actions", "File", "Used by", "Fields"]);
+    expect(table).not.toHaveTextContent("File:");
+    expect(table).not.toHaveTextContent("Blob Ref");
+    const source = within(table).getByRole("row", { name: /input\.csv Source: main/ });
+    expect(within(source).getByTitle("blob_ref")).toHaveTextContent(/^File$/);
+  });
+
+  it("offers Retry for a failed list read, re-issuing the same read", async () => {
+    useBlobStore.setState({ blobs: [], error: "Failed to load files.", listLoadFailed: true });
+    render(<GraphFiles state={state} onShowNode={vi.fn()} />);
+    await userEvent.setup().click(screen.getByText(filesSummary()));
+    loadBlobs.mockClear();
+    await userEvent.setup().click(within(screen.getByRole("alert")).getByRole("button", { name: "Retry" }));
+    expect(loadBlobs).toHaveBeenCalledWith(state.session_id);
+  });
+
+  it.each([
+    ["a failed list read (Retry offered)", true, "File names are unavailable. Use Retry above."],
+    ["a plain list error (nothing to retry)", false, "File names are unavailable."],
+  ])("says why Edit is blocked after %s, never asking for a reload", async (_case, listLoadFailed, reason) => {
+    useBlobStore.setState({ blobs: [], error: "Failed to load files.", listLoadFailed });
+    render(<GraphFiles state={state} onShowNode={vi.fn()} />);
+    await userEvent.setup().click(screen.getByText(filesSummary()));
+    expect(screen.getByRole("button", { name: "Edit file for solo" })).toHaveAttribute("title", reason);
+    expect(document.body).not.toHaveTextContent(/Reload/i);
+  });
+
+  it("lets a long file or step name wrap at its separators, keeping the text whole", async () => {
+    render(<GraphFiles state={state} onShowNode={vi.fn()} />);
+    await userEvent.setup().click(screen.getByText(filesSummary()));
+    const row = within(screen.getByRole("table")).getByRole("row", { name: /criteria\.txt Transform: inject/ });
+    const name = within(row).getByRole("rowheader");
+    expect(name).toHaveTextContent(/^criteria\.txt$/);
+    expect(name.querySelectorAll("wbr")).toHaveLength(1);
+    expect(row.querySelector(".graph-files-fields")).not.toBeNull();
+  });
+
+  it("sorts rows by file name, keeping graph order within a file", async () => {
+    render(<GraphFiles state={state} onShowNode={vi.fn()} />);
+    await userEvent.setup().click(screen.getByText(filesSummary()));
+    const headers = within(screen.getByRole("table")).getAllByRole("rowheader").map((cell) => cell.textContent);
+    expect(headers).toEqual(["criteria.txt", "input.csv", "File not in this session", "shared.txt", "shared.txt", "shared.txt", "shared.txt", "solo.txt"]);
+    const sharedUsers = within(screen.getByRole("table")).getAllByRole("row").filter((row) => /shared\.txt/.test(row.textContent ?? ""))
+      .map((row) => within(row).getByText(/^(Source|Transform|Sink):/).textContent);
+    expect(sharedUsers).toEqual(["Source: support", "Transform: score", "Transform: rationale", "Sink: out"]);
+  });
+
+  it("filters rows by file name or step name and says how many match", async () => {
+    render(<GraphFiles state={state} onShowNode={vi.fn()} />);
+    const user = userEvent.setup();
+    await user.click(screen.getByText(filesSummary()));
+    const filter = screen.getByRole("searchbox", { name: "Filter by file or step" });
+    expect(screen.getByRole("status")).toHaveTextContent("8 rows");
+    await user.type(filter, "SHARED");
+    await waitFor(() => expect(within(screen.getByRole("table")).getAllByRole("row")).toHaveLength(5));
+    expect(screen.getByRole("status")).toHaveTextContent("4 of 8 rows");
+    await user.clear(filter);
+    await user.type(filter, "rational");
+    await waitFor(() => expect(within(screen.getByRole("table")).getAllByRole("row")).toHaveLength(2));
+    expect(screen.getByRole("button", { name: "Show node rationale" })).toBeInTheDocument();
+    await user.clear(filter);
+    await user.type(filter, "no such thing");
+    await waitFor(() => expect(screen.getByText("No file or step matches this filter.")).toBeInTheDocument());
   });
 
   it("does not borrow another session's filenames or edit its files", async () => {
@@ -209,6 +278,10 @@ describe("GraphFiles", () => {
     const user = userEvent.setup();
     await user.click(screen.getByText(filesSummary()));
     expect(screen.getByRole("alert")).toHaveTextContent("Failed to load files.");
+    // The design system's error banner, not a bare paragraph at the pane edge.
+    expect(screen.getByRole("alert")).toHaveClass("alert-banner", "graph-files-alert");
+    // A plain error (no failed read recorded) offers nothing to retry.
+    expect(within(screen.getByRole("alert")).queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
     expect(screen.queryByText("File not in this session")).not.toBeInTheDocument();
     expect(screen.getAllByText("File name unavailable")).toHaveLength(8);
     act(() => useSessionStore.setState({ compositionState: { ...state, id: "new-state" } }));

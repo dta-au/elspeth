@@ -1,5 +1,4 @@
 import {
-  type JSX,
   useEffect,
   useState,
   useCallback,
@@ -41,6 +40,7 @@ import { HelloWorldTutorial } from "./components/tutorial";
 import {
   REQUEST_RUN_EVENT,
   dispatchAuthoringFocusIntent,
+  dispatchAuthoringToggleIntent,
   dispatchArtifactViewIntent,
 } from "./lib/composer-events";
 import { useAuthStore } from "./stores/authStore";
@@ -66,8 +66,6 @@ import { SaveForReviewDialog } from "./components/composer/SaveForReviewDialog";
 import { ComposerWorkspace } from "./components/workspace/ComposerWorkspace";
 import { ArtifactWorkspace } from "./components/workspace/ArtifactWorkspace";
 import { WorkspaceActionBar } from "./components/workspace/WorkspaceActionBar";
-import { useWorkspacePaneController } from "./components/workspace/WorkspacePaneContext";
-import { useCollapsedAuthoringStatus } from "./components/workspace/useCollapsedAuthoringStatus";
 import { useSessionLifecycle } from "./hooks/useSession";
 import {
   OPEN_CATALOG_EVENT,
@@ -80,27 +78,6 @@ const HEALTH_CHECK_INTERVAL = 30_000;
 // This must run before any component renders so that version-change
 // auto-clear is active from the first render.
 initStoreSubscriptions();
-
-/**
- * Top-level application component.
- *
- * Single composition root: AuthGuard gates the entire app behind authentication,
- * then AppHeader and ComposerWorkspace render the authoring and artifact
- * surfaces. No router in v1 -- the entire application is a single page.
- */
-function CollapsedAuthoringStatus(): JSX.Element {
-  const activeSessionId = useSessionStore((state) => state.activeSessionId);
-  const { state } = useWorkspacePaneController();
-  const status = useCollapsedAuthoringStatus({
-    activeSessionId,
-    authoringCollapsed: state.authoringCollapsed,
-  });
-  return (
-    <span className="workspace-collapsed-status" data-tone={status.tone}>
-      {status.text}
-    </span>
-  );
-}
 
 /**
  * Who shared the graph this session was imported from, or null.
@@ -117,6 +94,13 @@ function sharedImportSharer(meta: Record<string, unknown> | null | undefined): s
   return typeof sharer === "string" && sharer !== "" ? sharer : null;
 }
 
+/**
+ * Top-level application component.
+ *
+ * Single composition root: AuthGuard gates the entire app behind authentication,
+ * then AppHeader and ComposerWorkspace render the authoring and artifact
+ * surfaces. No router in v1 -- the entire application is a single page.
+ */
 function App() {
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   // Deploy-cache coherence beacon: this tab's own bundle identity (null in
@@ -502,6 +486,16 @@ function App() {
         return;
       }
 
+      // Ctrl+\ / Cmd+\: Hide or show the conversation. Alt excluded: on
+      // layouts that type "\" with AltGr (German, Nordic), Windows reports
+      // AltGr as Ctrl+Alt, so the bare check would fire on every typed
+      // backslash in the chat input.
+      if (e.key === "\\" && (e.ctrlKey || e.metaKey) && !e.altKey) {
+        e.preventDefault();
+        dispatchAuthoringToggleIntent();
+        return;
+      }
+
       // Ctrl+Shift+V / Cmd+Shift+V: Validate pipeline
       if (
         e.key === "V" &&
@@ -846,7 +840,6 @@ function App() {
           >
             <ComposerWorkspace
               authoring={<ChatPanel onOpenSecrets={openSecrets} />}
-              collapsedStatus={<CollapsedAuthoringStatus />}
               artifact={
                 // Same availability fact that mounts the REQUEST_RUN_EVENT
                 // owner (ExecuteButton via capabilities.completion), so the

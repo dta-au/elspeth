@@ -95,12 +95,16 @@ export class ComposerPage {
     return this.page.getByRole("group", { name: "Workspace actions" });
   }
 
+  /** The Hide control at the left end of the conversation's title bar
+   *  (2026-11-20; desktop layouts only, none under 960px). */
   collapseAuthoring(): Locator {
-    return this.page.getByRole("button", { name: "Collapse authoring pane" });
+    return this.page.getByRole("button", { name: "Hide conversation", exact: true });
   }
 
+  /** The Show control at the left end of the pipeline's title bar while the
+   *  conversation is hidden; same screen position as the Hide control. */
   restoreAuthoring(): Locator {
-    return this.page.getByRole("button", { name: "Restore authoring pane" });
+    return this.page.getByRole("button", { name: "Show conversation", exact: true });
   }
 
   composeViewTab(): Locator {

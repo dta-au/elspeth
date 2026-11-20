@@ -118,6 +118,10 @@ export type PromptFileEditability =
   | { editable: true }
   | { editable: false; code: string; reason: string; opens: boolean };
 
+/** `prompt_file_unbound`: the slot no longer reads this file. */
+export const PROMPT_FILE_UNBOUND_REASON =
+  "This prompt no longer reads this file. Your text is kept. Refresh the pipeline to see where the prompt points now.";
+
 const EDITABLE_MIME_TYPES = new Set(["text/plain", "text/csv", "application/json", "application/x-jsonlines", "application/jsonl", "text/jsonl"]);
 
 /** Whether a file's type can hold prompt text: the same set the prompt editor opens. */
@@ -152,12 +156,14 @@ export function promptFileEditability({ state, blobs, pendingEvents, nodeId, fie
     || state.outputs.some((output) => optionBlobReferences(output.options).some((ref) => ref.blobId === id))
     || state.nodes.some((node) => optionBlobReferences(node.options).some((ref) =>
       ref.blobId === id && !promptReferences.has(`${node.id}:${ref.fieldPath}:${id}`)));
-  if (mixed) return refuse("prompt_file_mixed_use", "This file is also used outside a prompt. Ask the assistant to give this prompt its own file.");
+  if (mixed) return refuse("prompt_file_mixed_use", "This file is also used outside a prompt. Ask Composer to give this prompt its own file.");
   const matches = bindings.filter((binding) => binding.blobId === id);
   if (matches.length > 1) return refuse("prompt_file_shared_binding", "This file backs more than one prompt. Give each prompt its own file before editing it here.");
   const node = state.nodes.find((candidate) => candidate.id === nodeId);
   if (!node || !matches.some((binding) => binding.nodeId === nodeId && binding.fieldPath === fieldPath)) {
-    return refuse("prompt_file_unbound", "This prompt file is no longer bound here. Reload the session.");
+    // Never "reload": unsaved prompt drafts live in memory only. The editor
+    // pairs this reason with "Refresh pipeline" (a graph read).
+    return refuse("prompt_file_unbound", PROMPT_FILE_UNBOUND_REASON);
   }
   if (matches[0]?.encoding !== "utf-8") return refuse("prompt_file_encoding_unsupported", "This prompt reads the file as non-UTF-8 text. Re-attach it as UTF-8 to edit it here.");
   // A step may use several prompt files; each is edited on its own. While the
