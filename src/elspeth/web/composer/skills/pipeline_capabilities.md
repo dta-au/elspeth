@@ -65,8 +65,9 @@ whose hint reports the pipeline unchanged needs no confirming read.
 
 For an existing transform's routing edit, preserve its description, options,
 and unrelated error routes in the replacement `upsert_node` arguments unless
-the user requests their change. `upsert_node` replaces the whole node; omitting
-one of these fields does not preserve its previous value.
+the user requests their change. `upsert_node` replaces the whole node: an
+omitted `description` is dropped and the supplied `options` replace the old
+ones, so resupply both; an omitted `on_error` keeps the existing choice.
 
 An absent policy-visible plugin is different from an unsupported pipeline
 shape. Say that a plugin is unavailable or policy-denied only when live

@@ -367,6 +367,13 @@ _SKILL_REVIEW_A4_CAPABILITY_SCOPE_CANONICAL_BYTES = 235
 # +831 B growth, preserving the prior 802 B headroom and the exact-boundary /
 # +1-byte overflow control.
 _ADVISOR_SCOPE_DESCRIPTION_GUIDANCE_CANONICAL_BYTES = 831
+# Review correction (2026-11-20): the same pipeline_capabilities.md paragraph
+# now says what a replacing upsert_node keeps (an omitted on_error keeps its
+# choice; an omitted description is dropped; supplied options replace the old
+# ones). Measured the same way: 143,663 B before, 143,749 B after, +86 B, all
+# of it that paragraph (the advisor text edits in the same round are not in
+# this request). Price only that growth; headroom and controls unchanged.
+_UPSERT_NODE_KEEPS_CORRECTION_CANONICAL_BYTES = 86
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
@@ -388,6 +395,7 @@ _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     + _CDA24_MILESTONE_GUIDANCE_CANONICAL_BYTES
     + _SKILL_REVIEW_A4_CAPABILITY_SCOPE_CANONICAL_BYTES
     + _ADVISOR_SCOPE_DESCRIPTION_GUIDANCE_CANONICAL_BYTES
+    + _UPSERT_NODE_KEEPS_CORRECTION_CANONICAL_BYTES
 )
 
 
