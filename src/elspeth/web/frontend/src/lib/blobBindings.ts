@@ -120,6 +120,11 @@ export type PromptFileEditability =
 
 const EDITABLE_MIME_TYPES = new Set(["text/plain", "text/csv", "application/json", "application/x-jsonlines", "application/jsonl", "text/jsonl"]);
 
+/** Whether a file's type can hold prompt text: the same set the prompt editor opens. */
+export function isPromptTextMimeType(mimeType: string): boolean {
+  return EDITABLE_MIME_TYPES.has(mimeType);
+}
+
 /**
  * Display mirror of the save route's refusals (blobs/prompt_text_routes.py);
  * the server remains the save authority. Not mirrored, because only the

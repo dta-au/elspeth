@@ -469,3 +469,85 @@ describe("BlobManager delete confirmation (WCAG 3.3.4)", () => {
     expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
   });
 });
+
+describe("BlobManager file wiring", () => {
+  const originalComposeRequest = useSessionStore.getState().composeRequest;
+  beforeEach(() => {
+    useSessionStore.setState({ activeSessionId: "session-1", isComposing: false,
+      compositionState: selectedState({ prompt_template: "Original prompt." }) });
+    setBlobState([makeBlob({ id: "replacement", filename: "prompt.txt", mime_type: "text/plain", content_hash: "hash" })]);
+  });
+  afterEach(() => {
+    useSessionStore.setState({ composeRequest: originalComposeRequest, compositionState: null, isComposing: false });
+    useBlobStore.setState({ fileManagerOpen: false });
+  });
+
+  it("opens the wiring pad beside the file actions and uses the standard Composer lifecycle", async () => {
+    const composeRequest = vi.fn().mockResolvedValue(undefined);
+    useSessionStore.setState({ composeRequest });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Wiring prompt.txt" }));
+    expect(composeRequest).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("checkbox", { name: /llm — User prompt/ }));
+    await user.click(screen.getByRole("button", { name: "Connect selected prompts" }));
+    expect(composeRequest).toHaveBeenCalledOnce();
+    expect(composeRequest).toHaveBeenCalledWith("send", expect.stringContaining("node:llm.options.prompt_template"));
+    expect(screen.queryByRole("dialog", { name: "File wiring pad" })).not.toBeInTheDocument();
+  });
+
+  it("offers no wiring control for a file that cannot hold prompt text", () => {
+    setBlobState([makeBlob({ id: "image", filename: "chart.png", mime_type: "image/png", content_hash: "hash" })]);
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: "Wiring chart.png" })).not.toBeInTheDocument();
+  });
+
+  it("withholds the old dialog after a session switch, including on return", async () => {
+    const composeRequest = vi.fn();
+    useSessionStore.setState({ composeRequest });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Wiring prompt.txt" }));
+    act(() => useSessionStore.setState({ activeSessionId: "session-2" }));
+    expect(screen.queryByRole("dialog", { name: "File wiring pad" })).not.toBeInTheDocument();
+    act(() => useSessionStore.setState({ activeSessionId: "session-1" }));
+    expect(screen.queryByRole("dialog", { name: "File wiring pad" })).not.toBeInTheDocument();
+    expect(composeRequest).not.toHaveBeenCalled();
+  });
+
+  it("refuses a connection if the graph changes while the pad is open", async () => {
+    const composeRequest = vi.fn();
+    useSessionStore.setState({ composeRequest });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Wiring prompt.txt" }));
+    await user.click(screen.getByRole("checkbox", { name: /llm — User prompt/ }));
+    act(() => useSessionStore.setState({ compositionState: { ...selectedState({ prompt_template: "New prompt." }), id: "state-2" } }));
+    expect(screen.getByRole("button", { name: "Connect selected prompts" })).toBeDisabled();
+    expect(screen.getByText("The graph changed. Close the wiring pad and reopen it.")).toBeInTheDocument();
+    expect(composeRequest).not.toHaveBeenCalled();
+  });
+
+  it("refuses a connection while Composer is busy", async () => {
+    const composeRequest = vi.fn();
+    useSessionStore.setState({ composeRequest });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Wiring prompt.txt" }));
+    await user.click(screen.getByRole("checkbox", { name: /llm — User prompt/ }));
+    act(() => useSessionStore.setState({ isComposing: true }));
+    expect(screen.getByRole("button", { name: "Connect selected prompts" })).toBeDisabled();
+    expect(screen.getByText("Wait for Composer to finish before connecting this file.")).toBeInTheDocument();
+    expect(composeRequest).not.toHaveBeenCalled();
+  });
+
+  it("keeps the file manager open when Escape closes the pad", async () => {
+    useBlobStore.getState().setFileManagerOpen(true);
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Wiring prompt.txt" }));
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "File wiring pad" })).not.toBeInTheDocument();
+    expect(useBlobStore.getState().fileManagerOpen).toBe(true);
+  });
+});

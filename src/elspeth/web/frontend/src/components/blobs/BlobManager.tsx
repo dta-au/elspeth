@@ -7,8 +7,10 @@ import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { BlobRow } from "./BlobRow";
 import { IdentityStorageTotal } from "./IdentityStorageTotal";
 import type { BlobMetadata, BlobCategory } from "@/types/api";
-import { componentOptionsById, optionBlobReferences, promptFileBindings, promptFileEditability } from "@/lib/blobBindings";
+import { componentOptionsById, isPromptTextMimeType, optionBlobReferences, promptFileBindings, promptFileEditability } from "@/lib/blobBindings";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
+import { useComposer } from "@/hooks/useComposer";
+import { FileWiringPad } from "./FileWiringPad";
 
 interface BlobManagerProps {
   onUseAsInput: (blob: BlobMetadata) => void;
@@ -47,6 +49,10 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   // compose is in flight (elspeth-3f38ebb1b5) so the manager cannot offer a
   // second compose the store admission gate would refuse.
   const isComposing = useSessionStore((s) => s.isComposing);
+  const { sendMessage } = useComposer();
+  // The file wiring pad is bound to the session, file and graph state it was
+  // opened on; a change to any of them refuses the connection until reopened.
+  const [pendingWire, setPendingWire] = useState<{ blob: BlobMetadata; sessionId: string; stateId: string | null } | null>(null);
   const pending = useInterpretationEventsStore((s) => activeSessionId ? s.pendingBySession[activeSessionId] : undefined);
   const { blobs, isLoading, error, activeSessionId: blobSessionId, loadBlobs, uploadBlob, deleteBlob, downloadBlob } =
     useBlobStore();
@@ -78,6 +84,16 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   );
   const missingCount = !isLoading && listBelongsToSession ? attached.size - matchedIds.size : 0;
   const promptBindings = useMemo(() => promptFileBindings(compositionState), [compositionState]);
+  const wireFile = pendingWire ? blobs.find((blob) => blob.id === pendingWire.blob.id) : undefined;
+  const wiringDisabledReason = isComposing ? "Wait for Composer to finish before connecting this file."
+    : !wireFile || !listBelongsToSession || isLoading || wireFile.status !== "ready" || wireFile.content_hash !== pendingWire?.blob.content_hash
+      ? "This file changed or is unavailable. Close the wiring pad and reopen it."
+      : (compositionState?.id ?? null) !== pendingWire?.stateId ? "The graph changed. Close the wiring pad and reopen it." : null;
+
+  useEffect(() => {
+    // A pad opened in another session never comes back when that session is reopened.
+    setPendingWire(null);
+  }, [activeSessionId]);
 
   useEffect(() => {
     if (previousSelectedNode.current !== selectedNodeId) {
@@ -304,6 +320,9 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
                     focused={focusedBlobId?.toLowerCase() === blob.id.toLowerCase()}
                     onSelect={() => useBlobStore.setState({ focusedBlobId: blob.id })}
                     editRefusal={editability?.editable === false ? editability.reason : undefined}
+                    onWire={isPromptTextMimeType(blob.mime_type)
+                      ? () => setPendingWire({ blob, sessionId: activeSessionId, stateId: compositionState?.id ?? null }) : undefined}
+                    wiringDisabled={blob.status !== "ready" || !listBelongsToSession || isLoading}
                     onEditPrompt={binding && opensEditor ? () => {
                       useSessionStore.getState().selectNode(binding.nodeId);
                       useBlobStore.getState().requestPromptEdit(binding.nodeId, binding.fieldPath);
@@ -324,6 +343,22 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
           variant="danger"
           onConfirm={confirmDelete}
           onCancel={() => setPendingDelete(null)}
+        />
+      )}
+      {pendingWire?.sessionId === activeSessionId && (
+        <FileWiringPad
+          key={`${pendingWire.sessionId}:${pendingWire.blob.id}:${pendingWire.stateId}`}
+          blob={pendingWire.blob}
+          state={compositionState}
+          blobs={listBelongsToSession ? blobs : []}
+          disabledReason={wiringDisabledReason}
+          onClose={() => setPendingWire(null)}
+          onConnect={(request) => {
+            // Rechecked at dispatch: a pad from an earlier session or graph never sends.
+            if (useSessionStore.getState().activeSessionId !== pendingWire.sessionId || wiringDisabledReason !== null) return;
+            void sendMessage(request);
+            setPendingWire(null);
+          }}
         />
       )}
     </div>

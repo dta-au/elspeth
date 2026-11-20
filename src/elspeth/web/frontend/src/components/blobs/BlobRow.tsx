@@ -36,6 +36,9 @@ interface BlobRowProps {
   onEditPrompt?: () => void;
   /** Why a save of this prompt file would be refused, or why it cannot be opened at all. */
   editRefusal?: string;
+  /** Opens the file wiring pad; absent for a file that cannot hold prompt text. */
+  onWire?: () => void;
+  wiringDisabled?: boolean;
   onSelect?: () => void;
 }
 
@@ -108,6 +111,8 @@ export function BlobRow({
   focused = false,
   onEditPrompt,
   editRefusal,
+  onWire,
+  wiringDisabled = false,
   onSelect,
 }: BlobRowProps) {
   const chipId = useId();
@@ -240,6 +245,19 @@ export function BlobRow({
 
         {/* Actions */}
         <div className="blob-row-actions">
+          {onWire && (
+            <Button
+              variant="bare"
+              onClick={onWire}
+              title="Open file wiring pad"
+              aria-label={`Wiring ${blob.filename}`}
+              className="blob-action-btn"
+              aria-describedby={attached ? chipId : undefined}
+              disabled={wiringDisabled}
+            >
+              <Icon name="pipeline" />
+            </Button>
+          )}
           {(onEditPrompt || editRefusal) && <>
             <Button type="button" variant="bare" onClick={onEditPrompt} aria-disabled={onEditPrompt === undefined} title={editRefusal}
               aria-label={`Edit prompt ${blob.filename}`}
