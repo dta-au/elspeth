@@ -37,6 +37,11 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
   const filenameLoading = useBlobStore((state) => state.activeSessionId !== sessionId || state.isLoading);
   const blobSessionId = useBlobStore((state) => state.activeSessionId);
   const blobs = useBlobStore((state) => state.blobs);
+  // The file's hash as the file list last reported it. A change that is not
+  // this editor's own save means the file was rewritten elsewhere (Composer,
+  // another tab), so the editor re-reads it instead of saving against an old base.
+  const listedHash = useBlobStore((state) => state.activeSessionId !== sessionId ? null
+    : state.blobs.find((candidate) => candidate.id.toLowerCase() === blobId.toLowerCase())?.content_hash ?? null);
   const editRequest = useBlobStore((state) => state.editRequest);
   const compositionState = useSessionStore((state) => state.compositionState);
   const pending = useInterpretationEventsStore((state) => sessionId ? state.pendingBySession[sessionId] : undefined);
@@ -58,6 +63,10 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
   // neither `expanded` nor `text` changes and the click would do nothing.
   const [focusRequestSeq, setFocusRequestSeq] = useState(0);
   const editorRef = useRef<HTMLTextAreaElement>(null);
+  // Which file the current read belongs to; a read that resolves after the
+  // slot moved to another file (or the editor unmounted) is dropped.
+  const readKeyRef = useRef<string | null>(null);
+  const seenListedHashRef = useRef(listedHash);
   // The Edit button that opened the editor, so Close can hand focus back to
   // the row the user came from (several query rows can share one slot).
   const triggerRef = useRef<HTMLElement | null>(null);
@@ -116,23 +125,49 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
   }, [sessionId, nodeId, fieldPath, expanded]);
 
   useEffect(() => {
-    let live = true;
+    const key = JSON.stringify([sessionId, nodeId, fieldPath, blobId]);
+    readKeyRef.current = key;
     setSavedText(null);
     setExpectedSha256(null);
     setStatus(null);
     if (sessionId) {
       readPromptFileText(sessionId, blobId)
         .then(({ text: content, sha256 }) => {
-          if (!live) return;
+          if (readKeyRef.current !== key) return;
           setExpectedSha256(sha256);
           setSavedText(content);
         })
         .catch((failure: unknown) => {
-          if (live) setStatus({ tone: "error", text: failure instanceof Error ? failure.message : "Could not load this prompt file." });
+          if (readKeyRef.current === key) setStatus({ tone: "error", text: failure instanceof Error ? failure.message : "Could not load this prompt file." });
         });
     }
-    return () => { live = false; };
+    return () => { readKeyRef.current = null; };
   }, [sessionId, nodeId, fieldPath, blobId]);
+
+  // Read the current file again, keeping what is on screen until it arrives.
+  // Unsaved text stays in the draft store, so a newer file turns it stale (the
+  // banner below says so) and a clean editor simply shows the new text.
+  // Resolves to the file's hash, or null when the editor moved on meanwhile.
+  const reread = async (): Promise<string | null> => {
+    const key = readKeyRef.current;
+    if (!sessionId || key === null) return null;
+    const { text: content, sha256 } = await readPromptFileText(sessionId, blobId);
+    if (readKeyRef.current !== key) return null;
+    setExpectedSha256(sha256);
+    setSavedText(content);
+    return sha256;
+  };
+  const rereadRef = useRef(reread);
+  rereadRef.current = reread;
+
+  // The file list reported a new hash that is not the version on screen.
+  useEffect(() => {
+    const previous = seenListedHashRef.current;
+    seenListedHashRef.current = listedHash;
+    if (listedHash === null || previous === null || listedHash === previous) return;
+    if (expectedSha256 === null || listedHash === expectedSha256) return;
+    void rereadRef.current().catch(() => undefined);
+  }, [listedHash, expectedSha256]);
 
   const save = async () => {
     if (!slot || !sessionId || !draft || stale || refusal !== null) return;
@@ -165,6 +200,21 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
     } catch (failure: unknown) {
       if (isCurrent()) {
         const typed = failure as { detail?: unknown; error_type?: unknown };
+        if (typed.error_type === "prompt_file_stale") {
+          // The server refuses a save whose base is not the file's current
+          // version. Read the current version: if it is newer, the draft turns
+          // stale and the banner offers the way out, so no second message.
+          // If the file is unchanged, the refusal was about the step's review,
+          // and the server's own wording says what to do.
+          let current: string | null = null;
+          try {
+            current = await reread();
+          } catch {
+            setStatus({ tone: "error", text: "Could not read the current version of this file. Try saving again." });
+            return;
+          }
+          if (current === null || current !== draft.baseSha256) return;
+        }
         setStatus({ tone: "error", text: typed.error_type === "prompt_file_review_pending"
           ? "Complete the existing node review before editing its files."
           : typed.error_type === "prompt_file_review_pending_inline"
@@ -233,17 +283,31 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
       </div>
       {refusal && <AlertBanner tone="warning" role="note" id={refusalId} className="prompt-editor-notice">{refusal}</AlertBanner>}
       {stale && draft && (
-        <AlertBanner tone="warning" role="note" id={staleId} className="prompt-editor-notice">
+        // A status, so the banner is announced when the file changes under an
+        // open editor, not only found later.
+        <AlertBanner tone="warning" role="status" id={staleId} className="prompt-editor-notice">
           {draft.blobId.toLowerCase() !== blobId.toLowerCase()
             ? `This prompt now reads a different file. Your unsaved text from ${draftFilename ?? "the earlier file"} is kept below.`
             : "This file changed since you started editing. Your unsaved text is kept below."}
           {" "}Put it on the current file to save it there, or discard it to load the current file.
           <span className="prompt-editor-stale-actions">
             <Button type="button" variant="ghost" compact disabled={currentBase === null}
-              onClick={() => { if (slot && currentBase) usePromptDraftStore.getState().rebase(slot, currentBase); }}>
+              onClick={() => {
+                if (!slot || !currentBase) return;
+                usePromptDraftStore.getState().rebase(slot, currentBase);
+                // The banner and this button go away; the text the user kept is next.
+                editorRef.current?.focus();
+              }}>
               Put my text on the current file
             </Button>
           </span>
+          {savedText !== null && (
+            // What Save would replace, before the user chooses to replace it.
+            <details className="prompt-editor-current">
+              <summary>View current file</summary>
+              <pre className="prompt-editor-current-text">{savedText}</pre>
+            </details>
+          )}
         </AlertBanner>
       )}
       <textarea

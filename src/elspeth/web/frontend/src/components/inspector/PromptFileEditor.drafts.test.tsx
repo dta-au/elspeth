@@ -170,3 +170,82 @@ describe("unsaved prompt text survives the editor unmounting", () => {
     expect(await editor()).toHaveValue("text of file-a");
   });
 });
+
+describe("the file changes while its editor is open", () => {
+  const STALE_SERVER_TEXT = "This file changed since you opened it. Reload it and retry.";
+  const listHash = (sha256: string) => act(() => useBlobStore.setState({
+    blobs: useBlobStore.getState().blobs.map((item) => item.id === "file-a" ? { ...item, content_hash: sha256 } : item),
+  }));
+
+  it("re-reads the file when the file list reports a new version, keeps the draft and announces the banner", async () => {
+    render(<Inspector />);
+    const box = await typeDraft("mine");
+    vi.mocked(readPromptFileText).mockResolvedValue({ text: "Composer's newer text", sha256: SHA_B });
+    listHash(SHA_B);
+    await waitFor(() => expect(screen.getByText(/This file changed since you started editing\. Your unsaved text is kept/)).toBeInTheDocument());
+    // Announced when it appears (a status), not a static note.
+    expect(screen.getByText(/This file changed since you started editing/).closest("[role]")).toHaveAttribute("role", "status");
+    expect(box).toHaveValue("mine");
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    expect(readPromptFileText).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows the new text in a clean open editor", async () => {
+    render(<Inspector />);
+    act(() => useBlobStore.getState().requestPromptEdit("score", "prompt_template"));
+    const box = await editor();
+    await waitFor(() => expect(box).toHaveValue("text of file-a"));
+    vi.mocked(readPromptFileText).mockResolvedValue({ text: "Composer's newer text", sha256: SHA_B });
+    listHash(SHA_B);
+    await waitFor(() => expect(box).toHaveValue("Composer's newer text"));
+    expect(screen.queryByText(/This file changed/)).not.toBeInTheDocument();
+  });
+
+  it("does not re-read after its own save moves the listed hash", async () => {
+    render(<Inspector />);
+    await typeDraft("save me");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(usePromptDraftStore.getState().drafts).toEqual({}));
+    listHash(SHA_B);
+    await act(async () => { await Promise.resolve(); });
+    expect(readPromptFileText).toHaveBeenCalledTimes(1);
+  });
+
+  it("turns a stale save refusal into the banner, with the server's 'reload' wording never shown", async () => {
+    vi.mocked(savePromptFile).mockRejectedValue({ error_type: "prompt_file_stale", detail: STALE_SERVER_TEXT });
+    render(<Inspector />);
+    const box = await typeDraft("mine");
+    vi.mocked(readPromptFileText).mockResolvedValue({ text: "Composer's newer text", sha256: SHA_B });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(screen.getByText(/This file changed since you started editing/)).toBeInTheDocument());
+    expect(screen.queryByText(/reload/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(box).toHaveValue("mine");
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+  });
+
+  it("keeps the server's wording when a stale refusal is about the step's review, not the file", async () => {
+    const reviewText = "This step's prompt is waiting for review. Reload the page so the step's review card appears, approve it, then edit the file.";
+    vi.mocked(savePromptFile).mockRejectedValue({ error_type: "prompt_file_stale", detail: reviewText });
+    render(<Inspector />);
+    await typeDraft("mine");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(reviewText);
+    expect(screen.queryByText(/This file changed since you started editing/)).not.toBeInTheDocument();
+  });
+
+  it("shows what Save would replace, and moves focus to the text once the user keeps theirs", async () => {
+    render(<Inspector />);
+    const box = await typeDraft("mine");
+    vi.mocked(readPromptFileText).mockResolvedValue({ text: "Composer's newer text", sha256: SHA_B });
+    listHash(SHA_B);
+    const summary = await screen.findByText("View current file");
+    expect(summary.tagName).toBe("SUMMARY");
+    expect(summary.closest("details")?.querySelector("pre")).toHaveTextContent("Composer's newer text");
+    fireEvent.click(screen.getByRole("button", { name: "Put my text on the current file" }));
+    expect(box).toHaveFocus();
+    expect(box).toHaveValue("mine");
+    expect(screen.queryByText("View current file")).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save" })).toBeEnabled());
+  });
+});

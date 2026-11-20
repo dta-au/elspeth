@@ -496,6 +496,54 @@
   white-space: nowrap;
 }
 
+/* Unsaved prompt text whose slot is gone (UnhomedPromptDrafts), above Files. */
+.prompt-drafts-unhomed {
+  margin: var(--space-sm) var(--space-pane-gutter);
+}
+
+.prompt-drafts-unhomed-title {
+  margin: 0;
+  font-weight: var(--font-weight-semibold);
+}
+
+.prompt-drafts-unhomed-note {
+  margin: var(--space-2xs) 0 var(--space-xs);
+}
+
+.prompt-drafts-unhomed-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.prompt-drafts-unhomed-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-xs) var(--space-sm);
+}
+
+.prompt-drafts-unhomed-name {
+  display: flex;
+  flex: 1 1 14rem;
+  flex-direction: column;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.prompt-drafts-unhomed-meta {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.prompt-drafts-unhomed-actions {
+  display: flex;
+  gap: var(--space-xs);
+}
+
 .graph-files-alert {
   margin: 0 var(--space-pane-gutter) var(--space-sm);
 }
@@ -1052,6 +1100,31 @@
 .prompt-editor-stale-actions {
   display: flex;
   margin-top: var(--space-xs);
+}
+
+/* "View current file" in the stale banner: the text Save would replace. */
+.prompt-editor-current {
+  margin-top: var(--space-xs);
+}
+
+.prompt-editor-current > summary {
+  cursor: pointer;
+  font-weight: var(--font-weight-semibold);
+}
+
+.prompt-editor-current-text {
+  max-height: 12rem;
+  overflow: auto;
+  margin: var(--space-xs) 0 0;
+  padding: var(--space-xs) var(--space-sm);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
 }
 
 .prompt-editor-hint {

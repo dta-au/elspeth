@@ -64,6 +64,7 @@ import { ConfigRows } from "./ConfigRows";
 import { OptionRows } from "./OptionRows";
 import { GraphOutputs } from "./GraphOutputs";
 import { GraphFiles } from "./GraphFiles";
+import { UnhomedPromptDrafts } from "./UnhomedPromptDrafts";
 import { PromptFileEditor } from "./PromptFileEditor";
 import { visibleGraphRoutes } from "@/lib/graphRouteVisibility";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
@@ -2413,6 +2414,9 @@ export function GraphView({ onFullscreen, inModal = false }: GraphViewProps = {}
             />
           )}
         </div>
+        <ErrorBoundary label="Unsaved prompt text">
+          <UnhomedPromptDrafts />
+        </ErrorBoundary>
         {compositionState && (
           <ErrorBoundary label="File mappings table">
             <GraphFiles key={compositionState.session_id} state={compositionState} onShowNode={showFileNode}
