@@ -187,12 +187,13 @@ def _blob_inline_validation_error(violation: BlobInlineValidationViolation) -> V
     if violation.field_path == BLOB_INLINE_AGGREGATE_FIELD_PATH:
         # The detail is the whole refusal sentence (total, cap, bindings);
         # the code is the one every oversized refusal has always carried.
+        # A pipeline total can only be oversized, so the code is spelled out.
         return ValidationError(
             component_id=None,
             component_type=None,
             message=violation.detail,
             suggestion=_INLINE_BLOB_TOTAL_REPAIR,
-            error_code=f"{violation.category}_inline_blob_content",
+            error_code="oversized_inline_blob_content",
         )
     not_text = violation.category == "not_text"
     return ValidationError(

@@ -172,6 +172,8 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("execution/http_errors.py", "pipeline_validation_http_exception", "err.error_code"),
         # RuntimeYamlImportError's only code is the literal censused at yaml_importer.py.
         ("sessions/routes/composer/state.py", "seed_state_from_runtime_yaml", "exc.error_code"),
+        # PromptFileTooLargeError's only code is a class constant (pinned below).
+        ("sessions/routes/composer/state.py", "_import_prompt_file_too_large_refusal", "exc.error_code"),
         ("coordination/repository.py", "record_composition_rejection", "error_code"),
         ("sessions/protocol.py", "decode_stored_composition_validation_errors", "error_code"),
         ("sessions/protocol.py", "serialize_composition_validation_error", "value.error_code"),
@@ -429,6 +431,9 @@ class TestRegistryCensus:
             f"{category}_inline_blob_content" for category in get_args(BlobInlineValidationCategory) if category != "not_text"
         } <= REGISTERED_ERROR_CODES
         assert "inline_blob_not_text" in REGISTERED_ERROR_CODES
+        from elspeth.web.sessions.protocol import PromptFileTooLargeError
+
+        assert PromptFileTooLargeError.error_code in REGISTERED_ERROR_CODES
         assert {"web_scrape_private_network_not_allowed", "web_fetch_private_network_not_allowed"} <= REGISTERED_ERROR_CODES
 
     def test_every_blocking_proof_diagnostic_code_is_registered(self) -> None:
