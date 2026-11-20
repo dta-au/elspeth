@@ -23,6 +23,7 @@ from __future__ import annotations
 # Slice 4 — additional imports for shared validation/repair helpers.
 import json
 import re
+import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -96,12 +97,14 @@ from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     REQUIRED_CONTROL_AUTO_WIRED_USER_TERM,
+    SERVER_STAGED_PIPELINE_DECISION_USER_TERMS,
     SOURCE_AUTHORING_KEY,
     SOURCE_COMPONENT_ID,
     InterpretationRequirement,
     ServerStagedRequiredControlUserTerm,
     UnknownInterpretationRequirementError,
     composer_pipeline_decision_user_term_error,
+    is_server_staged_review,
     parse_interpretation_requirements,
     project_planner_context_interpretation_requirement,
     prompt_review_draft_from_options,
@@ -771,7 +774,10 @@ def _reserved_connection_names(state: CompositionState) -> set[str]:
     return names
 
 
-_DUPLICATE_CONSUMER_REASON: Final = "One connection can feed one processing node; every node listed reads this one."
+_DUPLICATE_CONSUMER_REASON: Final = (
+    "One connection can feed one processing node; every node listed reads this one. "
+    "Change only the input bindings; preserve existing node options."
+)
 
 
 def _duplicate_consumer_repair_suggestions(
@@ -1814,8 +1820,9 @@ _SOURCE_VALIDATION_FAILURE_DESCRIPTION: Final[str] = (
 
 _STEP_DESCRIPTION_DESCRIPTION: Final[str] = (
     "One short sentence of plain prose saying what this step does, shown to reviewers "
-    "on the Spec tab. Supply it when creating the step and refresh it whenever you "
-    "change what the step does. Informational only — never affects validation or execution."
+    "on the Spec tab. Supply it for new steps. Preserve it during routing-only edits or explicit "
+    "content-preservation requests; refresh it only when the requested change includes the step's "
+    "purpose or description. Informational only — never affects validation or execution."
 )
 
 
@@ -2761,9 +2768,9 @@ def _normalize_echoed_interpretation_requirements(
     does NOT match — a single differing field included — is left verbatim for
     the gate to reject, so the elspeth-4496f61e30 forgery guard is untouched
     for non-matching values, and a forged "resolved" row on a component with
-    no stored counterpart never matches anything. The server-staged
-    required-control disclosure row is never normalized: only the
-    required-control finalizer may stage its user_term.
+    no stored counterpart never matches anything. A server-staged
+    required-control row is never normalized to a shell; the separate
+    boundary drops its exact echo and keeps the stored row.
 
     Returns the (possibly rewritten) options and whether any row was reduced.
     """
@@ -2807,6 +2814,131 @@ def _normalize_echoed_interpretation_requirements(
     if not normalized_any:
         return options, False
     return {**options, INTERPRETATION_REQUIREMENTS_KEY: normalized_rows}, True
+
+
+@observation_boundary(
+    tier=3,
+    source="model-supplied composer node options payload",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant="only an exact echo of a stored server-staged row is dropped; changed model rows remain for admission; malformed stored rows raise",
+)
+def _server_staged_requirement_boundary(
+    options: Mapping[str, object], *, stored_options: Mapping[str, object] | None, node_id: str
+) -> tuple[Mapping[str, object], str | None]:
+    if stored_options is None or INTERPRETATION_REQUIREMENTS_KEY not in options:
+        return options, None
+    if INTERPRETATION_REQUIREMENTS_KEY not in stored_options:
+        return options, None
+    stored_rows = stored_options[INTERPRETATION_REQUIREMENTS_KEY]
+    if not isinstance(stored_rows, (list, tuple)):
+        raise AuditIntegrityError(f"Stored interpretation requirements for node {node_id!r} are not rows")
+    echoes: dict[str, str] = {}
+    for stored in stored_rows:
+        if not isinstance(stored, Mapping):
+            raise AuditIntegrityError(f"Stored interpretation requirement for node {node_id!r} is not a row")
+        term = stored["user_term"]
+        if not isinstance(term, str):
+            raise AuditIntegrityError(f"Stored interpretation requirement for node {node_id!r} has no valid user term")
+        if not is_server_staged_review(stored["kind"], term):
+            continue
+        shell = {
+            "kind": stored["kind"],
+            "user_term": term,
+            "draft": stored["draft"],
+        }
+        if "display_title" in stored:
+            shell["display_title"] = stored["display_title"]
+        for view in (stored, project_planner_context_interpretation_requirement(stored), shell):
+            echoes[stable_hash(deep_thaw(view))] = term
+    if not echoes:
+        return options, None
+    supplied_rows = options[INTERPRETATION_REQUIREMENTS_KEY]
+    if supplied_rows == []:
+        term = next(iter(echoes.values()))
+        return options, (
+            f"Node '{node_id}' carries a server-staged review ({term}) that only the user can resolve, on its card. "
+            "interpretation_requirements [] would clear it. Nothing was changed. To edit the node, "
+            "re-send it without interpretation_requirements; the review is kept."
+        )
+    if not isinstance(supplied_rows, list):
+        return options, None
+    kept = [
+        row
+        for row in supplied_rows
+        if (isinstance(row, Mapping) and type(row.get("user_term")) is ServerStagedRequiredControlUserTerm)
+        or not isinstance(row, Mapping)
+        or stable_hash(deep_thaw(row)) not in echoes
+    ]
+    if len(kept) == len(supplied_rows):
+        return options, None
+    rewritten = dict(options)
+    if kept:
+        rewritten[INTERPRETATION_REQUIREMENTS_KEY] = kept
+    else:
+        del rewritten[INTERPRETATION_REQUIREMENTS_KEY]
+    return rewritten, None
+
+
+# Single letters from other scripts that render like a Latin letter, and two
+# digits that render like letters, mapped to that letter (lower case). This is a
+# fixed subset for one comparison, not a general confusables table: characters
+# outside it compare as themselves.
+_RESERVED_TERM_LOOKALIKES = str.maketrans(
+    {
+        "\u0430": "a",
+        "\u0441": "c",
+        "\u0501": "d",
+        "\u0435": "e",
+        "\u0261": "g",
+        "\u04bb": "h",
+        "\u0456": "i",
+        "\u0458": "j",
+        "\u043a": "k",
+        "\u04cf": "l",
+        "\u043e": "o",
+        "\u0440": "p",
+        "\u051b": "q",
+        "\u0455": "s",
+        "\u0443": "y",
+        "\u0445": "x",
+        "\u051d": "w",
+        "\u03b1": "a",
+        "\u03b5": "e",
+        "\u03b9": "i",
+        "\u03ba": "k",
+        "\u03bd": "v",
+        "\u03bf": "o",
+        "\u03c1": "p",
+        "\u03c4": "t",
+        "\u03c5": "u",
+        "\u03c7": "x",
+        "\u0131": "i",
+        "\u0269": "i",
+        "\u0251": "a",
+        "\u0142": "l",
+        "0": "o",
+        "1": "l",
+    }
+)
+# Letters with no visible glyph (Hangul and braille fillers).
+_INVISIBLE_LETTERS = frozenset("\u115f\u1160\u3164\uffa0\u2800")
+
+
+def _reserved_term_skeleton(term: str) -> str:
+    """Fold a term for comparison with the reserved server terms.
+
+    Compatibility forms are decomposed, invisible and combining characters are
+    dropped, case is folded, and the fixed look-alike letters above map to
+    their Latin letter. Every other character is kept as itself, so a term in
+    another script, or one that mixes scripts, does not match.
+    """
+    kept = "".join(
+        char
+        for char in unicodedata.normalize("NFKD", term)
+        if unicodedata.category(char) not in {"Cf", "Mn", "Me", "Cc", "Zs"} and not char.isspace() and char not in _INVISIBLE_LETTERS
+    )
+    return kept.casefold().translate(_RESERVED_TERM_LOOKALIKES)
 
 
 @observation_boundary(
@@ -2911,7 +3043,10 @@ def _resolver_owned_interpretation_requirement_error(
             or not draft.strip()
         ):
             return malformed_error
-        if user_term == REQUIRED_CONTROL_AUTO_WIRED_USER_TERM and not server_staged_auto_wire:
+        # Admission compares reserved-term skeletons; persisted ownership uses
+        # the original kind and term. Only the nominal marker can author one.
+        reserved_term = _reserved_term_skeleton(user_term) in SERVER_STAGED_PIPELINE_DECISION_USER_TERMS
+        if reserved_term and not server_staged_auto_wire:
             return (
                 f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY}[{index}] uses "
                 f"server-owned user_term '{REQUIRED_CONTROL_AUTO_WIRED_USER_TERM}'. "

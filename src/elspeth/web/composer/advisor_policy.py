@@ -267,10 +267,12 @@ _ADVISOR_FINDINGS_UNTRUSTED_END: Final[str] = "END_UNTRUSTED_ADVISOR_FINDINGS"
 ADVISOR_FINAL_REPLY_CONTRACT_CLAUSE: Final[str] = (
     "The end user has not read these findings: write your final reply to stand on its own and do not quote the fenced text."
 )
-ADVISOR_OUTPUT_CONTRACT_CLAUSE: Final[str] = "Fix the findings via tool calls. " + ADVISOR_FINAL_REPLY_CONTRACT_CLAUSE
+ADVISOR_OUTPUT_CONTRACT_CLAUSE: Final[str] = (
+    "Fix applicable findings via tools, or explain evidence that no edit is needed. " + ADVISOR_FINAL_REPLY_CONTRACT_CLAUSE
+)
 
 # elspeth-71617f1d21: the END-gate repair-continue message must state that
-# MUTATIONS are expected. In session 2e0c8ea3 both advisor repair turns were
+# MUTATIONS are expected for actual graph defects. In session 2e0c8ea3 both advisor repair turns were
 # spent entirely on get_pipeline_state lookups — the injection carried only
 # the output-contract clause, and nothing said a read-only turn is a wasted
 # pass. END-gate only: the EARLY advisory injection deliberately keeps its
@@ -281,10 +283,13 @@ ADVISOR_OUTPUT_CONTRACT_CLAUSE: Final[str] = "Fix the findings via tool calls. "
 # a large remaining graph must not become a self-selected checkpoint.
 # Trailing space is load-bearing: the two clauses concatenate.
 ADVISOR_MUTATION_EXPECTATION_CLAUSE: Final[str] = (
-    "If the user's active request authorizes changes, resolve graph findings through pipeline MUTATIONS via tool calls "
+    "If the user's active request authorizes changes, resolve applicable graph findings through pipeline MUTATIONS via tool calls "
     "(e.g. patch_node_options, upsert_node, patch_source_options, "
     "patch_output_options). Re-reading state (get_pipeline_state) or other "
-    "lookup-only calls is not a fix, though they can supply evidence. If the user asks for explanation or says not to make changes, "
+    "lookup-only calls is not a fix, though they can supply evidence. If a finding contradicts supplied evidence or binding contracts, "
+    "state that evidence in a reply that stands on its own for the user; do not change correct content or make no-op edits "
+    "to obtain another pass. "
+    "If the user asks for explanation or says not to make changes, "
     "answer that request without changing the pipeline; the advisor block still prevents completion. "
     "For a specific missing decision or suspected technical inability, call request_advisor_hint alone "
     "with trigger=cannot_complete and the observed evidence. On CONTINUE, take the supported next action; "

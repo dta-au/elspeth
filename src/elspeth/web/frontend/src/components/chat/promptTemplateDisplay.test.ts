@@ -119,7 +119,10 @@ describe("promptReviewDisplay — file-backed", () => {
       { bindings: [binding("prompt_template", text)] },
     ));
     expect(result.reviewAvailable).toBe(true);
-    expect(result.text).toBe(`File: review.txt (prompt_template)\n\n${text}`);
+    // The file name goes under the prompt's own heading, not into its text.
+    expect(result.text).toBe(text);
+    expect(result.promptTemplateFile).toBe("review.txt");
+    expect(result.systemPromptFile).toBeUndefined();
     expect(result.systemPrompt).toBe("Inline system.");
   });
 
@@ -129,7 +132,9 @@ describe("promptReviewDisplay — file-backed", () => {
       { bindings: [binding("system_prompt", "Bound system.", "system.md")] },
     ));
     expect(result.systemPrompt).toBe("Bound system.");
-    expect(result.text).toBe("File: system.md (system_prompt)\n\nUser.");
+    expect(result.systemPromptFile).toBe("system.md");
+    expect(result.promptTemplateFile).toBeUndefined();
+    expect(result.text).toBe("User.");
   });
 
   it.each([
@@ -141,8 +146,25 @@ describe("promptReviewDisplay — file-backed", () => {
       { bindings: [binding(fieldPath, "Bound query text.")] },
     ));
     expect(result.reviewAvailable).toBe(true);
-    expect(result.text).toContain(`File: review.txt (${fieldPath})\n\n`);
-    expect(result.text).toContain("Query 'classify':\nBound query text.\n");
+    expect(result.text).not.toContain(fieldPath);
+    expect(result.text).toContain("Query 'classify':\nFile: review.txt\nBound query text.\n");
+  });
+
+  it("names a multi-query step's bound system prompt under its own line", () => {
+    const result = promptReviewDisplay("evt-1", snapshot(
+      { system_prompt: MARKER, queries: [{ name: "classify", template: "Q." }] },
+      { bindings: [binding("system_prompt", "Bound system.", "system.md")] },
+    ));
+    expect(result.text).toContain("System prompt (sent with every query):\nFile: system.md\nBound system.\n");
+    expect(result.text).not.toContain("(system_prompt)");
+  });
+
+  it("still names a bound file it has no section for, above the prompt", () => {
+    const result = promptReviewDisplay("evt-1", snapshot(
+      { prompt_template: "User." },
+      { bindings: [binding("queries.0.template", "Orphan.", "extra.txt")] },
+    ));
+    expect(result.text.startsWith("File: extra.txt (queries.0.template)\n\n")).toBe(true);
   });
 
   it("is not approvable once the bound files no longer match the live node", () => {

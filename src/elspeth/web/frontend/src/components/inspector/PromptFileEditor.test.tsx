@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, expect, it, vi } from "vitest";
 import { fetchCompositionState, readPromptFileText, savePromptFile } from "@/api/client";
 import { useBlobStore } from "@/stores/blobStore";
@@ -109,10 +109,11 @@ it("shows a typed refusal and retains the user's draft", async () => {
   expect(editor).toHaveValue("my draft");
 });
 
+const KEPT = "Your text is still here and not saved. Copy it before you reload the page.";
+
 it.each([
   ["prompt_file_review_pending_inline", "Approve the review card first, then edit the file."],
   ["prompt_file_review_pending", "Complete the existing node review before editing its files."],
-  ["prompt_file_binding_changed", "This prompt file moved since you opened it. Reload the session."],
 ])("shows %s guidance", async (errorType, message) => {
   vi.mocked(savePromptFile).mockRejectedValue({ error_type: errorType });
   render(<PromptFileEditors nodeId="first" options={{ prompt_template: { mode: "inline_content", blob_ref: "blob-1" } }} />);
@@ -122,6 +123,92 @@ it.each([
   fireEvent.click(screen.getByRole("button", { name: "Save" }));
   expect(await screen.findByRole("alert")).toHaveTextContent(message);
   expect(editor).toHaveValue("my draft");
+});
+
+async function refuseSave(failure: unknown) {
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+  vi.mocked(savePromptFile).mockRejectedValue(failure);
+  render(<PromptFileEditors nodeId="first" options={{ prompt_template: { mode: "inline_content", blob_ref: "blob-1" } }} />);
+  const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
+  await waitFor(() => expect(editor).toHaveValue("first line\n  second line\n"));
+  // No Copy while the text can still be saved normally.
+  expect(screen.queryByRole("button", { name: "Copy your unsaved text" })).not.toBeInTheDocument();
+  fireEvent.change(editor, { target: { value: "my draft" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  const alert = await screen.findByRole("alert");
+  return { alert, editor, writeText };
+}
+
+// The server's own wording is shown as sent (some of it asks for a page
+// reload); the client line under it says the text is kept and unsaved.
+it.each([
+  // prompt_text_routes.py's card-owed and bindings-changed refusals: both are
+  // prompt_file_stale on an unchanged file, so the server's text is shown.
+  ["the review-card-owed refusal", { error_type: "prompt_file_stale", detail: "This step's prompt is waiting for review. Reload the page so the step's review card appears, approve it, then edit the file." }],
+  ["the bindings-changed refusal", { error_type: "prompt_file_stale", detail: "Prompt bindings changed. Reload the session and retry." }],
+  ["an unknown refusal with a server reason", { detail: "Something the server said." }],
+  ["prompt_file_review_pending", { error_type: "prompt_file_review_pending" }],
+])("adds the kept-text line and a Copy button under %s", async (_case, failure) => {
+  const { alert, editor, writeText } = await refuseSave(failure);
+  if (typeof (failure as { detail?: string }).detail === "string") expect(alert).toHaveTextContent((failure as { detail: string }).detail);
+  expect(alert).toHaveTextContent(KEPT);
+  const copy = screen.getByRole("button", { name: "Copy your unsaved text" });
+  expect(copy.closest(".prompt-editor-actions")).not.toBeNull();
+  fireEvent.click(copy);
+  await waitFor(() => expect(writeText).toHaveBeenCalledWith("my draft"));
+  expect(editor).toHaveValue("my draft");
+  // In memory only: nothing about the draft goes to browser storage.
+  expect(window.localStorage.length).toBe(0);
+  expect(window.sessionStorage.length).toBe(0);
+});
+
+it("words a failed save with no server reason without asking for a reload, and offers Copy", async () => {
+  const { alert } = await refuseSave(new Error("network down"));
+  expect(alert).toHaveTextContent(/^Could not save this prompt file\. Your text is still here\. Try Save again; if it keeps failing, copy your text before you leave this page\.$/);
+  expect(alert).not.toHaveTextContent(/reload/i);
+  expect(screen.getByRole("button", { name: "Copy your unsaved text" })).toBeInTheDocument();
+});
+
+it("says the pipeline changed on prompt_file_binding_changed, and Refresh pipeline re-reads the graph only", async () => {
+  const { alert, editor } = await refuseSave({ error_type: "prompt_file_binding_changed", detail: "Prompt bindings changed. Reload the session and retry." });
+  expect(alert).toHaveTextContent(/^The pipeline changed and this prompt no longer reads this file the way it did when you opened it\. Your text is kept\. Refresh the pipeline to see where the prompt points now\./);
+  expect(alert).not.toHaveTextContent(/reload/i);
+  expect(screen.getByRole("button", { name: "Copy your unsaved text" })).toBeInTheDocument();
+  const refreshed = { nodes: [], sources: {}, outputs: [], session_id: "session-1" } as unknown as CompositionState;
+  vi.mocked(fetchCompositionState).mockResolvedValueOnce(refreshed);
+  vi.mocked(savePromptFile).mockClear();
+  vi.mocked(readPromptFileText).mockClear();
+  const reloadSpy = vi.fn();
+  vi.spyOn(window, "location", "get").mockReturnValue({ ...window.location, reload: reloadSpy });
+  fireEvent.click(within(alert).getByRole("button", { name: "Refresh pipeline" }));
+  await waitFor(() => expect(useSessionStore.getState().compositionState).toBe(refreshed));
+  expect(fetchCompositionState).toHaveBeenCalledWith("session-1");
+  expect(savePromptFile).not.toHaveBeenCalled();
+  expect(reloadSpy).not.toHaveBeenCalled();
+  expect(editor).toHaveValue("my draft");
+});
+
+it("says a slot that no longer reads this file without asking for a reload, and offers Refresh pipeline", async () => {
+  useBlobStore.setState({ activeSessionId: "session-1", isLoading: false, blobs: [
+    { id: "blob-1", filename: "old.md", status: "ready", mime_type: "text/plain", content_hash: null } as BlobMetadata,
+    { id: "blob-2", filename: "new.md", status: "ready", mime_type: "text/plain", content_hash: null } as BlobMetadata,
+  ] });
+  // The graph already moved the slot to blob-2; this editor was opened on blob-1.
+  const moved = { nodes: [{ id: "first", plugin: "llm", options: { prompt_template: { mode: "inline_content", blob_ref: "blob-2", sha256: "a".repeat(64) } } }],
+    sources: {}, outputs: [] } as unknown as CompositionState;
+  useSessionStore.setState({ compositionState: moved });
+  render(<PromptFileEditors nodeId="first" options={{ prompt_template: { mode: "inline_content", blob_ref: "blob-1" } }} />);
+  await screen.findByRole("textbox", { name: /Edit prompt file/ });
+  const note = await screen.findByRole("note");
+  expect(note).toHaveTextContent("This prompt no longer reads this file. Your text is kept. Refresh the pipeline to see where the prompt points now.");
+  expect(note).not.toHaveTextContent(/reload/i);
+  const refreshed = { ...moved, id: "state-2" } as unknown as CompositionState;
+  vi.mocked(fetchCompositionState).mockResolvedValueOnce(refreshed);
+  fireEvent.click(within(note).getByRole("button", { name: "Refresh pipeline" }));
+  await waitFor(() => expect(useSessionStore.getState().compositionState).toBe(refreshed));
+  expect(fetchCompositionState).toHaveBeenCalledWith("session-1");
+  expect(savePromptFile).not.toHaveBeenCalled();
 });
 
 // --- A step that uses more than one prompt file ---
@@ -405,13 +492,29 @@ it("confirms a save politely, not through the error channel, and clears it on th
   expect(screen.queryByRole("status")).not.toBeInTheDocument();
 });
 
-it("says saved-but-not-refreshed politely when only the graph refetch fails", async () => {
-  vi.mocked(fetchCompositionState).mockRejectedValue(new Error("offline"));
+it("says saved-but-not-refreshed without asking for a reload, and Retry refetches the graph only", async () => {
+  // A reload would discard other unsaved prompt drafts in the session, so the
+  // fallback never asks for one; Retry repeats the graph read, not the save.
+  vi.mocked(fetchCompositionState).mockRejectedValueOnce(new Error("offline"));
   const editor = await openOneFileEditor();
   fireEvent.change(editor, { target: { value: "new text" } });
   fireEvent.click(screen.getByRole("button", { name: "Save" }));
-  await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Saved. Reload the session to see the updated prompt status."));
+  await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent(
+    "Saved. The prompt status will update when the pipeline next refreshes.",
+  ));
+  expect(screen.getByRole("status")).not.toHaveTextContent(/reload/i);
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(savePromptFile).toHaveBeenCalledTimes(1);
+  const fetchesBefore = vi.mocked(fetchCompositionState).mock.calls.length;
+
+  fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+  await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent(
+    "Saved. This step now uses the new text.",
+  ));
+  expect(vi.mocked(fetchCompositionState).mock.calls.length).toBe(fetchesBefore + 1);
+  expect(savePromptFile).toHaveBeenCalledTimes(1);
+  expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
 });
 
 it("keeps a refused save as an alert and keeps it while the user goes on typing", async () => {
@@ -466,7 +569,7 @@ it("says why Save is disabled when the server would not refuse", async () => {
   expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
   act(() => useSessionStore.setState({ isComposing: true }));
   expect(save).toBeDisabled();
-  expect(save).toHaveAccessibleDescription("Wait for the assistant to finish, then save.");
+  expect(save).toHaveAccessibleDescription("Wait for Composer to finish, then save.");
   // Changed and free to save: no hint, nothing describing the button.
   act(() => useSessionStore.setState({ isComposing: false }));
   expect(save).toBeEnabled();

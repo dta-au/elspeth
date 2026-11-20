@@ -781,6 +781,13 @@ class TestBuildSystemPrompt:
         assert "For a file-backed LLM prompt, wire a ready UTF-8 text session blob" in flattened
         assert "The file may be user-created or agent-authored" in flattened
         assert "Binding opens a mandatory `llm_prompt_template` card showing the full file text" in flattened
+        assert "**Prompt text over 100 words goes in a file.**" in result
+        assert "a structured prompt's compiled text hold at most that" in flattened
+        assert (
+            'set the field to `{"inline_blob": {"filename": "<name>.txt", "mime_type": "text/plain", "content": "<the text>"}}`'
+            in flattened
+        )
+        assert "whichever tool makes it" in flattened
         assert "Do not synthesize a replacement artifact" in flattened
         assert "ask one narrow file-selection question" in flattened
 

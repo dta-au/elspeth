@@ -22,11 +22,12 @@
 import { type ComponentType, type JSX, useEffect, useId } from "react";
 
 import { CodeBlock } from "@/components/chat/CodeBlock";
-import { BlobFileName } from "@/components/blobs/BlobFileName";
-import { useBlobFilename } from "@/components/blobs/BlobFileName";
+import { BlobFileName, useBlobFilename, useSessionFileList } from "@/components/blobs/BlobFileName";
 import { Button } from "@/components/ui";
+import { REDACTED_BLOB_SOURCE_PATH } from "@/lib/redactionPlaceholders";
 import { promptFileEditability, promptFileSlots, promptQueryCopyName, promptQueryEntries, promptQueryTemplatePath } from "@/lib/blobBindings";
 import { useBlobStore } from "@/stores/blobStore";
+import { usePromptDraftHiddenUnsaved } from "@/stores/promptDraftStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { titleCaseLabel } from "@/components/catalog/pluginDisplayName";
@@ -74,6 +75,11 @@ export function optionLabel(key: string): string {
   return OPTION_LABELS[key] ?? titleCaseLabel(key);
 }
 
+/** Reader-facing name of one prompt slot from `promptFileSlots`: its role, or its query's name. */
+export function promptSlotLabel(fieldPath: string, queryName?: string): string {
+  return queryName === undefined ? optionLabel(fieldPath) : `${optionLabel("prompt_template")}, query ${queryName}`;
+}
+
 // Fallback partition when the plugin's catalog schema is not cached (catalog
 // never loaded, invalidated, structural node). Declared explicitly — NOT
 // derived from OPTION_LABELS — so a copy edit cannot change what is visible.
@@ -114,24 +120,62 @@ function pick(options: Record<string, unknown>, keys: readonly string[]): Record
 // `value` to `string` for the `title` attribute directly from the `typeof`
 // check, with no cast. Shared by BOTH partitions (visible and advanced) so
 // masking is a property of the value, never of which disclosure it lands in.
-function OptionValue({ label, value }: { label: string; value: unknown }): JSX.Element {
-  if (
-    label === optionLabel("path") &&
-    typeof value === "string" &&
-    value.startsWith(BLOB_REF_PATH_PREFIX)
-  ) {
-    return <BlobFileName blobId={value.slice(BLOB_REF_PATH_PREFIX.length)} fallback={BLOB_REF_FRIENDLY_LABEL} />;
+//
+// A source or sink step's file row (`path`, or `file`, which shares its
+// label) names the file, not where it is stored: the session file's name when
+// the step has a `blob_ref`, else the path's last segment with the whole path
+// one disclosure away (two folders can hold files of the same name). The
+// server's placeholder for a masked blob path is never shown as text.
+interface FileStep {
+  /** The step's `blob_ref`, when it reads or writes a session file. */
+  blobId: string | undefined;
+}
+
+function OptionValue({ label, value, fileStep }: { label: string; value: unknown; fileStep: FileStep | null }): JSX.Element {
+  if (label === optionLabel("path") && typeof value === "string") {
+    if (value.startsWith(BLOB_REF_PATH_PREFIX)) {
+      return <BlobFileName blobId={value.slice(BLOB_REF_PATH_PREFIX.length)} fallback={BLOB_REF_FRIENDLY_LABEL} />;
+    }
+    if (fileStep?.blobId !== undefined) return <StepFileName blobId={fileStep.blobId} />;
+    if (value === REDACTED_BLOB_SOURCE_PATH) {
+      return <span className="graph-config-empty-value">File reference unavailable</span>;
+    }
+    if (fileStep !== null) return <PathFileName path={value} />;
   }
   return <ConfigValue value={value} humaniseKeys={STRUCTURAL_OPTION_CONTAINER_LABELS.has(label)} />;
 }
 
-function OptionDl({ rows }: { rows: Record<string, unknown> }): JSX.Element {
+/** The session file a source or sink step names by `blob_ref`. */
+function StepFileName({ blobId }: { blobId: string }): JSX.Element {
+  const sessionId = useSessionStore((state) => state.activeSessionId);
+  // A failed (or cut-short) list read is not evidence the file is gone.
+  const listFailed = useBlobStore((state) => state.activeSessionId === sessionId && !state.isLoading && state.error !== null);
+  return <BlobFileName blobId={blobId} fallback={listFailed ? "File name unavailable" : undefined} />;
+}
+
+/** A stored path's last segment, with the whole path behind a disclosure. */
+function PathFileName({ path }: { path: string }): JSX.Element {
+  const segments = path.split(/[\\/]/);
+  const name = segments[segments.length - 1];
+  if (name === "" || name === path) return <ConfigValue value={path} />;
+  return (
+    <span className="option-file-path">
+      <span title={path}>{name}</span>
+      <details className="option-file-path-full">
+        <summary>Full path</summary>
+        <code>{path}</code>
+      </details>
+    </span>
+  );
+}
+
+function OptionDl({ rows, fileStep }: { rows: Record<string, unknown>; fileStep: FileStep | null }): JSX.Element {
   return (
     <dl className="graph-config-rows">
       {Object.entries(rows).map(([label, value]) => (
         <div key={label}>
           <dt>{label}</dt>
-          <dd><OptionValue label={label} value={value} /></dd>
+          <dd><OptionValue label={label} value={value} fileStep={fileStep} /></dd>
         </div>
       ))}
     </dl>
@@ -158,7 +202,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function PromptRoleValue({ label, value, notSet, copyLabel }: { label: string; value: unknown; notSet: string; copyLabel: string }): JSX.Element {
   if (isUnsuppliedPrompt(value)) return <span className="option-rows-prompt-missing">{notSet}</span>;
-  return <><OptionValue label={label} value={value} />{typeof value === "string" && <PromptCopyButton value={value} label={copyLabel} />}</>;
+  return <><OptionValue label={label} value={value} fileStep={null} />{typeof value === "string" && <PromptCopyButton value={value} label={copyLabel} />}</>;
 }
 
 function PromptSlotActions({ value, nodeId, fieldPath, label, showInFiles }: {
@@ -202,7 +246,9 @@ function BoundPromptActions({ blobId, nodeId, fieldPath, label, sessionId, state
   const rowId = useId();
   const reasonId = `${rowId}-reason`;
   const missingReasonId = `${rowId}-missing`;
+  const unsaved = usePromptDraftHiddenUnsaved({ sessionId, nodeId, fieldPath });
   return <span className="prompt-slot-actions">
+    {unsaved && <span className="prompt-editor-tag">Unsaved changes</span>}
     {showInFiles && <>
       {/* The accessible name STARTS with the visible label (WCAG 2.5.3), so
           "click Show in files" matches for voice-control users. */}
@@ -346,6 +392,10 @@ export function OptionRows({
   }, [pluginKind, pluginName, catalogKey, loadSchema]);
 
   const isLlmStep = plugin !== null && plugin.kind === "transform" && plugin.name === "llm";
+  const fileStep: FileStep | null = plugin?.kind === "source" || plugin?.kind === "sink"
+    ? { blobId: typeof options.blob_ref === "string" ? options.blob_ref : undefined }
+    : null;
+  useSessionFileList(fileStep?.blobId !== undefined);
   const candidateKeys = Object.keys(options).filter(
     (key) => !INTERNAL_OPTION_KEYS.has(key) && !(isLlmStep && LLM_PROMPT_ROLE_KEYS.includes(key)),
   );
@@ -390,11 +440,11 @@ export function OptionRows({
       ) : (
         <>
           {isLlmStep && <LlmPromptRoles options={options} slotActions={slotActions} />}
-          {Object.keys(visible).length > 0 && <OptionDl rows={visible} />}
+          {Object.keys(visible).length > 0 && <OptionDl rows={visible} fileStep={fileStep} />}
           {advancedKeys.length > 0 && (
             <details className="option-rows-advanced" open={showAdvanced}>
               <summary>Advanced settings ({advancedKeys.length})</summary>
-              <OptionDl rows={advanced} />
+              <OptionDl rows={advanced} fileStep={fileStep} />
             </details>
           )}
         </>

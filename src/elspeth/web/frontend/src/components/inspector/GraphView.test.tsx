@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { readFileSync } from "node:fs";
-import { act, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import dagre from "@dagrejs/dagre";
 import { GraphView } from "./GraphView";
@@ -20,6 +20,7 @@ import { projectValidationWorkspaceStatus } from "@/components/workspace/workspa
 // and the updateNodeInternals spy its custom node calls when handles change.
 const flowProbe = vi.hoisted(() => ({
   onNodesChange: undefined as undefined | ((changes: unknown[]) => void),
+  onInit: undefined as undefined | ((instance: unknown) => void),
   updateNodeInternals: vi.fn(),
 }));
 
@@ -46,11 +47,13 @@ vi.mock("@xyflow/react", () => ({
     fitViewOptions,
     minZoom,
     onNodeClick,
+    onPaneClick,
     onNodesChange,
     nodesFocusable,
     edgesFocusable,
   }: any) => {
     flowProbe.onNodesChange = onNodesChange;
+    flowProbe.onInit = onInit;
     return (
     <div
       data-testid="react-flow"
@@ -69,6 +72,7 @@ vi.mock("@xyflow/react", () => ({
       data-nodes-focusable={nodesFocusable === undefined ? "absent" : String(Boolean(nodesFocusable))}
       data-edges-focusable={edgesFocusable === undefined ? "absent" : String(Boolean(edgesFocusable))}
     >
+      <div data-testid="react-flow-pane" onClick={() => onPaneClick?.()} />
       {nodes?.map((n: any) => {
         const NodeRenderer = nodeTypes?.[n.type];
         return (
@@ -469,6 +473,85 @@ describe("GraphView", () => {
     expect(within(screen.getByTestId("node-classify")).getByText("classify")).toBeInTheDocument();
     // The plugin name
     expect(within(screen.getByTestId("node-classify")).getByText("llm_transform")).toBeInTheDocument();
+  });
+
+  it("keeps unsaved prompt text through a canvas click, another step, and the Files table's Show node and Edit file", async () => {
+    const SHA = "a".repeat(64);
+    const fetchStub = vi.fn(async () => new Response("original prompt text", { status: 200, headers: { "X-Content-SHA256": SHA } }));
+    vi.stubGlobal("fetch", fetchStub);
+    try {
+      const marker = { blob_ref: "prompt-file", mode: "inline_content", sha256: SHA };
+      useSessionStore.setState({ activeSessionId: "session-1", selectedNodeId: "step", compositionState: makeState({
+        nodes: [makeNode({ id: "step", plugin: "llm", options: { prompt_template: marker } }), makeNode({ id: "other", plugin: "llm" })],
+      }) });
+      useBlobStore.setState({ activeSessionId: "session-1", isLoading: false, error: null, loadBlobs: vi.fn().mockResolvedValue(undefined),
+        blobs: [{ id: "prompt-file", filename: "prompt.txt", session_id: "session-1", mime_type: "text/plain", status: "ready", content_hash: SHA,
+          size_bytes: 20, created_at: "2026-01-01T00:00:00Z", created_by: "user", source_description: null, creation_modality: "verbatim",
+          created_from_message_id: null, creating_model_identifier: null, creating_model_version: null, creating_provider: null,
+          creating_composer_skill_hash: null, creating_arguments_hash: null } as BlobMetadata] });
+      const user = userEvent.setup();
+      render(<GraphView />);
+      act(() => useBlobStore.getState().requestPromptEdit("step", "prompt_template"));
+      const box = await screen.findByRole("textbox", { name: /Edit prompt file/ });
+      await waitFor(() => expect(box).toHaveValue("original prompt text"));
+      fireEvent.change(box, { target: { value: "unsaved words" } });
+      // Canvas click deselects: the panel and its editor unmount.
+      await user.click(screen.getByTestId("react-flow-pane"));
+      expect(screen.queryByRole("textbox", { name: /Edit prompt file/ })).not.toBeInTheDocument();
+      await user.click(screen.getByTestId("node-step"));
+      expect(await screen.findByRole("textbox", { name: /Edit prompt file/ })).toHaveValue("unsaved words");
+      // Another step, then back through the Files table.
+      await user.click(screen.getByTestId("node-other"));
+      expect(screen.queryByRole("textbox", { name: /Edit prompt file/ })).not.toBeInTheDocument();
+      await user.click(screen.getByText((_content, element) => element?.tagName === "SUMMARY" && element.textContent?.trim().startsWith("Files") === true));
+      expect(screen.getByRole("row", { name: /prompt\.txt/ })).toHaveTextContent("Unsaved changes");
+      await user.click(screen.getByRole("button", { name: "Show node step" }));
+      expect(await screen.findByRole("textbox", { name: /Edit prompt file/ })).toHaveValue("unsaved words");
+      await user.click(screen.getByTestId("node-other"));
+      await user.click(screen.getByRole("button", { name: "Edit file for step" }));
+      expect(await screen.findByRole("textbox", { name: /Edit prompt file/ })).toHaveValue("unsaved words");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("shows a file's component from the Files table: selects it, fits it, and refuses one the view hides", async () => {
+    const marker = { blob_ref: "prompt-file", mode: "inline_content", sha256: "a".repeat(64) };
+    useSessionStore.setState({ compositionState: makeState({
+      sources: { source: { plugin: "csv", options: {}, on_success: "rows", on_validation_failure: "quarantine" } },
+      nodes: [makeNode({ id: "step", plugin: "llm", input: "rows", on_success: "shared", options: { prompt_template: marker } })],
+      outputs: [
+        { name: "shared", plugin: "json", options: {}, on_write_failure: "quarantine" },
+        { name: "quarantine", plugin: "json", options: { path: "blob:dump-file" }, on_write_failure: "discard" },
+      ],
+    }) });
+    render(<GraphView />);
+    const fitView = vi.fn().mockResolvedValue(true);
+    act(() => flowProbe.onInit?.({ fitView }));
+    const user = userEvent.setup();
+    await user.click(screen.getByText((_content, element) => element?.tagName === "SUMMARY" && element.textContent?.trim() === "Files"));
+    await user.click(screen.getByRole("button", { name: "Show node step" }));
+    expect(useSessionStore.getState().selectedNodeId).toBe("step");
+    expect(fitView).toHaveBeenLastCalledWith(expect.objectContaining({ nodes: [{ id: "step" }] }));
+    expect(screen.getByRole("button", { name: "Show node quarantine" })).toHaveAttribute("aria-disabled", "false");
+    // Hiding quarantine and discard routes removes the quarantine sink from the view.
+    await user.click(screen.getByRole("switch", { name: "Show quarantine and discard routes" }));
+    expect(screen.queryByTestId("node-quarantine")).not.toBeInTheDocument();
+    const hidden = screen.getByRole("button", { name: "Show node quarantine" });
+    expect(hidden).toHaveAttribute("aria-disabled", "true");
+    fitView.mockClear();
+    await user.click(hidden);
+    expect(useSessionStore.getState().selectedNodeId).toBe("step");
+    expect(fitView).not.toHaveBeenCalled();
+  });
+
+  it("places the file mapping dropdown above Wiring", () => {
+    useSessionStore.setState({ compositionState: makeState({ nodes: [makeNode()] }) });
+    render(<GraphView />);
+    const summary = screen.getByText((_content, element) => element?.tagName === "SUMMARY" && element.textContent?.trim() === "Files");
+    const wiring = screen.getByText(wiringSummary(1));
+    expect(summary.compareDocumentPosition(wiring) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(summary.closest("details")).not.toHaveAttribute("open");
   });
 
   it.each([

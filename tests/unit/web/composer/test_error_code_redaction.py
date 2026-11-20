@@ -108,6 +108,8 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("composer/tools/transforms.py", "_substring_refusal", "code"),
         ("composer/tools/transforms.py", "_prepare_transform_candidate", "error_code"),
         ("composer/turn_audit.py", "_state_payload_for_compose_turn", "error.error_code"),
+        # Re-emits the primary refusal entry's code, already censused at its producer.
+        ("composer/tools/state_inspection.py", "enforce_state_inspection_limit", "primary.error_code"),
         # The imported ``ADVISOR_SIGNOFF_BLOCKED_CODE`` (pinned below).
         ("composer/advisor_policy.py", "_advisor_signoff_fully_blocking_validation", "_ADVISOR_SIGNOFF_BLOCKED_CODE"),
         # Planner / discovery feedback that projects an already-produced code,

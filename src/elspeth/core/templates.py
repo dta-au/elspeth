@@ -36,6 +36,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 from jinja2 import Environment, meta
@@ -210,12 +211,28 @@ def template_loads_name(template_string: str, name: str) -> bool:
 _ATTRIBUTE_KEYWORD_FILTERS: frozenset[str] = frozenset({"map", "join", "sort", "unique", "sum", "min", "max"})
 _ATTRIBUTE_POSITIONAL_FILTERS: frozenset[str] = frozenset({"selectattr", "rejectattr", "groupby"})
 MAX_JINJA_TEMPLATE_BYTES = 16 * 1024
+# Entry bound of the three template-analysis caches below. Validation walks a
+# graph's templates in the same order every time, and an LRU smaller than that
+# walk misses on every call: at 128 a 400-template walk scored 0 hits on its
+# second pass (measured 2026-11-20). The bound covers one walk of the largest
+# plausible graph, 50 LLM steps x 64 queries plus their prompts (~3,250 texts),
+# each analysed with and without ``row_attribute`` (~6,500 keys). At the full
+# bound, 8,192 distinct 8 KB templates held 73 MiB across all three caches,
+# almost all of it the template text a graph that size already holds; the
+# enclave's ~200 KB of prompt text costs well under 1 MiB.
+_TEMPLATE_ANALYSIS_CACHE_ENTRIES = 8192
 
 
 def validate_jinja_source(source: str) -> None:
     """Bound parser input before Jinja sees a web or YAML authored template."""
     if len(source) > MAX_JINJA_TEMPLATE_BYTES or len(source.encode("utf-8")) > MAX_JINJA_TEMPLATE_BYTES:
         raise ValueError(f"Template exceeds {MAX_JINJA_TEMPLATE_BYTES} UTF-8 bytes")
+    _validate_bounded_jinja_source(source)
+
+
+@lru_cache(maxsize=_TEMPLATE_ANALYSIS_CACHE_ENTRIES)
+def _validate_bounded_jinja_source(source: str) -> None:
+    """Reuse pure checks of exact bounded text; size admission runs first."""
     if source.count("{%") > 64 or source.count("{{") > 256:
         raise ValueError("Template has too many Jinja expressions or blocks")
     depth = 0
@@ -292,6 +309,12 @@ def extract_jinja2_field_usage(
     ``row.source_row`` / ``row['source_row']`` as the row.
     """
     validate_jinja_source(template_string)
+    return _cached_jinja2_field_usage(template_string, namespace, row_attribute)
+
+
+@lru_cache(maxsize=_TEMPLATE_ANALYSIS_CACHE_ENTRIES)
+def _cached_jinja2_field_usage(template_string: str, namespace: str, row_attribute: str | None) -> Jinja2FieldExtraction:
+    """Reuse immutable analysis of exact text and parameters."""
     env = _create_field_extraction_environment()
     ast = env.parse(template_string)
     if row_attribute is not None:
@@ -316,6 +339,12 @@ def extract_jinja2_context_fields(template_string: str, namespace: str = "row", 
     between them.
     """
     validate_jinja_source(template_string)
+    return _cached_jinja2_context_fields(template_string, namespace, row_attribute)
+
+
+@lru_cache(maxsize=_TEMPLATE_ANALYSIS_CACHE_ENTRIES)
+def _cached_jinja2_context_fields(template_string: str, namespace: str, row_attribute: str) -> frozenset[str]:
+    """Keep row and context analyses distinct after source admission."""
     ast = _create_field_extraction_environment().parse(template_string)
     ast = _NestedRowRoot(namespace, row_attribute, _nested_row_root(namespace, row_attribute)).visit(ast)
     return _field_usage(ast, namespace).fields

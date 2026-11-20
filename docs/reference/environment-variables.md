@@ -364,6 +364,54 @@ next call's input/output tokens or guarantee context fit. The operator remains
 responsible for the selected model and gateway's actual capacity. Restart the
 service after changing the setting.
 
+### Validation reuse within a compose call (`ELSPETH_WEB__COMPOSER_VALIDATION_REUSE_ENABLED`)
+
+Default `true`. Within one compose call, the Composer can hand back a
+validation verdict it has already computed for the same state object instead
+of computing it again. This covers two validations:
+
+- The runtime preflight of a state that references an uploaded or
+  composer-created file (a `blob_ref`). Before every reuse ELSPETH reads again
+  each referenced file's metadata record, the stored file's size, modification
+  time, change time and inode, the user's secret inventory (names and
+  availability, not values), and every source, sink and `provider_config`
+  path as the path allowlist resolves it, symbolic links included. Every
+  value must equal what was read immediately before and after the verdict was
+  computed, and the file rows the computation itself read must match too.
+  Otherwise the preflight runs again. A state whose own options wire a
+  secret reference is never reused, because its verdict depends on the
+  secret's value. A state that gets a credential from an operator profile can
+  be reused: its preflight resolves that credential, and the reuse checks it
+  only through the secret inventory (names and availability, never values),
+  so a value replaced under the same name is seen at the next compute. A
+  failed preflight is never reused. A reuse is not made after the caller's deadline;
+  the call fails with the same timeout a fresh preflight would.
+- The policy view's authoring validation of the same state object.
+
+Any composer tool call that can change the pipeline, a secret or a file ends
+every reuse in that compose call, whether the call succeeded or not. Nothing
+is reused across compose calls.
+
+What was compared before this shipped, on synthetic graphs: every verdict
+field of each validation with reuse on and off across scripted rounds,
+including rounds that change secrets, stored file bytes and sink paths, and
+rounds with an expired deadline. That comparison is evidence for those
+scripts, not for every state.
+
+Reuse is visible in telemetry. `composer.runtime_preflight.reused` counts
+verdicts handed back (attribute `layer`: `runtime_preflight` or
+`policy_view`); `composer.runtime_preflight.total` still counts only
+preflights actually computed. `composer.runtime_preflight.reuse_declined`
+counts runtime-preflight verdicts computed with reuse on that were not kept
+for reuse, by `reason` (for example `evidence_read_failed`,
+`secret_ref_sites` or `evidence_changed`); a steady stream of
+`evidence_read_failed` means reuse has stopped working and every preflight is
+being computed.
+
+Set `ELSPETH_WEB__COMPOSER_VALIDATION_REUSE_ENABLED=false` to compute every
+validation every time, as before this setting existed. The value is read once
+when the Composer service is built; restart the service after changing it.
+
 ### Strict tool contracts (`ELSPETH_WEB__COMPOSER_STRICT_TOOLS`)
 
 On routes that can carry it, the Composer can send its tool list with OpenAI

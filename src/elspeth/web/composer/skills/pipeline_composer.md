@@ -262,8 +262,9 @@ Examples of complete workflow scope, whether built atomically or in batches:
 
 The capability core defines the optional `description` on every source, node,
 and output. Describe the step's purpose in the user's terms ("Fetch each page
-at its url"), not its plugin mechanics, and refresh it whenever you change what
-the step does — a stale description is worse than none.
+at its url"), not its plugin mechanics. Preserve existing descriptions during
+routing-only edits or when the user asks to preserve content. Refresh them
+only when the requested change includes the step's purpose or description.
 
 ## Reply Register
 
@@ -379,9 +380,18 @@ tools for real work, not for memorising signatures.
 - **State / preview:** `get_pipeline_state` (for full state, omit the component argument or use full, all, pipeline, or the empty string), `preview_pipeline`, `diff_pipeline`
 - **Build / edit:** `set_source`, `patch_source_options`, `clear_source`, `set_source_from_blob`, `set_pipeline`, `upsert_node`, `splice_transform`, `upsert_edge`, `remove_node`, `remove_edge`, `set_metadata`, `patch_node_options`, `change_substring`, `set_output`, `remove_output`, `patch_output_options`
 - **Diagnostics:** `explain_validation_error`, `request_advisor_hint`, `request_interpretation_review`
-- **Blobs:** `list_blobs`, `list_composer_blobs`, `get_blob_metadata`, `get_blob_content`, `read_attachment`, `create_blob`, `update_blob`, `delete_blob`, `wire_blob_inline_ref`, `set_source_from_blobs`, `inspect_source`
+- **Blobs:** `list_blobs`, `list_composer_blobs`, `get_blob_metadata`, `get_blob_content`, `read_attachment`, `create_blob`, `update_blob`, `delete_blob`, `wire_blob_inline_ref`, `set_source_from_blobs`, `inspect_source`, `report_composer_bug`
 - **Secrets:** `list_secret_refs`, `validate_secret_ref`, `wire_secret_ref`
 <!-- END AUTOGEN: tool-inventory -->
+
+Product feedback: when the skill or a tool description promises one behavior
+and a tool call shows another, call `report_composer_bug` once for that
+mismatch with the guidance reference, the expected and observed behavior, and
+the related tool, then continue the task. The report is a session file marked
+suspected and unverified; it does not repair the problem, confirm the bug, or
+change the pipeline. Describe error messages in your own words and never paste
+tokens, keys, passwords or connection strings: credential-shaped text ends the
+whole turn.
 
 #### Advisor Review
 
@@ -575,10 +585,11 @@ A top-level `validation_guidance` maps each
 `message` when it has none.
 <!-- taught:end -->
 
-<!-- taught:begin envelope * plugin_schemas; plugin-schema * plugin_schemas.<kind/plugin>.name; plugin-schema * plugin_schemas.<kind/plugin>.description; plugin-schema * plugin_schemas.<kind/plugin>.plugin_type; plugin-schema * plugin_schemas.<kind/plugin>.json_schema; plugin-schema * plugin_schemas.<kind/plugin>.knob_schema; plugin-schema * plugin_schemas.<kind/plugin>.web_config_authority; plugin-schema * plugin_schemas.<kind/plugin>.composer_hints; plugin-schema * plugin_schemas.<kind/plugin>.secret_requirements -->
+<!-- taught:begin envelope * plugin_schemas; plugin-schema * plugin_schemas.<kind/plugin>.name; plugin-schema * plugin_schemas.<kind/plugin>.description; plugin-schema * plugin_schemas.<kind/plugin>.plugin_type; plugin-schema * plugin_schemas.<kind/plugin>.json_schema; plugin-schema * plugin_schemas.<kind/plugin>.knob_schema; plugin-schema * plugin_schemas.<kind/plugin>.usage_when_not_to_use; plugin-schema * plugin_schemas.<kind/plugin>.web_config_authority; plugin-schema * plugin_schemas.<kind/plugin>.composer_hints; plugin-schema * plugin_schemas.<kind/plugin>.secret_requirements -->
 A top-level `plugin_schemas` (when present) is
 the option schema for each plugin a rejected component uses, keyed
 `<kind>/<name>`, each with `name` (the plugin identifier), `description` (its purpose), `plugin_type`, `json_schema`, `knob_schema`,
+`usage_when_not_to_use` (its own stated prohibition, or null),
 `web_config_authority`, `composer_hints`, and `secret_requirements` (the
 credential fields YOU must wire; empty when there are none — an
 `operator_profiled` plugin's credentials live in its profile, not in your
@@ -743,7 +754,7 @@ rejoins:
 ### Blob Source
 
 Treat `create_blob` plus source binding as one operation. If you call
-`create_blob`, your immediate next build/edit action in the same turn is
+`create_blob` for source data, your immediate next build/edit action in the same turn is
 `set_source_from_blob`, `set_pipeline` with `source.blob_id`, or an equivalent
 source-binding patch. `create_blob` alone is not progress on pipeline state.
 
@@ -798,6 +809,19 @@ with the blob's id and `content_hash`. `default_content` is not accepted either:
 use `on_miss: null` or `on_miss: fail` and handle the miss downstream. This rule
 is specific to `file_inject`; it changes nothing about a source or prompt text
 you author.
+
+**Prompt text over 100 words goes in a file.** As text in the node options,
+`prompt_template`, `system_prompt`, each query `template` and a structured
+prompt's compiled text hold at most that, whoever wrote it (`{{ ... }}` and
+`{% ... %}` tags are not counted). Put longer text in a text file with
+`create_blob` and bind the file as described next; on a step the call creates,
+set the option to the file marker shown above, filled from the `create_blob`
+result. Where you have no `create_blob`, set the field to
+`{"inline_blob": {"filename": "<name>.txt", "mime_type": "text/plain", "content": "<the text>"}}`
+instead. Text the user supplied goes in whole and word for word, never
+shortened or reworded to fit; say in your reply that it is in a file. A write
+that adds or changes text over the limit is refused (`inline_prompt_too_long`),
+whichever tool makes it.
 For a file-backed LLM prompt, wire a ready UTF-8 text session blob into
 `prompt_template`, `system_prompt`, or one existing query template. The file
 may be user-created or agent-authored. Binding opens a mandatory
@@ -1627,7 +1651,7 @@ These are common one-shot mappings:
 | Joined or enriched field disagrees with a consumer's required type | Consult the producer's `get_plugin_schema` and `get_plugin_assistance` to establish actual output types. Preserve supplied reference data. Keep the consumer's contract aligned with those types when that meets the request; otherwise discover and configure an explicit conversion before the consumer. A type declaration alone is not proof of conversion. Any format change must be permitted by the user's data requirements. |
 | Producer guarantees are empty and producer is source | For rows you generated, or when the required fields are known, declare them in the source `schema` (`mode: flexible` with `fields`). Never author `schema.guaranteed_fields` for uploaded or path-bound data; that promise is the user's, through the `source_data_contract` review. |
 | Consumer requires a generated or inspected source field but source guarantees are empty | Declare that known field through the selected source's schema-defined contract mechanism, then retry; do not ask the user to confirm a field you authored or inspected. |
-| Producer guarantees are empty and producer is a transform | Patch that transform schema or use plugin assistance for the plugin-owned contract. |
+| Producer guarantees are empty and producer is a transform | Patch that transform schema or use plugin assistance for the plugin-owned contract. A `contract_probe_deferred` warning is a notice, not an error: that node reads an attached file, the warning alone leaves the graph valid, and its contract is checked before the run starts. Tell the user that in one sentence; nothing on the node needs repair. A missing-field error after such a node is still a real error to fix. |
 | Consumer requires fields not produced upstream | Correct the upstream producer, or narrow the consumer's `required_input_fields` if the requirement was overstated. On an `llm` node, narrowing alone trades one rejection for another: a `prompt_template` may not read a `row.<field>` its `required_input_fields` omits, so drop the template reference in the same edit. |
 | A cleanup or projection transform consumes a field that no upstream node guarantees, and the user-requested producer is absent from the current graph | Restore the missing producer node — this is the silent-downgrade pattern from **Requested Workflow Integrity**. The cleanup transform's field requirements are the trace of what the dropped node was supposed to produce. Do not repair by deleting requested result mappings. Add the missing node back, wired before the cleanup transform. Reapply the model-node review preflight when the restored node is a model transform. |
 | Validation reports "Duplicate consumer for connection" | One connection is read by two or more steps, and a connection feeds one. Decide what was meant, steps in sequence or steps that each need the same rows, and repair it as `graph_repair_suggestions` under "Reading a tool result" describes. Do not remove a consumer to resolve the conflict; the user requested each one. |

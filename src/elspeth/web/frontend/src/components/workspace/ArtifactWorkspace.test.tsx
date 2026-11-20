@@ -1695,6 +1695,34 @@ describe("toolbar catalog trigger (2026-08-15 UX review)", () => {
       ).toEqual(["Workflow", "Approvals", "Spec", "YAML", "Checks: Ready", "Run"]);
     });
 
+    it("opens the toolbar with the Show conversation control while collapsed", async () => {
+      // 2026-11-20 ruling (home A): collapsed, the Show control is the first
+      // thing in the pipeline's title bar, ahead of the "Pipeline" title.
+      const user = userEvent.setup();
+      renderArtifactWorkspace();
+      const toolbar = screen
+        .getByRole("heading", { level: 2, name: "Pipeline" })
+        .closest(".artifact-workspace-toolbar");
+      expect(
+        within(toolbar as HTMLElement).queryByRole("button", { name: /conversation$/ }),
+      ).toBeNull();
+
+      await user.click(screen.getByRole("button", { name: "Hide conversation" }));
+
+      const show = within(toolbar as HTMLElement).getByRole("button", {
+        name: "Show conversation",
+      });
+      expect(toolbar?.firstElementChild).toBe(show);
+      expect(show).toHaveFocus();
+      expect(show).toHaveAttribute("aria-describedby", "workspace-collapsed-status");
+      expect(document.getElementById("workspace-collapsed-status")).toHaveClass(
+        "visually-hidden",
+      );
+
+      await user.click(show);
+      expect(screen.getByRole("button", { name: "Hide conversation" })).toHaveFocus();
+    });
+
     it("keeps the disabled empty-composition tab a plain unbadged Checks", () => {
       useSessionStore.setState({ compositionState: null });
       renderArtifactWorkspace();

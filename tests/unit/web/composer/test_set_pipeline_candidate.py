@@ -415,11 +415,17 @@ def test_postbuilder_inline_quota_refusal_has_no_candidate_effects(tmp_path: Pat
         composer_skill_hash="a" * 64,
         tool_arguments_hash="b" * 64,
     )
-    with patch.object(
-        sessions_tools, "_persist_prepared_blob_create", autospec=True, return_value="Session blob quota exceeded."
-    ) as settle:
-        result = _execute_set_pipeline(args, state, context)
-    settle.assert_called_once()
+    with fenced_operation_context(engine, session_id) as operation:
+        result = _execute_set_pipeline(
+            args,
+            state,
+            replace(
+                context,
+                max_blob_storage_per_session_bytes=1,
+                session_operation_context=operation,
+                session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
+            ),
+        )
     assert result.updated_state is state
     assert result.updated_state.version == state.version
     assert result.affected_nodes == ()

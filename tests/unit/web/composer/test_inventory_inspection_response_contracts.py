@@ -44,7 +44,8 @@ def _context(catalog: MagicMock) -> ToolContext:
     return ToolContext(catalog=catalog, plugin_snapshot=MagicMock(spec=PluginAvailabilitySnapshot))
 
 
-@pytest.mark.parametrize("tool,kind", [("list_sources", "source"), ("list_transforms", "transform"), ("list_sinks", "sink")])
+# list_transforms is the selection index; test_transform_inventory_index.py pins its bytes.
+@pytest.mark.parametrize("tool,kind", [("list_sources", "source"), ("list_sinks", "sink")])
 def test_inventory_real_handlers_preserve_baseline_bytes(tool: str, kind: str) -> None:
     catalog = MagicMock(spec=PolicyCatalogView)
     mutable_values: list[JsonValue] = [None, True, 1, 1.5]
@@ -62,7 +63,6 @@ def test_inventory_real_handlers_preserve_baseline_bytes(tool: str, kind: str) -
     ) = [summary]
     declarations = {
         "list_sources": sources._LIST_SOURCES_DECLARATION,
-        "list_transforms": transforms._LIST_TRANSFORMS_DECLARATION,
         "list_sinks": transforms._LIST_SINKS_DECLARATION,
     }
     declaration = declarations[tool]

@@ -34,6 +34,7 @@ class PluginSchemaSnapshot:
     description: str
     json_schema: JSONSchemaSnapshot
     knob_schema: KnobSchemaSnapshot
+    usage_when_not_to_use: str | None
     composer_hints: tuple[str, ...]
     secret_requirements: tuple[SchemaSecretRequirement, ...]
     web_config_authority: WebConfigAuthority
@@ -113,6 +114,7 @@ def _snapshot(value: object) -> PluginSchemaSnapshot:
         _text(value.description),
         json_schema,
         knob_schema,
+        None if value.usage_when_not_to_use is None else _text(value.usage_when_not_to_use),
         _texts(value.composer_hints),
         tuple(_secret(item, owned=type(value) is PluginSchemaSnapshot) for item in _tuple(value.secret_requirements)),
         value.web_config_authority,
@@ -128,6 +130,7 @@ def _encode(value: PluginSchemaSnapshot) -> dict[str, JsonValue]:
         "description": value.description,
         "json_schema": value.json_schema.to_wire(),
         "knob_schema": value.knob_schema.to_wire(),
+        "usage_when_not_to_use": value.usage_when_not_to_use,
         "composer_hints": list(value.composer_hints),
         "secret_requirements": [{"field": item.field, "candidates": list(item.candidates)} for item in value.secret_requirements],
         "web_config_authority": value.web_config_authority.value,

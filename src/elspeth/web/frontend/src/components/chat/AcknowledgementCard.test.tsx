@@ -679,14 +679,38 @@ describe("AcknowledgementCard — prompt-template View/Approve controls", () => 
     expect(approve).toHaveAttribute("aria-disabled", "true");
     await user.click(screen.getByRole("button", { name: "View prompt" }));
     const region = screen.getByRole("region", { name: /prompt template review/i });
-    await waitFor(() => expect(region.querySelector("pre.ack-card-prompt-pre")?.textContent)
-      .toBe(`File: prompt.txt (prompt_template)\n\n${text}`));
-    expect(region).toHaveTextContent("File: prompt.txt (prompt_template)");
+    await waitFor(() => expect(region.querySelector("pre.ack-card-prompt-pre")?.textContent).toBe(text));
+    // The file sits under the prompt's heading with no raw slot name.
+    expect(region.querySelector(".ack-card-prompt-file")).toHaveTextContent("File: prompt.txt");
+    expect(region).not.toHaveTextContent("(prompt_template)");
     expect(region.innerHTML).not.toContain("<script>");
     expect(region).not.toHaveTextContent("not text");
     expect(approve).not.toHaveAttribute("aria-disabled");
     expect(api.getPromptReviewSnapshot).toHaveBeenCalledWith("sess-1", event.id, expect.any(AbortSignal));
   });
+  it("puts each file under its own prompt heading, with readable labels", async () => {
+    const event = makeEvent({ kind: "llm_prompt_template", llm_draft: "draft" });
+    const marker = (id: string) => ({ blob_ref: id, mode: "inline_content", sha256: "a".repeat(64) });
+    const bound = (field_path: string, blob_id: string, filename: string, text: string) => ({ field_path, blob_id, content_sha256: "a".repeat(64),
+      encoding: "utf-8" as const, byte_length: text.length, filename, creation_modality: "verbatim", created_by: "user", provenance: {}, text });
+    vi.mocked(api.getPromptReviewSnapshot).mockResolvedValue({
+      version: 1, session_id: "sess-1", node_id: "node-1", event_id: event.id,
+      authored_surface: { system_prompt: marker("sys"), prompt_template: marker("user") },
+      bindings: [bound("system_prompt", "sys", "risk_system_prompt.txt", "System text."), bound("prompt_template", "user", "risk_user_prompt.txt", "User text.")],
+      anchor: "b".repeat(64), effective_artifact_hash: null, is_live_review: true,
+    });
+    renderCard(event, { showAmend: false });
+    fireEvent.click(screen.getByRole("button", { name: "View prompt" }));
+    const region = await screen.findByRole("region", { name: /prompt template review/i });
+    await waitFor(() => expect(region.querySelectorAll(".ack-card-prompt-file")).toHaveLength(2));
+    // Heading, its file, its text, in that order, for each prompt.
+    const order = Array.from(region.querySelectorAll(".ack-card-prompt-role, .ack-card-prompt-file, pre.ack-card-prompt-pre"))
+      .filter((element) => element.closest("details") === null).map((element) => element.textContent);
+    expect(order).toEqual(["System prompt", "File: risk_system_prompt.txt", "System text.", "User prompt", "File: risk_user_prompt.txt", "User text."]);
+    expect(region).not.toHaveTextContent("(system_prompt)");
+    expect(region).not.toHaveTextContent("(prompt_template)");
+  });
+
   it("unlocks approval after viewing all query templates when no shared template exists", async () => {
     const user = userEvent.setup();
     const event = makeEvent({ kind: "llm_prompt_template", llm_draft: "Shortened preview" });
@@ -1330,6 +1354,27 @@ describe("AcknowledgementCard prompt copying", () => {
     await within(region).findByRole("button", { name: "Copy user prompt template" });
     expect(within(region).queryByRole("button", { name: "Copy system prompt" })).not.toBeInTheDocument();
     expect(within(region).queryByRole("button", { name: /Copy prompt template for query/ })).not.toBeInTheDocument();
+  });
+
+  it("lines the copy controls up in one row under the text, and adds no empty row when nothing can be copied", async () => {
+    vi.mocked(api.getPromptReviewSnapshot).mockResolvedValue(inlineSnapshot({
+      prompt_template: "Display", queries: [{ name: "a", template: "A" }, { name: "b", template: "B" }],
+    }, ANCHOR_1));
+    const { unmount } = renderCard(makeEvent({ kind: "llm_prompt_template", llm_draft: "bounded draft" }), { showAmend: false });
+    fireEvent.click(screen.getByRole("button", { name: "View prompt" }));
+    const region = await screen.findByRole("region", { name: /prompt template review/i });
+    await within(region).findByRole("button", { name: "Copy user prompt template" });
+    const row = region.querySelector(".ack-card-copy-actions");
+    expect(row).not.toBeNull();
+    expect(within(row as HTMLElement).getAllByRole("button").map((button) => button.textContent))
+      .toEqual(["Copy user prompt template", "Copy prompt template for query a (position 1)", "Copy prompt template for query b (position 2)"]);
+    unmount();
+    vi.mocked(api.getPromptReviewSnapshot).mockResolvedValue(inlineSnapshot({ system_prompt: { mode: "inline_content", blob_ref: "file-1" } }, ANCHOR_2));
+    renderCard(makeEvent({ kind: "llm_prompt_template", llm_draft: "bounded draft" }), { showAmend: false });
+    fireEvent.click(screen.getByRole("button", { name: "View prompt" }));
+    const fileOnly = await screen.findByRole("region", { name: /prompt template review/i });
+    await waitFor(() => expect(fileOnly.querySelector("pre")).not.toBeNull());
+    expect(fileOnly.querySelector(".ack-card-copy-actions")).toBeNull();
   });
 });
 

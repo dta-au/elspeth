@@ -1,4 +1,12 @@
 import "@testing-library/jest-dom/vitest";
+import { afterEach } from "vitest";
+import { usePromptDraftStore } from "@/stores/promptDraftStore";
+
+// Unsaved prompt drafts live in a module-level store that outlives a test's
+// render; without this a draft typed in one spec would reopen an editor in the next.
+afterEach(() => {
+  usePromptDraftStore.getState().reset();
+});
 
 // jsdom doesn't implement window.matchMedia.
 // Provide a minimal stub so components that use media queries (e.g. Layout)

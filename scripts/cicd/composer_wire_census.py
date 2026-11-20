@@ -31,7 +31,7 @@ from elspeth.web.composer.tools._common import _validate_mutation_arguments
 from elspeth.web.composer.tools._dispatch import get_tool_definitions, require_schema_valid_arguments
 from elspeth.web.composer.tools._registry import _REGISTERED_TOOLS
 from elspeth.web.composer.tools.schema_contract import assert_set_pipeline_schema_compatible, assert_upsert_node_schema_compatible
-from elspeth.web.composer.tools.sessions import _SESSION_AWARE_TOOL_HANDLERS
+from elspeth.web.composer.tools.sessions import _SESSION_AWARE_TOOL_HANDLERS, _custody_arguments
 
 if TYPE_CHECKING or __package__:
     from .composer_admitted_wire import admitted_wire_rows, model_argument_keys
@@ -762,6 +762,16 @@ def _reads_for_handler(
             if target is require_schema_valid_arguments:
                 # The closed-root S gate validates the whole input against the
                 # flat schema and raises; it extracts no field for use.
+                return None
+            if target is _custody_arguments:
+                # The direct set_pipeline path's one whole-input copy for
+                # custody: it stores and rewrites the whole input (the stored
+                # source named by blob_id) and extracts no field for use. The
+                # fields that path uses are read in build_set_pipeline_candidate.
+                # Only the raw input as the first of two positional arguments.
+                if len(args) == 2 and not node.keywords and args[0] is not None and args[0].model is None and args[1] is None:
+                    return None
+                unresolved.add(f"{site(node)}: unsupported custody argument forwarding")
                 return None
             if not isinstance(target, FunctionType) or None in kwargs:
                 unresolved.add(f"{site(node)}: unsupported callable receiving input provenance")

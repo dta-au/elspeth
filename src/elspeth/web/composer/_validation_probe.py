@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any, cast
+import json
+from collections.abc import Callable, Mapping
+from types import MappingProxyType
+from typing import Any, Final, cast
 
 from pydantic_core import ErrorDetails
 
 from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.core.llm_profiles import LLM_PROFILE_PRIVATE_FIELDS
 from elspeth.core.secrets import redact_secret_refs_for_validation
 
@@ -21,6 +24,17 @@ def is_inline_content_reference(value: object) -> bool:
     """Recognize an unresolved value only when it is a valid inline marker."""
     marker = is_widened_blob_ref(value)
     return marker is not None and marker.mode == "inline_content"
+
+
+def holds_inline_content_reference(value: object) -> bool:
+    """Whether a valid ``inline_content`` marker sits anywhere in thawed option data."""
+    if is_inline_content_reference(value):
+        return True
+    if type(value) is dict:
+        return any(holds_inline_content_reference(child) for child in value.values())
+    if type(value) is list:
+        return any(holds_inline_content_reference(child) for child in value)
+    return False
 
 
 def is_deferred_blob_error(error: ErrorDetails, errors: list[ErrorDetails]) -> bool:
@@ -43,6 +57,144 @@ def is_deferred_blob_error(error: ErrorDetails, errors: list[ErrorDetails]) -> b
         detail["loc"][:2] == ("queries", selected) and detail["type"] == "string_type" and is_inline_content_reference(detail["input"])
         for detail in errors
     )
+
+
+_ABSENT: Final = object()
+
+
+def _option_child(container: object, segment: str | int) -> object:
+    if type(container) is dict:
+        return container[segment] if segment in container else _ABSENT
+    if type(container) is list and type(segment) is int and 0 <= segment < len(container):
+        return container[segment]
+    return _ABSENT
+
+
+def _option_path(location: tuple[str | int, ...], options: object) -> tuple[tuple[str | int, ...], int | None]:
+    """Map a pydantic ``loc`` onto the option tree; return the path and the index of the first tag segment.
+
+    A ``loc`` segment that names no key or index at that point of the
+    options is a union or validator tag (``"str"``, ``"list[str]"``,
+    ``"function-after[...]"``) and is dropped from the path.
+    """
+    path: list[str | int] = []
+    current = options
+    first_tag: int | None = None
+    for index, segment in enumerate(location):
+        child = _option_child(current, segment)
+        if child is not _ABSENT:
+            current = child
+            path.append(segment)
+        elif first_tag is None:
+            first_tag = index
+    return tuple(path), first_tag
+
+
+def only_marker_errors(errors: list[ErrorDetails], options: object) -> bool:
+    """Whether every config error is explained by a valid marker in ``options``.
+
+    An error counts when ``is_deferred_blob_error`` accepts it (a string
+    field holding a marker; the queries list-or-mapping union), or when it is
+    a CONSEQUENCE of such an error on the same option:
+
+    - the other branch of the union whose branch holds the marker
+      (``fields: str | list[str]`` with a marker at ``fields.0`` also reports
+      ``fields`` as not a string): same ``loc`` up to the union tag, a
+      different tag;
+    - a ``too_short`` on a container that holds the marker error, when the
+      container's own length meets the ``min_length`` the error reports.
+      pydantic counts only the items that validated, so a list whose only
+      item is a marker is "too short" until the marker is read; a list that
+      is short whatever the file says is a real error.
+
+    Anything else is a real config error and the probe is a failure, not a
+    deferral: an unknown option holding a marker, a marker in a ``Literal``
+    position, a missing sibling, a bad value elsewhere.
+    """
+    if not errors:
+        return False
+    marker_errors = [error for error in errors if is_deferred_blob_error(error, errors)]
+    if not marker_errors:
+        return False
+    marker_locations = [(error["loc"], *_option_path(error["loc"], options)) for error in marker_errors]
+    marker_option_paths = [path for _location, path, _tag in marker_locations]
+
+    def explained(error: ErrorDetails) -> bool:
+        if is_deferred_blob_error(error, errors):
+            return True
+        path, tag = _option_path(error["loc"], options)
+        holds_marker_error = any(len(found) > len(path) and found[: len(path)] == path for found in marker_option_paths)
+        if not holds_marker_error:
+            return False
+        if error["type"] == "too_short":
+            return _long_enough_once_read(error, path, options)
+        if tag is None:
+            return False
+        # Both errors must carry a union tag at the same position: a loc
+        # segment that is merely a missing key is not a branch.
+        location = error["loc"]
+        return any(
+            marker_tag == tag and marker_location[:tag] == location[:tag] and marker_location[tag] != location[tag]
+            for marker_location, _marker_path, marker_tag in marker_locations
+        )
+
+    return all(explained(error) for error in errors)
+
+
+def _long_enough_once_read(error: ErrorDetails, path: tuple[str | int, ...], options: object) -> bool:
+    """Whether the container at ``path`` already holds ``min_length`` items, so only unread markers made it short.
+
+    Needs the error's ``ctx``; without it nothing is assumed and the error stays real.
+    """
+    context = error["ctx"] if "ctx" in error else None
+    if context is None or "min_length" not in context:
+        return False
+    container = options
+    for segment in path:
+        container = _option_child(container, segment)
+    min_length = context["min_length"]
+    if type(min_length) is not int:
+        return False
+    if type(container) is list or type(container) is dict:
+        return len(container) >= min_length
+    return False
+
+
+def _string_keys(value: object) -> frozenset[str]:
+    return frozenset(key for key in value if type(key) is str) if type(value) is dict else frozenset()
+
+
+def deferred_created_fields(plugin: str, options: object) -> frozenset[str] | None:
+    """Output field names a deferring node creates, read from its config shape, or ``None`` when unknowable.
+
+    Only shapes where the names are certain without the file's bytes:
+    ``reference_join`` writes exactly the keys of ``output`` (single lookup)
+    or of each ``lookups[].output``; ``file_inject`` writes ``output_field``
+    (``mode: select``) or each ``files.<name>.output_field`` (``mode: all``).
+    Every other plugin, or a shape that does not read cleanly, is ``None``:
+    the caller then says "the fields this step adds" without naming any.
+    """
+    if type(options) is not dict:
+        return None
+    if plugin == "reference_join":
+        names = set(_string_keys(options["output"])) if "output" in options else set()
+        lookups = options["lookups"] if "lookups" in options else None
+        if type(lookups) is list:
+            for lookup in lookups:
+                if type(lookup) is dict and "output" in lookup:
+                    names |= _string_keys(lookup["output"])
+        return frozenset(names) or None
+    if plugin == "file_inject":
+        mode = options["mode"] if "mode" in options else None
+        if mode == "select":
+            field = options["output_field"] if "output_field" in options else None
+            return frozenset({field}) if type(field) is str else None
+        files = options["files"] if "files" in options else None
+        if mode != "all" or type(files) is not dict:
+            return None
+        written = {entry["output_field"] for entry in files.values() if type(entry) is dict and "output_field" in entry}
+        return frozenset(name for name in written if type(name) is str) or None
+    return None
 
 
 def prepare_query_definition_probe(queries: object) -> object:
@@ -106,6 +258,163 @@ def _substitute_query_template_placeholders(queries: object) -> bool:
             entry["template"] = _PROBE_PROMPT_FILE_PLACEHOLDER
             substituted = True
     return substituted
+
+
+def _stand_in_llm_prompt_template(prepared: object) -> bool:
+    """``prompt_template``: in single-prompt mode the text reads every declared row field."""
+    if type(prepared) is not dict or "prompt_template" not in prepared or not is_inline_content_reference(prepared["prompt_template"]):
+        return False
+    # Single-prompt mode is the only one whose template must read the
+    # declared row fields; a query-mode fallback renders query bindings.
+    single_prompt = "queries" not in prepared or prepared["queries"] is None
+    declared = prepared["required_input_fields"] if "required_input_fields" in prepared else None
+    prepared["prompt_template"] = _probe_prompt_file_placeholder(declared, reads_row=single_prompt)
+    return True
+
+
+def _stand_in_llm_system_prompt(prepared: object) -> bool:
+    """``system_prompt``: inert text that reads nothing."""
+    if type(prepared) is not dict or "system_prompt" not in prepared or not is_inline_content_reference(prepared["system_prompt"]):
+        return False
+    prepared["system_prompt"] = _PROBE_PROMPT_FILE_PLACEHOLDER
+    return True
+
+
+def _stand_in_llm_query_templates(prepared: object) -> bool:
+    """``queries.*.template``, in query mode only."""
+    if type(prepared) is not dict or "queries" not in prepared or prepared["queries"] is None:
+        return False
+    return _substitute_query_template_placeholders(prepared["queries"])
+
+
+_PROBE_FILE_PLACEHOLDER = "validation-probe-file-placeholder"
+"""Inert text standing in for a file-held ``file_inject`` entry inside a probe projection."""
+
+_PROBE_JSON_VALUE_BY_DECLARED_TYPE: Final[Mapping[str, int | float | bool]] = MappingProxyType({"int": 0, "float": 0.5, "bool": True})
+"""A non-null JSON value for each declarable scalar type other than ``str``; any other declaration, or none, takes a JSON string."""
+
+
+def _file_inject_declared_fields(schema: object) -> dict[str, FieldDefinition] | ValueError:
+    """The node's authored ``schema.fields`` by name, or the reason the block does not parse.
+
+    The config model refuses an unparseable block with this same error when
+    the probe constructs the plugin, so the error is returned to the caller,
+    which then substitutes nothing rather than guess which fields were meant.
+    """
+    try:
+        parsed = SchemaConfig.from_dict(cast("Mapping[str, Any]", schema))
+    except ValueError as exc:
+        return exc
+    return {field.name: field for field in parsed.fields or ()}
+
+
+def _file_inject_entry_stand_in(entry: object, *, written_field: object, declared: Mapping[str, FieldDefinition]) -> str | None:
+    """Probe-only content for one entry, chosen by its ``format`` and the author's declaration.
+
+    ``text`` is always the string itself and ``csv`` and ``jsonl`` always a
+    list, whatever the file holds. The csv header is one column whose name
+    avoids the delimiter, with no data rows. ``json`` takes a non-null value
+    of the type the author declared for the written field (``int`` ``0``,
+    ``float`` ``0.5``, ``bool`` ``true``), otherwise a JSON string, wrapped in
+    an object under ``data_key`` when one is set; it is never a JSON null.
+    ``None`` means the entry's own options are malformed, which the config
+    model refuses whatever the content.
+
+    An undeclared json written field is stood in although a JSON null in the
+    file would make it nullable. That is sound only because such a field is
+    typed ``any`` and no authoring verdict separates a nullable ``any`` from
+    a non-null one; ``test_file_inject_file_content_probe.py::
+    test_PIN_undeclared_json_nullability_is_unobservable_at_authoring`` goes
+    red the day one does. Residue: a ``row_union_schema_incompatible`` error
+    renders the field as ``Any`` and ``nullable: false`` whatever the file
+    holds, where the bytes could make it ``Any | None``; its verdict and code
+    are unaffected, and the runtime preflight in the same round reports the
+    exact type. A declared field is published from the declaration instead,
+    and execution validation holds the bytes against it.
+    """
+    if type(entry) is not dict:
+        return None
+    fmt = entry["format"] if "format" in entry else None
+    if fmt == "text":
+        return _PROBE_FILE_PLACEHOLDER
+    if fmt == "jsonl":
+        return json.dumps(_PROBE_FILE_PLACEHOLDER) + "\n"
+    if fmt == "csv":
+        delimiter = entry["delimiter"] if "delimiter" in entry else ","
+        if type(delimiter) is not str:
+            return None
+        return ("probe" if delimiter not in "probe" else "x") + "\n"
+    if fmt != "json":
+        return None
+    value: str | int | float | bool = _PROBE_FILE_PLACEHOLDER
+    if type(written_field) is str and written_field in declared:
+        field_type = declared[written_field].field_type
+        if field_type in _PROBE_JSON_VALUE_BY_DECLARED_TYPE:
+            value = _PROBE_JSON_VALUE_BY_DECLARED_TYPE[field_type]
+    data_key = entry["data_key"] if "data_key" in entry else None
+    if data_key is None:
+        return json.dumps(value)
+    if type(data_key) is not str:
+        return None
+    return json.dumps({data_key: value})
+
+
+def _stand_in_file_inject_contents(prepared: object) -> bool:
+    """``files.*.content``: all valid markers of the node, or none of them.
+
+    If any file-held entry cannot be stood in (its own options are
+    malformed, or the schema block does not parse), every entry keeps its
+    marker, so no partial substitution changes which error the constructor
+    reports.
+    """
+    if type(prepared) is not dict or "files" not in prepared or type(prepared["files"]) is not dict:
+        return False
+    files = prepared["files"]
+    held = [
+        name
+        for name, entry in files.items()
+        if type(entry) is dict and "content" in entry and is_inline_content_reference(entry["content"])
+    ]
+    if not held:
+        return False
+    declared = _file_inject_declared_fields(prepared["schema"]) if "schema" in prepared else {}
+    if type(declared) is not dict:
+        return False
+    mode = prepared["mode"] if "mode" in prepared else None
+    select_field = prepared["output_field"] if mode == "select" and "output_field" in prepared else None
+    stand_ins: dict[str, str] = {}
+    for name in held:
+        entry = files[name]
+        written_field = select_field if mode == "select" else (entry["output_field"] if mode == "all" and "output_field" in entry else None)
+        stand_in = _file_inject_entry_stand_in(entry, written_field=written_field, declared=declared)
+        if stand_in is None:
+            return False
+        stand_ins[name] = stand_in
+    for name, stand_in in stand_ins.items():
+        files[name]["content"] = stand_in
+    return True
+
+
+_ProbeStandIn = Callable[[object], bool]
+
+_PROBE_STAND_INS: Final[Mapping[str, tuple[tuple[str, _ProbeStandIn], ...]]] = MappingProxyType(
+    {
+        "llm": (
+            ("prompt_template", _stand_in_llm_prompt_template),
+            ("system_prompt", _stand_in_llm_system_prompt),
+            ("queries.*.template", _stand_in_llm_query_templates),
+        ),
+        "file_inject": (("files.*.content", _stand_in_file_inject_contents),),
+    }
+)
+"""Option positions whose file-held value is no input to the plugin's output contract.
+
+One row per (plugin, position). Each stand-in rewrites a VALID
+``inline_content`` marker in the detached projection, in place, and returns
+whether it did. A position belongs here only when the plugin's guaranteed
+field names, their types and their nullability are the same for every bytes
+the file could hold; otherwise the node must keep deferring.
+"""
 
 
 def prepare_validation_probe_options(options: Mapping[str, Any], *, plugin: str | None) -> dict[str, Any]:
@@ -185,6 +494,37 @@ def prepare_validation_probe_options(options: Mapping[str, Any], *, plugin: str 
     substitutes nothing, keeps its hash in the projection and is still
     checked here; so is a malformed marker, or a well-formed marker of any
     other mode, neither of which is substituted.
+
+    For ``plugin="file_inject"`` the projection supplies probe-only content
+    wherever ``files.<name>.content`` holds a VALID ``inline_content`` marker,
+    which in the composer is every entry (content must be a user upload). The
+    same deferral otherwise zeroed the node's guarantees, upstream fields
+    included, although the written field NAMES come from ``output_field``
+    options and never from the bytes. The stand-in parses under the entry's
+    ``format`` (``text``; ``csv`` with its ``delimiter``; ``jsonl``; ``json``
+    with or without ``data_key``) in both modes, and is never a JSON null.
+
+    One fact still depends on the bytes: a ``json`` entry holding a JSON null
+    makes an undeclared written field nullable. That field is typed ``any``,
+    and no authoring consumer separates a nullable ``any`` from a non-null
+    one, so the stand-in decides no verdict (pinned; see
+    ``_file_inject_entry_stand_in``); a declared field takes its type and
+    nullability from the declaration. A node still defers only when an
+    entry's own options or the schema block are malformed, and then every
+    entry keeps its marker. ``default_content`` is never touched: the
+    composer refuses it outright.
+
+    The stand-in proves nothing about the file. Every check that reads the
+    content runs in ``FileInjectConfig._validate_injection`` (parsing under the
+    format, data_key and delimiter, canonical-value and depth rules, the
+    per-entry and per-node size caps, and ``_validate_declared_output_types``,
+    which holds an authored type and nullability against the parsed value).
+    Execution validation runs it on the materialized bytes: the bytes replace
+    the marker in ``_validation_materialization`` and the plugin is then built
+    by ``validate_runtime_plugins``; run admission runs the same validation
+    before a run is created. A refusal that does not depend on the bytes (text
+    under a narrow declared type, a bad option beside a marker) is now made at
+    authoring, as it would be for the inline twin.
     """
     from elspeth.web.interpretation_state import strip_authoring_options
 
@@ -209,22 +549,13 @@ def prepare_validation_probe_options(options: Mapping[str, Any], *, plugin: str 
         prepared["endpoint"] = "https://validation-probe.invalid/v1"
         prepared["api_key"] = "validation-probe-placeholder"
         prepared["required_capabilities"] = tuple(sorted(GATEWAY_SUPPORTED_CAPABILITIES))
-    if plugin == "llm":
-        # Single-prompt mode is the only one whose template must read the
-        # declared row fields; a query-mode fallback renders query bindings.
-        single_prompt = "queries" not in prepared or prepared["queries"] is None
-        declared = prepared["required_input_fields"] if "required_input_fields" in prepared else None
+    if plugin is not None and plugin in _PROBE_STAND_INS:
         substituted = False
-        if "prompt_template" in prepared and is_inline_content_reference(prepared["prompt_template"]):
-            prepared["prompt_template"] = _probe_prompt_file_placeholder(declared, reads_row=single_prompt)
-            substituted = True
-        if "system_prompt" in prepared and is_inline_content_reference(prepared["system_prompt"]):
-            prepared["system_prompt"] = _PROBE_PROMPT_FILE_PLACEHOLDER
-            substituted = True
-        if not single_prompt and _substitute_query_template_placeholders(prepared["queries"]):
-            substituted = True
+        for _position, stand_in in _PROBE_STAND_INS[plugin]:
+            if stand_in(prepared):
+                substituted = True
         # The approval hash binds effective prompt text this projection does
         # not hold once a file stands at any prompt position.
-        if substituted and "approved_prompt_artifact_hash" in prepared:
+        if plugin == "llm" and substituted and "approved_prompt_artifact_hash" in prepared:
             del prepared["approved_prompt_artifact_hash"]
     return prepared

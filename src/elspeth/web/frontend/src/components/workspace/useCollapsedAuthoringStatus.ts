@@ -6,6 +6,10 @@ import { useSessionStore } from "@/stores/sessionStore";
 export interface CollapsedAuthoringStatus {
   text: string;
   tone: "neutral" | "busy" | "error";
+  /** Items the user has not seen since collapsing: new messages plus new
+   *  decisions to acknowledge. The hide/show toggle shows it as a count
+   *  badge; absent or 0 means nothing unread. */
+  unreadCount?: number;
 }
 
 interface UseCollapsedAuthoringStatusOptions {
@@ -124,7 +128,11 @@ export function useCollapsedAuthoringStatus({
       );
     }
     if (unreadParts.length > 0) {
-      return { text: unreadParts.join(", "), tone: "busy" };
+      return {
+        text: unreadParts.join(", "),
+        tone: "busy",
+        unreadCount: newMessages + newAcknowledgements,
+      };
     }
   }
 

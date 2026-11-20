@@ -309,3 +309,15 @@ describe("shortcuts subheadings sit BELOW the dialog title (elspeth-44491d3ea1)"
     }
   });
 });
+
+describe("the open step panel sits above the canvas's floating panels (UX review finding 7)", () => {
+  it("stacks .graph-config-panel above @xyflow's .react-flow__panel (MiniMap, Controls)", () => {
+    expect(winningValue(".graph-config-panel", "z-index")).toBe("var(--z-panel-controls)");
+    const tokens = readFileSync(join(barrelDir, "tokens.css"), "utf8");
+    const panelControls = Number(/--z-panel-controls:\s*(\d+)/.exec(tokens)?.[1]);
+    const xyflow = readFileSync("node_modules/@xyflow/react/dist/style.css", "utf8");
+    const minimap = Number(/\.react-flow__panel\s*\{[^}]*z-index:\s*(\d+)/.exec(xyflow)?.[1]);
+    expect(Number.isFinite(minimap)).toBe(true);
+    expect(panelControls).toBeGreaterThan(minimap);
+  });
+});

@@ -1,11 +1,16 @@
-"""One immutable response contract shared by the three plugin inventories."""
+"""Immutable response contracts for the plugin inventories.
+
+``list_sources`` and ``list_sinks`` share the full inventory contract.
+``list_transforms`` is a selection index: five facts per plugin, the
+prohibited section, and the per-plugin details tool.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import cast
+from typing import Final, cast
 
 from pydantic import JsonValue
 
@@ -99,6 +104,23 @@ class InventoryProhibitedPlugin:
 @dataclass(frozen=True, slots=True)
 class PluginInventoryResponse:
     available: tuple[InventoryPlugin, ...]
+    prohibited: tuple[InventoryProhibitedPlugin, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PluginIndexEntry:
+    name: str
+    description: str
+    capability_tags: tuple[str, ...]
+    web_config_authority: WebConfigAuthority
+    policy_capabilities: tuple[CapabilityDeclaration, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PluginIndexResponse:
+    """The transform selection index; its ``details_tool`` is fixed by the type."""
+
+    available: tuple[PluginIndexEntry, ...]
     prohibited: tuple[InventoryProhibitedPlugin, ...]
 
 
@@ -325,3 +347,81 @@ def encode_plugin_inventory(value: PluginInventoryResponse) -> JsonValue:
 
 
 PLUGIN_INVENTORY_RESPONSE_CONTRACT = SelectedResponseContract(parse_plugin_inventory, encode_plugin_inventory)
+
+
+PLUGIN_INDEX_DETAILS_TOOL: Final = "get_plugin_schema"
+_INDEX_ENTRY_FIELDS = ("name", "description", "capability_tags", "web_config_authority", "policy_capabilities")
+
+
+def _index_entry(value: object) -> PluginIndexEntry:
+    if type(value) is PluginIndexEntry:
+        if type(value.capability_tags) is not tuple or type(value.policy_capabilities) is not tuple:
+            raise _bad()
+        value = {
+            "name": value.name,
+            "description": value.description,
+            "capability_tags": value.capability_tags,
+            "web_config_authority": value.web_config_authority,
+            "policy_capabilities": value.policy_capabilities,
+        }
+    row = _record(value, _INDEX_ENTRY_FIELDS)
+    authority = row["web_config_authority"]
+    if type(authority) is str:
+        authority = WebConfigAuthority(authority)
+    if type(authority) is not WebConfigAuthority:
+        raise _bad()
+    return PluginIndexEntry(
+        _text(row["name"]),
+        _text(row["description"]),
+        _texts(row["capability_tags"]),
+        authority,
+        tuple(_capability(item) for item in _items(row["policy_capabilities"])),
+    )
+
+
+def parse_plugin_index(value: object) -> PluginIndexResponse:
+    try:
+        if type(value) is PluginIndexResponse:
+            if type(value.available) is not tuple or type(value.prohibited) is not tuple:
+                raise _bad()
+            if any(type(item) is not PluginIndexEntry for item in value.available) or any(
+                type(item) is not InventoryProhibitedPlugin for item in value.prohibited
+            ):
+                raise _bad()
+            value = {"available": value.available, "prohibited": value.prohibited, "details_tool": PLUGIN_INDEX_DETAILS_TOOL}
+        row = _record(value, ("available", "prohibited", "details_tool"))
+        if _text(row["details_tool"]) != PLUGIN_INDEX_DETAILS_TOOL:
+            raise _bad()
+        return PluginIndexResponse(
+            tuple(_index_entry(item) for item in _items(row["available"])),
+            tuple(_prohibited(item) for item in _items(row["prohibited"])),
+        )
+    except (TypeError, ValueError):
+        raise _bad() from None
+
+
+def encode_plugin_index(value: PluginIndexResponse) -> JsonValue:
+    return {
+        "available": [
+            {
+                "name": item.name,
+                "description": item.description,
+                "capability_tags": list(item.capability_tags),
+                "web_config_authority": item.web_config_authority.value,
+                "policy_capabilities": [
+                    {
+                        "capability": declaration.capability.value,
+                        "control_role": declaration.control_role.value if declaration.control_role is not None else None,
+                        "blocks_positive_detection": declaration.blocks_positive_detection,
+                    }
+                    for declaration in item.policy_capabilities
+                ],
+            }
+            for item in value.available
+        ],
+        "prohibited": [{"name": item.name, "reason": item.reason, "explanation": item.explanation} for item in value.prohibited],
+        "details_tool": PLUGIN_INDEX_DETAILS_TOOL,
+    }
+
+
+PLUGIN_INDEX_RESPONSE_CONTRACT = SelectedResponseContract(parse_plugin_index, encode_plugin_index)

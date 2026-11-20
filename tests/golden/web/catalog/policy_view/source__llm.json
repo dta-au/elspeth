@@ -409,5 +409,6 @@
     }
   ],
   "secret_requirements": [],
+  "usage_when_not_to_use": "Do not use this source for row-by-row enrichment, streaming generation, or deterministic replay. Use the LLM transform when prompts depend on incoming rows.",
   "web_config_authority": "operator_profiled"
 }

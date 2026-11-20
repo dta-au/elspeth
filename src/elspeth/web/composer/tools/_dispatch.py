@@ -32,6 +32,7 @@ from elspeth.contracts.freeze import deep_freeze, deep_thaw
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.composer.inline_prompt_limit import inline_prompt_refusal_message, new_long_inline_prompt
 from elspeth.web.composer.protocol import (
     REQUEST_INTERPRETATION_REVIEW_KIND_VALUES,
     SCHEMA_VIOLATION_MAX_LOC_DEPTH,
@@ -79,6 +80,7 @@ from elspeth.web.composer.tools.sessions import (
     ADVISOR_TRIGGER_VALUES,
 )
 from elspeth.web.credential_guard import require_no_credential_material_for_tool
+from elspeth.web.interpretation_state import server_staged_review_preservation_error
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
 from elspeth.web.sessions.protocol import SessionOperationAuthority
@@ -779,19 +781,24 @@ def _enforce_composition_interpretation_gate(
     prior_state: CompositionState,
 ) -> ToolResult:
     """Reject a successful public state mutation before its result is published."""
-    if not result.success or EffectDomain.GRAPH not in effects.domains:
+    if not result.success:
         return result
-    canonical_error = _composition_canonical_interpretation_requirement_error(
-        result.updated_state,
-        tool_name=tool_name,
-    )
-    if canonical_error is None:
-        return result
-    return _failure_result(
-        prior_state,
-        canonical_error,
-        error_code="interpretation_requirements_invalid",
-    )
+    if EffectDomain.GRAPH in effects.domains:
+        canonical_error = _composition_canonical_interpretation_requirement_error(
+            result.updated_state,
+            tool_name=tool_name,
+        )
+        if canonical_error is not None:
+            return _failure_result(
+                prior_state,
+                canonical_error,
+                error_code="interpretation_requirements_invalid",
+            )
+    if result.updated_state is not prior_state:
+        review_error = server_staged_review_preservation_error(prior_state, result.updated_state)
+        if review_error is not None:
+            return _failure_result(prior_state, review_error, error_code="server_owned_review_protected")
+    return result
 
 
 def execute_tool(
@@ -915,94 +922,113 @@ def execute_tool(
     if catalog.snapshot is not plugin_snapshot:
         raise ValueError("plugin_snapshot_catalog_mismatch")
 
-    all_handlers: dict[str, ToolHandler] = {
-        **_DISCOVERY_TOOLS,
-        **_MUTATION_TOOLS,
-        **_BLOB_DISCOVERY_TOOLS,
-        **_BLOB_MUTATION_TOOLS,
-        **_SECRET_DISCOVERY_TOOLS,
-        **_SECRET_MUTATION_TOOLS,
-    }
-    if tool_name not in all_handlers:
-        return normalize_tool_result_validation(_failure_result(state, f"Unknown tool: {tool_name}"), catalog)
-    handler = all_handlers[tool_name]
-    current_validation = prior_validation or catalog.validate_composition_state(state).validation
+    try:
+        all_handlers: dict[str, ToolHandler] = {
+            **_DISCOVERY_TOOLS,
+            **_MUTATION_TOOLS,
+            **_BLOB_DISCOVERY_TOOLS,
+            **_BLOB_MUTATION_TOOLS,
+            **_SECRET_DISCOVERY_TOOLS,
+            **_SECRET_MUTATION_TOOLS,
+        }
+        if tool_name not in all_handlers:
+            return normalize_tool_result_validation(_failure_result(state, f"Unknown tool: {tool_name}"), catalog)
+        handler = all_handlers[tool_name]
+        current_validation = prior_validation or catalog.validate_composition_state(state).validation
 
-    if validate_arguments or raise_schema_argument_errors:
-        argument_error = _validate_tool_arguments(
-            tool_name,
-            arguments,
-            state,
-            raise_on_error=raise_schema_argument_errors,
-        )
-        if argument_error is not None:
-            return normalize_tool_result_validation(argument_error, catalog)
-
-    if _requires_secret_context(tool_name) and (secret_service is None or user_id is None):
-        result = normalize_tool_result_validation(
-            _saved_graph_rejection_result(
+        if validate_arguments or raise_schema_argument_errors:
+            argument_error = _validate_tool_arguments(
+                tool_name,
+                arguments,
                 state,
-                "Secret tools require secret service context.",
-                error_code="secret_context_unavailable",
-                rejected_component=None,
-            ),
-            catalog,
+                raise_on_error=raise_schema_argument_errors,
+            )
+            if argument_error is not None:
+                return normalize_tool_result_validation(argument_error, catalog)
+
+        if _requires_secret_context(tool_name) and (secret_service is None or user_id is None):
+            result = normalize_tool_result_validation(
+                _saved_graph_rejection_result(
+                    state,
+                    "Secret tools require secret service context.",
+                    error_code="secret_context_unavailable",
+                    rejected_component=None,
+                ),
+                catalog,
+            )
+            return _augment_with_validation_guidance(result, tool_name)
+
+        # ``current_validation`` carries the live state's ValidationSummary
+        # into ``diff_pipeline`` so its delta against the baseline is computed
+        # using the caller's pre-mutation validation rather than re-running
+        # ``state.validate()`` inside the handler. For every other handler,
+        # the field is unused.
+        context = ToolContext(
+            catalog=catalog,
+            plugin_snapshot=plugin_snapshot,
+            data_dir=data_dir,
+            mcp_root_authority=mcp_root_authority,
+            require_data_dir_for_paths=require_data_dir_for_paths,
+            session_engine=session_engine,
+            session_id=session_id,
+            current_state_id=current_state_id,
+            session_operation_context=session_operation_context,
+            session_operation_authority=session_operation_authority,
+            secret_service=secret_service,
+            secret_wiring_policy=secret_wiring_policy,
+            user_id=user_id,
+            baseline=baseline,
+            baseline_kind=baseline_kind,
+            current_validation=current_validation,
+            runtime_preflight=runtime_preflight,
+            structural_preflight=structural_preflight,
+            max_blob_storage_per_session_bytes=max_blob_storage_per_session_bytes,
+            user_message_id=user_message_id,
+            user_message_content=user_message_content,
+            composer_model_identifier=composer_model_identifier,
+            composer_model_version=composer_model_version,
+            composer_provider=composer_provider,
+            composer_skill_hash=composer_skill_hash,
+            tool_arguments_hash=tool_arguments_hash,
+            reviewed_source_authority=reviewed_source_authority,
+            executing_proposal_id=executing_proposal_id,
+            _interpretation_requirements_are_internal=_interpretation_requirements_are_internal,
         )
-        return _augment_with_validation_guidance(result, tool_name)
 
-    # ``current_validation`` carries the live state's ValidationSummary
-    # into ``diff_pipeline`` so its delta against the baseline is computed
-    # using the caller's pre-mutation validation rather than re-running
-    # ``state.validate()`` inside the handler. For every other handler,
-    # the field is unused.
-    context = ToolContext(
-        catalog=catalog,
-        plugin_snapshot=plugin_snapshot,
-        data_dir=data_dir,
-        mcp_root_authority=mcp_root_authority,
-        require_data_dir_for_paths=require_data_dir_for_paths,
-        session_engine=session_engine,
-        session_id=session_id,
-        current_state_id=current_state_id,
-        session_operation_context=session_operation_context,
-        session_operation_authority=session_operation_authority,
-        secret_service=secret_service,
-        secret_wiring_policy=secret_wiring_policy,
-        user_id=user_id,
-        baseline=baseline,
-        baseline_kind=baseline_kind,
-        current_validation=current_validation,
-        runtime_preflight=runtime_preflight,
-        structural_preflight=structural_preflight,
-        max_blob_storage_per_session_bytes=max_blob_storage_per_session_bytes,
-        user_message_id=user_message_id,
-        user_message_content=user_message_content,
-        composer_model_identifier=composer_model_identifier,
-        composer_model_version=composer_model_version,
-        composer_provider=composer_provider,
-        composer_skill_hash=composer_skill_hash,
-        tool_arguments_hash=tool_arguments_hash,
-        reviewed_source_authority=reviewed_source_authority,
-        executing_proposal_id=executing_proposal_id,
-        _interpretation_requirements_are_internal=_interpretation_requirements_are_internal,
-    )
+        effects = resolve_tool_effects(tool_name, arguments)
+        result = handler(arguments, state, context)
+        result = _enforce_composition_interpretation_gate(
+            result,
+            tool_name=tool_name,
+            effects=effects,
+            prior_state=state,
+        )
 
-    effects = resolve_tool_effects(tool_name, arguments)
-    result = handler(arguments, state, context)
-    result = _enforce_composition_interpretation_gate(
-        result,
-        tool_name=tool_name,
-        effects=effects,
-        prior_state=state,
-    )
+        if session_id is not None and executing_proposal_id is None and result.success:
+            long_prompt = new_long_inline_prompt(state, result.updated_state)
+            if long_prompt is not None:
+                node_id, field, words, characters = long_prompt
+                result = _saved_graph_rejection_result(
+                    state,
+                    inline_prompt_refusal_message(field, words, characters),
+                    error_code="inline_prompt_too_long",
+                    rejected_component=f"node:{node_id}",
+                )
 
-    return finalize_tool_result(
-        result,
-        tool_name=tool_name,
-        catalog=catalog,
-        context=context,
-        prior_validation=current_validation,
-    )
+        return finalize_tool_result(
+            result,
+            tool_name=tool_name,
+            catalog=catalog,
+            context=context,
+            prior_validation=current_validation,
+        )
+    finally:
+        # A mutation-kind call can change a secret or a blob that no state key
+        # sees, so once it ends (applied, refused or raised) no verdict computed
+        # before it is reused in this round: this is the one place the round's
+        # mutation epoch moves.
+        if tool_name in _ALL_MUTATION_TOOL_NAMES:
+            catalog.record_mutation_tool_end()
 
 
 def execute_discovery_tool_with_context(

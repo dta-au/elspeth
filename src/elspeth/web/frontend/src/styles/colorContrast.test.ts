@@ -967,18 +967,20 @@ describe("design-review contrast remediation (2026-06-29)", () => {
     }
   });
 
-  it("gives the workspace pane toggles a resting boundary clearing WCAG 1.4.11 (3:1)", () => {
-    // .workspace-pane-toggle (collapse/restore, 2026-08-15 recut) has a
-    // transparent fill, so its --color-input-border boundary is the only
-    // resting affordance. It sits on --color-surface (the pane band and the
-    // collapsed strip), a step darker than the elevated surface M04 proves
-    // against — pin the actual ground. workspaceChrome.test.ts pins that the
-    // class really uses this token.
+  it("gives the workspace pane toggle a resting boundary clearing WCAG 1.4.11 (3:1)", () => {
+    // .workspace-pane-toggle (hide/show conversation) has a transparent
+    // fill, so its --color-input-border boundary is the only resting
+    // affordance. Since 2026-11-20 it sits at the left end of a pane title
+    // bar (--color-pane-header) — pin the actual ground, plus the badge
+    // dots, which are non-text indicators on the same bar.
+    // workspaceChrome.test.ts pins that the class really uses this token.
     for (const theme of themes) {
-      expect(
-        contrastRatio(resolveHex(theme, "--color-input-border"), resolveHex(theme, "--color-surface")),
-        `pane-toggle border on surface (${theme})`,
-      ).toBeGreaterThanOrEqual(3);
+      for (const token of ["--color-pane-toggle-border", "--color-info", "--color-error"]) {
+        expect(
+          contrastRatio(resolveHex(theme, token), resolveHex(theme, "--color-pane-header")),
+          `${token} on the pane title bar (${theme})`,
+        ).toBeGreaterThanOrEqual(3);
+      }
     }
   });
 });
@@ -1154,6 +1156,9 @@ describe("ARGOnite pane chrome text pairs (Task 6)", () => {
     ["Checks glyph on a success fill", "--color-surface", "--color-success"],
     ["Checks glyph on a warning fill", "--color-surface", "--color-warning"],
     ["Checks glyph on an error fill", "--color-surface", "--color-error"],
+    // The hide/show conversation toggle's unread count, same recipe
+    // (workspace.css .workspace-pane-toggle-badge--count).
+    ["unread count on its info fill", "--color-surface", "--color-info"],
   ];
 
   it.each(pairs)("keeps the %s at AA in both themes", (_label, text, ground) => {

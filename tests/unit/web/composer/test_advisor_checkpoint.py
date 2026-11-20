@@ -51,7 +51,12 @@ from elspeth.web.composer.advisor_context import (
     advisor_checkpoint_summary_chars,
 )
 from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGatePassed, AdvisorSignoffGateFact
-from elspeth.web.composer.advisor_policy import ADVISOR_MALFORMED_USER_DETAIL, ADVISOR_UNAVAILABLE_USER_DETAIL
+from elspeth.web.composer.advisor_policy import (
+    ADVISOR_FINAL_REPLY_CONTRACT_CLAUSE,
+    ADVISOR_MALFORMED_USER_DETAIL,
+    ADVISOR_OUTPUT_CONTRACT_CLAUSE,
+    ADVISOR_UNAVAILABLE_USER_DETAIL,
+)
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.composition_completion import CompositionCompletion
 from elspeth.web.composer.invariants import InvariantError
@@ -3124,6 +3129,8 @@ async def drive_try_terminate(
     orphan_sites: tuple[tuple[str, str, InterpretationKind], ...] = (),
     use_real_orphan_gate: bool = False,
     plugin_snapshot=None,
+    turn_evidence=None,
+    advisor_review_state=None,
 ):
     """Drive ``_try_terminate_no_tools`` with the full kwarg set.
 
@@ -3220,13 +3227,17 @@ async def drive_try_terminate(
     kwargs = {}
     if deadline is not None:
         kwargs["deadline"] = deadline
+    if advisor_review_state is not None:
+        kwargs["advisor_review_state"] = advisor_review_state
     session_id = session_operation_context.fence.session_id if session_operation_context is not None else str(uuid.uuid4())
     from elspeth.web.composer.turn_effects import TurnEvidence
 
     context = session_operation_context or _compose_context(session_id)
     return await service._completion._try_terminate_no_tools(
         assistant_message=_AdmittedAssistantMessage(content=candidate),
-        turn_evidence=TurnEvidence(
+        turn_evidence=turn_evidence
+        if turn_evidence is not None
+        else TurnEvidence(
             session_id=session_id,
             session_operation_context=context,
             request_id="advisor-unit-request",
@@ -3391,7 +3402,13 @@ async def test_end_gate_publication_only_repair_does_not_require_graph_mutations
     assert len(llm_messages) == 1
     content = llm_messages[0]["content"]
     assert "A prose-only correction is valid; do not mutate the graph merely to satisfy this review." in content
-    assert "Fix the findings via tool calls." not in content
+    # The graph-repair half of the blocking output contract must not leak into
+    # publication-only repair; only the shared final-reply clause rides here.
+    graph_repair_clause = ADVISOR_OUTPUT_CONTRACT_CLAUSE.removesuffix(ADVISOR_FINAL_REPLY_CONTRACT_CLAUSE)
+    assert graph_repair_clause.strip()
+    assert graph_repair_clause != ADVISOR_OUTPUT_CONTRACT_CLAUSE
+    assert graph_repair_clause not in content
+    assert ADVISOR_FINAL_REPLY_CONTRACT_CLAUSE in content
     assert "pipeline MUTATIONS via tool calls" not in content
     assert "do not quote the fenced text" in content
     assert content.endswith("BEGIN_UNTRUSTED_ADVISOR_FINDINGS\nCorrect the unsupported completion claim.\nEND_UNTRUSTED_ADVISOR_FINDINGS")
