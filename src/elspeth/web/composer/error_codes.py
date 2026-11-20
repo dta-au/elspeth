@@ -314,11 +314,14 @@ _EMITTED_POLICY_AND_EXECUTION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "source_inspection_failed",
         "text_source_url_without_web_scrape",
         # Session-route validation (persisted runtime-preflight failure, and
-        # the YAML import's refusal of a prompt file it cannot verify).
+        # the YAML import's refusal of a prompt file it cannot verify or that
+        # is over an inline size cap; the last is PromptFileTooLargeError's
+        # code, which the prompt-file save route reports too).
         # Not tool responses; registered so the census covers
         # the whole web tree without a special case.
         "runtime_preflight_failed",
         "import_prompt_file_unverified",
+        "prompt_file_too_large",
     }
 )
 
