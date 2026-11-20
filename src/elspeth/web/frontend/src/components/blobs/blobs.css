@@ -322,6 +322,49 @@
   color: var(--color-text-muted);
 }
 
+.file-wiring-filter {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-xs);
+}
+
+.file-wiring-filter .input {
+  flex: 1 1 12rem;
+}
+
+.file-wiring-selected {
+  color: var(--color-text-muted);
+}
+
+.file-wiring-step {
+  margin: var(--space-sm) 0 0;
+  border: 0;
+  border-top: 1px solid var(--color-border);
+  padding: var(--space-xs) 0 0;
+}
+
+.file-wiring-step legend {
+  padding: 0 var(--space-xs);
+  font-weight: var(--font-weight-semibold);
+}
+
+/* The status shares the button band: it takes the free space to the left of
+   Cancel / Connect, and wraps above them on a narrow dialog. */
+.file-wiring-actions {
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+/* Never display:none while empty: a live region must already be in the
+   accessibility tree when its text arrives, or the change is not announced. */
+.file-wiring-status {
+  flex: 1 1 12rem;
+  margin: 0;
+  color: var(--color-text-secondary);
+}
+
 .file-wiring-instructions {
   display: grid;
   gap: var(--space-xs);
