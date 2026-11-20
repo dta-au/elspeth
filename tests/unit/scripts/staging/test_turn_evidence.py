@@ -63,6 +63,14 @@ def test_a_call_finishing_after_the_last_row_extends_the_span() -> None:
     assert evidence["server_ms"] == 8000
 
 
+def test_a_span_shorter_than_provider_time_gives_no_server_time_rather_than_a_negative_one() -> None:
+    # The call began 30 s before the turn's first stored row, so the stored span cannot contain it.
+    evidence = turn_evidence(rows(call("2025-12-31T23:59:30+00:00", "2026-01-01T00:00:02+00:00", 32_000)), OP, shed_before=None)
+    assert evidence["span_ms"] == 10_000
+    assert evidence["provider_busy_ms"] == 32_000
+    assert evidence["server_ms"] is None
+
+
 def test_untimed_calls_leave_the_figures_unavailable_rather_than_estimated() -> None:
     untimed = {"_kind": "llm_call_audit", "call": {"status": "timeout", "latency_ms": None}}
     evidence = turn_evidence(rows(untimed), OP, shed_before=None)

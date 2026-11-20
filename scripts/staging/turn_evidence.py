@@ -19,7 +19,10 @@ Time figures, all in milliseconds:
   ``[started_at, finished_at]`` intervals; overlapping calls count once.
 * ``provider_latency_ms_sum`` -- the sum of the calls' ``latency_ms``.
 * ``server_ms`` -- ``span_ms - provider_busy_ms``: time in the turn with no
-  provider call in flight.
+  provider call in flight. It is null, never negative, when it cannot be
+  measured: a missing figure, or a span shorter than the provider time (a
+  provider call that began before the turn's first stored row collapses the
+  span, and the stored rows then cannot say where the turn began).
 
 The client's own wall time for the turn (submission to the poll that saw it
 finish) is measured by the battery, not here; its resolution is the poll
@@ -145,7 +148,7 @@ def turn_evidence(rows: Sequence[Mapping[str, Any]], operation_id: str, *, shed_
         "provider_latency_ms_sum": sum(latencies) if len(latencies) == len(calls) else None,
         "provider_latency_ms_max": max(latencies) if latencies else None,
         "provider_call_over_300_seconds": any(value > LONG_PROVIDER_CALL_MS for value in latencies),
-        "server_ms": span - busy if span is not None and busy is not None else None,
+        "server_ms": span - busy if span is not None and busy is not None and span >= busy else None,
         "history": {
             "calls_with_shedding": sum(
                 1
