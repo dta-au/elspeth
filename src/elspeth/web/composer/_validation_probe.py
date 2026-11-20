@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import functools
 import json
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
-from typing import Any, Final, cast
+from typing import Any, Final, cast, get_args
 
 from pydantic_core import ErrorDetails
 
@@ -14,6 +15,9 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.core.llm_profiles import LLM_PROFILE_PRIVATE_FIELDS
 from elspeth.core.secrets import redact_secret_refs_for_validation
+from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailPlugin, BedrockGuardrailProfileSettings
+from elspeth.plugins.transforms.aws.textract_regions import TEXTRACT_INVARIANT_PROBE_REGION
+from elspeth.web.plugin_policy.profiles import AWSTextractProfileSettings, AzureSearchProfileSettings, DetachedProfileLowering
 
 
 class DeferredBlobContractProbe(Exception):
@@ -450,6 +454,12 @@ def prepare_validation_probe_options(options: Mapping[str, Any], *, plugin: str 
     ``json_schema``) still constructs. An authored ``provider`` — a YAML
     import that carries its own — is left to stand on its own config.
 
+    For the other profile-bound transforms (``_inert_profile_bindings``), a
+    string ``profile`` is lowered by the plugin's own resolver over an inert
+    profile, so the projection holds exactly the keys run-time lowering
+    writes. A refusal by that lowering is raised as ``PluginConfigError``,
+    which every probe site tolerates as a config failure.
+
     For ``plugin="llm"`` the projection also supplies probe-only text wherever
     a prompt position (``prompt_template``, ``system_prompt``, a query's
     ``template``) holds a VALID ``inline_content`` marker. The config model
@@ -530,6 +540,32 @@ def prepare_validation_probe_options(options: Mapping[str, Any], *, plugin: str 
 
     thawed = cast(dict[str, Any], deep_thaw(options))
     runtime_options = strip_authoring_options(thawed)
+    if (
+        plugin is not None
+        and plugin in _inert_profile_bindings()
+        and "profile" in runtime_options
+        and type(runtime_options["profile"]) is str
+    ):
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+
+        try:
+            lowered = _inert_profile_bindings()[plugin].lower_options(
+                alias=_PROBE_PROFILE_ALIAS,
+                safe_options={name: value for name, value in runtime_options.items() if name != "profile"},
+            )
+        except ValueError as exc:
+            # The plugin's own resolver refuses these authored options (a
+            # private binding option beside the alias, an option a
+            # profile-bound node may not author, a missing index), as run-time
+            # lowering does. Its reason is a value-free code. Every probe site
+            # tolerates a config error, so the node fails as a config error.
+            raise PluginConfigError(
+                f"Invalid configuration for transform '{plugin}': operator profile lowering refuses these options ({exc})",
+                cause=str(exc),
+                plugin_name=plugin,
+                component_type="transform",
+            ) from exc
+        runtime_options = cast(dict[str, Any], deep_thaw(lowered.executable_options))
     prepared = redact_secret_refs_for_validation(runtime_options)
     # Approval evidence is server-stamped after review and is retained by the
     # runtime config. It is not a private provider binding: its presence must
@@ -559,3 +595,69 @@ def prepare_validation_probe_options(options: Mapping[str, Any], *, plugin: str 
         if plugin == "llm" and substituted and "approved_prompt_artifact_hash" in prepared:
             del prepared["approved_prompt_artifact_hash"]
     return prepared
+
+
+_PROBE_PROFILE_ALIAS: Final = "validation-probe"
+"""Alias of every inert operator profile below; the authored alias is never looked up."""
+
+
+@functools.cache
+def _inert_profile_bindings() -> Mapping[str, DetachedProfileLowering]:
+    """An inert operator profile per non-llm profile-bound transform, for the probe only.
+
+    A web-authored node of these plugins carries only its public ``profile``
+    alias and public options; the private binding (guardrail identity and
+    region, Textract bucket and region, Search endpoint and credential) is
+    written by the operator profile at lowering, after authoring validation
+    has run. Constructing the authored shape fails on the missing binding and
+    on ``profile`` as an extra input, and the known-pass-through fail-closed
+    arm of ``_effective_producer_vote`` turned that into "guarantees
+    nothing": every consumer requiring a field behind the node was refused,
+    and no source data-contract demand could cross it. The same defect was
+    fixed for llm by the gateway stub in ``prepare_validation_probe_options``.
+
+    Each value is an inert profile handed to the plugin's own resolver
+    through ``DetachedProfileLowering``, so the projection is exactly what
+    lowering would write, and lowering's own refusals (a private option
+    beside the alias, an option a profile-bound node may not author, a
+    missing index) still refuse. The output contract of these plugins is a
+    function of the public options (``fields``, ``schema``, the Textract
+    output fields, the Search ``output_prefix``); none reads the binding.
+
+    The values are obviously fake (``validation-probe`` names, a ``.invalid``
+    host, an unset credential name that redaction replaces with its
+    placeholder) and reach only the detached dict that the probe hands to a
+    constructor and drops. None of these constructors opens a client: the
+    SDK clients are built in ``on_start``, which a probe never calls. Which
+    plugins are profile-bound is decided by ``OperatorProfileRegistry``; a
+    test enumerates it and fails when a profile-bound plugin has no row here.
+    """
+    bindings: dict[str, DetachedProfileLowering] = {
+        plugin: DetachedProfileLowering(
+            "bedrock_guardrail",
+            BedrockGuardrailProfileSettings(
+                alias=_PROBE_PROFILE_ALIAS,
+                plugin=plugin,
+                guardrail_identifier="validationprobe",
+                guardrail_version="1",
+                region="us-east-1",
+            ).model_dump_json(),
+        )
+        for plugin in get_args(BedrockGuardrailPlugin)
+    }
+    bindings["aws_textract_document_analysis"] = DetachedProfileLowering(
+        "textract",
+        AWSTextractProfileSettings(alias=_PROBE_PROFILE_ALIAS, bucket="validation-probe-bucket").model_dump_json(),
+        TEXTRACT_INVARIANT_PROBE_REGION,
+    )
+    bindings["azure_ai_search"] = DetachedProfileLowering(
+        "azure_search",
+        AzureSearchProfileSettings(
+            alias=_PROBE_PROFILE_ALIAS,
+            endpoint="https://validation-probe.invalid",
+            auth="api_key",
+            credential_ref="VALIDATION_PROBE_UNSET",
+            indexes="any",
+        ).model_dump_json(),
+    )
+    return MappingProxyType(bindings)
