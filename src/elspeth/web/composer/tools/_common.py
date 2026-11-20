@@ -1814,8 +1814,9 @@ _SOURCE_VALIDATION_FAILURE_DESCRIPTION: Final[str] = (
 
 _STEP_DESCRIPTION_DESCRIPTION: Final[str] = (
     "One short sentence of plain prose saying what this step does, shown to reviewers "
-    "on the Spec tab. Supply it when creating the step and refresh it whenever you "
-    "change what the step does. Informational only — never affects validation or execution."
+    "on the Spec tab. Supply it for new steps. Preserve it during routing-only edits or explicit "
+    "content-preservation requests; refresh it only when the requested change includes the step's "
+    "purpose or description. Informational only — never affects validation or execution."
 )
 
 
