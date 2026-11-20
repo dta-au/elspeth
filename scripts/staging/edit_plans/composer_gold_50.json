@@ -390,11 +390,11 @@
     },
     {
       "id": "max-tokens",
-      "message": "Set max_tokens on {llm_file} to 777.",
+      "message": "Set max_tokens on {llm_file} to 1237.",
       "expect": [
         {
           "equals": "/nodes/{llm_file}/options/max_tokens",
-          "value": 777
+          "value": 1237
         }
       ],
       "tools_any": [
@@ -404,11 +404,11 @@
     },
     {
       "id": "temperature",
-      "message": "Set temperature on {llm_file} to 0.3.",
+      "message": "Set temperature on {llm_file} to 0.37.",
       "expect": [
         {
           "equals": "/nodes/{llm_file}/options/temperature",
-          "value": 0.3
+          "value": 0.37
         }
       ],
       "tools_any": [
@@ -755,11 +755,11 @@
     },
     {
       "id": "max-tokens-2",
-      "message": "Set max_tokens on {llm_file} to 777.",
+      "message": "Set max_tokens on {llm_file} to 1381.",
       "expect": [
         {
           "equals": "/nodes/{llm_file}/options/max_tokens",
-          "value": 777
+          "value": 1381
         }
       ],
       "tools_any": [
@@ -769,11 +769,11 @@
     },
     {
       "id": "temperature-2",
-      "message": "Set temperature on {llm_file} to 0.3.",
+      "message": "Set temperature on {llm_file} to 0.43.",
       "expect": [
         {
           "equals": "/nodes/{llm_file}/options/temperature",
-          "value": 0.3
+          "value": 0.43
         }
       ],
       "tools_any": [
