@@ -9,6 +9,8 @@ Behaviour pinned here:
   bytes (exactly at the byte limit is admitted, one byte over is refused); an
   over-size or malformed report is refused as a model-readable
   ``ToolArgumentError`` and writes nothing;
+* a session keeps at most a fixed number of reports; past it the call fails
+  with a model-readable message and writes nothing;
 * the report prose is redacted from the assistant row's tool-call record (the
   tool and audit rows keep the arguments, as for every tool);
 * the report runs immediately under explicit approval, like ``create_blob``,
@@ -288,6 +290,41 @@ def test_one_behaviour_field_at_its_cap_in_multibyte_text_fits_and_is_stored_as_
     assert len(saved) <= impl.max_bytes
     assert text.encode("utf-8") in saved
     assert json.loads(saved)["observations"]["observed_behavior"] == text
+
+
+def test_session_report_limit_refuses_the_next_report_and_continues(tmp_path: Path) -> None:
+    """At the per-session limit the call fails with a model-readable message and writes nothing.
+
+    Only this tool's reports count: another assistant file with the same
+    filename prefix does not use up the limit.
+    """
+    impl = _impl()
+    reports = vars(impl.reports)
+    assert "COMPOSER_BUG_REPORTS_PER_SESSION_MAX" in reports, "the per-session report limit is missing"
+    limit = reports["COMPOSER_BUG_REPORTS_PER_SESSION_MAX"]
+    assert limit == 20
+    state = _empty_state()
+    with _report_session(tmp_path) as (engine, kwargs):
+        other = execute_tool(
+            "create_blob",
+            {"filename": "composer-bug-report-notes.json", "mime_type": "application/json", "content": "{}"},
+            state,
+            _mock_catalog(),
+            **kwargs,
+        )
+        assert other.success
+        for _ in range(limit):
+            assert execute_tool("report_composer_bug", _arguments(), state, _mock_catalog(), **kwargs).success
+        refused = execute_tool("report_composer_bug", _arguments(), state, _mock_catalog(), **kwargs)
+        rows = _blob_rows(engine)
+
+    assert not refused.success
+    assert refused.updated_state is state
+    message = refused.validation.errors[0].message
+    assert f"{limit} composer bug reports" in message
+    assert "not saved" in message
+    assert "continue the user's task" in message
+    assert len(rows) == limit + 1
 
 
 def test_report_over_the_session_quota_fails_without_a_file(tmp_path: Path) -> None:

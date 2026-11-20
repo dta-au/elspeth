@@ -22,6 +22,8 @@ from datetime import UTC, datetime
 from typing import Final, TypedDict
 from uuid import uuid4
 
+from sqlalchemy import Engine, func, select
+
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.composer.protocol import (
@@ -53,8 +55,9 @@ from elspeth.web.composer.tools.blobs import (
     _PreparedBlobCreate,
 )
 from elspeth.web.composer.tools.declarations import ToolDeclaration, ToolKind
+from elspeth.web.sessions.models import blobs_table
 
-__all__ = ["REPORT_STATUS", "REPORT_TYPE", "TOOLS_IN_MODULE", "ComposerBugReportPayload"]
+__all__ = ["COMPOSER_BUG_REPORTS_PER_SESSION_MAX", "REPORT_STATUS", "REPORT_TYPE", "TOOLS_IN_MODULE", "ComposerBugReportPayload"]
 
 # The saved file is bounded by ``COMPOSER_BUG_REPORT_MAX_BYTES`` (UTF-8 bytes)
 # as well as by the field caps (characters). The caps alone do not bound it:
@@ -70,6 +73,17 @@ REPORT_TYPE: Final = "suspected_composer_bug"
 REPORT_STATUS: Final = "suspected_unverified"
 _REPORT_MIME_TYPE: Final = "application/json"
 _REPORT_DESCRIPTION: Final = "Suspected Composer guidance or tool mismatch, reported by the composer model; not verified."
+_REPORT_FILENAME_PREFIX: Final = "composer-bug-report-"
+
+# At most this many report files per session. Reports are ordinary session
+# files and the file listing shows only the newest, so an unbounded run of
+# reports would push the user's own files out of it. The count is read from the
+# session's existing report files; no store state is added.
+COMPOSER_BUG_REPORTS_PER_SESSION_MAX: Final = 20
+_REPORT_LIMIT_REACHED: Final = (
+    f"This session already holds {COMPOSER_BUG_REPORTS_PER_SESSION_MAX} composer bug reports, the limit per session. "
+    "This report was not saved. Do not report again in this session; continue the user's task."
+)
 
 
 class ComposerBugReportPayload(TypedDict):
@@ -97,6 +111,23 @@ def _report_observations(report: ReportComposerBugArgumentsModel) -> dict[str, s
     if report.related_tool is not None:
         observations["related_tool"] = report.related_tool
     return observations
+
+
+def _session_report_count(session_engine: Engine, session_id: str) -> int:
+    """How many report files this tool has already saved in the session."""
+    query = (
+        select(func.count())
+        .select_from(blobs_table)
+        .where(
+            blobs_table.c.session_id == session_id,
+            blobs_table.c.created_by == "assistant",
+            blobs_table.c.source_description == _REPORT_DESCRIPTION,
+            blobs_table.c.filename.startswith(_REPORT_FILENAME_PREFIX, autoescape=True),
+        )
+    )
+    with session_engine.connect() as conn:
+        count: int = conn.execute(query).scalar_one()
+    return count
 
 
 def _report_content(observations: Mapping[str, str], state: CompositionState, context: ToolContext) -> str:
@@ -156,10 +187,15 @@ def _execute_report_composer_bug(
         return _failure_result(state, "Blob tools require session context.")
     if context.data_dir is None:
         return _failure_result(state, "Blob tools require data_dir for storage.")
+    # Calls in a tool batch run one at a time. The count is a plain read, not
+    # taken under the quota lock: the limit keeps the file listing usable and
+    # is not a security bound.
+    if _session_report_count(session_engine, session_id) >= COMPOSER_BUG_REPORTS_PER_SESSION_MAX:
+        return _failure_result(state, _REPORT_LIMIT_REACHED)
 
     provenance = _blob_creation_provenance(content, context)
     prepared = _prepare_blob_create(
-        filename=f"composer-bug-report-{uuid4()}.json",
+        filename=f"{_REPORT_FILENAME_PREFIX}{uuid4()}.json",
         mime_type=_REPORT_MIME_TYPE,
         content=content,
         description=_REPORT_DESCRIPTION,
@@ -196,7 +232,8 @@ _REPORT_COMPOSER_BUG_DECLARATION: Final = ToolDeclaration(
         "Saves a JSON report file in this session and returns its `blob_id`, `filename` and `status` "
         "(always `suspected_unverified`). "
         "Reporting does not change the pipeline, repair the problem or confirm the bug. "
-        "Report each distinct mismatch once, then continue the user's task. "
+        "Report each distinct mismatch once, then continue the user's task; "
+        f"a session keeps at most {COMPOSER_BUG_REPORTS_PER_SESSION_MAX} reports. "
         f"The saved report is at most {COMPOSER_BUG_REPORT_MAX_BYTES:,} bytes of UTF-8 JSON. "
         "State factual observations only; never include credentials or document content the mismatch does not need."
     ),
