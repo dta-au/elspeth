@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any, cast
+import json
+from collections.abc import Callable, Mapping
+from types import MappingProxyType
+from typing import Any, Final, cast
 
 from pydantic_core import ErrorDetails
 
 from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.core.llm_profiles import LLM_PROFILE_PRIVATE_FIELDS
 from elspeth.core.secrets import redact_secret_refs_for_validation
 
@@ -108,6 +111,159 @@ def _substitute_query_template_placeholders(queries: object) -> bool:
     return substituted
 
 
+def _stand_in_llm_prompt_template(prepared: object) -> bool:
+    """``prompt_template``: in single-prompt mode the text reads every declared row field."""
+    if type(prepared) is not dict or "prompt_template" not in prepared or not is_inline_content_reference(prepared["prompt_template"]):
+        return False
+    # Single-prompt mode is the only one whose template must read the
+    # declared row fields; a query-mode fallback renders query bindings.
+    single_prompt = "queries" not in prepared or prepared["queries"] is None
+    declared = prepared["required_input_fields"] if "required_input_fields" in prepared else None
+    prepared["prompt_template"] = _probe_prompt_file_placeholder(declared, reads_row=single_prompt)
+    return True
+
+
+def _stand_in_llm_system_prompt(prepared: object) -> bool:
+    """``system_prompt``: inert text that reads nothing."""
+    if type(prepared) is not dict or "system_prompt" not in prepared or not is_inline_content_reference(prepared["system_prompt"]):
+        return False
+    prepared["system_prompt"] = _PROBE_PROMPT_FILE_PLACEHOLDER
+    return True
+
+
+def _stand_in_llm_query_templates(prepared: object) -> bool:
+    """``queries.*.template``, in query mode only."""
+    if type(prepared) is not dict or "queries" not in prepared or prepared["queries"] is None:
+        return False
+    return _substitute_query_template_placeholders(prepared["queries"])
+
+
+_PROBE_FILE_PLACEHOLDER = "validation-probe-file-placeholder"
+"""Inert text standing in for a file-held ``file_inject`` entry inside a probe projection."""
+
+_PROBE_JSON_VALUE_BY_DECLARED_TYPE: Final[Mapping[str, int | float | bool]] = MappingProxyType({"int": 0, "float": 0.5, "bool": True})
+"""A non-null JSON value for each declarable scalar type other than ``str``; any other declaration, or none, takes a JSON string."""
+
+
+def _file_inject_declared_fields(schema: object) -> dict[str, FieldDefinition] | ValueError:
+    """The node's authored ``schema.fields`` by name, or the reason the block does not parse.
+
+    The config model refuses an unparseable block with this same error when
+    the probe constructs the plugin, so the error is returned to the caller,
+    which then substitutes nothing rather than guess which fields were meant.
+    """
+    try:
+        parsed = SchemaConfig.from_dict(cast("Mapping[str, Any]", schema))
+    except ValueError as exc:
+        return exc
+    return {field.name: field for field in parsed.fields or ()}
+
+
+def _file_inject_entry_stand_in(entry: object, *, written_field: object, declared: Mapping[str, FieldDefinition]) -> str | None:
+    """Probe-only content for one entry, chosen by its ``format`` and the author's declaration.
+
+    ``text`` is always the string itself and ``csv`` and ``jsonl`` always a
+    list, whatever the file holds. The csv header is one column whose name
+    avoids the delimiter, with no data rows. ``json`` takes a non-null value
+    of the type the author declared for the written field (``int`` ``0``,
+    ``float`` ``0.5``, ``bool`` ``true``), otherwise a JSON string, wrapped in
+    an object under ``data_key`` when one is set; it is never a JSON null.
+    ``None`` means the entry's own options are malformed, which the config
+    model refuses whatever the content.
+
+    An undeclared json written field is stood in although a JSON null in the
+    file would make it nullable. That is sound only because such a field is
+    typed ``any`` and no authoring consumer separates a nullable ``any`` from
+    a non-null one; ``test_file_inject_file_content_probe.py::
+    test_PIN_undeclared_json_nullability_is_unobservable_at_authoring`` goes
+    red the day one does. A declared field is published from the declaration
+    instead, and execution validation holds the bytes against it.
+    """
+    if type(entry) is not dict:
+        return None
+    fmt = entry["format"] if "format" in entry else None
+    if fmt == "text":
+        return _PROBE_FILE_PLACEHOLDER
+    if fmt == "jsonl":
+        return json.dumps(_PROBE_FILE_PLACEHOLDER) + "\n"
+    if fmt == "csv":
+        delimiter = entry["delimiter"] if "delimiter" in entry else ","
+        if type(delimiter) is not str:
+            return None
+        return ("probe" if delimiter not in "probe" else "x") + "\n"
+    if fmt != "json":
+        return None
+    value: str | int | float | bool = _PROBE_FILE_PLACEHOLDER
+    if type(written_field) is str and written_field in declared:
+        field_type = declared[written_field].field_type
+        if field_type in _PROBE_JSON_VALUE_BY_DECLARED_TYPE:
+            value = _PROBE_JSON_VALUE_BY_DECLARED_TYPE[field_type]
+    data_key = entry["data_key"] if "data_key" in entry else None
+    if data_key is None:
+        return json.dumps(value)
+    if type(data_key) is not str:
+        return None
+    return json.dumps({data_key: value})
+
+
+def _stand_in_file_inject_contents(prepared: object) -> bool:
+    """``files.*.content``: all valid markers of the node, or none of them.
+
+    If any file-held entry cannot be stood in (its own options are
+    malformed, or the schema block does not parse), every entry keeps its
+    marker, so no partial substitution changes which error the constructor
+    reports.
+    """
+    if type(prepared) is not dict or "files" not in prepared or type(prepared["files"]) is not dict:
+        return False
+    files = prepared["files"]
+    held = [
+        name
+        for name, entry in files.items()
+        if type(entry) is dict and "content" in entry and is_inline_content_reference(entry["content"])
+    ]
+    if not held:
+        return False
+    declared = _file_inject_declared_fields(prepared["schema"]) if "schema" in prepared else {}
+    if type(declared) is not dict:
+        return False
+    mode = prepared["mode"] if "mode" in prepared else None
+    select_field = prepared["output_field"] if mode == "select" and "output_field" in prepared else None
+    stand_ins: dict[str, str] = {}
+    for name in held:
+        entry = files[name]
+        written_field = select_field if mode == "select" else (entry["output_field"] if mode == "all" and "output_field" in entry else None)
+        stand_in = _file_inject_entry_stand_in(entry, written_field=written_field, declared=declared)
+        if stand_in is None:
+            return False
+        stand_ins[name] = stand_in
+    for name, stand_in in stand_ins.items():
+        files[name]["content"] = stand_in
+    return True
+
+
+_ProbeStandIn = Callable[[object], bool]
+
+_PROBE_STAND_INS: Final[Mapping[str, tuple[tuple[str, _ProbeStandIn], ...]]] = MappingProxyType(
+    {
+        "llm": (
+            ("prompt_template", _stand_in_llm_prompt_template),
+            ("system_prompt", _stand_in_llm_system_prompt),
+            ("queries.*.template", _stand_in_llm_query_templates),
+        ),
+        "file_inject": (("files.*.content", _stand_in_file_inject_contents),),
+    }
+)
+"""Option positions whose file-held value is no input to the plugin's output contract.
+
+One row per (plugin, position). Each stand-in rewrites a VALID
+``inline_content`` marker in the detached projection, in place, and returns
+whether it did. A position belongs here only when the plugin's guaranteed
+field names, their types and their nullability are the same for every bytes
+the file could hold; otherwise the node must keep deferring.
+"""
+
+
 def prepare_validation_probe_options(options: Mapping[str, Any], *, plugin: str | None) -> dict[str, Any]:
     """Return detached runtime options safe for validation-only construction.
 
@@ -185,6 +341,37 @@ def prepare_validation_probe_options(options: Mapping[str, Any], *, plugin: str 
     substitutes nothing, keeps its hash in the projection and is still
     checked here; so is a malformed marker, or a well-formed marker of any
     other mode, neither of which is substituted.
+
+    For ``plugin="file_inject"`` the projection supplies probe-only content
+    wherever ``files.<name>.content`` holds a VALID ``inline_content`` marker,
+    which in the composer is every entry (content must be a user upload). The
+    same deferral otherwise zeroed the node's guarantees, upstream fields
+    included, although the written field NAMES come from ``output_field``
+    options and never from the bytes. The stand-in parses under the entry's
+    ``format`` (``text``; ``csv`` with its ``delimiter``; ``jsonl``; ``json``
+    with or without ``data_key``) in both modes, and is never a JSON null.
+
+    One fact still depends on the bytes: a ``json`` entry holding a JSON null
+    makes an undeclared written field nullable. That field is typed ``any``,
+    and no authoring consumer separates a nullable ``any`` from a non-null
+    one, so the stand-in decides no verdict (pinned; see
+    ``_file_inject_entry_stand_in``); a declared field takes its type and
+    nullability from the declaration. A node still defers only when an
+    entry's own options or the schema block are malformed, and then every
+    entry keeps its marker. ``default_content`` is never touched: the
+    composer refuses it outright.
+
+    The stand-in proves nothing about the file. Every check that reads the
+    content runs in ``FileInjectConfig._validate_injection`` (parsing under the
+    format, data_key and delimiter, canonical-value and depth rules, the
+    per-entry and per-node size caps, and ``_validate_declared_output_types``,
+    which holds an authored type and nullability against the parsed value).
+    Execution validation runs it on the materialized bytes: the bytes replace
+    the marker in ``_validation_materialization`` and the plugin is then built
+    by ``validate_runtime_plugins``; run admission runs the same validation
+    before a run is created. A refusal that does not depend on the bytes (text
+    under a narrow declared type, a bad option beside a marker) is now made at
+    authoring, as it would be for the inline twin.
     """
     from elspeth.web.interpretation_state import strip_authoring_options
 
@@ -209,22 +396,13 @@ def prepare_validation_probe_options(options: Mapping[str, Any], *, plugin: str 
         prepared["endpoint"] = "https://validation-probe.invalid/v1"
         prepared["api_key"] = "validation-probe-placeholder"
         prepared["required_capabilities"] = tuple(sorted(GATEWAY_SUPPORTED_CAPABILITIES))
-    if plugin == "llm":
-        # Single-prompt mode is the only one whose template must read the
-        # declared row fields; a query-mode fallback renders query bindings.
-        single_prompt = "queries" not in prepared or prepared["queries"] is None
-        declared = prepared["required_input_fields"] if "required_input_fields" in prepared else None
+    if plugin is not None and plugin in _PROBE_STAND_INS:
         substituted = False
-        if "prompt_template" in prepared and is_inline_content_reference(prepared["prompt_template"]):
-            prepared["prompt_template"] = _probe_prompt_file_placeholder(declared, reads_row=single_prompt)
-            substituted = True
-        if "system_prompt" in prepared and is_inline_content_reference(prepared["system_prompt"]):
-            prepared["system_prompt"] = _PROBE_PROMPT_FILE_PLACEHOLDER
-            substituted = True
-        if not single_prompt and _substitute_query_template_placeholders(prepared["queries"]):
-            substituted = True
+        for _position, stand_in in _PROBE_STAND_INS[plugin]:
+            if stand_in(prepared):
+                substituted = True
         # The approval hash binds effective prompt text this projection does
         # not hold once a file stands at any prompt position.
-        if substituted and "approved_prompt_artifact_hash" in prepared:
+        if plugin == "llm" and substituted and "approved_prompt_artifact_hash" in prepared:
             del prepared["approved_prompt_artifact_hash"]
     return prepared
