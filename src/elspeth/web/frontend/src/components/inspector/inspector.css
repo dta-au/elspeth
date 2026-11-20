@@ -1020,6 +1020,12 @@
   margin-inline-start: auto;
 }
 
+/* The stale-draft banner's choice sits on its own line under the message. */
+.prompt-editor-stale-actions {
+  display: flex;
+  margin-top: var(--space-xs);
+}
+
 .prompt-editor-hint {
   margin: 0;
   color: var(--color-text-secondary);
