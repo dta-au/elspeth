@@ -528,7 +528,7 @@ class TestStep3DiscoveryTierMigration:
             "pages carry exact `content`, `encoding`, `field_path`, `offset_chars`, `total_chars`, `next_offset_chars` and `sha256`. "
             "Use field_path for exact values; pass the hash to continue. "
             "Changes give `baseline_kind`, `from_version`, `projection`, and `changes` with `operation`, `path`, optional `value`. "
-            'For the web set_pipeline tool, put that document inside {"pipeline": <document>}; do not send its source/nodes/edges/outputs fields at the top level. '
+            'For the web set_pipeline tool, put the flat `set_pipeline_arguments` document inside {"pipeline": <document>}; do not send its source/nodes/edges/outputs fields at the top level. '
             "Full diagnostic reads include `inspection`: `requested_component`, `resolved_component` and `accepted_full_state_aliases`.",
             "parameters": {
                 "type": "object",
