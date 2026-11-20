@@ -292,6 +292,12 @@
   border-bottom: 1px solid var(--color-border);
 }
 
+/* The label keeps to one line; the field takes the remaining width. */
+.blob-manager-filter label {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
 .blob-manager-filter .input {
   flex: 1 1 auto;
   min-width: 0;
