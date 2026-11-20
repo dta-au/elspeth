@@ -213,7 +213,18 @@ def template_loads_name(template_string: str, name: str) -> bool:
 
 _ATTRIBUTE_KEYWORD_FILTERS: frozenset[str] = frozenset({"map", "join", "sort", "unique", "sum", "min", "max"})
 _ATTRIBUTE_POSITIONAL_FILTERS: frozenset[str] = frozenset({"selectattr", "rejectattr", "groupby"})
-MAX_JINJA_TEMPLATE_BYTES = 16 * 1024
+# Largest template the parser is given, in UTF-8 bytes. The node, depth and
+# expression bounds are checked only after the whole text is parsed, so this
+# sets how long a refusal can take: about 3.2 ms per KB, 0.2 s at this value
+# (measured 2026-11-21 in the template-bound sizing study, against 0.05 s at the
+# old 16 KiB). An ordinary prompt of this size costs about 5 ms to compile and
+# 7 ms per row to render; about 16,000 tokens. The memory the three analysis
+# caches below keep does not grow with this value: they share one byte budget.
+# What grows with it is the time to refuse. One constant for every template the engine
+# parses: LLM transform prompts and query templates, RAG query templates
+# (plugins/transforms/rag), LLM-source prompts (plugins/sources/llm) and the
+# Azure blob sink's path templates (plugins/sinks/azure_blob_sink.py).
+MAX_JINJA_TEMPLATE_BYTES = 64 * 1024
 # Entry bound of the three template-analysis caches below. Validation walks a
 # graph's templates in the same order every time, and an LRU smaller than that
 # walk misses on every call: at 128 a 400-template walk scored 0 hits on its
@@ -429,10 +440,55 @@ def _field_usage_bytes(usage: Jinja2FieldExtraction) -> int:
     return sys.getsizeof(usage) + _name_set_bytes(usage.fields) + sys.getsizeof(usage.dynamic_accesses)
 
 
+class TemplateSourceRefusedError(ValueError):
+    """Template text refused before or during analysis: over a source bound, or nested too deeply to analyse.
+
+    A ``ValueError``, so every caller that handled these refusals as
+    ``ValueError`` still does; a caller that must not catch every
+    ``ValueError`` (the advisor summary) catches this type.
+    """
+
+
+class TemplateSourceTooLargeError(TemplateSourceRefusedError):
+    """A template's source is over ``MAX_JINJA_TEMPLATE_BYTES``; carries both figures.
+
+    A ``ValueError``, so every caller that already handles the size refusal
+    still does; a caller that knows the template's position names it with
+    :func:`template_size_refusal`.
+    """
+
+    def __init__(self, size_bytes: int, limit_bytes: int) -> None:
+        self.size_bytes = size_bytes
+        self.limit_bytes = limit_bytes
+        super().__init__(f"Template exceeds {limit_bytes} UTF-8 bytes")
+
+
+class PromptTemplateRefusal(ValueError):
+    """A template refused for its size or nesting, in a sentence that names its position and quotes no template text.
+
+    The plugin validators raise it, so pydantic reports it as a validation
+    error; authoring validation shows it as written, where it shows other
+    plugin option errors only in a generic sentence.
+    """
+
+
+def template_nesting_refusal(position: str) -> str:
+    """The refusal for a template whose loops or blocks nest deeper than Python's compiler allows."""
+    return f"{position} is too deeply nested to compile: its loops or blocks nest deeper than Python allows. Flatten the nesting."
+
+
+def template_size_refusal(position: str, size_bytes: int, limit_bytes: int) -> str:
+    """The refusal for one prompt template over the bound, naming where it sits."""
+    return (
+        f"{position} is {size_bytes} bytes; the limit for one prompt template is {limit_bytes} bytes. "
+        "Shorten it, or move reference text into a file_inject step and read it from the row."
+    )
+
+
 def validate_jinja_source(source: str) -> None:
     """Bound parser input before Jinja sees a web or YAML authored template."""
     if len(source) > MAX_JINJA_TEMPLATE_BYTES or len(source.encode("utf-8")) > MAX_JINJA_TEMPLATE_BYTES:
-        raise ValueError(f"Template exceeds {MAX_JINJA_TEMPLATE_BYTES} UTF-8 bytes")
+        raise TemplateSourceTooLargeError(len(source.encode("utf-8")), MAX_JINJA_TEMPLATE_BYTES)
     _validate_bounded_jinja_source(source)
 
 
@@ -440,13 +496,13 @@ def validate_jinja_source(source: str) -> None:
 def _validate_bounded_jinja_source(source: str) -> None:
     """Reuse pure checks of exact bounded text; size admission runs first."""
     if source.count("{%") > 64 or source.count("{{") > 256:
-        raise ValueError("Template has too many Jinja expressions or blocks")
+        raise TemplateSourceRefusedError("Template has too many Jinja expressions or blocks")
     depth = 0
     for character in source:
         if character in "([":
             depth += 1
             if depth > 64:
-                raise ValueError("Template expression nesting exceeds 64")
+                raise TemplateSourceRefusedError("Template expression nesting exceeds 64")
         elif character in ")]":
             depth = max(0, depth - 1)
 
@@ -483,8 +539,49 @@ class Jinja2FieldExtraction:
         return tuple(kind for kind in self.dynamic_accesses if kind not in ROW_API_MISUSE_KINDS)
 
 
+# The deepest template tree admitted, counted from the root's children at 1.
+# The sandbox refuses deeper trees before compiling
+# (``plugins/infrastructure/templates.py`` ``_check_template_ast`` imports this
+# number) and the field analysis below refuses the same depth, so the analysis
+# never refuses a template the sandbox compiles.
+MAX_TEMPLATE_AST_DEPTH = 64
+
+
+class TemplateTooDeeplyNestedError(TemplateSourceRefusedError):
+    """A template nests deeper than the analysis walks; the analysis recurses, so it refuses first."""
+
+    def __init__(self) -> None:
+        super().__init__(f"Template is too deeply nested to analyse (more than {MAX_TEMPLATE_AST_DEPTH} levels)")
+
+
+class _FieldExtractionEnvironment(Environment):
+    """Plain parse for analysis, with the depth bound the sandbox applies before compiling.
+
+    The analysis visitors and Jinja's own scope analysis recurse over the
+    tree, and the parser recurses over the text, so a deep chain could raise
+    ``RecursionError`` here. Both become :class:`TemplateTooDeeplyNestedError`,
+    a ``ValueError`` like the size refusal, which callers already handle. The
+    depth is measured without recursion. The sandbox refuses the same depth
+    (``plugins/infrastructure/templates.py`` ``_check_template_ast``), so no
+    template that compiles is refused here.
+    """
+
+    def parse(self, source: str, name: str | None = None, filename: str | None = None) -> Template:
+        try:
+            ast = super().parse(source, name=name, filename=filename)
+        except RecursionError as exc:
+            raise TemplateTooDeeplyNestedError() from exc
+        pending = [(child, 1) for child in ast.iter_child_nodes()]
+        while pending:
+            node, depth = pending.pop()
+            if depth > MAX_TEMPLATE_AST_DEPTH:
+                raise TemplateTooDeeplyNestedError()
+            pending.extend((child, depth + 1) for child in node.iter_child_nodes())
+        return ast
+
+
 def _create_field_extraction_environment() -> Environment:
-    return Environment(autoescape=True)
+    return _FieldExtractionEnvironment(autoescape=True)
 
 
 def extract_jinja2_field_usage(

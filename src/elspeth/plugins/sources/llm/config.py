@@ -8,8 +8,15 @@ from pydantic import Field, field_validator, model_validator
 
 from elspeth.contracts.identifiers import validate_field_name
 from elspeth.contracts.value_source import ValueSource
+from elspeth.core.templates import PromptTemplateRefusal, template_nesting_refusal, template_size_refusal
 from elspeth.plugins.infrastructure.config_base import DataPluginConfig
-from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment, find_runtime_unbound_variables
+from elspeth.plugins.infrastructure.templates import (
+    TemplateError,
+    TemplateSourceTooLarge,
+    TemplateTooDeeplyNested,
+    create_sandboxed_environment,
+    find_runtime_unbound_variables,
+)
 from elspeth.plugins.llm.config_validation import (
     AZURE_MODEL_VALUE_SOURCES,
     BEDROCK_ACCESS_KEY_ID_MAX_LENGTH,
@@ -114,6 +121,10 @@ class LLMSourceConfig(DataPluginConfig):
 
         try:
             PromptTemplate(value)
+        except TemplateSourceTooLarge as exc:
+            raise PromptTemplateRefusal(template_size_refusal("prompt_template", exc.size_bytes, exc.limit_bytes)) from exc
+        except TemplateTooDeeplyNested as exc:
+            raise PromptTemplateRefusal(template_nesting_refusal("prompt_template")) from exc
         except TemplateError as exc:
             raise ValueError(f"Invalid Jinja2 template: {exc}") from exc
 

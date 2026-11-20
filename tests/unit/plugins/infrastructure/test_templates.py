@@ -175,7 +175,7 @@ def test_sandboxed_environment_rejects_invalid_syntax():
 
 def test_template_source_limits_apply_before_parse_and_compile():
     env = create_sandboxed_environment()
-    oversized = "a" * 16385
+    oversized = "a" * (64 * 1024 + 1)
     with pytest.raises(TemplateError, match="exceeds"):
         env.parse(oversized)
     with pytest.raises(TemplateError, match="exceeds"):

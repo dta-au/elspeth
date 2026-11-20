@@ -49,7 +49,13 @@ from elspeth.contracts.field_spelling import header_spelling_canonical
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.tier_registry import FrameworkBugError
 from elspeth.contracts.trust_boundary import trust_boundary
-from elspeth.core.templates import RETIRED_ROW_API_NAMES, TEMPLATE_ROW_METHODS, validate_jinja_source
+from elspeth.core.templates import (
+    MAX_TEMPLATE_AST_DEPTH,
+    RETIRED_ROW_API_NAMES,
+    TEMPLATE_ROW_METHODS,
+    TemplateSourceTooLargeError,
+    validate_jinja_source,
+)
 
 if TYPE_CHECKING:
     from elspeth.contracts.schema_contract import PipelineRow
@@ -57,6 +63,22 @@ if TYPE_CHECKING:
 
 class TemplateError(Exception):
     """Error in template rendering (including sandbox violations)."""
+
+
+class TemplateSourceTooLarge(TemplateError):
+    """The template source is over the byte bound; carries the figures so a caller can name its position."""
+
+    def __init__(self, size_bytes: int, limit_bytes: int) -> None:
+        self.size_bytes = size_bytes
+        self.limit_bytes = limit_bytes
+        super().__init__(f"Template exceeds {limit_bytes} UTF-8 bytes")
+
+
+class TemplateTooDeeplyNested(TemplateError):
+    """Python's compiler refused the code Jinja generated for the template's nested loops or blocks."""
+
+    def __init__(self) -> None:
+        super().__init__("Template blocks are too deeply nested to compile")
 
 
 class TemplateWorkerLostError(PluginRetryableError):
@@ -633,6 +655,8 @@ def _restore_context_value(value: Any, *, memo: dict[int, Any] | None = None) ->
 def _check_template_source(source: str) -> None:
     try:
         validate_jinja_source(source)
+    except TemplateSourceTooLargeError as exc:
+        raise TemplateSourceTooLarge(exc.size_bytes, exc.limit_bytes) from exc
     except ValueError as exc:
         raise TemplateError(str(exc)) from exc
 
@@ -1089,7 +1113,14 @@ class _BoundedEnvironment(_LocalSandboxedEnvironment):
         # Jinja's stock compiler folds authored constants here. This
         # environment disables that path, so syntax validation is bounded by
         # the source/AST limits and does not wait for a child on the web loop.
-        compiled = super().from_string(ast)
+        try:
+            compiled = super().from_string(ast)
+        except SyntaxError as exc:
+            # Python's own compiler refuses the code Jinja generates for more than
+            # 20 nested loops ("too many statically nested blocks"): a few hundred
+            # bytes pass every source and AST bound above. The builtin SyntaxError
+            # is not a TemplateError, so without this it escapes every validator.
+            raise TemplateTooDeeplyNested() from exc
         # Static text has a fixed output no larger than its bounded source.
         # Keep it in-process so ordinary blob paths need no worker startup.
         if all(type(node) is nodes.Output and all(type(child) is nodes.TemplateData for child in node.nodes) for node in ast.body):
@@ -1107,8 +1138,8 @@ def _check_template_ast(ast: nodes.Template) -> None:
         count += 1
         if count > 2048:
             raise TemplateError("Template AST exceeds 2048 nodes")
-        if depth > 64:
-            raise TemplateError("Template AST nesting exceeds 64 levels")
+        if depth > MAX_TEMPLATE_AST_DEPTH:
+            raise TemplateError(f"Template AST nesting exceeds {MAX_TEMPLATE_AST_DEPTH} levels")
         pending.extend((child, depth + 1) for child in node.iter_child_nodes())
     if next(ast.find_all(nodes.Pow), None) is not None:
         raise TemplateError("Power expressions are not supported in pipeline templates")

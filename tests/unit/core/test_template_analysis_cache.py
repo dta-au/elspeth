@@ -154,7 +154,7 @@ def test_source_guard_reuses_exact_text_but_rejects_new_resource_violations():
     with pytest.raises(ValueError, match="nesting exceeds"):
         templates.validate_jinja_source("(" * 65 + "x" + ")" * 65)
     with pytest.raises(ValueError, match="UTF-8 bytes"):
-        templates.validate_jinja_source("é" * 8193)
+        templates.validate_jinja_source("é" * 32769)
     assert templates._validate_bounded_jinja_source.cache_info().currsize == 1
 
 

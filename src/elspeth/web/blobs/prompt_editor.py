@@ -18,6 +18,16 @@ class PromptBinding:
     encoding: str
 
 
+def is_template_binding_path(field_path: str) -> bool:
+    """Whether a binding path from :func:`prompt_bindings_for_blob` is parsed as a Jinja template.
+
+    ``prompt_template`` and a query's ``template`` are; ``system_prompt`` is
+    plain text.
+    """
+    parts = field_path.split(".")
+    return parts == ["prompt_template"] or (len(parts) == 3 and parts[0] == "queries" and parts[2] == "template")
+
+
 def prompt_bindings_for_blob(state: CompositionStateRecord | None, blob: BlobRecord) -> tuple[tuple[PromptBinding, ...], bool]:
     """Return all supported scalar bindings and whether any other use exists."""
     if state is None:
