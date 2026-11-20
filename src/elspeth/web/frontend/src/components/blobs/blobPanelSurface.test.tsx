@@ -177,6 +177,12 @@ describe("the blob panel keeps one content edge (elspeth-350d5a8b0e)", () => {
   });
 });
 
+describe("file manager height (UX review finding 8)", () => {
+  it("shows more than four rows: at least 280px, growing to half the viewport", () => {
+    expect(declaredValue(".blob-manager-container", "max-height")).toBe("max(280px, 50vh)");
+  });
+});
+
 describe("blob row dividers live in CSS, not on the element (elspeth-a1a1b62aa9)", () => {
   beforeEach(() => {
     useSessionStore.setState({ activeSessionId: "session-1", isComposing: false });

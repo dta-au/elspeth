@@ -1,5 +1,5 @@
 // src/components/blobs/BlobManager.tsx
-import { useEffect, useLayoutEffect, useRef, useCallback, useMemo, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useCallback, useMemo, useState } from "react";
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { Button, Input } from "@/components/ui";
@@ -70,6 +70,9 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   const previousSelectedNode = useRef(selectedNodeId);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  // Narrows the list by file name; in memory, per mount.
+  const [fileFilter, setFileFilter] = useState("");
+  const filterId = useId();
   const lastScrolledSelection = useRef<string | null>(null);
 
   const attached = useMemo(() => {
@@ -135,6 +138,12 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
     }
     const row = Array.from(listRef.current?.querySelectorAll<HTMLElement>(".blob-row-item") ?? [])
       .find((item) => item.dataset.blobId?.toLowerCase() === revealRequest.blobId.toLowerCase());
+    // A file the filter hides is still in the session: clear the filter and
+    // reveal it on the next pass instead of reporting it missing.
+    if (!row && fileFilter !== "" && blobs.some((blob) => blob.id.toLowerCase() === revealRequest.blobId.toLowerCase())) {
+      setFileFilter("");
+      return;
+    }
     if (row) {
       setMissingRevealName(null);
       row.scrollIntoView?.({ block: "nearest" });
@@ -145,7 +154,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
       statusRef.current?.focus({ preventScroll: true });
     }
     useBlobStore.getState().consumeRevealRequest(revealRequest.seq);
-  }, [revealRequest, activeSessionId, isLoading, listBelongsToSession, blobs]);
+  }, [revealRequest, activeSessionId, isLoading, listBelongsToSession, blobs, fileFilter]);
 
   useEffect(() => {
     if (selectedNodeId === null) {
@@ -166,17 +175,20 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   // whichever session happens to be active at confirmation time.
   const [pendingDelete, setPendingDelete] = useState<{ blob: BlobMetadata; sessionId: string } | null>(null);
 
+  const fileQuery = fileFilter.trim().toLowerCase();
+  const visibleBlobs = useMemo(() => fileQuery === "" ? blobs
+    : blobs.filter((blob) => blob.filename.toLowerCase().includes(fileQuery)), [blobs, fileQuery]);
   const grouped = useMemo(() => {
     const groups: Record<BlobCategory, BlobMetadata[]> = {
       source: [],
       sink: [],
       other: [],
     };
-    for (const blob of blobs) {
+    for (const blob of visibleBlobs) {
       groups[categorizeBlob(blob)].push(blob);
     }
     return groups;
-  }, [blobs]);
+  }, [visibleBlobs]);
 
   const handleUpload = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -285,6 +297,13 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
         </div>
       )}
 
+      {!isLoading && blobs.length > 0 && <div className="blob-manager-filter">
+        <label htmlFor={`${filterId}-input`}>Filter files</label>
+        <Input id={`${filterId}-input`} type="search" value={fileFilter} onChange={(event) => setFileFilter(event.target.value)}
+          autoComplete="off" spellCheck={false} />
+        {fileQuery !== "" && <span className="blob-manager-filter-count">{visibleBlobs.length} of {blobs.length}</span>}
+      </div>}
+
       {/* Categorized file list */}
       <div className="blob-manager-list" ref={listRef}>
         {isLoading ? (
@@ -294,6 +313,10 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
         ) : blobs.length === 0 ? (
           <div className="blob-manager-empty">
             No files yet. Upload a file to get started.
+          </div>
+        ) : visibleBlobs.length === 0 ? (
+          <div className="blob-manager-empty">
+            No file name matches this filter.
           </div>
         ) : (
           CATEGORY_ORDER.map((category) => {

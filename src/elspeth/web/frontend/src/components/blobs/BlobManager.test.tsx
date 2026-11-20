@@ -272,6 +272,38 @@ describe("BlobManager reveal request", () => {
   });
 });
 
+describe("BlobManager file filter", () => {
+  beforeEach(() => {
+    useSessionStore.setState({ activeSessionId: "session-1", selectedNodeId: null, compositionState: null });
+    setBlobState([makeBlob({ id: "one", filename: "system.txt" }), makeBlob({ id: "two", filename: "User-Prompt.txt" }),
+      makeBlob({ id: "three", filename: "data.csv" })]);
+  });
+
+  it("narrows the list by file name and says when nothing matches", async () => {
+    const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+    const user = userEvent.setup();
+    const filter = screen.getByRole("searchbox", { name: "Filter files" });
+    await user.type(filter, "prompt");
+    expect(Array.from(container.querySelectorAll(".blob-row-item")).map((row) => row.getAttribute("data-blob-id"))).toEqual(["two"]);
+    expect(screen.getByText("1 of 3")).toBeInTheDocument();
+    await user.clear(filter);
+    await user.type(filter, "zzz");
+    expect(container.querySelector(".blob-row-item")).toBeNull();
+    expect(screen.getByText("No file name matches this filter.")).toBeInTheDocument();
+    await user.clear(filter);
+    expect(container.querySelectorAll(".blob-row-item")).toHaveLength(3);
+  });
+
+  it("clears the filter to reveal a file it hides, instead of calling it missing", async () => {
+    const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+    await userEvent.setup().type(screen.getByRole("searchbox", { name: "Filter files" }), "csv");
+    act(() => useBlobStore.getState().revealBlob("session-1", "two", "User-Prompt.txt"));
+    expect(screen.getByRole("searchbox", { name: "Filter files" })).toHaveValue("");
+    expect(document.activeElement).toBe(container.querySelector('[data-blob-id="two"]'));
+    expect(screen.getByRole("status")).not.toHaveTextContent("no longer in this session");
+  });
+});
+
 describe("BlobManager categorized folders", () => {
   beforeEach(() => {
     useSessionStore.setState({ activeSessionId: "session-1" });
