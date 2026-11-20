@@ -75,6 +75,12 @@ describe("read-only / mutating membership", () => {
     expect(describeToolCall("change_substring")).toContain("fresh review");
   });
 
+  it("labels the suspected-bug report as a file write, not a lookup", () => {
+    expect(MUTATING_TOOL_CALL_NAMES).toContain("report_composer_bug");
+    expect(isReadOnlyToolCall("report_composer_bug")).toBe(false);
+    expect(describeToolCall("report_composer_bug")).toContain("suspected");
+  });
+
   it("admits no mutating verb prefix into the read-only half", () => {
     // A structural check independent of the list above: it catches a NEW
     // mutating tool misfiled on the read-only side even if someone updates
@@ -136,6 +142,7 @@ describe("toolCallOutcomeLabel", () => {
       "update_blob",
       "delete_blob",
       "wire_blob_inline_ref",
+      "report_composer_bug",
       "request_interpretation_review",
     ]) {
       expect(toolCallOutcomeLabel(name, "completed")).toBe(

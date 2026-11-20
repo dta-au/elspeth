@@ -266,6 +266,7 @@ class TestStep2RegistryAggregation:
         declared = {d.name for d in _REGISTERED_TOOLS if d.kind is ToolKind.BLOB_MUTATION}
         expected = {
             "create_blob",
+            "report_composer_bug",
             "update_blob",
             "delete_blob",
             "set_source_from_blob",

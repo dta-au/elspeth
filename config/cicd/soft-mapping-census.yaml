@@ -944,6 +944,8 @@ files:
     dict[str, Any]: 13
   src/elspeth/web/composer/tools/outputs.py:
     dict[str, Any]: 7
+  src/elspeth/web/composer/tools/reports.py:
+    boundary: 1
   src/elspeth/web/composer/tools/schema_contract.py:
     Mapping[str, Any]: 43
     MutableMapping[str, Any]: 1
@@ -1124,7 +1126,7 @@ totals:
   Mapping[str, Any]: 819
   Mapping[str, object]: 319
   MutableMapping[str, Any]: 9
-  boundary: 69
+  boundary: 70
   dict[str, Any]: 1124
   dict[str, object]: 406
   soft: 2677

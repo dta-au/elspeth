@@ -108,6 +108,16 @@ def is_blob_store_only_mutation_tool(name: str) -> bool:
     return name in _BLOB_STORE_ONLY_MUTATION_TOOL_NAMES
 
 
+# Blob-store-only tools that only ever ADD a new session file. They run
+# immediately even under ``trust_mode == "explicit_approve"``: creating a file
+# overwrites and removes nothing, and never advances CompositionState.
+# ``create_blob`` allocates the blob id a later composition proposal may
+# reference; ``report_composer_bug`` writes a suspected-bug report the graph
+# never references. Destructive blob writes (``update_blob``, ``delete_blob``)
+# are not listed and still require approval.
+_IMMEDIATE_BLOB_CREATE_TOOL_NAMES: Final[frozenset[str]] = frozenset({"create_blob", "report_composer_bug"})
+
+
 def is_approval_required_blob_store_only_mutation_tool(name: str) -> bool:
     """Return True for blob-only mutations that must not bypass explicit approval."""
-    return is_blob_store_only_mutation_tool(name) and name != "create_blob"
+    return is_blob_store_only_mutation_tool(name) and name not in _IMMEDIATE_BLOB_CREATE_TOOL_NAMES

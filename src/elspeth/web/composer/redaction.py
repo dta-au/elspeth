@@ -19,9 +19,10 @@ from collections.abc import Callable, Iterator, Mapping
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from types import MappingProxyType, UnionType
-from typing import Annotated, Any, Literal, TypeAliasType, Union, get_args, get_origin
+from typing import Annotated, Any, Final, Literal, TypeAliasType, Union, get_args, get_origin
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     BeforeValidator,
     ConfigDict,
@@ -1695,6 +1696,53 @@ class CreateBlobArgumentsModel(BaseModel):
     description: _OmittableString = None
 
     model_config = ConfigDict(extra="forbid")
+
+
+# Field bounds for ``report_composer_bug``. The tool's JSON schema
+# (``tools/reports.py``) reads the same constants, so the provider-facing
+# ``maxLength``/``pattern`` and the model that admits the call cannot disagree.
+REPORT_SUMMARY_MAX_CHARS: Final = 240
+REPORT_BEHAVIOR_MAX_CHARS: Final = 4000
+REPORT_GUIDANCE_REFERENCE_MAX_CHARS: Final = 1000
+REPORT_RELATED_TOOL_MAX_CHARS: Final = 100
+REPORT_RELATED_TOOL_PATTERN: Final = r"^[a-z][a-z0-9_]*$"
+
+
+def _require_visible_text(value: str) -> str:
+    """Refuse prose that is empty once whitespace is ignored."""
+    if not value.strip():
+        raise ValueError("expected text with at least one visible character")
+    return value
+
+
+_ReportProse = Annotated[str, AfterValidator(_require_visible_text), Sensitive()]
+
+
+class ReportComposerBugArgumentsModel(BaseModel):
+    """Redaction-bearing argument model for the ``report_composer_bug`` tool.
+
+    The report prose may quote tool errors or document text, so every prose
+    field is :class:`Sensitive`: the assistant row's ``chat_messages.tool_calls``
+    keeps a length-disclosing placeholder. The redaction does not reach the
+    other copies every tool's arguments have: the full text is also kept in
+    the session report file, in the tool row's visible tool event
+    (``received_arguments``) and in the audit row, and the visible event feeds
+    the advisor transcript. ``related_tool`` is limited to a tool-name
+    spelling and is kept in the clear so the call history shows which tool
+    was reported.
+    """
+
+    summary: _ReportProse = Field(min_length=1, max_length=REPORT_SUMMARY_MAX_CHARS)
+    expected_behavior: _ReportProse = Field(min_length=1, max_length=REPORT_BEHAVIOR_MAX_CHARS)
+    observed_behavior: _ReportProse = Field(min_length=1, max_length=REPORT_BEHAVIOR_MAX_CHARS)
+    guidance_reference: Annotated[
+        str | SkipJsonSchema[None],
+        BeforeValidator(_reject_supplied_null),
+        Sensitive(),
+    ] = Field(default=None, min_length=1, max_length=REPORT_GUIDANCE_REFERENCE_MAX_CHARS)
+    related_tool: _OmittableString = Field(default=None, max_length=REPORT_RELATED_TOOL_MAX_CHARS, pattern=REPORT_RELATED_TOOL_PATTERN)
+
+    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 # ---------------------------------------------------------------------------
@@ -3718,6 +3766,10 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
         # blob-write tools.
         "create_blob": ToolRedaction(
             argument_model=CreateBlobArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
+        "report_composer_bug": ToolRedaction(
+            argument_model=ReportComposerBugArgumentsModel,
             response_model=_ToolResultResponseModel,
         ),
         "update_blob": ToolRedaction(

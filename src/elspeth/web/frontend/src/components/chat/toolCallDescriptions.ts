@@ -89,6 +89,8 @@ const MUTATING_TOOL_CALL_DESCRIPTIONS: Record<string, string> = {
   create_blob: "Creates a new file from inline content for the pipeline to use.",
   delete_blob: "Deletes a session file and its storage.",
   update_blob: "Replaces the content of a session file.",
+  report_composer_bug:
+    "Records a suspected mismatch between Composer guidance and tool behavior in a session report file.",
   set_source_from_blob: "Wires a session file as the pipeline's data source.",
   set_source_from_blobs:
     "Wires one or more files containing user-provided content as a one-row-per-file data source.",

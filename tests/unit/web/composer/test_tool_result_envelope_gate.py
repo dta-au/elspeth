@@ -60,7 +60,7 @@ from elspeth.web.composer import provider_discovery_response, redaction, state, 
 from elspeth.web.composer import tool_result_envelope as env
 from elspeth.web.composer.prompts import build_system_prompt
 from elspeth.web.composer.tools import _common as common
-from elspeth.web.composer.tools import _dispatch, _registry, blobs, secrets, state_responses, transforms
+from elspeth.web.composer.tools import _dispatch, _registry, blobs, reports, secrets, state_responses, transforms
 from elspeth.web.composer.tools._dispatch import get_tool_definitions
 from elspeth.web.composer.tools.prompt_target_responses import PromptTargetMetadata
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
@@ -82,6 +82,7 @@ _TOOL_DATA_FILES: tuple[str, ...] = (
     "blobs.py",
     "generation.py",
     "outputs.py",
+    "reports.py",
     "secrets.py",
     "sessions.py",
     "sources.py",
@@ -161,6 +162,7 @@ class _Literal(NamedTuple):
 # appear here; the walker refuses an unattributed one.
 _DATA_HELPER_PAYLOADS: dict[str, type | _ListPayload | _Literal | None] = {
     "_blob_create_payload": blobs.BlobCreatePayload,
+    "_report_payload": reports.ComposerBugReportPayload,
     "_serialize_full_pipeline_state": common._FullPipelineStatePayload,
     "_serialize_set_pipeline_arguments": _Literal(COMMON, "_serialize_set_pipeline_arguments"),
     "_inventory_item_payload": secrets._SecretInventoryItemPayload,

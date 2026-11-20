@@ -550,6 +550,28 @@ The session owner can edit a bound prompt file in the graph node inspector; Save
 
 ---
 
+### `report_composer_bug`
+
+Record a suspected mismatch between the composer's guidance (the skill or a tool description) and what a tool call actually did.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `summary` | string | **Yes** | One-line summary, 1–240 characters |
+| `expected_behavior` | string | **Yes** | What the skill or tool description says should happen, 1–4,000 characters |
+| `observed_behavior` | string | **Yes** | What the tool call actually did, with any error described in the model's own words, 1–4,000 characters |
+| `guidance_reference` | string | No | The skill section or tool description being contradicted, 1–1,000 characters |
+| `related_tool` | string | No | Name of the composer tool involved: a lowercase letter, then lowercase letters, digits or `_`; at most 100 characters |
+
+**Returns:** `blob_id`, `filename` and `status` (always `suspected_unverified`). The report prose is not echoed in the result.
+
+**Where the text is kept:** the prose fields are redacted only from the assistant message's tool-call record, which keeps a length placeholder for each. As for every tool, the full arguments are also kept in the tool message's visible tool event (`received_arguments`) and in the audit message, and the visible event feeds the advisor transcript. The report file holds the text as well.
+
+**Behaviour:** Saves one JSON file (`application/json`, named `composer-bug-report-<uuid>.json`) in the session's files, created by the assistant with the usual composer provenance. The file holds `report_type` `suspected_composer_bug`, `status` `suspected_unverified`, the time of the report, the observations as supplied, and the context that produced them: session, state id and version, user message, composer model, version and provider, skill hash and tool-arguments hash. The pipeline state is returned unchanged; nothing is repaired or verified. Blank, over-length, mistyped or extra fields are refused. The field limits count characters; the saved file, written as UTF-8 JSON, is limited to 16,384 bytes, so long text in several fields can reach the file limit before the field limits (ordinary ASCII at every field limit takes about 10 KB, and one behaviour field at its limit fits in two- or three-byte text but not in four-byte text such as emoji). A refused report writes nothing. A session keeps at most 20 reports; past that the call fails with a message telling the model to stop reporting and continue the task, and nothing is written. The session file quota applies. Credential-shaped text in any argument ends the whole turn (the composer request is refused, as for every tool call), so the model is told to describe error messages in its own words and never paste tokens, keys, passwords or connection strings. Like other changes, a successful report in a tool batch blocks a later `inspect_prompt_targets` in the same batch, so the description asks for reports after reads. Like `create_blob`, it runs immediately when the session requires approval for changes, because it only adds a file; `update_blob` and `delete_blob` still need approval.
+
+**When to use:** Once per distinct mismatch, then continue the user's task.
+
+---
+
 ## Secret Tools
 
 These tools manage API keys and credentials without exposing secret values.

@@ -102,6 +102,9 @@ from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.redaction import (
     MANIFEST,
+    REPORT_BEHAVIOR_MAX_CHARS,
+    REPORT_GUIDANCE_REFERENCE_MAX_CHARS,
+    REPORT_SUMMARY_MAX_CHARS,
     CreateBlobArgumentsModel,
     GetBlobContentArgumentsModel,
     GetBlobContentDataModel,
@@ -110,6 +113,7 @@ from elspeth.web.composer.redaction import (
     ReadAttachmentArgumentsModel,
     ReadAttachmentDataModel,
     ReadAttachmentResponseModel,
+    ReportComposerBugArgumentsModel,
     SetPipelineArgumentsModel,
     SetSourceFromBlobArgumentsModel,
     SetSourceFromBlobsArgumentsModel,
@@ -221,6 +225,25 @@ def _create_blob_strategy() -> st.SearchStrategy[CreateBlobArgumentsModel]:
         },
         optional={"description": st.text()},
     ).map(CreateBlobArgumentsModel.model_validate)
+
+
+def _report_composer_bug_strategy() -> st.SearchStrategy[ReportComposerBugArgumentsModel]:
+    # The optional fields refuse a supplied null, so they are omitted rather
+    # than generated as None; prose needs at least one visible character.
+    def prose(cap: int) -> st.SearchStrategy[str]:
+        return st.text(min_size=1, max_size=cap).filter(lambda text: bool(text.strip()))
+
+    return st.fixed_dictionaries(
+        {
+            "summary": prose(REPORT_SUMMARY_MAX_CHARS),
+            "expected_behavior": prose(REPORT_BEHAVIOR_MAX_CHARS),
+            "observed_behavior": prose(REPORT_BEHAVIOR_MAX_CHARS),
+        },
+        optional={
+            "guidance_reference": prose(REPORT_GUIDANCE_REFERENCE_MAX_CHARS),
+            "related_tool": st.from_regex(r"[a-z][a-z0-9_]{0,40}", fullmatch=True),
+        },
+    ).map(ReportComposerBugArgumentsModel.model_validate)
 
 
 def _get_blob_content_response_strategy() -> st.SearchStrategy[GetBlobContentResponseModel]:
@@ -424,6 +447,7 @@ st.register_type_strategy(GetBlobContentResponseModel, _get_blob_content_respons
 st.register_type_strategy(ReadAttachmentArgumentsModel, _read_attachment_arguments_strategy())
 st.register_type_strategy(ReadAttachmentDataModel, _read_attachment_data_strategy())
 st.register_type_strategy(ReadAttachmentResponseModel, _read_attachment_response_strategy())
+st.register_type_strategy(ReportComposerBugArgumentsModel, _report_composer_bug_strategy())
 st.register_type_strategy(_SetPipelineSourceModel, _set_pipeline_source_strategy())
 st.register_type_strategy(_SetPipelineNamedSourceModel, _set_pipeline_named_source_strategy())
 st.register_type_strategy(_PipelineNodeModel, _pipeline_node_strategy())

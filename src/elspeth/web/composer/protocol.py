@@ -117,6 +117,16 @@ INTERPRETATION_RATE_CAP_PER_TERM_EXPECTATION: Final[str] = (
     "options.prompt_template and remove the pending vague_term requirement and its prompt wiring rather than "
     "requesting the review again"
 )
+# report_composer_bug file-size repair vocabulary. The handler
+# (``tools/reports.py``) and the secret-safe ToolArgumentError projector share
+# these exact, value-free strings, so the refusal reaches the model with the
+# limit and the repair instead of collapsing to a generic diagnostic.
+COMPOSER_BUG_REPORT_MAX_BYTES: Final[int] = 16 * 1024
+COMPOSER_BUG_REPORT_TOO_LARGE_EXPECTATION: Final[str] = (
+    f"a report whose saved file is at most {COMPOSER_BUG_REPORT_MAX_BYTES} bytes; shorten the text fields and report again"
+)
+COMPOSER_BUG_REPORT_TOO_LARGE_ACTUAL_TYPE: Final[str] = "report larger than the file size limit"
+
 INTERPRETATION_RATE_CAP_PER_SESSION_DAY_EXPECTATION: Final[str] = (
     "within the per session per UTC day interpretation request limit — no more reviews are available today, "
     "so use a direct interpretation in the prompt template instead: write the interpretation into "
@@ -951,6 +961,7 @@ _SAFE_TOOL_ARGUMENT_NAMES = frozenset(
         "remove_edge arguments",
         "remove_node arguments",
         "remove_output arguments",
+        "report_composer_bug arguments",
         "request_interpretation_review arguments",
         "set_metadata arguments",
         "set_output arguments",
@@ -981,6 +992,7 @@ _TOOL_ARGUMENT_SCHEMA_EXPECTATIONS = MappingProxyType(
         "remove_edge arguments": "object conforming to _RemoveByIdArgumentsModel",
         "remove_node arguments": "object conforming to _RemoveByIdArgumentsModel",
         "remove_output arguments": "object conforming to _RemoveOutputArgumentsModel",
+        "report_composer_bug arguments": "object conforming to ReportComposerBugArgumentsModel",
         "request_interpretation_review arguments": "object conforming to _RequestInterpretationReviewArgumentsModel",
         "set_metadata arguments": "object conforming to _SetMetadataArgumentsModel",
         "set_output arguments": "object conforming to _SetOutputArgumentsModel",
@@ -1091,6 +1103,7 @@ _SAFE_TOOL_ARGUMENT_EXPECTATIONS = (
             LLM_PROMPT_REVIEW_DRAFT_EXPECTATION,
             INTERPRETATION_RATE_CAP_PER_SESSION_DAY_EXPECTATION,
             INTERPRETATION_RATE_CAP_PER_TERM_EXPECTATION,
+            COMPOSER_BUG_REPORT_TOO_LARGE_EXPECTATION,
         }
     )
     | frozenset(_TOOL_ARGUMENT_SCHEMA_EXPECTATIONS.values())
@@ -1117,6 +1130,7 @@ REVIEW_CONTENT_REJECTION_MESSAGES: Final[frozenset[str]] = frozenset(
 _SAFE_TOOL_ARGUMENT_ACTUAL_TYPES = frozenset(
     {
         "credential-shaped content rejected at the tool boundary",
+        COMPOSER_BUG_REPORT_TOO_LARGE_ACTUAL_TYPE,
         SOURCE_DATA_CONTRACT_DRAFT_MISMATCH_ACTUAL_TYPE,
         SOURCE_DATA_CONTRACT_MISSING_SOURCE_ACTUAL_TYPE,
         "invalid_schema",
