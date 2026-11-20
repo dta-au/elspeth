@@ -886,3 +886,67 @@ def test_the_rejection_vocabularies_are_closed():
         "other",
         "contract_rejected",
     }
+
+
+# --- token counts on the completion event -----------------------------------------
+
+
+async def _completion_event(client, caplog, usage, *, construct=CanonicalResponse) -> dict:
+    caplog.set_level(logging.INFO, logger="test.service")
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"ok": True}))
+    adapter = FakeAdapter(parse_success_result=construct(text=UPSTREAM_CANARY, finish_reason=FinishReason.STOP, usage=usage))
+    service = _service(_config(), adapter, client)
+
+    await service.complete(_chat_request(messages=[{"role": "user", "content": PROMPT_CANARY}]), "req-tokens")
+
+    _assert_no_canary(caplog)
+    completions = [event for event in _events(caplog) if event["event"] == "completion"]
+    assert len(completions) == 1
+    return completions[0]
+
+
+@respx.mock
+async def test_completion_logs_token_counts_as_the_response_reports_them(client, caplog):
+    event = await _completion_event(client, caplog, CanonicalUsage(prompt_tokens=7, completion_tokens=0, total_tokens=7))
+
+    assert event["status"] == "success"
+    assert (event["prompt_tokens"], event["completion_tokens"], event["total_tokens"]) == (7, 0, 7)
+    assert all(type(event[name]) is int for name in ("prompt_tokens", "completion_tokens", "total_tokens"))
+
+
+@respx.mock
+async def test_completion_without_usage_omits_token_counts(client, caplog):
+    event = await _completion_event(client, caplog, None)
+
+    assert event["status"] == "success"
+    assert {"prompt_tokens", "completion_tokens", "total_tokens"}.isdisjoint(event)
+
+
+@pytest.mark.parametrize("bad_count", [True, 2.0, -1, "3"], ids=["bool", "float", "negative", "string"])
+@respx.mock
+async def test_a_count_that_is_not_a_non_negative_int_is_omitted(client, caplog, bad_count):
+    # model_construct skips validation, as an untrusted adapter's parse_success can.
+    usage = CanonicalUsage.model_construct(prompt_tokens=bad_count, completion_tokens=4, total_tokens=9)
+
+    event = await _completion_event(client, caplog, usage, construct=CanonicalResponse.model_construct)
+
+    assert event["status"] == "success"
+    assert "prompt_tokens" not in event
+    assert (event["completion_tokens"], event["total_tokens"]) == (4, 9)
+
+
+@respx.mock
+async def test_an_error_completion_carries_no_token_counts(client, caplog):
+    caplog.set_level(logging.INFO, logger="test.service")
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(500, json={"detail": UPSTREAM_CANARY}))
+    adapter = FakeAdapter(classify_result=ErrorClassification(code="upstream_unavailable", retryable=True))
+    service = _service(_config(), adapter, client)
+
+    with pytest.raises(GatewayError):
+        await service.complete(_chat_request(), "req-tokens-error")
+
+    completions = [event for event in _events(caplog) if event["event"] == "completion"]
+    assert len(completions) == 1
+    assert {"prompt_tokens", "completion_tokens", "total_tokens"}.isdisjoint(completions[0])

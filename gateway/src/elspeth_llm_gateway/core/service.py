@@ -45,6 +45,7 @@ from elspeth_llm_gateway.sdk.types import (
     CanonicalThinkingBlock,
     CanonicalToolCall,
     CanonicalToolDef,
+    CanonicalUsage,
     Capability,
     FinishReason,
     ResponseFormatSpec,
@@ -209,6 +210,26 @@ def _validate_canonical_response(
         seen_ids.add(validated.id)
 
 
+def _usage_log_fields(usage: CanonicalUsage | None) -> dict[str, int]:
+    """The token counts the ``completion`` event may carry, as the response reported them.
+
+    A deliberate exception to the logging policy: the gateway has no audit
+    store of its own, so counts (never content) go to its log. Adapter code
+    is untrusted and ``model_construct`` skips validation, so a count is
+    logged only when it is a plain non-negative ``int``; anything else is
+    omitted. Building the fields never raises, so a log line cannot fail a
+    request.
+    """
+    if usage is None:
+        return {}
+    counts = {
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+    }
+    return {name: value for name, value in counts.items() if type(value) is int and value >= 0}
+
+
 class ResponseValidationStage(StrEnum):
     """Where a 2xx upstream reply was refused (event ``response_validation_rejected``)."""
 
@@ -272,6 +293,7 @@ class CompletionService:
             # purpose. request_hash above is stable for the same reason.
             response_hash=canonical_hash(canonical_response.model_dump(mode="json")),
             response_bytes=len(json.dumps(response).encode("utf-8")),
+            **_usage_log_fields(canonical_response.usage),
         )
         return response
 
