@@ -22,6 +22,7 @@ defers, when one entry's own options or the schema block are malformed.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -42,9 +43,12 @@ from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
 from elspeth.web.composer import yaml_generator
 from elspeth.web.composer._validation_probe import prepare_validation_probe_options
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec, ValidationSummary
+from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.execution.validation import validate_pipeline_for_trained_operator
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.sessions.routes._helpers import _runtime_preflight_for_state
 from tests.unit.web.composer import test_file_inject_upload_only_tool_parity as upload_tools
 from tests.unit.web.execution.test_validate_blob_inline import _ready_blob_record, _state_with_reference_join
 
@@ -554,6 +558,50 @@ def test_a_node_declaring_its_own_written_field_validates_including_its_inbound_
     assert _codes(summary) == _codes(inline.validate()) == ([], [])
 
 
+@pytest.mark.parametrize("field_type", ["str", "any"])
+def test_a_json_entry_declared_outside_the_number_and_bool_types_constructs_with_the_string_stand_in(
+    tmp_path: Path, field_type: str
+) -> None:
+    """``SUPPORTED_TYPES`` is ``{str, int, float, bool, any}``; the stand-in table covers int, float and bool.
+
+    For a declared ``str`` or ``any`` the stand-in stays the JSON string
+    placeholder, which both types admit, so the node constructs with its
+    declared written field and the probe neither defers nor fails.
+    """
+    schema = {
+        "mode": "flexible",
+        "fields": ["kind: str", "item: str", {"name": "guide_value", "type": field_type, "required": True, "nullable": False}],
+    }
+    options = _all({"content": _marker(ENTRY_BLOB, '"Plain guidance."'), "format": "json"}, schema=schema)
+
+    prepared = prepare_validation_probe_options(options, plugin="file_inject")
+    summary = _inject_state(tmp_path, options, sink_schema={"mode": "flexible", "fields": [f"guide_value: {field_type}"]}).validate()
+
+    assert json.loads(prepared["files"]["guide"]["content"]) == PROBE_FILE_PLACEHOLDER
+    assert summary.is_valid, [entry.to_dict() for entry in summary.errors]
+    assert _codes(summary) == ([], [])
+
+
+@pytest.mark.parametrize("field_type", ["list", "dict", "object", "array", "json", "list[str]"])
+def test_a_container_declared_for_the_written_field_is_a_config_error_with_or_without_the_file(tmp_path: Path, field_type: str) -> None:
+    """The schema language has no container type: ``SchemaConfig`` refuses it, so no stand-in is ever asked for one.
+
+    The file-held node and its inline twin get the same config error; the
+    marker changes nothing about it.
+    """
+    schema = {"mode": "flexible", "fields": ["kind: str", "item: str", f"guide_value: {field_type}"]}
+    file_held = _inject_state(tmp_path / "file", _all({"content": _marker(ENTRY_BLOB, "[1, 2]"), "format": "json"}, schema=schema))
+    inline = _inject_state(tmp_path / "inline", _all({"content": "[1, 2]", "format": "json"}, schema=schema))
+
+    with pytest.raises(ValueError, match=f"Unknown type '{re.escape(field_type)}'"):
+        SchemaConfig.from_dict(schema)
+    summary = file_held.validate()
+
+    assert not summary.is_valid
+    assert "contract_config_invalid" in _codes(summary)[0]
+    assert _codes(summary) == _codes(inline.validate())
+
+
 def test_several_bytes_independent_entries_are_all_substituted(tmp_path: Path) -> None:
     options = {
         "mode": "all",
@@ -636,7 +684,13 @@ def test_a_valid_marker_beside_a_genuinely_bad_option_is_still_an_error(
 
 
 def test_reference_join_with_a_marker_still_defers_and_warns(tmp_path: Path) -> None:
-    """``reference_join``'s output fields are read from the table bytes: unknown bytes prove nothing."""
+    """``reference_join`` reads its joined values from the table bytes: no file_inject stand-in reaches it, so it still defers.
+
+    Since stage 2a a deferral is not a refusal: behind this observed source
+    the join abstains, the sink's requirement is decided before the run
+    starts (``test_deferred_contract_notice.py``), and the notice is the only
+    thing authoring says.
+    """
     state = _state_with_reference_join(
         tmp_path, session_id=SESSION_ID, reference_format="csv", content=_marker(ENTRY_BLOB, "sku,description\n")
     )
@@ -655,8 +709,9 @@ def test_reference_join_with_a_marker_still_defers_and_warns(tmp_path: Path) -> 
     errors, warnings = _codes(summary)
 
     assert PROBE_FILE_PLACEHOLDER not in json.dumps(prepared, default=str)
+    assert prepared["reference_content"] == _marker(ENTRY_BLOB, "sku,description\n")
     assert warnings == ["contract_probe_deferred"]
-    assert errors == ["sink_contract_violation"]
+    assert errors == []
 
 
 @pytest.mark.parametrize("plugin", ["reference_join", "llm", "field_mapper", None])
@@ -1042,6 +1097,76 @@ def test_what_the_file_held_node_publishes_for_its_undeclared_json_field(tmp_pat
 
     assert published == {"name": _WRITTEN_FIELD, "field_type": "any", "required": True, "nullable": False}
     assert f"{_WRITTEN_FIELD} (expected str, got Any)" in report["message"]
+
+
+def _row_union_of_two_file_held_arms(tmp_path: Path, inject_text: str) -> CompositionState:
+    """The fixed/fixed row_union with BOTH arms file-held, so the runtime preflight reaches the row_union check.
+
+    The inject arm leaves the written field undeclared and its file holds
+    ``inject_text``; the other arm is a ``file_inject`` declaring the field
+    ``str``, non-null. Paths sit in the session's folders the runtime admits.
+    """
+    session_root = tmp_path / "blobs" / str(SESSION_ID)
+    (tmp_path / "outputs" / str(SESSION_ID)).mkdir(parents=True)
+    state = _row_union_state(
+        session_root,
+        _all({"content": _marker(ENTRY_BLOB, inject_text), "format": "json"}, schema={"mode": "fixed", "fields": ["item: str"]}),
+        ["item: str"],
+    )
+    other_options = _all(
+        {"content": _marker(SECOND_ENTRY_BLOB, '"a sentence"'), "format": "json"},
+        schema={"mode": "fixed", "fields": _OTHER_ARM},
+    )
+    nodes = tuple(replace(node, plugin="file_inject", options=other_options) if node.id == "other" else node for node in state.nodes)
+    (sink,) = state.outputs
+    sink_path = str(tmp_path / "outputs" / str(SESSION_ID) / "results.json")
+    return replace(state, nodes=nodes, outputs=(replace(sink, options={**sink.options, "path": sink_path}),))
+
+
+def _runtime_preflight(tmp_path: Path, state: CompositionState, texts: dict[UUID, str]) -> ValidationResult:
+    """The runtime preflight the composer state routes run, with the session's file bytes behind each marker."""
+    records = {blob_id: _record_for(blob_id, text) for blob_id, text in texts.items()}
+    catalog = create_catalog_service()
+    return asyncio.run(
+        _runtime_preflight_for_state(
+            state,
+            settings=SimpleNamespace(data_dir=tmp_path, secret_wiring_allowlist=(), composer_runtime_preflight_timeout_seconds=60.0),
+            secret_service=None,
+            user_id=None,
+            session_id=SESSION_ID,
+            plugin_snapshot=PluginAvailabilitySnapshot.for_trained_operator(catalog),
+            profile_registry=None,
+            catalog=catalog,
+            blob_get_content=lambda blob_id: (records[blob_id], texts[blob_id].encode()),
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("inject_text", "runtime_type"),
+    [pytest.param("null", "typing.Any | None", id="file-holds-null"), pytest.param('{"a": 1}', "Any)", id="file-holds-a-value")],
+)
+def test_the_runtime_preflight_in_the_same_round_reports_the_exact_type(tmp_path: Path, inject_text: str, runtime_type: str) -> None:
+    """Proves the residue sentence in ``_file_inject_entry_stand_in``'s docstring.
+
+    Authoring renders the undeclared json field as ``Any`` whatever the file
+    holds; the runtime preflight, given the same state and the file's bytes,
+    renders ``typing.Any | None`` for a file holding a JSON null and ``Any``
+    for one holding a value. The second case is the control: the runtime's
+    rendering follows the bytes, not the shape.
+    """
+    state = _row_union_of_two_file_held_arms(tmp_path, inject_text)
+
+    authoring = state.validate()
+    runtime = _runtime_preflight(tmp_path, state, {ENTRY_BLOB: inject_text, SECOND_ENTRY_BLOB: '"a sentence"'})
+
+    (authoring_report,) = [entry.message for entry in authoring.errors if entry.error_code == _ROW_UNION_REPORT]
+    assert f"{_WRITTEN_FIELD} (expected str, got Any)" in authoring_report
+    assert runtime.is_valid is False
+    (runtime_report,) = [
+        error.message for error in runtime.errors if "receives incompatible schemas from multiple branches" in error.message
+    ]
+    assert f"{_WRITTEN_FIELD} (expected str, got {runtime_type}" in runtime_report
 
 
 @pytest.mark.parametrize(

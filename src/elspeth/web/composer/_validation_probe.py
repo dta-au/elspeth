@@ -26,6 +26,17 @@ def is_inline_content_reference(value: object) -> bool:
     return marker is not None and marker.mode == "inline_content"
 
 
+def holds_inline_content_reference(value: object) -> bool:
+    """Whether a valid ``inline_content`` marker sits anywhere in thawed option data."""
+    if is_inline_content_reference(value):
+        return True
+    if type(value) is dict:
+        return any(holds_inline_content_reference(child) for child in value.values())
+    if type(value) is list:
+        return any(holds_inline_content_reference(child) for child in value)
+    return False
+
+
 def is_deferred_blob_error(error: ErrorDetails, errors: list[ErrorDetails]) -> bool:
     """Defer string markers, retaining errors on their siblings and containers.
 
@@ -46,6 +57,144 @@ def is_deferred_blob_error(error: ErrorDetails, errors: list[ErrorDetails]) -> b
         detail["loc"][:2] == ("queries", selected) and detail["type"] == "string_type" and is_inline_content_reference(detail["input"])
         for detail in errors
     )
+
+
+_ABSENT: Final = object()
+
+
+def _option_child(container: object, segment: str | int) -> object:
+    if type(container) is dict:
+        return container[segment] if segment in container else _ABSENT
+    if type(container) is list and type(segment) is int and 0 <= segment < len(container):
+        return container[segment]
+    return _ABSENT
+
+
+def _option_path(location: tuple[str | int, ...], options: object) -> tuple[tuple[str | int, ...], int | None]:
+    """Map a pydantic ``loc`` onto the option tree; return the path and the index of the first tag segment.
+
+    A ``loc`` segment that names no key or index at that point of the
+    options is a union or validator tag (``"str"``, ``"list[str]"``,
+    ``"function-after[...]"``) and is dropped from the path.
+    """
+    path: list[str | int] = []
+    current = options
+    first_tag: int | None = None
+    for index, segment in enumerate(location):
+        child = _option_child(current, segment)
+        if child is not _ABSENT:
+            current = child
+            path.append(segment)
+        elif first_tag is None:
+            first_tag = index
+    return tuple(path), first_tag
+
+
+def only_marker_errors(errors: list[ErrorDetails], options: object) -> bool:
+    """Whether every config error is explained by a valid marker in ``options``.
+
+    An error counts when ``is_deferred_blob_error`` accepts it (a string
+    field holding a marker; the queries list-or-mapping union), or when it is
+    a CONSEQUENCE of such an error on the same option:
+
+    - the other branch of the union whose branch holds the marker
+      (``fields: str | list[str]`` with a marker at ``fields.0`` also reports
+      ``fields`` as not a string): same ``loc`` up to the union tag, a
+      different tag;
+    - a ``too_short`` on a container that holds the marker error, when the
+      container's own length meets the ``min_length`` the error reports.
+      pydantic counts only the items that validated, so a list whose only
+      item is a marker is "too short" until the marker is read; a list that
+      is short whatever the file says is a real error.
+
+    Anything else is a real config error and the probe is a failure, not a
+    deferral: an unknown option holding a marker, a marker in a ``Literal``
+    position, a missing sibling, a bad value elsewhere.
+    """
+    if not errors:
+        return False
+    marker_errors = [error for error in errors if is_deferred_blob_error(error, errors)]
+    if not marker_errors:
+        return False
+    marker_locations = [(error["loc"], *_option_path(error["loc"], options)) for error in marker_errors]
+    marker_option_paths = [path for _location, path, _tag in marker_locations]
+
+    def explained(error: ErrorDetails) -> bool:
+        if is_deferred_blob_error(error, errors):
+            return True
+        path, tag = _option_path(error["loc"], options)
+        holds_marker_error = any(len(found) > len(path) and found[: len(path)] == path for found in marker_option_paths)
+        if not holds_marker_error:
+            return False
+        if error["type"] == "too_short":
+            return _long_enough_once_read(error, path, options)
+        if tag is None:
+            return False
+        # Both errors must carry a union tag at the same position: a loc
+        # segment that is merely a missing key is not a branch.
+        location = error["loc"]
+        return any(
+            marker_tag == tag and marker_location[:tag] == location[:tag] and marker_location[tag] != location[tag]
+            for marker_location, _marker_path, marker_tag in marker_locations
+        )
+
+    return all(explained(error) for error in errors)
+
+
+def _long_enough_once_read(error: ErrorDetails, path: tuple[str | int, ...], options: object) -> bool:
+    """Whether the container at ``path`` already holds ``min_length`` items, so only unread markers made it short.
+
+    Needs the error's ``ctx``; without it nothing is assumed and the error stays real.
+    """
+    context = error["ctx"] if "ctx" in error else None
+    if context is None or "min_length" not in context:
+        return False
+    container = options
+    for segment in path:
+        container = _option_child(container, segment)
+    min_length = context["min_length"]
+    if type(min_length) is not int:
+        return False
+    if type(container) is list or type(container) is dict:
+        return len(container) >= min_length
+    return False
+
+
+def _string_keys(value: object) -> frozenset[str]:
+    return frozenset(key for key in value if type(key) is str) if type(value) is dict else frozenset()
+
+
+def deferred_created_fields(plugin: str, options: object) -> frozenset[str] | None:
+    """Output field names a deferring node creates, read from its config shape, or ``None`` when unknowable.
+
+    Only shapes where the names are certain without the file's bytes:
+    ``reference_join`` writes exactly the keys of ``output`` (single lookup)
+    or of each ``lookups[].output``; ``file_inject`` writes ``output_field``
+    (``mode: select``) or each ``files.<name>.output_field`` (``mode: all``).
+    Every other plugin, or a shape that does not read cleanly, is ``None``:
+    the caller then says "the fields this step adds" without naming any.
+    """
+    if type(options) is not dict:
+        return None
+    if plugin == "reference_join":
+        names = set(_string_keys(options["output"])) if "output" in options else set()
+        lookups = options["lookups"] if "lookups" in options else None
+        if type(lookups) is list:
+            for lookup in lookups:
+                if type(lookup) is dict and "output" in lookup:
+                    names |= _string_keys(lookup["output"])
+        return frozenset(names) or None
+    if plugin == "file_inject":
+        mode = options["mode"] if "mode" in options else None
+        if mode == "select":
+            field = options["output_field"] if "output_field" in options else None
+            return frozenset({field}) if type(field) is str else None
+        files = options["files"] if "files" in options else None
+        if mode != "all" or type(files) is not dict:
+            return None
+        written = {entry["output_field"] for entry in files.values() if type(entry) is dict and "output_field" in entry}
+        return frozenset(name for name in written if type(name) is str) or None
+    return None
 
 
 def prepare_query_definition_probe(queries: object) -> object:
