@@ -232,11 +232,28 @@ def test_validation_delta_reports_a_new_consumer_as_one_resolved_and_one_new_err
     assert [entry["message"] for entry in new] == [_expected_message(SHARED, ids)]
 
 
+def _paged_authoring_document(state: CompositionState, catalog: Any) -> dict[str, Any]:
+    """The whole authoring document of a graph too large for one read, joined from its hash-bound pages."""
+    arguments: dict[str, Any] = {"component": "set_pipeline_arguments", "field_path": ""}
+    content = ""
+    while True:
+        page = execute_tool("get_pipeline_state", arguments, state, catalog).to_dict()["data"]
+        assert page["view"] == "field"
+        content += page["content"]
+        if page["next_offset_chars"] is None:
+            break
+        arguments = {**arguments, "offset_chars": page["next_offset_chars"], "expected_sha256": page["sha256"]}
+    assert len(content) == page["total_chars"]
+    document = json.loads(content)
+    assert type(document) is dict
+    return document
+
+
 def test_refused_full_replacement_carries_no_saved_graph_repair_suggestion() -> None:
     """Control: a candidate refusal already describes only the candidate."""
     catalog = _mock_catalog()
     state = _graph(2)
-    candidate = execute_tool("get_pipeline_state", {"component": "set_pipeline_arguments"}, state, catalog).to_dict()["data"]
+    candidate = _paged_authoring_document(state, catalog)
 
     result = execute_tool("set_pipeline", candidate, state, catalog, validate_arguments=True)
     wire = _wire("set_pipeline", result)
