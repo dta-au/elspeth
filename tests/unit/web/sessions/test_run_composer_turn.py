@@ -1339,11 +1339,11 @@ async def test_actual_inspection_review_controls_public_and_saved_equivalence_cl
         assert review["saved_effects"]["net_changed"] is False
         assert review["saved_effects"]["initial_authored_state_hash"] == review["saved_effects"]["latest_verified_authored_state_hash"]
         assert review["saved_effects"]["changed_fields"] == []
-    assert len([call for call in calls if "response_format" in call]) == (1 if admit or route == "planner" else 2)
+    # The primary graph is newly FLAGGED, so it keeps its remaining review even
+    # when the reply is admitted: one repair reply and a second END pass.
+    assert len([call for call in calls if "response_format" in call]) == (1 if route == "planner" else 2)
     inspected_page_count = len({page["start_char"] for page in selected_pages})
-    assert len([call for call in calls if "response_format" not in call]) == inspected_page_count + 1 + int(
-        not admit and route == "primary"
-    )
+    assert len([call for call in calls if "response_format" not in call]) == inspected_page_count + 1 + int(route == "primary")
     if read_all:
         assert len(selected_pages) > 1
         for earlier, later in pairwise(selected_pages):
