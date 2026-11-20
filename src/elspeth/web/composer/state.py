@@ -121,6 +121,7 @@ from elspeth.web.composer._validation_probe import (
     prepare_query_definition_probe,
     prepare_validation_probe_options,
 )
+from elspeth.web.paths import NESTED_LOCAL_PATH_OPTION_KEYS, SINK_LOCAL_PATH_OPTION_KEYS, SOURCE_LOCAL_PATH_OPTION_KEYS
 from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
 
 if TYPE_CHECKING:
@@ -2399,6 +2400,83 @@ def _probe_sink_declarations(plugin: str, options: Mapping[str, Any]) -> _SinkDe
     # Abstain rather than invent: the raw-config union at the call site keeps
     # whatever the schema block declared.
     return _SinkDeclarations(declared if declared is not None else frozenset(), reads)
+
+
+def _sink_probe_defers(output: OutputSpec) -> bool:
+    """Whether ``output``'s config fails only where a valid file reference stands.
+
+    ``_probe_sink_declarations`` abstains to the empty requirement on any
+    construction failure, so a ``text`` or ``document`` sink whose ``path`` or
+    ``field`` holds a file reference loses the ``field`` it requires. The
+    runtime preflight decides that requirement on the real bytes; this is the
+    test for saying so. The rule is the transform probe's (``only_marker_errors``):
+    unknown fields and mixed config errors are config failures, not deferrals.
+    """
+    if _sink_path_file_reference_errors(output) or not holds_inline_content_reference(deep_thaw(output.options)):
+        return False
+    from elspeth.plugins.infrastructure.config_base import PluginConfigError
+    from elspeth.plugins.infrastructure.validation import get_sink_config_model
+
+    probe_options = prepare_validation_probe_options(output.options, plugin=output.plugin)
+    try:
+        config_model = get_sink_config_model(output.plugin)
+        if config_model is not None:
+            config_model.from_dict(probe_options, plugin_name=output.plugin)
+    except PluginConfigError as config_error:
+        # ``from_dict`` chains the pydantic error it wraps; a pre-check refusal has none.
+        cause = config_error.__cause__
+        return isinstance(cause, PydanticValidationError) and only_marker_errors(cause.errors(include_url=False), probe_options)
+    except Exception as exc:
+        if not _is_sink_config_probe_exception(exc):
+            raise
+    return False
+
+
+# A file reference where a local path stands can never run. The save path
+# (``web/execution/_validation_authoring.py``) and run admission
+# (``web/execution/service.py``) confine the keys in ``web/paths.py`` and admit
+# only a non-empty string there (or Chroma's explicit ``None``); a reference
+# is neither, so the reference alone decides it here, over the same keys.
+def _local_path_file_reference_entry(component: str, subject: str, key: str) -> ValidationEntry:
+    return ValidationEntry(
+        component,
+        f"{subject} {key} must be a string path; an attached file cannot stand there.",
+        "high",
+        "plugin_options_invalid",
+    )
+
+
+def _source_path_file_reference_errors(source_name: str, source: SourceSpec) -> tuple[ValidationEntry, ...]:
+    """A file reference at a ``SOURCE_LOCAL_PATH_OPTION_KEYS`` key of a source."""
+    component = "source" if source_name == "source" else f"source:{source_name}"
+    return tuple(
+        _local_path_file_reference_entry(component, f"Source '{source_name}'", key)
+        for key in SOURCE_LOCAL_PATH_OPTION_KEYS
+        if key in source.options and is_inline_content_reference(deep_thaw(source.options[key]))
+    )
+
+
+def _sink_path_file_reference_errors(output: OutputSpec) -> tuple[ValidationEntry, ...]:
+    """A file reference at a ``SINK_LOCAL_PATH_OPTION_KEYS`` key of an output."""
+    return tuple(
+        _local_path_file_reference_entry(f"output:{output.name}", f"Sink '{output.name}'", key)
+        for key in SINK_LOCAL_PATH_OPTION_KEYS
+        if key in output.options and is_inline_content_reference(deep_thaw(output.options[key]))
+    )
+
+
+def _nested_path_file_reference_errors(node: NodeSpec) -> tuple[ValidationEntry, ...]:
+    """A file reference at a ``NESTED_LOCAL_PATH_OPTION_KEYS`` key of a node's ``provider_config``."""
+    if node.plugin is None or "provider_config" not in node.options:
+        return ()
+    provider_config = deep_thaw(node.options["provider_config"])
+    if type(provider_config) is not dict:
+        return ()
+    return tuple(
+        _local_path_file_reference_entry(f"node:{node.id}", f"{node.node_type.capitalize()} '{node.id}'", f"provider_config.{key}")
+        for key in NESTED_LOCAL_PATH_OPTION_KEYS
+        if key in provider_config and is_inline_content_reference(provider_config[key])
+    )
 
 
 def _batch_distribution_profile_value_field_entries(
@@ -8227,8 +8305,12 @@ def _check_schema_contracts(
             continue
         if not holds_inline_content_reference(deep_thaw(deferred_node.options)):
             continue
+        if _nested_path_file_reference_errors(deferred_node):
+            continue
         if _probe_defers(deferred_node, deferred_node.plugin):
             contract_warnings.append(_deferred_contract_notice(deferred_node))
+    # The same notice for a sink: its required fields were not read either.
+    contract_warnings.extend(_deferred_sink_notice(output) for output in outputs if _sink_probe_defers(output))
 
     return tuple(errors), tuple(contract_warnings), tuple(edge_contracts)
 
@@ -8248,6 +8330,17 @@ def _deferred_contract_notice(node: NodeSpec) -> ValidationEntry:
         f"node:{node.id}",
         f"Node '{node.id}' ({plugin}) reads an attached file that this check does not open, so {fields}, "
         "their types and whether they can be empty are checked before the run starts. No change is needed.",
+        "medium",
+        "contract_probe_deferred",
+    )
+
+
+def _deferred_sink_notice(output: OutputSpec) -> ValidationEntry:
+    """``contract_probe_deferred`` for an output: the fields it requires are decided on the file's bytes."""
+    return ValidationEntry(
+        f"output:{output.name}",
+        f"Output '{output.name}' ({output.plugin}) reads an attached file that this check does not open, so the fields "
+        "it requires are checked before the run starts. No change is needed.",
         "medium",
         "contract_probe_deferred",
     )
@@ -8579,6 +8672,7 @@ class CompositionState:
             if source_name_error is not None:
                 component = "source" if source_name == "source" else f"source:{source_name}"
                 errors.append(_err(component, source_name_error, "high", "source_name_invalid"))
+            errors.extend(_source_path_file_reference_errors(source_name, self.sources[source_name]))
 
         # 1b. Every routing label the runtime settings model validates
         # (elspeth-2ed41f0a4a): connection/route/branch labels and sink names.
@@ -8651,6 +8745,7 @@ class CompositionState:
                     )
                 )
             seen_node_ids.add(node.id)
+            errors.extend(_nested_path_file_reference_errors(node))
 
         # 5. Output names unique
         seen_output_names: set[str] = set()
@@ -8658,6 +8753,7 @@ class CompositionState:
             if output.name in seen_output_names:
                 errors.append(_err(f"output:{output.name}", f"Duplicate output name: '{output.name}'.", "high", "duplicate_output_name"))
             seen_output_names.add(output.name)
+            errors.extend(_sink_path_file_reference_errors(output))
 
         # 6. Edge IDs unique
         seen_edge_ids: set[str] = set()
