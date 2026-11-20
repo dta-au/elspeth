@@ -16,7 +16,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from difflib import get_close_matches
 from hashlib import sha256
-from typing import Any, Final, Literal, NotRequired, TypedDict
+from typing import Any, Final, Literal, NotRequired, TypedDict, final
 
 from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.composer_interpretation import InterpretationKind
@@ -711,15 +711,45 @@ def _authored_options_hash(node: NodeSpec) -> str:
     return stable_hash({key: deep_thaw(value) for key, value in node.options.items() if key != INTERPRETATION_REQUIREMENTS_KEY})
 
 
+@final
+@dataclass(frozen=True, slots=True)
+class _RetainedReviewRowsNotRows:
+    """A retained node keeps a stored server-staged review, but its proposed requirements are not rows."""
+
+    node_id: str
+
+
+def server_staged_review_preservation_error(previous: CompositionState, proposed: CompositionState) -> str | None:
+    """Describe the first server-staged review that a proposed state would not keep.
+
+    Only a node that keeps a stored server-staged review needs its proposed
+    rows. If that value is not rows, the server cannot tell whether the review
+    was kept, which is an integrity failure. The observation of the stored
+    rows reports it and never raises; this wrapper raises it.
+
+    A non-row value on any other node is not this check's concern. Not every
+    caller has passed canonical admission first: the dispatcher admits only
+    tools with graph effects, and untouched nodes come from storage or a YAML
+    import.
+    """
+    outcome = _stored_review_preservation_outcome(previous, proposed)
+    if type(outcome) is _RetainedReviewRowsNotRows:
+        raise AuditIntegrityError(f"Proposed interpretation requirements for node {outcome.node_id!r} are not rows")
+    return outcome
+
+
 @observation_boundary(
     tier=3,
     source="untyped interpretation_requirements rows in stored and proposed composer node options",
     source_param="previous",
     suppresses=("R1", "R5"),
-    invariant="canonical admission handles model row shape; malformed retained state rows raise; a matching review is required on a retained node",
+    invariant=(
+        "a stored value that is not rows, and stored rows that are not server-staged reviews, are skipped; "
+        "a matching review is required on a retained node; never raises"
+    ),
 )
-def server_staged_review_preservation_error(previous: CompositionState, proposed: CompositionState) -> str | None:
-    """Describe the first server-staged review that a proposed state would not keep."""
+def _stored_review_preservation_outcome(previous: CompositionState, proposed: CompositionState) -> str | _RetainedReviewRowsNotRows | None:
+    """Observe the stored server-staged rows of ``previous`` against the rows of ``proposed``."""
     proposed_nodes = {node.id: node for node in proposed.nodes}
     for old_node in previous.nodes:
         old_rows = old_node.options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in old_node.options else ()
@@ -747,7 +777,7 @@ def server_staged_review_preservation_error(previous: CompositionState, proposed
                 return prefix + "Its node type and plugin cannot be changed." + suffix
             new_rows = new_node.options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in new_node.options else ()
             if not isinstance(new_rows, (list, tuple)):
-                raise AuditIntegrityError(f"Proposed interpretation requirements for node {old_node.id!r} are not rows")
+                return _RetainedReviewRowsNotRows(old_node.id)
             identity = (old_row["id"], old_row["kind"], term)
             matching = next(
                 (
