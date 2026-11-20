@@ -405,13 +405,29 @@ it("confirms a save politely, not through the error channel, and clears it on th
   expect(screen.queryByRole("status")).not.toBeInTheDocument();
 });
 
-it("says saved-but-not-refreshed politely when only the graph refetch fails", async () => {
-  vi.mocked(fetchCompositionState).mockRejectedValue(new Error("offline"));
+it("says saved-but-not-refreshed without asking for a reload, and Retry refetches the graph only", async () => {
+  // A reload would discard other unsaved prompt drafts in the session, so the
+  // fallback never asks for one; Retry repeats the graph read, not the save.
+  vi.mocked(fetchCompositionState).mockRejectedValueOnce(new Error("offline"));
   const editor = await openOneFileEditor();
   fireEvent.change(editor, { target: { value: "new text" } });
   fireEvent.click(screen.getByRole("button", { name: "Save" }));
-  await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Saved. Reload the session to see the updated prompt status."));
+  await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent(
+    "Saved. The prompt status will update when the pipeline next refreshes.",
+  ));
+  expect(screen.getByRole("status")).not.toHaveTextContent(/reload/i);
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(savePromptFile).toHaveBeenCalledTimes(1);
+  const fetchesBefore = vi.mocked(fetchCompositionState).mock.calls.length;
+
+  fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+  await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent(
+    "Saved. This step now uses the new text.",
+  ));
+  expect(vi.mocked(fetchCompositionState).mock.calls.length).toBe(fetchesBefore + 1);
+  expect(savePromptFile).toHaveBeenCalledTimes(1);
+  expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
 });
 
 it("keeps a refused save as an alert and keeps it while the user goes on typing", async () => {

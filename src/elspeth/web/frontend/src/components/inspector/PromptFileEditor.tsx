@@ -54,7 +54,9 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
   // What the editor last has to say: a failure (announced as an alert) or a
   // confirmation or caution (announced politely). A save that worked is never
   // sent through the error channel.
-  const [status, setStatus] = useState<{ tone: "error" | "success" | "warning"; text: string } | null>(null);
+  // retryRefresh: the save landed but the graph refetch after it failed; the
+  // banner offers the same refetch again.
+  const [status, setStatus] = useState<{ tone: "error" | "success" | "warning"; text: string; retryRefresh?: true } | null>(null);
   const [saving, setSaving] = useState(false);
   // A slot with unsaved text opens with it showing, wherever the editor remounts.
   const [expanded, setExpanded] = useState(() => draft !== undefined);
@@ -169,6 +171,34 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
     void rereadRef.current().catch(() => undefined);
   }, [listedHash, expectedSha256]);
 
+  // Re-read the graph after a save so the step's prompt status follows. A
+  // failure here never asks for a reload: other prompt drafts in this session
+  // may be unsaved, and a reload would lose them.
+  const refreshGraphAfterSave = async (
+    activeSessionId: string,
+    isCurrent: () => boolean,
+  ): Promise<void> => {
+    try {
+      const state = await fetchCompositionState(activeSessionId);
+      if (!isCurrent()) return;
+      useSessionStore.setState({ compositionState: state });
+      setStatus({ tone: "success", text: "Saved. This step now uses the new text." });
+    } catch {
+      if (isCurrent()) {
+        setStatus({
+          tone: "warning",
+          text: "Saved. The prompt status will update when the pipeline next refreshes.",
+          retryRefresh: true,
+        });
+      }
+    }
+  };
+
+  const retryRefresh = () => {
+    if (!sessionId) return;
+    void refreshGraphAfterSave(sessionId, captureSessionPublicationGuard(sessionId));
+  };
+
   const save = async () => {
     if (!slot || !sessionId || !draft || stale || refusal !== null) return;
     const sent = draft.text;
@@ -189,14 +219,7 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
       setStatus({ tone: "success", text: "Saved. This step now uses the new text." });
       // The save rewrote the blob, so the file manager's hash and size are stale.
       void useBlobStore.getState().loadBlobs(sessionId);
-      try {
-        const state = await fetchCompositionState(sessionId);
-        if (isCurrent()) {
-          useSessionStore.setState({ compositionState: state });
-        }
-      } catch {
-        if (isCurrent()) setStatus({ tone: "warning", text: "Saved. Reload the session to see the updated prompt status." });
-      }
+      await refreshGraphAfterSave(sessionId, isCurrent);
     } catch (failure: unknown) {
       if (isCurrent()) {
         const typed = failure as { detail?: unknown; error_type?: unknown };
@@ -323,7 +346,18 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
         aria-describedby={[refusal ? refusalId : null, stale ? staleId : null].filter((id) => id !== null).join(" ") || undefined}
         rows={12}
       />
-      {status && <AlertBanner tone={status.tone} className="prompt-editor-notice">{status.text}</AlertBanner>}
+      {status && (
+        <AlertBanner
+          tone={status.tone}
+          className="prompt-editor-notice"
+          action={status.retryRefresh ? (
+            // The same graph read the save made, issued again; nothing is resaved.
+            <Button type="button" variant="ghost" compact onClick={retryRefresh}>Retry</Button>
+          ) : null}
+        >
+          {status.text}
+        </AlertBanner>
+      )}
       <div className="prompt-editor-actions">
         <Button
           type="button"
