@@ -102,6 +102,14 @@ def malformed_inline_blob_marker_paths(config: InlinePreflightState) -> tuple[st
     return ()
 
 
+def inline_blob_refs(config: InlinePreflightState) -> tuple[BlobInlineRef, ...]:
+    """Every inline-content binding in ``config``, one per place a file is bound; empty if a marker is malformed."""
+    try:
+        return tuple(_discover_blob_content_refs(cast(dict[str, Any], _inline_discovery_config(config))))
+    except BlobContentResolutionError:
+        return ()
+
+
 _REFUSAL_LIMIT_BYTES: Mapping[InlineBlobNotAdmittedReason, int | None] = MappingProxyType(
     {
         "unverified": None,
@@ -206,6 +214,19 @@ def prepare_session_inline_blob_snapshot(
     aggregate_exhausted = False
     for ref in refs:
         if ref.blob_id in records:
+            # Bytes are read once per file, but the total counts every
+            # binding, as validation and run admission count it: a file bound
+            # in two places is resolved twice. The binding that crosses the
+            # cap withdraws its file, so a reader of it is refused as the run
+            # would refuse it.
+            if not aggregate_exhausted:
+                repeated_bytes = len(records[ref.blob_id][1])
+                aggregate += repeated_bytes
+                declared_aggregate += repeated_bytes
+                if aggregate > BLOB_INLINE_AGGREGATE_BYTE_CAP:
+                    del records[ref.blob_id]
+                    refusals[ref.blob_id] = "aggregate_oversized"
+                    aggregate_exhausted = True
             continue
         if aggregate_exhausted:
             # Reads stop here, as before; keep any more specific reason
