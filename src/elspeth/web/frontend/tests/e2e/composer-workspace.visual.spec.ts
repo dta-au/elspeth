@@ -173,8 +173,8 @@ test.describe("Composer workspace visual baselines", () => {
   // restore affordance (collapsed strip + icon toggle) shipped and was
   // recut without a pixel oracle (flagged by that day's UX review). The
   // graph re-fits when the pane collapses, so the whole canvas is masked;
-  // this baseline pins the chrome — collapsed strip, restore toggle, action
-  // bar — not the graph.
+  // this baseline pins the chrome — the Show control at the left end of the
+  // pipeline title bar (2026-11-20), action bar — not the graph.
   test("collapsed authoring at 1280x720", async ({ page }) => {
     const { composer, sessionId } = await openStableVisualScenario(
       page,
