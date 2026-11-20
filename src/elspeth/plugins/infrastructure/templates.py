@@ -49,7 +49,12 @@ from elspeth.contracts.field_spelling import header_spelling_canonical
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.tier_registry import FrameworkBugError
 from elspeth.contracts.trust_boundary import trust_boundary
-from elspeth.core.templates import RETIRED_ROW_API_NAMES, TEMPLATE_ROW_METHODS, validate_jinja_source
+from elspeth.core.templates import (
+    RETIRED_ROW_API_NAMES,
+    TEMPLATE_ROW_METHODS,
+    TemplateSourceTooLargeError,
+    validate_jinja_source,
+)
 
 if TYPE_CHECKING:
     from elspeth.contracts.schema_contract import PipelineRow
@@ -57,6 +62,15 @@ if TYPE_CHECKING:
 
 class TemplateError(Exception):
     """Error in template rendering (including sandbox violations)."""
+
+
+class TemplateSourceTooLarge(TemplateError):
+    """The template source is over the byte bound; carries the figures so a caller can name its position."""
+
+    def __init__(self, size_bytes: int, limit_bytes: int) -> None:
+        self.size_bytes = size_bytes
+        self.limit_bytes = limit_bytes
+        super().__init__(f"Template exceeds {limit_bytes} UTF-8 bytes")
 
 
 class TemplateWorkerLostError(PluginRetryableError):
@@ -633,6 +647,8 @@ def _restore_context_value(value: Any, *, memo: dict[int, Any] | None = None) ->
 def _check_template_source(source: str) -> None:
     try:
         validate_jinja_source(source)
+    except TemplateSourceTooLargeError as exc:
+        raise TemplateSourceTooLarge(exc.size_bytes, exc.limit_bytes) from exc
     except ValueError as exc:
         raise TemplateError(str(exc)) from exc
 

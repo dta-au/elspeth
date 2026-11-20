@@ -213,7 +213,18 @@ def template_loads_name(template_string: str, name: str) -> bool:
 
 _ATTRIBUTE_KEYWORD_FILTERS: frozenset[str] = frozenset({"map", "join", "sort", "unique", "sum", "min", "max"})
 _ATTRIBUTE_POSITIONAL_FILTERS: frozenset[str] = frozenset({"selectattr", "rejectattr", "groupby"})
-MAX_JINJA_TEMPLATE_BYTES = 16 * 1024
+# Largest template the parser is given, in UTF-8 bytes. The node, depth and
+# expression bounds are checked only after the whole text is parsed, so this
+# sets how long a refusal can take: about 3.2 ms per KB, 0.2 s at this value
+# (measured 2026-11-21 in the template-bound sizing study, against 0.05 s at the
+# old 16 KiB). An ordinary prompt of this size costs about 5 ms to compile and
+# 7 ms per row to render; about 16,000 tokens. The memory the three analysis
+# caches below keep does not grow with this value: they share one byte budget.
+# What grows with it is the time to refuse. One constant for every template the engine
+# parses: LLM transform prompts and query templates, RAG query templates
+# (plugins/transforms/rag), LLM-source prompts (plugins/sources/llm) and the
+# Azure blob sink's path templates (plugins/sinks/azure_blob_sink.py).
+MAX_JINJA_TEMPLATE_BYTES = 64 * 1024
 # Entry bound of the three template-analysis caches below. Validation walks a
 # graph's templates in the same order every time, and an LRU smaller than that
 # walk misses on every call: at 128 a 400-template walk scored 0 hits on its
@@ -429,10 +440,32 @@ def _field_usage_bytes(usage: Jinja2FieldExtraction) -> int:
     return sys.getsizeof(usage) + _name_set_bytes(usage.fields) + sys.getsizeof(usage.dynamic_accesses)
 
 
+class TemplateSourceTooLargeError(ValueError):
+    """A template's source is over ``MAX_JINJA_TEMPLATE_BYTES``; carries both figures.
+
+    A ``ValueError``, so every caller that already handles the size refusal
+    still does; a caller that knows the template's position names it with
+    :func:`template_size_refusal`.
+    """
+
+    def __init__(self, size_bytes: int, limit_bytes: int) -> None:
+        self.size_bytes = size_bytes
+        self.limit_bytes = limit_bytes
+        super().__init__(f"Template exceeds {limit_bytes} UTF-8 bytes")
+
+
+def template_size_refusal(position: str, size_bytes: int, limit_bytes: int) -> str:
+    """The refusal for one prompt template over the bound, naming where it sits."""
+    return (
+        f"{position} is {size_bytes} bytes; the limit for one prompt template is {limit_bytes} bytes. "
+        "Shorten it, or move reference text into a file_inject step and read it from the row."
+    )
+
+
 def validate_jinja_source(source: str) -> None:
     """Bound parser input before Jinja sees a web or YAML authored template."""
     if len(source) > MAX_JINJA_TEMPLATE_BYTES or len(source.encode("utf-8")) > MAX_JINJA_TEMPLATE_BYTES:
-        raise ValueError(f"Template exceeds {MAX_JINJA_TEMPLATE_BYTES} UTF-8 bytes")
+        raise TemplateSourceTooLargeError(len(source.encode("utf-8")), MAX_JINJA_TEMPLATE_BYTES)
     _validate_bounded_jinja_source(source)
 
 

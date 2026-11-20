@@ -13,10 +13,11 @@ from sqlalchemy import Connection, desc, select
 
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.core.templates import MAX_JINJA_TEMPLATE_BYTES, template_size_refusal
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.middleware import require_pipeline_user
 from elspeth.web.auth.models import UserIdentity
-from elspeth.web.blobs.prompt_editor import prompt_bindings_for_blob, repin_prompt_bindings
+from elspeth.web.blobs.prompt_editor import is_template_binding_path, prompt_bindings_for_blob, repin_prompt_bindings
 from elspeth.web.blobs.protocol import (
     ALLOWED_MIME_TYPES,
     BlobActiveRunError,
@@ -173,6 +174,17 @@ def create_prompt_text_router() -> APIRouter:
                     409,
                     "prompt_file_encoding_unsupported",
                     "This prompt reads the file with a non-UTF-8 encoding; re-attach it as UTF-8 text before editing it here.",
+                )
+            if is_template_binding_path(bindings[0].field_path) and len(new_bytes) > MAX_JINJA_TEMPLATE_BYTES:
+                # A file at a template position is parsed as one template, so a
+                # longer text would save and then fail validation at every turn.
+                # A system prompt is plain text: only the file cap above applies.
+                raise _prompt_save_refusal(
+                    413,
+                    "prompt_file_too_large",
+                    template_size_refusal(
+                        f"{bindings[0].field_path} on step {bindings[0].node_id}", len(new_bytes), MAX_JINJA_TEMPLATE_BYTES
+                    ),
                 )
 
             def attested_before_save() -> dict[str, PromptReviewSnapshot | None]:

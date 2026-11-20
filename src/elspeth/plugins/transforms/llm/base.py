@@ -16,10 +16,16 @@ from pydantic import Field, ValidationError, field_validator, model_validator
 
 from elspeth.contracts.schema_contract import declared_type_name_admits
 from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
+from elspeth.core.templates import template_size_refusal
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.pooling import PoolConfig
 from elspeth.plugins.infrastructure.pooling.config import validate_pool_delay_invariants
-from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment, find_runtime_unbound_variables
+from elspeth.plugins.infrastructure.templates import (
+    TemplateError,
+    TemplateSourceTooLarge,
+    create_sandboxed_environment,
+    find_runtime_unbound_variables,
+)
 from elspeth.plugins.transforms.llm import LLM_GUARANTEED_SUFFIXES, _llm_created_output_fields
 from elspeth.plugins.transforms.llm.image_inputs import ImageInputConfig
 from elspeth.plugins.transforms.llm.multi_query import (
@@ -542,6 +548,8 @@ class LLMConfig(TransformDataConfig):
         # Validate template syntax at config time
         try:
             PromptTemplate(v)
+        except TemplateSourceTooLarge as e:
+            raise ValueError(template_size_refusal("prompt_template", e.size_bytes, e.limit_bytes)) from e
         except TemplateError as e:
             raise ValueError(f"Invalid Jinja2 template: {e}") from e
         return v

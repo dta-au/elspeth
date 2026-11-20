@@ -13,12 +13,13 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.core.templates import template_size_refusal
 from elspeth.plugins.infrastructure.config_base import PluginConfig
-from elspeth.plugins.infrastructure.templates import RowProjection, TemplateError, TemplateRow
+from elspeth.plugins.infrastructure.templates import RowProjection, TemplateError, TemplateRow, TemplateSourceTooLarge
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
 
 
@@ -224,7 +225,7 @@ class QueryDefinition(BaseModel):
 
     @field_validator("template")
     @classmethod
-    def validate_template(cls, v: str | None) -> str | None:
+    def validate_template(cls, v: str | None, info: ValidationInfo) -> str | None:
         """Compile-check per-query templates at config time (compose parity).
 
         Pack pressure-suite run 4 (P4): ``options.prompt_template`` is
@@ -251,6 +252,12 @@ class QueryDefinition(BaseModel):
             )
         try:
             PromptTemplate(v)
+        except TemplateSourceTooLarge as exc:
+            # ``name`` is declared before ``template``, so pydantic has validated
+            # it by now; it is absent only when its own validation failed.
+            name = info.data["name"] if "name" in info.data else None
+            position = f"queries.{name}.template" if type(name) is str else "queries entry template"
+            raise ValueError(template_size_refusal(position, exc.size_bytes, exc.limit_bytes)) from exc
         except TemplateError as exc:
             raise ValueError(f"Invalid Jinja2 template in queries entry: {exc}") from exc
         return v
