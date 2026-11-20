@@ -299,7 +299,9 @@ collects them. The logging policy
 (`.claude/skills/logging-telemetry-policy/SKILL.md`) limits the logger to
 transitory debugging and to reporting failures of the audit or telemetry
 systems themselves. Row-level decisions, call results and outcomes are not
-logged, because the Landscape already holds them.
+logged, because the Landscape already holds them. One deliberate exception: the
+LLM gateway (`gateway/`) logs token counts on its `completion` event, never
+content, because the gateway has no audit store of its own.
 
 Web error handling is designed so logs do not become a second copy of user
 data:
