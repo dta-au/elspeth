@@ -954,6 +954,27 @@
   word-break: break-word;
 }
 
+/* A source or sink file row: the file's name, the stored path one click away. */
+.option-file-path {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  min-width: 0;
+}
+
+.option-file-path-full > summary {
+  width: fit-content;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+
+.option-file-path-full > code {
+  display: block;
+  margin-top: var(--space-2xs);
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
 /* Nested objects: indent + left rule so a nested group still reads as belonging
    to its parent key now that rows stack (the two-column value offset that used
    to signal nesting is gone). */
