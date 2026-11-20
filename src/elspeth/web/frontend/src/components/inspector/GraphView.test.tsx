@@ -471,6 +471,15 @@ describe("GraphView", () => {
     expect(within(screen.getByTestId("node-classify")).getByText("llm_transform")).toBeInTheDocument();
   });
 
+  it("places the file mapping dropdown above Wiring", () => {
+    useSessionStore.setState({ compositionState: makeState({ nodes: [makeNode()] }) });
+    render(<GraphView />);
+    const summary = screen.getByText((_content, element) => element?.tagName === "SUMMARY" && element.textContent?.trim() === "Files");
+    const wiring = screen.getByText(wiringSummary(1));
+    expect(summary.compareDocumentPosition(wiring) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(summary.closest("details")).not.toHaveAttribute("open");
+  });
+
   it.each([
     { options: { model: "anthropic/claude-sonnet-4" }, label: "model anthropic/claude-sonnet-4" },
     { options: { profile: "sonnet", resolved_model: "private-deployment" }, label: "profile sonnet" },

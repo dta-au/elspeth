@@ -63,6 +63,7 @@ import type { CompositionState } from "@/types/index";
 import { ConfigRows } from "./ConfigRows";
 import { OptionRows } from "./OptionRows";
 import { GraphOutputs } from "./GraphOutputs";
+import { GraphFiles } from "./GraphFiles";
 import { PromptFileEditor } from "./PromptFileEditor";
 import { visibleGraphRoutes } from "@/lib/graphRouteVisibility";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
@@ -1024,6 +1025,12 @@ export function GraphView({ onFullscreen, inModal = false }: GraphViewProps = {}
   // instead of restating an assumption about when React mounts things.
   const diagramRef = useRef<HTMLDivElement | null>(null);
   const flowInstanceRef = useRef<ReactFlowInstance | null>(null);
+  // The Files table's Show node: select the component and bring it into view.
+  const showFileNode = useCallback((id: string) => {
+    setActiveEdgeId(null);
+    selectNode(id);
+    void flowInstanceRef.current?.fitView({ ...GRAPH_FIT_VIEW_OPTIONS, nodes: [{ id }] });
+  }, [selectNode]);
   const hasFittedRef = useRef(false);
 
   const fitOnceWhenMeasurable = useCallback(() => {
@@ -2106,10 +2113,11 @@ export function GraphView({ onFullscreen, inModal = false }: GraphViewProps = {}
     const laidOut = layoutGraph(parallelGeometry.nodes, parallelGeometry.edges);
     return { nodes: laidOut.nodes, edges: withFanInArrivals(laidOut.nodes, laidOut.edges) };
   }, [nodes, edges, compositionState, showFailureRoutes]);
-  const hiddenOutputNames = useMemo(() => {
-    const visibleIds = new Set(visibleGraph.nodes.map((node) => node.id));
-    return new Set(compositionState?.outputs.filter((output) => !visibleIds.has(output.name)).map((output) => output.name));
-  }, [visibleGraph.nodes, compositionState]);
+  const visibleNodeIds = useMemo(() => new Set(visibleGraph.nodes.map((node) => node.id)), [visibleGraph.nodes]);
+  const hiddenOutputNames = useMemo(
+    () => new Set(compositionState?.outputs.filter((output) => !visibleNodeIds.has(output.name)).map((output) => output.name)),
+    [visibleNodeIds, compositionState],
+  );
   useEffect(() => {
     if (activeEdgeId && !visibleGraph.edges.some((edge) => edge.id === activeEdgeId)) setActiveEdgeId(null);
     if (selectedNodeId && hiddenOutputNames.has(selectedNodeId)) selectNode(null);
@@ -2405,6 +2413,12 @@ export function GraphView({ onFullscreen, inModal = false }: GraphViewProps = {}
             />
           )}
         </div>
+        {compositionState && (
+          <ErrorBoundary label="File mappings table">
+            <GraphFiles key={compositionState.session_id} state={compositionState} onShowNode={showFileNode}
+              visibleNodeIds={visibleNodeIds} />
+          </ErrorBoundary>
+        )}
         {compositionState && (
           <ErrorBoundary label="Wiring table">
             <GraphOutputs state={compositionState} showFailureRoutes={showFailureRoutes} hiddenOutputNames={hiddenOutputNames}>
