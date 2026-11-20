@@ -539,7 +539,9 @@ Record a suspected mismatch between the composer's guidance (the skill or a tool
 | `guidance_reference` | string | No | The skill section or tool description being contradicted, 1–1,000 characters |
 | `related_tool` | string | No | Name of the composer tool involved: a lowercase letter, then lowercase letters, digits or `_`; at most 100 characters |
 
-**Returns:** `blob_id`, `filename` and `status` (always `suspected_unverified`). The report prose is not echoed in the result, and the chat tool-call record keeps a length placeholder in place of each prose field.
+**Returns:** `blob_id`, `filename` and `status` (always `suspected_unverified`). The report prose is not echoed in the result.
+
+**Where the text is kept:** the prose fields are redacted only from the assistant message's tool-call record, which keeps a length placeholder for each. As for every tool, the full arguments are also kept in the tool message's visible tool event (`received_arguments`) and in the audit message, and the visible event feeds the advisor transcript. The report file holds the text as well.
 
 **Behaviour:** Saves one JSON file (`application/json`, named `composer-bug-report-<uuid>.json`) in the session's files, created by the assistant with the usual composer provenance. The file holds `report_type` `suspected_composer_bug`, `status` `suspected_unverified`, the time of the report, the observations as supplied, and the context that produced them: session, state id and version, user message, composer model, version and provider, skill hash and tool-arguments hash. The pipeline state is returned unchanged; nothing is repaired or verified. Blank, over-length, mistyped or extra fields are refused, and so is a report whose saved file would exceed 16,384 bytes (possible only with heavily escaped text, since the file is written as ASCII JSON); a refused report writes nothing. The session file quota applies. Credential-shaped text is refused before anything is written. Like `create_blob`, it runs immediately when the session requires approval for changes, because it only adds a file; `update_blob` and `delete_blob` still need approval.
 

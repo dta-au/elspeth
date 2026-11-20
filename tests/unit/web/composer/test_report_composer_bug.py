@@ -8,7 +8,8 @@ Behaviour pinned here:
 * every free-text field is capped, and so is the saved file; an over-size or
   malformed report is refused as a model-readable ``ToolArgumentError`` and
   writes nothing;
-* the report prose stays out of the chat tool-call record;
+* the report prose is redacted from the assistant row's tool-call record (the
+  tool and audit rows keep the arguments, as for every tool);
 * the report runs immediately under explicit approval, like ``create_blob``,
   while destructive blob writes still require approval.
 
