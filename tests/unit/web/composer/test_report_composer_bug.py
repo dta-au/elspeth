@@ -5,9 +5,10 @@ Behaviour pinned here:
 * the report is an ordinary assistant-created session blob with the composer
   context that produced it, marked suspected and unverified;
 * the pipeline state is returned unchanged;
-* every free-text field is capped, and so is the saved file; an over-size or
-  malformed report is refused as a model-readable ``ToolArgumentError`` and
-  writes nothing;
+* every free-text field is capped in characters, and the saved UTF-8 file in
+  bytes (exactly at the byte limit is admitted, one byte over is refused); an
+  over-size or malformed report is refused as a model-readable
+  ``ToolArgumentError`` and writes nothing;
 * the report prose is redacted from the assistant row's tool-call record (the
   tool and audit rows keep the arguments, as for every tool);
 * the report runs immediately under explicit approval, like ``create_blob``,
@@ -121,9 +122,9 @@ def _max_ascii_arguments(impl: _Impl) -> dict[str, str]:
 
 
 def _oversize_file_arguments(impl: _Impl) -> dict[str, str]:
-    """Within every field cap, but escaped non-ASCII text makes the file too large."""
+    """Within every field cap, but three-byte text in both behaviour fields makes the file too large."""
     behavior_cap = impl.caps["observed_behavior"]
-    return {**_arguments(), "expected_behavior": "é" * behavior_cap, "observed_behavior": "é" * behavior_cap}
+    return {**_arguments(), "expected_behavior": "漢" * behavior_cap, "observed_behavior": "漢" * behavior_cap}
 
 
 def _blob_rows(engine: Any) -> list[Any]:
@@ -238,6 +239,55 @@ def test_report_over_the_file_limit_is_refused_and_writes_nothing(tmp_path: Path
     assert impl.too_large_expectation in message
     assert impl.too_large_actual in message
     assert str(impl.max_bytes) in message
+
+
+def test_file_limit_admits_exactly_the_limit_and_refuses_one_byte_more(tmp_path: Path) -> None:
+    """Exact byte boundary: a file of exactly the limit is saved; one byte more is refused and writes nothing."""
+    impl = _impl()
+    render = vars(impl.reports)["_report_content"]
+    state = _empty_state()
+    behavior_cap = impl.caps["observed_behavior"]
+
+    def required(expected_length: int) -> dict[str, str]:
+        # Three-byte text fills most of the file; ASCII padding sets the exact size.
+        return {"summary": "Exact boundary", "expected_behavior": "x" * expected_length, "observed_behavior": "漢" * behavior_cap}
+
+    with _report_session(tmp_path) as (engine, kwargs):
+        context = _trained_tool_context(**kwargs)
+        unpadded = len(render(required(1), state, context).encode("utf-8"))
+        at_limit = required(1 + impl.max_bytes - unpadded)
+        over_limit = required(2 + impl.max_bytes - unpadded)
+        impl.model.model_validate(at_limit)
+        impl.model.model_validate(over_limit)
+        # Control the instrument: the padding lands exactly on the limit and one byte past it.
+        assert len(render(at_limit, state, context).encode("utf-8")) == impl.max_bytes
+        assert len(render(over_limit, state, context).encode("utf-8")) == impl.max_bytes + 1
+
+        with pytest.raises(ToolArgumentError):
+            impl.reports._execute_report_composer_bug(arguments=over_limit, state=state, context=context)
+        assert _blob_rows(engine) == []
+        result = impl.reports._execute_report_composer_bug(arguments=at_limit, state=state, context=context)
+        rows = _blob_rows(engine)
+
+    assert result.success
+    assert len(rows) == 1
+    assert len(Path(rows[0].storage_path).read_bytes()) == impl.max_bytes
+
+
+@pytest.mark.parametrize("character", ["é", "漢"], ids=["two_byte", "three_byte"])
+def test_one_behaviour_field_at_its_cap_in_multibyte_text_fits_and_is_stored_as_utf8(tmp_path: Path, character: str) -> None:
+    """The advertised character cap holds for non-ASCII text: the file stores UTF-8, not escapes."""
+    impl = _impl()
+    text = character * impl.caps["observed_behavior"]
+    with _report_session(tmp_path) as (engine, kwargs):
+        result = execute_tool("report_composer_bug", {**_arguments(), "observed_behavior": text}, _empty_state(), _mock_catalog(), **kwargs)
+        rows = _blob_rows(engine)
+
+    assert result.success
+    saved = Path(rows[0].storage_path).read_bytes()
+    assert len(saved) <= impl.max_bytes
+    assert text.encode("utf-8") in saved
+    assert json.loads(saved)["observations"]["observed_behavior"] == text
 
 
 def test_report_over_the_session_quota_fails_without_a_file(tmp_path: Path) -> None:

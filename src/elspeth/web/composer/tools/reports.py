@@ -56,11 +56,15 @@ from elspeth.web.composer.tools.declarations import ToolDeclaration, ToolKind
 
 __all__ = ["REPORT_STATUS", "REPORT_TYPE", "TOOLS_IN_MODULE", "ComposerBugReportPayload"]
 
-# The saved file is bounded by ``COMPOSER_BUG_REPORT_MAX_BYTES`` as well as by
-# the field caps. The caps alone do not bound it: the report is written with
-# ``ensure_ascii=True``, so one non-ASCII character can take up to twelve
-# bytes. Ordinary ASCII prose at every field cap fits (about 10.5 KB measured);
-# a larger report is refused before anything is written.
+# The saved file is bounded by ``COMPOSER_BUG_REPORT_MAX_BYTES`` (UTF-8 bytes)
+# as well as by the field caps (characters). The caps alone do not bound it:
+# the report is written as UTF-8 JSON, so a character takes one to four bytes,
+# and JSON escapes a quote, a backslash or a control character. Ordinary ASCII
+# prose at every field cap fits (10,136 bytes measured), and so does one
+# behaviour field at its cap in two- or three-byte text (four-byte text does
+# not); a larger report is refused before anything is written. The tool
+# description states the byte limit, so the model is not promised more than
+# the file can hold.
 
 REPORT_TYPE: Final = "suspected_composer_bug"
 REPORT_STATUS: Final = "suspected_unverified"
@@ -100,7 +104,8 @@ def _report_content(observations: Mapping[str, str], state: CompositionState, co
     document = {
         "report_type": REPORT_TYPE,
         "status": REPORT_STATUS,
-        "reported_at": datetime.now(UTC).isoformat(),
+        # Fixed width: the file size must not depend on whether the clock read a whole second.
+        "reported_at": datetime.now(UTC).isoformat(timespec="microseconds"),
         "observations": dict(observations),
         "context": {
             "session_id": context.session_id,
@@ -114,7 +119,7 @@ def _report_content(observations: Mapping[str, str], state: CompositionState, co
             "tool_arguments_hash": context.tool_arguments_hash,
         },
     }
-    return json.dumps(document, ensure_ascii=True, indent=2)
+    return json.dumps(document, ensure_ascii=False, indent=2)
 
 
 @trust_boundary(
@@ -192,6 +197,7 @@ _REPORT_COMPOSER_BUG_DECLARATION: Final = ToolDeclaration(
         "(always `suspected_unverified`). "
         "Reporting does not change the pipeline, repair the problem or confirm the bug. "
         "Report each distinct mismatch once, then continue the user's task. "
+        f"The saved report is at most {COMPOSER_BUG_REPORT_MAX_BYTES:,} bytes of UTF-8 JSON. "
         "State factual observations only; never include credentials or document content the mismatch does not need."
     ),
     json_schema={
