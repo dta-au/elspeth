@@ -4,7 +4,9 @@ Rule: an admitted reply over a newly FLAGGED graph gets one more repair/review
 round only when this turn's edits changed the saved graph. Every other
 admitted reply ends the turn on the first pass. If the extra round times out,
 errors, or ends with its reply withheld, the turn publishes the reply the
-first pass admitted, and the block stands.
+first pass admitted, and the block stands. The exception is a second review
+that cleared the graph (CLEAN) but withheld its reply: the turn keeps the
+plain withheld outcome, so no FLAGGED block outlives the review that lifted it.
 """
 
 import asyncio
@@ -14,6 +16,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from elspeth.web.composer.advisor_audit import AdvisorGraphReviewIdentity
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict, _AdvisorCheckpointComposeDeadlineExpired
 from elspeth.web.composer.advisor_decision import AdvisorGatePassed
 from elspeth.web.composer.protocol import ComposerConvergenceError
@@ -229,7 +232,6 @@ async def test_already_blocked_graph_ends_on_the_first_admitted_reply_even_after
     "second_verdict",
     [
         pytest.param(_flagged("WITHHOLD"), id="flagged-withheld"),
-        pytest.param(_clean("WITHHOLD"), id="clean-withheld"),
         pytest.param(checkpoint_fixtures._unavailable_verdict(), id="advisor-unavailable"),
         pytest.param(
             AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text="malformed", failure_class="malformed"), id="advisor-malformed"
@@ -256,6 +258,34 @@ async def test_second_reply_not_admitted_publishes_the_first_admitted_reply(make
     assert result.advisor_terminal_publication.reason == "flagged_final_pass"
     assert result.raw_assistant_content == _FIRST
     # The reply the advisor did not admit stays private.
+    assert _withheld_rows(service) == [("advisor_publication_withheld", _SECOND)]
+    # The review identity is the one that admitted the published reply: pass 1.
+    assert second.result.graph_review_identity == AdvisorGraphReviewIdentity(
+        binding=reviewed[0], for_graph=completion_gate_fingerprint(state), source="model"
+    )
+
+
+@pytest.mark.asyncio
+async def test_clean_second_review_with_withheld_reply_keeps_the_plain_withheld_outcome(make_service, clean_runnable_state):
+    """The latest review cleared the graph: no fallback under a FLAGGED block it no longer holds."""
+    service = make_service()
+    state = clean_runnable_state
+    evidence, context = _turn_evidence(state, changed=True)
+    reviewed = _scripted_reviews(service, _flagged("ADMIT"), _clean("WITHHOLD"))
+
+    first = await _first_pass(service, state, evidence, context, [])
+    assert first.action == "continue"
+    second = await _second_pass(service, state, evidence, context, first)
+
+    assert len(reviewed) == 2
+    assert second.action == "return"
+    result = second.result
+    assert _FIRST not in result.message
+    assert _SECOND not in result.message
+    assert result.advisor_terminal_publication.reason == "publication_withheld"
+    assert second.result.graph_review_identity == AdvisorGraphReviewIdentity(
+        binding=reviewed[1], for_graph=completion_gate_fingerprint(state), source="model"
+    )
     assert _withheld_rows(service) == [("advisor_publication_withheld", _SECOND)]
 
 
@@ -344,3 +374,50 @@ async def test_extra_round_never_exceeds_the_pass_budget(make_service, clean_run
     assert outcome.action == "return"
     assert outcome.advisor_passes_delta == 0
     assert outcome.result.runtime_preflight.readiness.completion_ready is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["graph-changed", "preflight-fails"])
+async def test_failed_round_fallback_checks_the_kept_reply_before_preflight(make_service, clean_runnable_state, case):
+    """The composer-failure fallback runs no preflight for an unusable kept reply, and hands a failing one back to its caller.
+
+    The caller (the compose-loop handler) then re-raises the round's original
+    failure; ``test_failed_preflight_never_replaces_the_extra_round_failure``
+    in ``test_run_composer_turn.py`` pins that end to end.
+    """
+    from elspeth.web.composer.protocol import ComposerRuntimePreflightError
+
+    service = make_service()
+    state = _state_without_review_sites(clean_runnable_state)
+    evidence, context = _turn_evidence(state, changed=True)
+    _scripted_reviews(service, _flagged("ADMIT"))
+    first = await _first_pass(service, state, evidence, context, [])
+    assert first.advisor_review_state.admitted_fallback is not None
+    preflight_runs = []
+
+    async def preflight():
+        preflight_runs.append(case)
+        raise ComposerRuntimePreflightError(original_exc=RuntimeError("validation crashed"), partial_state=state)
+
+    def fallback():
+        return service._completion._admitted_fallback_result(
+            advisor_review_state=first.advisor_review_state,
+            state=replace(state, metadata=replace(state.metadata, name="Repaired draft")) if case == "graph-changed" else state,
+            runtime_preflight=preflight,
+            session_id=None,
+            session_operation_context=None,
+            recorder=None,
+            repair_turns_used=0,
+            persisted_assistant_message_id=None,
+            persisted_assistant_content=None,
+            persisted_tool_call_turn=False,
+        )
+
+    if case == "graph-changed":
+        # None tells the caller to re-raise its own timeout or provider error.
+        assert await fallback() is None
+        assert preflight_runs == []
+    else:
+        with pytest.raises(ComposerRuntimePreflightError):
+            await fallback()
+        assert preflight_runs == ["preflight-fails"]

@@ -195,7 +195,7 @@ from elspeth.web.composer.strict_transport import (
     StrictTransportDiagnostic,
     resolve_composer_tool_contract,
 )
-from elspeth.web.composer.tools import ToolResult
+from elspeth.web.composer.tools import ToolResult, is_blob_store_only_mutation_tool
 from elspeth.web.composer.tools.generation import MalformedSourceProofClaim, ProofUnavailable
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.credential_guard import require_no_credential_material, require_no_credential_material_in_state
@@ -551,6 +551,30 @@ def _record_advisor_repair_mutations(
         review_state,
         successful_mutating_actions=tuple(actions[:_ADVISOR_ATTEMPTED_ACTIONS_MAX_ITEMS]),
     )
+
+
+def _drop_admitted_fallback_after_file_change(
+    review_state: _AdvisorReviewState,
+    tool_outcomes: tuple[_ToolOutcome, ...],
+) -> _AdvisorReviewState:
+    """Forget the kept admitted reply once the round creates, updates or deletes a session file.
+
+    The kept reply was admitted against the session as it stood. The graph
+    fingerprint covers what the graph references, but blob-store-only tools
+    (``create_blob``/``update_blob``/``delete_blob``) change session files
+    without changing the graph, so a reply about those files could otherwise
+    be published after they changed. Any such call that did not plainly fail
+    drops the fallback; the turn then ends as it would without one.
+    """
+    if review_state.admitted_fallback is None:
+        return review_state
+    for outcome in tool_outcomes:
+        if not is_blob_store_only_mutation_tool(outcome.call.function.name) or outcome.error_class is not None:
+            continue
+        if isinstance(outcome.response, ToolResult) and not outcome.response.success:
+            continue
+        return replace(review_state, admitted_fallback=None)
+    return review_state
 
 
 # The per-dispatch audit envelope (DispatchAudit, begin_dispatch, finish_*)
@@ -3160,20 +3184,24 @@ class ComposerServiceImpl:
                     provider_owner=provider_owner,
                     turn_evidence=turn_evidence,
                 )
-            except (ComposerConvergenceError, OpenAIError, _MalformedLLMResponseError):
+            except (ComposerConvergenceError, OpenAIError, _MalformedLLMResponseError, _BadRequestLLMError) as round_failure:
                 # The composer call of an extra review round (a newly flagged
-                # graph after this turn changed it) timed out or failed: fall
-                # back to the reply the earlier pass admitted, block standing.
-                # Without a kept reply for this unchanged graph, the failure
-                # stands exactly as before.
-                fallback_result = await self._completion._admitted_fallback_result(
-                    advisor_review_state=advisor_review_state,
-                    state=state,
-                    runtime_preflight=await self._preflight.turn_runtime_preflight(
-                        state=state,
+                # graph after this turn changed it) timed out, failed or was
+                # refused with a 400: fall back to the reply the earlier pass
+                # admitted, block standing. The failed call is already in the
+                # turn's LLM-call audit. Without a kept reply for this
+                # unchanged graph and these session files, the failure stands
+                # exactly as before; the kept reply is checked before any
+                # preflight runs, and a preflight failure never replaces it.
+                async def fallback_preflight(
+                    _state: CompositionState = state,
+                    _last_runtime_preflight: ValidationResult | None = last_runtime_preflight,
+                ) -> ValidationResult | None:
+                    return await self._preflight.turn_runtime_preflight(
+                        state=_state,
                         user_id=user_id,
                         session_id=session_id,
-                        last_runtime_preflight=last_runtime_preflight,
+                        last_runtime_preflight=_last_runtime_preflight,
                         runtime_preflight_cache=runtime_preflight_cache,
                         initial_version=initial_version,
                         session_scope=session_scope,
@@ -3181,16 +3209,25 @@ class ComposerServiceImpl:
                         plugin_snapshot=plugin_snapshot,
                         session_operation_context=session_operation_context,
                     )
-                    if advisor_review_state.admitted_fallback is not None
-                    else None,
-                    session_id=session_id,
-                    session_operation_context=session_operation_context,
-                    recorder=recorder,
-                    repair_turns_used=repair_turns_used,
-                    persisted_assistant_message_id=persisted_assistant_message_id,
-                    persisted_assistant_content=persisted_assistant_content,
-                    persisted_tool_call_turn=persisted_tool_call_turn,
-                )
+
+                try:
+                    fallback_result = await self._completion._admitted_fallback_result(
+                        advisor_review_state=advisor_review_state,
+                        state=state,
+                        runtime_preflight=fallback_preflight,
+                        session_id=session_id,
+                        session_operation_context=session_operation_context,
+                        recorder=recorder,
+                        repair_turns_used=repair_turns_used,
+                        persisted_assistant_message_id=persisted_assistant_message_id,
+                        persisted_assistant_content=persisted_assistant_content,
+                        persisted_tool_call_turn=persisted_tool_call_turn,
+                    )
+                except ComposerRuntimePreflightError:
+                    # The round's own failure is what the user is owed, re-raised
+                    # with its own ``__cause__`` unchanged; the preflight failure
+                    # stays attached as its ``__context__``.
+                    raise round_failure from round_failure.__cause__
                 if fallback_result is None:
                     raise
                 # An END blocked terminal: the advisor-repair prose replacer
@@ -3493,6 +3530,7 @@ class ComposerServiceImpl:
                 advisor_review_state,
                 dispatch.tool_outcomes,
             )
+            advisor_review_state = _drop_admitted_fallback_after_file_change(advisor_review_state, dispatch.tool_outcomes)
             current_state_id = persist.current_state_id
             persisted_assistant_message_id = persist.persisted_assistant_message_id
             persisted_assistant_content = persist.persisted_assistant_content
