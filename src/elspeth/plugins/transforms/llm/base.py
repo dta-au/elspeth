@@ -16,12 +16,18 @@ from pydantic import Field, ValidationError, field_validator, model_validator
 
 from elspeth.contracts.schema_contract import declared_type_name_admits
 from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
-from elspeth.core.templates import PromptTemplateRefusal, template_nesting_refusal, template_size_refusal
+from elspeth.core.templates import (
+    PromptTemplateRefusal,
+    template_nesting_refusal,
+    template_number_literal_refusal,
+    template_size_refusal,
+)
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.pooling import PoolConfig
 from elspeth.plugins.infrastructure.pooling.config import validate_pool_delay_invariants
 from elspeth.plugins.infrastructure.templates import (
     TemplateError,
+    TemplateNumberLiteralTooLong,
     TemplateSourceTooLarge,
     TemplateTooDeeplyNested,
     create_sandboxed_environment,
@@ -553,6 +559,8 @@ class LLMConfig(TransformDataConfig):
             raise PromptTemplateRefusal(template_size_refusal("prompt_template", e.size_bytes, e.limit_bytes)) from e
         except TemplateTooDeeplyNested as e:
             raise PromptTemplateRefusal(template_nesting_refusal("prompt_template")) from e
+        except TemplateNumberLiteralTooLong as e:
+            raise PromptTemplateRefusal(template_number_literal_refusal("prompt_template")) from e
         except TemplateError as e:
             raise ValueError(f"Invalid Jinja2 template: {e}") from e
         return v
