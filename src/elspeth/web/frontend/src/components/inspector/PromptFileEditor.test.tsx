@@ -189,6 +189,28 @@ it("says the pipeline changed on prompt_file_binding_changed, and Refresh pipeli
   expect(editor).toHaveValue("my draft");
 });
 
+it("says a slot that no longer reads this file without asking for a reload, and offers Refresh pipeline", async () => {
+  useBlobStore.setState({ activeSessionId: "session-1", isLoading: false, blobs: [
+    { id: "blob-1", filename: "old.md", status: "ready", mime_type: "text/plain", content_hash: null } as BlobMetadata,
+    { id: "blob-2", filename: "new.md", status: "ready", mime_type: "text/plain", content_hash: null } as BlobMetadata,
+  ] });
+  // The graph already moved the slot to blob-2; this editor was opened on blob-1.
+  const moved = { nodes: [{ id: "first", plugin: "llm", options: { prompt_template: { mode: "inline_content", blob_ref: "blob-2", sha256: "a".repeat(64) } } }],
+    sources: {}, outputs: [] } as unknown as CompositionState;
+  useSessionStore.setState({ compositionState: moved });
+  render(<PromptFileEditors nodeId="first" options={{ prompt_template: { mode: "inline_content", blob_ref: "blob-1" } }} />);
+  await screen.findByRole("textbox", { name: /Edit prompt file/ });
+  const note = await screen.findByRole("note");
+  expect(note).toHaveTextContent("This prompt no longer reads this file. Your text is kept. Refresh the pipeline to see where the prompt points now.");
+  expect(note).not.toHaveTextContent(/reload/i);
+  const refreshed = { ...moved, id: "state-2" } as unknown as CompositionState;
+  vi.mocked(fetchCompositionState).mockResolvedValueOnce(refreshed);
+  fireEvent.click(within(note).getByRole("button", { name: "Refresh pipeline" }));
+  await waitFor(() => expect(useSessionStore.getState().compositionState).toBe(refreshed));
+  expect(fetchCompositionState).toHaveBeenCalledWith("session-1");
+  expect(savePromptFile).not.toHaveBeenCalled();
+});
+
 // --- A step that uses more than one prompt file ---
 
 const FILE_A = { mode: "inline_content", blob_ref: "blob-a", sha256: "a".repeat(64) };

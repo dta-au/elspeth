@@ -356,7 +356,15 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
         {refusal !== null && <span className="prompt-editor-tag">Read only</span>}
         {dirty && <span className="prompt-editor-tag">Unsaved changes</span>}
       </div>
-      {refusal && <AlertBanner tone="warning" role="note" id={refusalId} className="prompt-editor-notice">{refusal}</AlertBanner>}
+      {refusal && (
+        <AlertBanner tone="warning" role="note" id={refusalId} className="prompt-editor-notice"
+          action={editability?.editable === false && editability.code === "prompt_file_unbound" ? (
+            // The graph read, so the step's rows follow where the prompt points now.
+            <Button type="button" variant="ghost" compact onClick={() => void refreshPipeline()}>Refresh pipeline</Button>
+          ) : null}>
+          {refusal}
+        </AlertBanner>
+      )}
       {stale && draft && (
         // A status, so the banner is announced when the file changes under an
         // open editor, not only found later.
