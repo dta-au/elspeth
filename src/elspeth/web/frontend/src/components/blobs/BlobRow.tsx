@@ -27,7 +27,8 @@ interface BlobRowProps {
   onDelete: (blobId: string) => void;
   onUseAsInput: (blob: BlobMetadata) => void;
   /** Disables the Use-as-input compose entry point while a freeform compose
-   *  is in flight (elspeth-3f38ebb1b5). Preview/download/delete stay live. */
+   *  is in flight (elspeth-3f38ebb1b5) or the session is still loading.
+   *  Preview/download/delete stay live. */
   useAsInputDisabled?: boolean;
   attachedFields?: readonly string[];
   selectedNodeLabel?: string | null;

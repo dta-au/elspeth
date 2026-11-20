@@ -10,8 +10,10 @@ interface FileWiringPadProps {
   state: CompositionState | null;
   /** The active session's file list; only used to name the file a slot already reads. */
   blobs: readonly BlobMetadata[];
-  /** Why connecting is refused right now (Composer busy, file or graph changed); null when allowed. */
+  /** Why connecting is refused right now (session loading, Composer busy, file or graph changed); null when allowed. */
   disabledReason: string | null;
+  /** Set when Composer did not take the last request; the pad stays open with the user's input intact. */
+  sendRefusal?: string | null;
   /** Receives the user's chat request. The pad never writes the graph itself. */
   onConnect: (request: string) => void;
   onClose: () => void;
@@ -54,7 +56,7 @@ function wiringSlots(state: CompositionState | null, blob: BlobMetadata, blobs: 
  * ordinary chat request: Composer chooses and runs the audited wiring tools,
  * and their review cards and refusals apply as for any typed request.
  */
-export function FileWiringPad({ blob, state, blobs, disabledReason, onConnect, onClose }: FileWiringPadProps) {
+export function FileWiringPad({ blob, state, blobs, disabledReason, sendRefusal = null, onConnect, onClose }: FileWiringPadProps) {
   const id = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
   const [mode, setMode] = useState<"select" | "ai">("select");
@@ -86,7 +88,10 @@ export function FileWiringPad({ blob, state, blobs, disabledReason, onConnect, o
 
   return <>
     <div className="confirm-dialog-backdrop" role="presentation" onClick={onClose} />
-    <div ref={dialogRef} className="confirm-dialog file-wiring-pad" role="dialog" aria-modal="true"
+    {/* tabIndex -1: a click on the pad's text focuses the pad itself rather
+        than the page body, so Escape still reaches this handler. It stays
+        out of the Tab order (the focus trap skips tabindex="-1"). */}
+    <div ref={dialogRef} className="confirm-dialog file-wiring-pad" role="dialog" aria-modal="true" tabIndex={-1}
       aria-labelledby={`${id}-title`} aria-describedby={`${id}-description`}
       onKeyDown={(event) => {
         // Stop here so the file manager's own Escape handler does not also close the manager.
@@ -119,6 +124,7 @@ export function FileWiringPad({ blob, state, blobs, disabledReason, onConnect, o
             value={instructions} onChange={(event) => setInstructions(event.target.value)} />
         </label>}
         {disabledReason && <p role="status">{disabledReason}</p>}
+        {sendRefusal && disabledReason === null && <p role="alert">{sendRefusal}</p>}
       </div>
       <footer className="confirm-dialog-actions">
         <Button className="confirm-dialog-btn" onClick={onClose}>Cancel</Button>
