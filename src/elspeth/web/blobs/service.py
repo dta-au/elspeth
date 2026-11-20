@@ -11,7 +11,7 @@ import os
 import re
 import stat
 import threading
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -2890,6 +2890,38 @@ class BlobServiceImpl:
         """Get blob metadata in a synchronous preflight worker under its exact fence."""
         _require_blob_operation_context(context, allowed_kinds=_READ_BLOB_OPERATION_KINDS)
         return self._fenced_blob_record(blob_id, context)
+
+    def get_blobs_sync(self, blob_ids: Iterable[UUID], context: SessionOperationContext) -> tuple[BlobRecord, ...]:
+        """Get several blobs' metadata in ONE authority mutation, in ascending id order.
+
+        ``_fenced_blob_record`` for a set: the exact context is checked once
+        and every row is read under the session's fence lock in that one
+        transaction, so the records are one snapshot. Rows are read (and so
+        locked) in ascending UUID order. Every transaction that locks a blob
+        row first holds that row's session lock (``locked_session_transaction``),
+        so no other transaction can hold one of these rows meanwhile, and the
+        order cannot form a cycle with the single-record readers or writers.
+        The first missing or out-of-custody id fails the whole read with
+        ``BlobNotFoundError`` and nothing is returned. No ids: no transaction.
+        """
+        _require_blob_operation_context(context, allowed_kinds=_READ_BLOB_OPERATION_KINDS)
+        ordered = tuple(sorted(set(blob_ids)))
+        if not ordered:
+            return ()
+        # Local import: see _fenced_blob_record.
+        from elspeth.web.coordination.repository import SessionDerivedCustodyError
+
+        def _read_all(transaction: SessionOperationMutationTransaction) -> tuple[BlobRecord, ...]:
+            records: list[BlobRecord] = []
+            for blob_id in ordered:
+                try:
+                    records.append(transaction.blobs.read_blob(blob_id=blob_id))
+                except SessionDerivedCustodyError:
+                    # As one read: outside the fence's custody reads exactly like missing.
+                    raise BlobNotFoundError(str(blob_id)) from None
+            return tuple(records)
+
+        return self._session_operation_authority.mutate(context, _read_all)
 
     async def list_blobs(
         self,

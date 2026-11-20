@@ -29,6 +29,7 @@ from elspeth.web.required_work import (
 )
 from elspeth.web.sessions.models import chat_messages_table
 from elspeth.web.sessions.service import SessionServiceImpl
+from tests.helpers.prompt_guard_audit import assert_prompt_guard_check_shape, assert_prompt_guard_wire_payload
 
 
 def assert_provider_audit_companion(envelopes: Sequence[Mapping[str, Any]], context: SessionOperationContext) -> None:
@@ -86,22 +87,7 @@ class GuardedQuotaTurn:
         assert len(checks) == guards
         assert len({check["audit_id"] for check in checks}) == guards
         for check in checks:
-            assert set(check) == {
-                "schema_version",
-                "audit_id",
-                "operation_id",
-                "operation_epoch",
-                "role",
-                "adapter",
-                "mode",
-                "policy_fingerprint",
-                "request_hash",
-                "disposition",
-                "reason",
-                "started_at",
-                "duration_ms",
-            }
-            assert check["schema_version"] == 1
+            assert_prompt_guard_check_shape(check)
             assert check["operation_id"] == self.context.fence.operation_id
             assert check["operation_epoch"] == self.context.fence.operation_epoch
             assert (check["adapter"], check["mode"], check["role"]) == ("azure_prompt_shields", "required", "composer")
@@ -109,15 +95,15 @@ class GuardedQuotaTurn:
             assert check["policy_fingerprint"] == self.mount.client.policy_fingerprint
             assert len(check["request_hash"]) == 64
             assert all(character in "0123456789abcdef" for character in check["request_hash"])
-        # A guard decision may batch documents into multiple real HTTP requests.
-        assert len(self.requests) >= guards
-        assert bool(self.requests) is bool(guards)
+        # A check sends only units not already allowed in this session, the
+        # user prompt and the documents in separate calls; zero calls when
+        # nothing is new, which the check's own counts must then state.
+        assert len(self.requests) >= sum(1 for check in checks if check["units_scanned"])
+        assert bool(self.requests) is any(check["units_scanned"] for check in checks)
         for request in self.requests:
             assert request.method == "POST"
             assert request.url.host == "guard.example.test"
-            payload = json.loads(request.content)
-            assert payload["userPrompt"] == self.user_prompt
-            assert set(payload) == {"userPrompt", "documents"}
+            assert_prompt_guard_wire_payload(json.loads(request.content), user_prompt=self.user_prompt)
 
 
 @contextmanager

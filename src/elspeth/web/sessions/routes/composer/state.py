@@ -1433,6 +1433,14 @@ async def seed_state_from_runtime_yaml(
                 data_dir=str(request.app.state.settings.data_dir),
                 session_id=session.id,
             )
+            # The bindings above add file markers and paths the scan before them
+            # did not see. Scan the state as it will be stored, so the import
+            # never saves a state the read side then refuses to open.
+            require_no_credential_material_in_state(
+                imported_state,
+                surface="composer_yaml_import",
+                env_ref_names=env_ref_names,
+            )
             _reject_redacted_sources_without_rebind(imported_state, yaml_text=body.yaml)
             _reject_unbound_blob_storage_sources(
                 imported_state,

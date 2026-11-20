@@ -18,6 +18,7 @@ message (which might echo request or upstream content) to a caller.
 import json
 import logging
 import time
+from enum import StrEnum
 
 from elspeth_llm_gateway import CONTRACT_MAJOR
 from elspeth_llm_gateway.core.config import GatewayConfig
@@ -208,6 +209,28 @@ def _validate_canonical_response(
         seen_ids.add(validated.id)
 
 
+class ResponseValidationStage(StrEnum):
+    """Where a 2xx upstream reply was refused (event ``response_validation_rejected``)."""
+
+    ADAPTER = "adapter"
+    CANONICAL = "canonical"
+
+
+class ResponseRejectionCategory(StrEnum):
+    """The closed set of reasons logged for a refused 2xx upstream reply.
+
+    The adapter categories name only the class of the exception the adapter's
+    ``parse_success`` raised; the exception's text can echo upstream content
+    and is never logged.
+    """
+
+    MISSING_FIELD = "missing_field"
+    INVALID_TYPE = "invalid_type"
+    INVALID_VALUE = "invalid_value"
+    OTHER = "other"
+    CONTRACT_REJECTED = "contract_rejected"
+
+
 class CompletionService:
     """Orchestrates one chat-completion request end to end."""
 
@@ -223,7 +246,7 @@ class CompletionService:
         request_hash = canonical_hash(request.model_dump(mode="json"))
 
         try:
-            canonical_response = await self._run_pipeline(request, descriptor.capabilities)
+            canonical_response = await self._run_pipeline(request, descriptor.capabilities, request_id)
         except GatewayError as exc:
             self._log_completion(descriptor, request_id, request.model, request_hash, start, status="error", error_code=exc.code.value)
             raise
@@ -252,7 +275,7 @@ class CompletionService:
         )
         return response
 
-    async def _run_pipeline(self, request: ChatRequest, capabilities: frozenset[Capability]) -> CanonicalResponse:
+    async def _run_pipeline(self, request: ChatRequest, capabilities: frozenset[Capability], request_id: str) -> CanonicalResponse:
         # Step 1: capability check, before any configuration lookup or network call.
         _check_capabilities(request, capabilities)
 
@@ -271,14 +294,37 @@ class CompletionService:
             raise GatewayError(GatewayErrorCode.INTERNAL_ERROR) from None
 
         result = await self._upstream.invoke(plan)
+        log_event(
+            self._logger,
+            "upstream_result",
+            request_id=request_id,
+            upstream_status_class=f"{result.status // 100}xx",
+            upstream_status_code=result.status,
+        )
 
         if 200 <= result.status < 300:
-            # Step 5: parse_success, then response validation.
+            # Step 5: parse_success, then response validation. Each arm logs
+            # only the class of the adapter's exception, never its text.
+            body = result.body if result.body is not None else {}
             try:
-                canonical_response = self._adapter.parse_success(result.body if result.body is not None else {})
+                canonical_response = self._adapter.parse_success(body)
+            except KeyError:
+                raise self._response_rejected(
+                    request_id, ResponseValidationStage.ADAPTER, ResponseRejectionCategory.MISSING_FIELD
+                ) from None
+            except TypeError:
+                raise self._response_rejected(request_id, ResponseValidationStage.ADAPTER, ResponseRejectionCategory.INVALID_TYPE) from None
+            except ValueError:
+                raise self._response_rejected(
+                    request_id, ResponseValidationStage.ADAPTER, ResponseRejectionCategory.INVALID_VALUE
+                ) from None
             except Exception:
-                raise GatewayError(GatewayErrorCode.UPSTREAM_RESPONSE_INVALID) from None
-            _validate_canonical_response(canonical_response, request, self._config.bounds, capabilities)
+                raise self._response_rejected(request_id, ResponseValidationStage.ADAPTER, ResponseRejectionCategory.OTHER) from None
+            try:
+                _validate_canonical_response(canonical_response, request, self._config.bounds, capabilities)
+            except GatewayError:
+                self._log_response_rejected(request_id, ResponseValidationStage.CANONICAL, ResponseRejectionCategory.CONTRACT_REJECTED)
+                raise
             return canonical_response
 
         # Step 6: classify_error.
@@ -293,6 +339,20 @@ class CompletionService:
         if result.status in (400, 422) and classification.code == GatewayErrorCode.UPSTREAM_RESPONSE_INVALID.value:
             raise GatewayError(GatewayErrorCode.UPSTREAM_REQUEST_REJECTED)
         raise GatewayError(GatewayErrorCode(classification.code))
+
+    def _log_response_rejected(self, request_id: str, stage: ResponseValidationStage, category: ResponseRejectionCategory) -> None:
+        log_event(
+            self._logger,
+            "response_validation_rejected",
+            request_id=request_id,
+            validation_stage=stage.value,
+            exception_category=category.value,
+        )
+
+    def _response_rejected(self, request_id: str, stage: ResponseValidationStage, category: ResponseRejectionCategory) -> GatewayError:
+        """Log a refused 2xx reply and return the fixed error the caller raises."""
+        self._log_response_rejected(request_id, stage, category)
+        return GatewayError(GatewayErrorCode.UPSTREAM_RESPONSE_INVALID)
 
     def _log_completion(
         self,

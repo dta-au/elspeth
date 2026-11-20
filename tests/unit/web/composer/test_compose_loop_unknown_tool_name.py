@@ -46,6 +46,7 @@ from elspeth.web.composer.state import (
     PipelineMetadata,
 )
 from elspeth.web.config import WebSettings
+from tests.helpers.prompt_guard_audit import assert_prompt_guard_wire_payload
 from tests.unit.web.composer._helpers import _composer_service_with_session
 
 # ---------------------------------------------------------------------------
@@ -272,7 +273,7 @@ class TestUnknownToolNameComposeLoopAuditShape:
         def shield_response(request):
             assert request.url.host in {"primary-shield.example.test", "advisor-shield.example.test"}
             payload = json.loads(request.content)
-            assert payload["userPrompt"] == "Build a pipeline"
+            assert_prompt_guard_wire_payload(payload, user_prompt="Build a pipeline")
             shield_requests.append((request.url.host, payload))
             return httpx.Response(
                 200,

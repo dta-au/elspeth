@@ -343,6 +343,30 @@ class InlineBlobPromptSurfaceAdmissionError(Exception):
     """
 
 
+def _admitted_local_path(value: object, *, subject: str, component_id: str, component_type: str, option: str) -> str:
+    """Return a local path option as text, or refuse the run as an invalid pipeline.
+
+    A stored option at a local path position may hold a file reference or any
+    other non-text value. ``Path(...)`` cannot take it, so it is refused here
+    with the same typed failure as any other invalid pipeline. The sentence
+    names the step and option only; it never repeats the stored value.
+    """
+    if type(value) is str:
+        return value
+    message = f"{subject} {option} must be text, not a file reference or other value."
+    raise PipelineValidationError(
+        errors=(
+            ValidationError(
+                component_id=component_id,
+                component_type=component_type,
+                message=message,
+                suggestion=f"Set {option} to a path written as text inside this session's folders.",
+                error_code=None,
+            ),
+        ),
+    )
+
+
 def _bounded_proof_text(value: object, *, field_name: str) -> str:
     """Validate and bound one detector-owned, client-visible proof string."""
     if type(value) is not str or not value:
@@ -2536,6 +2560,13 @@ class ExecutionServiceImpl:
                 for key in SOURCE_LOCAL_PATH_OPTION_KEYS:
                     value = source.options[key] if key in source.options else None
                     if value is not None:
+                        value = _admitted_local_path(
+                            value,
+                            subject=f"Source '{source_name}'",
+                            component_id="source" if source_name == "source" else f"source:{source_name}",
+                            component_type="source",
+                            option=key,
+                        )
                         resolved = resolve_data_path(value, str(self._settings.data_dir))
                         if not any(resolved.is_relative_to(d) for d in allowed_dirs):
                             raise PathAllowlistViolationError(
@@ -2553,6 +2584,9 @@ class ExecutionServiceImpl:
                 for key in SINK_LOCAL_PATH_OPTION_KEYS:
                     value = output.options[key] if key in output.options else None
                     if value is not None:
+                        value = _admitted_local_path(
+                            value, subject=f"Sink '{output.name}'", component_id=output.name, component_type="sink", option=key
+                        )
                         resolved = resolve_sink_data_path(value, str(self._settings.data_dir), session_id=str(session_id))
                         if not any(resolved.is_relative_to(d) for d in allowed_sink_dirs):
                             raise PathAllowlistViolationError(
@@ -2594,6 +2628,13 @@ class ExecutionServiceImpl:
                 for key in NESTED_LOCAL_PATH_OPTION_KEYS:
                     value = provider_config[key] if key in provider_config else None
                     if value is not None:
+                        value = _admitted_local_path(
+                            value,
+                            subject=f"{node.node_type.capitalize()} '{node.id}'",
+                            component_id=node.id,
+                            component_type="transform",
+                            option=key,
+                        )
                         resolved = resolve_sink_data_path(value, str(self._settings.data_dir), session_id=str(session_id))
                         if not any(resolved.is_relative_to(d) for d in allowed_sink_dirs):
                             raise PathAllowlistViolationError(

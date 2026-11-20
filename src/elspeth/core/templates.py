@@ -34,10 +34,13 @@ fields and declare only the truly required subset in required_input_fields.
 from __future__ import annotations
 
 import copy
+import functools
+import sys
+import threading
+from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from functools import lru_cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple, Protocol, cast
 
 from jinja2 import Environment, meta
 from jinja2.compiler import find_undeclared
@@ -216,11 +219,214 @@ MAX_JINJA_TEMPLATE_BYTES = 16 * 1024
 # walk misses on every call: at 128 a 400-template walk scored 0 hits on its
 # second pass (measured 2026-11-20). The bound covers one walk of the largest
 # plausible graph, 50 LLM steps x 64 queries plus their prompts (~3,250 texts),
-# each analysed with and without ``row_attribute`` (~6,500 keys). At the full
-# bound, 8,192 distinct 8 KB templates held 73 MiB across all three caches,
-# almost all of it the template text a graph that size already holds; the
-# enclave's ~200 KB of prompt text costs well under 1 MiB.
+# each analysed with and without ``row_attribute`` (~6,500 keys). It applies to
+# each cache; the memory all three keep is bounded by the byte budget below.
 _TEMPLATE_ANALYSIS_CACHE_ENTRIES = 8192
+# The one byte budget the three caches share, in PROCESS bytes as
+# ``sys.getsizeof`` reports them, not UTF-8 bytes: a template holding one
+# character outside the BMP is stored at 4 bytes per character, so a 64 KiB
+# UTF-8 template can occupy 256 KiB (262,192 bytes measured). Counted: each
+# entry's bookkeeping, its value (the field set and every name in it; a wide
+# template's set can be ~8x its own text, 513 KB for a 64 KB template naming
+# 5,508 fields, measured), and each key object ONCE, however many entries in
+# however many caches hold it. The three caches key on the caller's own
+# ``str``, so one text analysed by all three, with and without
+# ``row_attribute``, is counted once. Not counted: memory the caller would hold
+# anyway. Over-counted, which only makes the bound conservative: interned or
+# shared names inside values, and key objects such as ``"row"`` that outlive
+# the cache. The entry count alone stopped bounding memory once one template
+# may be 64 KiB: 8,192 such entries hold over 512 MiB of text per cache.
+# Sizing: one pipeline's template text is at most its inline file text
+# (``BLOB_INLINE_AGGREGATE_BYTE_CAP``, going to 4 MiB) plus its inline YAML
+# (``MAX_IN_MEMORY_PIPELINE_YAML_BYTES``, 2 MiB), ~6 MiB of UTF-8, at most
+# ~24 MiB in memory at 4 bytes per character and counted once. Bookkeeping and
+# ordinary values add at most ~3 x 8,192 entries x ~0.75 KiB (measured), ~18 MiB.
+# So one worst-case walk costs ~42 MiB, and 128 MiB holds three of them (several
+# sessions or prompt versions) with the second pass still hitting. 128 MiB is
+# also the most the three caches together retain, by this estimate; per-cache
+# budgets would count shared text up to four times and allow 3 x the budget.
+# A pipeline of maximally wide templates (values ~8x text) cannot be held
+# whole: its walk misses and re-analyses, but memory stays bounded.
+_TEMPLATE_ANALYSIS_BUDGET_BYTES = 128 * 1024 * 1024
+# Bookkeeping per entry beyond its value and key objects: its slots in its
+# cache's order and in the shared order, the (value, entry) pair, the entry
+# record and the key tuple. Measured on CPython 3.14 and rounded up.
+_TEMPLATE_ANALYSIS_ENTRY_OVERHEAD_BYTES = 512
+# Bookkeeping per distinct key object in the shared ledger: the record and its
+# dict slot. Measured on CPython 3.14 and rounded up.
+_TEMPLATE_ANALYSIS_HELD_OBJECT_OVERHEAD_BYTES = 192
+
+
+class TemplateAnalysisCacheInfo(NamedTuple):
+    """``functools`` ``cache_info()`` fields, plus the shared byte budget and the bytes it currently holds."""
+
+    hits: int
+    misses: int
+    maxsize: int
+    currsize: int
+    maxbytes: int
+    currbytes: int
+
+
+class _EntryOwner(Protocol):
+    """The cache an entry lives in, as the shared budget sees it: only able to drop a key."""
+
+    def __delitem__(self, key: tuple[object, ...], /) -> None: ...
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _AnalysisEntry:
+    """One retained analysis. Hashed by identity, so the shared recency order can hold it."""
+
+    owner: _EntryOwner
+    key: tuple[object, ...]
+    cost: int
+
+
+@dataclass(slots=True)
+class _HeldObject:
+    """A key object the budget counts once, and how many entries hold it."""
+
+    key_object: object
+    size: int
+    users: int
+
+
+class _TemplateAnalysisBudget:
+    """The byte budget the three template-analysis caches share, and the one lock that guards it and them.
+
+    ``order`` holds every entry of every cache, least recently used first;
+    over budget, the oldest entry anywhere is evicted. ``held`` counts each
+    key object once by identity: an equal but distinct string is separate
+    memory and is counted separately. Every method runs with ``lock`` held.
+    """
+
+    def __init__(self, max_bytes: int) -> None:
+        self.max_bytes = max_bytes
+        self.lock = threading.Lock()
+        self.order: OrderedDict[_AnalysisEntry, None] = OrderedDict()
+        self.held: dict[int, _HeldObject] = {}
+        self.retained_bytes = 0
+
+    def admit(self, entry: _AnalysisEntry) -> None:
+        """Count an entry its cache has just stored, then evict the oldest entries until the budget holds."""
+        self.order[entry] = None
+        self.retained_bytes += entry.cost
+        for key_object in entry.key:
+            if id(key_object) in self.held:
+                self.held[id(key_object)].users += 1
+            else:
+                size = sys.getsizeof(key_object) + _TEMPLATE_ANALYSIS_HELD_OBJECT_OVERHEAD_BYTES
+                self.held[id(key_object)] = _HeldObject(key_object, size, 1)
+                self.retained_bytes += size
+        while self.retained_bytes > self.max_bytes:
+            self.forget(next(iter(self.order)))
+
+    def forget(self, entry: _AnalysisEntry) -> None:
+        """Drop an entry from its cache and the order, releasing each key object no other entry holds."""
+        del self.order[entry]
+        del entry.owner[entry.key]
+        self.retained_bytes -= entry.cost
+        for key_object in entry.key:
+            record = self.held[id(key_object)]
+            record.users -= 1
+            if record.users == 0:
+                del self.held[id(key_object)]
+                self.retained_bytes -= record.size
+
+
+_TEMPLATE_ANALYSIS_BUDGET = _TemplateAnalysisBudget(_TEMPLATE_ANALYSIS_BUDGET_BYTES)
+
+
+class _TemplateAnalysisCache[*Ts, R](Protocol):
+    """The ``functools.lru_cache`` surface the analysis caches keep: call, ``cache_info()``, ``cache_clear()``, ``__wrapped__``."""
+
+    __wrapped__: Callable[[*Ts], R]
+    cache_info: Callable[[], TemplateAnalysisCacheInfo]
+    cache_clear: Callable[[], None]
+
+    def __call__(self, *args: *Ts) -> R: ...
+
+
+def _template_analysis_cache[*Ts, R](
+    value_bytes: Callable[[R], int],
+    *,
+    budget: _TemplateAnalysisBudget = _TEMPLATE_ANALYSIS_BUDGET,
+    max_entries: int = _TEMPLATE_ANALYSIS_CACHE_ENTRIES,
+) -> Callable[[Callable[[*Ts], R]], _TemplateAnalysisCache[*Ts, R]]:
+    """A least-recently-used memo of one pure analysis, bounded by ``max_entries`` and by the shared ``budget``.
+
+    As with ``functools.lru_cache``: an exception is never cached, the
+    analysis runs outside the lock, and concurrent misses on one key may both
+    compute (the first stored result is kept). An entry that alone exceeds
+    the budget is computed and returned but never retained, so one oversize
+    text cannot empty the caches for nothing. ``value_bytes`` estimates what
+    a value keeps alive; it runs once, when the entry is stored.
+    """
+
+    def decorate(function: Callable[[*Ts], R]) -> _TemplateAnalysisCache[*Ts, R]:
+        lock = budget.lock
+        order = budget.order
+        entries: OrderedDict[tuple[object, ...], tuple[R, _AnalysisEntry]] = OrderedDict()
+        hits = 0
+        misses = 0
+
+        def cached(*args: *Ts) -> R:
+            nonlocal hits, misses
+            with lock:
+                if args in entries:
+                    entries.move_to_end(args)
+                    value, entry = entries[args]
+                    order.move_to_end(entry)
+                    hits += 1
+                    return value
+                misses += 1
+            value = function(*args)
+            cost = _TEMPLATE_ANALYSIS_ENTRY_OVERHEAD_BYTES + value_bytes(value)
+            if cost + sum(sys.getsizeof(arg) + _TEMPLATE_ANALYSIS_HELD_OBJECT_OVERHEAD_BYTES for arg in args) > budget.max_bytes:
+                return value
+            with lock:
+                if args not in entries:
+                    entry = _AnalysisEntry(entries, args, cost)
+                    entries[args] = (value, entry)
+                    budget.admit(entry)
+                    if len(entries) > max_entries:
+                        budget.forget(next(iter(entries.values()))[1])
+            return value
+
+        def cache_info() -> TemplateAnalysisCacheInfo:
+            with lock:
+                return TemplateAnalysisCacheInfo(hits, misses, max_entries, len(entries), budget.max_bytes, budget.retained_bytes)
+
+        def cache_clear() -> None:
+            nonlocal hits, misses
+            with lock:
+                for _value, entry in list(entries.values()):
+                    budget.forget(entry)
+                hits = 0
+                misses = 0
+
+        functools.update_wrapper(cached, function)
+        cache = cast("_TemplateAnalysisCache[*Ts, R]", cached)
+        cache.cache_info = cache_info
+        cache.cache_clear = cache_clear
+        return cache
+
+    return decorate
+
+
+def _no_value_bytes(_value: None) -> int:
+    return 0
+
+
+def _name_set_bytes(names: frozenset[str]) -> int:
+    """The set and every name in it: the parser makes the names, so the entry is their only holder."""
+    return sys.getsizeof(names) + sum(map(sys.getsizeof, names))
+
+
+def _field_usage_bytes(usage: Jinja2FieldExtraction) -> int:
+    """The record, its field set and its kinds tuple; the kind strings are module constants and are not counted."""
+    return sys.getsizeof(usage) + _name_set_bytes(usage.fields) + sys.getsizeof(usage.dynamic_accesses)
 
 
 def validate_jinja_source(source: str) -> None:
@@ -230,7 +436,7 @@ def validate_jinja_source(source: str) -> None:
     _validate_bounded_jinja_source(source)
 
 
-@lru_cache(maxsize=_TEMPLATE_ANALYSIS_CACHE_ENTRIES)
+@_template_analysis_cache(_no_value_bytes)
 def _validate_bounded_jinja_source(source: str) -> None:
     """Reuse pure checks of exact bounded text; size admission runs first."""
     if source.count("{%") > 64 or source.count("{{") > 256:
@@ -312,7 +518,7 @@ def extract_jinja2_field_usage(
     return _cached_jinja2_field_usage(template_string, namespace, row_attribute)
 
 
-@lru_cache(maxsize=_TEMPLATE_ANALYSIS_CACHE_ENTRIES)
+@_template_analysis_cache(_field_usage_bytes)
 def _cached_jinja2_field_usage(template_string: str, namespace: str, row_attribute: str | None) -> Jinja2FieldExtraction:
     """Reuse immutable analysis of exact text and parameters."""
     env = _create_field_extraction_environment()
@@ -342,7 +548,7 @@ def extract_jinja2_context_fields(template_string: str, namespace: str = "row", 
     return _cached_jinja2_context_fields(template_string, namespace, row_attribute)
 
 
-@lru_cache(maxsize=_TEMPLATE_ANALYSIS_CACHE_ENTRIES)
+@_template_analysis_cache(_name_set_bytes)
 def _cached_jinja2_context_fields(template_string: str, namespace: str, row_attribute: str) -> frozenset[str]:
     """Keep row and context analyses distinct after source admission."""
     ast = _create_field_extraction_environment().parse(template_string)
