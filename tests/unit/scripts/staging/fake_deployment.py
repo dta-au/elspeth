@@ -1,0 +1,176 @@
+"""An in-memory stand-in for the ELSPETH web API routes the staging tools call.
+
+It is an :class:`~scripts.staging.opslib.HttpTransport`: tools under test
+talk to it through a real :class:`~scripts.staging.opslib.WebClient`, so the
+client's authentication, paths and error handling are exercised too. Every
+request is recorded in ``requests`` for assertions about what a tool did.
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import hashlib
+import json
+import re
+import urllib.parse
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from typing import Any
+from uuid import uuid4
+
+from scripts.staging.opslib import HttpResponse
+
+BASE_URL = "https://deployment.invalid"
+
+type JsonObject = dict[str, Any]
+type Provider = Callable[[JsonObject, str], tuple[JsonObject, list[JsonObject]]]
+
+
+def fake_jwt(username: str, exp: float) -> str:
+    def part(value: object) -> str:
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+
+    return f"{part({'alg': 'none'})}.{part({'username': username, 'exp': exp, 'jti': uuid4().hex})}.sig"
+
+
+def success_call() -> JsonObject:
+    return {"_kind": "llm_call_audit", "call": {"status": "success", "latency_ms": 1200}}
+
+
+@dataclass
+class Blob:
+    id: str
+    filename: str
+    data: bytes
+
+    def meta(self, session_id: str) -> JsonObject:
+        return {
+            "id": self.id,
+            "session_id": session_id,
+            "filename": self.filename,
+            "mime_type": "text/plain",
+            "size_bytes": len(self.data),
+            "content_hash": hashlib.sha256(self.data).hexdigest(),
+            "status": "ready",
+        }
+
+
+@dataclass
+class Session:
+    owner: str
+    state: JsonObject
+    blobs: dict[str, Blob] = field(default_factory=dict)
+    messages: list[JsonObject] = field(default_factory=list)
+    reviews: dict[str, JsonObject] = field(default_factory=dict)
+    operations: dict[str, JsonObject] = field(default_factory=dict)
+
+
+@dataclass
+class FakeDeployment:
+    passwords: dict[str, str]
+    sessions: dict[str, Session] = field(default_factory=dict)
+    provider: Provider | None = None
+    token_lifetime: float = 3600.0
+    clock: Callable[[], float] = lambda: 1_000_000.0
+    on_request: Callable[[str, str], None] | None = None
+    requests: list[tuple[str, str, object]] = field(default_factory=list)
+    tokens: dict[str, str] = field(default_factory=dict)
+
+    # -- transport -------------------------------------------------------
+
+    def __call__(self, method: str, url: str, *, headers: Mapping[str, str], body: bytes | None, timeout: float) -> HttpResponse:
+        parsed = urllib.parse.urlsplit(url)
+        assert f"{parsed.scheme}://{parsed.netloc}" == BASE_URL
+        query = dict(urllib.parse.parse_qsl(parsed.query))
+        payload = json.loads(body) if body else None
+        self.requests.append((method, parsed.path, payload))
+        if parsed.path == "/api/auth/login":
+            if self.passwords.get(payload["username"]) != payload["password"]:
+                return self._json(401, {"detail": "bad credentials"})
+            return self._json(200, {"access_token": self._issue(payload["username"])})
+        user = self.tokens.get(headers.get("Authorization", "").removeprefix("Bearer "))
+        if user is None:
+            return self._json(401, {"detail": "unauthenticated"})
+        response = self._route(method, parsed.path, query, payload, user, headers)
+        if self.on_request is not None:
+            self.on_request(method, parsed.path)
+        return response
+
+    def _issue(self, username: str) -> str:
+        token = fake_jwt(username, self.clock() + self.token_lifetime)
+        self.tokens[token] = username
+        return token
+
+    @staticmethod
+    def _json(status: int, value: object) -> HttpResponse:
+        return HttpResponse(status=status, body=json.dumps(value).encode())
+
+    def _page(self, items: list[Any], query: Mapping[str, str]) -> HttpResponse:
+        offset = int(query["offset"])
+        return self._json(200, items[offset : offset + int(query["limit"])])
+
+    # -- routes ----------------------------------------------------------
+
+    def _route(self, method: str, path: str, query: dict[str, str], payload: Any, user: str, headers: Mapping[str, str]) -> HttpResponse:
+        if path == "/api/auth/me":
+            return self._json(200, {"username": user, "user_id": "id-" + user})
+        if path == "/api/auth/logout":
+            self.tokens.pop(headers["Authorization"].removeprefix("Bearer "))
+            return HttpResponse(status=204, body=b"")
+        if path == "/api/auth/token":
+            return self._json(200, {"access_token": self._issue(user)})
+        match = re.fullmatch(r"/api/sessions/([0-9a-f-]{36})(/.*)", path)
+        if match is None:
+            return self._json(404, {"detail": "no route"})
+        session = self.sessions.get(match.group(1))
+        if session is None or session.owner != user:
+            return self._json(404, {"detail": "session not found"})
+        rest = match.group(2)
+        key = (method, rest)
+        if key == ("GET", "/state"):
+            return self._json(200, session.state)
+        if key == ("GET", "/blobs"):
+            return self._page([blob.meta(match.group(1)) for blob in session.blobs.values()], query)
+        blob_match = re.fullmatch(r"/blobs/([^/]+)/content", rest)
+        if method == "GET" and blob_match is not None:
+            return HttpResponse(status=200, body=session.blobs[blob_match.group(1)].data)
+        if key == ("GET", "/messages"):
+            audit = query.get("include_llm_audit") == "true"
+            rows = [row for row in session.messages if audit or row["role"] != "audit"]
+            return self._page(rows, query)
+        if key == ("GET", "/interpretations"):
+            assert query["status"] == "pending"
+            return self._json(200, {"events": [review["event"] for review in session.reviews.values() if review["pending"]]})
+        review_match = re.fullmatch(r"/interpretations/([^/]+)/(prompt|resolve)", rest)
+        if review_match is not None:
+            review = session.reviews[review_match.group(1)]
+            if review_match.group(2) == "prompt":
+                return self._json(200, {**review["snapshot"], "is_live_review": review["pending"]})
+            assert payload == {"choice": "accepted_as_drafted", "reviewed_anchor": review["snapshot"]["anchor"]}
+            review["pending"] = False
+            return self._json(200, {"event": review["event"]})
+        if key == ("POST", "/validate"):
+            return self._json(200, {"is_valid": True, "readiness": "ready", "errors": []})
+        if key == ("POST", "/messages"):
+            return self._admit(session, payload)
+        operation_match = re.fullmatch(r"/operations/([0-9a-f-]{36})", rest)
+        if method == "GET" and operation_match is not None:
+            return self._json(200, session.operations[operation_match.group(1)])
+        return self._json(404, {"detail": f"no route {method} {rest}"})
+
+    def _admit(self, session: Session, payload: JsonObject) -> HttpResponse:
+        operation_id = payload["operation_id"]
+        if operation_id not in session.operations:
+            assert self.provider is not None
+            new_state, audit = self.provider(copy.deepcopy(session.state), payload["content"])
+            session.state = new_state
+            session.messages.append({"role": "user", "operation_id": operation_id, "tool_calls": None, "content": payload["content"]})
+            session.messages.append({"role": "audit", "operation_id": operation_id, "tool_calls": audit, "content": ""})
+            session.operations[operation_id] = {"operation_id": operation_id, "status": "completed", "result": {"message": {}}}
+        return self._json(202, {"operation_id": operation_id, "status": "queued"})
+
+    # -- assertions ------------------------------------------------------
+
+    def calls(self, method: str, suffix: str) -> list[object]:
+        return [payload for verb, path, payload in self.requests if verb == method and path.endswith(suffix)]
