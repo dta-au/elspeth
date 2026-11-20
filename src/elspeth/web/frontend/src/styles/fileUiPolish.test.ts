@@ -23,7 +23,7 @@ function declared(path: string, selector: string, property: string, media: strin
     .filter((rule) => rule.media === media && rule.selectors.includes(selector))
     .map((rule) => new RegExp(`(?:^|;)\\s*${property}\\s*:([^;]+)`).exec(rule.declarations)?.[1].trim())
     .filter((value): value is string => value !== undefined);
-  return values.at(-1);
+  return values[values.length - 1];
 }
 
 const BLOBS = "src/components/blobs/blobs.css";

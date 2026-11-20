@@ -378,7 +378,8 @@ describe("BlobManager upload affordance (elspeth-29eef452a8)", () => {
     // Visible "Close" leads the accessible name (WCAG 2.5.3).
     expect(close.textContent?.trim()).toBe("Close");
     const header = close.parentElement as HTMLElement;
-    expect(within(header).getAllByRole("button").at(-1)).toBe(close);
+    const buttons = within(header).getAllByRole("button");
+    expect(buttons[buttons.length - 1]).toBe(close);
     await userEvent.setup().click(close);
     expect(useBlobStore.getState().fileManagerOpen).toBe(false);
   });
