@@ -2411,7 +2411,9 @@ class CompositionCompletion:
             ).binding
             == publication_review.binding
         )
-        terminal_block = (verdict.blocking and publication_admitted) or (
+        # An admitted explanation can close a turn about an existing graph
+        # block. A new finding still gets the remaining repair/review budget.
+        terminal_block = (graph_already_blocked and verdict.blocking and publication_admitted) or (
             (verdict.blocking or not publication_admitted)
             and (
                 is_last_pass
