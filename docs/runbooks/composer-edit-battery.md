@@ -276,70 +276,90 @@ overall rubric; a gate that routes low scores to a moderation-queue sink;
 summary and feedback LLM steps; truncate steps capping case text before the
 steps that read it; and a final `field_mapper` into a main sink that
 declares its fields. Every LLM step declares `required_input_fields` that
-earlier steps produce, and its prompts name those fields. Single-prompt
-steps hold a system and a user prompt in files, multi-query steps their
-rubric (query templates cannot be file-held, so they are short and inline).
+earlier steps produce, and its prompts name those fields. All prompt text is
+file-held: single-prompt steps hold a system and a user prompt in files;
+multi-query steps hold their rubric (system prompt) and every query template
+in files, each template bound to its designed slot
+`node:<step>.options.queries.<query>.template` and left out of the YAML.
 
 | Default (acceptance) | Value |
 | --- | --- |
 | Steps (transforms and gates) | 27 |
 | LLM steps | 12 (4 multi-query: 3, 3, 3 and 8 queries) |
-| Prompt files | 22, holding exactly 200,000 bytes (16 of 3.6-4.8 KB, 6 of 18-27 KB); 20 with `--file-inject omit` |
+| Prompt files | 39, holding exactly 200,000 bytes: 16 single-step prompts (1.7-2.4 KB), 17 query templates (4.5-6.5 KB), 4 rubrics (11-18 KB), 2 injected files (7-13 KB) |
 | Sinks | 3 (main, error, moderation queue) |
-| Graph document once imported | about 32 KB: the prompt text stays in the bound files |
+| Graph document once imported | about 38 KB: the prompt text stays in the bound files |
 | Positions | after the source, mid-chain between two LLM steps, at the final mapper |
 
-`--steps`, `--llm-steps`, `--queries-per-llm-step` (3 scoring steps),
-`--large-queries` (the overall rubric), `--prompt-bytes`, `--inject-files`
-and `--seed` change the size; the counts and prompt bytes are met exactly.
-`--profile` names the LLM profile the steps use on the target server
-(default `task-role`).
+`--steps`, `--llm-steps`, `--queries-per-llm-step` (the 3 scoring steps),
+`--large-queries` (the overall rubric), `--total-prompt-bytes`,
+`--inject-files` and `--seed` change the size; the counts and bytes are met
+exactly. `--query-templates inline` writes the query templates into the
+YAML instead (short ones, for comparison); `--file-inject omit` leaves the
+`file_inject` step out. `--profile` names the LLM profile the steps use on
+the target server (default `task-role`). The generator refuses a prompt file
+over the server's per-file cap (256 KiB, read from `core/blobs_inline.py`).
 
 The `single-node` preset reproduces the customer's shape for a like-for-like
 comparison with their telemetry: source `source`, one LLM node
-`capacity_probe` with 32 queries of 15,600 bytes held inline (499,200 bytes,
-as theirs), a 4,000-byte system prompt file, and sinks `results` and
-`errors`. `--queries-per-llm-step` and `--query-bytes` change the query count
-and size, `--prompt-bytes` the system prompt file. Multi-line text is written
-as YAML literal blocks; even so the default preset's YAML is 518,741
-characters, 5,547 under the import limit of 524,288, so larger queries do
-not import.
+`capacity_probe` with 32 file-held query templates of 15,600 bytes
+(499,200 bytes), a 4,000-byte system prompt file, and sinks `results` and
+`errors`. `--queries-per-llm-step` and `--total-prompt-bytes` change the
+count and the size (the system prompt stays 4,000 bytes; the rest is split
+evenly over the queries). With `--query-templates inline` the templates are
+written into the YAML as literal blocks: 518,741 characters, 5,547 under the
+YAML import limit of 524,288.
 
-### Graphs near the state scan limit
+### Limits a large graph meets (measured on candidate 5)
 
-The server scans the whole state for credential material and refuses a state
-whose scan visits more than 4,096 values (`CredentialTraversalPolicy.max_nodes`).
-The manifest's `state_scan_values` is that count for the graph as imported,
-measured with the server's own importer and scan. Each query adds 13 values
-in this generator's query shape, so the boundary is set by values, not by a
-query count: measured,
+**Aggregate file-held text: 1 MiB.** The text bound to a graph's files may
+total at most 1,048,576 bytes (`BLOB_INLINE_AGGREGATE_BYTE_CAP`). Measured
+through the real import:
 
-| Fixture | Scan values at import | Stored, prompt file bound | Import |
+| Fixture | Files | Bytes | Result |
 | --- | --- | --- | --- |
-| `--preset single-node --queries-per-llm-step 309 --query-bytes 400` | 4,085 | 4,094 | accepted, valid |
-| `--preset single-node --queries-per-llm-step 310 --query-bytes 400` | 4,098 | - | HTTP 422 |
+| `--preset acceptance --total-prompt-bytes 943718` (0.9 MiB) | 39 | 943,718 | imports, valid |
+| `--preset acceptance --total-prompt-bytes 1153433` (1.1 MiB) | 39 | 1,153,433 | HTTP 500 at import |
 
-The refusal is `credential_material_rejected` with category
+Over the cap, the import's prompt-review snapshot raises
+`PromptFileTooLargeError`, which no handler maps: the user gets an internal
+server error, not the size refusal, and no graph is saved.
+
+**State scan: 4,096 values.** The server scans the whole state for
+credential material and refuses one whose scan visits more than 4,096
+values (`CredentialTraversalPolicy.max_nodes`). The manifest's
+`state_scan_values_at_import` is that count for the graph as the YAML import
+scans it, measured with the server's own importer and scan. A file-held
+template's marker is bound after that scan, so the stored state counts more:
+
+| Fixture (single-node) | Values at import | Values stored | Result |
+| --- | --- | --- | --- |
+| 251 file-held queries | 3,080 | 4,092 | imports, valid, readable |
+| 252 file-held queries | 3,092 | 4,108 | imports; `GET /state` then answers 409 "The saved graph is unavailable" |
+| 309 inline queries (400 B) | 4,085 | 4,094 | imports, valid |
+| 310 inline queries (400 B) | 4,098 | - | HTTP 422 at import |
+
+In this generator's query shape a file-held query adds 16 stored values and
+an inline one 13. At 252 file-held queries the import accepts the graph and
+the session's graph can no longer be opened: the read path's editable-draft
+check fails it for credential material (`checkpoint_credential_material`).
+The inline refusal at 310 is `credential_material_rejected` with category
 `traversal_limit`, and its text tells the user the content "appears to
-contain a credential". A graph refused for its size is reported as a
-credential problem. The stored 309-query graph is 2 values under the limit,
-so the first edit that adds a node may cross it.
+contain a credential".
 
-### File-held `file_inject` and the validation defect
+### `file_inject` content
 
-On servers without the fix for the "Producer guarantees: (none)" defect, a
-`file_inject` step whose content is a file makes authoring validation lose
-every upstream field, so each later step fails `schema_contract_violation`
-and the default fixture does not validate. Until that fix is on the server,
-generate with `--file-inject omit`: the step is left out and its share of
-the prompt bytes goes to the other prompt files. With the fix, use the
-default (`--file-inject file`). The composer refuses `file_inject` content
-written into the YAML, so there is no inline form.
+The default `--file-inject file` holds the `file_inject` content in uploaded
+files. It validates on servers with the `file_inject` producer-guarantee fix
+(candidate 5 onward); on older servers authoring validation reports
+"Producer guarantees: (none)" for every later step. `--file-inject omit`
+leaves the step out for those servers. The composer refuses `file_inject`
+content written into the YAML, so there is no inline form.
 
 ### Creating the session
 
 ```bash
-python -m scripts.staging.large_graph_fixture --preset acceptance --out "$FIXTURE" [--file-inject omit]
+python -m scripts.staging.large_graph_fixture --preset acceptance --out "$FIXTURE"
 python -m scripts.staging.composer_edit_battery setup --fixture "$FIXTURE" \
   --base-url "$URL" --session "$NEW_SESSION" --account "$ACCOUNT" --execute
 ```

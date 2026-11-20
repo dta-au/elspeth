@@ -24,7 +24,7 @@ from scripts.staging import structural_cycle as cycle
 from scripts.staging.fixture_setup import graph_document_bytes, setup_fixture
 from scripts.staging.opslib import REPO_ROOT, ApiError, HttpResponse, OperationFailed, UsageError, WebClient
 
-from elspeth.contracts.credential_material import CredentialTraversalPolicy
+from elspeth.contracts.credential_material import CredentialTraversalPolicy, find_credential_material
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.blobs.routes import create_blobs_router
 from elspeth.web.blobs.service import BlobServiceImpl
@@ -59,7 +59,7 @@ def _server_secret(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "fixture-test-fingerprint-key")
 
 
-def _server(tmp_path: Path) -> SyncASGITestClient:
+def _server(tmp_path: Path, *, raise_server_exceptions: bool = True) -> SyncASGITestClient:
     """The session, blob, import and review routes with the real catalog and one usable LLM profile."""
     app, service = _make_app(tmp_path)
     settings = WebSettings.model_validate(
@@ -96,7 +96,7 @@ def _server(tmp_path: Path) -> SyncASGITestClient:
     app.state.blob_service = blobs
     service._inline_blob_read = lambda context, blob_id: blobs.read_blob_content_sync(blob_id, context)
     app.include_router(create_blobs_router())
-    return SyncASGITestClient(app)
+    return SyncASGITestClient(app, raise_server_exceptions=raise_server_exceptions)
 
 
 def _client(server: SyncASGITestClient, *, shown: Callable[[str, bytes], bytes] | None = None) -> WebClient:
@@ -173,15 +173,25 @@ def test_the_acceptance_preset_hits_its_targets() -> None:
     assert measures["steps"] == 27
     assert measures["llm_steps"] == 12
     assert measures["multi_query_steps"] == 4
-    assert measures["files"] == 22
+    # 16 single-step prompts, 4 rubrics, 17 query templates and 2 injected files, every one file-held.
+    assert measures["files"] == 39
     assert measures["prompt_bytes_in_files"] == 200_000
+    assert measures["inline_prompt_bytes"] == 0
     assert measures["sinks"] == 3
     sizes = {file.name: len(file.content) for file in fixture.files}
-    # Tolerance: single-step prompt files 1-5 KB; rubrics and injected files 10-30 KB (seeded +-15% spread).
+    # Tolerance, from the seeded +-15% spread (measured over seeds 1-20: 1.7-2.4 KB, 4.5-6.5 KB, 11-18 KB, 7.3-13 KB).
     assert all(1_000 <= size <= 5_000 for name, size in sizes.items() if name.endswith((".system.md", ".user.md")))
-    assert all(10_000 <= size <= 30_000 for name, size in sizes.items() if name.endswith(".rubric.md") or name.startswith("attach_"))
+    assert all(3_000 <= size <= 10_000 for name, size in sizes.items() if name.endswith(".query.md"))
+    assert all(10_000 <= size <= 30_000 for name, size in sizes.items() if name.endswith(".rubric.md"))
+    assert all(5_000 <= size <= 20_000 for name, size in sizes.items() if name.startswith("attach_"))
     queries = {step["name"]: len(step["options"]["queries"]) for step in fixture.pipeline["transforms"] if "queries" in step["options"]}
     assert queries == {"cs1_scoring": 3, "cs2_scoring": 3, "risk_review": 3, "overall_rubric": 8}
+    # A file-held query template is absent from the YAML and bound to its designed slot.
+    slots = {file.slot for file in fixture.files}
+    for step in fixture.pipeline["transforms"]:
+        for name, query in step["options"]["queries"].items() if "queries" in step["options"] else []:
+            assert "template" not in query
+            assert f"node:{step['name']}.options.queries.{name}.template" in slots
 
 
 def test_the_graph_is_one_wired_chain_whose_steps_read_only_what_earlier_steps_wrote() -> None:
@@ -217,10 +227,18 @@ def test_the_graph_is_one_wired_chain_whose_steps_read_only_what_earlier_steps_w
             assert all(f"row['{name}']" in user.content.decode() for name in step["options"]["required_input_fields"])
 
 
-@pytest.mark.parametrize(("steps", "llm_steps", "prompt_bytes"), [(25, 10, 150_000), (30, 12, 250_000), (30, 14, 200_000), (20, 6, 60_000)])
-def test_other_sizes_are_hit_exactly(steps: int, llm_steps: int, prompt_bytes: int) -> None:
-    measures = lgf.build_fixture(lgf.preset_spec("acceptance", steps=steps, llm_steps=llm_steps, prompt_bytes=prompt_bytes)).measures()
-    assert (measures["steps"], measures["llm_steps"], measures["prompt_bytes_in_files"]) == (steps, llm_steps, prompt_bytes)
+@pytest.mark.parametrize(
+    ("steps", "llm_steps", "total"), [(25, 10, 150_000), (30, 12, 250_000), (30, 14, 200_000), (20, 6, 60_000), (27, 12, 1_153_433)]
+)
+def test_other_sizes_are_hit_exactly(steps: int, llm_steps: int, total: int) -> None:
+    measures = lgf.build_fixture(lgf.preset_spec("acceptance", steps=steps, llm_steps=llm_steps, total_prompt_bytes=total)).measures()
+    assert (measures["steps"], measures["llm_steps"], measures["prompt_bytes_in_files"]) == (steps, llm_steps, total)
+
+
+def test_a_prompt_file_over_the_server_s_per_file_cap_is_refused() -> None:
+    per_file, _ = lgf._inline_blob_caps()
+    with pytest.raises(UsageError, match=f"exceed the server's {per_file}-byte per-file cap"):
+        lgf.build_fixture(lgf.preset_spec("single-node", queries_per_llm_step=2, total_prompt_bytes=4_000 + 2 * (per_file + 1)))
 
 
 def test_too_few_steps_for_the_llm_steps_is_refused() -> None:
@@ -232,27 +250,35 @@ def test_the_single_node_preset_is_the_customer_s_shape() -> None:
     fixture = lgf.build_fixture(lgf.preset_spec("single-node"))
     measures = fixture.measures()
     assert (measures["steps"], measures["llm_steps"], measures["queries"], measures["sinks"], measures["sources"]) == (1, 1, 32, 2, 1)
-    # 32 inline queries of 15,600 bytes, about 500 KB, as the customer's.
-    assert measures["inline_prompt_bytes"] == 32 * 15_600
+    # 32 file-held query templates of 15,600 bytes (499,200), as the customer's, and a 4,000-byte system prompt.
+    queries = [file for file in fixture.files if ".options.queries." in str(file.slot)]
+    assert [len(file.content) for file in queries] == [15_600] * 32
+    assert (measures["files"], measures["prompt_bytes_in_files"], measures["inline_prompt_bytes"]) == (33, 503_200, 0)
     assert fixture.positions == (cycle.Position("source", "capacity_probe", "results", True),)
+
+
+def test_the_inline_single_node_variant_fits_under_the_import_limit_only_as_literal_blocks() -> None:
+    fixture = lgf.build_fixture(lgf.preset_spec("single-node", query_templates="inline"))
+    assert fixture.measures()["inline_prompt_bytes"] == 32 * 15_600
     # Written as a person writes YAML (literal blocks), it fits under the import limit; the YAML reads back exactly.
     assert len(fixture.yaml_text) <= MAX_RUNTIME_YAML_IMPORT_CHARS
     assert yaml.safe_load(fixture.yaml_text) == fixture.pipeline
 
 
 def test_query_names_go_past_the_criteria_without_repeating() -> None:
-    fixture = lgf.build_fixture(lgf.preset_spec("acceptance", queries_per_llm_step=lgf.MAX_QUERIES))
+    fixture = lgf.build_fixture(lgf.preset_spec("acceptance", queries_per_llm_step=lgf.MAX_QUERIES, query_templates="inline"))
     queries = next(step for step in fixture.pipeline["transforms"] if step["name"] == "cs1_scoring")["options"]["queries"]
     assert len(queries) == lgf.MAX_QUERIES
     assert list(queries)[:2] == ["cs1_accuracy", "cs1_reasoning"]
     assert "cs1_accuracy_2" in queries
     with pytest.raises(UsageError, match="must be 1-500"):
-        lgf.build_fixture(lgf.preset_spec("acceptance", queries_per_llm_step=lgf.MAX_QUERIES + 1))
+        lgf.build_fixture(lgf.preset_spec("acceptance", queries_per_llm_step=lgf.MAX_QUERIES + 1, query_templates="inline"))
 
 
 @pytest.mark.parametrize(("queries", "values"), [(309, 4085), (310, 4098)])
 def test_the_scan_count_is_measured_with_the_server_s_own_scan(queries: int, values: int) -> None:
-    yaml_text = lgf.build_fixture(lgf.preset_spec("single-node", queries_per_llm_step=queries, query_bytes=400)).yaml_text
+    spec = lgf.preset_spec("single-node", queries_per_llm_step=queries, total_prompt_bytes=4_000 + 400 * queries, query_templates="inline")
+    yaml_text = lgf.build_fixture(spec).yaml_text
     assert lgf.state_scan_values(yaml_text) == values
     # Control: the server's state guard agrees with the measure on which side of its limit the graph is.
     state = composition_state_from_runtime_yaml(yaml_text)
@@ -278,7 +304,7 @@ def test_the_acceptance_positions_rotate_through_the_graph() -> None:
 def test_a_written_fixture_reads_back_and_a_changed_file_is_refused(tmp_path: Path) -> None:
     root = lgf.write_fixture(lgf.build_fixture(lgf.preset_spec("acceptance")), tmp_path / "fx")
     loaded = lgf.load_fixture(root)
-    assert loaded.manifest["measures"]["files"] == 22
+    assert loaded.manifest["measures"]["files"] == 39
     assert set(loaded.contents) == {entry["name"] for entry in [loaded.manifest["source"]["file"], *loaded.manifest["files"]]}
     target = root / "files" / loaded.manifest["files"][0]["name"]
     target.write_bytes(target.read_bytes() + b"x")
@@ -306,8 +332,13 @@ def test_the_generator_command_writes_the_fixture(tmp_path: Path, capsys: pytest
 # ── setup through the real routes ──────────────────────────────────────────
 
 
-def test_the_acceptance_fixture_imports_validates_and_passes_its_reviews(tmp_path: Path) -> None:
-    client, session, events, summary = _set_up(tmp_path, lgf.preset_spec("acceptance", file_inject="omit"))
+@pytest.mark.parametrize(
+    "overrides",
+    [{}, {"file_inject": "omit"}, {"query_templates": "inline"}],
+    ids=["default-file-held-file-inject", "file-inject-omitted", "inline-query-templates"],
+)
+def test_the_acceptance_fixture_imports_validates_and_passes_its_reviews(tmp_path: Path, overrides: dict[str, str]) -> None:
+    client, session, events, summary = _set_up(tmp_path, lgf.preset_spec("acceptance", **overrides))
     assert type(summary) is dict, summary
     assert summary["valid"] is True
     assert summary["reviews_left"] == []
@@ -330,25 +361,33 @@ def test_the_single_node_fixture_imports_and_validates_at_the_customer_s_size(tm
     assert type(summary) is dict, summary
     assert summary["valid"] is True and summary["prompt_reviews_approved"] == ["capacity_probe"]
     state = client.get_json(f"/api/sessions/{session}/state")
-    # The query text is the graph: about 500 KB of it in the graph document.
-    assert graph_document_bytes(state) > 32 * 15_600
+    # The query text is held in files: the graph document carries only their markers.
+    assert graph_document_bytes(state) < 32 * 15_600 // 10
     assert cycle.check_fixture(state, positions=[cycle.Position("source", "capacity_probe", "results", True)])["prompt_queries"] == 32
 
 
-def test_a_graph_just_under_the_scan_limit_imports_and_one_just_over_is_refused(tmp_path: Path) -> None:
+def test_inline_queries_just_under_the_scan_limit_import_and_just_over_are_refused_at_import(tmp_path: Path) -> None:
     server = _server(tmp_path / "server")
     client = _client(server)
     session = client.post_json("/api/sessions", {"title": "under"})["id"]
-    under = _written(tmp_path, lgf.preset_spec("single-node", queries_per_llm_step=309, query_bytes=400), "under")
+    under = _written(
+        tmp_path,
+        lgf.preset_spec("single-node", queries_per_llm_step=309, total_prompt_bytes=4_000 + 400 * 309, query_templates="inline"),
+        "under",
+    )
     summary = setup_fixture(client, session, under, emit=Events())
     assert summary["valid"] is True
-    assert summary["measures"]["state_scan_values"] == 4085
+    assert summary["measures"]["state_scan_values_at_import"] == 4085
     # The state as the server stores it, the bound system prompt included, measured with the same scan.
     record = asyncio.run(server.app.state.session_service.get_current_state(UUID(session)))
     stored = lgf.scan_values_of_state(state_from_record(record))
     assert 4085 <= stored <= SCAN_LIMIT, stored
     other = client.post_json("/api/sessions", {"title": "over"})["id"]
-    over = _written(tmp_path, lgf.preset_spec("single-node", queries_per_llm_step=310, query_bytes=400), "over")
+    over = _written(
+        tmp_path,
+        lgf.preset_spec("single-node", queries_per_llm_step=310, total_prompt_bytes=4_000 + 400 * 310, query_templates="inline"),
+        "over",
+    )
     # The size refusal arrives as a credential refusal (category traversal_limit); the message says "credential".
     with pytest.raises(ApiError, match=r'/state/yaml returned HTTP 422.*"category":"traversal_limit"') as refused:
         setup_fixture(client, other, over, emit=Events())
@@ -356,20 +395,69 @@ def test_a_graph_just_under_the_scan_limit_imports_and_one_just_over_is_refused(
     assert "credential_material_rejected" in str(refused.value)
 
 
-def test_file_held_file_inject_is_red_until_fix_0816_file_inject_probe_lands_false_none_guarantees(tmp_path: Path) -> None:
-    """Expected red on this base: downstream of a file-held ``file_inject`` authoring validation sees no guarantees.
+def test_file_held_text_just_under_the_aggregate_cap_validates(tmp_path: Path) -> None:
+    _, aggregate = lgf._inline_blob_caps()
+    _, _, _, summary = _set_up(tmp_path, lgf.preset_spec("acceptance", total_prompt_bytes=int(0.9 * aggregate)))
+    assert type(summary) is dict, summary
+    assert summary["valid"] is True
 
-    The fix is on ``fix/0816-file-inject-probe``. When it lands this test goes
-    red; the default fixture then validates as it stands, and this test should
-    assert that instead. ``--file-inject omit`` is the variant pinned valid
-    meanwhile (the composer refuses inline ``file_inject`` content).
+
+def test_file_held_text_just_over_the_aggregate_cap_fails_the_import_with_an_unhandled_server_error(tmp_path: Path) -> None:
+    """The import's prompt-review snapshot raises ``PromptFileTooLargeError`` and no handler maps it: HTTP 500.
+
+    A user gets an internal server error instead of the size refusal. When a
+    handler maps it, this test goes red and should assert that refusal.
     """
-    client, session, _, outcome = _set_up(tmp_path, lgf.preset_spec("acceptance"))
-    assert isinstance(outcome, OperationFailed)
-    assert "not valid" in str(outcome)
-    errors = client.get_json(f"/api/sessions/{session}/state")["validation_errors"]
-    assert errors and {error["error_code"] for error in errors} == {"schema_contract_violation"}
-    assert "Producer (truncate) guarantees: [(none)]" in errors[0]["message"]
+    _, aggregate = lgf._inline_blob_caps()
+    server = _server(tmp_path / "server", raise_server_exceptions=False)
+    client = _client(server)
+    session = client.post_json("/api/sessions", {"title": "over"})["id"]
+    over = _written(tmp_path, lgf.preset_spec("acceptance", total_prompt_bytes=int(1.1 * aggregate)))
+    with pytest.raises(ApiError, match="/state/yaml returned HTTP 500") as refused:
+        setup_fixture(client, session, over, emit=Events())
+    assert refused.value.status == 500
+    assert client.get_json(f"/api/sessions/{session}/state") is None
+
+
+def _stored_state(server: SyncASGITestClient, session: str) -> Any:
+    record = asyncio.run(server.app.state.session_service.get_current_state(UUID(session)))
+    return state_from_record(record)
+
+
+def _file_held_queries(tmp_path: Path, queries: int) -> tuple[SyncASGITestClient, WebClient, str, lgf.LoadedFixture]:
+    server = _server(tmp_path / "server")
+    client = _client(server)
+    session = client.post_json("/api/sessions", {"title": "bound"})["id"]
+    spec = lgf.preset_spec("single-node", queries_per_llm_step=queries, total_prompt_bytes=4_000 + 200 * queries)
+    return server, client, session, _written(tmp_path, spec)
+
+
+def test_251_file_held_queries_keep_the_stored_state_within_the_scan_bound(tmp_path: Path) -> None:
+    server, client, session, loaded = _file_held_queries(tmp_path, 251)
+    summary = setup_fixture(client, session, loaded, emit=Events())
+    assert summary["valid"] is True
+    state = _stored_state(server, session)
+    assert find_credential_material(state.to_dict()) is None
+    require_no_credential_material_in_state(state, surface="fixture_test")
+
+
+def test_252_file_held_queries_import_but_the_stored_state_crosses_the_scan_bound_and_cannot_be_read(tmp_path: Path) -> None:
+    """The import scans the YAML's state; the file markers bound afterwards add values it never saw.
+
+    The import is accepted, the stored state is over the bound, and reading it
+    back fails the editable-checkpoint check (``checkpoint_credential_material``):
+    ``GET /state`` answers 409 "The saved graph is unavailable". When the import
+    refuses this graph instead, this test goes red and should assert that.
+    """
+    server, client, session, loaded = _file_held_queries(tmp_path, 252)
+    assert loaded.manifest["measures"]["state_scan_values_at_import"] <= SCAN_LIMIT
+    with pytest.raises(ApiError, match=r"GET .*/state returned HTTP 409.*composition_state_unavailable"):
+        setup_fixture(client, session, loaded, emit=Events())
+    state = _stored_state(server, session)
+    finding = find_credential_material(state.to_dict())
+    assert finding is not None and finding.category == "traversal_limit"
+    with pytest.raises(CredentialMaterialRefused):
+        require_no_credential_material_in_state(state, surface="fixture_test")
 
 
 def test_setup_refuses_a_session_that_already_has_a_graph(tmp_path: Path) -> None:
@@ -409,7 +497,8 @@ def test_setup_without_execute_contacts_nothing(tmp_path: Path, capsys: pytest.C
     argv = ["setup", "--fixture", str(root), "--base-url", BASE, "--session", "11111111-2222-4333-8444-555555555555", "--account", "tester"]
     assert battery.main(argv, client_factory=no_network) == 0
     event = json.loads(capsys.readouterr().out.splitlines()[-1])
-    assert event["event"] == "dry_run" and len(event["uploads"]) == 2
+    # The source data, the system prompt and 32 query templates.
+    assert event["event"] == "dry_run" and len(event["uploads"]) == 34
 
 
 def test_setup_needs_a_fixture() -> None:

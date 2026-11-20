@@ -11,26 +11,29 @@ produce, and every LLM step declares ``required_input_fields``.
 
 Prompt text lives in FILES bound to the steps: each single-prompt LLM step has
 a system and a user prompt file, each multi-query step a system prompt file
-(the rubric), and the ``file_inject`` step one file per entry. Query templates
-cannot be file-held, so they stay short and inline.
+(the rubric) and one file per query template (bound to
+``node:<step>.options.queries.<query>.template`` and left out of the YAML),
+and the ``file_inject`` step one file per entry. ``--query-templates inline``
+writes the query templates into the YAML instead.
 
 Two presets:
 
 ``acceptance``
-    The realistic graph (defaults: 27 steps, 12 LLM steps, about 200 KB of
-    prompt text in files). The manifest lists three anchor positions -- after
-    the source, mid-chain between two LLM steps, and at the final mapper --
-    for the structural-cycle workload to rotate through.
+    The realistic graph (defaults: 27 steps, 12 LLM steps, 200,000 bytes of
+    prompt text in 39 files). The manifest lists three anchor positions --
+    after the source, mid-chain between two LLM steps, and at the final
+    mapper -- for the structural-cycle workload to rotate through.
 ``single-node``
     A like-for-like copy of the shape measured on a customer deployment: one
-    source ``source``, one LLM node ``capacity_probe`` with 32 queries of
-    15,600 bytes each held inline (about 500 KB, as that fixture's were), a
-    small system prompt file, a main sink ``results`` and an error sink.
+    source ``source``, one LLM node ``capacity_probe`` with 32 file-held query
+    templates of 15,600 bytes each (about 500 KB, as that fixture's were), a
+    4,000-byte system prompt file, a main sink ``results`` and an error sink.
 
-``--queries-per-llm-step`` (and, for ``single-node``, ``--query-bytes``)
-builds graphs of several hundred queries on purpose. The manifest's ``state_scan_values`` is the number of values the
-server's whole-state credential scan visits for the imported graph, measured
-with that scan; the server refuses a state over 4,096 of them.
+``--queries-per-llm-step`` and ``--total-prompt-bytes`` build graphs near the
+server's limits on purpose. The manifest reports ``state_scan_values_at_import``
+(values the server's whole-state credential scan visits for the graph as the
+YAML import scans it, measured with that scan; the server refuses over 4,096)
+and the server's per-file and aggregate caps on file-held text.
 
 The output directory holds ``pipeline.yaml`` (the import document),
 ``files/`` (each file to upload) and ``manifest.json`` (what to upload, where
@@ -71,8 +74,11 @@ from scripts.staging.structural_cycle import Position
 MANIFEST_VERSION = 1
 # Under the credential scan's width limit (512 entries in one mapping), so only its value count is in play.
 MAX_QUERIES = 500
+SINGLE_NODE_SYSTEM_BYTES = 4_000
+SINGLE_NODE_QUERY_BYTES = 15_600
 SCAN_CEILING = 1_000_000
 type InjectHolding = Literal["file", "omit"]
+type TemplateHolding = Literal["file", "inline"]
 type Preset = Literal["acceptance", "single-node"]
 
 # 14 source fields, all text: the CSV source declares a fixed schema of exactly these.
@@ -189,8 +195,8 @@ class FixtureSpec:
     llm_steps: int = 12
     queries_per_llm_step: int = 3
     large_queries: int = 8
-    query_bytes: int = 15_600
-    prompt_bytes: int = 200_000
+    query_templates: TemplateHolding = "file"
+    total_prompt_bytes: int = 200_000
     inject_files: int = 2
     file_inject: InjectHolding = "file"
     profile: str = "task-role"
@@ -256,7 +262,7 @@ def _text(rng: random.Random, size: int, head: str, *, sentences_per_line: int =
         length += len(line) + 1
     text = "\n".join(parts)
     if len(head) + 1 > size:
-        raise UsageError(f"a prompt of {size} bytes cannot hold its {len(head)}-byte header; raise --prompt-bytes")
+        raise UsageError(f"a prompt of {size} bytes cannot hold its {len(head)}-byte header; raise --total-prompt-bytes")
     body = text[: size - 1]
     # Never end a line on a space: YAML cannot hold such text as a literal block.
     if body.endswith(" "):
@@ -275,7 +281,7 @@ def _sizes(rng: random.Random, weights: Sequence[float], total: int) -> list[int
     sizes = [max(400, int(weight * scale)) for weight in jittered]
     sizes[-1] += total - sum(sizes)
     if sizes[-1] < 400:
-        raise UsageError("--prompt-bytes is too small for this many prompt files")
+        raise UsageError("--total-prompt-bytes is too small for this many prompt files")
     return sizes
 
 
@@ -320,21 +326,26 @@ def _query_names(prefix: str, count: int) -> list[str]:
     ]
 
 
-def _multi_query_options(role: _Role, queries: int) -> tuple[JsonObject, list[str], int]:
+def _query_head(role: _Role, name: str) -> str:
+    """The start of a query template: what it scores and the fields it reads."""
+    criterion = name.removeprefix(role.prefix + "_").rstrip("_0123456789").replace("_", " ")
+    placeholders = " ".join(f"{{{{ row.input_{index + 1} }}}}" for index in range(len(role.reads)))
+    return f"Score the {criterion} criterion from 0 to 100 using the rubric. Material: {placeholders}\n"
+
+
+def _multi_query_options(role: _Role, queries: int, *, file_held: bool) -> tuple[JsonObject, list[str], int]:
+    """A multi-query step's options; a file-held template is left out of the YAML and bound from its file at import."""
     names = _query_names(role.prefix, queries)
     inputs = {f"input_{index + 1}": name for index, name in enumerate(role.reads)}
-    placeholders = " ".join(f"{{{{ row.input_{index + 1} }}}}" for index in range(len(role.reads)))
     definitions: JsonObject = {}
     inline = 0
     for name in names:
-        criterion = name.removeprefix(role.prefix + "_").rstrip("_0123456789").replace("_", " ")
-        template = f"Score the {criterion} criterion from 0 to 100 using the rubric. Material: {placeholders}\n"
-        inline += len(template.encode())
-        definitions[name] = {
-            "input_fields": dict(inputs),
-            "template": template,
-            "output_fields": [{"suffix": "score", "type": "integer"}, {"suffix": "rationale", "type": "string"}],
-        }
+        definition: JsonObject = {"input_fields": dict(inputs)}
+        if not file_held:
+            definition["template"] = _query_head(role, name)
+            inline += len(definition["template"].encode())
+        definition["output_fields"] = [{"suffix": "score", "type": "integer"}, {"suffix": "rationale", "type": "string"}]
+        definitions[name] = definition
     options: JsonObject = {"required_input_fields": list(role.reads), "queries": definitions}
     return options, [f"{name}_score" for name in names] + [f"{name}_rationale" for name in names], inline
 
@@ -360,7 +371,11 @@ def _acceptance(spec: FixtureSpec) -> Fixture:
             plan.append((f"{role.name}.system.md", f"node:{role.name}.options.system_prompt", 0.7))
             plan.append((f"{role.name}.user.md", f"node:{role.name}.options.prompt_template", 0.7))
         else:
-            plan.append((f"{role.name}.rubric.md", f"node:{role.name}.options.system_prompt", 4.2 if role.kind == "large" else 3.5))
+            plan.append((f"{role.name}.rubric.md", f"node:{role.name}.options.system_prompt", 5.6 if role.kind == "large" else 4.6))
+            if spec.query_templates == "file":
+                count = spec.large_queries if role.kind == "large" else spec.queries_per_llm_step
+                for query in _query_names(role.prefix, count):
+                    plan.append((f"{role.name}.{query}.query.md", f"node:{role.name}.options.queries.{query}.template", 1.9))
     inject_entries = [("framework", "framework")] + [(f"annex_{index}", f"annex_{index}") for index in range(1, spec.inject_files)]
     if not inject:
         inject_entries = []
@@ -368,7 +383,7 @@ def _acceptance(spec: FixtureSpec) -> Fixture:
         plan.append(
             (f"attach_framework.{entry}.md", f"node:attach_framework.options.files.{entry}.content", 4.0 if entry == "framework" else 3.0)
         )
-    sizes = _sizes(rng, [weight for _, _, weight in plan], spec.prompt_bytes)
+    sizes = _sizes(rng, [weight for _, _, weight in plan], spec.total_prompt_bytes)
 
     produced: dict[str, str] = {}  # field -> producing step
     for name in SOURCE_FIELDS:
@@ -378,7 +393,9 @@ def _acceptance(spec: FixtureSpec) -> Fixture:
     for (name, slot, _), size in zip(plan, sizes, strict=True):
         step = slot.split(":", 1)[1].split(".", 1)[0]
         owner = next((item for item in roles if item.name == step), None)
-        if owner is not None and slot.endswith("prompt_template"):
+        if owner is not None and ".options.queries." in slot:
+            head = _query_head(owner, slot.split(".options.queries.", 1)[1].removesuffix(".template")) + "\nRubric detail follows.\n"
+        elif owner is not None and slot.endswith("prompt_template"):
             head = f"# {owner.name.replace('_', ' ').title()}\n\nUse the material below.\n\n{_refs(owner.reads)}\n\nGuidance follows.\n"
         elif owner is not None:
             head = f"# {owner.name.replace('_', ' ').title()} instructions\n\nYou are one step of an assessment panel.\n"
@@ -439,7 +456,7 @@ def _acceptance(spec: FixtureSpec) -> Fixture:
             produced[role.name] = role.name
         else:
             queries = spec.large_queries if role.kind == "large" else spec.queries_per_llm_step
-            query_options, outputs, query_bytes = _multi_query_options(role, queries)
+            query_options, outputs, query_bytes = _multi_query_options(role, queries, file_held=spec.query_templates == "file")
             options.update(query_options)
             options["response_field"] = f"{role.name}_summary"
             inline += query_bytes
@@ -580,7 +597,10 @@ def _single_node(spec: FixtureSpec) -> Fixture:
     rng = random.Random(spec.seed)
     queries = spec.queries_per_llm_step
     fields = ("case_text", "case_history", "reviewer_notes")
-    system_size = spec.prompt_bytes
+    system_size = SINGLE_NODE_SYSTEM_BYTES
+    per_query = (spec.total_prompt_bytes - system_size) // queries
+    if per_query < 200:
+        raise UsageError(f"--total-prompt-bytes must be at least {system_size + 200 * queries} for {queries} queries")
     files = [
         FixtureFile(
             name="capacity_probe.system.md",
@@ -594,14 +614,21 @@ def _single_node(spec: FixtureSpec) -> Fixture:
     for index in range(queries):
         name = f"q{index + 1:02d}_{CRITERIA[index % len(CRITERIA)]}"
         head = "Score this criterion from 0 to 100. Case: {{ row.input_1 }} History: {{ row.input_2 }} Notes: {{ row.input_3 }}\n"
-        # Paragraphs, as real prompts are; each YAML line carries indentation, so line count is import size.
-        template = _text(rng, spec.query_bytes, head, sentences_per_line=6)
-        inline += len(template.encode())
-        definitions[name] = {
-            "input_fields": {"input_1": fields[0], "input_2": fields[1], "input_3": fields[2]},
-            "template": template,
-            "output_fields": [{"suffix": "score", "type": "integer"}, {"suffix": "rationale", "type": "string"}],
-        }
+        # The last query takes the bytes the division left, so the total is exact.
+        size = per_query + ((spec.total_prompt_bytes - system_size) % queries if index == queries - 1 else 0)
+        # Paragraphs, as real prompts are; inline, each YAML line carries indentation, so line count is import size.
+        template = _text(rng, size, head, sentences_per_line=6)
+        definition: JsonObject = {"input_fields": {"input_1": fields[0], "input_2": fields[1], "input_3": fields[2]}}
+        if spec.query_templates == "file":
+            slot = f"node:capacity_probe.options.queries.{name}.template"
+            files.append(
+                FixtureFile(name=f"capacity_probe.{name}.query.md", slot=slot, mime_type="text/markdown", content=template.encode())
+            )
+        else:
+            definition["template"] = template
+            inline += len(template.encode())
+        definition["output_fields"] = [{"suffix": "score", "type": "integer"}, {"suffix": "rationale", "type": "string"}]
+        definitions[name] = definition
     pipeline: JsonObject = {
         "sources": {
             "source": {
@@ -650,7 +677,13 @@ def preset_spec(preset: Preset, **overrides: Any) -> FixtureSpec:
     base = (
         FixtureSpec(preset=preset)
         if preset == "acceptance"
-        else FixtureSpec(preset=preset, steps=1, llm_steps=1, queries_per_llm_step=32, prompt_bytes=4_000)
+        else FixtureSpec(
+            preset=preset,
+            steps=1,
+            llm_steps=1,
+            queries_per_llm_step=32,
+            total_prompt_bytes=SINGLE_NODE_SYSTEM_BYTES + 32 * SINGLE_NODE_QUERY_BYTES,
+        )
     )
     return replace(base, **overrides)
 
@@ -695,17 +728,20 @@ def scan_values_of_state(state: CompositionState) -> int:
 
 
 def build_fixture(spec: FixtureSpec) -> Fixture:
-    if spec.prompt_bytes < 4000 or spec.prompt_bytes > 4_000_000:
-        raise UsageError("--prompt-bytes must be between 4000 and 4000000")
+    if spec.total_prompt_bytes < 4000 or spec.total_prompt_bytes > 4_000_000:
+        raise UsageError("--total-prompt-bytes must be between 4000 and 4000000")
     if not 1 <= spec.queries_per_llm_step <= MAX_QUERIES or not 1 <= spec.large_queries <= MAX_QUERIES:
         raise UsageError(f"--queries-per-llm-step and --large-queries must be 1-{MAX_QUERIES}")
-    if not 200 <= spec.query_bytes <= 262_144:
-        raise UsageError("--query-bytes must be between 200 and 262144")
     if not 1 <= spec.inject_files <= 8:
         raise UsageError("--inject-files must be between 1 and 8")
-    if spec.preset == "single-node":
-        return _single_node(spec)
-    return _acceptance(spec)
+    fixture = _single_node(spec) if spec.preset == "single-node" else _acceptance(spec)
+    per_file_cap, _ = _inline_blob_caps()
+    too_big = [file.name for file in fixture.files if len(file.content) > per_file_cap]
+    if too_big:
+        raise UsageError(
+            f"{len(too_big)} prompt files would exceed the server's {per_file_cap}-byte per-file cap; add files or lower the bytes"
+        )
+    return fixture
 
 
 def manifest(fixture: Fixture) -> JsonObject:
@@ -718,8 +754,21 @@ def manifest(fixture: Fixture) -> JsonObject:
         "sink_paths": dict(fixture.sink_paths),
         "positions": [position.as_json() for position in fixture.positions],
         "llm_steps": list(fixture.llm_steps),
-        "measures": {**fixture.measures(), "state_scan_values": state_scan_values(fixture.yaml_text), "state_scan_limit": _scan_limit()},
+        "measures": {
+            **fixture.measures(),
+            "state_scan_values_at_import": state_scan_values(fixture.yaml_text),
+            "state_scan_limit": _scan_limit(),
+            "inline_blob_aggregate_cap": _inline_blob_caps()[1],
+            "inline_blob_per_file_cap": _inline_blob_caps()[0],
+        },
     }
+
+
+def _inline_blob_caps() -> tuple[int, int]:
+    """The server's per-file and aggregate caps on file-held (inline-bound) text, read from its source."""
+    from elspeth.core.blobs_inline import BLOB_INLINE_AGGREGATE_BYTE_CAP, BLOB_INLINE_PER_REF_BYTE_CAP
+
+    return BLOB_INLINE_PER_REF_BYTE_CAP, BLOB_INLINE_AGGREGATE_BYTE_CAP
 
 
 def _scan_limit() -> int:
@@ -816,11 +865,18 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"queries in each multi-query LLM step: acceptance's scoring steps (default 3), single-node's one step (default 32); up to {MAX_QUERIES}",
     )
     parser.add_argument("--large-queries", type=int, help="acceptance: queries in the larger multi-query step (default 8)")
-    parser.add_argument("--query-bytes", type=int, help="single-node: bytes of each inline query template (default 15600)")
     parser.add_argument(
-        "--prompt-bytes",
+        "--query-templates",
+        choices=["file", "inline"],
+        help="hold multi-query templates in bound files (default, as the customer's) or inline in the YAML",
+    )
+    parser.add_argument(
+        "--total-prompt-bytes",
         type=int,
-        help="acceptance: prompt text bytes held in files (default 200000); single-node: its system prompt file (default 4000)",
+        help=(
+            "prompt text bytes in total, split over the prompt files (acceptance default 200000; single-node default 503200: "
+            "a 4000-byte system prompt and 32 queries of 15600)"
+        ),
     )
     parser.add_argument("--inject-files", type=int, help="acceptance: file_inject entries, one file each (default 2)")
     parser.add_argument(
@@ -840,8 +896,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "llm_steps": args.llm_steps,
         "queries_per_llm_step": args.queries_per_llm_step,
         "large_queries": args.large_queries,
-        "query_bytes": args.query_bytes,
-        "prompt_bytes": args.prompt_bytes,
+        "query_templates": args.query_templates,
+        "total_prompt_bytes": args.total_prompt_bytes,
         "inject_files": args.inject_files,
         "file_inject": args.file_inject,
         "profile": args.profile,
