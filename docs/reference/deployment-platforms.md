@@ -63,6 +63,15 @@ Terraform package, the ACA Bicep bundle, and their acceptance controllers.
 
 Web startup validates existing schemas; it does not create or repair them.
 
+After startup, every `/api/ready` probe checks that each database answers a
+query; with external PostgreSQL it does so over a newly opened connection. The
+schema check against the current models runs on the first probe
+and then at most once every 60 seconds; between those runs the probe reports
+the last `CURRENT` result. A schema that is not `CURRENT` is never reused, and
+a probe that cannot connect makes the next probe check the schema again. A
+schema altered under a running server is therefore reported within about a
+minute plus the platform's own probe failure window.
+
 ### Qualifying a multi-replica web target
 
 More than one web replica requires distinct external PostgreSQL databases for
