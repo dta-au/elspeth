@@ -17,7 +17,14 @@ Safety properties (each is named by a test in
   no run is queued or running on any cluster. After pausing it re-reads the
   activity counts and aborts if anything changed since the drain check; it
   re-reads them again after capture and aborts if the snapshot raced a write.
-* Writers are unpaused in a ``finally`` block, with retries, whatever happens.
+* Writers are unpaused in a ``finally`` block, whatever happens. A writer is
+  listed as possibly paused BEFORE its pause is issued; every listed writer is
+  tried, each with retries, a timed-out or failed ``docker unpause`` is
+  followed by a check of the container's paused state, and an interrupt
+  arriving meanwhile is held until every writer has been tried. Anything still
+  paused is reported with the manual command. SIGTERM and SIGHUP (a dropped
+  terminal) interrupt the run the same way Ctrl-C does, so the ``finally``
+  block runs.
 * Every artifact is read back from the destination and its SHA-256 compared
   before it is recorded; a failed command leaves no partial artifact.
 * Source archives are fingerprinted before and after; a change aborts.
@@ -40,6 +47,8 @@ import hashlib
 import json
 import os
 import signal
+import subprocess
+import sys
 import tarfile
 import time
 import traceback
@@ -407,8 +416,10 @@ class RecoveryCapture:
         paused: list[str] = []
         try:
             for name in self.config.writers:
-                capture(self.runner, self.docker("pause", name))
+                # Listed first: an interrupt between issuing the pause and its
+                # return must still lead to an unpause attempt.
                 paused.append(name)
+                capture(self.runner, self.docker("pause", name))
             emit("application_writers_paused", containers=paused)
             if self.all_activity() != before:
                 raise OperationFailed("activity changed before writers were paused; retry when idle")
@@ -458,15 +469,50 @@ class RecoveryCapture:
             self.unpause(paused)
         return databases
 
-    def unpause(self, paused: Sequence[str]) -> None:
-        failed: list[str] = []
-        for name in reversed(paused):
-            for _attempt in range(self.config.unpause_attempts):
+    def is_paused(self, name: str) -> bool | None:
+        """The container's paused state, or ``None`` when it cannot be read."""
+        try:
+            result = self.runner.run(self.docker("container", "inspect", "--format", "{{.State.Paused}}", name), timeout=60)
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        state = result.stdout.strip()
+        if result.returncode != 0 or state not in (b"true", b"false"):
+            return None
+        return state == b"true"
+
+    def unpause_one(self, name: str) -> bool:
+        """Try to unpause one container; ``True`` once it is known not to be paused."""
+        for attempt in range(self.config.unpause_attempts):
+            try:
                 if self.runner.run(self.docker("unpause", name), timeout=60).returncode == 0:
-                    break
-                self.sleep(1)
-            else:
+                    return True
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                emit("unpause_attempt_failed", container=name, attempt=attempt + 1, error=type(exc).__name__)
+            # A container whose pause never took effect refuses an unpause: it is not paused either.
+            if self.is_paused(name) is False:
+                return True
+            self.sleep(1)
+        return False
+
+    def unpause(self, paused: Sequence[str]) -> None:
+        """Unpause every listed writer; report loudly any that may still be paused."""
+        failed: list[str] = []
+        interrupted: KeyboardInterrupt | None = None
+        for name in reversed(paused):
+            try:
+                resumed = self.unpause_one(name)
+            except KeyboardInterrupt as exc:
+                # A second interrupt must not leave the remaining writers paused.
+                interrupted = exc
+                resumed = False
+            if not resumed:
                 failed.append(name)
+        if failed:
+            manual = " ".join(self.docker("unpause", *failed))
+            emit("writers_still_paused", containers=failed, manual_command=manual)
+            print(f"\nWARNING: application containers may still be paused: {', '.join(failed)}\nRun: {manual}\n", file=sys.stderr)
+        if interrupted is not None:
+            raise interrupted
         if failed:
             raise OperationFailed(f"containers still paused and need a manual unpause: {failed}")
         if paused:
@@ -776,12 +822,21 @@ def main(
     return 0
 
 
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
+
+
 def _stop_requested(signum: int, frame: FrameType | None) -> None:
-    raise KeyboardInterrupt("recovery capture interrupted")
+    raise KeyboardInterrupt(f"recovery capture interrupted by signal {signum}")
+
+
+def install_stop_handlers() -> None:
+    """Turn SIGTERM and SIGHUP into the same interrupt as Ctrl-C, so the unpause ``finally`` runs."""
+    for number in STOP_SIGNALS:
+        signal.signal(number, _stop_requested)
 
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, _stop_requested)
+    install_stop_handlers()
     raise SystemExit(run_tool(main))
 
 

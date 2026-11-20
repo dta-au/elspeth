@@ -10,6 +10,8 @@ import dataclasses
 import gzip
 import io
 import json
+import os
+import signal
 import subprocess
 import sys
 import tarfile
@@ -57,6 +59,10 @@ class FakeHost:
     fingerprints: list[str] = field(default_factory=lambda: ["fp-1"] * 4)
     fail_stream: str | None = None
     unpause_fails: bool = False
+    unpause_hangs: frozenset[str] = frozenset()
+    pause_fails: frozenset[str] = frozenset()
+    on_stream: Callable[[str], None] | None = None
+    paused: set[str] = field(default_factory=set)
     verifier_accepts_corruption: bool = False
     hmac_in_env: bool = False
     events: list[tuple[str, str]] = field(default_factory=list)
@@ -102,10 +108,23 @@ class FakeHost:
             return CommandResult(0, json.dumps([{"Name": name, "Mountpoint": "/v/" + name} for name in args[3:]]).encode(), b"")
         if args[:2] == ["docker", "pause"]:
             self.events.append(("pause", args[2]))
+            if args[2] in self.pause_fails:
+                return CommandResult(1, b"", b"pause failed")
+            self.paused.add(args[2])
             return ok
         if args[:2] == ["docker", "unpause"]:
             self.events.append(("unpause", args[2]))
-            return CommandResult(1, b"", b"busy") if self.unpause_fails else ok
+            if args[2] in self.unpause_hangs:
+                # What subprocess.run(timeout=60) raises when docker hangs.
+                raise subprocess.TimeoutExpired(list(argv), timeout or 0)
+            if args[2] not in self.paused:
+                return CommandResult(1, b"", b"container is not paused")
+            if self.unpause_fails:
+                return CommandResult(1, b"", b"busy")
+            self.paused.discard(args[2])
+            return ok
+        if args[:3] == ["docker", "container", "inspect"]:
+            return CommandResult(0, b"true\n" if args[-1] in self.paused else b"false\n", b"")
         if args[:2] == ["docker", "exec"] and backup.ACTIVITY_SQL in args:
             name = args[2]
             value = self.activity(name, self.activity_reads)
@@ -142,6 +161,8 @@ class FakeHost:
         args = self._strip(argv)
         label = " ".join(args)
         self.events.append(("stream", label))
+        if self.on_stream is not None:
+            self.on_stream(label)
         if self.fail_stream is not None and self.fail_stream in label:
             yield b"partial"
             raise CommandFailed(argv, 3, b"disk full")
@@ -219,6 +240,52 @@ def test_unpause_failure_is_reported_not_swallowed(tmp_path: Path) -> None:
     host = FakeHost(unpause_fails=True)
     with pytest.raises(OperationFailed, match="need a manual unpause"):
         make_capture(tmp_path, host).run()
+
+
+def test_unpause_timeout_still_resumes_every_other_writer_and_names_the_stuck_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    host = FakeHost(fail_stream="pg_dump", unpause_hangs=frozenset({GATEWAY}))
+    with pytest.raises(OperationFailed, match="need a manual unpause"):
+        make_capture(tmp_path, host).run()
+
+    assert host.paused == {GATEWAY}
+    assert [detail for event, detail in host.events if event == "unpause"] == [GATEWAY, GATEWAY, GATEWAY, WEB]
+    captured = capsys.readouterr()
+    stuck = next(json.loads(line) for line in captured.out.splitlines() if '"writers_still_paused"' in line)
+    assert stuck["containers"] == [GATEWAY]
+    assert stuck["manual_command"] == f"sudo -n docker unpause {GATEWAY}"
+    assert f"docker unpause {GATEWAY}" in captured.err
+
+
+def test_failure_mid_pause_unpauses_the_writers_already_listed(tmp_path: Path) -> None:
+    host = FakeHost(pause_fails=frozenset({GATEWAY}))
+    with pytest.raises(OperationFailed, match="exited 1"):
+        make_capture(tmp_path, host).run()
+
+    # The gateway pause failed, so its unpause is refused; its state shows it is not paused.
+    assert host.paused == set()
+    assert [detail for event, detail in host.events if event == "unpause"] == [GATEWAY, WEB]
+
+
+def test_a_stop_signal_during_capture_unpauses_every_writer(tmp_path: Path) -> None:
+    previous = {number: signal.getsignal(number) for number in backup.STOP_SIGNALS}
+
+    def hang_up(label: str) -> None:
+        if "pg_dump" in label:
+            os.kill(os.getpid(), signal.SIGHUP)
+
+    host = FakeHost(on_stream=hang_up)
+    try:
+        backup.install_stop_handlers()
+        with pytest.raises(KeyboardInterrupt, match="signal"):
+            make_capture(tmp_path, host).run()
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+    assert set(backup.STOP_SIGNALS) == {signal.SIGTERM, signal.SIGHUP}
+    assert host.paused == set()
+    assert [detail for event, detail in host.events if event == "unpause"] == [GATEWAY, WEB]
 
 
 def test_physical_verification_not_run_when_disk_is_short(tmp_path: Path) -> None:
