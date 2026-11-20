@@ -390,6 +390,25 @@ def create_app(
     return app
 
 
+def _route_events_to_stderr(event_logger: logging.Logger) -> None:
+    """Make the gateway's metadata-only events visible in the container log.
+
+    Uvicorn configures only its own loggers, so without a handler the
+    gateway's INFO events are dropped. A handler is attached only when the
+    logger has none: an operator who configured this logger (for example
+    with ``--log-config``) keeps their own handlers and propagation. When
+    the handler is attached, propagation is turned off so the root logger
+    cannot print a second copy of each line.
+    """
+    if event_logger.handlers:
+        return
+    handler = logging.StreamHandler()  # stderr
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    event_logger.addHandler(handler)
+    event_logger.setLevel(logging.INFO)
+    event_logger.propagate = False
+
+
 def build() -> FastAPI:
     """``uvicorn --factory`` entry point: build the app from process environment.
 
@@ -403,4 +422,5 @@ def build() -> FastAPI:
     startup, before it ever binds a port -- there is no fallback or partial
     app to serve.
     """
+    _route_events_to_stderr(logger)
     return create_app(load_config(os.environ))
