@@ -93,7 +93,7 @@ describe("GraphFiles", () => {
     // Copy-register rule: the raw option path is only a title; the visible text is the option's label.
     const inject = within(table).getByRole("row", { name: /File: criteria.txt Transform: inject/ });
     expect(inject).not.toHaveTextContent("files.criteria.content");
-    expect(within(inject).getByTitle("files.criteria.content")).toHaveTextContent("Files");
+    expect(within(inject).getByTitle("files.criteria.content")).toHaveTextContent(/^Files: criteria$/);
     expect(within(table).getByRole("row", { name: /File: input.csv Source: main/ })).toBeInTheDocument();
     expect(within(table).getByRole("row", { name: /File: shared.txt Sink: out/ })).toBeInTheDocument();
     expect(screen.getByText("File not in this session")).toBeInTheDocument();
@@ -152,6 +152,45 @@ describe("GraphFiles", () => {
     expect(sink).toHaveAccessibleDescription("This component is hidden by the current graph view.");
     await user.click(sink);
     expect(showNode).not.toHaveBeenCalled();
+  });
+
+  it("blocks editing a graph that is no longer the current one, even with the file list ready", async () => {
+    useSessionStore.setState({ compositionState: { ...state, id: "newer-state" } });
+    render(<GraphFiles state={state} onShowNode={vi.fn()} />);
+    const user = userEvent.setup();
+    await user.click(screen.getByText(filesSummary()));
+    const edit = screen.getByRole("button", { name: "Edit file for solo" });
+    expect(edit).toHaveAttribute("aria-disabled", "true");
+    expect(edit).toHaveAccessibleDescription("Open the current graph to edit its files.");
+    useBlobStore.setState({ editRequest: null });
+    await user.click(edit);
+    expect(useBlobStore.getState().editRequest).toBeNull();
+  });
+
+  it("waits for the file list to load before offering Edit file", async () => {
+    useBlobStore.setState({ isLoading: true });
+    render(<GraphFiles state={state} onShowNode={vi.fn()} />);
+    const user = userEvent.setup();
+    await user.click(screen.getByText(filesSummary()));
+    const edit = screen.getByRole("button", { name: "Edit file for solo" });
+    expect(edit).toHaveAttribute("aria-disabled", "true");
+    expect(edit).toHaveAccessibleDescription("Wait for the file list to load.");
+    useBlobStore.setState({ editRequest: null });
+    await user.click(edit);
+    expect(useBlobStore.getState().editRequest).toBeNull();
+  });
+
+  it("names each entry of a multi-key option, keeping the raw path as the title", async () => {
+    const twoEntries: CompositionState = { ...state, sources: {}, outputs: [], nodes: [
+      { id: "inject", node_type: "transform", plugin: "file_inject", input: "rows", on_success: "out", on_error: "discard", options: {
+        files: { alpha: { content: marker("criteria") }, beta: { content: marker("criteria") } },
+      } },
+    ] };
+    render(<GraphFiles state={twoEntries} onShowNode={vi.fn()} />);
+    await userEvent.setup().click(screen.getByText(filesSummary()));
+    const row = within(screen.getByRole("table")).getByRole("row", { name: /File: criteria.txt Transform: inject/ });
+    expect(within(row).getByTitle("files.alpha.content")).toHaveTextContent(/^Files: alpha$/);
+    expect(within(row).getByTitle("files.beta.content")).toHaveTextContent(/^Files: beta$/);
   });
 
   it("does not borrow another session's filenames or edit its files", async () => {

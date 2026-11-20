@@ -27,7 +27,8 @@ interface FileMapping {
   componentId: string;
   /** Only an LLM step's prompt slots can be edited here. */
   isNode: boolean;
-  fields: Array<{ path: string; label: string }>;
+  /** `key` names the entry inside a multi-key option (e.g. `criteria` in `files.criteria.content`). */
+  fields: Array<{ path: string; label: string; key?: string }>;
 }
 
 /** One row per (component, file): every option field of that component that references the file. */
@@ -55,9 +56,13 @@ function fileMappings(state: CompositionState): FileMapping[] {
         isNode: component.isNode, fields: [],
       };
       if (!mapping.fields.some((field) => field.path === reference.fieldPath)) {
-        // Copy-register rule: a raw option path stays in the title; visible text uses the option's label.
-        const label = promptLabels.get(reference.fieldPath) ?? optionLabel(reference.fieldPath.split(".")[0]);
-        mapping.fields.push({ path: reference.fieldPath, label });
+        // Copy-register rule: the raw option path stays in the title; visible
+        // text is the option's label, plus the entry key (as code) when the
+        // option holds several entries, so two entries never read the same.
+        const prompt = promptLabels.get(reference.fieldPath);
+        const [option, key] = reference.fieldPath.split(".");
+        mapping.fields.push(prompt !== undefined ? { path: reference.fieldPath, label: prompt }
+          : { path: reference.fieldPath, label: optionLabel(option), key });
       }
       mappings.set(key, mapping);
     }
@@ -163,7 +168,9 @@ function FileMappingRow({ row, state, onShowNode, hidden, binding, sameSession, 
       ? <BlobFileName blobId={row.blobId} fallback={loadError ? "File name unavailable" : undefined} />
       : <span title={row.blobId}>File reference</span>}</th>
     <td>{row.kind}: <code>{row.component}</code></td>
-    <td>{row.fields.map((field) => <div key={field.path} title={field.path}>{field.label}</div>)}</td>
+    <td>{row.fields.map((field) => <div key={field.path} title={field.path}>
+      {field.label}{field.key !== undefined && <>: <code>{field.key}</code></>}
+    </div>)}</td>
     <td>
       <div className="graph-file-actions">
         <Button type="button" compact aria-label={`Show node ${row.component}`}
