@@ -330,8 +330,18 @@ def _without(kwargs: Mapping[str, Any], *keys: str) -> dict[str, Any]:
 
 
 def _loop_request(requests: list[dict[str, Any]]) -> dict[str, Any]:
-    loop_requests = [request for request in requests if "tools" in request and len(request["tools"]) == 47]
-    assert loop_requests, "the ordinary compose loop made no 47-tool request"
+    """The ordinary compose loop's request, chosen by what it is, never by a tool count.
+
+    The loop sends tools with no ``max_tokens`` (``_call_llm`` sends none); the
+    planner and escape-hatch requests carry ``max_tokens`` and the END advisor
+    carries ``response_format``. Every loop request sends the same tool list.
+    """
+    loop_requests = [
+        request for request in requests if "tools" in request and "max_tokens" not in request and "response_format" not in request
+    ]
+    assert loop_requests, "the ordinary compose loop made no request"
+    tool_lists = {tuple(tool["function"]["name"] for tool in request["tools"]) for request in loop_requests}
+    assert len(tool_lists) == 1, "loop requests sent different tool lists"
     return loop_requests[0]
 
 
@@ -384,6 +394,8 @@ async def test_mutation_control_dropped_reasoning_makes_the_loop_comparison_red(
 
     assert "reasoning" not in probe
     assert _without(probe, "messages", "max_tokens") != _without(production, "messages")
+    # Red for the dropped reasoning alone: the rest of the selected loop request still matches.
+    assert _without(probe, "messages", "max_tokens") == _without(production, "messages", "reasoning")
 
 
 @pytest.mark.asyncio

@@ -96,6 +96,7 @@ import uvicorn
 from sqlalchemy import select
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
@@ -896,7 +897,8 @@ async def test_sessionless_gateway_boot_probe_is_unqualified_without_dispatch(
         composer_prompt_guard_mode=mode,
     )
     assert [request.surface for request in requests] == ["loop_tools", "planner_tools"]
-    assert requests[0].tool_count == 47
+    # The loop surface carries the compose loop's whole tool list (same length in every dialect).
+    assert requests[0].tool_count == len(provider_gateway.composer_loop_tool_definitions(ToolContractDialect.NONE))
 
     for request in requests:
         assert request.model == model
@@ -1086,12 +1088,17 @@ async def test_advisor_role_does_not_use_primary_gateway_endpoint(
 
 
 def _loop_tools_stamped(flag: bool) -> list[dict[str, Any]]:
-    """The compose loop's ``openai_strict`` tools whose stamp is ``flag`` (36 true, 11 false)."""
-    from elspeth.contracts.composer_llm_audit import ToolContractDialect
+    """The compose loop's ``openai_strict`` tools whose stamp is ``flag``.
+
+    Every tool on that list carries a stamp, and both stamps occur; the exact
+    split is pinned by the unit tool-contract tests, not here.
+    """
     from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 
-    tools = [tool for tool in composer_loop_tool_definitions(ToolContractDialect.OPENAI_STRICT) if tool["function"]["strict"] is flag]
-    assert len(tools) == (36 if flag else 11)
+    loop_tools = composer_loop_tool_definitions(ToolContractDialect.OPENAI_STRICT)
+    assert all("strict" in tool["function"] for tool in loop_tools)
+    tools = [tool for tool in loop_tools if tool["function"]["strict"] is flag]
+    assert tools, f"no loop tool is stamped strict={flag}"
     return tools
 
 
@@ -1198,7 +1205,10 @@ async def test_gateway_accepts_the_preferred_route_tool_list(gateway_base_url: s
     resolution = resolve_strict_transport(model=_MODEL_ALIAS, api_base=f"{gateway_base_url}/v1", setting="preferred", env={})
     assert resolution.transport is StrictTransport.NONE
     tools = composer_loop_tool_definitions(dialect_for(resolution.transport))
-    assert len(tools) == 47
+    # The same tools as the strict dialect's list, none of them stamped.
+    assert [tool["function"]["name"] for tool in tools] == [
+        tool["function"]["name"] for tool in composer_loop_tool_definitions(ToolContractDialect.OPENAI_STRICT)
+    ]
     assert [tool for tool in tools if "strict" in tool["function"]] == []
 
     response = await litellm.acompletion(
