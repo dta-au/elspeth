@@ -610,7 +610,6 @@ class SetPipelineCandidate:
     result: ToolResult
     prepared_inline_blob: _PreparedBlobCreate | None
     prepared_prompt_blobs: tuple[tuple[str, _PreparedBlobCreate], ...] = ()
-    original_arguments: dict[str, JsonValue] | None = None
 
     @property
     def acceptable(self) -> bool:
@@ -749,7 +748,6 @@ def build_set_pipeline_candidate(
             result=normalized,
             prepared_inline_blob=prepared_inline_blob,
             prepared_prompt_blobs=tuple(prepared_prompt_blobs),
-            original_arguments=cast(dict[str, JsonValue], args),
         )
 
     def _failure_result(
@@ -2318,6 +2316,29 @@ def build_set_pipeline_candidate(
     )
 
 
+def _custody_arguments(
+    arguments: Mapping[str, JsonValue],
+    prepared_inline_blob: _PreparedBlobCreate | None,
+) -> dict[str, JsonValue]:
+    """Copy the direct call's arguments for pipeline custody.
+
+    This is the only place the direct ``set_pipeline`` path copies the whole
+    tool input. When the source file was already stored, the copy names it by
+    ``blob_id`` instead of carrying its bytes inline; every other argument is
+    kept as the caller sent it.
+    """
+    custody_args = dict(arguments)
+    if prepared_inline_blob is not None:
+        original_source = arguments["source"]
+        if type(original_source) is not dict:
+            raise AuditIntegrityError("set_pipeline candidate lost its original source")
+        source_args = dict(original_source)
+        del source_args["inline_blob"]
+        source_args["blob_id"] = prepared_inline_blob.blob_id
+        custody_args["source"] = source_args
+    return custody_args
+
+
 def _execute_set_pipeline(
     args: dict[str, Any],
     state: CompositionState,
@@ -2339,10 +2360,9 @@ def _execute_set_pipeline(
             error_code="source_binding_context_unavailable",
             rejected_component="source",
         )
-    if candidate.original_arguments is None:
-        raise AuditIntegrityError("set_pipeline candidate lost its original arguments")
+    original_arguments = cast(dict[str, JsonValue], args)
     prompt_arguments_hash = (
-        prompt_call_arguments_hash(candidate.original_arguments, prepared_inline_blob)
+        prompt_call_arguments_hash(original_arguments, prepared_inline_blob)
         if prepared_inline_blob is not None and candidate.prepared_prompt_blobs
         else None
     )
@@ -2367,15 +2387,7 @@ def _execute_set_pipeline(
         return replace(result, data=data)
     if context.data_dir is None:
         raise AuditIntegrityError("inline pipeline custody requires data_dir")
-    custody_args = dict(candidate.original_arguments)
-    if prepared_inline_blob is not None:
-        original_source = candidate.original_arguments["source"]
-        if type(original_source) is not dict:
-            raise AuditIntegrityError("set_pipeline candidate lost its original source")
-        source_args = dict(original_source)
-        del source_args["inline_blob"]
-        source_args["blob_id"] = prepared_inline_blob.blob_id
-        custody_args["source"] = source_args
+    custody_args = _custody_arguments(original_arguments, prepared_inline_blob)
     max_storage = _resolve_blob_quota_bytes(context.max_blob_storage_per_session_bytes)
     preparation = prepare_pipeline_custody(
         custody_args,
