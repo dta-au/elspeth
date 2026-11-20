@@ -357,6 +357,7 @@ _CDA24_MILESTONE_GUIDANCE_CANONICAL_BYTES = -19
 # assertion's ceiling lowered to 1, live and small catalog alike: the scaffold
 # is 142,045 B before and 142,280 B after, +235 B. Price only that growth.
 _SKILL_REVIEW_A4_CAPABILITY_SCOPE_CANONICAL_BYTES = 235
+_P2_READ_GUIDANCE_CANONICAL_BYTES = 237
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
@@ -377,6 +378,7 @@ _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     + _CONTENT_UNDERSTANDING_CATALOG_CANONICAL_BYTES
     + _CDA24_MILESTONE_GUIDANCE_CANONICAL_BYTES
     + _SKILL_REVIEW_A4_CAPABILITY_SCOPE_CANONICAL_BYTES
+    + _P2_READ_GUIDANCE_CANONICAL_BYTES
 )
 
 
@@ -934,6 +936,7 @@ async def _plan(
     policy_override: Any = None,
     retained_operation_context: pipeline_planner.RetainedOperationContext | None = None,
     turn_evidence: pipeline_planner.TurnEvidence | None = None,
+    turn_evidence_initial_state: CompositionState | None = None,
     context_policy: ContextBudgetPolicy | None = None,
     context_budget_history: ContextBudgetHistory | None = None,
 ) -> Any:
@@ -1021,7 +1024,18 @@ async def _plan(
                     mark_schema_loaded=mark_schema_loaded,
                     conversation_context=conversation_context,
                     retained_operation_context=retained_operation_context,
-                    turn_evidence=turn_evidence,
+                    turn_evidence=(
+                        pipeline_planner.TurnEvidence(
+                            session_id=origin.session_id,
+                            session_operation_context=operation_context,
+                            request_id=origin.message_id,
+                            request=origin.content,
+                            initial_state_id=None,
+                            initial_state=turn_evidence_initial_state,
+                        )
+                        if turn_evidence_initial_state is not None
+                        else turn_evidence
+                    ),
                     policy_catalog=policy_catalog,
                     plugin_snapshot=plugin_snapshot,
                     originating_message=origin,

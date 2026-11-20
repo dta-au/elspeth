@@ -519,24 +519,34 @@ class TestStep3DiscoveryTierMigration:
     def test_get_pipeline_state(self) -> None:
         assert self._get("get_pipeline_state") == {
             "name": "get_pipeline_state",
-            "description": "Inspect the full current pipeline state including all "
-            "options for source, nodes, and outputs. When a mutation result carries "
-            "an applied_component field, that field is already the post-change state "
-            "of everything that mutation touched — read it there, and call this tool "
-            "for what it does not cover: a component the change did not touch, or "
-            "the whole document. A node or output request returns just `node` or "
-            '`output`; `component="source"` returns the `sources` map; '
-            "`set_pipeline_arguments` returns the flat pipeline document. For the web "
-            'set_pipeline tool, put that document inside {"pipeline": <document>}; do not '
-            "send its source/nodes/edges/outputs fields at the top level. A "
-            "full-state read (no component, or an alias) returns the whole document "
-            "with an `inspection` block: `requested_component` (what you asked for), "
-            "`resolved_component` (always `full` here — the request matched a "
-            "full-state alias), and `accepted_full_state_aliases` (the exact strings "
-            "that do).",
+            "description": "Inspect graph or since_start changes. Oversized whole-graph reads return a structural `view`; "
+            "pages carry exact `content`, `encoding`, `field_path`, `offset_chars`, `total_chars`, `next_offset_chars` and `sha256`. "
+            "Use field_path for exact values; pass the hash to continue. "
+            "Changes give `baseline_kind`, `from_version`, `projection`, and `changes` with `operation`, `path`, optional `value`. "
+            'For the web set_pipeline tool, put that document inside {"pipeline": <document>}; do not send its source/nodes/edges/outputs fields at the top level. '
+            "Full diagnostic reads include `inspection`: `requested_component`, `resolved_component` and `accepted_full_state_aliases`.",
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "field_path": {
+                        "type": "string",
+                        "maxLength": 512,
+                        "description": "Exact JSON pointer: node /input or /options/system_prompt; output /options/<key>. Wrapper /node/input works. Source /sources/<name>/on_success or /on_success. Empty reads bounded pages.",
+                    },
+                    "offset_chars": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Page `offset_chars` (default 0) within `total_chars`. Follow `next_offset_chars`; supply the returned `sha256` as expected_sha256.",
+                    },
+                    "expected_sha256": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$",
+                        "description": "Content identity returned by the previous page; required when offset_chars is greater than zero.",
+                    },
+                    "since_start": {
+                        "type": "boolean",
+                        "description": "Return `changes` from `baseline_kind` request_start and `from_version`: each `operation` has a `path` and optional `value`. The `projection` keys components by ID. Do not combine with component; default false.",
+                    },
                     "component": {
                         "type": "string",
                         "description": (

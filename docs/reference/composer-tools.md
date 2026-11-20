@@ -60,6 +60,29 @@ argument check does not certify a response.
 
 ## Discovery Tools
 
+### `get_pipeline_state`
+
+Read the current graph, or set `since_start=true` to receive net field changes
+from the graph at the start of this turn. Changes use component identities as
+keys and report component ordering separately. `since_start` cannot be combined
+with `component` and requires a turn-start baseline.
+
+An oversized whole-graph read returns a structural `view` without option values
+or descriptions; large `since_start` reads retain exact values in `view="changes"`.
+Supply
+`field_path` as a JSON pointer to select an exact value. A page contains
+`content`, `encoding`, `offset_chars`, `total_chars`, `next_offset_chars`, and
+`sha256`; pass `next_offset_chars` as the next offset and `sha256` as
+`expected_sha256`. A continuation with a missing or mismatched hash is refused.
+Each response discloses at most 32,768 bytes. A structural view or partial page
+does not claim complete graph coverage.
+For a node, use `/input` or `/options/system_prompt`; for an output, use
+`/options/<key>`. Full diagnostic reads include `inspection`; the
+`set_pipeline_arguments` authoring document does not. Call `preview_pipeline`
+to inspect validation when state inspection diagnostics exceed the budget.
+
+---
+
 ### `list_sources`
 
 List available source plugins with their full catalog summaries.

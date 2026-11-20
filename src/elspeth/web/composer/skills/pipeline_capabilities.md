@@ -63,6 +63,13 @@ not call `get_pipeline_state` to confirm those components. Use
 question, or a successful mutation that omits the echo. A successful result
 whose hint reports the pipeline unchanged needs no confirming read.
 
+Use `get_pipeline_state(since_start=true)` for the net changes since this turn
+began: exact values, components keyed by identity, their order reported
+separately. A whole-graph read too large to return becomes a structural `view`
+without option values or descriptions. Read an exact value with `field_path`;
+continue a page from `next_offset_chars`, passing the returned `sha256` as
+`expected_sha256`. A structural view or a partial page is not the whole graph.
+
 An absent policy-visible plugin is different from an unsupported pipeline
 shape. Say that a plugin is unavailable or policy-denied only when live
 discovery proves it — use the supplied discovery digest's `prohibited` entries

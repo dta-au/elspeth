@@ -60,7 +60,7 @@ from elspeth.web.composer import provider_discovery_response, redaction, state, 
 from elspeth.web.composer import tool_result_envelope as env
 from elspeth.web.composer.prompts import build_system_prompt
 from elspeth.web.composer.tools import _common as common
-from elspeth.web.composer.tools import _dispatch, _registry, blobs, secrets
+from elspeth.web.composer.tools import _dispatch, _registry, blobs, secrets, state_responses
 from elspeth.web.composer.tools._dispatch import get_tool_definitions
 from elspeth.web.composer.tools.prompt_target_responses import PromptTargetMetadata
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
@@ -78,7 +78,16 @@ SHARED = "*"  # the ``tool`` column for surfaces every tool ships
 # Files whose result-constructor calls define a TOOL's ``data`` payload. The
 # shared helpers (_common.py, tool_batch.py) and the planner's own rejection
 # builders are walked by the shared-surface generators instead.
-_TOOL_DATA_FILES: tuple[str, ...] = ("blobs.py", "generation.py", "outputs.py", "secrets.py", "sessions.py", "sources.py", "transforms.py")
+_TOOL_DATA_FILES: tuple[str, ...] = (
+    "blobs.py",
+    "generation.py",
+    "outputs.py",
+    "secrets.py",
+    "sessions.py",
+    "sources.py",
+    "state_inspection.py",
+    "transforms.py",
+)
 _RESULT_CONSTRUCTORS = frozenset({"_discovery_result", "_mutation_result", "ToolResult", "replace"})
 
 # Every ``data=`` result-constructor site in web/composer that ``_TOOL_DATA_FILES`` does NOT walk,
@@ -161,6 +170,8 @@ _DATA_HELPER_PAYLOADS: dict[str, type | _ListPayload | _Literal | None] = {
     "_blob_inline_descriptors": _ListPayload(blobs.BlobInlineDescriptor),
     "facts_to_dict": _Literal(COMPOSER / "source_inspection.py", "facts_to_dict"),
     "diff_states": _Literal(COMMON, "diff_states"),
+    "pipeline_state_changes": state_responses.StateChangesPayload,
+    "state_inspection_page_payload": state_responses.StateInspectionPagePayload,
     # Element builders of a shipped container. Unreachable from a ``data=`` site directly —
     # each is called once per item inside a comprehension or splatted into one — and
     # unattributed until ``_nested_value_keys`` stopped declining containers (RED2-2 residue).
@@ -278,6 +289,7 @@ _LOCAL_DATA_PAYLOADS: dict[tuple[str, str, str], type | None] = {}
 _SPLAT_KEYS: dict[str, tuple[str, ...]] = {}
 # enclosing function -> tool name, where the ``_handle_`` / ``_execute_`` prefix rule does not apply.
 _FUNCTION_TOOL_OVERRIDES: dict[str, str] = {
+    "_state_inspection_page_result": "get_pipeline_state",
     "_apply_guarded_node_option_patch": "patch_node_options",
     "_inspect_prompt_targets": "inspect_prompt_targets",
     "build_set_pipeline_candidate": "set_pipeline",

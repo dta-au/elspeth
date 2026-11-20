@@ -258,6 +258,7 @@ def _valid_information_key(key: str) -> bool:
         _CATALOG_SELECTION_INFORMATION,
         *_CATALOG_DETAIL_INFORMATION_BY_TOOL.values(),
         "pipeline.full",
+        "pipeline.structure",
         "pipeline.source",
         "model.catalog",
         "blob.index.session",
@@ -270,6 +271,7 @@ def _valid_information_key(key: str) -> bool:
     } or key.startswith(
         (
             "pipeline.component:",
+            "pipeline.field:",
             "plugin.schema:",
             "plugin.assistance:",
             "blob.metadata:",
@@ -435,6 +437,10 @@ class PlannerDiscoveryPolicy:
 
 def _tool_information_keys(name: str, arguments: Mapping[str, Any]) -> tuple[str, ...]:
     if name == "get_pipeline_state":
+        if "field_path" in arguments and arguments["field_path"] is not None:
+            return ("pipeline.field:" + canonical_json(dict(arguments)),)
+        if "since_start" in arguments and arguments["since_start"] is True:
+            return ("pipeline.diff",)
         component = arguments["component"] if "component" in arguments else None
         normalized = component.strip().lower() if type(component) is str else ""
         if normalized in _FULL_STATE_ALIASES or component is None or normalized == "set_pipeline_arguments":
@@ -570,6 +576,15 @@ def _resolved_discovery_information_keys(call: _ParsedToolCall, discovery: Admit
     inventory key stays pending, so the gaps-closed notice cannot follow it.
     """
     keys = planner_discovery_information_keys(call)
+    if call.name == "get_pipeline_state" and discovery.result.success:
+        assert discovery.response is not None
+        data = discovery.response.to_wire()
+        assert type(data) is dict
+        if "view" in data:
+            if data["offset_chars"] != 0 or data["next_offset_chars"] is not None:
+                return ()
+            if data["view"] == "structure":
+                return ("pipeline.structure",)
     if call.name in {"list_blobs", "list_composer_blobs"} and discovery.result.success:
         return () if blob_list_is_incomplete(discovery.result) else keys
     if call.name != "list_models" or not discovery.result.success:
@@ -1287,10 +1302,11 @@ _PLANNER_INFORMATION_EXACT: Final[Mapping[str, ComposerPlannerInformationClass]]
         ComposerPlannerInformationClass.SECRET_REFERENCE,
         ComposerPlannerInformationClass.VALIDATION_CODE,
     }
-}
+} | {"pipeline.structure": ComposerPlannerInformationClass.PIPELINE_COMPONENT}
 _PLANNER_INFORMATION_PREFIXES: Final[tuple[tuple[str, ComposerPlannerInformationClass], ...]] = (
     ("model.catalog.", ComposerPlannerInformationClass.MODEL_CATALOG),
     ("pipeline.component:", ComposerPlannerInformationClass.PIPELINE_COMPONENT),
+    ("pipeline.field:", ComposerPlannerInformationClass.PIPELINE_COMPONENT),
     ("plugin.schema:", ComposerPlannerInformationClass.PLUGIN_SCHEMA),
     ("plugin.assistance:", ComposerPlannerInformationClass.PLUGIN_ASSISTANCE),
     ("blob.metadata:", ComposerPlannerInformationClass.BLOB_METADATA),
@@ -5387,6 +5403,13 @@ async def _plan_pipeline_inner(
                 if call_to_execute.wire_error is not None:
                     raise call_to_execute.wire_error
                 execution_arguments = cast(dict[str, Any], deep_thaw(call_to_execute.arguments))
+                discovery_context = (
+                    replace(request_context, baseline=turn_evidence.effects.initial_state if turn_evidence is not None else None)
+                    if call_to_execute.name == "get_pipeline_state"
+                    and "since_start" in execution_arguments
+                    and execution_arguments["since_start"] is True
+                    else request_context
+                )
                 result = cast(
                     ToolResult,
                     await run_planner_sync(
@@ -5394,7 +5417,7 @@ async def _plan_pipeline_inner(
                         call_to_execute.name,
                         execution_arguments,
                         current_state,
-                        request_context,
+                        discovery_context,
                     ),
                 )
                 if result.updated_state != current_state:

@@ -3340,6 +3340,9 @@ async def run_tool_batch(
                 if ctx.turn_evidence is not None:
                     ctx.turn_evidence.diff_baseline = (diff_baseline, diff_baseline_kind)
             call_baseline, call_baseline_kind = diff_baseline, diff_baseline_kind
+            if _tool_name == "get_pipeline_state" and ctx.turn_evidence is not None:
+                call_baseline = ctx.turn_evidence.effects.initial_state
+                call_baseline_kind = "request_start"
             if (
                 _tool_name == "diff_pipeline"
                 and ctx.turn_evidence is not None
