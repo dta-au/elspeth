@@ -24,7 +24,22 @@ from scripts.staging.opslib import HttpResponse
 BASE_URL = "https://deployment.invalid"
 
 type JsonObject = dict[str, Any]
-type Provider = Callable[[JsonObject, str], tuple[JsonObject, list[JsonObject]]]
+
+
+@dataclass
+class FakeTurn:
+    """What one fake Composer turn did: the new state and the rows the server would store for it."""
+
+    state: JsonObject
+    audit: list[JsonObject] = field(default_factory=list)
+    assistant_tool_calls: list[JsonObject] = field(default_factory=list)
+    reviews: dict[str, JsonObject] = field(default_factory=dict)
+    status: str = "completed"
+    error_code: str | None = None
+    created_at: tuple[str, str] = ("2026-01-01T00:00:00+00:00", "2026-01-01T00:00:05+00:00")
+
+
+type Provider = Callable[[JsonObject, str], tuple[JsonObject, list[JsonObject]] | FakeTurn]
 
 
 def fake_jwt(username: str, exp: float) -> str:
@@ -149,6 +164,12 @@ class FakeDeployment:
                 return self._json(200, {**review["snapshot"], "is_live_review": review["pending"]})
             assert payload == {"choice": "accepted_as_drafted", "reviewed_anchor": review["snapshot"]["anchor"]}
             review["pending"] = False
+            # As the server does, resolving a prompt card settles the node's pending prompt requirement.
+            for node in session.state["nodes"]:
+                if node["id"] == review["snapshot"]["node_id"] and "interpretation_requirements" in node["options"]:
+                    for requirement in node["options"]["interpretation_requirements"]:
+                        if requirement["kind"] == review["event"]["kind"]:
+                            requirement["status"] = "resolved"
             return self._json(200, {"event": review["event"]})
         if key == ("POST", "/validate"):
             return self._json(200, {"is_valid": True, "readiness": "ready", "errors": []})
@@ -163,12 +184,36 @@ class FakeDeployment:
         operation_id = payload["operation_id"]
         if operation_id not in session.operations:
             assert self.provider is not None
-            new_state, audit = self.provider(copy.deepcopy(session.state), payload["content"])
-            session.state = new_state
-            session.messages.append({"role": "user", "operation_id": operation_id, "tool_calls": None, "content": payload["content"]})
-            session.messages.append({"role": "audit", "operation_id": operation_id, "tool_calls": audit, "content": ""})
-            session.operations[operation_id] = {"operation_id": operation_id, "status": "completed", "result": {"message": {}}}
-        return self._json(202, {"operation_id": operation_id, "status": "queued"})
+            produced = self.provider(copy.deepcopy(session.state), payload["content"])
+            turn = produced if isinstance(produced, FakeTurn) else FakeTurn(state=produced[0], audit=produced[1])
+            session.state = turn.state
+            session.reviews.update(turn.reviews)
+            first, last = turn.created_at
+            session.messages.append(
+                {"role": "user", "operation_id": operation_id, "tool_calls": None, "content": payload["content"], "created_at": first}
+            )
+            if turn.assistant_tool_calls:
+                session.messages.append(
+                    {
+                        "role": "assistant",
+                        "operation_id": operation_id,
+                        "tool_calls": turn.assistant_tool_calls,
+                        "content": "",
+                        "created_at": first,
+                    }
+                )
+            session.messages.append(
+                {"role": "audit", "operation_id": operation_id, "tool_calls": turn.audit, "content": "", "created_at": last}
+            )
+            completed = turn.status == "completed"
+            session.operations[operation_id] = {
+                "operation_id": operation_id,
+                "status": turn.status,
+                "poll_after_ms": 0,
+                "result": {"message": {}} if completed else None,
+                "error": None if completed else {"code": turn.error_code},
+            }
+        return self._json(202, {"operation_id": operation_id, "status": "queued", "poll_after_ms": 1000})
 
     # -- assertions ------------------------------------------------------
 

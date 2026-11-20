@@ -1,0 +1,939 @@
+{
+  "format": "elspeth-composer-edit-plan/1",
+  "name": "composer-gold-50",
+  "description": "Fifty small edits in a row on an existing large graph: pipeline metadata, inserting, describing, reordering, renaming and removing temporary passthrough steps, a temporary error output and error routing, LLM option patches and their restoration, inline prompt substring edits, prompt-file edits, and restoring every changed description and name. Every temporary step and output is removed again. Gold is all fifty verified in a row.",
+  "forbidden_tools": [
+    "set_pipeline"
+  ],
+  "targets": {
+    "source": {
+      "kind": "first_source"
+    },
+    "head": {
+      "kind": "consumer_of",
+      "target": "source"
+    },
+    "llm_inline": {
+      "kind": "llm_node",
+      "prompt": "inline"
+    },
+    "llm_file": {
+      "kind": "llm_node",
+      "prompt": "file"
+    }
+  },
+  "edits": [
+    {
+      "id": "rename-pipeline",
+      "message": "Rename the pipeline to \"Battery check\".",
+      "expect": [
+        {
+          "equals": "/metadata/name",
+          "value": "Battery check"
+        }
+      ],
+      "tools_any": [
+        "set_metadata"
+      ]
+    },
+    {
+      "id": "pipeline-description",
+      "message": "Set the pipeline description to \"Edited by the Composer edit battery.\"",
+      "expect": [
+        {
+          "equals": "/metadata/description",
+          "value": "Edited by the Composer edit battery."
+        }
+      ],
+      "tools_any": [
+        "set_metadata"
+      ]
+    },
+    {
+      "id": "insert-a",
+      "message": "Insert a passthrough transform with the id battery_a between {source} and {head}.",
+      "expect": [
+        {
+          "present": "/nodes/battery_a"
+        },
+        {
+          "equals": "/nodes/battery_a/plugin",
+          "value": "passthrough"
+        },
+        {
+          "chain": {
+            "from": "{source}",
+            "to": "{head}",
+            "via": [
+              "battery_a"
+            ]
+          }
+        }
+      ],
+      "may_change": [
+        "/edges"
+      ],
+      "tools_any": [
+        "splice_transform",
+        "upsert_node"
+      ]
+    },
+    {
+      "id": "describe-a",
+      "message": "Set the description of the step battery_a to \"Battery step A.\".",
+      "expect": [
+        {
+          "equals": "/nodes/battery_a/description",
+          "value": "Battery step A."
+        }
+      ]
+    },
+    {
+      "id": "insert-b",
+      "message": "Insert a passthrough transform with the id battery_b between battery_a and {head}.",
+      "expect": [
+        {
+          "present": "/nodes/battery_b"
+        },
+        {
+          "equals": "/nodes/battery_b/plugin",
+          "value": "passthrough"
+        },
+        {
+          "chain": {
+            "from": "{source}",
+            "to": "{head}",
+            "via": [
+              "battery_a",
+              "battery_b"
+            ]
+          }
+        }
+      ],
+      "may_change": [
+        "/edges"
+      ],
+      "tools_any": [
+        "splice_transform",
+        "upsert_node"
+      ]
+    },
+    {
+      "id": "insert-c",
+      "message": "Insert a passthrough transform with the id battery_c between {source} and battery_a.",
+      "expect": [
+        {
+          "present": "/nodes/battery_c"
+        },
+        {
+          "equals": "/nodes/battery_c/plugin",
+          "value": "passthrough"
+        },
+        {
+          "chain": {
+            "from": "{source}",
+            "to": "{head}",
+            "via": [
+              "battery_c",
+              "battery_a",
+              "battery_b"
+            ]
+          }
+        }
+      ],
+      "may_change": [
+        "/edges"
+      ],
+      "tools_any": [
+        "splice_transform",
+        "upsert_node"
+      ]
+    },
+    {
+      "id": "describe-head",
+      "message": "Set the description of the step {head} to \"Battery-edited description.\".",
+      "expect": [
+        {
+          "equals": "/nodes/{head}/description",
+          "value": "Battery-edited description."
+        }
+      ]
+    },
+    {
+      "id": "move-c",
+      "message": "Move battery_c so the order is {source}, battery_a, battery_c, battery_b, {head}.",
+      "expect": [
+        {
+          "chain": {
+            "from": "{source}",
+            "to": "{head}",
+            "via": [
+              "battery_a",
+              "battery_c",
+              "battery_b"
+            ]
+          }
+        }
+      ],
+      "may_change": [
+        "/edges"
+      ]
+    },
+    {
+      "id": "rename-b",
+      "message": "Rename the step battery_b to battery_d, keeping its place in the pipeline and its settings.",
+      "expect": [
+        {
+          "absent": "/nodes/battery_b"
+        },
+        {
+          "present": "/nodes/battery_d"
+        },
+        {
+          "equals": "/nodes/battery_d/plugin",
+          "value": "passthrough"
+        },
+        {
+          "chain": {
+            "from": "{source}",
+            "to": "{head}",
+            "via": [
+              "battery_a",
+              "battery_c",
+              "battery_d"
+            ]
+          }
+        }
+      ],
+      "may_change": [
+        "/edges"
+      ]
+    },
+    {
+      "id": "add-output",
+      "message": "Add an output named battery_out that writes rows as JSON lines to the file battery_out.jsonl, and send the rows that fail in battery_a to it.",
+      "expect": [
+        {
+          "present": "/outputs/battery_out"
+        },
+        {
+          "equals": "/nodes/battery_a/on_error",
+          "value": "battery_out"
+        }
+      ],
+      "may_change": [
+        "/edges"
+      ],
+      "tools_any": [
+        "set_output"
+      ]
+    },
+    {
+      "id": "output-path",
+      "message": "Change the output battery_out to write to the file battery_errors.jsonl instead.",
+      "expect": [
+        {
+          "ends_with": "/outputs/battery_out/options/path",
+          "value": "battery_errors.jsonl"
+        }
+      ],
+      "tools_any": [
+        "patch_output_options"
+      ]
+    },
+    {
+      "id": "route-c-errors",
+      "message": "Send the rows that fail in battery_c to battery_out as well.",
+      "expect": [
+        {
+          "equals": "/nodes/battery_c/on_error",
+          "value": "battery_out"
+        }
+      ],
+      "may_change": [
+        "/edges"
+      ]
+    },
+    {
+      "id": "discard-a-errors",
+      "message": "Discard the rows that fail in battery_a instead of sending them to battery_out.",
+      "expect": [
+        {
+          "equals": "/nodes/battery_a/on_error",
+          "value": "discard"
+        }
+      ],
+      "may_change": [
+        "/edges"
+      ]
+    },
+    {
+      "id": "describe-output",
+      "message": "Set the description of the output battery_out to \"Rows that failed in battery steps.\"",
+      "expect": [
+        {
+          "equals": "/outputs/battery_out/description",
+          "value": "Rows that failed in battery steps."
+        }
+      ]
+    },
+    {
+      "id": "route-d-errors",
+      "message": "Send the rows that fail in battery_d to battery_out as well.",
+      "expect": [
+        {
+          "equals": "/nodes/battery_d/on_error",
+          "value": "battery_out"
+        }
+      ],
+      "may_change": [
+        "/edges"
+      ]
+    },
+    {
+      "id": "max-tokens",
+      "message": "Set max_tokens on {llm_inline} to 777.",
+      "expect": [
+        {
+          "equals": "/nodes/{llm_inline}/options/max_tokens",
+          "value": 777
+        }
+      ],
+      "tools_any": [
+        "patch_node_options"
+      ]
+    },
+    {
+      "id": "temperature",
+      "message": "Set temperature on {llm_inline} to 0.3.",
+      "expect": [
+        {
+          "equals": "/nodes/{llm_inline}/options/temperature",
+          "value": 0.3
+        }
+      ],
+      "tools_any": [
+        "patch_node_options"
+      ]
+    },
+    {
+      "id": "restore-max-tokens",
+      "message": "Set max_tokens on {llm_inline} back to {was:/nodes/{llm_inline}/options/max_tokens}.",
+      "expect": [
+        {
+          "restored": "/nodes/{llm_inline}/options/max_tokens"
+        }
+      ],
+      "tools_any": [
+        "patch_node_options"
+      ]
+    },
+    {
+      "id": "restore-temperature",
+      "message": "Set temperature on {llm_inline} back to {was:/nodes/{llm_inline}/options/temperature}.",
+      "expect": [
+        {
+          "restored": "/nodes/{llm_inline}/options/temperature"
+        }
+      ],
+      "tools_any": [
+        "patch_node_options"
+      ]
+    },
+    {
+      "id": "prompt-append-1",
+      "message": "Add the sentence \"Battery marker one.\" at the end of the prompt of {llm_inline}.",
+      "expect": [
+        {
+          "text": "/nodes/{llm_inline}/options/prompt_template",
+          "append": "Battery marker one.",
+          "form": "inline"
+        }
+      ],
+      "may_change": [
+        "/nodes/{llm_inline}/options/interpretation_requirements"
+      ],
+      "tools_any": [
+        "change_substring",
+        "patch_node_options"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{llm_inline}"
+      }
+    },
+    {
+      "id": "prompt-change-1",
+      "message": "In the prompt of {llm_inline}, change \"Battery marker one.\" to \"Battery marker two.\".",
+      "expect": [
+        {
+          "text": "/nodes/{llm_inline}/options/prompt_template",
+          "replace": [
+            "Battery marker one.",
+            "Battery marker two."
+          ],
+          "form": "inline"
+        }
+      ],
+      "may_change": [
+        "/nodes/{llm_inline}/options/interpretation_requirements"
+      ],
+      "tools_any": [
+        "change_substring"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{llm_inline}"
+      }
+    },
+    {
+      "id": "describe-llm",
+      "message": "Set the description of the step {llm_inline} to \"Battery-edited LLM step.\".",
+      "expect": [
+        {
+          "equals": "/nodes/{llm_inline}/description",
+          "value": "Battery-edited LLM step."
+        }
+      ]
+    },
+    {
+      "id": "prompt-remove-1",
+      "message": "Remove the sentence \"Battery marker two.\" from the prompt of {llm_inline}.",
+      "expect": [
+        {
+          "text": "/nodes/{llm_inline}/options/prompt_template",
+          "remove": "Battery marker two.",
+          "form": "inline"
+        }
+      ],
+      "may_change": [
+        "/nodes/{llm_inline}/options/interpretation_requirements"
+      ],
+      "tools_any": [
+        "change_substring",
+        "patch_node_options"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{llm_inline}"
+      }
+    },
+    {
+      "id": "file-append-1",
+      "message": "Add the sentence \"Battery file marker one.\" at the end of the prompt file used by {llm_file}.",
+      "expect": [
+        {
+          "text": "/nodes/{llm_file}/options/prompt_template",
+          "append": "Battery file marker one.",
+          "form": "file"
+        }
+      ],
+      "may_change": [
+        "/nodes/{llm_file}/options/interpretation_requirements"
+      ],
+      "tools_any": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{llm_file}"
+      }
+    },
+    {
+      "id": "file-change-1",
+      "message": "In the prompt file used by {llm_file}, change \"Battery file marker one.\" to \"Battery file marker two.\".",
+      "expect": [
+        {
+          "text": "/nodes/{llm_file}/options/prompt_template",
+          "replace": [
+            "Battery file marker one.",
+            "Battery file marker two."
+          ],
+          "form": "file"
+        }
+      ],
+      "may_change": [
+        "/nodes/{llm_file}/options/interpretation_requirements"
+      ],
+      "tools_any": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{llm_file}"
+      }
+    },
+    {
+      "id": "file-remove-1",
+      "message": "Remove the sentence \"Battery file marker two.\" from the prompt file used by {llm_file}.",
+      "expect": [
+        {
+          "text": "/nodes/{llm_file}/options/prompt_template",
+          "remove": "Battery file marker two.",
+          "form": "file"
+        }
+      ],
+      "may_change": [
+        "/nodes/{llm_file}/options/interpretation_requirements"
+      ],
+      "tools_any": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{llm_file}"
+      }
+    },
+    {
+      "id": "discard-c-errors",
+      "message": "Discard the rows that fail in battery_c instead of sending them to battery_out.",
+      "expect": [
+        {
+          "equals": "/nodes/battery_c/on_error",
+          "value": "discard"
+        }
+      ],
+      "may_change": [
+        "/edges"
+      ]
+    },
+    {
+      "id": "remove-output",
+      "message": "Discard the rows that fail in battery_d, and remove the output battery_out.",
+      "expect": [
+        {
+          "equals": "/nodes/battery_d/on_error",
+          "value": "discard"
+        },
+        {
+          "absent": "/outputs/battery_out"
+        }
+      ],
+      "may_change": [
+        "/edges"
+      ],
+      "tools_any": [
+        "remove_output"
+      ]
+    },
+    {
+      "id": "remove-c",
+      "message": "Remove the step battery_c and connect battery_a directly to battery_d.",
+      "expect": [
+        {
+          "absent": "/nodes/battery_c"
+        },
+        {
+          "chain": {
+            "from": "{source}",
+            "to": "{head}",
+            "via": [
+              "battery_a",
+              "battery_d"
+            ]
+          }
+        }
+      ],
+      "may_change": [
+        "/edges"
+      ],
+      "tools_any": [
+        "remove_node"
+      ]
+    },
+    {
+      "id": "remove-d",
+      "message": "Remove the step battery_d and connect battery_a directly to {head}.",
+      "expect": [
+        {
+          "absent": "/nodes/battery_d"
+        },
+        {
+          "chain": {
+            "from": "{source}",
+            "to": "{head}",
+            "via": [
+              "battery_a"
+            ]
+          }
+        }
+      ],
+      "may_change": [
+        "/edges"
+      ],
+      "tools_any": [
+        "remove_node"
+      ]
+    },
+    {
+      "id": "remove-a",
+      "message": "Remove the step battery_a and connect {source} directly to {head}.",
+      "expect": [
+        {
+          "absent": "/nodes/battery_a"
+        },
+        {
+          "chain": {
+            "from": "{source}",
+            "to": "{head}",
+            "via": []
+          }
+        }
+      ],
+      "may_change": [
+        "/edges"
+      ],
+      "tools_any": [
+        "remove_node"
+      ]
+    },
+    {
+      "id": "insert-e",
+      "message": "Insert a passthrough transform with the id battery_e between {source} and {head}.",
+      "expect": [
+        {
+          "present": "/nodes/battery_e"
+        },
+        {
+          "equals": "/nodes/battery_e/plugin",
+          "value": "passthrough"
+        },
+        {
+          "chain": {
+            "from": "{source}",
+            "to": "{head}",
+            "via": [
+              "battery_e"
+            ]
+          }
+        }
+      ],
+      "may_change": [
+        "/edges"
+      ],
+      "tools_any": [
+        "splice_transform",
+        "upsert_node"
+      ]
+    },
+    {
+      "id": "insert-f",
+      "message": "Insert a passthrough transform with the id battery_f between battery_e and {head}.",
+      "expect": [
+        {
+          "present": "/nodes/battery_f"
+        },
+        {
+          "equals": "/nodes/battery_f/plugin",
+          "value": "passthrough"
+        },
+        {
+          "chain": {
+            "from": "{source}",
+            "to": "{head}",
+            "via": [
+              "battery_e",
+              "battery_f"
+            ]
+          }
+        }
+      ],
+      "may_change": [
+        "/edges"
+      ],
+      "tools_any": [
+        "splice_transform",
+        "upsert_node"
+      ]
+    },
+    {
+      "id": "describe-f",
+      "message": "Set the description of the step battery_f to \"Battery step F.\".",
+      "expect": [
+        {
+          "equals": "/nodes/battery_f/description",
+          "value": "Battery step F."
+        }
+      ]
+    },
+    {
+      "id": "swap-e-f",
+      "message": "Swap battery_e and battery_f so the order is {source}, battery_f, battery_e, {head}.",
+      "expect": [
+        {
+          "chain": {
+            "from": "{source}",
+            "to": "{head}",
+            "via": [
+              "battery_f",
+              "battery_e"
+            ]
+          }
+        }
+      ],
+      "may_change": [
+        "/edges"
+      ]
+    },
+    {
+      "id": "prompt-append-2",
+      "message": "Add the sentence \"Battery marker three.\" at the end of the prompt of {llm_inline}.",
+      "expect": [
+        {
+          "text": "/nodes/{llm_inline}/options/prompt_template",
+          "append": "Battery marker three.",
+          "form": "inline"
+        }
+      ],
+      "may_change": [
+        "/nodes/{llm_inline}/options/interpretation_requirements"
+      ],
+      "tools_any": [
+        "change_substring",
+        "patch_node_options"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{llm_inline}"
+      }
+    },
+    {
+      "id": "prompt-change-2",
+      "message": "In the prompt of {llm_inline}, change \"Battery marker three.\" to \"Battery marker four.\".",
+      "expect": [
+        {
+          "text": "/nodes/{llm_inline}/options/prompt_template",
+          "replace": [
+            "Battery marker three.",
+            "Battery marker four."
+          ],
+          "form": "inline"
+        }
+      ],
+      "may_change": [
+        "/nodes/{llm_inline}/options/interpretation_requirements"
+      ],
+      "tools_any": [
+        "change_substring"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{llm_inline}"
+      }
+    },
+    {
+      "id": "prompt-change-3",
+      "message": "In the prompt of {llm_inline}, change \"Battery marker four.\" to \"Battery marker five.\".",
+      "expect": [
+        {
+          "text": "/nodes/{llm_inline}/options/prompt_template",
+          "replace": [
+            "Battery marker four.",
+            "Battery marker five."
+          ],
+          "form": "inline"
+        }
+      ],
+      "may_change": [
+        "/nodes/{llm_inline}/options/interpretation_requirements"
+      ],
+      "tools_any": [
+        "change_substring"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{llm_inline}"
+      }
+    },
+    {
+      "id": "prompt-remove-2",
+      "message": "Remove the sentence \"Battery marker five.\" from the prompt of {llm_inline}.",
+      "expect": [
+        {
+          "text": "/nodes/{llm_inline}/options/prompt_template",
+          "remove": "Battery marker five.",
+          "form": "inline"
+        }
+      ],
+      "may_change": [
+        "/nodes/{llm_inline}/options/interpretation_requirements"
+      ],
+      "tools_any": [
+        "change_substring",
+        "patch_node_options"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{llm_inline}"
+      }
+    },
+    {
+      "id": "max-tokens-2",
+      "message": "Set max_tokens on {llm_inline} to 555.",
+      "expect": [
+        {
+          "equals": "/nodes/{llm_inline}/options/max_tokens",
+          "value": 555
+        }
+      ],
+      "tools_any": [
+        "patch_node_options"
+      ]
+    },
+    {
+      "id": "restore-max-tokens-2",
+      "message": "Set max_tokens on {llm_inline} back to {was:/nodes/{llm_inline}/options/max_tokens}.",
+      "expect": [
+        {
+          "restored": "/nodes/{llm_inline}/options/max_tokens"
+        }
+      ],
+      "tools_any": [
+        "patch_node_options"
+      ]
+    },
+    {
+      "id": "rename-pipeline-2",
+      "message": "Rename the pipeline to \"Battery check, second round\".",
+      "expect": [
+        {
+          "equals": "/metadata/name",
+          "value": "Battery check, second round"
+        }
+      ],
+      "tools_any": [
+        "set_metadata"
+      ]
+    },
+    {
+      "id": "restore-pipeline-name",
+      "message": "Set the pipeline name back to {was:/metadata/name}.",
+      "expect": [
+        {
+          "restored": "/metadata/name"
+        }
+      ],
+      "tools_any": [
+        "set_metadata"
+      ]
+    },
+    {
+      "id": "restore-head-description",
+      "message": "Set the description of the step {head} back to {was:/nodes/{head}/description}.",
+      "expect": [
+        {
+          "restored": "/nodes/{head}/description"
+        }
+      ]
+    },
+    {
+      "id": "restore-llm-description",
+      "message": "Set the description of the step {llm_inline} back to {was:/nodes/{llm_inline}/description}.",
+      "expect": [
+        {
+          "restored": "/nodes/{llm_inline}/description"
+        }
+      ]
+    },
+    {
+      "id": "restore-pipeline-description",
+      "message": "Set the pipeline description back to {was:/metadata/description}.",
+      "expect": [
+        {
+          "restored": "/metadata/description"
+        }
+      ],
+      "tools_any": [
+        "set_metadata"
+      ]
+    },
+    {
+      "id": "file-append-2",
+      "message": "Add the sentence \"Battery file marker three.\" at the end of the prompt file used by {llm_file}.",
+      "expect": [
+        {
+          "text": "/nodes/{llm_file}/options/prompt_template",
+          "append": "Battery file marker three.",
+          "form": "file"
+        }
+      ],
+      "may_change": [
+        "/nodes/{llm_file}/options/interpretation_requirements"
+      ],
+      "tools_any": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{llm_file}"
+      }
+    },
+    {
+      "id": "file-remove-2",
+      "message": "Remove the sentence \"Battery file marker three.\" from the prompt file used by {llm_file}.",
+      "expect": [
+        {
+          "text": "/nodes/{llm_file}/options/prompt_template",
+          "remove": "Battery file marker three.",
+          "form": "file"
+        }
+      ],
+      "may_change": [
+        "/nodes/{llm_file}/options/interpretation_requirements"
+      ],
+      "tools_any": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{llm_file}"
+      }
+    },
+    {
+      "id": "remove-e",
+      "message": "Remove the step battery_e and connect battery_f directly to {head}.",
+      "expect": [
+        {
+          "absent": "/nodes/battery_e"
+        },
+        {
+          "chain": {
+            "from": "{source}",
+            "to": "{head}",
+            "via": [
+              "battery_f"
+            ]
+          }
+        }
+      ],
+      "may_change": [
+        "/edges"
+      ],
+      "tools_any": [
+        "remove_node"
+      ]
+    },
+    {
+      "id": "remove-f",
+      "message": "Remove the step battery_f and connect {source} directly to {head}.",
+      "expect": [
+        {
+          "absent": "/nodes/battery_f"
+        },
+        {
+          "chain": {
+            "from": "{source}",
+            "to": "{head}",
+            "via": []
+          }
+        }
+      ],
+      "may_change": [
+        "/edges"
+      ],
+      "tools_any": [
+        "remove_node"
+      ]
+    }
+  ]
+}
