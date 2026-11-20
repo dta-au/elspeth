@@ -159,7 +159,7 @@ UPDATE token_work_items 1 2
         },
         "fork": {
             "counters": {
-                "statements": (620, 338),
+                "statements": (621, 338),
                 "commits": (70, 45),
                 "core.canonical.canonical_json": (24, 36),
                 "core.canonical.stable_hash": (20, 28),
@@ -222,7 +222,7 @@ SELECT sink_effect_streams 11 0
 SELECT sink_effects 51 0
 SELECT token_lineage_frames 1 8
 SELECT token_outcomes 4 4
-SELECT token_parents 0 4
+SELECT token_parents 1 4
 SELECT token_work_items 9 26
 SELECT tokens 2 17
 UPDATE coalesce_effects 0 1
@@ -244,7 +244,7 @@ UPDATE token_work_items 1 11
     "postgres": {
         "linear": {
             "counters": {
-                "statements": (500, 79),
+                "statements": (501, 79),
                 "commits": (67, 13),
                 "core.canonical.canonical_json": (20, 14),
                 "core.canonical.stable_hash": (16, 19),
@@ -297,7 +297,7 @@ UPDATE token_work_items 1 11
                 "SELECT token_parents": (0, 1),
                 "SELECT token_work_items": (5, 7),
                 "SELECT tokens": (3, 4),
-                "SET <expression>": (27, 5),
+                "SET <expression>": (28, 5),
                 "UPDATE node_states": (1, 2),
                 "UPDATE nodes": (1, 0),
                 "UPDATE operations": (2, 0),
@@ -314,7 +314,7 @@ UPDATE token_work_items 1 11
         },
         "fork": {
             "counters": {
-                "statements": (526, 263),
+                "statements": (528, 263),
                 "commits": (70, 45),
                 "core.canonical.canonical_json": (24, 36),
                 "core.canonical.stable_hash": (20, 28),
@@ -373,10 +373,10 @@ UPDATE token_work_items 1 11
                 "SELECT sink_effects": (51, 0),
                 "SELECT token_lineage_frames": (1, 8),
                 "SELECT token_outcomes": (4, 4),
-                "SELECT token_parents": (0, 4),
+                "SELECT token_parents": (1, 4),
                 "SELECT token_work_items": (9, 26),
                 "SELECT tokens": (3, 20),
-                "SET <expression>": (27, 24),
+                "SET <expression>": (28, 24),
                 "UPDATE coalesce_effects": (0, 1),
                 "UPDATE node_states": (1, 3),
                 "UPDATE nodes": (1, 0),
