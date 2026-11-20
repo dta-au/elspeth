@@ -1869,29 +1869,41 @@ class TestTemplateFilePathTraversal:
 class TestBoundedYamlStringLoader:
     """In-memory web-facing YAML loader hardening."""
 
-    def test_load_settings_from_yaml_string_accepts_inline_blob_aggregate_sized_content(self) -> None:
-        """Resolved inline content up to the blob aggregate cap fits under the YAML cap."""
-        from elspeth.config_loading import load_settings_from_yaml_string
-        from elspeth.core.blobs_inline import BLOB_INLINE_AGGREGATE_BYTE_CAP
+    def test_load_settings_from_yaml_string_holds_user_yaml_to_the_2_mib_limit(self) -> None:
+        """User-written and CLI YAML: the text limit is 2 MiB, at the limit and one byte over.
 
-        inline_content = "x" * BLOB_INLINE_AGGREGATE_BYTE_CAP
-        settings = load_settings_from_yaml_string(
-            f"""
+        This limit no longer has to hold the file-text cap. A web preflight
+        judges the configuration it resolved (file-held text substituted in)
+        as data, against its own bound derived from the cap:
+        ``tests/unit/web/execution/test_rendered_pipeline_yaml.py``
+        (``test_a_resolved_configuration_holding_the_whole_file_text_cap_passes_its_bound``).
+        """
+        from elspeth.config_loading import load_settings_from_yaml_string
+        from elspeth.core.config import MAX_IN_MEMORY_PIPELINE_YAML_BYTES
+
+        template = """
 sources:
   primary:
     plugin: csv_local
     on_success: output
     options:
-      inline_content: {inline_content}
+      inline_content: {content}
 sinks:
   output:
     plugin: json
     on_write_failure: discard
     options: {{}}
 """
-        )
+        overhead = len(template.format(content="").encode("utf-8"))
+        at_limit = "x" * (MAX_IN_MEMORY_PIPELINE_YAML_BYTES - overhead)
+        text_at_limit = template.format(content=at_limit)
+        assert len(text_at_limit.encode("utf-8")) == MAX_IN_MEMORY_PIPELINE_YAML_BYTES
 
-        assert settings.sources["primary"].options["inline_content"] == inline_content
+        settings = load_settings_from_yaml_string(text_at_limit)
+        assert settings.sources["primary"].options["inline_content"] == at_limit
+
+        with pytest.raises(ValueError, match=f"^YAML content exceeds the {MAX_IN_MEMORY_PIPELINE_YAML_BYTES} byte YAML limit$"):
+            load_settings_from_yaml_string(template.format(content=at_limit + "x"))
 
     def test_load_settings_from_config_dict_accepts_content_that_would_dump_over_yaml_cap(self) -> None:
         """Resolved inline content is not serialized back through the YAML byte cap."""

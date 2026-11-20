@@ -1,6 +1,6 @@
 """Tests for dry-run validation using real engine code paths.
 
-Validation calls the actual engine functions: load_settings_from_yaml_string(),
+Validation calls the actual engine functions: load_settings_from_config_dict(),
 instantiate_plugins_from_config(), ExecutionGraph.from_plugin_instances(),
 graph.validate(). No parallel validation logic exists.
 
@@ -18,7 +18,6 @@ from typing import Any, cast
 from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
-import yaml
 from pydantic import BaseModel, SecretBytes
 from pydantic import ValidationError as PydanticValidationError
 from structlog.testing import capture_logs
@@ -454,7 +453,7 @@ class TestValidatePipelineLlmSourcePolicy:
         yaml_generator = MagicMock(spec=YamlGenerator)
         yaml_generator.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as settings_loader:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as settings_loader:
             settings_loader.side_effect = ValueError("settings stop")
             result = validate_pipeline_for_trained_operator(
                 state,
@@ -491,7 +490,7 @@ class TestValidatePipelineLlmSourcePolicy:
         yaml_generator = MagicMock(spec=YamlGenerator)
         yaml_generator.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as settings_loader:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as settings_loader:
             settings_loader.side_effect = ValueError("settings stop")
             result = validate_pipeline_for_trained_operator(
                 state,
@@ -573,7 +572,7 @@ class TestValidatePipelineLlmSourcePolicy:
         yaml_generator = MagicMock(spec=YamlGenerator)
         yaml_generator.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as settings_loader:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as settings_loader:
             settings_loader.side_effect = ValueError("settings stop")
             result = validate_pipeline_for_trained_operator(
                 state,
@@ -640,7 +639,7 @@ class TestValidatePipelineLlmSourcePolicy:
         yaml_generator = MagicMock(spec=YamlGenerator)
         yaml_generator.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as settings_loader:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as settings_loader:
             settings_loader.side_effect = ValueError("settings stop")
             result = validate_pipeline_for_trained_operator(
                 state,
@@ -1159,7 +1158,7 @@ def test_public_facade_resolves_runtime_dependencies_at_call_time() -> None:
     graph = _runtime_graph_mock()
 
     with (
-        patch("elspeth.web.execution.validation.load_settings_from_yaml_string", return_value=_fake_settings()) as load_settings,
+        patch("elspeth.web.execution.validation.load_settings_from_config_dict", return_value=_fake_settings()) as load_settings,
         patch(
             "elspeth.web.execution.validation.instantiate_runtime_plugins",
             return_value=_FakeRuntimeBundle(),
@@ -1203,7 +1202,7 @@ def test_canonical_web_validation_lowers_profiled_s3_source_before_runtime_const
     graph = _runtime_graph_mock()
 
     with (
-        patch("elspeth.web.execution.validation.load_settings_from_yaml_string", return_value=_fake_settings()) as load_settings,
+        patch("elspeth.web.execution.validation.load_settings_from_config_dict", return_value=_fake_settings()) as load_settings,
         patch(
             "elspeth.web.execution.validation.instantiate_runtime_plugins",
             return_value=_FakeRuntimeBundle(),
@@ -1254,6 +1253,9 @@ def test_canonical_web_validation_lowers_profiled_s3_source_before_runtime_const
 
 
 def test_public_facade_resolves_bounded_and_dict_loaders_at_call_time() -> None:
+    # The literal "blob_ref"/"inline_content" text sends materialization
+    # through its injected bounded loader (it then finds no marker); the
+    # runtime phase loads settings through the injected dict loader.
     state = _make_state(outputs=(_make_output(),))
     settings = _make_settings()
     yaml_generator = _FakeYamlGenerator(
@@ -1262,6 +1264,7 @@ def test_public_facade_resolves_bounded_and_dict_loaders_at_call_time() -> None:
     plugin: csv
     on_success: primary
     options:
+      note: blob_ref inline_content
       api_key:
         secret_ref: MY_KEY
 sinks:
@@ -1272,19 +1275,12 @@ sinks:
     )
     catalog = create_catalog_service()
     plugin_snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
-    parsed_config = {
-        "sources": {
-            "primary": {
-                "plugin": "csv",
-                "on_success": "primary",
-                "options": {"api_key": {"secret_ref": "MY_KEY"}},
-            }
-        },
-        "sinks": {"primary": {"plugin": "csv", "options": {}}},
-    }
 
     with (
-        patch("elspeth.web.execution.validation.load_bounded_pipeline_yaml", return_value=parsed_config) as load_yaml,
+        patch(
+            "elspeth.web.execution.validation.load_bounded_pipeline_yaml",
+            wraps=validation_module.load_bounded_pipeline_yaml,
+        ) as load_yaml,
         patch(
             "elspeth.web.execution.validation.load_settings_from_config_dict",
             side_effect=ValueError("stop after facade dependency capture"),
@@ -1319,8 +1315,10 @@ def test_web_validation_stamps_operator_export_before_settings_model_load(author
     }
     catalog = create_catalog_service()
 
+    # No inline-content marker: materialization hands the runtime phase the
+    # text alone, and its bounded load is what this patch answers.
     with (
-        patch("elspeth.web.execution.validation.load_bounded_pipeline_yaml", return_value=parsed_config),
+        patch("elspeth.web.execution._rendered_pipeline_yaml.load_bounded_pipeline_yaml", return_value=parsed_config),
         patch(
             "elspeth.web.execution.validation.load_settings_from_config_dict",
             side_effect=ValueError("stop after operator marking"),
@@ -1351,7 +1349,6 @@ def test_validation_pipeline_delegates_to_injected_impl_with_its_dependencies() 
 
     dependencies = ValidationDependencies(
         load_yaml=validation_module.load_bounded_pipeline_yaml,
-        load_settings_yaml=validation_module.load_settings_from_yaml_string,
         load_settings_dict=validation_module.load_settings_from_config_dict,
         instantiate_plugins=validation_module.instantiate_runtime_plugins,
         build_graph=validation_module.build_runtime_graph,
@@ -1510,7 +1507,7 @@ class TestValidatePipelineEmptyComposition:
         the mocks would intercept — confirms we are NOT relying on
         ``load_settings_from_yaml_string`` raising PydanticValidationError
         to detect this case."""
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             state = _make_state(source_options=None)
             settings = _make_settings()
             result = validate_pipeline_for_trained_operator(state, settings, _FakeYamlGenerator())
@@ -1529,7 +1526,7 @@ class TestValidatePipelineEmptyComposition:
         settings = _make_settings()
 
         with (
-            patch("elspeth.web.execution.validation.load_settings_from_yaml_string"),
+            patch("elspeth.web.execution.validation.load_settings_from_config_dict"),
             patch("elspeth.web.execution.validation.instantiate_runtime_plugins") as mock_inst,
         ):
             mock_inst.side_effect = PluginNotFoundError("placeholder")
@@ -1635,7 +1632,7 @@ class TestValidatePipelineMissingPartReframe:
         mock_yaml.generate_yaml.return_value = "sources:\n  source:\n    plugin: csv\n    options: {}"
         exc = _elspeth_settings_missing_parts_error(present={"sources"})
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string", side_effect=exc):
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict", side_effect=exc):
             result = validate_pipeline_for_trained_operator(state, _make_settings(), mock_yaml)
 
         assert result.is_valid is False
@@ -1654,7 +1651,7 @@ class TestValidatePipelineMissingPartReframe:
         mock_yaml.generate_yaml.return_value = "sources:\n  source:\n    plugin: csv\n    options: {}"
 
         with patch(
-            "elspeth.web.execution.validation.load_settings_from_yaml_string",
+            "elspeth.web.execution.validation.load_settings_from_config_dict",
             side_effect=ValueError("some other settings problem"),
         ):
             result = validate_pipeline_for_trained_operator(state, _make_settings(), mock_yaml)
@@ -1704,7 +1701,7 @@ class TestValidatePipelinePathAllowlist:
         settings = _make_settings(data_dir="/tmp/test_data")
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
         # B11: path check is always recorded — verify it passed
@@ -1759,7 +1756,7 @@ class TestValidatePipelinePathAllowlist:
         settings = _make_settings(data_dir="/tmp/test_data")
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
         # B11: check IS recorded with passed=True and "skipped" detail
@@ -1811,7 +1808,7 @@ class TestValidatePipelineWebFetchNetworkPolicy:
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}\n"
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("settings stop")
             result = validate_pipeline_for_web_principal(state, settings, mock_yaml_gen)
 
@@ -1835,7 +1832,7 @@ class TestValidatePipelineWebFetchNetworkPolicy:
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}\n"
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("settings stop")
             result = validate_pipeline_for_web_principal(
                 state,
@@ -1858,7 +1855,7 @@ class TestValidatePipelineWebFetchNetworkPolicy:
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}\n"
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("settings stop")
             result = validate_pipeline_for_trained_operator(state, _make_settings(), mock_yaml_gen)
 
@@ -1884,7 +1881,7 @@ class TestValidatePipelineWebFetchNetworkPolicy:
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}\n"
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("settings stop")
             result = validate_pipeline_for_web_principal(state, settings, mock_yaml_gen)
 
@@ -1929,7 +1926,7 @@ class TestValidatePipelineWebFetchNetworkPolicy:
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}\n"
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("settings stop")
             result = validate_pipeline_for_web_principal(state, settings, mock_yaml_gen)
 
@@ -1968,7 +1965,7 @@ class TestValidatePipelineWebFetchNetworkPolicy:
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}\n"
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("settings stop")
             result = validate_pipeline_for_web_principal(state, _make_settings(), mock_yaml_gen)
 
@@ -1995,7 +1992,7 @@ class TestValidatePipelineWebFetchNetworkPolicy:
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}\n"
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("settings stop")
             result = validate_pipeline_for_web_principal(state, settings, mock_yaml_gen)
 
@@ -2016,7 +2013,7 @@ class TestValidatePipelineWebFetchNetworkPolicy:
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}\n"
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("settings stop")
             result = validate_pipeline_for_trained_operator(state, _make_settings(), mock_yaml_gen)
 
@@ -2039,7 +2036,7 @@ class TestValidatePipelineWebFetchNetworkPolicy:
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}\n"
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("settings stop")
             result = validate_pipeline_for_web_principal(state, settings, mock_yaml_gen)
 
@@ -2069,7 +2066,7 @@ class TestValidatePipelineWebFetchNetworkPolicy:
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}\n"
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("settings stop")
             result = validate_pipeline_for_web_principal(state, settings, mock_yaml_gen)
 
@@ -2098,7 +2095,7 @@ class TestValidatePipelineWebFetchNetworkPolicy:
         settings = _make_settings()
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}\n"
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("settings stop")
             result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
 
@@ -2161,7 +2158,7 @@ class TestValidatePipelineLlmBaseUrlPolicy:
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv\n  options: {}\n"
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("settings stop")
             result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
 
@@ -2179,7 +2176,7 @@ class TestValidatePipelineLlmBaseUrlPolicy:
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv\n  options: {}\n"
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("settings stop")
             result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
 
@@ -2197,7 +2194,7 @@ class TestValidatePipelineLlmBaseUrlPolicy:
         settings = _make_settings()
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv\n  options: {}\n"
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("settings stop")
             result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
 
@@ -2213,7 +2210,7 @@ class TestValidatePipelineLlmBaseUrlPolicy:
         settings = _make_settings()
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv\n  options: {}\n"
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("settings stop")
             result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
 
@@ -2258,7 +2255,7 @@ class TestValidatePipelineLlmTracingPolicy:
 
         with (
             patch(
-                "elspeth.web.execution.validation.load_settings_from_yaml_string",
+                "elspeth.web.execution.validation.load_settings_from_config_dict",
                 side_effect=ValueError("settings stop"),
             ) as mock_load,
             patch("elspeth.web.execution.validation.instantiate_runtime_plugins") as mock_instantiate,
@@ -2302,7 +2299,7 @@ class TestValidatePipelineAwsS3EndpointUrlPolicy:
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("settings stop")
             result = validate_pipeline_for_trained_operator(state, _make_settings(), mock_yaml_gen)
 
@@ -2328,7 +2325,7 @@ class TestValidatePipelineAwsS3EndpointUrlPolicy:
         mock_yaml_gen.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
 
         with (
-            patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load,
+            patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load,
             patch("elspeth.web.execution.validation.instantiate_runtime_plugins") as mock_instantiate,
         ):
             result = validation_module.validate_pipeline(
@@ -2370,7 +2367,7 @@ class TestValidatePipelineAwsS3EndpointUrlPolicy:
         mock_yaml_gen.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
 
         with (
-            patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load,
+            patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load,
             patch("elspeth.web.execution.validation.instantiate_runtime_plugins") as mock_instantiate,
         ):
             result = validate_pipeline_for_web_principal(state, settings, mock_yaml_gen)
@@ -2399,7 +2396,7 @@ class TestValidatePipelineAwsS3EndpointUrlPolicy:
         mock_yaml_gen.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
 
         with (
-            patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load,
+            patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load,
             patch("elspeth.web.execution.validation.instantiate_runtime_plugins") as mock_instantiate,
         ):
             result = validate_pipeline_for_web_principal(state, settings, mock_yaml_gen)
@@ -2427,7 +2424,7 @@ class TestValidatePipelineAwsS3EndpointUrlPolicy:
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("settings stop")
             result = validate_pipeline_for_trained_operator(state, _make_settings(), mock_yaml_gen)
 
@@ -2455,7 +2452,7 @@ class TestValidatePipelineAwsS3EndpointUrlPolicy:
         mock_yaml_gen.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
 
         with (
-            patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load,
+            patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load,
             patch("elspeth.web.execution.validation.instantiate_runtime_plugins") as mock_instantiate,
         ):
             mock_load.side_effect = ValueError("settings stop")
@@ -2682,7 +2679,7 @@ class TestValidatePipelinePendingInterpretationPlaceholders:
         graph = _runtime_graph_mock()
 
         with (
-            patch("elspeth.web.execution.validation.load_settings_from_yaml_string", return_value=_fake_settings()),
+            patch("elspeth.web.execution.validation.load_settings_from_config_dict", return_value=_fake_settings()),
             patch("elspeth.web.execution.validation.instantiate_runtime_plugins", return_value=_FakeRuntimeBundle()),
             patch("elspeth.web.execution.validation.build_runtime_graph", return_value=graph),
             patch(
@@ -2972,7 +2969,7 @@ class TestValidatePipelinePendingInterpretationPlaceholders:
             return "source:\n  plugin: csv_source\n  options: {}"
 
         mock_yaml_gen.generate_yaml.side_effect = _generate_yaml
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("settings stop")
             result = validate_pipeline_for_trained_operator(
                 state,
@@ -3007,7 +3004,7 @@ class TestValidatePipelinePendingInterpretationPlaceholders:
             return "source:\n  plugin: csv_source\n  options: {}"
 
         mock_yaml_gen.generate_yaml.side_effect = _generate_yaml
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("settings stop")
             result = validate_pipeline_for_trained_operator(
                 state,
@@ -3053,7 +3050,7 @@ class TestValidatePipelineSinkPathAllowlist:
         settings = _make_settings(data_dir="/tmp/test_data")
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
         path_check = next(c for c in result.checks if c.name == "path_allowlist")
@@ -3069,7 +3066,7 @@ class TestValidatePipelineSinkPathAllowlist:
         settings = _make_settings(data_dir="/tmp/test_data")
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen, session_id="sess-1")
         path_check = next(c for c in result.checks if c.name == "path_allowlist")
@@ -3137,7 +3134,7 @@ class TestValidatePipelineSinkPathAllowlist:
         settings = _make_settings(data_dir="/tmp/test_data")
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
         path_check = next(c for c in result.checks if c.name == "path_allowlist")
@@ -3186,7 +3183,7 @@ class TestValidatePipelineTransformProviderConfigPathAllowlist:
         settings = _make_settings(data_dir="/tmp/test_data")
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
         path_check = next(c for c in result.checks if c.name == "path_allowlist")
@@ -3198,7 +3195,7 @@ class TestValidatePipelineTransformProviderConfigPathAllowlist:
         settings = _make_settings(data_dir="/tmp/test_data")
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
         # No path option anywhere → check is recorded as passed (skipped-style).
@@ -3366,7 +3363,7 @@ class TestValidatePipelineLlmRetryBudgetPolicy:
         settings = _make_settings(data_dir="/tmp/test_data")
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
 
             # Authoring-preflight path (allow_pending_interpretation_placeholders=True):
@@ -3391,7 +3388,7 @@ class TestValidatePipelineLlmRetryBudgetPolicy:
         settings = _make_settings(data_dir="/tmp/test_data")
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             # Authoring-preflight path so llm_retry_budget_policy (#9) is reached past
             # interpretation_review (#6); see the blocked-budget test above.
@@ -3406,7 +3403,7 @@ class TestValidatePipelineLlmRetryBudgetPolicy:
         settings = _make_settings(data_dir="/tmp/test_data")
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             # Authoring-preflight path so llm_retry_budget_policy (#9) is reached past
             # interpretation_review (#6); see the blocked-budget test above.
@@ -3522,7 +3519,7 @@ class TestValidatePipelineSemanticContractsLegacy:
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
 
@@ -3546,7 +3543,7 @@ class TestValidatePipelineSemanticContractsLegacy:
         settings = _make_settings(data_dir="/tmp/test_data")
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
 
@@ -3661,7 +3658,7 @@ class TestValidatePipelineSemanticContracts:
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
 
@@ -3773,7 +3770,7 @@ class TestValidatePipelineRelativePaths:
         settings = _make_settings(data_dir="/tmp/test_data")
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
         path_check = next(c for c in result.checks if c.name == "path_allowlist")
@@ -3787,7 +3784,7 @@ class TestValidatePipelineRelativePaths:
         settings = _make_settings(data_dir="/tmp/test_data")
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
         path_check = next(c for c in result.checks if c.name == "path_allowlist")
@@ -3815,7 +3812,7 @@ class TestValidatePipelineRelativePaths:
         settings = _make_settings(data_dir="/tmp/test_data")
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen, session_id="sess-1")
         path_check = next(c for c in result.checks if c.name == "path_allowlist")
@@ -3839,7 +3836,7 @@ class TestValidatePipelineRelativePaths:
 
 class TestValidatePipelineSuccess:
     @patch("elspeth.web.execution.validation.assemble_and_validate_pipeline_config")
-    @patch("elspeth.web.execution.validation.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.validation.load_settings_from_config_dict")
     @patch("elspeth.web.execution.validation.instantiate_runtime_plugins")
     @patch("elspeth.web.execution.validation.build_runtime_graph")
     def test_valid_pipeline_returns_all_checks_passed(
@@ -3915,7 +3912,7 @@ class TestValidatePipelineSuccess:
         mock_graph.validate_edge_compatibility.assert_called_once()
 
     @patch("elspeth.web.execution.validation.assemble_and_validate_pipeline_config")
-    @patch("elspeth.web.execution.validation.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.validation.load_settings_from_config_dict")
     @patch("elspeth.web.execution.validation.instantiate_runtime_plugins")
     @patch("elspeth.web.execution.validation.build_runtime_graph")
     def test_validate_pipeline_surfaces_graph_warnings(
@@ -4133,7 +4130,7 @@ sinks:
         assert any("template_file" in error.message and "load_settings()" in error.message for error in result.errors)
         mock_instantiate.assert_not_called()
 
-    @patch("elspeth.web.execution.validation.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.validation.load_settings_from_config_dict")
     def test_pydantic_validation_error_short_circuits(
         self,
         mock_load: MagicMock,
@@ -4168,7 +4165,7 @@ sinks:
         assert all(not c.passed for c in skipped)
         assert len(result.errors) >= 1
 
-    @patch("elspeth.web.execution.validation.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.validation.load_settings_from_config_dict")
     def test_file_not_found_error_from_settings(
         self,
         mock_load: MagicMock,
@@ -4186,7 +4183,7 @@ sinks:
 
 
 class TestValidatePipelinePluginFailure:
-    @patch("elspeth.web.execution.validation.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.validation.load_settings_from_config_dict")
     @patch("elspeth.web.execution.validation.instantiate_runtime_plugins")
     def test_unknown_plugin_returns_attributed_error(
         self,
@@ -4263,7 +4260,7 @@ sinks:
 
 
 class TestValidatePipelineGraphFailure:
-    @patch("elspeth.web.execution.validation.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.validation.load_settings_from_config_dict")
     @patch("elspeth.web.execution.validation.instantiate_runtime_plugins")
     @patch("elspeth.web.execution.validation.build_runtime_graph")
     def test_graph_validation_error_attributed_to_node(
@@ -4289,7 +4286,7 @@ class TestValidatePipelineGraphFailure:
         assert _check(result, "graph_structure").passed is False
         assert len(result.errors) >= 1
 
-    @patch("elspeth.web.execution.validation.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.validation.load_settings_from_config_dict")
     @patch("elspeth.web.execution.validation.instantiate_runtime_plugins")
     @patch("elspeth.web.execution.validation.build_runtime_graph")
     def test_edge_compatibility_error(
@@ -4321,7 +4318,7 @@ class TestValidatePipelineGraphFailure:
 class TestValidatePipelineNoBareCatch:
     """W18 fix: unexpected exceptions propagate — no bare except Exception."""
 
-    @patch("elspeth.web.execution.validation.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.validation.load_settings_from_config_dict")
     def test_unexpected_exception_propagates(
         self,
         mock_load: MagicMock,
@@ -4340,7 +4337,7 @@ class TestValidatePipelineNoBareCatch:
 class TestValidatePipelineInMemoryLoading:
     """Verify settings loading uses in-memory loader, matching execution service."""
 
-    @patch("elspeth.web.execution.validation.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.validation.load_settings_from_config_dict")
     @patch("elspeth.web.execution.validation.instantiate_runtime_plugins")
     @patch("elspeth.web.execution.validation.build_runtime_graph")
     def test_settings_loaded_from_yaml_string(
@@ -4349,7 +4346,7 @@ class TestValidatePipelineInMemoryLoading:
         mock_instantiate: MagicMock,
         mock_load: MagicMock,
     ) -> None:
-        """Settings are loaded via load_settings_from_yaml_string, not file-based."""
+        """Settings load in memory from the bounded-loaded mapping, not file-based."""
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
         mock_settings = _fake_settings()
@@ -4363,11 +4360,11 @@ class TestValidatePipelineInMemoryLoading:
         settings = _make_settings()
         validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
 
-        # In-memory loader called with YAML string content
+        # In-memory loader called with the mapping parsed from the YAML content
         mock_load.assert_called_once()
-        loaded_yaml = mock_load.call_args.args[0]
-        assert isinstance(loaded_yaml, str)
-        assert "csv_source" in loaded_yaml
+        loaded_config = mock_load.call_args.args[0]
+        assert type(loaded_config) is dict
+        assert loaded_config["source"]["plugin"] == "csv_source"
 
 
 # ── Secret Ref Helpers ────────────────────────────────────────────────
@@ -4512,7 +4509,7 @@ class TestValidatePipelineSecretRefs:
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
         secret_svc = FakeSecretService(available_refs={"MY_KEY"})
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(
                 state,
@@ -4536,7 +4533,7 @@ class TestValidatePipelineSecretRefs:
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
         secret_svc = FakeSecretService(available_refs=set())
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(
                 state,
@@ -4559,7 +4556,7 @@ class TestValidatePipelineSecretRefs:
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
 
@@ -4871,7 +4868,7 @@ class TestValidatePipelineFabricatedCredentials:
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
         secret_svc = FakeSecretService(available_refs={"REAL_KEY"})
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(
                 state,
@@ -4956,7 +4953,7 @@ class TestValidatePipelineFabricatedCredentials:
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
         secret_svc = FakeSecretService(available_refs=set(refs.values()))
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(
                 state,
@@ -5036,7 +5033,7 @@ class TestValidatePipelineFabricatedCredentials:
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
         secret_svc = FakeSecretService(available_refs={"DATABASE_URL"})
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(
                 state,
@@ -5062,7 +5059,7 @@ class TestValidatePipelineFabricatedCredentials:
             inventory_refs={"OPENROUTER_API_KEY"},
         )
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(
                 state,
@@ -5086,7 +5083,7 @@ class TestValidatePipelineFabricatedCredentials:
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
         secret_svc = FakeSecretService(available_refs=set())
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(
                 state,
@@ -5110,7 +5107,7 @@ class TestValidatePipelineFabricatedCredentials:
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
         secret_svc = FakeSecretService(available_refs=set())
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(
                 state,
@@ -5142,7 +5139,7 @@ class TestValidatePipelineFabricatedCredentials:
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
         secret_svc = FakeSecretService(available_refs=set())
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(
                 state,
@@ -5167,7 +5164,7 @@ class TestValidatePipelineFabricatedCredentials:
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
         secret_svc = FakeSecretService(available_refs=set())
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")
             result = validate_pipeline_for_trained_operator(
                 state,
@@ -5346,7 +5343,7 @@ class TestSecretRefResolutionBeforeSettingsLoad:
         assert resolved_config["source"]["options"]["api_key"] == "fake"
         assert _check(result, "settings_load").passed is True
 
-    @patch("elspeth.web.execution.validation.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.validation.load_settings_from_config_dict")
     @patch("elspeth.web.execution.validation.instantiate_runtime_plugins")
     @patch("elspeth.web.execution.validation.build_runtime_graph")
     def test_no_secrets_also_uses_in_memory_loader(
@@ -5355,10 +5352,10 @@ class TestSecretRefResolutionBeforeSettingsLoad:
         mock_instantiate: MagicMock,
         mock_load_string: MagicMock,
     ) -> None:
-        """Without secret refs, validation still uses load_settings_from_yaml_string.
+        """Without secret refs, validation still uses load_settings_from_config_dict.
 
-        Both paths (with and without secrets) use the same in-memory loader
-        to ensure validation exercises the exact same code path as execution.
+        Both paths (with and without secrets) load settings from the one
+        bounded-loaded mapping through the same in-memory loader.
         """
         state = _make_state(source_options={"url": "https://example.com/data"})
         settings = _make_settings()
@@ -5391,11 +5388,11 @@ class TestSecretRefResolutionBeforeSettingsLoad:
 
 class TestValidatePipelineRuntimePathResolution:
     @staticmethod
-    def _loaded_yaml_from_settings_loader(mock_load: MagicMock) -> str:
+    def _loaded_config_from_settings_loader(mock_load: MagicMock) -> dict[str, Any]:
         call = mock_load.call_args
         if call.args:
-            return cast(str, call.args[0])
-        return cast(str, call.kwargs["yaml_content"])
+            return cast(dict[str, Any], call.args[0])
+        return cast(dict[str, Any], call.kwargs["config_dict"])
 
     def test_validate_pipeline_resolves_relative_source_and_sink_paths_before_settings_load(self) -> None:
         state = CompositionState(
@@ -5435,12 +5432,11 @@ sinks:
       path: outputs/out.csv
 """
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("stop after settings-load input capture")
             validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
 
-        loaded_yaml = self._loaded_yaml_from_settings_loader(mock_load)
-        parsed = yaml.safe_load(loaded_yaml)
+        parsed = self._loaded_config_from_settings_loader(mock_load)
         assert parsed["sources"]["primary"]["options"]["path"] == "/tmp/test_data/blobs/test-session/input.csv"
         assert parsed["sinks"]["main"]["options"]["path"] == "/tmp/test_data/outputs/test-session/out.csv"
 
@@ -5482,12 +5478,11 @@ sinks:
       path: /tmp/test_data/outputs/test-session/out.csv
 """
 
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict") as mock_load:
             mock_load.side_effect = ValueError("stop after settings-load input capture")
             validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
 
-        loaded_yaml = self._loaded_yaml_from_settings_loader(mock_load)
-        parsed = yaml.safe_load(loaded_yaml)
+        parsed = self._loaded_config_from_settings_loader(mock_load)
         assert parsed["sources"]["primary"]["options"]["path"] == "/tmp/test_data/blobs/test-session/input.csv"
         assert parsed["sinks"]["main"]["options"]["path"] == "/tmp/test_data/outputs/test-session/out.csv"
 
@@ -5535,7 +5530,7 @@ sinks:
         fake_graph = _runtime_graph_mock()
 
         with (
-            patch("elspeth.web.execution.validation.load_settings_from_yaml_string", return_value=_fake_settings()),
+            patch("elspeth.web.execution.validation.load_settings_from_config_dict", return_value=_fake_settings()),
             patch("elspeth.web.execution.validation.instantiate_runtime_plugins", return_value=_FakeRuntimeBundle()) as mock_instantiate,
             patch("elspeth.web.execution.validation.build_runtime_graph", return_value=fake_graph),
             patch("elspeth.web.execution.validation.assemble_and_validate_pipeline_config", return_value=_fake_pipeline_config()),
@@ -5569,7 +5564,7 @@ sinks:
         mock_yaml_gen.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
         fake_graph = _runtime_graph_mock()
         with (
-            patch("elspeth.web.execution.validation.load_settings_from_yaml_string", return_value=_fake_settings()),
+            patch("elspeth.web.execution.validation.load_settings_from_config_dict", return_value=_fake_settings()),
             patch("elspeth.web.execution.validation.instantiate_runtime_plugins", return_value=_FakeRuntimeBundle()),
             patch("elspeth.web.execution.validation.build_runtime_graph", return_value=fake_graph),
             patch("elspeth.web.execution.validation.assemble_and_validate_pipeline_config", return_value=_fake_pipeline_config()),
@@ -5589,7 +5584,7 @@ sinks:
         assert emitted.index("aws_s3_source_policy") == emitted.index("aws_s3_endpoint_url_policy") + 1
         assert emitted.index("web_scrape_network_policy") < emitted.index("llm_retry_budget_policy")
 
-    @patch("elspeth.web.execution.validation.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.validation.load_settings_from_config_dict")
     @patch("elspeth.web.execution.validation.instantiate_runtime_plugins")
     @patch("elspeth.web.execution.validation.build_runtime_graph")
     def test_graph_structure_failure_uses_graph_check(
@@ -5632,7 +5627,7 @@ sinks:
         fake_graph.validate_edge_compatibility.assert_not_called()
 
     @patch("elspeth.web.execution.validation.assemble_and_validate_pipeline_config")
-    @patch("elspeth.web.execution.validation.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.validation.load_settings_from_config_dict")
     @patch("elspeth.web.execution.validation.instantiate_runtime_plugins")
     @patch("elspeth.web.execution.validation.build_runtime_graph")
     def test_schema_failure_uses_schema_check(
@@ -6185,7 +6180,7 @@ class TestEdgeContractFailureFormatting:
 
     # ── End-to-end through validate_pipeline_for_trained_operator ─────────────────────────────
 
-    @patch("elspeth.web.execution.validation.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.validation.load_settings_from_config_dict")
     @patch("elspeth.web.execution.validation.instantiate_runtime_plugins")
     @patch("elspeth.web.execution.validation.build_runtime_graph")
     @patch("elspeth.web.execution.validation.assemble_and_validate_pipeline_config")
@@ -6241,7 +6236,7 @@ class TestEdgeContractFailureFormatting:
         assert err.component_id == "line_explode_d4e5f6"
         assert err.component_type == "transform"
 
-    @patch("elspeth.web.execution.validation.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.validation.load_settings_from_config_dict")
     @patch("elspeth.web.execution.validation.instantiate_runtime_plugins")
     @patch("elspeth.web.execution.validation.build_runtime_graph")
     @patch("elspeth.web.execution.validation.assemble_and_validate_pipeline_config")

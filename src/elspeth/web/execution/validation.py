@@ -9,9 +9,10 @@ W18 fix: Only typed exceptions are caught. Bare except Exception is forbidden.
 Unknown exception types propagate as 500 Internal Server Error, signalling
 that this function needs updating — not that the error should be swallowed.
 
-Settings loading uses load_settings_from_yaml_string() — the same in-memory
-loader as the execution service. This ensures validation exercises the exact
-same code path as execution, and resolved secrets never touch disk.
+Settings loading uses the bounded in-memory YAML load and then
+load_settings_from_config_dict() — the two halves of the execution service's
+load_settings_from_yaml_string(). This ensures validation exercises the same
+code path as execution, and resolved secrets never touch disk.
 
 Route-target validation (issue elspeth-127de6865a) closes the parity gap
 where the orchestrator's four pre-init validators
@@ -29,7 +30,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
-from elspeth.config_loading import load_settings_from_config_dict, load_settings_from_yaml_string
+from elspeth.config_loading import load_settings_from_config_dict
 from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
@@ -475,7 +476,6 @@ def validate_pipeline(
     """Compatibility facade that captures patchable runtime dependencies per call."""
     dependencies = ValidationDependencies(
         load_yaml=load_bounded_pipeline_yaml,
-        load_settings_yaml=load_settings_from_yaml_string,
         load_settings_dict=load_settings_from_config_dict,
         instantiate_plugins=instantiate_runtime_plugins,
         build_graph=build_runtime_graph,
@@ -527,8 +527,9 @@ def _validate_pipeline_impl(
     1. Source path allowlist check (C3/S2 defense-in-depth)
     1b. Secret ref validation (all referenced secrets exist)
     2. Generate YAML from CompositionState
-    3. Load settings via load_settings_from_yaml_string() — resolve secret
-       refs first if present, matching the execution service path exactly
+    3. Load settings: bounded YAML load, resolve secret refs if present,
+       then load_settings_from_config_dict() — the execution service's
+       load_settings_from_yaml_string() split at its parse
     4. instantiate_runtime_plugins(settings, plugin_snapshot=plugin_snapshot)
     5. build_runtime_graph(settings, bundle)
     6. graph.validate() + graph.validate_edge_compatibility()
@@ -695,8 +696,6 @@ def _validate_pipeline_impl(
             operator_settings=settings if isinstance(settings, WebSettings) else None,
             secret_service=secret_service,
             user_id=user_id,
-            load_yaml=dependencies.load_yaml,
-            load_settings_yaml=dependencies.load_settings_yaml,
             load_settings_dict=dependencies.load_settings_dict,
             reframe_missing_parts=_reframe_settings_missing_parts,
         ),

@@ -13,8 +13,6 @@ from pathlib import Path
 from typing import Any, Final, Literal, cast
 from uuid import UUID
 
-import yaml
-
 from elspeth.contracts.blobs import AllowedMimeType, BlobCreator, BlobNotFoundError, BlobRecord, BlobStateError
 from elspeth.contracts.blobs_inline import (
     INLINE_BLOB_NOT_TEXT_CODE,
@@ -39,6 +37,7 @@ from elspeth.core.blobs_inline import (
     _validate_blob_content_refs_sync,
 )
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.execution._rendered_pipeline_yaml import RenderedPipelineYaml, ResolvedPipelineTooLargeError
 from elspeth.web.execution._validation_model import (
     InterpretationValidatedState,
     MaterializedYaml,
@@ -753,7 +752,7 @@ def materialize_validation_yaml(
                 artifact=MaterializedYaml(
                     authored=interpretation.authored,
                     materialized_state=interpretation.materialized_state,
-                    pipeline_yaml=pipeline_yaml,
+                    pipeline=RenderedPipelineYaml.of_text(pipeline_yaml),
                 ),
                 checks=(
                     ValidationCheck(
@@ -964,16 +963,40 @@ def materialize_validation_yaml(
                 readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
                 semantic_contracts=interpretation.authored.semantic_contracts,
             )
+        # The resolved configuration's size is judged here, as text bytes of
+        # its data; the document stays in hand so the settings phase need not
+        # render it and parse it back.
+        try:
+            pipeline = RenderedPipelineYaml.of_resolved(resolved_config)
+        except ResolvedPipelineTooLargeError as exc:
+            detail = f"The resolved pipeline configuration holds {exc.total_bytes} bytes of text; the limit is {exc.limit_bytes} bytes."
+            return PhaseFailure(
+                passed_checks=(),
+                failed_check=ValidationCheck(
+                    name=CHECK_BLOB_INLINE_REFS, passed=False, detail=detail, affected_nodes=(), outcome_code=None
+                ),
+                errors=(
+                    ValidationError(
+                        component_id=None,
+                        component_type=None,
+                        message=detail,
+                        suggestion="Hold less text in prompt files and inline options, or split the pipeline.",
+                        error_code="resolved_pipeline_config_oversized",
+                    ),
+                ),
+                readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
+                semantic_contracts=interpretation.authored.semantic_contracts,
+            )
         check_detail = "All inline-content blob references and bytes are valid"
-        pipeline_yaml = yaml.dump(resolved_config, default_flow_style=False)
     else:
         check_detail = "No inline-content blob references found"
+        pipeline = RenderedPipelineYaml.of_text(pipeline_yaml)
 
     return PhaseReport(
         artifact=MaterializedYaml(
             authored=interpretation.authored,
             materialized_state=interpretation.materialized_state,
-            pipeline_yaml=pipeline_yaml,
+            pipeline=pipeline,
         ),
         checks=(
             ValidationCheck(

@@ -288,6 +288,9 @@ _EMITTED_POLICY_AND_EXECUTION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "missing_secret_ref",
         "missing_sink",
         "missing_source",
+        # Materialization's bound on the resolved configuration's text
+        # (web/execution/_rendered_pipeline_yaml.py).
+        "resolved_pipeline_config_oversized",
         "source_data_contract_analysis_limit_exceeded",
         "state_shape_materialization",
         "unauthorized_secret_ref",

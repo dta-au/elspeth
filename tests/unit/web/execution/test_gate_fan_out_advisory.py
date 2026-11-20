@@ -260,7 +260,7 @@ def _runtime_graph_double() -> MagicMock:
 
 
 @patch("elspeth.web.execution.validation.assemble_and_validate_pipeline_config")
-@patch("elspeth.web.execution.validation.load_settings_from_yaml_string")
+@patch("elspeth.web.execution.validation.load_settings_from_config_dict")
 @patch("elspeth.web.execution.validation.instantiate_runtime_plugins")
 @patch("elspeth.web.execution.validation.build_runtime_graph")
 def test_advisory_is_emitted_without_blocking_the_run(
