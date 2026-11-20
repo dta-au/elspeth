@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final, Literal, cast, final, get_args
@@ -18,7 +19,14 @@ from pydantic import JsonValue
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import is_lower_sha256_hex, stable_hash
 from elspeth.contracts.prompt_guard import PromptGuardContentPart
-from elspeth.web.composer.context_budget import escaped_bytes
+from elspeth.web.composer.context_budget import (
+    ContextBudgetPolicy,
+    ContextBudgetRefusal,
+    SheddableKind,
+    SheddableSegment,
+    decide_context_budget,
+    escaped_bytes,
+)
 from elspeth.web.composer.control_messages import replay_composer_control_message
 from elspeth.web.composer.prompt_guard_rendering import JsonPath, _json_inspection_text, json_content_parts
 from elspeth.web.composer.visible_tool_event import (
@@ -575,11 +583,119 @@ def _recover_read_bodies(events: list[dict[str, Any]], reader: TranscriptBlobRea
 
 # The availability gap a transcript reduced to fit the context budget carries.
 CONTEXT_BUDGET_TRANSCRIPT_OMISSION_GAP: Final[str] = "oldest_events_omitted_for_context_budget"
+# The gap an Advisor transcript carries when it sends earlier tool results as a stub.
+CONTEXT_BUDGET_TRANSCRIPT_STUB_GAP: Final[str] = "older_tool_results_stubbed_for_context_budget"
+# What an earlier tool result reads once the Advisor's context budget stubs it.
+# The compose loop's stub tells the model to call the tool again; the Advisor
+# has no tools, so its stub states only the omission.
+ADVISOR_TRANSCRIPT_TOOL_RESULT_STUB: Final[str] = "[Result omitted by ELSPETH to fit the context budget.]"
+# The gap an Advisor transcript carries when it shortens earlier user requests.
+CONTEXT_BUDGET_TRANSCRIPT_USER_REQUEST_GAP: Final[str] = "older_user_requests_shortened_for_context_budget"
+# How much of an earlier user request the last reduction tier keeps, in characters.
+ADVISOR_TRANSCRIPT_USER_REQUEST_KEEP_CHARS: Final[int] = 2_000
+# What follows the kept start of a shortened earlier user request; it carries
+# the request's original length so the Advisor knows how much it cannot see.
+ADVISOR_TRANSCRIPT_USER_REQUEST_MARKER: Final[str] = (
+    "\n[ELSPETH shortened this earlier user request to its first {kept:,} of {length:,} characters to fit the context budget.]"
+)
+# Worst-case wire bytes a reduced Advisor request adds that the event savings do
+# not count: the longer reduced transcript header with its counts, the
+# ``context_budget_reduction`` object and the three gaps, all JSON-escaped
+# inside the user message, and the separator a saving over-counts when the last
+# earlier event goes. Those are under 850; the rest is margin. A shortened
+# request's own marker is counted in its saving.
+ADVISOR_TRANSCRIPT_REDUCTION_ALLOWANCE_BYTES: Final[int] = 1024
 
 # Where the current request's full text lives; the event carrying one of these
 # as its ``content_ref`` stands for the current request.
 AdvisorRequestReference = Literal["complete_original_user_request_section", "initial_planner_request.intent"]
 _REQUEST_REFERENCES: Final[frozenset[str]] = frozenset(get_args(AdvisorRequestReference))
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class AdvisorTranscriptReduction:
+    """Exact counts an Advisor transcript reduced to fit the context budget discloses."""
+
+    events_omitted: int
+    tool_results_stubbed: int
+    user_requests_shortened: int = 0
+
+    def __post_init__(self) -> None:
+        counts = (self.events_omitted, self.tool_results_stubbed, self.user_requests_shortened)
+        if any(type(count) is not int for count in counts):
+            raise TypeError("Advisor transcript reduction counts must be exact integers")
+        if min(counts) < 0 or sum(counts) == 0:
+            raise ValueError("Advisor transcript reduction must omit, stub or shorten at least one earlier event")
+
+
+def _earlier_event_limit(events: Sequence[dict[str, JsonValue]]) -> int:
+    """Index of the current request's reference event: every event before it belongs to an earlier turn.
+
+    The reference event, any persisted row after it (an interrupted prefix of
+    this same request) and every event observed this turn are this turn's
+    evidence. Without a reference event no event is known to be earlier.
+    """
+    return next(
+        (index for index, event in enumerate(events) if "content_ref" in event and event["content_ref"] in _REQUEST_REFERENCES),
+        0,
+    )
+
+
+def _stubbed_tool_event(event: dict[str, JsonValue]) -> dict[str, JsonValue] | None:
+    """The event with every tool-result body replaced by the Advisor stub; None when it carries none.
+
+    The event is this module's own projection (see ``from_records``):
+    ``legacy_invocations`` is a list of objects and ``recovered_read`` an
+    object with a string ``content``.
+    """
+    if event["role"] != "tool":
+        return None
+    stubbed = dict(event)
+    changed = False
+    if "content" in event and type(event["content"]) is str and event["content"] != ADVISOR_TRANSCRIPT_TOOL_RESULT_STUB:
+        stubbed["content"] = ADVISOR_TRANSCRIPT_TOOL_RESULT_STUB
+        changed = True
+    if "legacy_invocations" in event:
+        invocations: list[JsonValue] = []
+        for invocation in cast(list[dict[str, JsonValue]], event["legacy_invocations"]):
+            if (
+                "result_canonical" in invocation
+                and type(invocation["result_canonical"]) is str
+                and invocation["result_canonical"] != ADVISOR_TRANSCRIPT_TOOL_RESULT_STUB
+            ):
+                invocation = dict(invocation) | {"result_canonical": ADVISOR_TRANSCRIPT_TOOL_RESULT_STUB}
+                changed = True
+            invocations.append(invocation)
+        stubbed["legacy_invocations"] = invocations
+    if "recovered_read" in event:
+        recovered = cast(dict[str, JsonValue], event["recovered_read"])
+        if recovered["content"] != ADVISOR_TRANSCRIPT_TOOL_RESULT_STUB:
+            stubbed["recovered_read"] = recovered | {"content": ADVISOR_TRANSCRIPT_TOOL_RESULT_STUB}
+            changed = True
+    return stubbed if changed else None
+
+
+def _event_wire_bytes(event: dict[str, JsonValue]) -> int:
+    """An event's escaped share of the transcript inside a request message, plus its separator."""
+    return escaped_bytes(json.dumps(event, ensure_ascii=False)) + 1
+
+
+def _shortened_user_event(event: dict[str, JsonValue]) -> dict[str, JsonValue] | None:
+    """A human event cut to its first characters plus a marker with its original length; None when it is short enough."""
+    content = event["content"] if "content" in event else None
+    if type(content) is not str or len(content) <= ADVISOR_TRANSCRIPT_USER_REQUEST_KEEP_CHARS:
+        return None
+    marker = ADVISOR_TRANSCRIPT_USER_REQUEST_MARKER.format(kept=ADVISOR_TRANSCRIPT_USER_REQUEST_KEEP_CHARS, length=len(content))
+    return event | {"content": content[:ADVISOR_TRANSCRIPT_USER_REQUEST_KEEP_CHARS] + marker}
+
+
+def _within_shed_above(policy: ContextBudgetPolicy, request_bytes: int) -> bool:
+    """Whether a request of this many wire bytes is at or under the high mark, priced as the budgeter prices it with no anchor."""
+    return (
+        math.ceil(request_bytes / policy.fallback_bytes_per_token) <= policy.shed_above * policy.max_prompt_tokens
+        and request_bytes <= policy.max_request_bytes
+    )
 
 
 @final
@@ -591,6 +707,9 @@ class AdvisorVisibleTranscript:
     binding: str
     provider_json: str = field(repr=False)
     semantic_binding: str
+    # Set only on the transcript an Advisor request sends after its context
+    # budget reduced it; the header that introduces it states these counts.
+    reduction: AdvisorTranscriptReduction | None = None
 
     def with_request_reference(
         self,
@@ -607,6 +726,8 @@ class AdvisorVisibleTranscript:
             stable_hash({"transcript": self.binding, "request_reference": reference}),
             json.dumps(payload, ensure_ascii=False),
             self.semantic_binding,
+            # Renaming the reference changes no event, so a reduction's counts stay exact.
+            self.reduction,
         )
 
     def event_bytes(self) -> tuple[int, ...]:
@@ -655,6 +776,8 @@ class AdvisorVisibleTranscript:
         """
         if not indices:
             return self
+        if self.reduction is not None:
+            raise ValueError("a transcript already reduced for an Advisor request cannot be reduced again")
         if not indices <= frozenset(self.sheddable_event_indices()):
             raise ValueError("only sheddable transcript events can be omitted")
         payload = json.loads(self.provider_json)
@@ -666,6 +789,117 @@ class AdvisorVisibleTranscript:
             stable_hash({"transcript": self.binding, "omitted_events": sorted(indices)}),
             json.dumps(payload, ensure_ascii=False),
             self.semantic_binding,
+        )
+
+    def context_budget_segments(self) -> tuple[SheddableSegment, ...]:
+        """What an Advisor request may leave out of this transcript, oldest first, as context-budget segments.
+
+        Only events before the current request's reference are eligible, and
+        never a human-authored one. A tool event with a result body yields a
+        ``stub:<index>`` segment (its saving: the body's bytes less the
+        stub's) and every eligible event a ``drop:<index>`` segment (its
+        saving: what remains of it once stubbed). Stubs rank before drops, so
+        a decision stubs every eligible result before it drops any event, and
+        a dropped event's two savings add up to its whole size.
+        """
+        events = json.loads(self.provider_json)["events"]
+        stubs: list[SheddableSegment] = []
+        drops: list[SheddableSegment] = []
+        for index, event in enumerate(events[: _earlier_event_limit(events)]):
+            if event["authorship"] == "human":
+                continue
+            size = _event_wire_bytes(event)
+            stubbed = _stubbed_tool_event(event)
+            stubbed_size = _event_wire_bytes(stubbed) if stubbed is not None else size
+            if stubbed_size < size:
+                stubs.append(SheddableSegment(kind=SheddableKind.TOOL_RESULT, key=f"stub:{index}", saving_bytes=size - stubbed_size))
+                size = stubbed_size
+            drops.append(SheddableSegment(kind=SheddableKind.HATCH_EVENT, key=f"drop:{index}", saving_bytes=size))
+        return (*stubs, *drops)
+
+    def user_request_segments(self) -> tuple[SheddableSegment, ...]:
+        """Earlier user requests the last reduction tier may shorten, oldest first, as ``shorten:<index>`` segments.
+
+        Only a human event before the current request's reference whose text
+        is longer than the kept start is eligible; its saving is its size less
+        the shortened event's, marker included. The current request and this
+        turn's events are never eligible.
+        """
+        events = json.loads(self.provider_json)["events"]
+        segments: list[SheddableSegment] = []
+        for index, event in enumerate(events[: _earlier_event_limit(events)]):
+            shortened = _shortened_user_event(event) if event["authorship"] == "human" else None
+            if shortened is not None:
+                saving = _event_wire_bytes(event) - _event_wire_bytes(shortened)
+                segments.append(SheddableSegment(kind=SheddableKind.USER_REQUEST, key=f"shorten:{index}", saving_bytes=saving))
+        return tuple(segments)
+
+    def reduced(
+        self, *, stubbed: frozenset[int], omitted: frozenset[int], shortened: frozenset[int] = frozenset()
+    ) -> AdvisorVisibleTranscript:
+        """Stub earlier tool results, leave earlier events out and shorten earlier user requests, disclosing exact counts.
+
+        ``binding`` covers this transcript's binding plus the index sets;
+        ``request`` and ``semantic_binding`` are unchanged, so leaving evidence
+        out is never mistaken for new or lost repair progress. No indices
+        returns this transcript.
+        """
+        if not stubbed and not omitted and not shortened:
+            return self
+        if self.reduction is not None:
+            # Indices name this transcript's events and the counts would restart.
+            raise ValueError("a transcript already reduced for an Advisor request cannot be reduced again")
+        payload = json.loads(self.provider_json)
+        events = payload["events"]
+        earlier = list(enumerate(events[: _earlier_event_limit(events)]))
+        eligible = {index for index, event in earlier if event["authorship"] != "human"}
+        if not omitted <= eligible or not stubbed <= eligible:
+            raise ValueError("only earlier, non-human transcript events can be reduced")
+        if not shortened <= {index for index, event in earlier if event["authorship"] == "human"}:
+            raise ValueError("only earlier user requests can be shortened")
+        projected: list[JsonValue] = []
+        stubs_sent = 0
+        for index, event in enumerate(events):
+            if index in omitted:
+                continue
+            if index in stubbed:
+                replacement = _stubbed_tool_event(event)
+                if replacement is None:
+                    raise ValueError("only an earlier tool result with a body can be stubbed")
+                event = replacement
+                stubs_sent += 1
+            if index in shortened:
+                replacement = _shortened_user_event(event)
+                if replacement is None:
+                    raise ValueError("only an earlier user request longer than the kept start can be shortened")
+                event = replacement
+            projected.append(event)
+        payload["events"] = projected
+        for gap, applies in (
+            (CONTEXT_BUDGET_TRANSCRIPT_OMISSION_GAP, bool(omitted)),
+            (CONTEXT_BUDGET_TRANSCRIPT_STUB_GAP, stubs_sent > 0),
+            (CONTEXT_BUDGET_TRANSCRIPT_USER_REQUEST_GAP, bool(shortened)),
+        ):
+            if applies and gap not in payload["availability_gaps"]:
+                payload["availability_gaps"].append(gap)
+        reduction = AdvisorTranscriptReduction(
+            events_omitted=len(omitted), tool_results_stubbed=stubs_sent, user_requests_shortened=len(shortened)
+        )
+        payload["context_budget_reduction"] = {
+            "older_events_omitted": reduction.events_omitted,
+            "older_tool_results_stubbed": reduction.tool_results_stubbed,
+            "older_user_requests_shortened": reduction.user_requests_shortened,
+        }
+        return AdvisorVisibleTranscript(
+            self.request,
+            stable_hash(
+                {"transcript": self.binding, "omitted_events": sorted(omitted)}
+                | ({"stubbed_events": sorted(stubbed)} if stubbed else {})
+                | ({"shortened_events": sorted(shortened)} if shortened else {})
+            ),
+            json.dumps(payload, ensure_ascii=False),
+            self.semantic_binding,
+            reduction,
         )
 
     def untrusted_content_parts(self) -> tuple[PromptGuardContentPart, ...]:
@@ -705,6 +939,52 @@ class AdvisorVisibleTranscript:
 
         walk(payload)
         return json_content_parts(self.provider_json, ensure_ascii=False, string_parts=partitions)
+
+
+def fit_advisor_transcript_to_context_budget(
+    transcript: AdvisorVisibleTranscript, *, policy: ContextBudgetPolicy, request_wire_bytes: int
+) -> AdvisorVisibleTranscript:
+    """Reduce an Advisor request's transcript to the compose loop's context budget, or return it unchanged.
+
+    ``request_wire_bytes`` is the wire size of the whole Advisor request as it
+    would be sent with ``transcript`` unreduced. Under ``shed_above`` of the
+    window nothing changes, byte for byte. Above it, earlier tool results are
+    stubbed and then earlier events dropped, oldest first, toward ``shed_to``.
+    Only when those two tiers cannot bring the request under ``shed_above``
+    are earlier user requests shortened, oldest first, to their first
+    characters, until it is under. The current request and this turn's events
+    are never reduced. Each request decides afresh: the Advisor replays no
+    cached conversation, so there is no shed state to keep stable. Nothing is
+    ever refused here: a request still over the window, or over the byte
+    maximum, is sent with everything eligible reduced, and the provider judges
+    its own limit.
+    """
+    segments = transcript.context_budget_segments()
+    remaining = request_wire_bytes + ADVISOR_TRANSCRIPT_REDUCTION_ALLOWANCE_BYTES
+    shed: tuple[str, ...] = ()
+    if segments:
+        try:
+            decision = decide_context_budget(
+                policy=policy, request_bytes=remaining, segments=segments, previously_shed=frozenset(), on_over_estimate="send"
+            )
+            shed, remaining = decision.shed_keys, decision.request_bytes_after
+        except ContextBudgetRefusal as refusal:
+            # With on_over_estimate="send" the budgeter never raises its "tokens"
+            # refusal (that one is raised only for "refuse"), so a refusal here
+            # is the byte ceiling, raised only once every segment is shed. Any
+            # other ceiling would be a new budgeter contract, not an Advisor fault.
+            if refusal.ceiling != "bytes":
+                raise
+            shed, remaining = tuple(segment.key for segment in segments), refusal.request_bytes
+    shortened: set[int] = set()
+    for segment in transcript.user_request_segments():
+        if _within_shed_above(policy, remaining):
+            break
+        shortened.add(int(segment.key.removeprefix("shorten:")))
+        remaining -= segment.saving_bytes
+    stubbed = frozenset(int(key.removeprefix("stub:")) for key in shed if key.startswith("stub:"))
+    omitted = frozenset(int(key.removeprefix("drop:")) for key in shed if key.startswith("drop:"))
+    return transcript.reduced(stubbed=stubbed, omitted=omitted, shortened=frozenset(shortened))
 
 
 @dataclass(slots=True)

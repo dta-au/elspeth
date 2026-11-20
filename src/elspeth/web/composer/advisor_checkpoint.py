@@ -57,9 +57,15 @@ from elspeth.web.composer.advisor_output import (
     sanitize_advisor_note,
 )
 from elspeth.web.composer.advisor_request import build_advisor_request_options
-from elspeth.web.composer.advisor_transcript import AdvisorTranscriptOwner, AdvisorVisibleTranscript
+from elspeth.web.composer.advisor_transcript import (
+    AdvisorTranscriptOwner,
+    AdvisorVisibleTranscript,
+    fit_advisor_transcript_to_context_budget,
+)
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
+from elspeth.web.composer.context_budget import ContextBudgetPolicy
+from elspeth.web.composer.context_budget_apply import request_wire_bytes
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.llm_response_parsing import (
     attach_llm_calls,
@@ -90,7 +96,7 @@ from elspeth.web.composer.progress import advisor_checkpoint_progress_event, emi
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount
 from elspeth.web.composer.protocol import ComposerResult, ComposerSettings, ToolArgumentError
 from elspeth.web.composer.provider_context import capture_provider_context
-from elspeth.web.composer.provider_errors import ProviderRequestFailure, classify_provider_failure
+from elspeth.web.composer.provider_errors import ProviderRequestFailure, classify_provider_failure, is_context_length_rejection
 from elspeth.web.composer.provider_gateway import (
     _capture_composer_llm_completion_fields,
     _MalformedLLMResponseError,
@@ -251,6 +257,15 @@ class AdvisorCheckpointOwner:
         self._chargeable_admission = chargeable_admission
         self._prompt_guard_mount = (
             prompt_guard_mount if prompt_guard_mount is not None else build_prompt_guard_mount(settings.composer_advisor_prompt_guard)
+        )
+        # The compose loop's own context budget (ComposerServiceImpl builds the
+        # same policy): it assumes the Advisor model's window is at least the
+        # gateway prompt-token limit the operator configured for the composer.
+        self._context_budget_policy = ContextBudgetPolicy(
+            max_prompt_tokens=settings.composer_context_max_prompt_tokens,
+            max_request_bytes=settings.composer_planner_max_request_bytes,
+            shed_above=settings.composer_context_shed_above,
+            shed_to=settings.composer_context_shed_to,
         )
 
     def _require_sessions_service(self) -> SessionServiceProtocol:
@@ -493,6 +508,29 @@ class AdvisorCheckpointOwner:
                 {"type": "text", "text": self._composer_skill_text, "cache_control": {"type": "ephemeral"}},
                 {"type": "text", "text": trigger_instructions},
             ]
+        # The visible transcript is the only part of an Advisor request that
+        # grows with the session. Above the compose loop's shed mark, older
+        # tool results are stubbed and older events left out, oldest first;
+        # this turn's events and every user request always go. Every binding
+        # was taken on the complete transcript before this point; the request
+        # sent states what it leaves out. Under the mark nothing changes.
+        transcript = _advisor_context.advisor_request_transcript(arguments)
+        if transcript is not None:
+            fitted = fit_advisor_transcript_to_context_budget(
+                transcript, policy=self._context_budget_policy, request_wire_bytes=request_wire_bytes(messages, None)
+            )
+            if fitted is not transcript:
+                arguments = (
+                    {**arguments, "publication_review": replace(arguments["publication_review"], transcript=fitted)}
+                    if "publication_review" in arguments
+                    else {**arguments, "advisor_transcript": fitted}
+                )
+                user_msg = _advisor_context.build_advisor_user_message(arguments)
+                messages[1] = {
+                    "role": "user",
+                    "content": user_msg,
+                    PROMPT_GUARD_CONTENT_PARTS_KEY: _advisor_context.advisor_user_content_parts(arguments),
+                }
 
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
@@ -609,7 +647,8 @@ class AdvisorCheckpointOwner:
             failure = classify_provider_failure(exc)
             status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
-            error_message = type(exc).__name__
+            # As the provider gateway records it: a context-length rejection is named.
+            error_message = "context_length_exceeded" if is_context_length_rejection(exc) else error_class
             raise
         except _MalformedLLMResponseError as exc:
             status = ComposerLLMCallStatus.MALFORMED_RESPONSE

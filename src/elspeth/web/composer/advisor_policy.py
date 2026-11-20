@@ -11,6 +11,7 @@ from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Any, Final, Literal
 
+from elspeth.contracts.composer_progress import CONTEXT_BUDGET_REFUSAL_DETAIL
 from elspeth.contracts.provider_rejection import SafeRequestRejection
 from elspeth.web.composer import no_tool_policy as _no_tool_policy
 from elspeth.web.composer.state import CompositionState
@@ -500,9 +501,15 @@ def advisor_signoff_blocked_wording(
             if request_rejection is not None
             else SafeRequestRejection(reason_code=None, reason_disposition="unavailable", reason_source="unavailable")
         )
+        # A request too large for the model's context: the recourse is the
+        # context budget's own (a new session or a shorter request). The
+        # suggestion is stored on the blocker but never matched against stored
+        # text; only its length is bounded (advisor_audit).
         return (
             rejection.public_detail,
-            "An unchanged rejected request will not be retried automatically. Review the rejection reason before sending another message.",
+            CONTEXT_BUDGET_REFUSAL_DETAIL
+            if rejection.reason_code == "context_length_exceeded"
+            else "An unchanged rejected request will not be retried automatically. Review the rejection reason before sending another message.",
         )
     if reason == "unavailable":
         return (

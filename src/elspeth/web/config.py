@@ -371,7 +371,9 @@ class WebSettings(BaseModel):
     composer_max_tool_calls_per_turn: int = Field(default=16, ge=1)
     # Context budget: the operator's gateway prompt-token limit has no safe
     # default, so it is required. The budgeter sheds history above
-    # ``shed_above`` of this cap down to ``shed_to`` of it.
+    # ``shed_above`` of this cap down to ``shed_to`` of it. The same policy
+    # bounds the Advisor's visible transcript, so it assumes the Advisor
+    # model's window is at least this cap.
     composer_context_max_prompt_tokens: int = Field(..., strict=True, ge=1)
     composer_context_shed_above: float = Field(default=0.85, strict=True, gt=0, le=1)
     composer_context_shed_to: float = Field(default=0.60, strict=True, gt=0, lt=1)
