@@ -56,8 +56,13 @@ Add `--execute` once the plan is right. What it does, in order:
    anything changed since the drain check, then captures every database
    (logical dump, cluster globals, physical base backup) and every
    non-database volume. It re-reads the counts again and aborts if the capture
-   raced a write. The writers are unpaused whatever happens; a container that
-   will not unpause is reported by name.
+   raced a write. Each writer is recorded before its pause is issued, so a
+   pause that fails or hangs part-way still counts. Every recorded writer is
+   then unpaused whatever happens, including SIGINT, SIGTERM or SIGHUP during
+   capture: each unpause is retried and checked against the container's paused
+   state, a failure on one writer does not stop the others, and the run ends
+   with a `writers_still_paused` event and a stderr warning naming every
+   container still paused, with the exact `docker unpause` command to run.
 6. Decodes every logical dump with `pg_restore --list`. For each physical
    backup it measures the archive's rounded file size; when the verification
    volume (the `--verification-mount` volume of `--verification-container`,
@@ -150,17 +155,26 @@ one's hash and size. Then, for each pending `llm_prompt_template` review, it
 proves that the review is live, that it shows the node's current prompt
 options, that its bindings are exactly the prompt's file markers, and that
 every bound file has the bytes of a source-session file and the text shown
-for it. It prints the full text to the terminal, and resolves the review
-`accepted_as_drafted` with the reviewed anchor only when the operator types
-`approve`. Any other review kind, any mismatch or any other answer stops the
-run with that review unresolved.
+for it. It also reads the source session's graph and requires the card's whole
+prompt surface to equal the source session's surface for the same node:
+inline text byte for byte and files by content hash, slot for slot. It prints
+the full text of every slot the card covers, inline and file, and resolves the
+review `accepted_as_drafted` with the reviewed anchor only when the operator
+types `approve`. A card it cannot show and verify in full (a structured
+`prompt_template_parts` surface, a slot that is neither inline text nor an
+inline-content file, or a node the source does not have), any other review
+kind, any mismatch or any other answer stops the run with that review
+unresolved.
 
 Use it only for prompts copied unchanged from the source. Never use it for
 text authored or edited in the copy: those reviews belong to their reviewer.
 The tool goes through `POST .../interpretations/{id}/resolve` and writes
 nothing to a database. Afterwards it requires the graph content and chat
 history to be unchanged and no review left pending, then runs the normal
-`POST .../validate`.
+`POST .../validate`. The only graph change it accepts is what the server's
+resolve writes on a reviewed node (`options.approved_prompt_artifact_hash`
+and that node's `options.interpretation_requirements` row); the completion
+event lists those paths as `server_written`.
 
 Passwords come from a hidden prompt, or from the variables named by
 `--password-env` / `--source-password-env`. A pre-issued bearer token can
