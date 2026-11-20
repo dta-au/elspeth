@@ -76,12 +76,13 @@ BLOB_INLINE_PER_REF_BYTE_CAP: Final = 256 * 1024
 # of server work in a compose round that runs four; peak RSS grows about
 # 12 MB per MiB. Audit-store growth: a run's Landscape records hold the
 # resolved text about twice (run settings and node configs), so about 8.5 MB
-# per run at this cap. 4 MiB, not more, because the YAML dump-and-parse round
-# trip is 80% of the size-dependent time; revisit once it is gone.
-# Validation also dumps the resolved configuration and parses it under the
-# separate resolved-YAML bound in core/config.py, which this value does not
-# move: near or above about 1.7 MiB of English text (less for non-ASCII,
-# which the dump escapes), that bound refuses first.
+# per run at this cap. Those timings were taken while validation still dumped
+# and re-parsed the resolved configuration, which was 80% of the
+# size-dependent time; it now parses once, so the cost per MiB is lower and
+# has not been re-measured. 4 MiB is what that measurement supports.
+# The bound on the resolved configuration as a whole follows this value
+# (web/execution/_rendered_pipeline_yaml.py, four times this cap, counted as
+# UTF-8 text bytes), so the two move together.
 BLOB_INLINE_AGGREGATE_BYTE_CAP: Final = 4 * 1024 * 1024
 # One option-key segment of an inline field path, as ``BlobInlineRef`` reads a
 # mapping key. Numeric segments are list positions only.
