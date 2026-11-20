@@ -1729,6 +1729,9 @@ class ComposerSettings(Protocol):
     def composer_runtime_preflight_timeout_seconds(self) -> float: ...
 
     @property
+    def composer_validation_reuse_enabled(self) -> bool: ...
+
+    @property
     def composer_advisor_model(self) -> str: ...
 
     @property
