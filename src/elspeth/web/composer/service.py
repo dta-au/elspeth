@@ -748,11 +748,15 @@ class ComposerServiceImpl:
         if operator_profile_registry is None and not trained_operator_mode:
             raise TypeError("operator_profile_registry must be provided")
         self._sessions_service = sessions_service
+        # Read once here: the switch is a constructor value of the preflight
+        # owner and of the policy-view factory, never a per-call env read.
+        validation_reuse_enabled = settings.composer_validation_reuse_enabled
         self._policy_context = PluginPolicyContextFactory(
             catalog,
             plugin_snapshot_factory,
             operator_profile_registry,
             trained_operator_mode=trained_operator_mode,
+            validation_reuse_enabled=validation_reuse_enabled,
         )
         self._chargeable_admission = ComposerChargeableAdmission(sessions_service)
         self._model = settings.composer_model
@@ -850,6 +854,7 @@ class ComposerServiceImpl:
             secret_wiring_policy=self._secret_wiring_policy,
             operator_profile_registry=operator_profile_registry,
             coordinator=runtime_preflight_coordinator or RuntimePreflightCoordinator(),
+            validation_reuse_enabled=validation_reuse_enabled,
         )
         self._availability = compute_availability(
             model=self._model,
@@ -3105,7 +3110,9 @@ class ComposerServiceImpl:
         # so subsequent preview_pipeline calls don't re-fire an already-failed
         # worker. Content identity prevents concurrent unsaved requests from
         # sharing a result solely because they both start at version zero.
-        runtime_preflight_cache = self._preflight.new_cache()
+        # The cache shares the round view's mutation epoch, so a verdict for
+        # a blob-bearing state is not reused across a mutation-kind tool call.
+        runtime_preflight_cache = self._preflight.new_cache(mutation_epoch=policy_catalog.mutation_epoch)
         last_runtime_preflight: ValidationResult | None = None
         session_scope = f"session:{session_id}" if session_id is not None else "session:unsaved"
 

@@ -353,6 +353,16 @@ class WebSettings(BaseModel):
     composer_seed: int | None = None
     # Tests/offline development can disable the real provider boot probe.
     composer_boot_probe_enabled: bool = True
+    # Within one compose call, hand back a validation verdict already computed
+    # for the same state object instead of recomputing it: the runtime
+    # preflight of a blob-bearing state and the policy view's authoring
+    # validation. Before every runtime-preflight reuse the blob records, the
+    # stored files' stat (size, mtime, ctime, inode) and the user's secret
+    # inventory are read again and must be unchanged; a state that wires a
+    # secret is never reused; any mutation-kind tool call ends every reuse.
+    # Set ELSPETH_WEB__COMPOSER_VALIDATION_REUSE_ENABLED=false and restart to
+    # turn reuse off. Read once when the composer service is built.
+    composer_validation_reuse_enabled: bool = True
     composer_strict_tools: StrictToolsSetting = Field(
         default="preferred",
         description=(
