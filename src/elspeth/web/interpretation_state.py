@@ -2893,8 +2893,10 @@ def multi_query_prompt_surface_from_options(options: Mapping[str, Any]) -> Multi
     a node-level-template user, because plugin schema validation rejects the
     node. That matches the binding guard
     (``state._validate_multi_query_template_variable_bindings``), which skips
-    such a query whole without counting it as a node-level-template user, and
-    the advisor evidence walk (``service._advisor_query_option_values``).
+    such a query whole without counting it as a node-level-template user. The
+    advisor evidence walk (``advisor_context._advisor_query_option_values``)
+    differs on one shape: a valid ``inline_content`` file marker is a file-held
+    prompt there, stated with its file facts, not an invalid template.
     A node-level ``prompt_template`` that is an ``inline_content`` file marker
     is not text: the surface carries ``node_prompt_template=None`` and, when
     any query falls back to it, its marker identity as

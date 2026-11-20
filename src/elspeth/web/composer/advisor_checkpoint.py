@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -13,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal, cast
 from openai import OpenAIError
 from pydantic import ValidationError as PydanticValidationError
 
+from elspeth.contracts.blobs import BlobServiceProtocol
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.composer_progress import ComposerProgressSink
@@ -26,6 +28,7 @@ from elspeth.contracts.prompt_guard import (
 )
 from elspeth.contracts.provider_rejection import SafeRequestRejection
 from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer import advisor_context as _advisor_context
 from elspeth.web.composer import advisor_policy as _advisor_policy
 from elspeth.web.composer import provider_gateway
@@ -55,6 +58,13 @@ from elspeth.web.composer.advisor_output import (
     parse_advisor_abandonment_response,
     parse_advisor_checkpoint_response,
     sanitize_advisor_note,
+)
+from elspeth.web.composer.advisor_prompt_files import (
+    UNREAD_PROMPT_FILES,
+    AdvisorPromptFile,
+    AdvisorPromptFiles,
+    PromptFileKey,
+    read_advisor_prompt_files,
 )
 from elspeth.web.composer.advisor_request import build_advisor_request_options
 from elspeth.web.composer.advisor_transcript import (
@@ -127,6 +137,8 @@ if TYPE_CHECKING:
 
 _ADVISOR_RECENT_ERRORS_MAX_ITEMS: Final[int] = 5
 _ADVISOR_LIST_ITEM_MAX_CHARS: Final[int] = 2_000
+# Session operations whose read prompt-file facts are kept (most recent first out).
+_PROMPT_FILE_CACHE_OPERATIONS: Final[int] = 32
 
 
 def _compose_deadline_time() -> float:
@@ -262,8 +274,14 @@ class AdvisorCheckpointOwner:
         sessions_service: SessionServiceProtocol | None,
         chargeable_admission: ComposerChargeableAdmission,
         prompt_guard_mount: PromptGuardMount | None = None,
+        blob_service: BlobServiceProtocol | None = None,
     ) -> None:
         self._settings = settings
+        self._blob_service = blob_service
+        # Read file-held prompt facts, per session operation (one compose
+        # turn): a key selects exact bytes by digest, so a successful read
+        # stays true for the operation. Unavailable facts are read again.
+        self._prompt_file_cache: OrderedDict[SessionOperationContext, dict[PromptFileKey, AdvisorPromptFile]] = OrderedDict()
         self._composer_skill_text = composer_skill_text
         self._advisor_endpoint_base_url = advisor_endpoint_base_url
         self._advisor_endpoint_api_key = advisor_endpoint_api_key
@@ -277,6 +295,42 @@ class AdvisorCheckpointOwner:
         if self._sessions_service is None:
             raise RuntimeError("sessions_service not wired")
         return self._sessions_service
+
+    async def _advisor_prompt_files(
+        self, state: CompositionState, session_operation_context: SessionOperationContext | None
+    ) -> AdvisorPromptFiles:
+        """Facts (and, for files not recorded as the user's own writing, text) of every file-held prompt in ``state``.
+
+        Read in a worker thread under the caller's own session fence, before
+        any evidence is rendered, so the renderers stay pure. Each
+        ``(blob, digest, encoding)`` is read once per session operation.
+        Without a blob service or an operation context nothing can be read
+        and every file is stated as ``unavailable:no_reader``.
+        """
+        if self._blob_service is None or session_operation_context is None:
+            return UNREAD_PROMPT_FILES
+        keys = _advisor_context.advisor_prompt_file_keys(state)
+        if not keys:
+            return AdvisorPromptFiles(read=True)
+        if session_operation_context in self._prompt_file_cache:
+            self._prompt_file_cache.move_to_end(session_operation_context)
+        else:
+            self._prompt_file_cache[session_operation_context] = {}
+            while len(self._prompt_file_cache) > _PROMPT_FILE_CACHE_OPERATIONS:
+                self._prompt_file_cache.popitem(last=False)
+        cached = self._prompt_file_cache[session_operation_context]
+        missing = sorted(key for key in keys if key not in cached)
+        if missing:
+            fresh = await run_sync_in_worker(
+                read_advisor_prompt_files, missing, blob_service=self._blob_service, context=session_operation_context
+            )
+            for key, prompt_file in fresh.files.items():
+                if prompt_file.unavailable is None:
+                    cached[key] = prompt_file
+            files = {**{key: cached[key] for key in keys if key in cached}, **fresh.files}
+        else:
+            files = {key: cached[key] for key in keys}
+        return AdvisorPromptFiles(files=files, read=True)
 
     def _validate_advisor_arguments(self, arguments: dict[str, Any]) -> RequestAdvisorHintArgumentsModel | AdvisorArgumentRejection:
         """Admit complete public input before advisor budget or provider effects.
@@ -339,6 +393,7 @@ class AdvisorCheckpointOwner:
         abandonment_context: AdvisorAbandonmentReview | None = None,
         advisor_transcript: AdvisorVisibleTranscript | None = None,
         current_state: CompositionState | None = None,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> _AdvisorCallOutcome:
         """Classify an advisor call without suppressing controlled-code faults.
 
@@ -374,6 +429,7 @@ class AdvisorCheckpointOwner:
                     current_state,
                     internal_request,
                     self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN,
+                    await self._advisor_prompt_files(current_state, session_operation_context),
                 )
                 internal_request["schema_excerpt"] = "".join(part.text for part in summary.values)
                 internal_request["_elspeth_advisor_summary_parts"] = summary
@@ -863,6 +919,7 @@ class AdvisorCheckpointOwner:
         advisor_review_state: _AdvisorReviewState | None = None,
         publication_review: AdvisorPublicationReview | None = None,
         advisor_transcript: AdvisorVisibleTranscript | None = None,
+        prompt_files: AdvisorPromptFiles = UNREAD_PROMPT_FILES,
     ) -> dict[str, Any]:
         """Synthesize the (Tier-1, trusted) advisor ``arguments`` for a checkpoint.
 
@@ -880,7 +937,7 @@ class AdvisorCheckpointOwner:
         request, so its separate fallback is omitted rather than duplicated.
         Required request text is not part of the optional graph-prose allowance.
         """
-        pipeline_summary = _advisor_context.summarize_pipeline_for_advisor(state)
+        pipeline_summary = _advisor_context.summarize_pipeline_for_advisor(state, prompt_files)
         if publication_review is None and advisor_transcript is None and user_message is not None:
             advisor_transcript = AdvisorTranscriptOwner(request=user_message).snapshot()
         # Identity covers complete evidence, before optional prose fitting.
@@ -900,7 +957,7 @@ class AdvisorCheckpointOwner:
             }
             if advisor_transcript is not None:
                 early_arguments["advisor_transcript"] = advisor_transcript
-            summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, early_arguments, char_cap)
+            summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, early_arguments, char_cap, prompt_files)
             early_arguments["schema_excerpt"] = "".join(part.text for part in summary_parts.values)
             early_arguments["_elspeth_advisor_summary_parts"] = summary_parts
             return early_arguments
@@ -975,7 +1032,7 @@ class AdvisorCheckpointOwner:
             end_arguments["advisor_transcript"] = advisor_transcript
         elif user_message is not None and user_message.strip():
             end_arguments["user_message"] = user_message
-        summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, end_arguments, char_cap)
+        summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, end_arguments, char_cap, prompt_files)
         end_arguments["schema_excerpt"] = "".join(part.text for part in summary_parts.values)
         end_arguments["_elspeth_advisor_summary_parts"] = summary_parts
         return end_arguments
@@ -1456,6 +1513,7 @@ class AdvisorCheckpointOwner:
             )
 
         await emit_progress(progress, advisor_checkpoint_progress_event(phase))
+        prompt_files = await self._advisor_prompt_files(state, session_operation_context)
         try:
             arguments = self._build_checkpoint_arguments(
                 phase=phase,
@@ -1464,6 +1522,7 @@ class AdvisorCheckpointOwner:
                 advisor_review_state=advisor_review_state,
                 publication_review=publication_review,
                 advisor_transcript=advisor_transcript,
+                prompt_files=prompt_files,
             )
         except _advisor_context.AdvisorGraphCoverageUnavailable:
             return graph_coverage_withheld()
@@ -1491,7 +1550,7 @@ class AdvisorCheckpointOwner:
                 # The format instruction can change rendered budget overhead.
                 # Refit the same complete saved graph, never a fitted prefix.
                 try:
-                    summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, call_arguments, char_cap)
+                    summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, call_arguments, char_cap, prompt_files)
                 except _advisor_context.AdvisorGraphCoverageUnavailable:
                     return graph_coverage_withheld()
                 call_arguments = {

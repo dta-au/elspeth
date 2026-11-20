@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import Any, Never, TypedDict, TypeVar, cast
+from typing import Any, Final, Never, TypedDict, TypeVar, cast
 from uuid import UUID, uuid4, uuid5
 
 from opentelemetry import metrics
@@ -110,6 +110,14 @@ _INLINE_CUSTODY_SCHEMA = "elspeth.inline-custody.v1"
 _LOWERCASE_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _LOWERCASE_UUID_HEX = re.compile(r"[0-9a-f]{32}\Z")
 _INLINE_CUSTODY_STAGE_SUFFIX = ".inline-custody-staged"
+
+SESSION_FORK_COPY_DESCRIPTION_PREFIX: Final = "copied from session fork (original: "
+"""Start of every session-fork copy's ``source_description``; the original's description is not kept."""
+
+
+def session_fork_copy_description(source_blob_id: UUID) -> str:
+    """The ``source_description`` a session-fork copy records (readers match :data:`SESSION_FORK_COPY_DESCRIPTION_PREFIX`)."""
+    return f"{SESSION_FORK_COPY_DESCRIPTION_PREFIX}{source_blob_id})"
 
 
 def _blob_operation_path_token(
@@ -4265,7 +4273,7 @@ class BlobServiceImpl:
                     content=content,
                     mime_type=source_blob.mime_type,
                     created_by=source_blob.created_by,
-                    source_description=f"copied from session fork (original: {source_blob.id})",
+                    source_description=session_fork_copy_description(source_blob.id),
                     # A copy is as LLM-authored as its source: relabelling it
                     # VERBATIM would let a fork launder model-written content
                     # past every modality guard (dta-au/elspeth#365). The
