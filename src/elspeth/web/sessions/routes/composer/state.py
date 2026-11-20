@@ -14,6 +14,7 @@ from elspeth.contracts.blobs_inline import (
     INLINE_BLOB_NOT_TEXT_REPAIR,
     BlobInlineRef,
     ContentEncoding,
+    inline_blob_total_refusal,
     is_widened_blob_ref,
 )
 from elspeth.contracts.composer_interpretation import InterpretationSurfaceOrigin
@@ -83,6 +84,7 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginI
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
 from elspeth.web.sessions.inline_blob_preflight import (
     InlinePreflightState,
+    inline_blob_refs,
     malformed_inline_blob_marker_paths,
     prepare_session_inline_blob_snapshot,
 )
@@ -92,6 +94,7 @@ from elspeth.web.sessions.protocol import (
     CompositionStateRecord,
     OperationReceiptResult,
     OperationReceiptSettlementConflictError,
+    PromptFileTooLargeError,
     SessionRecord,
     StateRevertReceiptResult,
 )
@@ -1540,6 +1543,14 @@ async def seed_state_from_runtime_yaml(
                 )
             except PromptFileReviewStale as exc:
                 raise _import_prompt_file_review_refusal(imported_state, node_id=exc.node_id) from exc
+            except PromptFileTooLargeError as exc:
+                raise await _import_prompt_file_too_large_refusal(
+                    imported_state,
+                    exc,
+                    request=request,
+                    session_id=session.id,
+                    session_operation_context=lease.context,
+                ) from exc
             return _state_response(response_state, policy_catalog=catalog)
     finally:
         await lease.close()
@@ -1637,6 +1648,66 @@ def _import_prompt_file_review_refusal(state: CompositionState, *, node_id: str 
             ),
         },
     )
+
+
+async def _import_prompt_file_too_large_refusal(
+    state: CompositionState,
+    exc: PromptFileTooLargeError,
+    *,
+    request: Request,
+    session_id: UUID,
+    session_operation_context: SessionOperationContext,
+) -> HTTPException:
+    """Refuse an import whose prompt file is over an inline size cap (413), never a 500.
+
+    The card writer cannot prepare a review for a prompt file no run could
+    use, and the state and its cards commit together, so nothing is
+    imported. The code is the card writer's own (``prompt_file_too_large``,
+    as the prompt-file save route reports it). For the pipeline total the
+    message gives the figures every other site gives: the total of the
+    imported state's file-held text, counted once per binding, the cap and
+    the number of bindings, read from this session's blob records. If a
+    bound file cannot be read here the figures are not known, and the
+    message names the cap alone.
+    """
+    message = f"{exc} Nothing was imported."
+    if exc.aggregate:
+        figures = await _imported_inline_text_total(
+            state, request=request, session_id=session_id, session_operation_context=session_operation_context
+        )
+        if figures is not None:
+            total, bindings = figures
+            message = f"{inline_blob_total_refusal(total, exc.limit_bytes, bindings)} Nothing was imported."
+    return HTTPException(status_code=413, detail={"error_code": exc.error_code, "message": message})
+
+
+async def _imported_inline_text_total(
+    state: CompositionState,
+    *,
+    request: Request,
+    session_id: UUID,
+    session_operation_context: SessionOperationContext,
+) -> tuple[int, int] | None:
+    """``(total bytes, bindings)`` of the state's file-held text, per binding; None if a file cannot be read."""
+    refs = inline_blob_refs(InlinePreflightState.from_composition_state(state))
+    blob_service: BlobServiceProtocol | None = request.app.state.blob_service
+    if not refs or blob_service is None:
+        return None
+    sizes: dict[UUID, int] = {}
+    total = 0
+    bindings = 0
+    for ref in refs:
+        if ref.blob_id not in sizes:
+            try:
+                record = await blob_service.get_blob(ref.blob_id, session_operation_context=session_operation_context)
+            except BlobNotFoundError:
+                return None
+            if record.session_id != session_id:
+                return None
+            sizes[ref.blob_id] = record.size_bytes
+        total += sizes[ref.blob_id]
+        bindings += 1
+    return total, bindings
 
 
 def _reject_file_inject_content_not_uploaded(state: CompositionState) -> None:

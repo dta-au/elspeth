@@ -2221,12 +2221,16 @@ sinks:
         mock_session_service: MagicMock,
     ) -> None:
         from elspeth.contracts.blobs_inline import BlobContentResolutionError
+        from elspeth.core.blobs_inline import BLOB_INLINE_AGGREGATE_BYTE_CAP, BLOB_INLINE_PER_REF_BYTE_CAP
 
         del mock_payload_cls, mock_landscape_cls, mock_runtime_graph
-        blob_ids = [uuid4() for _ in range(5)]
+        # One more full-size file than the total cap holds: every file is
+        # within the per-file cap, the sum is not.
+        file_count = BLOB_INLINE_AGGREGATE_BYTE_CAP // BLOB_INLINE_PER_REF_BYTE_CAP + 1
+        blob_ids = [uuid4() for _ in range(file_count)]
         run_id = uuid4()
         owner_session = uuid4()
-        hashes = [hashlib.sha256(f"blob-{index}".encode()).hexdigest() for index in range(5)]
+        hashes = [hashlib.sha256(f"blob-{index}".encode()).hexdigest() for index in range(file_count)]
         mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=owner_session)
 
         records_by_id: dict[UUID, Any] = {}
@@ -2235,7 +2239,7 @@ sinks:
                 blob_id=blob_id,
                 session_id=owner_session,
                 content_hash=blob_hash,
-                size_bytes=220 * 1024,
+                size_bytes=BLOB_INLINE_PER_REF_BYTE_CAP,
             )
 
         async def get_blob(blob_id: UUID, *, session_operation_context: SessionOperationContext) -> Any:
@@ -2278,7 +2282,8 @@ sinks:
         with pytest.raises(BlobContentResolutionError) as exc_info:
             service._run_pipeline(str(run_id), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
 
-        assert exc_info.value.oversized == (("(aggregate)", 5 * 220 * 1024, 1024 * 1024),)
+        assert exc_info.value.oversized == (("(aggregate)", file_count * BLOB_INLINE_PER_REF_BYTE_CAP, BLOB_INLINE_AGGREGATE_BYTE_CAP),)
+        assert exc_info.value.aggregate_binding_count == file_count
         blob_service.read_blob_content.assert_not_awaited()
         blob_service.link_blob_to_run.assert_not_awaited()
         mock_session_service.record_blob_inline_resolutions.assert_not_called()

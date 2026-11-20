@@ -670,6 +670,32 @@ def _no_source_configured_repair(state: CompositionState) -> str:
     )
 
 
+def _inline_file_size_refusal(prepared_prompt_blobs: list[tuple[str, _PreparedBlobCreate]]) -> str | None:
+    """Name the inline-file size limit this call's new files break, with the figures, or None.
+
+    Counts only the files this call writes, one per binding; files already
+    bound are counted by validation, which applies the same pipeline total.
+    """
+    over_file_cap = [
+        f"{field_path} is {len(item.content_bytes)} bytes"
+        for field_path, item in prepared_prompt_blobs
+        if len(item.content_bytes) > BLOB_INLINE_PER_REF_BYTE_CAP
+    ]
+    if over_file_cap:
+        return (
+            f"Inline file over the per-file limit of {BLOB_INLINE_PER_REF_BYTE_CAP} bytes: {'; '.join(over_file_cap)}. "
+            "Shorten each named file."
+        )
+    total = sum(len(item.content_bytes) for _field_path, item in prepared_prompt_blobs)
+    if total > BLOB_INLINE_AGGREGATE_BYTE_CAP:
+        return (
+            f"The new inline files in this call total {total} bytes across {len(prepared_prompt_blobs)} files; "
+            f"the limit for all file-held text in one pipeline is {BLOB_INLINE_AGGREGATE_BYTE_CAP} bytes. "
+            "Remove a file or shorten the largest ones."
+        )
+    return None
+
+
 @trust_boundary(
     tier=3,
     source="LLM composer tool-call arguments",
@@ -727,15 +753,12 @@ def build_set_pipeline_candidate(
 
     def _candidate(result: ToolResult) -> SetPipelineCandidate:
         normalized = normalize_tool_result_validation(result, context.catalog)
-        prepared_files = [item for _, item in prepared_prompt_blobs]
-        if normalized.success and (
-            any(len(item.content_bytes) > BLOB_INLINE_PER_REF_BYTE_CAP for item in prepared_files)
-            or sum(len(item.content_bytes) for item in prepared_files) > BLOB_INLINE_AGGREGATE_BYTE_CAP
-        ):
+        size_refusal = _inline_file_size_refusal(prepared_prompt_blobs) if normalized.success else None
+        if size_refusal is not None:
             normalized = normalize_tool_result_validation(
                 _candidate_rejection_result(
                     state,
-                    "Inline files exceed the per-file or combined size limit.",
+                    size_refusal,
                     error_code="BLOB_QUOTA_EXCEEDED",
                     rejected_component=None,
                 ),

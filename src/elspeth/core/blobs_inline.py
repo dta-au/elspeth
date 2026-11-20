@@ -27,12 +27,14 @@ from elspeth.contracts.blobs import (
     BlobStateError,
 )
 from elspeth.contracts.blobs_inline import (
+    BLOB_INLINE_AGGREGATE_FIELD_PATH,
     BlobContentResolutionError,
     BlobInlineRef,
     BlobInlineValidationViolation,
     InlineBlobNotTextError,
     ResolvedBlobContent,
     WidenedBlobRefShape,
+    inline_blob_total_refusal,
     is_widened_blob_ref,
 )
 
@@ -64,7 +66,24 @@ from elspeth.contracts.blobs_inline import (
 _NODE_COLLECTION_KEYS: Final = ("transforms", "gates", "aggregations", "coalesce", "collectors")
 _OUTPUT_COLLECTION_KEYS: Final = ("outputs", "sinks")
 BLOB_INLINE_PER_REF_BYTE_CAP: Final = 256 * 1024
-BLOB_INLINE_AGGREGATE_BYTE_CAP: Final = 1024 * 1024
+# Total file-held text one pipeline may resolve, counted once per REFERENCE
+# (a file bound in two places counts twice) at every site that enforces it:
+# validation, approval compile, run admission, the session snapshot that YAML
+# export and prompt review read, and set_pipeline's newly written files.
+# What it bounds (measured 2026-11-20 in the blob-cap sizing study, 128
+# files): server time, not memory. Each runtime preflight costs about
+# 0.9 s + 0.75 s per MiB, so 4 MiB is about 4 s per preflight and about 17 s
+# of server work in a compose round that runs four; peak RSS grows about
+# 12 MB per MiB. Audit-store growth: a run's Landscape records hold the
+# resolved text about twice (run settings and node configs), so about 8.5 MB
+# per run at this cap. Those timings were taken while validation still dumped
+# and re-parsed the resolved configuration, which was 80% of the
+# size-dependent time; it now parses once, so the cost per MiB is lower and
+# has not been re-measured. 4 MiB is what that measurement supports.
+# The bound on the resolved configuration as a whole follows this value
+# (web/execution/_rendered_pipeline_yaml.py, four times this cap, counted as
+# UTF-8 text bytes), so the two move together.
+BLOB_INLINE_AGGREGATE_BYTE_CAP: Final = 4 * 1024 * 1024
 # One option-key segment of an inline field path, as ``BlobInlineRef`` reads a
 # mapping key. Numeric segments are list positions only.
 _OPTION_KEY_PATTERN: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
@@ -77,6 +96,9 @@ class _BlobMetadataEvaluation:
     hash_mismatches: tuple[tuple[BlobInlineRef, str | None], ...] = ()
     oversized: tuple[tuple[str, int, int], ...] = ()
     not_text: tuple[str, ...] = ()
+    # Bindings counted toward the total; read only when ``oversized`` holds
+    # the total entry.
+    aggregate_binding_count: int = 0
 
 
 def _discover_blob_content_refs(config: dict[str, Any]) -> list[BlobInlineRef]:
@@ -145,6 +167,7 @@ def _evaluate_blob_content_ref_metadata(
     not_ready_lookup = not_ready_by_blob_id or {}
 
     aggregate_bytes = 0
+    aggregate_binding_count = 0
     for ref in refs:
         if ref.blob_id in not_ready_lookup and ref.blob_id not in records_by_blob_id:
             not_ready.append((ref.field_path, not_ready_lookup[ref.blob_id]))
@@ -165,9 +188,10 @@ def _evaluate_blob_content_ref_metadata(
         if per_ref_byte_cap is not None and record.size_bytes > per_ref_byte_cap:
             oversized.append((ref.field_path, record.size_bytes, per_ref_byte_cap))
         aggregate_bytes += record.size_bytes
+        aggregate_binding_count += 1
 
     if aggregate_byte_cap is not None and aggregate_bytes > aggregate_byte_cap:
-        oversized.append(("(aggregate)", aggregate_bytes, aggregate_byte_cap))
+        oversized.append((BLOB_INLINE_AGGREGATE_FIELD_PATH, aggregate_bytes, aggregate_byte_cap))
 
     return _BlobMetadataEvaluation(
         missing=tuple(missing),
@@ -175,6 +199,7 @@ def _evaluate_blob_content_ref_metadata(
         hash_mismatches=tuple(hash_mismatches),
         oversized=tuple(oversized),
         not_text=tuple(not_text),
+        aggregate_binding_count=aggregate_binding_count,
     )
 
 
@@ -187,7 +212,9 @@ def _metadata_evaluation_validation_violations(
     not_ready_by_path = dict(evaluation.not_ready)
     hash_mismatches_by_path = {ref.field_path: (ref, actual) for ref, actual in evaluation.hash_mismatches}
     oversized_by_path = {
-        field_path: (size_bytes, cap) for field_path, size_bytes, cap in evaluation.oversized if field_path != "(aggregate)"
+        field_path: (size_bytes, cap)
+        for field_path, size_bytes, cap in evaluation.oversized
+        if field_path != BLOB_INLINE_AGGREGATE_FIELD_PATH
     }
     not_text_paths = set(evaluation.not_text)
 
@@ -236,13 +263,13 @@ def _metadata_evaluation_validation_violations(
             )
 
     for field_path, size_bytes, cap in evaluation.oversized:
-        if field_path != "(aggregate)":
+        if field_path != BLOB_INLINE_AGGREGATE_FIELD_PATH:
             continue
         violations.append(
             BlobInlineValidationViolation(
                 category="oversized",
                 field_path=field_path,
-                detail=f"total resolved bytes {size_bytes} exceeds aggregate cap {cap}",
+                detail=inline_blob_total_refusal(size_bytes, cap, evaluation.aggregate_binding_count),
             )
         )
 
@@ -296,10 +323,12 @@ def _enforce_blob_content_ref_metadata(
             actual=actual or "<missing>",
         )
     if evaluation.missing or evaluation.oversized or evaluation.not_ready:
+        over_total = any(field_path == BLOB_INLINE_AGGREGATE_FIELD_PATH for field_path, _size, _cap in evaluation.oversized)
         raise BlobContentResolutionError(
             missing=[field_path for field_path, _blob_id in evaluation.missing],
             oversized=evaluation.oversized,
             not_ready=evaluation.not_ready,
+            aggregate_binding_count=evaluation.aggregate_binding_count if over_total else None,
         )
 
 

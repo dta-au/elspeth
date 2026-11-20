@@ -15,11 +15,13 @@ from uuid import UUID
 
 from elspeth.contracts.blobs import AllowedMimeType, BlobCreator, BlobNotFoundError, BlobRecord, BlobStateError
 from elspeth.contracts.blobs_inline import (
+    BLOB_INLINE_AGGREGATE_FIELD_PATH,
     INLINE_BLOB_NOT_TEXT_CODE,
     INLINE_BLOB_NOT_TEXT_REPAIR,
     BlobContentResolutionError,
     BlobInlineRef,
     BlobInlineValidationViolation,
+    inline_blob_total_refusal,
     is_widened_blob_ref,
 )
 from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
@@ -146,7 +148,7 @@ def _llm_policy_components(state: CompositionState) -> tuple[_LLMPolicyComponent
 
 
 def _blob_inline_component_id(field_path: str) -> str | None:
-    if field_path == "(aggregate)":
+    if field_path == BLOB_INLINE_AGGREGATE_FIELD_PATH:
         return None
     if field_path.startswith("source."):
         return "source"
@@ -160,7 +162,7 @@ def _blob_inline_component_id(field_path: str) -> str | None:
 
 
 def _blob_inline_component_type(field_path: str) -> str | None:
-    if field_path == "(aggregate)":
+    if field_path == BLOB_INLINE_AGGREGATE_FIELD_PATH:
         return None
     if field_path.startswith("source."):
         return "source"
@@ -175,7 +177,23 @@ def _blob_inline_validation_detail(violations: list[BlobInlineValidationViolatio
     return "; ".join(f"{violation.field_path}: {violation.category}" for violation in violations)
 
 
+_INLINE_BLOB_TOTAL_REPAIR: Final = (
+    "Remove a file binding or shorten the largest files until the total is at or under the limit; "
+    "each file counts once for every place it is bound."
+)
+
+
 def _blob_inline_validation_error(violation: BlobInlineValidationViolation) -> ValidationError:
+    if violation.field_path == BLOB_INLINE_AGGREGATE_FIELD_PATH:
+        # The detail is the whole refusal sentence (total, cap, bindings);
+        # the code is the one every oversized refusal has always carried.
+        return ValidationError(
+            component_id=None,
+            component_type=None,
+            message=violation.detail,
+            suggestion=_INLINE_BLOB_TOTAL_REPAIR,
+            error_code=f"{violation.category}_inline_blob_content",
+        )
     not_text = violation.category == "not_text"
     return ValidationError(
         component_id=_blob_inline_component_id(violation.field_path),
@@ -868,6 +886,7 @@ def materialize_validation_yaml(
         content_failure_by_blob_id: dict[UUID, BlobInlineValidationViolation] = {}
         content_violations: list[BlobInlineValidationViolation] = []
         actual_total_bytes = 0
+        actual_binding_count = 0
         for ref in refs:
             if ref.blob_id in content_failure_by_blob_id:
                 previous_failure = content_failure_by_blob_id[ref.blob_id]
@@ -918,13 +937,14 @@ def materialize_validation_yaml(
                     )
                 )
             actual_total_bytes += len(content)
+            actual_binding_count += 1
             fetched[ref] = content
         if actual_total_bytes > BLOB_INLINE_AGGREGATE_BYTE_CAP:
             content_violations.append(
                 BlobInlineValidationViolation(
                     category="oversized",
-                    field_path="(aggregate)",
-                    detail=f"total resolved bytes {actual_total_bytes} exceeds aggregate cap {BLOB_INLINE_AGGREGATE_BYTE_CAP}",
+                    field_path=BLOB_INLINE_AGGREGATE_FIELD_PATH,
+                    detail=inline_blob_total_refusal(actual_total_bytes, BLOB_INLINE_AGGREGATE_BYTE_CAP, actual_binding_count),
                 )
             )
         if content_violations:

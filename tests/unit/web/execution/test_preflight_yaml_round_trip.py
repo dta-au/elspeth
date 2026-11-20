@@ -311,6 +311,10 @@ def test_runtime_settings_equal_the_deleted_dump_then_parse_path(shape: str, tmp
 # ── the resolved configuration's bound does not depend on prompt language ──
 
 _LANGUAGES = ["en", "zh", "ru"]
+# The cap before it was raised. At this size the deleted path accepted English
+# text and refused the same bytes of Chinese or Russian, which is what the
+# first test below compares against; at the raised cap it refused all three.
+_PREVIOUS_CAP = 1024 * 1024
 _RULED_CAP = 4 * 1024 * 1024
 
 
@@ -331,9 +335,9 @@ def _cap_graph(tmp_path: Path, *, total_bytes: int, files: int, language: str) -
 def test_a_graph_holding_the_whole_file_text_cap_validates_in_any_language(
     language: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """At today's cap: the same bytes of text validate whatever language they are in."""
+    """At the previous 1 MiB cap: the same bytes of text validate whatever language they are in."""
     capture = _capture(monkeypatch)
-    graph = _cap_graph(tmp_path, total_bytes=BLOB_INLINE_AGGREGATE_BYTE_CAP, files=128, language=language)
+    graph = _cap_graph(tmp_path, total_bytes=_PREVIOUS_CAP, files=128, language=language)
 
     result = _web_preflight(tmp_path, graph)
 
