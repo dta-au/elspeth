@@ -704,17 +704,42 @@ export async function fetchSystemStatus(): Promise<SystemStatus> {
 
 // ── Sessions ────────────────────────────────────────────────────────────────
 
-/** List all sessions for the current user. */
+/** The session list route's own maximum page size (`limit` is `le=200`). */
+const SESSION_LIST_PAGE_SIZE = 200;
+/** Bounds the paging loop; the newest sessions up to this many are listed. */
+const SESSION_LIST_MAX_SESSIONS = 10_000;
+
+/** List all sessions for the current user, newest first. The route returns
+ *  one page per request (50 by default), so this pages until a short page,
+ *  the way `listBlobs` does. */
 export async function fetchSessions(includeArchived = true): Promise<Session[]> {
-  const params = new URLSearchParams();
-  if (includeArchived) {
-    params.set("include_archived", "true");
+  const sessions: Session[] = [];
+  const seen = new Set<string>();
+  let offset = 0;
+  while (offset < SESSION_LIST_MAX_SESSIONS) {
+    const params = new URLSearchParams();
+    if (includeArchived) {
+      params.set("include_archived", "true");
+    }
+    params.set("limit", String(SESSION_LIST_PAGE_SIZE));
+    params.set("offset", String(offset));
+    const response = await authFetch(`/api/sessions?${params.toString()}`, {
+      headers: authHeaders(),
+    });
+    const page = await parseResponse<Session[]>(response);
+    let added = 0;
+    for (const session of page) {
+      if (seen.has(session.id)) continue;
+      seen.add(session.id);
+      sessions.push(session);
+      added += 1;
+    }
+    // A short page is the last one; a full page that adds nothing means the
+    // window did not advance, so stop instead of requesting it forever.
+    if (page.length < SESSION_LIST_PAGE_SIZE || added === 0) break;
+    offset += page.length;
   }
-  const query = params.size > 0 ? `?${params.toString()}` : "";
-  const response = await authFetch(`/api/sessions${query}`, {
-    headers: authHeaders(),
-  });
-  return parseResponse<Session[]>(response);
+  return sessions;
 }
 
 /** Create a new session.
