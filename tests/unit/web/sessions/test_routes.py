@@ -118,7 +118,9 @@ from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.composer_fakes import StaticPluginSnapshotFactory
 from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
+from tests.helpers.async_rendezvous import wait_for_event_or_producer
 from tests.helpers.composer_operations import (
+    RunningComposerOperation,
     SettledComposerOperation,
     current_head_state_id,
     current_head_state_id_sync,
@@ -362,13 +364,30 @@ def _capture_turn_exception(monkeypatch: pytest.MonkeyPatch) -> list[BaseExcepti
     return captured
 
 
+async def _wait_for_operation_event(
+    client: AsyncClient, operation: RunningComposerOperation, event: asyncio.Event, *, waiting_for: str
+) -> None:
+    """Wait for ``event``, raced against the worker drive that is meant to set it.
+
+    The drive (``run_until_idle``) gathers its jobs with
+    ``return_exceptions=True``, so when it goes idle first the failure lives in
+    the operation record; report that snapshot instead of a bare timeout.
+    """
+
+    async def snapshot() -> str:
+        polled = await client.get(operation.poll_path)
+        return f"operation snapshot {polled.status_code} {polled.text}"
+
+    await wait_for_event_or_producer(event, operation.drive, waiting_for=waiting_for, explain=snapshot)
+
+
 async def _cancel_registered_composer(
     client: AsyncClient, app: FastAPI, *, path: str, body: dict[str, object], composer: _CancellableComposer
 ):
     from httpx import Response
 
     async with running_operation_async(client, app, path=path, body=body) as operation:
-        await asyncio.wait_for(composer.entered.wait(), timeout=3)
+        await _wait_for_operation_event(client, operation, composer.entered, waiting_for="composer turn entering compose()")
         cancelled = await client.post(f"{operation.poll_path}/cancel")
         assert cancelled.status_code in (200, 202), cancelled.text
         await operation.drive
