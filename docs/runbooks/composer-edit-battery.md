@@ -17,8 +17,8 @@ Written 2026-11-20 for the 0.8.16 release. The tool is
 
 | Plan | For | Edits |
 | --- | --- | --- |
-| `composer_gold_50.json` (default) | A graph whose prompts are all held in files | 50 always applicable, plus 4 optional |
-| `composer_mixed_50.json` | A graph with an inline prompt and a prompt in a file | 50 always applicable, plus 4 optional |
+| `composer_gold_50.json` (default) | A graph whose prompts are all held in files | 58 required (the 8 `max_tokens`/`temperature` edits are skipped on a profile-bound step), plus 4 optional |
+| `composer_mixed_50.json` | A graph with an inline prompt and a prompt in a file | 58 required (the 8 `max_tokens`/`temperature` edits are skipped on a profile-bound step), plus 4 optional |
 
 Both plans leave the graph as found.
 
@@ -494,9 +494,11 @@ An edit whose every expectation sets `max_tokens` or `temperature` on a step
 that binds an operator `profile` (or restores one there) is also not
 applicable: the profile owns those options and the server refuses them on
 such a step (`plugin_options_invalid`). It is skipped the same way, with
-`profile_owned` naming the pointers. Gold still needs at least 50 applicable
-edits, so the shipped gold plan cannot reach gold on a graph whose file-prompt
-step is profile-bound (42 applicable without the optional roles).
+`profile_owned` naming the pointers.
+
+Count rule: gold needs at least 50 applicable edits, and each shipped plan keeps
+at least 52 applicable on the acceptance shape (every LLM step profile-bound, a
+csv source, no secret reference); `test_shipped_edit_plans.py` enforces it.
 
 The edits cover, with each edit's acceptable tools:
 - pipeline name and description (`set_metadata`);

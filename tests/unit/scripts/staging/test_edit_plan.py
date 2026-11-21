@@ -71,13 +71,15 @@ def write_plan(tmp_path: Path, edits: list[dict[str, Any]], **overrides: Any) ->
 # ── the shipped plans ──────────────────────────────────────────────────────
 
 
-def test_shipped_plans_have_fifty_required_edits_and_optional_extras() -> None:
+def test_shipped_plans_have_fifty_eight_required_edits_and_optional_extras() -> None:
+    # 58 required: 50 for gold plus the 8 max_tokens/temperature edits a profile-bound step skips
+    # (test_shipped_edit_plans checks the profile-bound count stays at 52 or more).
     for path in (edit_plan.DEFAULT_PLAN, edit_plan.MIXED_PLAN):
         plan = edit_plan.load_plan(path)
         optional = {name for name, spec in plan.targets.items() if "optional" in spec and spec["optional"]}
         required = [edit for edit in plan.edits if not plan.roles_of(edit) & optional]
-        assert len(required) == 50
-        assert len(plan.edits) == 54
+        assert len(required) == 58
+        assert len(plan.edits) == 62
         assert plan.forbidden_tools == ("set_pipeline",)
 
 
@@ -92,7 +94,7 @@ def test_shipped_plan_resolves_on_a_graph_with_its_roles_and_leaves_no_placehold
     targets = edit_plan.resolve_targets(plan, state, {})
     assert targets == {"source": "rows", "head": "classify", "llm_file": "summarise", "output": "out", "csv_source": "rows"}
     edits = edit_plan.resolve_edits(plan, targets, state)
-    assert [edit["number"] for edit in edits] == list(range(1, 55))
+    assert [edit["number"] for edit in edits] == list(range(1, 63))
     assert [edit["id"] for edit in edits if not edit["applicable"]] == ["secret-switch", "secret-restore"]
     assert not re.search(r"\{[a-z_]+(:[^}]*)?\}", json.dumps([edit for edit in edits if edit["applicable"]]))
     restore = next(edit for edit in edits if edit["id"] == "restore-pipeline-name")
