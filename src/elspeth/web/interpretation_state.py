@@ -3501,6 +3501,28 @@ def _vague_review_is_unchanged(
     return prompt_structure_hash(previous_parts) == prompt_structure_hash(proposed_parts)
 
 
+def _wording_edit_reopens_its_prompt_review(candidate: NodeSpec) -> bool:
+    """Whether a wording edit around carried terms is put to the user by a reopened prompt review.
+
+    ``candidate`` is the proposed node with its carried rows in place. A
+    resolved vague term keeps its accepted value across a wording edit only
+    when the node has an ``llm_prompt_template`` review: that review is the
+    review of the change. A term is carried only when the parts skeleton
+    changed, and every prompt review anchor contains the skeleton hash
+    (``prompt_review_anchor_hash_from_options``), so a review that exists has
+    been reopened by the same edit; only its absence needs checking here. The
+    length of the prompt plays no part; the prompt card has to show each
+    carried term's accepted definition at its slot, whatever it shortens.
+
+    A node where a query supplies its own template is never carried: that
+    query bypasses the node-level slots, and reopening the terms is what lets
+    ``unwired_vague_term_error`` refuse the edit as it did before.
+    """
+    if _prompt_template_review_requirement(candidate.options) is None:
+        return False
+    return "queries" not in candidate.options or vague_term_query_override_error(candidate.options["queries"]) is None
+
+
 def _reconcile_node_options(
     previous: NodeSpec | None,
     proposed: NodeSpec,
@@ -3519,6 +3541,9 @@ def _reconcile_node_options(
         del options["approved_prompt_artifact_hash"]
     reconciled: list[Mapping[str, Any]] = []
     carried_prompt_review = False
+    # Position in ``reconciled`` -> the pending shell to fall back to, for each
+    # vague term carried although the wording around its slot changed.
+    carried_across_wording_edit: dict[int, InterpretationRequirement] = {}
 
     for identity, proposed_requirement in proposed_index.items():
         requirement_id, kind, user_term = identity
@@ -3538,6 +3563,15 @@ def _reconcile_node_options(
         _require_resolved_review_coherence(previous_requirement)
         if kind is InterpretationKind.VAGUE_TERM:
             unchanged = _vague_review_is_unchanged(previous, proposed, previous_requirement)
+            if not unchanged and proposed_requirement["draft"] == previous_requirement["draft"]:
+                # Carry unless the term itself changed. The checks above hold:
+                # the slot is still referenced, the stored evidence is intact,
+                # and the row attests its accepted value alone, so wording
+                # edited elsewhere in the prompt leaves the acceptance standing.
+                # Whether a reopened prompt review puts the edit to the user
+                # is decided below, once every row is reconciled.
+                carried_across_wording_edit[len(reconciled)] = shell
+                unchanged = True
         elif kind is InterpretationKind.INVENTED_SOURCE:
             raise ValueError("invented_source review cannot target a transform node")
         else:
@@ -3574,6 +3608,17 @@ def _reconcile_node_options(
             )
         else:
             reconciled.append(shell)
+
+    if carried_across_wording_edit and not _wording_edit_reopens_its_prompt_review(
+        replace(proposed, options={**options, INTERPRETATION_REQUIREMENTS_KEY: reconciled})
+    ):
+        for position, pending_shell in carried_across_wording_edit.items():
+            reconciled[position] = pending_shell
+        carried_prompt_review = any(
+            row["status"] == "resolved"
+            and InterpretationKind(row["kind"]) in (InterpretationKind.VAGUE_TERM, InterpretationKind.LLM_PROMPT_TEMPLATE)
+            for row in reconciled
+        )
 
     if reconciled:
         options[INTERPRETATION_REQUIREMENTS_KEY] = reconciled

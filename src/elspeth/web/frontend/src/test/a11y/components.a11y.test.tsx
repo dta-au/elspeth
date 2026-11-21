@@ -1047,15 +1047,20 @@ describe("AcknowledgementCard", () => {
   it("has no axe violations on a snapshot with marked slots in both statuses", async () => {
     // The slots, their visually-hidden status prefixes and the status legend
     // render only for a snapshot carrying the frozen parts skeleton, with
-    // one slot's review pending and one accepted, so both are audited.
+    // one slot's review pending and one accepted earlier (shown with its
+    // approved definition), so both are audited.
     useInterpretationEventsStore.setState({
-      pendingBySession: { "sess-a11y": { "evt-tone": makeInterpretationEvent("evt-tone") } },
-      resolvedBySession: { "sess-a11y": [makeInterpretationEvent("evt-topic", { choice: "accepted_as_drafted" })] },
+      pendingBySession: { "sess-a11y": { "evt-tone": makeInterpretationEvent("evt-tone", { user_term: "an auditor" }) } },
+      resolvedBySession: {
+        "sess-a11y": [
+          makeInterpretationEvent("evt-topic", { user_term: "briefly", choice: "accepted_as_drafted", accepted_value: "in two sentences" }),
+        ],
+      },
     });
     vi.mocked(apiClient.getPromptReviewSnapshot).mockResolvedValue({
       version: 1, session_id: "sess-a11y", node_id: "node-1", event_id: "evt-3",
       authored_surface: {
-        prompt_template: "Summarise pending interpretation for pending interpretation.",
+        prompt_template: "Summarise in two sentences for pending interpretation.",
         prompt_template_parts: [
           { kind: "text", text: "Summarise " },
           { kind: "interpretation_ref", requirement_id: "req-1" },
@@ -1065,7 +1070,7 @@ describe("AcknowledgementCard", () => {
         ],
         interpretation_requirements: [
           { id: "req-1", event_id: "evt-topic", user_term: "briefly" },
-          { id: "req-2", event_id: "evt-tone", user_term: "an auditor" },
+          { id: "req-2", event_id: null, user_term: "an auditor" },
         ],
       },
       bindings: [], anchor: "c".repeat(64), effective_artifact_hash: null, is_live_review: true,

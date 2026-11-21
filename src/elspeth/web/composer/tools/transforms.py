@@ -2704,7 +2704,7 @@ _CHANGE_SUBSTRING_DECLARATION = ToolDeclaration(
     name="change_substring",
     handler=_execute_change_substring,
     kind=ToolKind.MUTATION,
-    description="Change exact text in one LLM prompt target. Inspect the target hash and state ID first. Each old substring must match once, counting overlapping starts; replace_all replaces left to right without rematching inserted text. File targets are declared but not supported yet. Prompt review reopens after a change. Result `target` identifies the edited text, `changed` reports whether it differs, `replacement_count` counts replacements, `length_chars` and `size_bytes` measure the result, and `sha256` hashes it. Inspect in a later tool batch to obtain the committed revision ID.",
+    description="Change exact text in one LLM prompt target. Inspect the target hash and state ID first. Each old substring must match once, counting overlapping starts; replace_all replaces left to right without rematching inserted text. File targets are declared but not supported yet. Prompt review reopens after a change; a term whose row is still resolved kept its definition. Result `target` identifies the edited text, `changed` reports whether it differs, `replacement_count` counts replacements, `length_chars` and `size_bytes` measure the result, and `sha256` hashes it. Inspect in a later tool batch to obtain the committed revision ID.",
     json_schema={
         "type": "object",
         "properties": {
