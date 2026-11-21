@@ -108,7 +108,8 @@ async def test_terms_carried_on_a_multi_query_node_stay_carried_when_more_querie
     assert _cards(await session.commit(edited.updated_state)) == [PROMPT_CARD]
 
     many_queries = {f"query_number_{index:02d}_with_a_long_descriptive_name": {"input_fields": {"text": "text"}} for index in range(60)}
-    more = _patch(session.state, {"queries": many_queries})
+    # A queries patch replaces the value whole, so it restates the two queries the node already has.
+    more = _patch(session.state, {"queries": {**MULTI_QUERY["queries"], **many_queries}})
     assert more.success, _errors(more)
     await session.commit(more.updated_state)
 
