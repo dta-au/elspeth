@@ -103,6 +103,7 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("composer/tools/sessions.py", "build_set_pipeline_candidate", "review_contract_code"),
         ("composer/tools/sessions.py", "_legacy_source_rejection", "header_conflict.error_code"),
         ("composer/tools/transforms.py", "_execute_upsert_node", "error_code"),
+        ("composer/tools/transforms.py", "_commit_node_candidate", "error_code"),
         ("composer/tools/transforms.py", "_execute_upsert_edge", "error_code"),
         ("composer/tools/transforms.py", "_apply_guarded_node_option_patch", "error_code"),
         ("composer/tools/transforms.py", "_substring_refusal", "code"),

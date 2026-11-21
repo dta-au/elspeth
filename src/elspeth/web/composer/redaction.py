@@ -3908,6 +3908,9 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
                     "id",
                     "node_type",
                     "input",
+                    # A boolean switch: true edits only input/on_success/on_error
+                    # of an existing transform. Not sensitive.
+                    "routing_only",
                     "plugin",
                     "on_success",
                     "on_error",

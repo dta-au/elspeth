@@ -105,6 +105,9 @@ def referenced_resources(tool: str, arguments: Mapping[str, JsonValue]) -> froze
     resources: set[Resource] = set()
     if tool == "upsert_node":
         _add(resources, "connection", arguments.get("input"))
+        if arguments.get("routing_only") is True:
+            # A routing-only edit changes a node that must already exist.
+            _add(resources, "node", arguments.get("id"))
         # Routing destinations can publish connections or target sinks/region
         # closers. Their spelling alone cannot prove a failed sink prerequisite.
     elif tool == "upsert_edge":

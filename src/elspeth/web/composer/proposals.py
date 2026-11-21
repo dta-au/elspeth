@@ -67,6 +67,22 @@ def build_tool_proposal_summary(
             arguments_redacted_json=redacted_arguments,
         )
 
+    if tool_name == "upsert_node" and "routing_only" in redacted_arguments and redacted_arguments["routing_only"] is True:
+        # A routing-only edit names exactly what it rewires; the generic card
+        # would read as a whole-node replacement that drops the options.
+        label = _string_argument(redacted_arguments, "id") or "selected node"
+        routes = [
+            f'{key} "{value}"'
+            for key in ("input", "on_success", "on_error")
+            if (value := _string_argument(redacted_arguments, key)) is not None
+        ]
+        return ToolProposalSummary(
+            summary=f'Rewire node "{label}": {", ".join(routes)}.',
+            rationale=rationale,
+            affects=affects,
+            arguments_redacted_json=redacted_arguments,
+        )
+
     if tool_name == "patch_node_options":
         label = _string_argument(redacted_arguments, "node_id") or "selected node"
         return ToolProposalSummary(

@@ -776,7 +776,7 @@ def _reserved_connection_names(state: CompositionState) -> set[str]:
 
 _DUPLICATE_CONSUMER_REASON: Final = (
     "One connection can feed one processing node; every node listed reads this one. "
-    "Change only the input bindings; preserve existing node options."
+    "Change only the input bindings; a routing_only rewire keeps a transform's options."
 )
 
 
@@ -1619,6 +1619,7 @@ def _mutation_result(
     data: Any = None,
     post_call_hints: tuple[str, ...] = (),
     full_replacement: bool = False,
+    component_echo: bool = True,
     catalog: PolicyCatalogView | None = None,
 ) -> ToolResult:
     """Build a ToolResult for a successful mutation.
@@ -1639,6 +1640,11 @@ def _mutation_result(
     is affected, so the echo would be the whole-state read it exists to
     replace, and the model already holds those bytes verbatim in the call it
     just made.
+
+    ``component_echo=False`` suppresses it for a call whose own ``data``
+    reports exactly what changed (``upsert_node`` with ``routing_only``):
+    there the echo would restate the step's unchanged options, up to its
+    16 KiB cap, and building it serialises the whole graph first.
 
     ``catalog`` is for a caller that normalizes the result through
     :func:`normalize_tool_result_validation` immediately (the set_pipeline
@@ -1667,7 +1673,7 @@ def _mutation_result(
         prior_validation=prior_validation,
         data=data,
         post_call_hints=post_call_hints,
-        applied_component=None if full_replacement else _applied_component_echo(new_state, affected),
+        applied_component=None if full_replacement or not component_echo else _applied_component_echo(new_state, affected),
         _validation_snapshot_hash=validation_snapshot_hash,
     )
 

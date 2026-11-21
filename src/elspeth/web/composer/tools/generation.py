@@ -1676,7 +1676,12 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
     DirectValidationGuidance(
         "node_routing_patch_invalid",
         "The options patch contains node routing fields, which are not plugin options.",
-        "Use upsert_node to edit input, on_success, on_error, routes or fork_to while retaining the intended node options. Preserve the user's failure choice; gates use on_error only for their supported error route.",
+        "Use upsert_node with routing_only=true to change a transform's input, on_success or on_error without its options; for routes, fork_to or any other kind, send the whole node with upsert_node. Preserve the user's failure choice; gates use on_error only for their supported error route.",
+    ),
+    DirectValidationGuidance(
+        "routing_only_edit_invalid",
+        "A routing-only upsert_node carried a field it does not change, a null route, or a node that is not a transform.",
+        "Send id, node_type 'transform', input and only the routes that change. Use patch_node_options for options; send the whole step with upsert_node for anything else.",
     ),
     DirectValidationGuidance(
         "splice_ids_not_distinct",

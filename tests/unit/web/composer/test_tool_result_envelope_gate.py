@@ -175,6 +175,7 @@ _DATA_HELPER_PAYLOADS: dict[str, type | _ListPayload | _Literal | None] = {
     "pipeline_state_changes": state_responses.StateChangesPayload,
     "state_inspection_page_payload": state_responses.StateInspectionPagePayload,
     "_transform_index_payload": transforms._TransformIndexPayload,
+    "_routing_update_payload": transforms._RoutingUpdatePayload,
     # Element builders of a shipped container. Unreachable from a ``data=`` site directly —
     # each is called once per item inside a comprehension or splatted into one — and
     # unattributed until ``_nested_value_keys`` stopped declining containers (RED2-2 residue).
@@ -297,6 +298,7 @@ _FUNCTION_TOOL_OVERRIDES: dict[str, str] = {
     "_inspect_prompt_targets": "inspect_prompt_targets",
     "build_set_pipeline_candidate": "set_pipeline",
     "_execute_upsert_queue_node": "upsert_node",
+    "_execute_routing_only_upsert": "upsert_node",
     "_execute_delete_blob_locked": "delete_blob",
     "_finalize_journaled_blob_deletion": "delete_blob",
     "_check_duplicate_interpretation": "request_interpretation_review",
