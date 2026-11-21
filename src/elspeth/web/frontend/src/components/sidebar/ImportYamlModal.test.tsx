@@ -1397,6 +1397,25 @@ describe("ImportYamlModal", () => {
     expect(screen.queryByText(IMPORT_YAML_422_MESSAGE)).not.toBeInTheDocument();
   });
 
+  it("shows the credential-guard 422 reason instead of the empty/oversized copy", async () => {
+    useSessionStore.setState({ compositionState: emptyState() } as never);
+    const reason =
+      "This control content appears to contain a credential. Store the value through the secret service and use a secret reference.";
+    vi.mocked(api.importCompositionYaml).mockRejectedValue({
+      status: 422,
+      detail: reason,
+      error_type: "credential_material_rejected",
+    });
+
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml();
+    await clickImport();
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(reason);
+    expect(screen.queryByText(IMPORT_YAML_422_MESSAGE)).not.toBeInTheDocument();
+  });
+
   it("renders the backend detail verbatim for a 400 (structural defect)", async () => {
     useSessionStore.setState({ compositionState: emptyState() } as never);
     vi.mocked(api.importCompositionYaml).mockRejectedValue({
