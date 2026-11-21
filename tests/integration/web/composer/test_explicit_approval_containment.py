@@ -142,7 +142,7 @@ async def test_batch_with_two_staged_edits_is_refused_before_effects_then_one_co
         # including a sibling refused for malformed arguments.
         assert "carried 2 pipeline-change calls" in message
         assert "None of them was applied and no proposal was recorded" in message
-        # Maintainer ruling 2026-11-19: under approval, narrow edits go one at a
+        # By design: under approval, narrow edits go one at a
         # time; a pipeline between changes does not have to validate.
         assert "only one proposal can await the user at a time" in message
         assert "Send the first change alone, then tell the user what follows" in message

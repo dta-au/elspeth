@@ -1696,7 +1696,7 @@ describe("toolbar catalog trigger (2026-08-15 UX review)", () => {
     });
 
     it("opens the toolbar with the Show conversation control while collapsed", async () => {
-      // 2026-11-20 ruling (home A): collapsed, the Show control is the first
+      // By design: collapsed, the Show control is the first
       // thing in the pipeline's title bar, ahead of the "Pipeline" title.
       const user = userEvent.setup();
       renderArtifactWorkspace();

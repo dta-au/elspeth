@@ -10,7 +10,7 @@ Two things a unit-level size check cannot show:
   the ceiling and the turn was refused before the call;
 * what explicit approval does to the fork the skill teaches (one gate and one
   re-pointed step per consumer, all through ``upsert_node``). This is a
-  stated cost recorded for the handoff, not approval behaviour under change.
+  stated cost recorded for reference, not approval behaviour under change.
 
 The provider is faked (``litellm.acompletion`` or the gateway's ``_call_llm``
 replays scripted tool calls); the compose loop, tool batch, dispatcher,

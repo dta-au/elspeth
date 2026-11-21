@@ -40,7 +40,7 @@ Safety properties (named by tests in
 * A run resumes only from a checkpoint that is complete and valid for the same
   session; a malformed checkpoint stops it.
 
-Not carried from the delivered script: building the copy's YAML import body,
+Not carried from the earlier script: building the copy's YAML import body,
 and an external display-restore step. Copy the session first by a supported
 means; see ``docs/runbooks/staging-hardware-upgrade-recovery.md``.
 """

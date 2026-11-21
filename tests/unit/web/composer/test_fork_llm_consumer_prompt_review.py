@@ -1,6 +1,6 @@
 """Re-pointing an LLM step into a fork branch: does its approved prompt review stand?
 
-On the enclave the consumers sharing a connection are LLM steps. The fork the
+In a large LLM graph the consumers sharing a connection are LLM steps. The fork the
 skill teaches re-sends each step whole (as the model read it) with only its
 ``input`` changed. This pins what that does to the step's prompt review: the
 review rows, the approved prompt artifact hash, and whether execution would

@@ -15,7 +15,7 @@ A writer site is a call that passes ``created_by`` either as the constant
 copies an existing row's authorship. Constants ``"assistant"`` and
 ``"pipeline"`` are not user rows and are not listed.
 
-This is a guard: it passes on the base and on the lane. The controls prove the
+This is a guard: it passes before and after the change. The controls prove the
 scanner reports a new writer and ignores a non-user one.
 """
 

@@ -5,7 +5,7 @@ When two or more steps read one connection, validation reports
 ``validation.graph_repair_suggestions``. That entry used to hand the model a
 server-built fork gate and one whole-node ``upsert_node`` call per consumer:
 36 KB at two LLM consumers, 218 KB at 25, on every result while the error
-stood. By the maintainer's ruling (form B) the entry now states facts only
+stood. By design the entry now states facts only
 (``code``, ``connection``, ``reason``, ``affected_consumers[].id``): no
 server-proposed names, no gate, no ready calls, no whole nodes. The plain
 error names every consumer, and the model builds the fork itself from the
@@ -47,8 +47,8 @@ _ENTRY_KEYS = {"code", "connection", "reason", "affected_consumers"}
 # Concrete bounds for the facts (entry + error entry, json.dumps default
 # separators). The fixed part covers code, connection, the reason, the error's
 # prefix and closing sentence; each consumer adds its id three times (twice in
-# the message, once in the entry) plus framing. Measured at 6-character ids:
-# see the handoff for the exact bytes.
+# the message, once in the entry) plus framing. Measured at 6-character ids
+# during 0.8.16 development.
 _FACTS_FIXED_BOUND_BYTES = 600
 _FACTS_PER_CONSUMER_BOUND_BYTES = 45
 
@@ -86,7 +86,7 @@ def _expected_message(connection: str, ids: list[str]) -> str:
     return f"Duplicate consumer for connection '{connection}': {listed}. Use a gate for fan-out."
 
 
-def test_fixture_has_enclave_shape() -> None:
+def test_fixture_has_large_graph_shape() -> None:
     state = _graph(1)
     payload_bytes = sum(_bytes(dict(_serialize_set_pipeline_node(node))) for node in state.nodes)
     assert len(state.nodes) == _STEPS

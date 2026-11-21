@@ -1,7 +1,6 @@
 """list_transforms is a selection index: five facts per plugin, never its configuration.
 
-Spec carried from the staging hotfix (``test_transform_inventory_index.py``):
-the listing keeps selection and prohibition facts and names the per-plugin
+Spec: the listing keeps selection and prohibition facts and names the per-plugin
 details tool, but no config field, default, hint or usage text reaches the
 model through it. Every assertion goes through the public declaration and its
 own response contract, and checks a key before indexing it, so a tree still

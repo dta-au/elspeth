@@ -235,7 +235,7 @@ describe("ComposerWorkspace", () => {
   });
 
   it("opens each title bar with the toggle: Hide in Conversation, Show in Pipeline", async () => {
-    // Maintainer ruling 2026-11-20 (home A): the left end of the title bar.
+    // By design, the toggle sits at the left end of the title bar.
     // Open, the Hide control is the first thing in the conversation's bar;
     // collapsed, the Show control is the first thing in the pipeline's bar,
     // so it stays on the same spot on screen (geometry pinned in

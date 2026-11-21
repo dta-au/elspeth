@@ -2529,7 +2529,7 @@ class CompositionCompletion:
             ).binding
             == publication_review.binding
         )
-        # Rule (maintainer, 2026-11-20): an admitted reply over a FLAGGED graph
+        # Rule: an admitted reply over a FLAGGED graph
         # gets one more repair/review round only when the graph is newly
         # flagged AND this turn's edits changed the saved graph. Every other
         # admitted reply closes the turn on this pass, as before: one about an
@@ -2538,7 +2538,7 @@ class CompositionCompletion:
         # earlier pass admitted is published with the block standing, except
         # when this (latest) review was CLEAN: it cleared the graph, so the
         # turn keeps the plain withheld outcome instead of a FLAGGED block the
-        # advisor no longer holds (lead ruling 2026-11-20, pending maintainer).
+        # advisor no longer holds.
         turn_changed_graph = turn_evidence.effects.net_changed is True
         terminal_block = (verdict.blocking and publication_admitted and (graph_already_blocked or not turn_changed_graph)) or (
             (verdict.blocking or not publication_admitted)

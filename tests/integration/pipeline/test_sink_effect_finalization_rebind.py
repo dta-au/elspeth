@@ -186,7 +186,7 @@ def test_multi_effect_redrive_rebinds_finalization_ordinals_and_copies_nothing_e
     effect, each re-drive spans that effect and a new one whose durable
     ordinals restart at zero, so the coordinator must rebind those finalization
     ordinals; without the rebind the re-drive fails with ``sink result accepted
-    unknown member ordinal`` (integrator verifier A's negative control). Every
+    unknown member ordinal`` (the negative control). Every
     other finalization member is passed through, so the construction count is
     the executor's members plus the rebinds only (base 019a98e15 builds 20-22
     here: it copies every member, changed or not).

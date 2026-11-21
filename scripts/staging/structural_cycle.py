@@ -1,7 +1,7 @@
 """The structural-cycle workload for the Composer edit battery, and its verifier.
 
-This is the large-graph stress workload a customer measured on their
-deployment, carried into the battery so the same edits can be sent and
+This is the reference large-graph stress workload, carried into the
+battery so the same edits can be sent and
 judged the same way. Each ten-step cycle edits the routing around one
 *anchor* step, between its *upstream* (a source or step) and its
 *downstream* (a step or sink) -- a :class:`Position`:
@@ -11,7 +11,7 @@ judged the same way. Each ten-step cycle edits the routing around one
 7-10. remove all four, the last step also restoring the original routing
 values. Cycle 1 names its nodes ``compact_*``, later cycles ``cycleN_*``.
 
-The customer's fixture was one source, one LLM node and a sink, so their
+The reference fixture was one source, one LLM node and a sink, so its
 one position was ``source -> capacity_probe -> results``. Given several
 positions (from a generated fixture's manifest), cycle ``k`` edits around
 position ``k`` modulo their number, so the edits land in different places of
@@ -19,7 +19,7 @@ a realistic graph.
 
 The instruction wording is the workload that was measured and is pinned by
 ``tests/unit/scripts/staging/test_structural_cycle.py``; change it only with
-the customer's workload.
+the reference workload.
 
 The workload is built in code rather than shipped as a plan file: it is a
 formula over the step number and three component names that the operator
@@ -28,7 +28,7 @@ of names. The built plan is hashed like a plan file, so a resumed attempt
 with other names or another step count is refused.
 
 The verifier (:func:`verify_state` and :func:`operation_codes`) reports the
-same error codes as the customer's runner, generalised from their one node to
+same error codes as the reference runner, generalised from its one node to
 any graph: every node, source and output the step did not name must equal
 the starting graph, and a named one may differ only in the wiring the step
 had to touch. Codes from the state check:
@@ -103,14 +103,14 @@ class Position:
 
 
 def _was(pointer: str) -> str:
-    # Rendered by resolve_edits from the attempt's starting graph as JSON text, as the customer's runner does.
+    # Rendered by resolve_edits from the attempt's starting graph as JSON text, as the reference runner does.
     return "{was:" + pointer + "}"
 
 
 def planned_step(number: int, position: Position) -> tuple[str, list[str]]:
     """The instruction for step ``number`` (from 1) and the node order it must leave between upstream and downstream.
 
-    The wording is the customer's template with the position's names put in;
+    The wording is the reference template with the position's names put in;
     a downstream output is called "the <name> sink" where the template says
     so, a downstream node just "<name>". The last step of a cycle names the
     original routing values as ``{was:...}`` fields, filled in from the
@@ -271,7 +271,7 @@ def _field(component: Mapping[str, Any] | None, key: str) -> Any:
 def verify_state(baseline: Mapping[str, Any], current: Mapping[str, Any], order: Sequence[str], position: Position) -> list[str]:
     """The state codes for a graph that should hold ``order`` between the position's upstream and downstream.
 
-    The customer's verifier, generalised from one node to any graph: every
+    The reference verifier, generalised from one node to any graph: every
     node, source and output the step did not name must equal the starting
     graph, and a named one may differ only in the wiring the step had to
     touch (the upstream's ``on_success``, the anchor's ``input`` and

@@ -385,15 +385,15 @@ _P2_READ_GUIDANCE_CANONICAL_BYTES = 237
 # list_transforms as a hints carrier, 905 -> 887 B (-18). Net +69 B, equal to
 # the measured scaffold overshoot (143,940 against a 143,871 ceiling).
 _P3_LISTING_INDEX_CANONICAL_BYTES = 69
-# P3 (2026-11-20, lead ruling option 1): get_plugin_schema returns and names
+# P3 (2026-11-20): get_plugin_schema returns and names
 # `usage_when_not_to_use`; its description's canonical JSON grows 420 -> 531 B
 # (+111), equal to the measured scaffold overshoot (144,051 against 143,940).
 # The pipeline_composer.md teaching line is not in the planner scaffold.
 _P3_SCHEMA_PROHIBITION_CANONICAL_BYTES = 111
-# Inline prompt limit: set_pipeline options description, 15,029 -> 15,266 B; measured on candidate 4 at 145,205 vs 144,968.
+# Inline prompt limit: set_pipeline options description, 15,029 -> 15,266 B; measured on the combined tree at 145,205 vs 144,968.
 _INLINE_PROMPT_LIMIT_CANONICAL_BYTES = 237
 # get_pipeline_state description names the document set_pipeline wraps ("that document" ->
-# "the flat `set_pipeline_arguments` document", +29 B); measured on candidate 4 at 145,234 vs 145,205.
+# "the flat `set_pipeline_arguments` document", +29 B); measured on the combined tree at 145,234 vs 145,205.
 _GET_PIPELINE_STATE_WRAP_ANTECEDENT_CANONICAL_BYTES = 29
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)

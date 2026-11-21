@@ -430,10 +430,9 @@ def test_patch_cannot_supply_replacement_approval_digest() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Replacing a structured prompt with new text (maintainer ruling 2026-11-19:
-# "if I am telling it to replace A with B, it doesn't matter what is already
-# there"). The signal is the model's: prompt_template as text together with
-# prompt_template_parts: null.
+# Replacing a structured prompt with new text (by design, replacing A with B
+# does not depend on what is already there). The signal is the model's:
+# prompt_template as text together with prompt_template_parts: null.
 # ---------------------------------------------------------------------------
 
 _WRITERS = ("patch_node_options", "upsert_node", "set_pipeline")
@@ -762,7 +761,7 @@ def test_the_stored_prompts_own_text_with_null_parts_replaces_nothing(writer: st
     This test used to assert the opposite
     (``test_byte_identical_replacement_text_still_reopens_the_prompt_review``):
     that the pair replaced the prompt and reopened its review even for
-    byte-identical text. It was inverted on the integrator's ruling of
+    byte-identical text. It was inverted by design on
     2026-11-19: a model that re-sends a structured node and adds the null key
     must not silently remove the user's accepted definitions. The old test's
     purpose, that nothing approved for A approves B, still holds here because

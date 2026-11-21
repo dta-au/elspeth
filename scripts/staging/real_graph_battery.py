@@ -34,7 +34,7 @@ Safety properties (named by tests in
 Reading provider evidence uses the audit-grade messages view, which records an
 audit-grade access entry for each read.
 
-Not carried from the delivered script: copying the source session's historical
+Not carried from the earlier script: copying the source session's historical
 graph and files (``prepare``), and the instruction suffix and evidence helpers
 of an operator module that is not in the repository.
 """
