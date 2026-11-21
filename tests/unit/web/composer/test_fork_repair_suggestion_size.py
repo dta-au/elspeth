@@ -41,7 +41,10 @@ from tests.unit.web.composer.test_tools import _mock_catalog, execute_tool
 _STEPS = 25
 _LLM_COUNT = 11
 
-_REASON = "One connection can feed one processing node; every node listed reads this one. Change only the input bindings; preserve existing node options."
+_REASON = (
+    "One connection can feed one processing node; every node listed reads this one. "
+    "Change only the input bindings; a routing_only rewire keeps a transform's options."
+)
 _ENTRY_KEYS = {"code", "connection", "reason", "affected_consumers"}
 
 # Concrete bounds for the facts (entry + error entry, json.dumps default

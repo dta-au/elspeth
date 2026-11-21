@@ -202,6 +202,7 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "row_union_on_success_must_be_connection",
         "row_union_schema_incompatible",
         "row_union_timeout_invalid",
+        "routing_only_edit_invalid",
         "runtime_preflight_not_run",
         "schema_contract_violation",
         "server_owned_review_protected",

@@ -395,6 +395,11 @@ _INLINE_PROMPT_LIMIT_CANONICAL_BYTES = 237
 # get_pipeline_state description names the document set_pipeline wraps ("that document" ->
 # "the flat `set_pipeline_arguments` document", +29 B); measured on the combined tree at 145,234 vs 145,205.
 _GET_PIPELINE_STATE_WRAP_ANTECEDENT_CANONICAL_BYTES = 29
+# upsert_node routing_only (0.8.16): the flag's schema property, the receipt and re-open sentences in the
+# description, and the plugin/options/description property notes (+355 B), plus the re-open sentence in
+# pipeline_capabilities.md's routing-edit paragraph (+246 B); measured on 9cdfacaa9 + the change at
+# 145,835 vs 145,234.
+_UPSERT_NODE_ROUTING_ONLY_CANONICAL_BYTES = 601
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
@@ -422,6 +427,7 @@ _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     + _P3_SCHEMA_PROHIBITION_CANONICAL_BYTES
     + _INLINE_PROMPT_LIMIT_CANONICAL_BYTES
     + _GET_PIPELINE_STATE_WRAP_ANTECEDENT_CANONICAL_BYTES
+    + _UPSERT_NODE_ROUTING_ONLY_CANONICAL_BYTES
 )
 
 

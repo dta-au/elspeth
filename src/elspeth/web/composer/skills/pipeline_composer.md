@@ -199,15 +199,16 @@ For ordinary build/edit turns, the action path is:
    duplicate.**
 6. End only in one of the valid terminal states below.
 
-**On a pipeline that already exists, edit with the narrow tools.** `change_substring` for prompt wording; `patch_node_options` for one step's options; `splice_transform` to insert a step between two others; `upsert_node` to add or replace a step or change its `input` (it re-sends that whole step, so it is not the first choice for a wording or option change); `upsert_edge` to route rows to an output; the remove tools to delete. Send a whole `set_pipeline` only to build or rebuild a pipeline of five nodes or fewer, to change one with five or fewer entries in `nodes`, or when no narrow tool can express the change: re-sending every step of a larger pipeline is slow, and a call that long may be cut off before it is complete. This is a choice of tool only: still make the whole change the user asked for; where changes need approval, that is one proposal at a time.
+**On a pipeline that already exists, edit with the narrow tools.** `change_substring` for prompt wording; `patch_node_options` for one step's options; `splice_transform` to insert a step between two others; `upsert_node` to add or replace a step (it re-sends that whole step, so it is not the first choice for a wording or option change), or with `routing_only=true` to change only an existing transform's `input`, `on_success` or `on_error` without re-sending it; `upsert_edge` to route rows to an output; the remove tools to delete. Send a whole `set_pipeline` only to build or rebuild a pipeline of five nodes or fewer, to change one with five or fewer entries in `nodes`, or when no narrow tool can express the change: re-sending every step of a larger pipeline is slow, and a call that long may be cut off before it is complete. This is a choice of tool only: still make the whole change the user asked for; where changes need approval, that is one proposal at a time.
 
 | Edit intent | Use |
 | --- | --- |
 | Create a new pipeline or perform an intentional full rebuild | `set_pipeline`, or bounded construction batches as described below |
-| Perform a one-transform insertion between existing nodes on a direct linear path | `splice_transform`: one call, with or without `edges`; the server re-points the successor's `input`. If it is refused, use `upsert_node` for the new node and re-point the successor's `input`, also with `upsert_node` |
+| Perform a one-transform insertion between existing nodes on a direct linear path | `splice_transform`: one call, with or without `edges`; the server re-points the successor's `input`. If it is refused, use `upsert_node` for the new node and re-point the successor's `input`, also with `upsert_node` (with `routing_only=true` when the successor is a transform) |
 | Make an option-only edit to an existing node | `patch_node_options` |
 | Replace an inline or structured LLM prompt's whole text with new text | `patch_node_options` with `prompt_template` (the new text) and `prompt_template_parts: null` |
 | Change a small exact span of an inline or structured LLM prompt | `inspect_prompt_targets`, then `change_substring` |
+| Change only what an existing transform reads or where its rows go | `upsert_node` with `routing_only=true` |
 | Add or rewire a node in an existing pipeline, when no narrower row above fits | `upsert_node` / `upsert_edge` |
 
 For a small edit to an existing prompt, call `inspect_prompt_targets` for the node and use its state ID and SHA-256 with `change_substring`; do not resend the whole prompt through `patch_node_options` to change part of it. Send the smallest `old` substring that matches exactly once; use `replace_all` only when every occurrence should change. After a successful edit, call `inspect_prompt_targets` in a later tool batch to obtain the committed revision ID. If the tool returns `target_changed`, inspect again before retrying. A changed prompt needs fresh review.
@@ -263,7 +264,8 @@ Examples of complete workflow scope, whether built atomically or in batches:
 The capability core defines the optional `description` on every source, node,
 and output. Describe the step's purpose in the user's terms ("Fetch each page
 at its url"), not its plugin mechanics. Preserve existing descriptions during
-routing-only edits or when the user asks to preserve content. Refresh them
+routing-only edits (a `routing_only=true` call keeps the stored one) or when
+the user asks to preserve content. Refresh them
 only when the requested change includes the step's purpose or description.
 
 ## Reply Register
@@ -543,25 +545,32 @@ proposes no repair: `connection` (the connection read more than once),
 `affected_consumers` (the `id` of every step reading it), `code` and `reason`.
 One connection feeds one step. If the steps were meant to run one after
 another, re-point the later step's `input` at the earlier step's output
-connection with `upsert_node`; that call re-sends the step whole. If each
+connection with `upsert_node`: for a transform add `routing_only=true`, which
+keeps its plugin and options; any other kind is re-sent whole. If each
 step needs the same rows, build a fork yourself: `upsert_node` a gate
 (`node_type` `gate`, no `plugin`, `condition='True'`,
 `routes={"true": "fork", "false": "fork"}`) whose `input` is the shared
 connection and whose `fork_to` lists one new branch name per step (at most
-32), and `upsert_node` each step with `input` set to its own branch. An
+32), and re-point each step's `input` to its own branch the same way. An
 aggregation or a coalesce cannot read a fork branch directly: add a relay on its
 branch, a transform that passes each row through unchanged (one the catalog
 offers, configured to change nothing, its `schema` `{"mode": "observed"}`;
 `input` the branch, `on_success` a new connection, `on_error` as on any
 transform), and have the step read that
-connection: an aggregation through `input`, a coalesce through the value of its
-`branches` entry, key kept. A row union cannot read a fork branch, even through
+connection, re-sent whole with `upsert_node`: an aggregation through `input`, a
+coalesce through the value of its `branches` entry, key kept. A row union cannot read a fork branch, even through
 a relay: build no fork for it and tell the user. The gate id, the relay ids and
 the branch and connection names are yours to choose. Until the last call the
 duplicate stands, with errors for connections nothing produces or reads yet;
 they clear with the last call. Where changes need approval, send these calls one
 per response, each after the one before is accepted.
 <!-- taught:end -->
+
+A rewire can re-open a review. A review of what feeds a step (prompt shield),
+of where an auto-wired control sits, or of a gate's routes re-opens when the
+rewire changes that fact. A routing-only result names each one in
+`reopened_reviews`; the user must approve it again before a run, so tell them
+which.
 
 <!-- taught:begin failure-data * data.repair.post_hoc_form.tool_sequence -->
 Under a credential failure's `repair` → `post_hoc_form`, `tool_sequence` is

@@ -257,6 +257,7 @@ row unions, queues, or collectors.
 | `id` | string | **Yes** | Unique node identifier (e.g. `"classifier"`, `"quality_gate"`) |
 | `node_type` | string | **Yes** | `transform`, `gate`, `aggregation`, `coalesce`, `row_union`, `queue`, or `collector` |
 | `input` | string | **Yes** | Input connection name (must match an upstream `on_success`) |
+| `routing_only` | boolean | No | Default `false`. `true` changes only `input`, `on_success` and `on_error` of an existing transform; see below. |
 | `plugin` | string | No | Plugin name. Required for transforms, aggregations, and collectors. Null for gates, coalesces, row unions, and queues. |
 | `on_success` | string | No | Output connection name. Required for transforms, row unions, and collectors. Null for gates and queues. |
 | `on_error` | string | For new transforms/aggregations | Explicit `"discard"` or an eligible named route. An update may omit it to preserve the same node kind's choice. New gates omit it for fail-fast; gate updates preserve an omitted prior choice and clear to fail-fast with null. Collectors reject this field because failures are whole-group verdicts. |
@@ -273,6 +274,8 @@ row unions, queues, or collectors.
 | `scope_policy` | string | No | Group arrival policy, `"require_all"` or `"best_effort"` (collectors only) — **required for collectors**, there is no default |
 
 **Behaviour:** If a node with the given `id` already exists, it is replaced. The `id` must be unique across all node types.
+
+**Routing-only edits.** With `routing_only: true` the call rewires an existing transform without re-sending it: send `id`, `node_type` (`"transform"`), `input` (the current one when it does not change) and only the routes that change. The stored plugin, options (a file-held prompt included), description and every route left out are kept; every authored option stays byte-identical. Any other field, an explicit `null` route, an unknown node or a node that is not a transform is refused (`routing_only_edit_invalid`, or `node_not_found`). Plugin admission is not re-run, because nothing it checks can change; the result's whole-graph `validation` reports a rewire the step cannot accept. Review reconciliation runs as for any node write: a prompt-shield review of a downstream LLM step, or the disclosure of an auto-wired control that is itself re-pointed, re-opens when the rewire changes the fact it binds. The result carries no `applied_component`; its `data` is `routing_update` (`id`, `input`, `on_success`, `on_error`), `options_preserved: true`, `reopened_reviews` (up to 32 entries of `component_id`, `kind`, `user_term`, each a review the run now waits on that it did not wait on before) and `reopened_review_count` (all of them). The server-derived `approved_prompt_artifact_hash` follows the rule every tool write follows: beside a file-held prompt it is re-derived as `null`.
 
 **Node type specifics:**
 

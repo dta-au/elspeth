@@ -492,7 +492,7 @@ class TestPreviewPipeline:
             {
                 "code": "duplicate_connection_consumer",
                 "connection": "shared",
-                "reason": "One connection can feed one processing node; every node listed reads this one. Change only the input bindings; preserve existing node options.",
+                "reason": "One connection can feed one processing node; every node listed reads this one. Change only the input bindings; a routing_only rewire keeps a transform's options.",
                 "affected_consumers": [{"id": "t1"}, {"id": "t2"}, {"id": "feeder"}],
             }
         ]
@@ -562,7 +562,7 @@ class TestPreviewPipeline:
             {
                 "code": "duplicate_connection_consumer",
                 "connection": "classified_rows",
-                "reason": "One connection can feed one processing node; every node listed reads this one. Change only the input bindings; preserve existing node options.",
+                "reason": "One connection can feed one processing node; every node listed reads this one. Change only the input bindings; a routing_only rewire keeps a transform's options.",
                 "affected_consumers": [{"id": "fraud_filter"}, {"id": "regular_filter"}],
             }
         ]

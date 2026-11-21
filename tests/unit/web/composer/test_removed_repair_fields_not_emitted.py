@@ -108,7 +108,7 @@ def test_duplicate_consumer_producer_and_shared_tool_validation_have_only_facts(
             "connection": "shared",
             "reason": (
                 "One connection can feed one processing node; every node listed reads this one. "
-                "Change only the input bindings; preserve existing node options."
+                "Change only the input bindings; a routing_only rewire keeps a transform's options."
             ),
             "affected_consumers": [{"id": "llm_00"}, {"id": "llm_01"}],
         }

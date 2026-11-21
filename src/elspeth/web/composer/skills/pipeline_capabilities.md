@@ -61,13 +61,21 @@ that field is the authoritative post-change state of everything it names; do
 not call `get_pipeline_state` to confirm those components. Use
 `get_pipeline_state` only for an untouched component, a whole-document
 question, or a successful mutation that omits the echo. A successful result
-whose hint reports the pipeline unchanged needs no confirming read.
+whose hint reports the pipeline unchanged needs no confirming read. A
+routing-only `upsert_node` returns `routing_update` instead of the echo; it is
+authoritative for the routes it names.
 
-For an existing transform's routing edit, preserve its description, options,
-and unrelated error routes in the replacement `upsert_node` arguments unless
-the user requests their change. `upsert_node` replaces the whole node: an
-omitted `description` is dropped and the supplied `options` replace the old
-ones, so resupply both; an omitted `on_error` keeps the existing choice.
+For an existing transform's routing edit, send `upsert_node` with
+`routing_only=true`, `id`, `node_type`, `input` (the current one when it does
+not change) and only the routes that change; its plugin, options, description
+and every route you leave out stay as stored, and a null route is refused. A
+review of what feeds the step (prompt shield), of where an auto-wired control
+sits, or of a gate's routes re-opens when the rewire changes that fact; the
+result names each in `reopened_reviews`, and each must be approved again
+before a run. Any other change to a step re-sends it whole. `upsert_node`
+replaces the whole node: an omitted `description` is dropped and the supplied
+`options` replace the old ones, so resupply both; an omitted `on_error` keeps
+the existing choice.
 
 Use `get_pipeline_state(since_start=true)` for the net changes since this turn
 began: exact values, components keyed by identity, their order reported
@@ -288,7 +296,8 @@ Every source, node, and output accepts an optional `description`: one short
 sentence of plain prose saying what that step does, shown to human reviewers
 beside the raw config. Supply it when authoring a step; refresh it only when
 the requested change includes the step's purpose or description. Preserve it
-for routing-only edits or explicit content-preservation requests. It is
+for routing-only edits or explicit content-preservation requests; a
+`routing_only=true` call keeps the stored one, so leave it out there. It is
 informational only — never routing, validation, or a substitute for review.
 
 ## Field contracts and structured plugin output
