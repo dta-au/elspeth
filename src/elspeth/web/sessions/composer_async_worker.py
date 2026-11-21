@@ -21,7 +21,7 @@ from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlemen
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError, run_required_sql_finish_once, run_sync_in_worker
 from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts
-from elspeth.web.composer.private_diagnostic_facts import capture_failure_facts
+from elspeth.web.composer.private_diagnostic_facts import capture_failure_facts, safe_failure_text
 from elspeth.web.composer_watch_reads import ComposerOperationWatchReader
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
@@ -75,6 +75,10 @@ from elspeth.web.sessions.service import ComposerTerminalSQLCompletionUnknown
 from elspeth.web.sessions.time_normalization import restore_utc
 
 slog = structlog.get_logger()
+
+# The audit-integrity log line carries at most this much of the leaf's text;
+# the private failure-facts row it points to retains up to 2048 bytes.
+_SETTLED_LOG_MESSAGE_BYTES = 512
 
 
 @dataclass(slots=True)
@@ -1126,13 +1130,39 @@ class ComposerAsyncWorker:
             self._adoption_recovery_pending.add(recovery_key)
             self._adoption_recovery_cancellations.setdefault(recovery_key, cancellation_observations)
             terminal = await self._recover_failed_adoption(services, running, current, coordinator, failure_projection, exc)
+        # A pointer to the private failure-facts row written with this terminal
+        # (``role='audit'``, ``tool_call_id='operation:<operation_id>'``), never
+        # a record of its own: the ids find the row, and the leaf's class and
+        # text are only what that row may retain, bounded smaller.
+        support_id = operation_failure_diagnostic_id(session_id=str(current.session_id), operation_id=current.operation_id)
         slog.info(
             "composer_operation.settled",
+            session_id=str(current.session_id),
+            operation_id=current.operation_id,
             status=terminal.status,
             failure_code=terminal.failure_code,
             settled_by=terminal.settled_by,
-            diagnostic_id=failure.diagnostic_id,
+            diagnostic_id=support_id,
         )
+        # The same roots the facts row records: the public failure can come
+        # from a required-work receipt rather than from ``exc`` (``_failure_for``).
+        integrity_leaves: list[AuditIntegrityError] = []
+        for root in roots:
+            for leaf in _failure_leaves(root):
+                if isinstance(leaf, AuditIntegrityError) and all(leaf is not seen for seen in integrity_leaves):
+                    integrity_leaves.append(leaf)
+        if terminal.status == "failed" and integrity_leaves:
+            leaf = integrity_leaves[0]
+            leaf_args = leaf.args
+            slog.error(
+                "composer_operation.audit_integrity_failure",
+                session_id=str(current.session_id),
+                operation_id=current.operation_id,
+                diagnostic_id=support_id,
+                leaf_class=safe_failure_text(type(leaf).__name__, 128) or "unavailable",
+                leaf_message=safe_failure_text(leaf_args[0], _SETTLED_LOG_MESSAGE_BYTES) if leaf_args else None,
+                integrity_leaf_count=len(integrity_leaves),
+            )
         return terminal
 
     async def _recover_failed_adoption(

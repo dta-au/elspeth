@@ -949,8 +949,32 @@ class SessionServiceImpl:
         *,
         session_id: UUID,
         anchor_id: UUID,
+        graph_review: Literal["projected", "stored"],
     ) -> tuple[CompositionStateRecord | None, CompositionStateRecord | None]:
-        """Capture a short read-only state view before blob custody acquisition."""
+        """Capture a short read-only (anchor, live) state view before blob custody acquisition.
+
+        The pair is the expectation a caller compares, under the SESSIONS
+        lock, with the rows it then reads, so the blob snapshot and the
+        validation built from this view are proved to come from the locked
+        rows. ``graph_review`` has no default: each caller must name the kind
+        of record its locked re-read produces, or the comparison fails by
+        construction.
+
+        * ``"stored"`` returns the raw immutable rows. The pending-review
+          create path compares with the coordination repository's
+          ``_verified_state`` reads, which never project a committed graph
+          review.
+        * ``"projected"`` returns the effective records (stored row plus any
+          committed graph review projected onto ``composer_meta`` and
+          ``review_projection``). The resolve path compares with its own
+          ``_effective_state_record_on_connection`` reads under the lock.
+
+        Either kind selects the same inline blobs: ``_inline_preflight_config``
+        reads only ``sources``, ``nodes`` and ``outputs``, which the
+        projection never changes.
+        """
+        if graph_review not in ("projected", "stored"):
+            raise ValueError(f"graph_review must be 'projected' or 'stored', got {graph_review!r}")
         sid = str(session_id)
 
         def _read() -> tuple[CompositionStateRecord | None, CompositionStateRecord | None]:
@@ -966,6 +990,11 @@ class SessionServiceImpl:
                     .order_by(desc(composition_states_table.c.version))
                     .limit(1)
                 ).one_or_none()
+                if graph_review == "stored":
+                    return (
+                        self._row_to_state_record(anchor_row) if anchor_row is not None else None,
+                        self._row_to_state_record(live_row) if live_row is not None else None,
+                    )
                 return (
                     self._effective_state_record_on_connection(conn, anchor_row) if anchor_row is not None else None,
                     self._effective_state_record_on_connection(conn, live_row) if live_row is not None else None,
@@ -5090,7 +5119,16 @@ class SessionServiceImpl:
             expected_anchor: CompositionStateRecord | None = None
             expected_live: CompositionStateRecord | None = None
             if proposed_state is None:
-                expected_anchor, expected_live = await self._preflight_state_pair(session_id=session_id, anchor_id=composition_state_id)
+                # STORED, not projected: the coordination repository plans
+                # against raw locked rows (``_verified_state``), and
+                # ``assert_source_state`` compares this pair with them by
+                # strict equality. A projected pair differs by construction
+                # once a committed graph review is bound to the anchor or live
+                # state, which refused every reconcile of a file-held prompt
+                # review after a no-edit turn's END review (HTTP 500).
+                expected_anchor, expected_live = await self._preflight_state_pair(
+                    session_id=session_id, anchor_id=composition_state_id, graph_review="stored"
+                )
                 snapshot_config = self._inline_preflight_config(expected_live) if expected_live is not None else None
             else:
                 snapshot_config = self._inline_preflight_config(proposed_state)
@@ -5248,9 +5286,13 @@ class SessionServiceImpl:
         expected_live: CompositionStateRecord | None = None
         inline_blob_snapshot: SessionInlineBlobSnapshot | None = None
         if preflight_event is not None and preflight_event.composition_state_id is not None:
+            # PROJECTED: the locked re-read below builds both records with
+            # ``_effective_state_record_on_connection`` and compares them with
+            # this pair by strict equality.
             expected_anchor, expected_live = await self._preflight_state_pair(
                 session_id=session_id,
                 anchor_id=UUID(preflight_event.composition_state_id),
+                graph_review="projected",
             )
             if expected_live is not None:
                 inline_blob_snapshot = await self._prepare_inline_blob_snapshot(

@@ -16,7 +16,8 @@ from elspeth.core.canonical import canonical_json
 from elspeth.web.composer.diagnostic_evidence import _decode
 
 
-def _safe_text(value: object, limit: int) -> str | None:
+def safe_failure_text(value: object, limit: int) -> str | None:
+    """Text the private failure facts may retain: a str within ``limit`` bytes, credential-filtered whole; else None."""
     if type(value) is not str or len(value) > limit:
         return None
     try:
@@ -48,7 +49,7 @@ def capture_failure_facts(exc: BaseException) -> PrivateFailureFacts:
         seen[id(current)] = node_id
         active.add(id(current))
         name = type.__dict__["__name__"].__get__(type(current))
-        safe_name = _safe_text(name, 128) or "unavailable"
+        safe_name = safe_failure_text(name, 128) or "unavailable"
         if len(canonical_json(safe_name).encode("utf-8")) > 160:
             safe_name = "unavailable"
         arguments: list[JsonValue] = []
@@ -62,7 +63,7 @@ def capture_failure_facts(exc: BaseException) -> PrivateFailureFacts:
         args = BaseException.__dict__["args"].__get__(current)
         if type(args) is tuple:
             for argument in args[:4]:
-                safe = _safe_text(argument, 2048)
+                safe = safe_failure_text(argument, 2048)
                 # Filter the whole bounded original before fitting any text.
                 disposition = (
                     "unavailable" if safe is None else ("filtered" if find_credential_material(argument) is not None else "retained")
@@ -216,9 +217,9 @@ def capture_received_response(
     records: list[PrivateReceivedDiagnostic] = []
     for index, call in enumerate(admitted_calls[:32]):
         function = _field(call, "function")
-        name = _safe_text(_field(function, "name"), 128)
+        name = safe_failure_text(_field(function, "name"), 128)
         known_name = name if name in known_tools else "unknown_tool"
-        provider_id = _safe_text(_field(call, "id"), 256)
+        provider_id = safe_failure_text(_field(call, "id"), 256)
         raw = _field(function, "arguments")
         canonical = None
         reason = "unsupported"

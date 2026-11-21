@@ -176,7 +176,8 @@ async def test_terminal_fact_projects_current_explicit_and_recovery_without_chec
         assert current.id == base.id and current.version == base.version
         assert current.review_projection.stored == base
         assert parse_completion_gates(current.composer_meta) == fact.gates
-        assert await store[3]._preflight_state_pair(session_id=store[4], anchor_id=base.id) == (current, current)
+        assert await store[3]._preflight_state_pair(session_id=store[4], anchor_id=base.id, graph_review="projected") == (current, current)
+        assert await store[3]._preflight_state_pair(session_id=store[4], anchor_id=base.id, graph_review="stored") == (base, base)
         assert (await store[3].get_state_versions(store[4]))[0] == base
         graph = await store[3].read_current_composition_graph(store[4])
         assert graph.record == current
