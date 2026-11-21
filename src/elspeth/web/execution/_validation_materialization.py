@@ -13,7 +13,15 @@ from pathlib import Path
 from typing import Any, Final, Literal, cast
 from uuid import UUID
 
-from elspeth.contracts.blobs import AllowedMimeType, BlobCreator, BlobNotFoundError, BlobRecord, BlobStateError
+from elspeth.contracts.blobs import (
+    AllowedMimeType,
+    BlobContentMissingError,
+    BlobCreator,
+    BlobIntegrityError,
+    BlobNotFoundError,
+    BlobRecord,
+    BlobStateError,
+)
 from elspeth.contracts.blobs_inline import (
     BLOB_INLINE_AGGREGATE_FIELD_PATH,
     INLINE_BLOB_NOT_TEXT_CODE,
@@ -939,6 +947,21 @@ def materialize_validation_yaml(
                     continue
                 except BlobStateError:
                     failure = BlobInlineValidationViolation(category="not_ready", field_path=ref.field_path, detail="blob is not ready")
+                    content_failure_by_blob_id[ref.blob_id] = failure
+                    content_violations.append(failure)
+                    continue
+                except BlobIntegrityError:
+                    # Storage damage: the stored bytes no longer hash to the blob row's content_hash.
+                    failure = BlobInlineValidationViolation(
+                        category="not_ready", field_path=ref.field_path, detail="stored file content does not match its record"
+                    )
+                    content_failure_by_blob_id[ref.blob_id] = failure
+                    content_violations.append(failure)
+                    continue
+                except BlobContentMissingError:
+                    failure = BlobInlineValidationViolation(
+                        category="missing", field_path=ref.field_path, detail="stored file content is missing"
+                    )
                     content_failure_by_blob_id[ref.blob_id] = failure
                     content_violations.append(failure)
                     continue
