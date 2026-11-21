@@ -217,6 +217,13 @@ Behaviour you will see:
   narrow tool can express the change. A failed call is retried as the same
   call. Tool descriptions list every review term the model can author, and a
   validation entry's `error_code` is documented as optional.
+- The composer can now clear a pipeline's description: `set_metadata` takes
+  `description: null` or an empty string, and a field left out is unchanged.
+  Its result lists the fields that actually changed (`changed_fields`). When
+  nothing changed it says so instead of reporting a successful edit, so the
+  composer no longer tells you it removed something it did not. A pipeline
+  name can be replaced but not cleared: `null`, an empty name or a
+  whitespace-only name is refused.
 - `upsert_node` accepts `routing_only=true` to rewire a step without re-sending
   it. It changes only an existing transform's `input`, `on_success` and
   `on_error` and keeps its plugin, options (file-held prompts included) and
