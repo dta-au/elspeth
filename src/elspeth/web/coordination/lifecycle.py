@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import time
 from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Never, cast, final
 from uuid import UUID
 
+import structlog
 from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts import errors as contract_errors
@@ -24,6 +26,7 @@ from elspeth.contracts.errors import ComposerOwnedSettlementFailure
 from elspeth.web.async_workers import (
     _raise_lifecycle_originals,
     _retain_cancellation,
+    outstanding_admissions,
     run_execution_lease_sql_finish_once,
     run_required_sql_finish_once,
     run_required_sql_in_worker,
@@ -108,6 +111,12 @@ async def _join_renewal_attempt_observation(attempt: _RenewalAttemptObservation)
 
 
 _MAX_RENEW_INTERVAL_SECONDS = 30.0
+# A renewal that starts this late after its due time, or takes this long, is
+# logged. A live owner's lease lapses once the two add up to lease minus
+# interval (20 s at the 30 s default).
+_SLOW_RENEWAL_LOG_SECONDS = 2.0
+
+slog = structlog.get_logger()
 type ArchiveLifecycleCallback = Callable[[], Awaitable[None]]
 
 
@@ -205,6 +214,34 @@ def _retain_adoption_cancellation_outcome(observations: list[asyncio.CancelledEr
             pending.extend(current.exceptions)
         if current.__cause__ is not None:
             pending.append(current.__cause__)
+
+
+def _log_slow_renewal(
+    context: SessionOperationContext,
+    *,
+    lease_seconds: int,
+    interval_seconds: float,
+    start_late_seconds: float,
+    attempt_seconds: float,
+    pool_outstanding: int,
+    outcome: str,
+) -> None:
+    """Log a renewal that ran late or slowly; a blocked event loop shows as a late start."""
+    if start_late_seconds < _SLOW_RENEWAL_LOG_SECONDS and attempt_seconds < _SLOW_RENEWAL_LOG_SECONDS:
+        return
+    slog.warning(
+        "session_operation.renewal_slow",
+        session_id=context.fence.session_id,
+        operation_id=context.fence.operation_id,
+        operation_epoch=context.fence.operation_epoch,
+        operation_kind=context.operation_kind.value,
+        lease_seconds=lease_seconds,
+        renew_interval_seconds=interval_seconds,
+        start_late_seconds=round(start_late_seconds, 3),
+        attempt_seconds=round(attempt_seconds, 3),
+        pool_outstanding_at_start=pool_outstanding,
+        outcome=outcome,
+    )
 
 
 def _validate_lifecycle_timing(*, lease_seconds: int, renew_interval_seconds: float | None) -> float:
@@ -907,6 +944,7 @@ class SessionOperationLease:
             obligation.bind_actual_renewal_task(self, actual_task)
             self._renewal_task = actual_task
         while not self._stop_renewal.is_set():
+            armed = time.monotonic()
             with suppress(TimeoutError):
                 await asyncio.wait_for(
                     self._stop_renewal.wait(),
@@ -914,6 +952,9 @@ class SessionOperationLease:
                 )
             if self._stop_renewal.is_set():
                 return
+            started = time.monotonic()
+            pool_outstanding = outstanding_admissions()
+            outcome = "failed"
             try:
                 if self._fork_authority is None:
                     if self._required_work is None:
@@ -952,7 +993,9 @@ class SessionOperationLease:
                     )
                 if type(renewed) is not SessionOperationContext or renewed != self._context:
                     raise RuntimeError("session operation renewal changed immutable context")
+                outcome = "renewed"
             except asyncio.CancelledError:
+                outcome = "cancelled"
                 raise
             except BaseExceptionGroup as renewal_error:
                 # Actual required SQL may retain both cancellation and a fault.
@@ -961,6 +1004,16 @@ class SessionOperationLease:
             except Exception as renewal_error:
                 self._record_renewal_error(renewal_error)
                 return
+            finally:
+                _log_slow_renewal(
+                    self._context,
+                    lease_seconds=self._lease_seconds,
+                    interval_seconds=self._renew_interval_seconds,
+                    start_late_seconds=started - armed - self._renew_interval_seconds,
+                    attempt_seconds=time.monotonic() - started,
+                    pool_outstanding=pool_outstanding,
+                    outcome=outcome,
+                )
 
     async def _run_required_renewal_attempt(
         self, attempt: _RenewalAttemptObservation, ticket: RequiredWorkTicket
