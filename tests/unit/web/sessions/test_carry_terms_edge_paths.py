@@ -254,3 +254,56 @@ async def test_a_wording_edit_accepted_as_a_proposal_carries_the_term_like_the_d
         # Pre-existing: the artifact hash is re-derived for the new text while its review is pending.
         assert options[HASH_KEY] != state.nodes[0].options[HASH_KEY]
     assert deep_thaw(accepted_options[INTERPRETATION_REQUIREMENTS_KEY]) == deep_thaw(direct_options[INTERPRETATION_REQUIREMENTS_KEY])
+
+
+MULTI_QUERY = {
+    "queries": {"first": {"input_fields": {"text": "text"}}, "second": {"input_fields": {"text": "text"}}},
+    "max_capacity_retry_seconds": 20,
+}
+
+
+@pytest.mark.asyncio
+async def test_a_wording_edit_sent_with_a_query_template_that_bypasses_the_slots_is_still_refused(
+    service: SessionServiceImpl,  # noqa: F811
+    tmp_path: Path,
+) -> None:
+    """A query with its own template does not use the node-level slots. The edit is refused, as before the carry."""
+    session = await _approved_session(service, tmp_path, extra_options=MULTI_QUERY)
+    queries = {
+        "first": {"input_fields": {"text": "text"}, "template": "Summarise {{ row.text }}."},
+        "second": {"input_fields": {"text": "text"}},
+    }
+
+    refused = _patch(
+        session.state,
+        {"prompt_template_parts": _with_first_text(TWO_TERM_PARTS, "Sort {{ row.text }} into "), "queries": queries},
+    )
+
+    assert not refused.success
+    assert "vague_term_query_override" in [entry["error_code"] for entry in _errors(refused)]
+
+
+@pytest.mark.asyncio
+async def test_parts_re_split_without_a_text_change_carry_the_terms_behind_a_reopened_prompt_card(
+    service: SessionServiceImpl,  # noqa: F811
+    tmp_path: Path,
+) -> None:
+    """Splitting one text part in two changes the parts skeleton and no text.
+
+    On a multi-query node too, the prompt review reopens for the changed
+    skeleton, so the terms are carried behind that card like any wording edit.
+    """
+    session = await _approved_session(service, tmp_path, extra_options=MULTI_QUERY)
+    original_rows = _rows(session.state)
+    original_prompt = _prompt(session.state)
+    re_split = [{"kind": "text", "text": "Classify "}, {"kind": "text", "text": "{{ row.text }} into "}, *TWO_TERM_PARTS[1:]]
+
+    edited = _patch(session.state, {"prompt_template_parts": re_split})
+    assert edited.success, _errors(edited)
+    opened = await session.commit(edited.updated_state)
+
+    assert _cards(opened) == [PROMPT_CARD]
+    assert _rows(session.state)[CATEGORY] == original_rows[CATEGORY]
+    assert _rows(session.state)[AUDIENCE] == original_rows[AUDIENCE]
+    assert _prompt(session.state) == original_prompt
+    assert isinstance(materialize_state_for_execution(session.state), InterpretationReviewPending)

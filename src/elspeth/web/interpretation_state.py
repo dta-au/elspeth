@@ -3510,9 +3510,15 @@ def _wording_edit_carry_is_reviewable(candidate: NodeSpec) -> bool:
     ``llm_prompt_template`` review is pending (it is the review of the change),
     and the bounded card text ends with the complete re-rendered prompt. A
     prompt longer than the card shows is not carried; the card is never widened.
+
+    A node where a query supplies its own template is never carried: that
+    query bypasses the node-level slots, and reopening the terms is what lets
+    ``unwired_vague_term_error`` refuse the edit as it did before.
     """
     prompt_review = _prompt_template_review_requirement(candidate.options)
     if prompt_review is None or prompt_review["status"] != "pending":
+        return False
+    if "queries" in candidate.options and vague_term_query_override_error(candidate.options["queries"]) is not None:
         return False
     parts = _prompt_parts(candidate.options)
     if parts is None:
