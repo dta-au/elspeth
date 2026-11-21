@@ -22,6 +22,10 @@ Written 2026-11-20 for the 0.8.16 release. The tool is
 
 Both plans leave the graph as found.
 
+A third plan, `composer_file_bindings.json`, measures connecting and
+reconnecting files rather than a long run of edits; it is described under
+[File-binding plan](#file-binding-plan).
+
 ## Before you start
 
 - The session must be in `auto_commit` trust mode. In `explicit_approve`
@@ -553,6 +557,66 @@ start of the attempt. The expectation forms are listed in the docstring of
 - `chain`;
 - `text` with `append`, `replace` or `remove`;
 - `new_node`, `new_output` and `renamed_node`.
+
+## File-binding plan
+
+`scripts/staging/edit_plans/composer_file_bindings.json` tests connecting a
+step or source to a file and re-pointing it at another file, from an empty
+pipeline. It has 35 edits, all applicable on any server (it names no graph
+role), and needs no fixture: the files it uses are tiny invented samples in
+`scripts/staging/edit_plans/files/`.
+
+In order: a csv source and a json output (the source then re-pointed at three
+other files, and the output at another file name); a reference join, its
+reference file re-pointed three times; an LLM step with an inline prompt, its
+prompt then bound to three uploaded files in turn and its system prompt bound
+to three more, then each re-bound to a file the Composer is asked to write; a
+multi-query LLM step whose query template is bound and re-bound twice; a
+`file_inject` step whose file entry is bound and re-bound twice; a reference
+join with a named table, bound and re-bound twice; every step removed; the
+source replaced by a one-row-per-file source over two files, then re-pointed
+at two others; and finally the source and output removed.
+
+What it adds to the battery, used only by this plan:
+
+- It needs a new, empty session (`"start": "empty"`). A session with no graph
+  reads as the empty pipeline. It refuses a session that already holds a file
+  with one of the plan's file names.
+- Before an edit's message, the battery uploads that edit's files (`attach`)
+  through `POST .../blobs`, as the user would, and saves each file id before
+  sending the message. A resumed run reuses a recorded upload, or an upload of
+  the same name and content it made but had not recorded. The Composer does
+  the wiring; the battery never binds a file.
+- `bound` checks which file a binding points at: the source's file, or a
+  file marker in a step's option (`reference_content`,
+  `tables/<name>/reference_content`, `prompt_template`, `system_prompt`,
+  `queries/<name>/template`, `files/<name>/content`). It must be the file the
+  battery uploaded under that name, or, for a file the Composer was asked to
+  write, a file of that name written by the assistant holding exactly the
+  asked text. `files` checks the whole graph: the names of the files it points
+  at, once per binding, are exactly those listed. Together they show the new
+  file is bound and the previous one no longer is.
+- An `approve` with a `card` requires the prompt review card and checks its
+  kind: `user_files` when every prompt slot of the step is bound to a file
+  the user uploaded (the light card), `agent_written` otherwise (inline text,
+  or a file the Composer wrote). A card of the other kind is a finding and is
+  not approved; no card is a finding.
+- The last edit lists `new_errors` (`no_source_configured`,
+  `no_sinks_configured`): an empty pipeline carries them, and no other new
+  error is allowed.
+- It passes on its own rule (`"pass_rule": "all_passed_as_found"`): every
+  edit passed in one attempt and the pipeline left empty, as found. It is never
+  gold, which is the 50-edit measure; the summary reports both.
+
+The server's plugin allowlist must allow `source:csv`, `source:blob_rows`,
+`transform:reference_join`, `transform:llm`, `transform:file_inject` and
+`sink:json`.
+
+```bash
+python -m scripts.staging.composer_edit_battery plan --plan scripts/staging/edit_plans/composer_file_bindings.json
+python -m scripts.staging.composer_edit_battery run --plan scripts/staging/edit_plans/composer_file_bindings.json \
+  --base-url "$URL" --session "$NEW_EMPTY_SESSION" --account "$ACCOUNT" --state-dir "$STATE" --execute
+```
 
 ## Prompt review cards
 

@@ -1,0 +1,1 @@
+Say whether the item name {{ row.input_1 }} sounds positive, neutral or negative. Answer with one word. Query version 3.

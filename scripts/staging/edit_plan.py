@@ -48,6 +48,24 @@ Expectation forms (exactly one operator key each):
 * ``{"renamed_node": {"from": A, "to": B}}`` -- A is gone and B carries every one of A's
   fields (plugin, options, description, error routing...) except its id and its place
   in the chain
+* ``{"bound": PTR, "file": NAME}`` -- the binding at PTR (a source's ``options/blob_ref``,
+  or an ``inline_content`` file marker) points at the session file NAME: the file the
+  battery attached under that name, or, for a name the plan does not attach, a file the
+  Composer created (created by the assistant); an optional ``"content"`` is the exact
+  text that file must hold (trailing whitespace ignored)
+* ``{"files": [NAME, ...]}`` -- the session files the whole graph points at, by file
+  name and counted once per binding, are exactly these
+
+File-binding plans (``composer_file_bindings.json``) add, all optional and unused by the
+other plans: a plan ``start`` of ``"empty"`` (the attempt must start on an empty
+pipeline), a plan ``pass_rule`` of ``"all_passed_as_found"`` (the process passes when
+every edit passed and the graph is left as found, however few edits the plan has), and
+per edit ``attach`` (files under ``edit_plans/files/`` the battery uploads, as the user
+would, before sending the message), ``new_errors`` (validation error codes the edit is
+expected to introduce, such as ``no_source_configured`` when it empties the pipeline)
+and an ``approve`` ``card`` of ``"user_files"`` or ``"agent_written"`` (the card must be
+there, and be of that kind: every prompt slot bound to a file the user uploaded, or
+not).
 """
 
 from __future__ import annotations
@@ -67,6 +85,7 @@ PLAN_FORMAT = "elspeth-composer-edit-plan/2"
 PLAN_DIR = Path(__file__).resolve().parent / "edit_plans"
 DEFAULT_PLAN = PLAN_DIR / "composer_gold_50.json"
 MIXED_PLAN = PLAN_DIR / "composer_mixed_50.json"
+FILE_BINDINGS_PLAN = PLAN_DIR / "composer_file_bindings.json"
 
 TARGET_KINDS = frozenset(
     {
@@ -82,7 +101,49 @@ TARGET_KINDS = frozenset(
     }
 )
 REVIEW_KINDS = frozenset({"llm_prompt_template"})
-OPERATORS = ("equals", "ends_with", "present", "absent", "restored", "chain", "text", "new_node", "new_output", "renamed_node")
+# The two prompt review card kinds the Composer shows: every prompt slot bound to a file the
+# user uploaded (``promptReviewIsUserSuppliedFiles`` in the frontend's promptTemplateDisplay.ts),
+# or anything else (inline text, a file the Composer wrote).
+CARD_KINDS = ("user_files", "agent_written")
+OPERATORS = (
+    "equals",
+    "ends_with",
+    "present",
+    "absent",
+    "restored",
+    "chain",
+    "text",
+    "new_node",
+    "new_output",
+    "renamed_node",
+    "bound",
+    "files",
+)
+FILE_OPERATORS = ("bound", "files")
+PLAN_STARTS = ("empty",)
+PASS_RULES = ("gold", "all_passed_as_found")
+ATTACHMENT_DIR = "files"
+# The upload MIME type for each attachment extension (all in the server's ALLOWED_MIME_TYPES).
+ATTACHMENT_MIME_TYPES: Mapping[str, str] = {
+    ".csv": "text/csv",
+    ".txt": "text/plain",
+    ".json": "application/json",
+    ".jsonl": "application/x-jsonlines",
+}
+_ATTACHMENT_NAME = re.compile(r"[a-z0-9][a-z0-9_]*\.(?:csv|txt|json|jsonl)")
+# What a session with no graph yet stands for. The server answers GET .../state with null
+# until the first edit, and the Composer starts that edit from an empty state with the default
+# pipeline metadata (``PipelineMetadata()``; test_edit_plan.py pins the two to each other).
+EMPTY_STATE: Mapping[str, Any] = {
+    "id": None,
+    "sources": {},
+    "nodes": [],
+    "edges": [],
+    "outputs": [],
+    "metadata": {"name": "Untitled Pipeline", "description": ""},
+    "is_valid": False,
+    "validation_errors": None,
+}
 TEXT_CHANGES = ("append", "replace", "remove")
 TEMPORARY_PREFIX = "battery_"
 MARKER_TEXTS = ("Battery marker", "Battery file marker")
@@ -109,7 +170,10 @@ _ROUTING_FIELDS = ("id", "input", "on_success")
 _NAME = re.compile(r"\{([a-z][a-z0-9_]*)\}")
 _MESSAGE_FIELD = re.compile(r"\{was:((?:[^{}]|\{[a-z][a-z0-9_]*\})+)\}|\{([a-z][a-z0-9_]*)\}")
 _PLAN_KEYS = frozenset({"format", "name", "description", "forbidden_tools", "targets", "edits"})
-_EDIT_KEYS = frozenset({"id", "message", "expect", "may_change", "edges_touching", "tools_any", "tools_all", "approve"})
+_OPTIONAL_PLAN_KEYS = frozenset({"start", "pass_rule"})
+_EDIT_KEYS = frozenset(
+    {"id", "message", "expect", "may_change", "edges_touching", "tools_any", "tools_all", "approve", "attach", "new_errors"}
+)
 _TARGET_ARGS: Mapping[str, frozenset[str]] = {
     "first_source": frozenset(),
     "first_output": frozenset(),
@@ -217,6 +281,11 @@ class Plan:
     edits: tuple[JsonObject, ...]
     verifier: str | None = None
     verifier_args: Mapping[str, Any] = field(default_factory=dict)
+    # File-binding plans only (see the module docstring): the start the plan needs, how the
+    # process decides a pass, and the bytes of every file its edits attach, by file name.
+    start: str | None = None
+    pass_rule: str = "gold"
+    attachments: Mapping[str, bytes] = field(default_factory=dict)
 
     def roles_of(self, edit: Mapping[str, Any]) -> set[str]:
         return set(_NAME.findall(json.dumps(edit)))
@@ -235,8 +304,15 @@ def load_plan(path: Path) -> Plan:
         raw = json.loads(data)
     except ValueError:
         raise UsageError(f"plan {path} is not JSON") from None
-    if type(raw) is not dict or set(raw) != _PLAN_KEYS or raw["format"] != PLAN_FORMAT:
-        raise UsageError(f"plan {path} must be an object with exactly {sorted(_PLAN_KEYS)} and format {PLAN_FORMAT}")
+    if type(raw) is not dict or not _PLAN_KEYS <= set(raw) <= _PLAN_KEYS | _OPTIONAL_PLAN_KEYS or raw["format"] != PLAN_FORMAT:
+        raise UsageError(
+            f"plan {path} must be an object with exactly {sorted(_PLAN_KEYS)} (and optionally {sorted(_OPTIONAL_PLAN_KEYS)}) "
+            f"and format {PLAN_FORMAT}"
+        )
+    if "start" in raw and raw["start"] not in PLAN_STARTS:
+        raise UsageError(f"plan start must be one of {list(PLAN_STARTS)}")
+    if "pass_rule" in raw and raw["pass_rule"] not in PASS_RULES:
+        raise UsageError(f"plan pass_rule must be one of {list(PASS_RULES)}")
     if type(raw["name"]) is not str or not raw["name"]:
         raise UsageError("plan name must be a non-empty string")
     forbidden = raw["forbidden_tools"]
@@ -253,13 +329,45 @@ def load_plan(path: Path) -> Plan:
     seen: set[str] = set()
     for edit in edits:
         _check_edit(edit, targets, seen, forbidden)
+    attachments = _load_attachments(path, edits)
     return Plan(
         name=raw["name"],
-        sha256=hashlib.sha256(data).hexdigest(),
+        sha256=_plan_sha256(data, attachments),
         forbidden_tools=tuple(forbidden),
         targets=targets,
         edits=tuple(edits),
+        start=raw["start"] if "start" in raw else None,
+        pass_rule=raw["pass_rule"] if "pass_rule" in raw else "gold",
+        attachments=attachments,
     )
+
+
+def _plan_sha256(data: bytes, attachments: Mapping[str, bytes]) -> str:
+    """The plan file's SHA-256; with attachments, over the plan and every attached file, so a changed file is a different plan."""
+    if not attachments:
+        return hashlib.sha256(data).hexdigest()
+    digest = hashlib.sha256(data)
+    for name in sorted(attachments):
+        digest.update(b"\0" + name.encode() + b"\0" + hashlib.sha256(attachments[name]).digest())
+    return digest.hexdigest()
+
+
+def _load_attachments(path: Path, edits: Sequence[Mapping[str, Any]]) -> dict[str, bytes]:
+    """Read every file the plan's edits attach, from ``files/`` beside the plan; each name is attached by one edit only."""
+    attachments: dict[str, bytes] = {}
+    for edit in edits:
+        for name in edit["attach"] if "attach" in edit else []:
+            if name in attachments:
+                raise UsageError(f"edit {edit['id']}: {name} is attached by an earlier edit; each file is uploaded once")
+            try:
+                attachments[name] = (path.parent / ATTACHMENT_DIR / name).read_bytes()
+            except OSError as exc:
+                raise UsageError(f"edit {edit['id']}: cannot read attachment {ATTACHMENT_DIR}/{name}: {exc.strerror}") from None
+    return attachments
+
+
+def attachment_mime_type(name: str) -> str:
+    return ATTACHMENT_MIME_TYPES[Path(name).suffix]
 
 
 def _check_target(name: str, spec: object, targets: Mapping[str, Any]) -> None:
@@ -306,8 +414,25 @@ def _check_edit(edit: object, targets: Mapping[str, Any], seen: set[str], forbid
         raise UsageError(f"edit {label}: the message names a tool; describe the change, not the tool")
     if "approve" in edit:
         approve = edit["approve"]
-        if type(approve) is not dict or set(approve) != {"kind", "node"} or approve["kind"] not in REVIEW_KINDS:
-            raise UsageError(f"edit {label}: approve must be {{kind, node}} with kind in {sorted(REVIEW_KINDS)}")
+        if (
+            type(approve) is not dict
+            or not {"kind", "node"} <= set(approve) <= {"kind", "node", "card"}
+            or approve["kind"] not in REVIEW_KINDS
+            or ("card" in approve and approve["card"] not in CARD_KINDS)
+        ):
+            raise UsageError(
+                f"edit {label}: approve must be {{kind, node}} with kind in {sorted(REVIEW_KINDS)}, and an optional card in {list(CARD_KINDS)}"
+            )
+    if "attach" in edit:
+        names = edit["attach"]
+        if type(names) is not list or not names or not all(type(name) is str and _ATTACHMENT_NAME.fullmatch(name) for name in names):
+            raise UsageError(f"edit {label}: attach must list file names such as orders_a.csv (lowercase; .csv, .txt, .json or .jsonl)")
+        if len(set(names)) != len(names):
+            raise UsageError(f"edit {label}: attach names a file twice")
+    if "new_errors" in edit and (
+        type(edit["new_errors"]) is not list or not edit["new_errors"] or not all(type(code) is str and code for code in edit["new_errors"])
+    ):
+        raise UsageError(f"edit {label}: new_errors must be a non-empty list of validation error codes")
     for name in _NAME.findall(json.dumps(edit)):
         if name not in targets:
             raise UsageError(f"edit {label}: placeholder {{{name}}} is not a plan target")
@@ -329,6 +454,16 @@ def _check_expectation(label: str, expectation: object) -> None:
         valid = keys == {operator, "value"} and (operator == "equals" or type(expectation["value"]) is str)
     elif operator in ("present", "absent", "restored"):
         valid = keys == {operator}
+    elif operator == "bound":
+        valid = (
+            {"bound", "file"} <= keys <= {"bound", "file", "content"}
+            and type(expectation["bound"]) is str
+            and type(expectation["file"]) is str
+            and bool(_ATTACHMENT_NAME.fullmatch(expectation["file"]))
+            and ("content" not in expectation or type(expectation["content"]) is str)
+        )
+    elif operator == "files":
+        valid = keys == {"files"} and type(expectation["files"]) is list and all(type(name) is str for name in expectation["files"])
     elif operator == "chain":
         chain = expectation["chain"]
         valid = (
@@ -570,7 +705,7 @@ def render_was(baseline: Mapping[str, Any], pointer: str) -> str:
     return json.dumps(value)
 
 
-_POINTER_KEYS = frozenset({"equals", "ends_with", "present", "absent", "restored", "text"})
+_POINTER_KEYS = frozenset({"equals", "ends_with", "present", "absent", "restored", "text", "bound"})
 
 
 def profile_owned_pointers(expect: Sequence[Mapping[str, Any]], baseline: Mapping[str, Any]) -> list[str]:
@@ -635,6 +770,9 @@ def resolve_edits(plan: Plan, targets: Mapping[str, str], baseline_state: Mappin
                 "approve": _fill(edit["approve"], targets, pointer=False) if "approve" in edit else None,
             }
         )
+        for key in ("attach", "new_errors"):
+            if key in edit:
+                resolved[-1][key] = list(edit[key])
         if "order" in edit:
             resolved[-1]["order"] = _fill(edit["order"], targets, pointer=False)
         if "position" in edit:
@@ -669,6 +807,8 @@ def named_components(edit: Mapping[str, Any]) -> set[str]:
             named.update(expectation["renamed_node"].values())
         elif "new_node" in expectation or "new_output" in expectation:
             named.add(expectation["new_node"] if "new_node" in expectation else expectation["new_output"])
+        elif "files" in expectation:
+            continue
         else:
             pointers.append(expectation[next(key for key in OPERATORS if key in expectation)])
     for pointer in pointers:
@@ -886,6 +1026,75 @@ def _renamed_ok(rename: Mapping[str, str], before: Mapping[str, Any], after: Map
     return True
 
 
+@dataclass(frozen=True, slots=True)
+class FileContext:
+    """What a file expectation is judged against: the files the battery attached, and the session's files.
+
+    ``uploads`` maps each attached file name to the id the upload returned; ``listing``
+    maps each session file id to its listing row (``filename``, ``created_by``...).
+    """
+
+    uploads: Mapping[str, str]
+    listing: Mapping[str, Mapping[str, Any]]
+
+
+def uses_files(edit: Mapping[str, Any]) -> bool:
+    """Whether an edit has an expectation judged against the session's files."""
+    return any(operator in expectation for expectation in edit["expect"] for operator in FILE_OPERATORS)
+
+
+def bound_blob(value: object) -> str | None:
+    """The file id a binding holds: a source's ``blob_ref`` string, or an ``inline_content`` marker's ``blob_ref``."""
+    if type(value) is str and value:
+        return value
+    if type(value) is dict and _is_file_held_prompt(value):
+        blob: str = value["blob_ref"]
+        return blob
+    return None
+
+
+def referenced_blob_ids(view: Mapping[str, Any]) -> list[str]:
+    """Every file id the graph's sources, nodes and outputs point at, once per binding (``blob_ref`` and ``blob_id`` keys)."""
+    found: list[str] = []
+
+    def walk(value: object) -> None:
+        if type(value) is dict:
+            for key, child in value.items():
+                if key in ("blob_ref", "blob_id") and type(child) is str:
+                    found.append(child)
+                else:
+                    walk(child)
+        elif type(value) is list:
+            for child in value:
+                walk(child)
+
+    walk([view["sources"], view["nodes"], view["outputs"]])
+    return found
+
+
+def referenced_file_names(view: Mapping[str, Any], files: FileContext) -> list[str]:
+    """The names of the files the graph points at, sorted; a file missing from the session reads ``missing:<id>``."""
+    return sorted(files.listing[blob]["filename"] if blob in files.listing else f"missing:{blob}" for blob in referenced_blob_ids(view))
+
+
+def _bound_ok(expectation: Mapping[str, Any], view: Mapping[str, Any], files: FileContext, read_text: ReadText) -> bool:
+    found, value = value_at(view, expectation["bound"])
+    blob = bound_blob(value) if found else None
+    if blob is None:
+        return False
+    name = expectation["file"]
+    if name in files.uploads:
+        ok = blob == files.uploads[name]
+    else:
+        # A file the Composer created: the name asked for, written by the assistant, not one the battery uploaded.
+        row = files.listing[blob] if blob in files.listing else None
+        ok = row is not None and row["filename"] == name and row["created_by"] == "assistant" and blob not in set(files.uploads.values())
+    if ok and "content" in expectation:
+        form, text = text_at(view, expectation["bound"], read_text)
+        ok = form == "file" and text is not None and text.rstrip() == expectation["content"].rstrip()
+    return ok
+
+
 def _edge_paths(view: Mapping[str, Any], components: Sequence[str]) -> list[str]:
     wanted = set(components)
     return ["/edges/" + escape(key) for key in view["edges"] if set(key.split("|")[:2]) & wanted]
@@ -897,8 +1106,13 @@ def check_expectations(
     after: Mapping[str, Any],
     baseline: Mapping[str, Any],
     read_text: ReadText,
+    *,
+    files: FileContext | None = None,
 ) -> tuple[list[str], list[str]]:
-    """``(failures, covered pointers)``: each failure names the expectation that did not hold."""
+    """``(failures, covered pointers)``: each failure names the expectation that did not hold.
+
+    ``files`` is needed only by the file expectations (``bound``, ``files``); without it they fail.
+    """
     failures: list[str] = []
     covered: list[str] = []
     transparent = auto_wired_controls(before, after)
@@ -906,7 +1120,18 @@ def check_expectations(
     for index, expectation in enumerate(edit["expect"]):
         label = f"expect[{index}]"
         operator = next(key for key in OPERATORS if key in expectation)
-        if operator == "chain":
+        if operator == "files":
+            pointer = "files"
+            ok = files is not None and referenced_file_names(after, files) == sorted(expectation["files"])
+        elif operator == "bound":
+            pointer = expectation["bound"]
+            covered.append(pointer)
+            parts = _segments(pointer)
+            if len(parts) == 4 and parts[0] == "sources" and parts[2] == "options" and parts[3] == "blob_ref":
+                # The bind tool writes the file's storage path beside its id (the state view shows it redacted).
+                covered.append(f"/sources/{escape(parts[1])}/options/path")
+            ok = files is not None and _bound_ok(expectation, after, files, read_text)
+        elif operator == "chain":
             chain = expectation["chain"]
             covered.extend(chain_paths(chain, before) + chain_paths(chain, after))
             touching.extend(_members(chain))
@@ -951,9 +1176,16 @@ def check_expectations(
     return failures, covered
 
 
-def preconditions(edit: Mapping[str, Any], current: Mapping[str, Any], baseline: Mapping[str, Any], read_text: ReadText) -> list[str]:
+def preconditions(
+    edit: Mapping[str, Any],
+    current: Mapping[str, Any],
+    baseline: Mapping[str, Any],
+    read_text: ReadText,
+    *,
+    files: FileContext | None = None,
+) -> list[str]:
     """Expectations that already hold on the current graph: the edit would pass with nothing changed."""
-    failures, _ = check_expectations(edit, current, current, baseline, read_text)
+    failures, _ = check_expectations(edit, current, current, baseline, read_text, files=files)
     failed = {item.split(":", 1)[0] for item in failures}
     return [f"precondition:expect[{index}]_already_holds" for index in range(len(edit["expect"])) if f"expect[{index}]" not in failed]
 
@@ -1023,6 +1255,52 @@ def new_validation_errors(before_state: Mapping[str, Any], after_state: Mapping[
             # Reported as the server stored it, so a finding still shows the full message.
             added.append(json.dumps([error["error_code"], component(error["component"]), error["message"]]))
     return added
+
+
+def expected_new_error(edit: Mapping[str, Any], key: str) -> bool:
+    """Whether a ``new_validation_errors`` key carries a code the edit lists in ``new_errors``."""
+    return "new_errors" in edit and json.loads(key)[0] in edit["new_errors"]
+
+
+def empty_state() -> JsonObject:
+    """A fresh copy of :data:`EMPTY_STATE`, for a session whose state read answers null."""
+    return copy.deepcopy(dict(EMPTY_STATE))
+
+
+def is_empty_graph(state: Mapping[str, Any]) -> bool:
+    """No source, no step and no output."""
+    return not state["sources"] and not state["nodes"] and not state["outputs"]
+
+
+def _prompt_slots(surface: Mapping[str, Any]) -> dict[str, object]:
+    """The filled prompt slots of a review's authored surface, by the field path a card binding carries."""
+    slots: dict[str, object] = {}
+    for key in ("prompt_template", "system_prompt"):
+        if key in surface and surface[key] is not None:
+            slots[key] = surface[key]
+    queries = surface["queries"] if "queries" in surface else None
+    entries = list(queries.items()) if type(queries) is dict else list(enumerate(queries)) if type(queries) is list else []
+    for name, entry in entries:
+        if type(entry) is dict and "template" in entry and entry["template"] is not None:
+            slots[f"queries.{name}.template"] = entry["template"]
+    return slots
+
+
+def card_kind(snapshot: Mapping[str, Any]) -> str:
+    """``user_files`` when every filled prompt slot is bound to a file the user uploaded, else ``agent_written``.
+
+    The frontend's ``promptReviewIsUserSuppliedFiles`` rule: a live review with
+    bindings, one binding per filled slot and no unbound slot, every binding
+    created by the user with the ``verbatim`` modality.
+    """
+    bindings = snapshot["bindings"]
+    if snapshot["is_live_review"] is not True or type(bindings) is not list or not bindings:
+        return "agent_written"
+    paths = [binding["field_path"] for binding in bindings]
+    slots = _prompt_slots(snapshot["authored_surface"])
+    user = all(binding["created_by"] == "user" and binding["creation_modality"] == "verbatim" for binding in bindings)
+    exact = len(set(paths)) == len(paths) and set(paths) == set(slots) and all(type(value) is dict for value in slots.values())
+    return "user_files" if user and exact else "agent_written"
 
 
 _USED = ("applied", "completed")
