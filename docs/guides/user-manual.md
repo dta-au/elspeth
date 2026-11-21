@@ -839,7 +839,8 @@ is admitted, so a pipeline whose `file_inject` content is anything other than
 a file you uploaded does not run.
 
 An attached file can be up to 256 KiB, and all inline attachments in one
-pipeline can total 1 MiB. Files are attached as text. This rule applies only to
+pipeline can total 4 MiB, counting a file once for each place it is attached.
+Files are attached as text. This rule applies only to
 `file_inject`: Composer can still create a source or draft prompt text for you,
 each behind its own review.
 

@@ -137,7 +137,7 @@ The summary gives `server_time_share_of_span` (server time over span),
 `server_ms_outside_provider_and_tools` (`null` if any edit lacks them),
 `edits_with_complete_tool_timings` and `end_reviews_recorded`.
 
-The sanitising rule for `calls` is the customer's: a text field is kept only
+The sanitising rule for `calls` is the reference rule: a text field is kept only
 when it is a short token of letters, digits and `_ . / : -` that is not a
 path or a URL; any other value drops the field. No prompt or reply text,
 tool argument or result, hash, request id, call id or tool-call id is ever
@@ -159,19 +159,19 @@ Not available from the API, so not reported:
 
 ## Structural-cycle workload
 
-`--workload structural-cycle` sends the customer's large-graph stress
-workload instead of a plan file, and judges it with their verifier and error
-codes. It repeats a ten-step cycle around an anchor step: add two passthrough
+`--workload structural-cycle` sends the reference large-graph stress
+workload instead of a plan file, and judges it with the reference verifier and
+error codes. It repeats a ten-step cycle around an anchor step: add two passthrough
 nodes before it and two after it, swap each pair, remove all four, and on the
 tenth step restore the original route names. Cycle 1 names its nodes
 `compact_*`, later cycles `cycle1_*`, `cycle2_*` and so on. The wording of
-every step is the customer's, pinned by a test; do not edit it.
+every step is the reference wording, pinned by a test; do not edit it.
 
 A *position* is where a cycle edits: an upstream (a source or step), the
 anchor step, and a downstream (a step or a sink). With `--fixture` the cycles
 rotate through the positions in the fixture's manifest, so the edits land in
 different places of the graph. Without it there is one position, the
-customer's: `--source` → `--anchor` → `--sink` (defaults `source`,
+reference one: `--source` → `--anchor` → `--sink` (defaults `source`,
 `capacity_probe`, `results`). Giving both is refused.
 
 ```bash
@@ -181,9 +181,9 @@ python -m scripts.staging.composer_edit_battery run --workload structural-cycle 
 ```
 
 For a downstream sink the wording says "the `<name>` sink", as the
-customer's does; a downstream step is just named. The `plan` action prints
+reference wording does; a downstream step is just named. The `plan` action prints
 the tenth step's restore values as `{was:/nodes/<anchor>/...}` fields; `run`
-fills them from the graph as JSON text, as the customer's runner does.
+fills them from the graph as JSON text, as the reference runner does.
 
 `--steps` is 1 to 60 (default 30). The step count and positions are part of
 the attempt's identity: resuming with others is refused.
@@ -210,12 +210,12 @@ nodes, LLM nodes, sinks, prompt queries), and each step's result its
 
 ### How a step is judged
 
-Each step must pass all of these. The codes are the customer's.
+Each step must pass all of these. The codes are the reference verifier's.
 
 | Code | Fails when |
 | --- | --- |
 | `node_inventory_mismatch` | The node ids are not the starting graph's plus exactly the passthroughs the step should leave |
-| `original_llm_content_changed` | A starting node changed beyond the wiring the step had to touch: the upstream's `on_success`, the anchor's `input` and `on_success`, a downstream step's `input`. The customer's code; it covers every starting node, not only the LLM one |
+| `original_llm_content_changed` | A starting node changed beyond the wiring the step had to touch: the upstream's `on_success`, the anchor's `input` and `on_success`, a downstream step's `input`. The reference code name is kept; it covers every starting node, not only the LLM one |
 | `source_content_changed` | A source changed (beyond the upstream source's `on_success`), or a source was added or removed |
 | `sink_content_changed` | Any output changed |
 | `metadata_changed` | The graph metadata changed |
@@ -242,7 +242,7 @@ Plan-file edits never required an end review. They required a completed
 turn, a successful provider call, settled evidence, the plan's expectations,
 no unrelated change, no new validation error and no refused tool call.
 
-The customer's runner read each turn's end review from the database. A
+The reference runner read each turn's end review from the database. A
 server with the END review view returns it through the audit-grade messages
 view: under `include_llm_audit=true` each END-phase
 `advisor_checkpoint_pass_audit` row comes back as a `role="audit"` row with
@@ -258,7 +258,7 @@ never a pass, so it cannot tell a clean review from none.
 
 | Mode | A recorded review that is not clean and admitted | A step with no recorded review |
 | --- | --- | --- |
-| `required` (the customer's rule) | fails the step | fails the step |
+| `required` (the reference rule) | fails the step | fails the step |
 | `if-recorded` | fails the step | warning `end_review_not_recorded` |
 | `auto` (default) | fails the step | `required` when the messages view sets the header, `if-recorded` when it does not |
 
@@ -316,8 +316,8 @@ YAML instead (short ones, for comparison); `--file-inject omit` leaves the
 the target server (default `task-role`). The generator refuses a prompt file
 over the server's per-file cap (256 KiB, read from `core/blobs_inline.py`).
 
-The `single-node` preset reproduces the customer's shape for a like-for-like
-comparison with their telemetry: source `source`, one LLM node
+The `single-node` preset reproduces a large single-step shape for a
+like-for-like comparison with earlier measurements: source `source`, one LLM node
 `capacity_probe` with 32 file-held query templates of 15,600 bytes
 (499,200 bytes), a 4,000-byte system prompt file, and sinks `results` and
 `errors`. `--queries-per-llm-step` and `--total-prompt-bytes` change the
@@ -326,7 +326,7 @@ evenly over the queries). With `--query-templates inline` the templates are
 written into the YAML as literal blocks: 518,741 characters, 5,547 under the
 YAML import limit of 524,288.
 
-### Limits a large graph meets (measured on candidate 5)
+### Limits a large graph meets (measured during 0.8.16 development)
 
 **Aggregate file-held text: 4 MiB.** The text bound to a graph's files may
 total at most 4,194,304 bytes (`BLOB_INLINE_AGGREGATE_BYTE_CAP`). Each file
@@ -366,7 +366,7 @@ to contain a credential" (the credential-scan size limit is 0.8.17 work).
 
 The default `--file-inject file` holds the `file_inject` content in uploaded
 files. It validates on servers with the `file_inject` producer-guarantee fix
-(candidate 5 onward); on older servers authoring validation reports
+(0.8.16 onward); on older servers authoring validation reports
 "Producer guarantees: (none)" for every later step. `--file-inject omit`
 leaves the step out for those servers. The composer refuses `file_inject`
 content written into the YAML, so there is no inline form.

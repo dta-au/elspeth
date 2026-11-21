@@ -2,9 +2,8 @@
 
 Use this runbook to capture a full recovery set of a single-host Docker
 deployment before a hardware change, to bring the deployment back afterwards,
-and to resume Composer test work on a copied real graph. It was first written
-for a staging VM resize during the 0.8.15 hotfix window and was carried into
-the repository on 2026-11-20 with the operator tools under `scripts/staging/`.
+and to resume Composer test work on a copied real graph. The operator tools it
+uses are under `scripts/staging/`.
 
 Every value that names the deployment is a placeholder below:
 
