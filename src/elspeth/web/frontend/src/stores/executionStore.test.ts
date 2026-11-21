@@ -484,6 +484,19 @@ describe("executionStore.execute", () => {
     expect(state.error).toBe("A run is already in progress for this pipeline.");
   });
 
+  it("does not point a transport failure at the run results panel", async () => {
+    const { executePipeline } = await import("@/api/client");
+    vi.mocked(executePipeline).mockRejectedValue(new TypeError("Failed to fetch"));
+
+    expect(await useExecutionStore.getState().execute("session-1")).toBeNull();
+    const state = useExecutionStore.getState();
+    expect(state.error).toBe(
+      "Could not confirm whether the run started. Check Run history before you run it again.",
+    );
+    expect(state.activeRunId).toBeNull();
+    expect(state.isExecuting).toBe(false);
+  });
+
   it.each([
     ["approval_required", "Approval is required before this pipeline can run."],
     ["approval_binding_mismatch", "The approval no longer matches this pipeline. Request a new approval."],
