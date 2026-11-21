@@ -247,7 +247,7 @@ function expectBottomRowContract(
 test.describe("Composer deterministic workspace geometry", () => {
   for (const viewport of [{ width: 1280, height: 720 }, { width: 1440, height: 900 }]) {
     test(`conversation reaches the bottom gutter and its toggle keeps one spot across both title bars at ${viewport.width}x${viewport.height}`, async ({ page }) => {
-      // Maintainer ruling 2026-11-20 (home A): open, the Hide control is the
+      // By design: open, the Hide control is the
       // first thing in the conversation's title bar; collapsed, the Show
       // control is the first thing in the pipeline's. Same box both ways.
       await page.setViewportSize(viewport);

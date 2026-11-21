@@ -181,7 +181,7 @@ def _byte_count(value: object) -> object:
 
 def sanitised_call(call: Mapping[str, Any]) -> JsonObject:
     """One provider call reduced to usage, latency, byte and context-budget figures; no text or identifiers."""
-    # As the customer's runner: every field is listed (null when absent) except one whose value is not safe to keep.
+    # As the reference runner: every field is listed (null when absent) except one whose value is not safe to keep.
     result: JsonObject = {}
     for key in CALL_FIELDS:
         value = call[key] if key in call else None

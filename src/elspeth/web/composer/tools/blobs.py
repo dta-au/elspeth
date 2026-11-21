@@ -1290,8 +1290,8 @@ def _whole_prompt_text_replacement(
     marker never qualifies (binding a file is ``wire_blob_inline_ref``), and
     ``prompt_template_parts: null`` alone replaces nothing. The server removes
     only the review state of the text the model replaced; it writes no prompt
-    text, parts or requirement content of its own (maintainer ruling
-    2026-11-19: replacing A with B does not depend on what A was).
+    text, parts or requirement content of its own (by design, replacing A
+    with B does not depend on what A was).
 
     Returns ``None`` when the write is not that signal or the stored prompt
     carries nothing to supersede, so an ordinary write keeps its ordinary path.
@@ -1527,7 +1527,7 @@ def _execute_wire_blob_inline_ref(
                 # Binding a file REPLACES the prompt, whatever form it had, and
                 # supersedes every card that reviewed the old text: the file's
                 # own review card is the one review of the new prompt
-                # (maintainer ruling 2026-11-19). A state whose requirements are
+                # (by design). A state whose requirements are
                 # already non-canonical is refused first, so the replacement
                 # can never launder a malformed row away.
                 stored_error = _composition_canonical_interpretation_requirement_error(state, tool_name="wire_blob_inline_ref")

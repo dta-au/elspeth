@@ -4,8 +4,8 @@ A prompt position (``prompt_template``, ``system_prompt``, a query's
 ``template``) may hold a valid ``inline_content`` file marker instead of
 text. The advisor's pipeline evidence states, for each such file, its name,
 size and who wrote it. A file the user wrote is not sent: a human-authored
-file needs its connection approved, not its text reviewed (maintainer ruling
-2026-11-21). Any other file -- one the composer wrote, a pipeline output, a
+file needs its connection approved, not its text reviewed (by design).
+Any other file -- one the composer wrote, a pipeline output, a
 file imported from a shared link or copied by a session fork -- is sent whole
 and reviewed like an inline prompt. Authorship that is not proven to be the
 user's sends the text.

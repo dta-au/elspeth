@@ -1,4 +1,4 @@
-"""The advisor's evidence for a prompt held in a file (maintainer ruling 2026-11-21).
+"""The advisor's evidence for a prompt held in a file.
 
 A prompt position may hold a valid ``inline_content`` file marker instead of
 text. The advisor is told the file's name, size and author, never that the
@@ -572,7 +572,7 @@ async def test_row_field_line_analyses_sent_text_and_counts_what_it_cannot_see(t
 # --------------------------------------------------------------------------- reads
 
 
-def _enclave_node(store: _PromptFileStore, *, composer: bool, count: int = 32) -> NodeSpec:
+def _many_query_node(store: _PromptFileStore, *, composer: bool, count: int = 32) -> NodeSpec:
     queries: dict[str, Any] = {}
     for index in range(count):
         record = store.add(
@@ -591,7 +591,7 @@ def _enclave_node(store: _PromptFileStore, *, composer: bool, count: int = 32) -
 async def test_each_file_is_read_once_per_operation_off_the_event_loop(tmp_path: Path, composer: bool) -> None:
     store = _PromptFileStore(root=tmp_path)
     service, advisor = _service(store)
-    state = _state(_enclave_node(store, composer=composer))
+    state = _state(_many_query_node(store, composer=composer))
     context = _context()
     loop_thread = threading.get_ident()
 
@@ -646,18 +646,18 @@ async def test_the_summary_header_explains_both_text_states(tmp_path: Path) -> N
     ) in message
 
 
-# --------------------------------------------------------------------------- measurement (enclave shape)
+# --------------------------------------------------------------------------- measurement (many-query shape)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("composer", [False, True])
-async def test_measure_enclave_shape(tmp_path: Path, composer: bool) -> None:
+async def test_measure_many_query_shape(tmp_path: Path, composer: bool) -> None:
     """Prints the request size and blob reads for 1 LLM step x 32 file-held queries (run with -s)."""
     store = _PromptFileStore(root=tmp_path)
     service, advisor = _service(store)
-    arguments, message = await _checkpoint(service, advisor, _state(_enclave_node(store, composer=composer)), context=_context())
+    arguments, message = await _checkpoint(service, advisor, _state(_many_query_node(store, composer=composer)), context=_context())
     print(
-        f"A3-MEASURE composer={composer} user_message_chars={len(message)} "
+        f"MEASURE composer={composer} user_message_chars={len(message)} "
         f"excerpt_chars={len(arguments['schema_excerpt'])} metadata_reads={store.metadata_reads} content_reads={store.content_reads}"
     )
     assert message

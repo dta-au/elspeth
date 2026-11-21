@@ -3,8 +3,8 @@
 A linear chain of transforms whose first ``shared`` steps all read the
 source's connection, so validation reports one ``duplicate_connection_consumer``
 naming every one of them. The LLM steps carry long prompts so the cost of
-restating a step is visible in bytes. Adapted from the s18 scale review's
-generator (``chain`` with ``shared=k``); tests cannot import from ``.claude/``.
+restating a step is visible in bytes. Adapted from an earlier scale review's
+generator (``chain`` with ``shared=k``), which lives outside the test tree.
 """
 
 from __future__ import annotations

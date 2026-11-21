@@ -35,19 +35,19 @@
    "surface": "tool-data",
    "tool": "patch_node_options",
    "key": "data.prompt_unchanged_node_ids",
-   "reason": "Not taught in prose by ruling: the same result carries prompt_unchanged_note, one sentence that says what the listed nodes keep. A description or skill clause was considered and not chosen, to keep per-request text small."
+   "reason": "Not taught in prose by design: the same result carries prompt_unchanged_note, one sentence that says what the listed nodes keep. A description or skill clause was considered and not chosen, to keep per-request text small."
   },
   {
    "surface": "tool-data",
    "tool": "upsert_node",
    "key": "data.prompt_unchanged_node_ids",
-   "reason": "Not taught in prose by ruling: the same result carries prompt_unchanged_note, one sentence that says what the listed nodes keep. A description or skill clause was considered and not chosen, to keep per-request text small."
+   "reason": "Not taught in prose by design: the same result carries prompt_unchanged_note, one sentence that says what the listed nodes keep. A description or skill clause was considered and not chosen, to keep per-request text small."
   },
   {
    "surface": "tool-data",
    "tool": "set_pipeline",
    "key": "data.prompt_unchanged_node_ids",
-   "reason": "Not taught in prose by ruling: the same result carries prompt_unchanged_note, one sentence that says what the listed nodes keep. A description or skill clause was considered and not chosen, to keep per-request text small."
+   "reason": "Not taught in prose by design: the same result carries prompt_unchanged_note, one sentence that says what the listed nodes keep. A description or skill clause was considered and not chosen, to keep per-request text small."
   }
  ]
 }

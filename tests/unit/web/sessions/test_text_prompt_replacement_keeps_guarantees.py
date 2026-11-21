@@ -373,7 +373,7 @@ async def test_an_approved_file_prompt_node_sent_back_as_exported_keeps_its_bind
     """Re-sending the exported node leaves the file binding and its resolved prompt review exactly as stored.
 
     Known and not fixed here (measured 2026-11-19 on ce7d94c1a and on this
-    branch, reported to the integrator): ``approved_prompt_artifact_hash``,
+    branch): ``approved_prompt_artifact_hash``,
     which card approval stamps into the saved options, comes back as ``None``.
     Node reconciliation re-derives that key with
     ``approved_prompt_artifact_hash_from_options``, which returns ``None`` for a

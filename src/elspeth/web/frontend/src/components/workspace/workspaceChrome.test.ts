@@ -111,7 +111,7 @@ describe("workspace action bar rhythm (elspeth-fca731fb28)", () => {
   });
 
   it("gives the hide/show toggle the title bars' 36px icon chrome", () => {
-    // 2026-11-20 (maintainer ruling): the toggle opens a pane title bar, so
+    // By design, the toggle opens a pane title bar, so
     // it takes the bars' compact register (the tab pills and Plugin catalog
     // are 36px in the 46px band) on BOTH axes. variant="bare" makes
     // .workspace-pane-toggle its ONLY chrome: transparent ground, hover-only

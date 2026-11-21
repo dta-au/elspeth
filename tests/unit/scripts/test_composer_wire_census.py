@@ -878,7 +878,7 @@ def test_read_set_pipeline_direct_path_fields_are_read_in_candidate_builder() ->
     from scripts.cicd import composer_wire_census as census
 
     # MEASURED on base 019a98e15: the set_pipeline READ set, all extracted in
-    # build_set_pipeline_candidate. The inline prompt lane adds no top-level key
+    # build_set_pipeline_candidate. The inline prompt limit adds no top-level key
     # (its prompt fields live in nodes[].options), so the set is unchanged.
     base_read = frozenset({"edges", "metadata", "nodes", "outputs", "source", "sources"})
     builder = "elspeth.web.composer.tools.sessions.build_set_pipeline_candidate"

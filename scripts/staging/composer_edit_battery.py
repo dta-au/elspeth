@@ -683,7 +683,7 @@ class EditBattery:
         warnings = tool_warnings(evidence)
         extra: JsonObject = {}
         if self.plan.verifier == structural_cycle.VERIFIER:
-            # The workload's own verifier judges the turn, with the customer's codes, in place of the plan expectations.
+            # The workload's own verifier judges the turn, with the reference codes, in place of the plan expectations.
             state_codes = structural_cycle.verify_state(baseline_state, after_state, edit["order"], Position.from_json(edit["position"]))
             turn_codes, review_warnings = structural_cycle.operation_codes(
                 operation, evidence["end_reviews"], end_review_evidence=self.resolved_end_review_evidence()
@@ -1392,7 +1392,7 @@ def main(
     if args.action == "cleanup":
         return cleanup(battery)
     summary = battery.run()
-    # A plan file passes on gold; a workload passes, as the customer's runner does, when every requested step passed.
+    # A plan file passes on gold; a workload passes, as the reference runner does, when every requested step passed.
     return 0 if (summary["all_passed"] if plan.verifier is not None else summary["gold"]) else 1
 
 

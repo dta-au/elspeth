@@ -24,9 +24,9 @@ Two presets:
     after the source, mid-chain between two LLM steps, and at the final
     mapper -- for the structural-cycle workload to rotate through.
 ``single-node``
-    A like-for-like copy of the shape measured on a customer deployment: one
+    A like-for-like copy of a large single-step reference shape: one
     source ``source``, one LLM node ``capacity_probe`` with 32 file-held query
-    templates of 15,600 bytes each (about 500 KB, as that fixture's were), a
+    templates of 15,600 bytes each (about 500 KB, as the reference's were), a
     4,000-byte system prompt file, a main sink ``results`` and an error sink.
 
 ``--queries-per-llm-step`` and ``--total-prompt-bytes`` build graphs near the
@@ -868,7 +868,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--query-templates",
         choices=["file", "inline"],
-        help="hold multi-query templates in bound files (default, as the customer's) or inline in the YAML",
+        help="hold multi-query templates in bound files (default, as the reference shape) or inline in the YAML",
     )
     parser.add_argument(
         "--total-prompt-bytes",

@@ -1,6 +1,6 @@
 """Shared support for the staging operator tools.
 
-This module replaces the git-ignored lane helpers the delivered staging
+This module replaces the untracked helper module earlier operator
 scripts imported. It owns four boundaries, each injectable so the tools can be
 tested without a network, Docker, sudo or cloud credentials:
 

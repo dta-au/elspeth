@@ -862,7 +862,7 @@ def test_deferred_created_fields_reads_only_names_the_config_fixes(plugin: str, 
 
 
 def test_the_notice_rides_in_the_same_tool_result_as_is_valid(tmp_path: Path, blob_env: dict[str, Any]) -> None:
-    """Integrator's condition: the planner reads the tool result, not the state object (``ToolResult.to_dict``)."""
+    """Required: the planner reads the tool result, not the state object (``ToolResult.to_dict``)."""
     state = _graph(
         tmp_path,
         _join_node("enrich", "src_out", "output", _join(CSV_TABLE, "csv")),

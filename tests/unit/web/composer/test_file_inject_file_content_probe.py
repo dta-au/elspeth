@@ -111,7 +111,7 @@ def _transform(node_id: str, plugin: str, *, input: str, on_success: str, option
 
 
 # ---------------------------------------------------------------------------
-# The customer's shape, with invented names
+# A realistic file-held shape, with invented names
 # ---------------------------------------------------------------------------
 
 
@@ -336,7 +336,7 @@ def test_execution_validation_admits_the_file_held_chain_with_its_real_bytes(tmp
 
     The multi-query template stays inline here: a reviewed prompt surface is
     what run admission needs from that node, and the review is staged the way
-    the card resolves it. Every other file of the customer's shape is held.
+    the card resolves it. Every other file of the shape is held.
     """
     state = _with_resolved_query_review(_chain(tmp_path, inject_file=True, prompt_files=True, query_file=False))
 

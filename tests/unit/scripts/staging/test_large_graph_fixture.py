@@ -246,11 +246,11 @@ def test_too_few_steps_for_the_llm_steps_is_refused() -> None:
         lgf.build_fixture(lgf.preset_spec("acceptance", steps=14))
 
 
-def test_the_single_node_preset_is_the_customer_s_shape() -> None:
+def test_the_single_node_preset_is_the_reference_shape() -> None:
     fixture = lgf.build_fixture(lgf.preset_spec("single-node"))
     measures = fixture.measures()
     assert (measures["steps"], measures["llm_steps"], measures["queries"], measures["sinks"], measures["sources"]) == (1, 1, 32, 2, 1)
-    # 32 file-held query templates of 15,600 bytes (499,200), as the customer's, and a 4,000-byte system prompt.
+    # 32 file-held query templates of 15,600 bytes (499,200), as the reference shape's, and a 4,000-byte system prompt.
     queries = [file for file in fixture.files if ".options.queries." in str(file.slot)]
     assert [len(file.content) for file in queries] == [15_600] * 32
     assert (measures["files"], measures["prompt_bytes_in_files"], measures["inline_prompt_bytes"]) == (33, 503_200, 0)
@@ -356,7 +356,7 @@ def test_the_acceptance_fixture_imports_validates_and_passes_its_reviews(tmp_pat
     assert [event for event, _ in events.seen] == ["fixture_files_uploaded", "fixture_setup"]
 
 
-def test_the_single_node_fixture_imports_and_validates_at_the_customer_s_size(tmp_path: Path) -> None:
+def test_the_single_node_fixture_imports_and_validates_at_the_reference_size(tmp_path: Path) -> None:
     client, session, _, summary = _set_up(tmp_path, lgf.preset_spec("single-node"))
     assert type(summary) is dict, summary
     assert summary["valid"] is True and summary["prompt_reviews_approved"] == ["capacity_probe"]

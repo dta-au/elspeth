@@ -634,7 +634,7 @@ def test_keep_going_records_a_failed_step_and_judges_the_rest(tmp_path: Path) ->
     composer.skip = {3}
     run, _, _ = make(tmp_path, composer=composer, keep_going=True)
     summary = run.run()
-    # The chain breaks at the missing node, so it also never reaches the sink (the customer's rule).
+    # The chain breaks at the missing node, so it also never reaches the sink (the reference rule).
     assert results(run)[2]["findings"] == ["node_inventory_mismatch", "routing_does_not_reach_sink", "routing_mismatch"]
     assert summary["judged"] == 10
     assert summary["passed"] == 9
@@ -642,7 +642,7 @@ def test_keep_going_records_a_failed_step_and_judges_the_rest(tmp_path: Path) ->
     assert summary["all_passed"] is False
 
 
-def test_a_step_that_changes_the_llm_node_fails_with_the_customer_s_code(tmp_path: Path) -> None:
+def test_a_step_that_changes_the_llm_node_fails_with_the_reference_code(tmp_path: Path) -> None:
     composer = CycleComposer(orders_for(10))
     composer.extra = {2: _drop_anchor_option}
     run, _, _ = make(tmp_path, composer=composer)
