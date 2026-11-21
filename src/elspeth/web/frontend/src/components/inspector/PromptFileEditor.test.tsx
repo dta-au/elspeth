@@ -535,6 +535,22 @@ it("reports a file that cannot be loaded as an alert", async () => {
   expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
 });
 
+it("retries a failed load in place and explains the disabled Save meanwhile", async () => {
+  vi.mocked(readPromptFileText)
+    .mockRejectedValueOnce(new Error("Could not read the file."))
+    .mockResolvedValueOnce({ text: "loaded text", sha256: "a".repeat(64) });
+  render(<PromptFileEditors nodeId="first" options={ONE_FILE} />);
+  expect(await screen.findByRole("alert")).toHaveTextContent("Could not read the file.");
+  const save = screen.getByRole("button", { name: "Save" });
+  expect(save).toBeDisabled();
+  expect(save).toHaveAccessibleDescription("The file did not load. Use Retry, then save.");
+  fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+  const editor = await screen.findByDisplayValue("loaded text");
+  expect(editor).toBeEnabled();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(readPromptFileText).toHaveBeenCalledTimes(2);
+});
+
 it("uses the design system's input and button classes, with the three actions in one row", async () => {
   const editor = await openOneFileEditor();
   expect(editor).toHaveClass("textarea", "input-mono", "prompt-editor-text");

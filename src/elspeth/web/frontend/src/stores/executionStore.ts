@@ -902,7 +902,9 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
         apiErr.status === 409 && apiErr.error_type === "run_already_active"
           ? "A run is already in progress for this pipeline."
           : apiErr.detail ??
-            "Pipeline execution failed. Check the run results panel for error details.";
+            // No server answer (e.g. a lost connection): the run may or may
+            // not have started, and no run id was returned to look up.
+            "Could not confirm whether the run started. Check Run history before you run it again.";
       set({
         isExecuting: false,
         error: message,
@@ -1164,7 +1166,7 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
       onAuthFailure() {
         if (!ownsConnection()) return;
         // Close code 4001 -- do not reconnect, trigger logout
-        useAuthStore.getState().logout();
+        useAuthStore.getState().logout({ expired: true });
       },
       onRunUnavailable() {
         if (!ownsConnection()) return;

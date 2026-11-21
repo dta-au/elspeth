@@ -28,6 +28,8 @@ export function TutorialTurn5AuditStory({
 }: TutorialTurn5AuditStoryProps): JSX.Element {
   const [summary, setSummary] = useState<RunAuditStoryResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Bumped by Retry: the same summary read again. The run is never re-run.
+  const [attempt, setAttempt] = useState(0);
   const headingRef = useRef<HTMLHeadingElement | null>(null);
 
   // Focus the turn's heading on mount (Group D: focus management).
@@ -47,7 +49,7 @@ export function TutorialTurn5AuditStory({
     return () => {
       cancelled = true;
     };
-  }, [runId, sessionId]);
+  }, [runId, sessionId, attempt]);
 
   return (
     <section className="tutorial-turn" aria-labelledby="tutorial-audit-title">
@@ -66,9 +68,22 @@ export function TutorialTurn5AuditStory({
         </p>
       )}
       {error !== null && (
-        <p role="alert" className="tutorial-error">
-          {error}
-        </p>
+        <>
+          <p role="alert" className="tutorial-error">
+            {error}
+          </p>
+          <div className="tutorial-actions">
+            <Button
+              variant="primary"
+              onClick={() => {
+                setError(null);
+                setAttempt((current) => current + 1);
+              }}
+            >
+              Retry
+            </Button>
+          </div>
+        </>
       )}
       {summary !== null && (
         <>

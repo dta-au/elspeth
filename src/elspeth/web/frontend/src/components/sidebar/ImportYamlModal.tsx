@@ -120,6 +120,16 @@ function describeImportError(apiErr: ApiError): ImportErrorInfo {
       detail: `${subject} is ${unavailableReasonLabel(apiErr.error_type).toLowerCase()} under the current plugin policy.`,
     };
   }
+  // The credential guard's 422 carries its own public reason and corrective
+  // action; it is not a body-validation failure.
+  if (
+    apiErr.status === 422 &&
+    apiErr.error_type === "credential_material_rejected" &&
+    apiErr.detail &&
+    apiErr.detail.trim().length > 0
+  ) {
+    return { title: "Could not import this pipeline.", detail: apiErr.detail };
+  }
   if (apiErr.status === 422) {
     return { title: "Could not import this paste.", detail: IMPORT_YAML_422_MESSAGE };
   }

@@ -40,6 +40,36 @@ describe("credential ownership of delayed responses", () => {
     expect(localStorage.getItem("auth_token")).toBeNull();
   });
 
+  it("tells the sign-in page why when the server rejects the current credential", async () => {
+    localStorage.setItem("auth_token", "old-token");
+    useAuthStore.setState({ token: "old-token" });
+    vi.mocked(fetch).mockResolvedValueOnce(response(401));
+    await expect(fetchCurrentUser()).rejects.toMatchObject({ status: 401 });
+    expect(useAuthStore.getState().loginError).toBe("Your sign-in has expired. Sign in again to continue.");
+  });
+
+  it("says the stored sign-in expired when boot finds it rejected, and nothing on a network failure", async () => {
+    localStorage.setItem("auth_token", "stored-token");
+    vi.mocked(fetch).mockResolvedValueOnce(response(401));
+    await useAuthStore.getState().loadFromStorage();
+    expect(useAuthStore.getState().token).toBeNull();
+    expect(useAuthStore.getState().loginError).toBe("Your sign-in has expired. Sign in again to continue.");
+
+    resetStore(useAuthStore);
+    localStorage.setItem("auth_token", "stored-token");
+    vi.mocked(fetch).mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    await useAuthStore.getState().loadFromStorage();
+    expect(useAuthStore.getState().loginError).toBeNull();
+  });
+
+  it("keeps a deliberate sign-out free of the expiry message", async () => {
+    localStorage.setItem("auth_token", "old-token");
+    useAuthStore.setState({ token: "old-token" });
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(null, { status: 204 }));
+    await useAuthStore.getState().logout();
+    expect(useAuthStore.getState().loginError).toBeNull();
+  });
+
   it.each([
     ["profile", fetchCurrentUser],
     ["workflow", fetchMailboxSummary],
