@@ -25,6 +25,7 @@ import ast
 from pathlib import Path
 
 import elspeth
+from tests.helpers.tree_gate import iter_gate_files
 
 _SRC = Path(elspeth.__file__).resolve().parent
 _ROW_WRITES = frozenset({"create_blob", "_persist_blob_content", "values"})
@@ -90,7 +91,7 @@ def user_row_writers(source: str) -> set[str]:
 
 def _production_writers() -> set[tuple[str, str]]:
     writers: set[tuple[str, str]] = set()
-    for path in sorted(_SRC.rglob("*.py")):
+    for path in iter_gate_files(_SRC):
         relative = path.relative_to(_SRC).as_posix()
         writers.update((relative, name) for name in user_row_writers(path.read_text(encoding="utf-8")))
     return writers

@@ -419,12 +419,15 @@ def test_policy_surface_parity_matrix(case: _MatrixCase, tmp_path: Path) -> None
     context = ToolContext(catalog=view, plugin_snapshot=snapshot, session_engine=engine, session_id=session_id)
 
     catalog_api, policy_wire = asyncio.run(_catalog_http_surfaces(snapshot=snapshot, policy=policy, profiles=profiles))
-    tool_results = (
-        _handle_list_sources({}, empty_state, context),
-        _handle_list_transforms({}, empty_state, context),
-        _handle_list_sinks({}, empty_state, context),
+    source_result = _handle_list_sources({}, empty_state, context)
+    transform_result = _handle_list_transforms({}, empty_state, context)
+    sink_result = _handle_list_sinks({}, empty_state, context)
+    # list_transforms returns a selection index: each entry is a mapping with a
+    # name and no plugin_type, because the tool itself fixes the kind.
+    tool_discovery = frozenset(
+        [str(PluginId(item.plugin_type, item.name)) for result in (source_result, sink_result) for item in result.data["available"]]
+        + [str(PluginId("transform", item["name"])) for item in transform_result.data["available"]]
     )
-    tool_discovery = frozenset(str(PluginId(item.plugin_type, item.name)) for result in tool_results for item in result.data["available"])
     prompt = build_catalog_context_string(view, plugin_snapshot=snapshot)
     freeform_policy = json.loads(prompt.partition("\n")[2])["plugin_policy"]
     freeform_prompt = frozenset(freeform_policy["available_ids"])
@@ -457,12 +460,17 @@ def test_policy_surface_parity_matrix(case: _MatrixCase, tmp_path: Path) -> None
     assert {row.capability.value: tuple(row.available_plugin_ids) for row in policy_wire.capability_groups} == expected_capabilities
     assert {name: tuple(plugin_ids) for name, plugin_ids in freeform_policy["capability_groups"].items()} == expected_capabilities
     tool_capabilities: dict[str, set[str]] = {}
-    for result in tool_results:
+    for result in (source_result, sink_result):
         assert result.success is True
         for item in result.data["available"]:
             plugin_id = str(PluginId(item.plugin_type, item.name))
             for declaration in item.policy_capabilities:
                 tool_capabilities.setdefault(declaration.capability.value, set()).add(plugin_id)
+    assert transform_result.success is True
+    for item in transform_result.data["available"]:
+        plugin_id = str(PluginId("transform", item["name"]))
+        for declaration in item["policy_capabilities"]:
+            tool_capabilities.setdefault(declaration["capability"], set()).add(plugin_id)
     assert {capability: tuple(sorted(plugin_ids)) for capability, plugin_ids in tool_capabilities.items()} == expected_capabilities
     assert frozenset(evidence.available_plugin_ids) == expected
     assert frozenset(evidence.authorized_plugin_ids) == frozenset(map(str, _CORE_IDS | case.extra_authorized))

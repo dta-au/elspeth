@@ -36,6 +36,7 @@ from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
 from elspeth.web.sessions.models import identity_roles_table
 from elspeth.web.sessions.routes._helpers import _composer_chat_history
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.tree_gate import iter_gate_files
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 from tests.unit.web.sessions.test_routes import _llm_call, _llm_call_audit_tool_calls, _make_app
@@ -438,7 +439,7 @@ class TestRowsReachOnlyTheHttpResponse:
 
     def test_only_the_messages_route_builds_the_projection(self) -> None:
         importers: set[str] = set()
-        for path in sorted(_SRC.rglob("*.py")):
+        for path in iter_gate_files(_SRC):
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for node in ast.walk(tree):
                 imports_view = (
