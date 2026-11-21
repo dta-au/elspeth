@@ -4013,7 +4013,7 @@ class TestSessionCRUDRoutes:
             service.get_active_run = _get_active_run_spy  # type: ignore[method-assign]
 
             delete_task = asyncio.create_task(client.delete(f"/api/sessions/{session_id}"))
-            await asyncio.wait_for(ownership_checked.wait(), timeout=2.0)
+            await wait_for_event_or_producer(ownership_checked, delete_task, waiting_for="delete passing its ownership check")
             await asyncio.sleep(0)
 
             assert not active_run_checked.is_set()
@@ -12457,17 +12457,17 @@ async def test_send_message_shielded_llm_call_persist_completes_under_a_real_out
             body=message_body("Will be cancelled inside the shielded persist"),
         ) as operation,
     ):
-        await asyncio.wait_for(composer.entered.wait(), timeout=3)
+        await _wait_for_operation_event(client, operation, composer.entered, waiting_for="composer turn entering compose()")
         cancellation = await client.post(f"{operation.poll_path}/cancel")
         assert cancellation.status_code in (200, 202)
-        await asyncio.wait_for(entered_persist.wait(), timeout=3)
+        await _wait_for_operation_event(client, operation, entered_persist, waiting_for="cancelled turn entering its audit persist")
         assert composer.owner is not None
         composer.owner.cancel(COMPOSER_CANCEL_REQUESTED)
         await asyncio.sleep(0)
         assert not composer.owner.done()
         release_persist.set()
         await asyncio.wait_for(operation.drive, timeout=5)
-        await asyncio.wait_for(persist_completed.wait(), timeout=3)
+        await _wait_for_operation_event(client, operation, persist_completed, waiting_for="shielded audit persist completing")
         terminal = await client.get(operation.poll_path)
         assert SettledComposerOperation(operation.accepted, terminal).error()[0] == 499
     assert captured == [cancelled]
@@ -12554,11 +12554,13 @@ async def test_recompose_repeat_cancel_joins_cleanup_before_releasing_lease(tmp_
             client, app, path=f"/api/sessions/{service.session.id}/recompose", body=recompose_body(str(user_msg.id))
         ) as operation,
     ):
-        await asyncio.wait_for(composer.entered.wait(), timeout=3)
+        await _wait_for_operation_event(client, operation, composer.entered, waiting_for="composer turn entering compose()")
         cancellation = await client.post(f"{operation.poll_path}/cancel")
         assert cancellation.status_code in (200, 202)
         try:
-            await asyncio.wait_for(entered.wait(), timeout=3)
+            await _wait_for_operation_event(
+                client, operation, entered, waiting_for=f"cancelled recompose entering its blocked {blocked_write} write"
+            )
             assert composer.owner is not None
             composer.owner.cancel(COMPOSER_CANCEL_REQUESTED)
             with pytest.raises(TimeoutError):
@@ -12631,7 +12633,7 @@ async def test_compose_cancel_preserves_original_when_cleanup_child_fails(tmp_pa
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         body = message_body("Hello") if route == "messages" else recompose_body(str(user_msg.id))
         async with running_operation_async(client, app, path=f"/api/sessions/{service.session.id}/{route}", body=body) as operation:
-            await asyncio.wait_for(composer.entered.wait(), timeout=3)
+            await _wait_for_operation_event(client, operation, composer.entered, waiting_for="composer turn entering compose()")
             cancellation = await client.post(f"{operation.poll_path}/cancel")
             assert cancellation.status_code in (200, 202)
             await asyncio.wait_for(operation.drive, timeout=5)
