@@ -54,6 +54,7 @@ from elspeth.core.templates import (
     RETIRED_ROW_API_NAMES,
     TEMPLATE_ROW_METHODS,
     TemplateSourceTooLargeError,
+    int_literal_too_long_to_render,
     validate_jinja_source,
 )
 
@@ -79,6 +80,17 @@ class TemplateTooDeeplyNested(TemplateError):
 
     def __init__(self) -> None:
         super().__init__("Template blocks are too deeply nested to compile")
+
+
+class TemplateNumberLiteralTooLong(TemplateError):
+    """An integer literal Python will not convert between text and int (``sys.get_int_max_str_digits()`` digits).
+
+    A decimal literal over the limit fails in Jinja's lexer; a hex, octal or
+    binary one fails when the code generator writes its value as decimal text.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("Template contains a number literal too long to read")
 
 
 class TemplateWorkerLostError(PluginRetryableError):
@@ -1089,6 +1101,14 @@ class _BoundedEnvironment(_LocalSandboxedEnvironment):
             return super().parse(source, name=name, filename=filename)
         except RecursionError as exc:
             raise TemplateError("Template expression nesting exceeds the parser limit") from exc
+        except ValueError as exc:
+            # Jinja's lexer reads an integer literal with ``int()``, which refuses
+            # more than 4300 digits with a bare ValueError; the checks this parse
+            # runs raise TemplateError types. A ValueError subclass is another
+            # cause and is re-raised unchanged.
+            if type(exc) is not ValueError:
+                raise
+            raise TemplateNumberLiteralTooLong() from exc
 
     def _parse(self, source: str, name: str | None, filename: str | None) -> nodes.Template:
         # Jinja's parse() wraps this method and hands a TemplateSyntaxError
@@ -1140,6 +1160,9 @@ def _check_template_ast(ast: nodes.Template) -> None:
             raise TemplateError("Template AST exceeds 2048 nodes")
         if depth > MAX_TEMPLATE_AST_DEPTH:
             raise TemplateError(f"Template AST nesting exceeds {MAX_TEMPLATE_AST_DEPTH} levels")
+        if type(node) is nodes.Const and type(node.value) is int and int_literal_too_long_to_render(node.value):
+            # The code generator writes repr() of every constant, which refuses this value.
+            raise TemplateNumberLiteralTooLong()
         pending.extend((child, depth + 1) for child in node.iter_child_nodes())
     if next(ast.find_all(nodes.Pow), None) is not None:
         raise TemplateError("Power expressions are not supported in pipeline templates")

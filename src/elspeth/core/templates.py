@@ -477,6 +477,11 @@ def template_nesting_refusal(position: str) -> str:
     return f"{position} is too deeply nested to compile: its loops or blocks nest deeper than Python allows. Flatten the nesting."
 
 
+def template_number_literal_refusal(position: str) -> str:
+    """The refusal for a template holding an integer literal longer than Python will read."""
+    return f"{position} contains a number literal too long to read. Shorten the number or quote it as text."
+
+
 def template_size_refusal(position: str, size_bytes: int, limit_bytes: int) -> str:
     """The refusal for one prompt template over the bound, naming where it sits."""
     return (
@@ -554,6 +559,37 @@ class TemplateTooDeeplyNestedError(TemplateSourceRefusedError):
         super().__init__(f"Template is too deeply nested to analyse (more than {MAX_TEMPLATE_AST_DEPTH} levels)")
 
 
+def int_literal_too_long_to_render(value: int) -> bool:
+    """Whether Python refuses to write ``value`` as decimal text, decided without converting it.
+
+    Python refuses an int with more decimal digits than
+    ``sys.get_int_max_str_digits()`` (4300 by default; the sign is not counted:
+    measured, ``repr(-(10**4300 - 1))`` renders and ``repr(10**4300)`` refuses).
+    A value has more than D digits exactly when ``abs(value) >= 10**D``. Since
+    ``2**(3*D) = 8**D < 10**D``, a value of at most ``3*D`` bits is under the
+    limit; only a longer one is compared with ``10**D``, integer arithmetic on a
+    number of about ``3.33*D`` bits. A limit of 0 disables Python's check, so
+    nothing is refused.
+    """
+    limit = sys.get_int_max_str_digits()
+    if limit == 0 or value.bit_length() <= 3 * limit:
+        return False
+    smallest_too_long: int = 10**limit  # int ** int is typed Any (a negative exponent gives a float); limit > 0 here
+    return abs(value) >= smallest_too_long
+
+
+class TemplateNumberLiteralTooLongError(TemplateSourceRefusedError):
+    """An integer literal Python will not convert between text and int (``sys.get_int_max_str_digits()`` digits).
+
+    A decimal literal over the limit fails in Jinja's lexer (``int()``); a hex,
+    octal or binary one is read, but its value cannot be written back as
+    decimal text, which Jinja's code generator does for every constant.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("Template contains a number literal too long to read")
+
+
 class _FieldExtractionEnvironment(Environment):
     """Plain parse for analysis, with the depth bound the sandbox applies before compiling.
 
@@ -571,11 +607,23 @@ class _FieldExtractionEnvironment(Environment):
             ast = super().parse(source, name=name, filename=filename)
         except RecursionError as exc:
             raise TemplateTooDeeplyNestedError() from exc
+        except ValueError as exc:
+            # Jinja's lexer reads an integer literal with ``int()``, which refuses
+            # more than 4300 digits with a bare ValueError. Its string unescape is
+            # already wrapped as TemplateSyntaxError, so a bare ValueError from
+            # this call is that literal. A subclass (an owned refusal, a Unicode
+            # error) is not this cause and is re-raised unchanged.
+            if type(exc) is not ValueError:
+                raise
+            raise TemplateNumberLiteralTooLongError() from exc
         pending = [(child, 1) for child in ast.iter_child_nodes()]
         while pending:
             node, depth = pending.pop()
             if depth > MAX_TEMPLATE_AST_DEPTH:
                 raise TemplateTooDeeplyNestedError()
+            if type(node) is Const and type(node.value) is int and int_literal_too_long_to_render(node.value):
+                # jinja2.meta runs the code generator, which writes repr() of every constant.
+                raise TemplateNumberLiteralTooLongError()
             pending.extend((child, depth + 1) for child in node.iter_child_nodes())
         return ast
 

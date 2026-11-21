@@ -38,6 +38,7 @@ from elspeth.core.blobs_inline import (
     _substitute_blob_content_refs_for_validation,
     _validate_blob_content_refs_sync,
 )
+from elspeth.core.templates import MAX_JINJA_TEMPLATE_BYTES, template_size_refusal
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution._rendered_pipeline_yaml import RenderedPipelineYaml, ResolvedPipelineTooLargeError
 from elspeth.web.execution._validation_model import (
@@ -249,6 +250,37 @@ def llm_prompt_file_scalar_field(field_path: str) -> tuple[str, str] | None:
     if option_path in {"prompt_template", "system_prompt"} or (len(parts) == 3 and parts[0] == "queries" and parts[2] == "template"):
         return node_name, option_path
     return None
+
+
+def _oversized_llm_template_files(
+    fetched: Mapping[BlobInlineRef, bytes], *, node_plugins: Mapping[str, str]
+) -> tuple[ValidationError, ...]:
+    """One entry per llm template position whose file is over the template bound, naming the step.
+
+    Plugin construction refuses the same text later, but its entry names the
+    plugin ('llm'), not the step, so with two llm steps the reader cannot tell
+    which file to shorten. A UTF-8 file's bytes are the resolved template's
+    UTF-8 bytes, the measure the plugin applies; other encodings are left to
+    the plugin's own refusal.
+    """
+    errors: list[ValidationError] = []
+    for ref, content in fetched.items():
+        position = llm_prompt_file_scalar_field(ref.field_path)
+        if position is None or ref.encoding != "utf-8" or len(content) <= MAX_JINJA_TEMPLATE_BYTES:
+            continue
+        node_name, option_path = position
+        if option_path == "system_prompt" or node_name not in node_plugins or node_plugins[node_name] != "llm":
+            continue
+        errors.append(
+            ValidationError(
+                component_id=node_name,
+                component_type="transform",
+                message=template_size_refusal(f"{option_path} on step {node_name}", len(content), MAX_JINJA_TEMPLATE_BYTES),
+                suggestion=None,
+                error_code="plugin_options_invalid",
+            )
+        )
+    return tuple(errors)
 
 
 def unsupported_llm_prompt_file_refs(refs: list[BlobInlineRef], *, node_plugins: Mapping[str, str]) -> list[BlobInlineRef]:
@@ -981,6 +1013,22 @@ def materialize_validation_yaml(
                     name=CHECK_BLOB_INLINE_REFS, passed=False, detail=detail, affected_nodes=(), outcome_code=None
                 ),
                 errors=tuple(_blob_inline_validation_error(violation) for violation in decode_violations),
+                readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
+                semantic_contracts=interpretation.authored.semantic_contracts,
+            )
+        oversized_templates = _oversized_llm_template_files(fetched, node_plugins=node_plugins)
+        if oversized_templates:
+            detail = "; ".join(error.message for error in oversized_templates)
+            return PhaseFailure(
+                passed_checks=(),
+                failed_check=ValidationCheck(
+                    name=CHECK_BLOB_INLINE_REFS,
+                    passed=False,
+                    detail=detail,
+                    affected_nodes=tuple(error.component_id for error in oversized_templates if error.component_id is not None),
+                    outcome_code=None,
+                ),
+                errors=oversized_templates,
                 readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
                 semantic_contracts=interpretation.authored.semantic_contracts,
             )

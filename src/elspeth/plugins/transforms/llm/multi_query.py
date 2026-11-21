@@ -17,11 +17,17 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validat
 
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
-from elspeth.core.templates import PromptTemplateRefusal, template_nesting_refusal, template_size_refusal
+from elspeth.core.templates import (
+    PromptTemplateRefusal,
+    template_nesting_refusal,
+    template_number_literal_refusal,
+    template_size_refusal,
+)
 from elspeth.plugins.infrastructure.config_base import PluginConfig
 from elspeth.plugins.infrastructure.templates import (
     RowProjection,
     TemplateError,
+    TemplateNumberLiteralTooLong,
     TemplateRow,
     TemplateSourceTooLarge,
     TemplateTooDeeplyNested,
@@ -273,6 +279,8 @@ class QueryDefinition(BaseModel):
             raise PromptTemplateRefusal(template_size_refusal(_query_template_position(info), exc.size_bytes, exc.limit_bytes)) from exc
         except TemplateTooDeeplyNested as exc:
             raise PromptTemplateRefusal(template_nesting_refusal(_query_template_position(info))) from exc
+        except TemplateNumberLiteralTooLong as exc:
+            raise PromptTemplateRefusal(template_number_literal_refusal(_query_template_position(info))) from exc
         except TemplateError as exc:
             raise ValueError(f"Invalid Jinja2 template in queries entry: {exc}") from exc
         return v
