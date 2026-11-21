@@ -57,9 +57,10 @@ from tests.unit.web.sessions.test_carry_terms_across_wording_edits import (
     _rows,
     _state_context_node,
     _with_first_text,
-    service,  # noqa: F401  (fixture)
 )
 from tests.unit.web.sessions.test_prompt_file_approval import _pending_file_review
+
+pytest_plugins = ("tests.unit.web.sessions.test_carry_terms_across_wording_edits",)
 
 blob_env = blob_tools.blob_env
 
@@ -127,7 +128,7 @@ def _with_changes(rows: list[dict[str, Any]], row_id: str, **changes: Any) -> li
 @pytest.mark.parametrize("tool", TOOLS)
 @pytest.mark.asyncio
 async def test_a_stored_row_sent_back_as_read_is_accepted_and_keeps_its_approval(
-    service: SessionServiceImpl,  # noqa: F811
+    service: SessionServiceImpl,
     tmp_path: Path,
     tool: str,
     form: str,
@@ -156,7 +157,7 @@ async def test_a_stored_row_sent_back_as_read_is_accepted_and_keeps_its_approval
 @pytest.mark.parametrize("tool", TOOLS)
 @pytest.mark.asyncio
 async def test_a_pending_row_sent_back_with_its_id_is_accepted_and_stays_pending(
-    service: SessionServiceImpl,  # noqa: F811
+    service: SessionServiceImpl,
     tmp_path: Path,
     tool: str,
 ) -> None:
@@ -191,7 +192,7 @@ async def test_a_pending_row_sent_back_with_its_id_is_accepted_and_stays_pending
 @pytest.mark.parametrize("tool", TOOLS)
 @pytest.mark.asyncio
 async def test_an_echo_with_one_server_owned_field_changed_is_refused(
-    service: SessionServiceImpl,  # noqa: F811
+    service: SessionServiceImpl,
     tmp_path: Path,
     tool: str,
     row_id: str,
@@ -212,7 +213,7 @@ async def test_an_echo_with_one_server_owned_field_changed_is_refused(
 @pytest.mark.parametrize("tool", TOOLS)
 @pytest.mark.asyncio
 async def test_a_pending_row_sent_back_as_resolved_is_refused(
-    service: SessionServiceImpl,  # noqa: F811
+    service: SessionServiceImpl,
     tmp_path: Path,
     tool: str,
 ) -> None:
@@ -229,7 +230,7 @@ async def test_a_pending_row_sent_back_as_resolved_is_refused(
 @pytest.mark.parametrize("tool", TOOLS)
 @pytest.mark.asyncio
 async def test_an_exact_echo_sent_with_a_wording_edit_keeps_the_terms(
-    service: SessionServiceImpl,  # noqa: F811
+    service: SessionServiceImpl,
     tmp_path: Path,
     tool: str,
     form: str,
@@ -263,7 +264,7 @@ async def test_an_exact_echo_sent_with_a_wording_edit_keeps_the_terms(
 @pytest.mark.parametrize("tool", TOOLS)
 @pytest.mark.asyncio
 async def test_a_new_row_carrying_a_server_owned_field_is_refused(
-    service: SessionServiceImpl,  # noqa: F811
+    service: SessionServiceImpl,
     tmp_path: Path,
     tool: str,
     extra_fields: dict[str, str],
@@ -289,7 +290,7 @@ async def test_a_new_row_carrying_a_server_owned_field_is_refused(
 @pytest.mark.parametrize("tool", TOOLS)
 @pytest.mark.asyncio
 async def test_only_the_first_bad_row_of_a_node_is_reported(
-    service: SessionServiceImpl,  # noqa: F811
+    service: SessionServiceImpl,
     tmp_path: Path,
     tool: str,
 ) -> None:
@@ -307,7 +308,7 @@ async def test_only_the_first_bad_row_of_a_node_is_reported(
     assert "interpretation_requirements[4]" not in refusals[0]
 
 
-async def _session_with_titled_terms(service: SessionServiceImpl, tmp_path: Path) -> Any:  # noqa: F811
+async def _session_with_titled_terms(service: SessionServiceImpl, tmp_path: Path) -> Any:
     """Terms authored with ``display_title``: the export then shows four-field term rows."""
     rows = [{**row, "display_title": f"What {row['user_term']} means"} for row in TWO_TERM_ROWS]
     return await _approved_session(service, tmp_path, rows=rows)
@@ -316,7 +317,7 @@ async def _session_with_titled_terms(service: SessionServiceImpl, tmp_path: Path
 @pytest.mark.parametrize("tool", WHOLE_NODE_TOOLS)
 @pytest.mark.asyncio
 async def test_the_whole_node_sent_back_as_exported_changes_nothing(
-    service: SessionServiceImpl,  # noqa: F811
+    service: SessionServiceImpl,
     tmp_path: Path,
     tool: str,
 ) -> None:
@@ -350,7 +351,7 @@ async def test_the_whole_node_sent_back_as_exported_changes_nothing(
 @pytest.mark.parametrize("tool", WHOLE_NODE_TOOLS)
 @pytest.mark.asyncio
 async def test_the_exported_node_with_only_its_input_changed_keeps_prompt_and_approvals(
-    service: SessionServiceImpl,  # noqa: F811
+    service: SessionServiceImpl,
     tmp_path: Path,
     tool: str,
 ) -> None:

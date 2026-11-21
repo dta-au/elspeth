@@ -57,14 +57,15 @@ from tests.unit.web.sessions.test_carry_terms_across_wording_edits import (
     _sent_prompt,
     _state_context_node,
     _with_first_text,
-    service,  # noqa: F401  (fixture)
 )
 from tests.unit.web.sessions.test_routes import _make_app
+
+pytest_plugins = ("tests.unit.web.sessions.test_carry_terms_across_wording_edits",)
 
 
 @pytest.mark.asyncio
 async def test_terms_carried_by_one_call_stay_carried_when_a_second_call_shortens_the_card(
-    service: SessionServiceImpl,  # noqa: F811
+    service: SessionServiceImpl,
     tmp_path: Path,
 ) -> None:
     """Two calls: a wording edit on a long prompt, then a system prompt that halves the card's share.
@@ -97,7 +98,7 @@ async def test_terms_carried_by_one_call_stay_carried_when_a_second_call_shorten
 
 @pytest.mark.asyncio
 async def test_terms_carried_on_a_multi_query_node_stay_carried_when_more_queries_shorten_the_card(
-    service: SessionServiceImpl,  # noqa: F811
+    service: SessionServiceImpl,
     tmp_path: Path,
 ) -> None:
     session = await _approved_session(service, tmp_path, extra_options=MULTI_QUERY)
@@ -124,7 +125,7 @@ async def test_terms_carried_on_a_multi_query_node_stay_carried_when_more_querie
 
 @pytest.mark.asyncio
 async def test_the_status_words_the_model_reads_are_resolved_and_pending(
-    service: SessionServiceImpl,  # noqa: F811
+    service: SessionServiceImpl,
     tmp_path: Path,
 ) -> None:
     """After one edit that re-drafts ``category`` and leaves ``audience`` alone: the literal row statuses."""
@@ -149,7 +150,7 @@ async def test_the_status_words_the_model_reads_are_resolved_and_pending(
 
 @pytest.mark.asyncio
 async def test_a_prompt_card_replaced_by_a_later_edit_cannot_approve_the_later_text(
-    service: SessionServiceImpl,  # noqa: F811
+    service: SessionServiceImpl,
     tmp_path: Path,
 ) -> None:
     session = await _approved_session(service, tmp_path)
@@ -177,7 +178,7 @@ async def test_a_prompt_card_replaced_by_a_later_edit_cannot_approve_the_later_t
 
 @pytest.mark.asyncio
 async def test_wording_changed_and_changed_back_still_needs_the_prompt_card_and_keeps_the_terms(
-    service: SessionServiceImpl,  # noqa: F811
+    service: SessionServiceImpl,
     tmp_path: Path,
 ) -> None:
     session = await _approved_session(service, tmp_path)
@@ -206,7 +207,7 @@ async def test_wording_changed_and_changed_back_still_needs_the_prompt_card_and_
 
 @pytest.mark.asyncio
 async def test_a_term_renamed_and_renamed_back_is_reviewed_again_with_the_authored_draft(
-    service: SessionServiceImpl,  # noqa: F811
+    service: SessionServiceImpl,
     tmp_path: Path,
 ) -> None:
     """Renaming a term drops its row; the old name coming back is a new pending row, not the old approval."""
@@ -313,7 +314,7 @@ MULTI_QUERY = {
 
 @pytest.mark.asyncio
 async def test_a_wording_edit_sent_with_a_query_template_that_bypasses_the_slots_is_still_refused(
-    service: SessionServiceImpl,  # noqa: F811
+    service: SessionServiceImpl,
     tmp_path: Path,
 ) -> None:
     """A query with its own template does not use the node-level slots. The edit is refused, as before the carry."""
@@ -334,7 +335,7 @@ async def test_a_wording_edit_sent_with_a_query_template_that_bypasses_the_slots
 
 @pytest.mark.asyncio
 async def test_parts_re_split_without_a_text_change_carry_the_terms_behind_a_reopened_prompt_card(
-    service: SessionServiceImpl,  # noqa: F811
+    service: SessionServiceImpl,
     tmp_path: Path,
 ) -> None:
     """Splitting one text part in two changes the parts skeleton and no text.

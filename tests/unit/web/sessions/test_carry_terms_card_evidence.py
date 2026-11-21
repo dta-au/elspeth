@@ -43,9 +43,10 @@ from tests.unit.web.sessions.test_carry_terms_across_wording_edits import (
     _rows,
     _sent_prompt,
     _Session,
-    service,  # noqa: F401  (fixture)
 )
 from tests.unit.web.sessions.test_routes import _make_app
+
+pytest_plugins = ("tests.unit.web.sessions.test_carry_terms_across_wording_edits",)
 
 
 async def _slot_values(session: _Session, card: InterpretationEventRecord) -> dict[str, str | None]:
@@ -77,7 +78,7 @@ async def _slot_values(session: _Session, card: InterpretationEventRecord) -> di
 
 @pytest.mark.asyncio
 async def test_the_slot_event_holds_the_run_value_for_drafted_and_amended_terms_before_and_after_a_carried_edit(
-    service: SessionServiceImpl,  # noqa: F811
+    service: SessionServiceImpl,
     tmp_path: Path,
 ) -> None:
     session = await _approved_session(service, tmp_path)
@@ -113,7 +114,7 @@ async def test_the_slot_event_holds_the_run_value_for_drafted_and_amended_terms_
 
 @pytest.mark.asyncio
 async def test_a_term_reviewed_twice_is_named_by_its_latest_event(
-    service: SessionServiceImpl,  # noqa: F811
+    service: SessionServiceImpl,
     tmp_path: Path,
 ) -> None:
     """Removed, added back and resolved again with a different amendment: two events for one term."""
@@ -143,7 +144,7 @@ async def test_a_term_reviewed_twice_is_named_by_its_latest_event(
 
 @pytest.mark.asyncio
 async def test_a_duplicated_slot_names_one_event_whose_value_fills_both_places(
-    service: SessionServiceImpl,  # noqa: F811
+    service: SessionServiceImpl,
     tmp_path: Path,
 ) -> None:
     session = await _approved_session(service, tmp_path)
@@ -165,7 +166,7 @@ async def test_a_duplicated_slot_names_one_event_whose_value_fills_both_places(
 
 @pytest.mark.asyncio
 async def test_a_prompt_card_can_be_approved_while_a_term_is_pending_and_is_not_reissued(
-    service: SessionServiceImpl,  # noqa: F811
+    service: SessionServiceImpl,
     tmp_path: Path,
 ) -> None:
     """Behaviour that predates the carry, pinned because the card design depends on it.
@@ -255,7 +256,7 @@ async def test_the_routes_send_the_client_each_slot_event_id_and_that_event_acce
 
 @pytest.mark.asyncio
 async def test_a_re_drafted_term_has_no_event_on_the_new_prompt_card_while_the_carried_term_does(
-    service: SessionServiceImpl,  # noqa: F811
+    service: SessionServiceImpl,
     tmp_path: Path,
 ) -> None:
     """One edit re-drafts ``category`` (not carried) and leaves ``audience`` alone (carried)."""
