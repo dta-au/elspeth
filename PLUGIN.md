@@ -27,7 +27,7 @@ Create custom sources, transforms, and sinks for ELSPETH pipelines.
 
 ## Prerequisites
 
-- **Python 3.12+** with type hints, dataclasses
+- **Python 3.14+** with type hints, dataclasses
 - **Pydantic v2** for config validation
 - **ELSPETH concepts** - Read [Data Trust and Error Handling](docs/guides/data-trust-and-error-handling.md) for the Three-Tier Trust Model
 

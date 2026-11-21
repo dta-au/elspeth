@@ -162,8 +162,9 @@ pipeline gains content (empty: only `Graph` and `Run`). The divider drags;
 
 **Slide 6 — One conversation, one planner.**
 - Describe the complete outcome or begin with a smaller request.
-- Check the chat header: **Auto-apply on** is the default; **Approval required**
-  holds changes for explicit review.
+- **Auto-apply on** is the default; **Approval required** holds changes for
+  explicit review. The web UI has no control for this mode and does not
+  display it.
 - Inspect the applied change or pending proposal, then ask for a revision if needed.
 - Continue in the same conversation to change the pipeline.
 
@@ -177,9 +178,12 @@ change and keeps the operator in control of what becomes the current pipeline.
 - A **decision card** such as `Classify step · prompt` — `Acknowledge` /
   `Approve` / `Change…`
 
-*Notes.* The authority chip states whether the session auto-applies eligible
-changes. A full-pipeline proposal needs a green runtime preflight before
-auto-commit; otherwise it waits for review. Neither path runs the pipeline:
+*Notes.* New sessions auto-apply eligible changes, and the transcript labels
+each change Composer applies. A session is switched to **Approval required**
+only through the session's composer-preferences API
+(`PATCH /api/sessions/{session_id}/composer/preferences`,
+`trust_mode: "explicit_approve"`). A full-pipeline proposal needs a green
+runtime preflight before auto-commit; otherwise it waits for review. Neither path runs the pipeline:
 `Run pipeline` remains a separate action. Decision cards can still need a
 human response after a change commits.
 
@@ -339,7 +343,7 @@ becomes visible on screen.
 - The operator sets: provider, credentials, endpoint, concurrency, timeouts — via a **profile** you pick by name
 - You never type an API key into a pipeline. `API keys & secrets` (chat `More actions`) stores them; the pipeline carries a *reference*. On a server-only deployment the panel is read-only: it lists the keys your administrator provisioned and offers no way to add your own
 
-*Notes.* The `Composer: <model>` chip in the chat header is the model the
+*Notes.* The `Composer: <model>` chip in the app header is the model the
 *planner* uses — it is display-only, set by the deployment. The model your
 *pipeline* uses is a per-node option, reviewable on the `· model` card.
 

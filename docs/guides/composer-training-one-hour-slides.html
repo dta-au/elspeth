@@ -295,7 +295,7 @@ table.tbl{border-collapse:collapse;width:100%;font-size:16px}
     <div class="card"><h3>Describe</h3><p>Describe the whole pipeline or begin with a smaller request.</p></div>
     <div class="card"><h3>Refine</h3><p>Inspect applied changes or pending proposals, then ask for changes in the same conversation.</p></div>
   </div>
-  <div class="quote" style="margin-top:22px">The model proposes the structure; ELSPETH validates and records applied changes. Check the authority chip for the current approval rule.<span class="cite">docs/guides/user-manual.md</span></div>
+  <div class="quote" style="margin-top:22px">The model proposes the structure; ELSPETH validates and records applied changes. New sessions auto-apply eligible changes; the web UI has no control for this mode and does not display it.<span class="cite">docs/guides/user-manual.md</span></div>
   <aside class="notes"><p>Show that a later request can revise the current pipeline without starting over.</p></aside>
 </section>
 
@@ -308,7 +308,7 @@ table.tbl{border-collapse:collapse;width:100%;font-size:16px}
     <div><h3>A decision card</h3><div class="pcard pending"><div class="hd"><span>Classify step · prompt</span></div><div style="font-size:13px">The LLM wrote the instruction for this step.</div><div style="margin-top:8px"><span class="btn">View prompt</span> <span class="btn primary dim">Approve</span> <span class="btn">Change…</span></div></div></div>
   </div>
   <div class="alert info" style="margin-top:6px">Auto-apply on can commit eligible changes without Accept. Run pipeline is always a separate action; pending review cards still need your decision.</div>
-  <aside class="notes"><p>Point out the authority chip: Auto-apply on is the default; Approval required holds mutations for explicit review. Full-pipeline auto-commit also needs a green runtime preflight. A dashed decision card may still need a human response after a change is applied.</p></aside>
+  <aside class="notes"><p>Auto-apply on is the default; Approval required holds mutations for explicit review. The web UI has no control for this mode and does not display it: a session is switched to Approval required only through the session's composer-preferences API (PATCH /api/sessions/{session_id}/composer/preferences, trust_mode: "explicit_approve"). Full-pipeline auto-commit also needs a green runtime preflight. A dashed decision card may still need a human response after a change is applied.</p></aside>
 </section>
 
 <section class="slide" data-seg="2">
@@ -545,7 +545,7 @@ Keep the same routing.</pre>
     <div class="card paper"><h3 style="color:var(--color-warning)">The operator sets</h3><ul class="mini" style="font-size:18px"><li>provider, credentials, endpoint</li><li>concurrency, timeouts</li><li>— all bound into the profile you pick</li></ul></div>
   </div>
   <div class="alert info" style="margin-top:18px">You never type an API key into a pipeline. <code>API keys &amp; secrets</code> (chat <code>More actions</code>) stores them; the pipeline carries a <em>reference</em>.</div>
-  <aside class="notes"><p>The "Composer: &lt;model&gt;" chip in the chat header is the model the planner uses — display-only, set by the deployment. The model your pipeline uses is a per-node option, reviewable on the "· model" card.</p></aside>
+  <aside class="notes"><p>The "Composer: &lt;model&gt;" chip in the app header is the model the planner uses — display-only, set by the deployment. The model your pipeline uses is a per-node option, reviewable on the "· model" card.</p></aside>
 </section>
 
 <section class="slide" data-seg="5">
