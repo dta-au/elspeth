@@ -322,7 +322,7 @@ def test_a_shipped_plan_can_be_gold_and_leaves_the_graph_as_found(
     failed = [(result["id"], result["findings"]) for result in checkpoint["results"] if "passed" in result and not result["passed"]]
     assert failed == []
     assert summary["gold"] is True
-    assert summary["applicable"] == (54 if optional_roles else 50)
+    assert summary["applicable"] == (62 if optional_roles else 58)
     assert len(summary["skipped_not_applicable"]) == (0 if optional_roles else 4)
     assert summary["as_found_differences"] == []
     # Prompt files the plan made are named in the summary, with whether the final graph still uses each.
@@ -354,3 +354,41 @@ def test_every_shipped_edit_names_its_tools_and_no_message_names_a_tool(plan_pat
     coverage = battery.plan_coverage(plan)
     for tool in ("upsert_edge", "remove_edge", "patch_source_options", "create_blob", "wire_blob_inline_ref", "wire_secret_ref"):
         assert tool in coverage["exercised"]
+
+
+@pytest.mark.parametrize("plan_path", [DEFAULT_PLAN, MIXED_PLAN])
+def test_every_new_output_edit_allows_the_collision_policy_set_output_requires(plan_path: Path) -> None:
+    outputs = [expectation for edit in load_plan(plan_path).edits for expectation in edit["expect"] if "new_output" in expectation]
+    assert outputs
+    assert all("collision_policy" in expectation["option_keys"] for expectation in outputs)
+
+
+@pytest.mark.parametrize("plan_path", [DEFAULT_PLAN, MIXED_PLAN])
+def test_on_the_acceptance_shape_profile_owned_edits_are_skipped_and_gold_stays_in_reach(plan_path: Path) -> None:
+    """The acceptance fixture's shape: every LLM step bound to an operator profile, a csv source, no secret reference.
+
+    The profile owns max_tokens and temperature, so those eight edits are skipped (``profile_owned``).
+    Gold needs GOLD_MINIMUM_EDITS applicable edits; the plan keeps a margin of 2 so that a later
+    plan change cannot silently put gold out of reach on this graph.
+    """
+    plan = load_plan(plan_path)
+    state, _ = graph(inline=plan_path == MIXED_PLAN, optional_roles=True)
+    for item in state["nodes"]:
+        if item["plugin"] == "llm":
+            item["options"]["profile"] = "task-role"
+            if "api_key" in item["options"]:
+                del item["options"]["api_key"]
+    edits = resolve_edits(plan, resolve_targets(plan, state, {}), state)
+    owned = [edit["id"] for edit in edits if "profile_owned" in edit]
+    assert owned == [
+        "max-tokens",
+        "temperature",
+        "restore-max-tokens",
+        "restore-temperature",
+        "max-tokens-2",
+        "temperature-2",
+        "restore-max-tokens-2",
+        "restore-temperature-2",
+    ]
+    assert [edit["id"] for edit in edits if not edit["applicable"] and "profile_owned" not in edit] == ["secret-switch", "secret-restore"]
+    assert sum(1 for edit in edits if edit["applicable"]) >= battery.GOLD_MINIMUM_EDITS + 2

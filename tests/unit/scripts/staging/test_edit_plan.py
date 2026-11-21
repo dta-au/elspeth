@@ -71,13 +71,15 @@ def write_plan(tmp_path: Path, edits: list[dict[str, Any]], **overrides: Any) ->
 # ── the shipped plans ──────────────────────────────────────────────────────
 
 
-def test_shipped_plans_have_fifty_required_edits_and_optional_extras() -> None:
+def test_shipped_plans_have_fifty_eight_required_edits_and_optional_extras() -> None:
+    # 58 required: 50 for gold plus the 8 max_tokens/temperature edits a profile-bound step skips
+    # (test_shipped_edit_plans checks the profile-bound count stays at 52 or more).
     for path in (edit_plan.DEFAULT_PLAN, edit_plan.MIXED_PLAN):
         plan = edit_plan.load_plan(path)
         optional = {name for name, spec in plan.targets.items() if "optional" in spec and spec["optional"]}
         required = [edit for edit in plan.edits if not plan.roles_of(edit) & optional]
-        assert len(required) == 50
-        assert len(plan.edits) == 54
+        assert len(required) == 58
+        assert len(plan.edits) == 62
         assert plan.forbidden_tools == ("set_pipeline",)
 
 
@@ -92,7 +94,7 @@ def test_shipped_plan_resolves_on_a_graph_with_its_roles_and_leaves_no_placehold
     targets = edit_plan.resolve_targets(plan, state, {})
     assert targets == {"source": "rows", "head": "classify", "llm_file": "summarise", "output": "out", "csv_source": "rows"}
     edits = edit_plan.resolve_edits(plan, targets, state)
-    assert [edit["number"] for edit in edits] == list(range(1, 55))
+    assert [edit["number"] for edit in edits] == list(range(1, 63))
     assert [edit["id"] for edit in edits if not edit["applicable"]] == ["secret-switch", "secret-restore"]
     assert not re.search(r"\{[a-z_]+(:[^}]*)?\}", json.dumps([edit for edit in edits if edit["applicable"]]))
     restore = next(edit for edit in edits if edit["id"] == "restore-pipeline-name")
@@ -181,6 +183,64 @@ def test_an_edit_needing_an_absent_optional_role_resolves_as_not_applicable(tmp_
     targets = edit_plan.resolve_targets(plan, graph(), {})
     assert targets == {}
     assert edit_plan.resolve_edits(plan, targets, graph()) == [{"number": 1, "id": "x", "applicable": False, "missing_roles": ["spare"]}]
+
+
+def _profile_plan(tmp_path: Path) -> edit_plan.Plan:
+    edits = [
+        {
+            "id": "max-tokens",
+            "message": "Set max_tokens on {llm} to 9.",
+            "expect": [{"equals": "/nodes/{llm}/options/max_tokens", "value": 9}],
+            **TOOLS,
+        },
+        {"id": "restore", "message": "Put it back.", "expect": [{"restored": "/nodes/{llm}/options/temperature"}], **TOOLS},
+        {
+            "id": "mixed",
+            "message": "Set max_tokens and rename.",
+            "expect": [{"equals": "/nodes/{llm}/options/max_tokens", "value": 9}, {"equals": "/metadata/name", "value": "x"}],
+            **TOOLS,
+        },
+        {"id": "other-option", "message": "Set it.", "expect": [{"equals": "/nodes/{llm}/options/response_field", "value": "r"}], **TOOLS},
+    ]
+    return edit_plan.load_plan(write_plan(tmp_path, edits, targets={"llm": {"kind": "llm_node", "prompt": "file"}}))
+
+
+def test_an_option_a_bound_profile_owns_makes_its_edits_not_applicable(tmp_path: Path) -> None:
+    plan = _profile_plan(tmp_path)
+    bound = graph()
+    bound["nodes"][1]["options"]["profile"] = "task-role"
+    targets = edit_plan.resolve_targets(plan, bound, {})
+    edits = edit_plan.resolve_edits(plan, targets, bound)
+    assert [(edit["id"], edit["applicable"]) for edit in edits] == [
+        ("max-tokens", False),
+        ("restore", False),
+        ("mixed", True),
+        ("other-option", True),
+    ]
+    assert edits[0] == {
+        "number": 1,
+        "id": "max-tokens",
+        "applicable": False,
+        "missing_roles": [],
+        "profile_owned": ["/nodes/summarise/options/max_tokens"],
+    }
+    assert edits[1]["profile_owned"] == ["/nodes/summarise/options/temperature"]
+
+
+def test_the_same_edits_apply_to_a_step_without_a_profile(tmp_path: Path) -> None:
+    plan = _profile_plan(tmp_path)
+    for unbound in (None, ""):
+        state = graph()
+        if unbound is not None:
+            state["nodes"][1]["options"]["profile"] = unbound
+        edits = edit_plan.resolve_edits(plan, edit_plan.resolve_targets(plan, state, {}), state)
+        assert all(edit["applicable"] for edit in edits)
+
+
+def test_the_profile_owned_options_are_ones_the_server_refuses_on_a_profiled_node() -> None:
+    from elspeth.core.llm_profiles import LLM_PROFILE_PRIVATE_FIELDS
+
+    assert set(edit_plan.PROFILE_OWNED_OPTION_KEYS) <= LLM_PROFILE_PRIVATE_FIELDS
 
 
 # ── verdict checks: each with a positive and a negative control ───────────
@@ -347,9 +407,10 @@ def test_a_new_node_is_checked_field_by_field() -> None:
     extra_option = with_insert(graph())
     extra_option["nodes"][-1]["options"] = {"schema": {"mode": "observed"}, "note": "unasked"}
     assert check([new_step()], extra_option) == ["expect[0]:new_node:/nodes/battery_a"]
+    # A description on the step the edit creates is allowed (and reported by new_component_notes).
     described = with_insert(graph())
     described["nodes"][-1]["description"] = "unasked"
-    assert check([new_step()], described) == ["expect[0]:new_node:/nodes/battery_a"]
+    assert check([new_step()], described) == []
     discard = with_insert(graph())
     discard["nodes"][-1]["on_error"] = "discard"
     assert check([new_step()], discard) == ["expect[0]:new_node:/nodes/battery_a"]
@@ -450,6 +511,89 @@ def test_server_written_review_fields_are_allowed_by_name_only() -> None:
         "/nodes/classify/options/interpretation_requirements",
         "/sources/rows/options/source_authoring",
     ]
+
+
+def test_new_component_notes_report_a_description_and_a_placed_output_path() -> None:
+    step = with_insert(graph())
+    step["nodes"][-1]["description"] = "Passes rows through."
+    edit = resolved([new_step()])
+    assert edit_plan.new_component_notes(edit, edit_plan.graph_view(graph()), edit_plan.graph_view(step)) == [
+        "new_component_described:/nodes/battery_a/description"
+    ]
+    assert edit_plan.new_component_notes(edit, edit_plan.graph_view(graph()), edit_plan.graph_view(with_insert(graph()))) == []
+    output = {
+        "new_output": "battery_out",
+        "fields": {"plugin": "json", "on_write_failure": "discard"},
+        "options": {"path": {"ends_with": "battery_out.jsonl"}},
+        "option_keys": ["path"],
+    }
+    placed = graph()
+    placed["outputs"].append(
+        {"name": "battery_out", "plugin": "json", "options": {"path": "outputs/s1/battery_out.jsonl"}, "on_write_failure": "discard"}
+    )
+    assert edit_plan.new_component_notes(resolved([output]), edit_plan.graph_view(graph()), edit_plan.graph_view(placed)) == [
+        "new_output_path_placed:/outputs/battery_out/options/path"
+    ]
+    bare = copy.deepcopy(placed)
+    bare["outputs"][-1]["options"]["path"] = "battery_out.jsonl"
+    assert edit_plan.new_component_notes(resolved([output]), edit_plan.graph_view(graph()), edit_plan.graph_view(bare)) == []
+
+
+def test_a_description_written_on_a_component_the_edit_did_not_create_is_still_unrelated() -> None:
+    after = with_insert(graph())
+    after["nodes"][0]["description"] = "Written beside the insert."
+    edit = resolved([new_step()])
+    failures, covered = edit_plan.check_expectations(
+        edit, edit_plan.graph_view(graph()), edit_plan.graph_view(after), edit_plan.graph_view(graph()), read_text
+    )
+    assert failures == []
+    changes = edit_plan.classify_changes(edit_plan.graph_view(graph()), edit_plan.graph_view(after), covered, named={"battery_a"})
+    # (The insert's own re-route of the source is covered by a chain expectation in a real plan.)
+    assert "/nodes/classify/description" in changes.unrelated
+
+
+def test_a_file_prompt_hash_cleared_to_null_is_server_written_on_any_node() -> None:
+    # "summarise" holds its prompt in a file, "classify" inline (graph()).
+    before = graph()
+    for item in before["nodes"]:
+        item["options"]["approved_prompt_artifact_hash"] = "abc"
+    cleared = copy.deepcopy(before)
+    for item in cleared["nodes"]:
+        item["options"]["approved_prompt_artifact_hash"] = None
+    changes = edit_plan.classify_changes(edit_plan.graph_view(before), edit_plan.graph_view(cleared), [], named=set())
+    assert changes.server_written == ["/nodes/summarise/options/approved_prompt_artifact_hash"]
+    # The inline step's hash going to null is not the file-prompt case: unrelated on a node the edit does not name.
+    assert changes.unrelated == ["/nodes/classify/options/approved_prompt_artifact_hash"]
+    absent = copy.deepcopy(before)
+    del absent["nodes"][1]["options"]["approved_prompt_artifact_hash"]
+    assert edit_plan.classify_changes(edit_plan.graph_view(before), edit_plan.graph_view(absent), [], named=set()).server_written == [
+        "/nodes/summarise/options/approved_prompt_artifact_hash"
+    ]
+
+
+def test_a_file_prompt_hash_changed_to_another_value_or_set_from_null_is_unrelated_where_not_named() -> None:
+    before = graph()
+    before["nodes"][1]["options"]["approved_prompt_artifact_hash"] = "abc"
+    other = copy.deepcopy(before)
+    other["nodes"][1]["options"]["approved_prompt_artifact_hash"] = "def"
+    changes = edit_plan.classify_changes(edit_plan.graph_view(before), edit_plan.graph_view(other), [], named=set())
+    assert changes.unrelated == ["/nodes/summarise/options/approved_prompt_artifact_hash"]
+    assert changes.server_written == []
+    unset = graph()
+    unset["nodes"][1]["options"]["approved_prompt_artifact_hash"] = None
+    set_again = copy.deepcopy(unset)
+    set_again["nodes"][1]["options"]["approved_prompt_artifact_hash"] = "abc"
+    assert edit_plan.classify_changes(edit_plan.graph_view(unset), edit_plan.graph_view(set_again), [], named=set()).unrelated == [
+        "/nodes/summarise/options/approved_prompt_artifact_hash"
+    ]
+    # A prompt moved from a file to inline in the same turn is not the server's clearing either.
+    moved = copy.deepcopy(before)
+    moved["nodes"][1]["options"]["approved_prompt_artifact_hash"] = None
+    moved["nodes"][1]["options"]["prompt_template"] = "Summarise the row."
+    assert (
+        "/nodes/summarise/options/approved_prompt_artifact_hash"
+        in edit_plan.classify_changes(edit_plan.graph_view(before), edit_plan.graph_view(moved), [], named=set()).unrelated
+    )
 
 
 def test_server_written_review_fields_count_only_on_the_components_named() -> None:

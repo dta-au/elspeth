@@ -93,6 +93,7 @@ from scripts.staging.edit_plan import (
     leftover_findings,
     load_plan,
     named_components,
+    new_component_notes,
     new_validation_errors,
     preconditions,
     render_was,
@@ -259,6 +260,30 @@ def tool_coverage(used: set[str]) -> JsonObject:
     }
 
 
+REVIEW_PENDING_CODE = "interpretation_review_pending"
+
+
+def _profile_owned(edit: Mapping[str, Any]) -> JsonObject:
+    """``{"profile_owned": [...]}`` for an edit skipped because a profile owns its option, else ``{}``."""
+    return {"profile_owned": edit["profile_owned"]} if "profile_owned" in edit else {}
+
+
+def _is_the_approved_review(edit: Mapping[str, Any], key: str) -> bool:
+    """Whether a new validation error (``new_validation_errors`` key) is the pending card this edit approves.
+
+    Exactly that node and kind: a pending review on any other node or of another kind is not covered.
+    """
+    if edit["approve"] is None:
+        return False
+    code, component, message = json.loads(key)
+    return (
+        code == REVIEW_PENDING_CODE
+        and component == edit["approve"]["node"]
+        and type(message) is str
+        and message.startswith(edit["approve"]["kind"] + " review pending")
+    )
+
+
 def summarise(checkpoint: Mapping[str, Any]) -> JsonObject:
     """The attempt's K-of-N summary with time, provider and tool totals."""
     applicable = [edit for edit in checkpoint["edits"] if edit["applicable"]]
@@ -296,7 +321,7 @@ def summarise(checkpoint: Mapping[str, Any]) -> JsonObject:
         "edits": len(checkpoint["edits"]),
         "applicable": len(applicable),
         "skipped_not_applicable": [
-            {"number": edit["number"], "id": edit["id"], "missing_roles": edit["missing_roles"]} for edit in skipped
+            {"number": edit["number"], "id": edit["id"], "missing_roles": edit["missing_roles"], **_profile_owned(edit)} for edit in skipped
         ],
         "judged": len(judged),
         "complete": complete,
@@ -668,7 +693,12 @@ class EditBattery:
             server_written: list[str] = []
             extra["graph_counts"] = structural_cycle.graph_counts(after_state)
         else:
-            server_written = self.judge_plan_edit(edit, operation, evidence, findings, before_state, after_state, baseline_state)
+            # The pending-review error for the card this edit approves is judged after the approval, not before it.
+            deferred: list[str] = []
+            server_written = self.judge_plan_edit(
+                edit, operation, evidence, findings, before_state, after_state, baseline_state, deferred=deferred
+            )
+            warnings.extend(new_component_notes(edit, graph_view(before_state), graph_view(after_state)))
             if edit["approve"] is not None and not findings:
                 # Only a turn with a clean verdict earns an approval; the approval may change server-written fields only.
                 self.approve_reviews(edit, after_state, approved, save)
@@ -681,6 +711,10 @@ class EditBattery:
                 after_state = approved_state
                 failures, _, _ = self.judge(edit, baseline_state, before_state, after_state)
                 findings.extend("after_approval:" + failure for failure in failures)
+                # Every validation error new since the turn began, the deferred one included, fails the edit now.
+                findings.extend("after_approval:new_validation_error:" + key for key in new_validation_errors(before_state, after_state))
+            else:
+                findings.extend(deferred)
         fields: JsonObject = {
             "status": operation["status"],
             "passed": not findings,
@@ -704,8 +738,15 @@ class EditBattery:
         before_state: Mapping[str, Any],
         after_state: Mapping[str, Any],
         baseline_state: Mapping[str, Any],
+        *,
+        deferred: list[str] | None = None,
     ) -> list[str]:
-        """Add a plan edit's findings (turn, expectations, unrelated changes, validation, tools, files); return server-written paths."""
+        """Add a plan edit's findings (turn, expectations, unrelated changes, validation, tools, files); return server-written paths.
+
+        With ``deferred`` and an edit that approves a card, a new ``interpretation_review_pending``
+        error on exactly the node and kind it approves goes to ``deferred`` instead of
+        ``findings``: the caller judges it after the approval (or adds it back if none happens).
+        """
         if operation["status"] != "completed" or operation["result"] is None:
             error = operation["error"] if "error" in operation else None
             findings.insert(
@@ -717,7 +758,11 @@ class EditBattery:
         failures, unrelated, server_written = self.judge(edit, baseline_state, before_state, after_state)
         findings.extend(failures)
         findings.extend("unrelated_change:" + path for path in unrelated)
-        findings.extend("new_validation_error:" + key for key in new_validation_errors(before_state, after_state))
+        for key in new_validation_errors(before_state, after_state):
+            if deferred is not None and _is_the_approved_review(edit, key):
+                deferred.append("new_validation_error:" + key)
+            else:
+                findings.append("new_validation_error:" + key)
         findings.extend(tool_findings(edit, evidence, self.plan.forbidden_tools))
         if "delete_files" in edit:
             present = {item["id"] for item in self.session_files()}
@@ -847,11 +892,10 @@ class EditBattery:
                 ):
                     continue
                 if not edit["applicable"]:
-                    checkpoint["results"].append(
-                        {"number": edit["number"], "id": edit["id"], "skipped": "not_applicable", "missing_roles": edit["missing_roles"]}
-                    )
+                    skip = {"missing_roles": edit["missing_roles"], **_profile_owned(edit)}
+                    checkpoint["results"].append({"number": edit["number"], "id": edit["id"], "skipped": "not_applicable", **skip})
                     self.store.write(self.name, checkpoint)
-                    emit("edit_skipped", number=edit["number"], id=edit["id"], reason="not_applicable", missing_roles=edit["missing_roles"])
+                    emit("edit_skipped", number=edit["number"], id=edit["id"], reason="not_applicable", **skip)
                     continue
                 self.run_edit(checkpoint, index)
             if "stopped_reason" not in checkpoint and "as_found_differences" not in checkpoint:

@@ -40,7 +40,8 @@ Expectation forms (exactly one operator key each):
   text must live afterwards
 * ``{"new_node": ID, "fields": {...}, "one_of": {...}, "option_keys": [...]}`` -- a node
   that did not exist, with the listed fields, each ``one_of`` field one of the listed
-  values, only the listed option keys, and every other field unset
+  values, only the listed option keys, and every other field unset except a
+  ``description``, which is allowed and reported (``new_component_notes``)
 * ``{"new_output": NAME, "fields": {...}, "one_of": {...}, "options": {...}, "option_keys": [...]}``
   -- the same for an output; ``options`` maps a key to ``{"equals": V}``,
   ``{"ends_with": S}`` or ``{"one_of": [...]}``
@@ -92,6 +93,16 @@ MARKER_TEXTS = ("Battery marker", "Battery file marker")
 # tools stamp. Allowed by name only, and reported as server-written.
 SERVER_NODE_OPTION_KEYS = ("interpretation_requirements", "approved_prompt_artifact_hash")
 SERVER_SOURCE_OPTION_KEYS = ("interpretation_requirements", "source_authoring")
+# A file-held prompt's stored approval hash is cleared by the server whenever it
+# reconciles that node (the run binds the hash from the admitted snapshot), so a
+# non-null to null change of this key on a file-held step is server-written on
+# any component. Any other change of it counts only where the edit names the node.
+CLEARED_FILE_PROMPT_HASH_KEY = "approved_prompt_artifact_hash"
+# LLM options an operator profile owns: a node that binds a ``profile`` can never
+# author them (a subset of ``elspeth.core.llm_profiles.LLM_PROFILE_PRIVATE_FIELDS``).
+# An edit whose every expectation sets one of them on a profile-bound node is not
+# applicable to that graph, and is skipped like an edit missing a role.
+PROFILE_OWNED_OPTION_KEYS = ("max_tokens", "temperature")
 AUTO_WIRED_CONTROL_TERM = "required_control_auto_wired"
 _ROUTING_FIELDS = ("id", "input", "on_success")
 
@@ -527,6 +538,29 @@ def render_was(baseline: Mapping[str, Any], pointer: str) -> str:
 _POINTER_KEYS = frozenset({"equals", "ends_with", "present", "absent", "restored", "text"})
 
 
+def profile_owned_pointers(expect: Sequence[Mapping[str, Any]], baseline: Mapping[str, Any]) -> list[str]:
+    """The pointers of an edit whose EVERY expectation sets a profile-owned option on a profile-bound node, else ``[]``.
+
+    Such an edit (and the edit that restores the same option) can never pass on
+    that graph: the server refuses the option on a node that binds a profile.
+    """
+    pointers: list[str] = []
+    for expectation in expect:
+        operator = next(key for key in OPERATORS if key in expectation)
+        if operator not in ("equals", "restored"):
+            return []
+        parts = _segments(expectation[operator])
+        if len(parts) != 4 or parts[0] != "nodes" or parts[2] != "options" or parts[3] not in PROFILE_OWNED_OPTION_KEYS:
+            return []
+        if parts[1] not in baseline["nodes"]:
+            return []
+        options = baseline["nodes"][parts[1]]["options"]
+        if "profile" not in options or type(options["profile"]) is not str or not options["profile"]:
+            return []
+        pointers.append(expectation[operator])
+    return pointers
+
+
 def resolve_edits(plan: Plan, targets: Mapping[str, str], baseline_state: Mapping[str, Any]) -> list[JsonObject]:
     """The plan's edits with targets and ``{was:...}`` values filled in, numbered from 1.
 
@@ -548,6 +582,10 @@ def resolve_edits(plan: Plan, targets: Mapping[str, str], baseline_state: Mappin
         expect: list[JsonObject] = []
         for expectation in edit["expect"]:
             expect.append({key: _fill(value, targets, pointer=key in _POINTER_KEYS) for key, value in expectation.items()})
+        owned = profile_owned_pointers(expect, baseline)
+        if owned:
+            resolved.append({"number": number, "id": edit["id"], "applicable": False, "missing_roles": [], "profile_owned": owned})
+            continue
         resolved.append(
             {
                 "number": number,
@@ -614,9 +652,24 @@ def server_written_paths(
     only on the components in ``named`` (the ones the edit names, and the node
     whose card was approved); on any other component they are unrelated
     changes. ``named=None`` allows them anywhere (the as-found comparison).
+    The one exception: a file-held prompt step's approval hash going from a
+    value to null is server-written on any component (the server clears it
+    when it reconciles the node). A change to another value, or on an inline
+    prompt step, still counts only where the edit names the node.
     """
     auto = auto_wired_controls(before, after)
     auto_routes = {route for node_id in auto for route in (after["nodes"][node_id]["input"], after["nodes"][node_id]["on_success"])}
+
+    def _file_prompt_hash_cleared(path: str) -> bool:
+        # Non-null before, null or absent after, on a step whose prompt is held in a file (before and after).
+        node_id = _segments(path)[1]
+        if node_id not in before["nodes"] or node_id not in after["nodes"]:
+            return False
+        if _prompt_form(before["nodes"][node_id]) != "file" or _prompt_form(after["nodes"][node_id]) != "file":
+            return False
+        was_found, was = value_at(before, path)
+        now_found, now = value_at(after, path)
+        return was_found and was is not None and (not now_found or now is None)
 
     def server_written(path: str) -> bool:
         parts = _segments(path)
@@ -624,6 +677,8 @@ def server_written_paths(
         if collection == "nodes" and len(parts) >= 2 and parts[1] in auto:
             return True
         if len(parts) >= 4 and parts[2] == "options":
+            if collection == "nodes" and len(parts) == 4 and parts[3] == CLEARED_FILE_PROMPT_HASH_KEY and _file_prompt_hash_cleared(path):
+                return True
             if named is not None and parts[1] not in named:
                 return False
             if collection == "nodes":
@@ -727,7 +782,8 @@ def _new_component_ok(expectation: Mapping[str, Any], operator: str, before: Map
         current = item[key] if key in item else None
         if not any(type(current) is type(value) and current == value for value in values):
             return False
-    exempt = {*fields, *one_of, "options", "name", *_ROUTING_FIELDS}
+    # A description on the component the edit creates is allowed and reported (new_component_notes).
+    exempt = {*fields, *one_of, "options", "name", "description", *_ROUTING_FIELDS}
     if any(not _empty(value) for key, value in item.items() if key not in exempt):
         return False
     server_keys = SERVER_NODE_OPTION_KEYS if collection == "nodes" else ("interpretation_requirements",)
@@ -745,6 +801,33 @@ def _new_component_ok(expectation: Mapping[str, Any], operator: str, before: Map
         if "one_of" in rule and current not in rule["one_of"]:
             return False
     return True
+
+
+def new_component_notes(edit: Mapping[str, Any], before: Mapping[str, Any], after: Mapping[str, Any]) -> list[str]:
+    """What a passing new step or output carries beyond what the edit asked for, reported (never failed).
+
+    ``new_component_described:PTR`` -- the model gave the component it created a description;
+    ``new_output_path_placed:PTR`` -- the output's path ends with the asked file name but is
+    not that bare name (the server writes sink paths into the session's output folder).
+    """
+    notes: list[str] = []
+    for expectation in edit["expect"]:
+        operator = next(key for key in OPERATORS if key in expectation)
+        if operator not in ("new_node", "new_output"):
+            continue
+        collection = "nodes" if operator == "new_node" else "outputs"
+        name = expectation[operator]
+        if name in before[collection] or name not in after[collection]:
+            continue
+        item = after[collection][name]
+        pointer = f"/{collection}/{escape(name)}"
+        if "description" not in expectation["fields"] and "description" in item and not _empty(item["description"]):
+            notes.append(f"new_component_described:{pointer}/description")
+        rules: Mapping[str, Mapping[str, Any]] = expectation["options"] if "options" in expectation else {}
+        placed = "path" in rules and "ends_with" in rules["path"] and "path" in item["options"]
+        if placed and item["options"]["path"] != rules["path"]["ends_with"]:
+            notes.append(f"new_output_path_placed:{pointer}/options/path")
+    return notes
 
 
 def _renamed_ok(rename: Mapping[str, str], before: Mapping[str, Any], after: Mapping[str, Any]) -> bool:

@@ -282,7 +282,8 @@
             "mode",
             "schema",
             "indent",
-            "encoding"
+            "encoding",
+            "collision_policy"
           ]
         },
         {
@@ -725,7 +726,8 @@
             "mode",
             "schema",
             "indent",
-            "encoding"
+            "encoding",
+            "collision_policy"
           ]
         },
         {
@@ -974,6 +976,108 @@
       ],
       "tools_any": [
         "remove_node"
+      ]
+    },
+    {
+      "id": "output-indent",
+      "message": "Make the output {output} write its JSON indented by 2 spaces.",
+      "expect": [
+        {
+          "equals": "/outputs/{output}/options/indent",
+          "value": 2
+        }
+      ],
+      "tools_any": [
+        "patch_output_options",
+        "set_output"
+      ]
+    },
+    {
+      "id": "restore-output-indent",
+      "message": "Put the indentation of the output {output} back to {was:/outputs/{output}/options/indent}.",
+      "expect": [
+        {
+          "restored": "/outputs/{output}/options/indent"
+        }
+      ],
+      "tools_any": [
+        "patch_output_options",
+        "set_output"
+      ]
+    },
+    {
+      "id": "describe-llm-2",
+      "message": "Set the description of the step {llm_file} to \"Scores the first case study.\".",
+      "expect": [
+        {
+          "equals": "/nodes/{llm_file}/description",
+          "value": "Scores the first case study."
+        }
+      ],
+      "tools_any": [
+        "upsert_node"
+      ]
+    },
+    {
+      "id": "describe-head-2",
+      "message": "Set the description of the step {head} to \"Checks each submission on arrival.\".",
+      "expect": [
+        {
+          "equals": "/nodes/{head}/description",
+          "value": "Checks each submission on arrival."
+        }
+      ],
+      "tools_any": [
+        "upsert_node"
+      ]
+    },
+    {
+      "id": "restore-llm-description-2",
+      "message": "Put the description of the step {llm_file} back to {was:/nodes/{llm_file}/description}.",
+      "expect": [
+        {
+          "restored": "/nodes/{llm_file}/description"
+        }
+      ],
+      "tools_any": [
+        "upsert_node"
+      ]
+    },
+    {
+      "id": "restore-head-description-2",
+      "message": "Put the description of the step {head} back to {was:/nodes/{head}/description}.",
+      "expect": [
+        {
+          "restored": "/nodes/{head}/description"
+        }
+      ],
+      "tools_any": [
+        "upsert_node"
+      ]
+    },
+    {
+      "id": "pipeline-description-2",
+      "message": "Set the pipeline description to \"Assessment pipeline, battery round two.\".",
+      "expect": [
+        {
+          "equals": "/metadata/description",
+          "value": "Assessment pipeline, battery round two."
+        }
+      ],
+      "tools_any": [
+        "set_metadata"
+      ]
+    },
+    {
+      "id": "restore-pipeline-description-2",
+      "message": "Put the pipeline description back to {was:/metadata/description}.",
+      "expect": [
+        {
+          "restored": "/metadata/description"
+        }
+      ],
+      "tools_any": [
+        "set_metadata"
       ]
     },
     {
