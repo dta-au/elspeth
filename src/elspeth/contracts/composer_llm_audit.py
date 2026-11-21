@@ -243,6 +243,10 @@ class ComposerContextBudgetRecord:
     # over the estimate: absence never means "false".
     over_estimate: bool | None = None
     max_prompt_tokens: int | None = None
+    # ``True`` on the one retry sent after the provider rejected the previous
+    # request of the turn as over its context limit, with every earlier turn
+    # left out. ``None`` on every other record: absence never means "false".
+    retry_after_provider_rejection: bool | None = None
 
     def __post_init__(self) -> None:
         _require_non_empty_str(self.policy_hash, "policy_hash")
@@ -265,6 +269,8 @@ class ComposerContextBudgetRecord:
             raise TypeError("authored_refuted must be bool or None")
         if self.over_estimate is not None and type(self.over_estimate) is not bool:
             raise TypeError("over_estimate must be bool or None")
+        if self.retry_after_provider_rejection is not None and self.retry_after_provider_rejection is not True:
+            raise ValueError("retry_after_provider_rejection is True or absent")
         if (self.over_estimate is None) != (self.max_prompt_tokens is None):
             raise ValueError("over_estimate and max_prompt_tokens are recorded together")
         if self.max_prompt_tokens is not None:
@@ -359,6 +365,8 @@ class ComposerContextBudgetRecord:
         if self.over_estimate is not None:
             result["over_estimate"] = self.over_estimate
             result["max_prompt_tokens"] = self.max_prompt_tokens
+        if self.retry_after_provider_rejection is not None:
+            result["retry_after_provider_rejection"] = self.retry_after_provider_rejection
         return result
 
 
