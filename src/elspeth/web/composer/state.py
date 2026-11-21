@@ -4614,6 +4614,25 @@ def _prompt_template_refusal(exc: Exception) -> str | None:
     return None
 
 
+def _inline_prompt_template_refusal(node: NodeSpec) -> str | None:
+    """The plugin's template refusal for an llm node's inline ``prompt_template``, or ``None``.
+
+    The plugin factory flattens its config errors to text, so the probe's
+    failure does not carry the typed refusal; this asks the plugin's own field
+    validator again. Any other rejection is ``None``: the caller keeps the
+    generic warning for it.
+    """
+    if node.plugin != "llm" or "prompt_template" not in node.options or type(node.options["prompt_template"]) is not str:
+        return None
+    try:
+        LLMConfig.validate_prompt_template(node.options["prompt_template"])
+    except PromptTemplateRefusal as exc:
+        return str(exc)
+    except ValueError:
+        return None
+    return None
+
+
 @observation_boundary(
     tier=3,
     source="NodeSpec carrying web-authored multi-query input and output declarations",
@@ -5684,7 +5703,16 @@ def _check_schema_contracts(
             # Class name only — the triage signal ("something about this
             # plugin's config is wrong") is preserved; detailed diagnosis
             # belongs in server logs, not the UI warning list.
-            if producer.producer_id not in contract_probe_failed_producers:
+            #
+            # The one exception: the plugin's template size, nesting or
+            # number-literal refusal. Its sentence names the template's
+            # position and quotes none of its text, and with many llm steps
+            # the user needs the step, so it is an error naming the step.
+            template_refusal = _inline_prompt_template_refusal(producer_node)
+            if producer.producer_id not in contract_probe_failed_producers and template_refusal is not None:
+                contract_probe_failed_producers.add(producer.producer_id)
+                errors.append(_err(f"node:{producer.producer_id}", template_refusal, "high", "plugin_options_invalid"))
+            elif producer.producer_id not in contract_probe_failed_producers:
                 contract_probe_failed_producers.add(producer.producer_id)
                 if is_known_pass_through:
                     contract_warnings.append(
