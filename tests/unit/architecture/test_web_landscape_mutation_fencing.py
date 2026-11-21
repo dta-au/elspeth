@@ -10341,7 +10341,7 @@ def _reserve_sink_effect_disjoint_receipts(units):
         (
             "src/elspeth/web/coordination/lifecycle.py",
             "SessionOperationLease",
-            "3d9707116754760383df627a49291c0a361f50771f0ab1d1fde711882500849e",
+            "97aac55a5b91d92528d14f07b54e9a95691e1aa8a9000b758adfff0f8c6b52af",
         ),
         (
             "src/elspeth/web/coordination/lifecycle.py",
