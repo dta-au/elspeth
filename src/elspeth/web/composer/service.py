@@ -1400,6 +1400,10 @@ class ComposerServiceImpl:
                     return (record, raw) if record is not None and raw is not None else None
 
                 turn_evidence.transcript.use_blob_reader(read_advisor_history_blob)
+            if advisor_history is not None:
+                # Decoding, blob recovery and redaction of the stored history
+                # grow with the session; do them once, in the worker pool.
+                await run_sync_in_worker(turn_evidence.transcript.prepare_history)
             plugin_snapshot, policy_catalog = self._policy_context.build(user_id)
             try:
                 # Route by graph/session prerequisites. The provider decides

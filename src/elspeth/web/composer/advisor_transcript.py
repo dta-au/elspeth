@@ -1137,6 +1137,26 @@ class AdvisorTranscriptOwner:
         self._blob_reader = blob_reader
         self._excluded: list[Mapping[str, Any]] = []
         self._observed: list[_ObservedMessage] = []
+        # The redaction of the stored history, keyed by the hash of the
+        # recovered history it was taken from. Every snapshot still decodes
+        # the history and re-checks blob access; only an identical recovered
+        # history reuses its redaction (a turn takes several snapshots).
+        self._history_redaction: tuple[str, list[JsonValue]] | None = None
+
+    def prepare_history(self) -> None:
+        """Take the history's redaction now; pure and blob-reading, so a worker thread may run it."""
+        self._projected_history()
+
+    def _projected_history(self) -> tuple[list[JsonValue], str, list[JsonValue]]:
+        events = json.loads(self._history.events_json) if self._history is not None else []
+        _recover_read_bodies(events, self._blob_reader, self._history.session_id if self._history is not None else None)
+        history_facts = stable_hash(events)
+        cached = self._history_redaction
+        if cached is not None and cached[0] == history_facts:
+            return events, history_facts, cached[1]
+        redacted = _redacted_events(events)
+        self._history_redaction = (history_facts, redacted)
+        return events, history_facts, redacted
 
     def begin_messages(self, messages: Sequence[Mapping[str, Any]]) -> None:
         """Exclude already-owned history, current request and static setup once."""
@@ -1250,14 +1270,14 @@ class AdvisorTranscriptOwner:
 
     def snapshot(self) -> AdvisorVisibleTranscript:
         self.observe_messages([entry.message for entry in self._observed])
-        events = json.loads(self._history.events_json) if self._history is not None else []
-        _recover_read_bodies(events, self._blob_reader, self._history.session_id if self._history is not None else None)
-        history_facts = stable_hash(events)
+        history_events, history_facts, redacted_history = self._projected_history()
+        events = history_events
         current_events = [json.loads(json.dumps(entry.event, ensure_ascii=False)) for entry in self._observed]
         events.extend(current_events)
         gaps: list[JsonValue] = [] if self._history is not None else ["authenticated_persisted_history_not_supplied"]
         payload = {
-            "events": _redacted_events(events),
+            # Redaction is per event, so the history's redaction is reused as is.
+            "events": [*redacted_history, *_redacted_events(current_events)],
             "availability_gaps": gaps,
             "current_request_ref": "complete_original_user_request_section",
             "scope": "same_session_visible_events_only; native_thinking_and_static_internal_prompts_excluded",

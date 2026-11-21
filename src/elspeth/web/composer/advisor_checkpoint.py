@@ -551,13 +551,11 @@ class AdvisorCheckpointOwner:
         # Checkpoint builders retain the complete required graph and fit only
         # optional additions. The public hint's allowance is not a graph cap.
 
+        # The user message's guard parts are rendered once, below, for the
+        # request actually sent; nothing before that reads them.
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_msg, PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.INSTRUCTION},
-            {
-                "role": "user",
-                "content": user_msg,
-                PROMPT_GUARD_CONTENT_PARTS_KEY: _advisor_context.advisor_user_content_parts(arguments),
-            },
+            {"role": "user", "content": user_msg},
         ]
         if abandonment_review:
             review = arguments["abandonment_context"]
@@ -602,11 +600,13 @@ class AdvisorCheckpointOwner:
                 key, value = bound(sent_transcript)
                 arguments = {**unshaped, key: value}
                 user_msg = _advisor_context.build_advisor_user_message(arguments)
-                messages[1] = {
-                    "role": "user",
-                    "content": user_msg,
-                    PROMPT_GUARD_CONTENT_PARTS_KEY: _advisor_context.advisor_user_content_parts(arguments),
-                }
+        # Rendering the parts grows with the transcript: it runs in the worker
+        # pool so the event loop stays free for lease renewal and polls.
+        messages[1] = {
+            "role": "user",
+            "content": user_msg,
+            PROMPT_GUARD_CONTENT_PARTS_KEY: await run_sync_in_worker(_advisor_context.advisor_user_content_parts, arguments),
+        }
 
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
