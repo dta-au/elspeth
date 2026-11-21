@@ -6132,10 +6132,20 @@ async def test_end_advisor_wire_still_flags_an_unshielded_llm_step_the_turn_adds
 
     assert (
         "Still flag violations of explicit workflow requirements, required-control policy or routing contracts that this turn "
-        "introduced or touched, such as an LLM step it added or rewired that receives untrusted content without a "
-        "prompt-injection shield plugin or a decision on the shield plugin recommendation." in system
+        "introduced or touched, such as an LLM step it added, or an LLM step whose untrusted input this turn changed "
+        "(a new untrusted producer upstream of it), without a prompt-injection shield plugin or a decision on the shield "
+        "plugin recommendation." in system
     )
-    assert "On an edit, apply it to the LLM steps the edit adds or rewires." in system
+    # Edit-battery inserts put a passthrough directly in front of an LLM step: that does not change its input.
+    assert (
+        "Inserting, removing or moving a step that leaves the content reaching an LLM step unchanged "
+        "does not change that step's input." in system
+    )
+    assert (
+        "On an edit, apply it to the LLM steps the edit adds and to those whose untrusted input the edit changes; "
+        "a step inserted, removed or moved in front of an LLM step without changing the content it receives does not count." in system
+    )
+    assert "an LLM step it added or rewired" not in system and "the edit adds or rewires" not in system
     # FLAGGED stays the blocking verdict and WITHHOLD still needs findings.
     assert "Set verdict to FLAGGED for a concrete visible blocking defect" in system
     assert "WITHHOLD requires nonempty findings, even with graph verdict CLEAN." in system
