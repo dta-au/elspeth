@@ -58,7 +58,7 @@ After every turn it records one JSON verdict (`edit_result`):
 | nothing else changed | Every difference from the previous graph is covered by an expectation, the edit's `may_change` prefixes, or edges touching its `edges_touching` components. Fields the server writes itself are allowed by name and listed in `server_written` (below) |
 | validation | No validation error appeared that was not there before |
 | tools | At least one of the edit's `tools_any` and every one of its `tools_all` was used. A forbidden tool (`set_pipeline`) called and not rejected fails the edit, whatever its stamp |
-| warnings | Tool calls the server rejected inside the turn. On a passing edit they were corrected; they do not fail it |
+| warnings | Tool calls the server rejected inside the turn. On a passing edit they were corrected; they do not fail it. Also `new_component_described:` (the model gave a step or output it created a description) and `new_output_path_placed:` (a new output's path ends with the asked file name but is not that bare name, as when the server writes it into the session's output folder) |
 | history shed | Whether any call in the turn left out history or stubbed tool results, and what was newly shed |
 | timing | Wall, span, provider and server time; provider-call and tool-call counts (below) |
 
@@ -70,7 +70,12 @@ Fields the server writes, allowed by name and reported as `server_written`:
   only on a component the edit names (in an expectation pointer, a chain, a
   new or renamed step, `may_change` or `edges_touching`) or on the node whose
   review card the edit approves. The same field changed on any other
-  component is an unrelated change and fails the edit;
+  component is an unrelated change and fails the edit. One exception: a
+  step whose prompt is held in a file, before and after the turn, may have
+  its `options.approved_prompt_artifact_hash` go from a value to null on any
+  component. The server clears it whenever it reconciles that node, and a
+  run binds the hash from the admitted snapshot. A change to another value,
+  or on an inline-prompt step, still counts only on a named component;
 - a deployment-required control the server auto-wired into the turn's
   graph (a new node whose requirement row carries `required_control_auto_wired`),
   its edges and the routes around it. A `chain` expectation steps through such a
@@ -485,13 +490,22 @@ role is absent is skipped as not applicable: it is reported in
 run in a row. The roles and resolved messages are saved with the attempt, and
 a resumed attempt reuses them.
 
+An edit whose every expectation sets `max_tokens` or `temperature` on a step
+that binds an operator `profile` (or restores one there) is also not
+applicable: the profile owns those options and the server refuses them on
+such a step (`plugin_options_invalid`). It is skipped the same way, with
+`profile_owned` naming the pointers. Gold still needs at least 50 applicable
+edits, so the shipped gold plan cannot reach gold on a graph whose file-prompt
+step is profile-bound (42 applicable without the optional roles).
+
 The edits cover, with each edit's acceptable tools:
 - pipeline name and description (`set_metadata`);
 - inserting, describing, reordering, renaming and removing temporary
   passthrough steps between the source and its head (`splice_transform`,
   `upsert_node`, `remove_node`). A new step is checked field by field:
   plugin, node type, error routing, only the expected option keys, and every
-  other field unset. A rename must keep every field but the id and routing;
+  other field unset except a description (allowed on the step the edit
+  creates, and reported). A rename must keep every field but the id and routing;
 - temporary outputs, their path and description, and error routing to them
   and away again (`set_output`, `patch_output_options`, `upsert_edge`,
   `remove_edge`, `remove_output`). Edge changes are allowed only on edges
@@ -550,8 +564,14 @@ text and files. It then resolves the card `accepted_as_drafted` through
 `POST .../interpretations/{id}/resolve`. The resolve writes the node's
 `approved_prompt_artifact_hash` and settles its requirement row; those are
 server-written. Any other change the approval makes fails the edit
-(`approval_changed:`). This exercises approval authority on the signed-in
-account: run the battery only on a session made for testing.
+(`approval_changed:`). The one validation error judged after the approval
+rather than before it is the `interpretation_review_pending` error for exactly
+the node and kind the edit approves, since the card the edit opens is the one
+it then approves. After the approval, every validation error that was not there
+before the turn fails the edit (`after_approval:new_validation_error:`), so a
+card the approval does not clear still fails it. A pending review on any other
+node fails the edit before any approval. This exercises approval authority on
+the signed-in account: run the battery only on a session made for testing.
 
 ## Safety properties and resuming
 

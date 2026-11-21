@@ -584,13 +584,27 @@ def test_an_edit_whose_change_already_holds_is_never_sent_and_fails_as_a_precond
 def test_a_new_step_with_an_unrequested_field_fails_field_by_field(tmp_path: Path) -> None:
     composer = FakeComposer()
 
+    def noted(state: State) -> None:
+        node(state, "battery_a")["note"] = "A field the message did not ask for."
+
+    composer.extra = {2: noted}
+    run, _, _ = make(tmp_path, composer)
+    run.run()
+    assert saved(run)["results"][1]["findings"] == ["expect[0]:new_node:/nodes/battery_a"]
+
+
+def test_a_description_on_the_step_the_edit_creates_passes_and_is_reported(tmp_path: Path) -> None:
+    composer = FakeComposer()
+
     def described(state: State) -> None:
         node(state, "battery_a")["description"] = "A step the message did not describe."
 
     composer.extra = {2: described}
     run, _, _ = make(tmp_path, composer)
     run.run()
-    assert saved(run)["results"][1]["findings"] == ["expect[0]:new_node:/nodes/battery_a"]
+    result = saved(run)["results"][1]
+    assert result["findings"] == []
+    assert "new_component_described:/nodes/battery_a/description" in result["warnings"]
 
 
 def test_an_unrelated_change_in_the_same_turn_fails_the_edit(tmp_path: Path) -> None:
@@ -1048,6 +1062,64 @@ def test_an_approval_that_changes_more_than_server_written_fields_fails_the_edit
     fake.on_request = resolve_side_effect
     run.run()
     assert saved(run)["results"][3]["findings"] == ["approval_changed:/nodes/audit_copy/options/note"]
+
+
+def _pending_review_error(node_id: str, kind: str = "llm_prompt_template") -> dict[str, Any]:
+    # The shape the server's state carries while a prompt review card is open (measured on the candidate, gold attempt 2).
+    return {
+        "error_code": "interpretation_review_pending",
+        "component": node_id,
+        "message": f"{kind} review pending for transform '{node_id}': {kind}:{node_id}",
+    }
+
+
+def _card_opens_a_pending_error(fake: FakeDeployment, composer: FakeComposer, *, node_id: str = "classify", clear: bool = True) -> None:
+    """Turn 4 (the approve edit) opens a card whose pending-review error the resolve clears (unless ``clear`` is False)."""
+
+    def opens(state: State) -> None:
+        state["validation_errors"] = [_pending_review_error(node_id)]
+        state["is_valid"] = False
+
+    composer.extra = {4: opens}
+
+    def resolve_clears(method: str, path: str) -> None:
+        if clear and method == "POST" and path.endswith("/resolve"):
+            fake.sessions[SESSION].state["validation_errors"] = None
+            fake.sessions[SESSION].state["is_valid"] = True
+
+    fake.on_request = resolve_clears
+
+
+def test_an_edit_that_opens_the_card_it_approves_is_approved_first_then_judged(tmp_path: Path) -> None:
+    composer = FakeComposer()
+    run, fake, _ = make(tmp_path, composer)
+    _card_opens_a_pending_error(fake, composer)
+    run.run()
+    result = saved(run)["results"][3]
+    assert result["passed"] is True, result["findings"]
+    assert result["approvals"] == [{"event_id": "review-4", "kind": "llm_prompt_template", "node_id": "classify"}]
+
+
+def test_a_pending_card_the_approval_does_not_clear_still_fails_the_edit(tmp_path: Path) -> None:
+    composer = FakeComposer()
+    run, fake, _ = make(tmp_path, composer)
+    _card_opens_a_pending_error(fake, composer, clear=False)
+    run.run()
+    result = saved(run)["results"][3]
+    key = json.dumps(["interpretation_review_pending", "classify", _pending_review_error("classify")["message"]])
+    assert result["findings"] == ["after_approval:new_validation_error:" + key]
+
+
+def test_a_pending_review_on_a_node_the_edit_does_not_approve_fails_before_any_approval(tmp_path: Path) -> None:
+    composer = FakeComposer()
+    run, fake, _ = make(tmp_path, composer)
+    _card_opens_a_pending_error(fake, composer, node_id="audit_copy")
+    run.run()
+    result = saved(run)["results"][3]
+    key = json.dumps(["interpretation_review_pending", "audit_copy", _pending_review_error("audit_copy")["message"]])
+    assert result["findings"] == ["new_validation_error:" + key]
+    assert result["approvals"] == []
+    assert not [path for _, path in writes(fake) if path.endswith("/resolve")]
 
 
 def test_a_card_showing_other_text_than_the_node_is_never_approved(tmp_path: Path) -> None:

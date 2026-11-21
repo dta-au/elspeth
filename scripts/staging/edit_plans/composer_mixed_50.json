@@ -282,7 +282,8 @@
             "mode",
             "schema",
             "indent",
-            "encoding"
+            "encoding",
+            "collision_policy"
           ]
         },
         {
@@ -725,7 +726,8 @@
             "mode",
             "schema",
             "indent",
-            "encoding"
+            "encoding",
+            "collision_policy"
           ]
         },
         {

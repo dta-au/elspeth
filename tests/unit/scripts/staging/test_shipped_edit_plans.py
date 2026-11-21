@@ -354,3 +354,30 @@ def test_every_shipped_edit_names_its_tools_and_no_message_names_a_tool(plan_pat
     coverage = battery.plan_coverage(plan)
     for tool in ("upsert_edge", "remove_edge", "patch_source_options", "create_blob", "wire_blob_inline_ref", "wire_secret_ref"):
         assert tool in coverage["exercised"]
+
+
+@pytest.mark.parametrize("plan_path", [DEFAULT_PLAN, MIXED_PLAN])
+def test_every_new_output_edit_allows_the_collision_policy_set_output_requires(plan_path: Path) -> None:
+    outputs = [expectation for edit in load_plan(plan_path).edits for expectation in edit["expect"] if "new_output" in expectation]
+    assert outputs
+    assert all("collision_policy" in expectation["option_keys"] for expectation in outputs)
+
+
+def test_on_a_profile_bound_prompt_file_step_the_option_edits_are_skipped_and_gold_falls_short() -> None:
+    # The acceptance fixture binds every LLM step to an operator profile, which owns max_tokens and temperature.
+    plan = load_plan(DEFAULT_PLAN)
+    state, _ = graph(inline=False, optional_roles=False)
+    next(node for node in state["nodes"] if node["id"] == "score")["options"]["profile"] = "task-role"
+    edits = resolve_edits(plan, resolve_targets(plan, state, {}), state)
+    owned = [edit["id"] for edit in edits if "profile_owned" in edit]
+    assert owned == [
+        "max-tokens",
+        "temperature",
+        "restore-max-tokens",
+        "restore-temperature",
+        "max-tokens-2",
+        "temperature-2",
+        "restore-max-tokens-2",
+        "restore-temperature-2",
+    ]
+    assert sum(1 for edit in edits if edit["applicable"]) == 42 < battery.GOLD_MINIMUM_EDITS
