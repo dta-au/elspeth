@@ -182,8 +182,11 @@ class _RemoveByIdArgumentsModel(BaseModel):
 
 
 class _SetMetadataPatchModel(BaseModel):
+    # An omitted field is unchanged; read the supplied set with exclude_unset.
+    # name refuses null: PipelineMetadata.name is a non-optional str.
+    # description admits null, which clears it to the empty default.
     name: _OmittableString = None
-    description: _OmittableString = None
+    description: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -668,7 +671,11 @@ _SET_METADATA_DECLARATION = ToolDeclaration(
     name="set_metadata",
     handler=_handle_set_metadata,
     kind=ToolKind.MUTATION,
-    description="Update pipeline metadata (name and description only).",
+    description=(
+        "Update pipeline metadata (name and description only). Pass null or an empty string for description "
+        "to clear it; name cannot be cleared, only replaced. Result `changed_fields` lists the fields whose value changed. "
+        "When it is empty nothing changed, the version did not advance, and `message` says so."
+    ),
     json_schema={
         "type": "object",
         "properties": {
@@ -677,8 +684,8 @@ _SET_METADATA_DECLARATION = ToolDeclaration(
                 "description": "Partial metadata update. Only included fields are changed.",
                 "additionalProperties": False,
                 "properties": {
-                    "name": {"type": "string"},
-                    "description": {"type": "string"},
+                    "name": {"type": "string", "description": "Pipeline name. Cannot be cleared; a pipeline always has a name."},
+                    "description": {"type": ["string", "null"]},
                 },
             },
         },
@@ -2049,13 +2056,26 @@ def _execute_set_metadata(
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
-    """Update pipeline metadata."""
+    """Update pipeline metadata; the receipt names the fields whose value changed.
+
+    An omitted field is unchanged and a null description clears it to the
+    empty default. A patch that changes nothing returns the saved state, so no
+    version is written (the ``_execute_patch_source_options`` unchanged
+    pattern), and says so instead of reading as a fresh edit.
+    """
     del context  # unused; signature uniformity with the other handlers.
     validated = _validate_mutation_arguments(_SetMetadataArgumentsModel, args, "set_metadata arguments")
-    patch = validated.patch.model_dump(exclude_none=True)
+    supplied = validated.patch.model_dump(exclude_unset=True)
+    patch = {field: "" if value is None else value for field, value in supplied.items()}
+    current = {"name": state.metadata.name, "description": state.metadata.description}
+    changed_fields = [field for field in ("name", "description") if field in patch and patch[field] != current[field]]
+    if not changed_fields:
+        return _mutation_result(
+            state, (), data={"changed_fields": [], "message": "No field changed: the supplied values match the saved metadata."}
+        )
 
     new_state = state.with_metadata(patch)
-    return _mutation_result(new_state, ())
+    return _mutation_result(new_state, (), data={"changed_fields": changed_fields})
 
 
 def _node_routing_option_patch_error(patch: Mapping[str, Any], *, node_type: NodeType) -> str | None:

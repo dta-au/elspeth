@@ -726,7 +726,11 @@ class TestStep3MutationTierMigration:
     def test_set_metadata(self) -> None:
         assert self._get("set_metadata") == {
             "name": "set_metadata",
-            "description": "Update pipeline metadata (name and description only).",
+            "description": (
+                "Update pipeline metadata (name and description only). Pass null or an empty string for description "
+                "to clear it; name cannot be cleared, only replaced. Result `changed_fields` lists the fields whose "
+                "value changed. When it is empty nothing changed, the version did not advance, and `message` says so."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -735,8 +739,8 @@ class TestStep3MutationTierMigration:
                         "description": "Partial metadata update. Only included fields are changed.",
                         "additionalProperties": False,
                         "properties": {
-                            "name": {"type": "string"},
-                            "description": {"type": "string"},
+                            "name": {"type": "string", "description": "Pipeline name. Cannot be cleared; a pipeline always has a name."},
+                            "description": {"type": ["string", "null"]},
                         },
                     },
                 },

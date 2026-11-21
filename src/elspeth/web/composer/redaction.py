@@ -4005,11 +4005,11 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
                 argument_summarizers={"patch": _summarize_set_metadata_patch},
                 redact_unknown_argument_keys=True,
                 handles_no_sensitive_data=False,
-                # Shared ToolResult.to_dict() envelope. _execute_set_metadata
-                # currently calls _mutation_result without data, so data remains
-                # excluded while optional ToolResult augmentation keys stay
-                # centrally covered.
-                known_response_keys=_tool_result_response_keys(data=False),
+                # Shared ToolResult.to_dict() envelope plus the data receipt
+                # _execute_set_metadata emits: data={changed_fields} on a change,
+                # data={changed_fields, message} on a no-op. changed_fields holds
+                # only the closed field names; message is a fixed literal.
+                known_response_keys=_tool_result_response_keys(data=True),
             )
         ),
         "set_output": ToolRedaction(
