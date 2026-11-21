@@ -25,6 +25,8 @@ interface EditorStatus {
   keptLine?: true;
   /** Offer "Refresh pipeline": the graph read, never a save or page reload. */
   refreshPipeline?: true;
+  /** The file's first read failed; offer the same read again. */
+  retryLoad?: true;
 }
 
 interface PromptFileEditorProps {
@@ -74,6 +76,8 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
   // sent through the error channel.
   const [status, setStatus] = useState<EditorStatus | null>(null);
   const [saving, setSaving] = useState(false);
+  // Bumped by Retry after a failed first read: re-runs the same read below.
+  const [loadAttempt, setLoadAttempt] = useState(0);
   // A slot with unsaved text opens with it showing, wherever the editor remounts.
   const [expanded, setExpanded] = useState(() => draft !== undefined);
   // The seq of the last Edit request this editor took. It re-runs the focus
@@ -156,11 +160,11 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
           setSavedText(content);
         })
         .catch((failure: unknown) => {
-          if (readKeyRef.current === key) setStatus({ tone: "error", text: failure instanceof Error ? failure.message : "Could not load this prompt file." });
+          if (readKeyRef.current === key) setStatus({ tone: "error", retryLoad: true, text: failure instanceof Error ? failure.message : "Could not load this prompt file." });
         });
     }
     return () => { readKeyRef.current = null; };
-  }, [sessionId, nodeId, fieldPath, blobId]);
+  }, [sessionId, nodeId, fieldPath, blobId, loadAttempt]);
 
   // Read the current file again, keeping what is on screen until it arrives.
   // Unsaved text stays in the draft store, so a newer file turns it stale (the
@@ -312,7 +316,9 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
   const dirty = draft !== undefined;
   // Why Save is disabled when the server would not refuse: said in one line
   // under the buttons, so a greyed Save is never unexplained.
-  const hint = refusal !== null || text === null
+  const hint = refusal === null && status?.retryLoad === true
+    ? "The file did not load. Use Retry, then save."
+    : refusal !== null || text === null
     ? (loading ? "Loading the file…" : null)
     : stale
       ? "Choose what to do with your unsaved text above, then save."
@@ -419,6 +425,9 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
             <Button type="button" variant="ghost" compact onClick={retryRefresh}>Retry</Button>
           ) : status.refreshPipeline ? (
             <Button type="button" variant="ghost" compact onClick={() => void refreshPipeline()}>Refresh pipeline</Button>
+          ) : status.retryLoad ? (
+            // The same read the editor made when it opened; nothing is saved.
+            <Button type="button" variant="ghost" compact onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry</Button>
           ) : null}
         >
           {status.text}
