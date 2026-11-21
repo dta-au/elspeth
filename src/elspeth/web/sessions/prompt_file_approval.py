@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -29,6 +29,7 @@ from elspeth.web.sessions.models import (
     sessions_table,
 )
 from elspeth.web.sessions.prompt_file_review import (
+    PromptFileBinding,
     PromptFileReviewStale,
     PromptReviewSnapshot,
     _surface_slots,
@@ -322,6 +323,147 @@ def record_prompt_file_approval(
         trigger=request.trigger,
         approved_at=now,
     )
+
+
+def _require_ready_blob_row(conn: Connection, request: PromptFileApprovalRequest) -> None:
+    record = _blob_record(conn, request.session_id, request.blob_id)
+    if record.status != "ready" or record.content_hash != request.content_sha256:
+        raise PromptFileApprovalStale()
+
+
+def _require_marker_matches(marker: WidenedBlobRefShape, request: PromptFileApprovalRequest) -> None:
+    # ``marker`` is ``_binding_marker(options, request.field_path)``, already parsed.
+    if marker.blob_id != request.blob_id or marker.sha256 != request.content_sha256:
+        raise PromptFileApprovalStale()
+
+
+def _require_snapshot_binding(bindings_by_path: Mapping[str, PromptFileBinding], request: PromptFileApprovalRequest) -> None:
+    selected = bindings_by_path[request.field_path] if request.field_path in bindings_by_path else None
+    if selected is None or selected.blob_id != request.blob_id or selected.content_sha256 != request.content_sha256:
+        raise PromptFileApprovalStale()
+
+
+def record_prompt_file_card_approvals(
+    conn: Connection,
+    requests: Sequence[PromptFileApprovalRequest],
+    *,
+    now: datetime,
+    expected_event_id: UUID,
+) -> tuple[PromptFileApprovalRecord, ...]:
+    """Record one card's approvals for every file binding of its node, in one pass.
+
+    This writes the rows that calling :func:`record_prompt_file_approval` with
+    the CARD trigger once per request would write, in the same order, and
+    refuses wherever that loop refused, with the same error. It runs in the
+    caller's open transaction under the caller's session lock.
+
+    The first request runs every check of the per-binding writer in that
+    writer's order. The session owner, the node's options, the resolved
+    snapshot (every bound blob's row and bytes), the pending event and the
+    stored card snapshot are then reused for the remaining requests instead of
+    being read again: all requests share one session, node, actor and the
+    CARD trigger, the only statements between two requests are inserts into
+    ``prompt_file_approvals`` (which none of those checks read), and the
+    caller's session write lock keeps other writers out for the whole
+    transaction. Each request's own blob row, its marker in the options and
+    its binding in the snapshot are still checked per request. Re-resolving
+    the snapshot per binding made one card O(N^2) blob reads under the session
+    lock, long enough at a few hundred files to lose the operation's lease.
+
+    ``expected_event_id`` is the card being resolved; every row must name it,
+    checked after each insert exactly where the per-binding loop checked it.
+    """
+    if type(now) is not datetime or any(type(request) is not PromptFileApprovalRequest for request in requests):
+        raise TypeError("prompt-file approval requires an owned request and datetime")
+    if requests and any(
+        request.trigger is not PromptApprovalTrigger.CARD
+        or (request.session_id, request.node_id, request.actor_user_id)
+        != (requests[0].session_id, requests[0].node_id, requests[0].actor_user_id)
+        for request in requests
+    ):
+        raise TypeError("prompt-file card approvals must share one session, node and actor, with the CARD trigger")
+    if not requests:
+        return ()
+    # The first request: every check of the per-binding writer, in its order.
+    first = requests[0]
+    owner = conn.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == str(first.session_id))).scalar_one_or_none()
+    if owner != first.actor_user_id:
+        raise PromptFileApprovalStale()
+    _require_ready_blob_row(conn, first)
+    options = _current_node_options(conn, first)
+    _require_marker_matches(_binding_marker(options, first.field_path), first)
+    snapshot = _current_snapshot(conn, first, options)
+    bindings_by_path: dict[str, PromptFileBinding] = {}
+    for binding in snapshot.bindings:
+        # First match wins, as the per-binding writer's ``next(...)`` scan did.
+        if binding.field_path not in bindings_by_path:
+            bindings_by_path[binding.field_path] = binding
+    _require_snapshot_binding(bindings_by_path, first)
+    event = conn.execute(
+        select(interpretation_events_table.c.id)
+        .where(
+            interpretation_events_table.c.session_id == str(first.session_id),
+            interpretation_events_table.c.affected_node_id == first.node_id,
+            interpretation_events_table.c.kind == "llm_prompt_template",
+            interpretation_events_table.c.choice == "pending",
+        )
+        .order_by(interpretation_events_table.c.created_at.desc())
+        .limit(1)
+    ).one_or_none()
+    if event is None:
+        raise PromptFileApprovalStale()
+    stored = conn.execute(
+        select(prompt_review_snapshots_table.c.anchor, prompt_review_snapshots_table.c.snapshot_json).where(
+            prompt_review_snapshots_table.c.event_id == event.id,
+            prompt_review_snapshots_table.c.session_id == str(first.session_id),
+        )
+    ).one_or_none()
+    if stored is None or stored.anchor != snapshot.anchor or stable_hash(stored.snapshot_json) != stable_hash(snapshot.payload()):
+        raise PromptFileApprovalStale()
+    event_id = UUID(event.id)
+    records: list[PromptFileApprovalRecord] = []
+    for index, request in enumerate(requests):
+        if index > 0:
+            # Every later request: its own row, marker and snapshot entry, in the same order.
+            _require_ready_blob_row(conn, request)
+            _require_marker_matches(_binding_marker(options, request.field_path), request)
+            _require_snapshot_binding(bindings_by_path, request)
+        approval_id = uuid4()
+        conn.execute(
+            insert(prompt_file_approvals_table).values(
+                id=str(approval_id),
+                session_id=str(request.session_id),
+                node_id=request.node_id,
+                field_path=request.field_path,
+                blob_id=str(request.blob_id),
+                content_sha256=request.content_sha256,
+                review_anchor=snapshot.anchor,
+                effective_artifact_hash=snapshot.effective_artifact_hash,
+                event_id=str(event_id),
+                actor_user_id=request.actor_user_id,
+                trigger=request.trigger.value,
+                approved_at=now,
+            )
+        )
+        records.append(
+            PromptFileApprovalRecord(
+                id=approval_id,
+                session_id=request.session_id,
+                node_id=request.node_id,
+                field_path=request.field_path,
+                blob_id=request.blob_id,
+                content_sha256=request.content_sha256,
+                review_anchor=snapshot.anchor,
+                effective_artifact_hash=snapshot.effective_artifact_hash,
+                event_id=event_id,
+                actor_user_id=request.actor_user_id,
+                trigger=request.trigger,
+                approved_at=now,
+            )
+        )
+        if event_id != expected_event_id:
+            raise PromptFileApprovalStale()
+    return tuple(records)
 
 
 def assert_prompt_file_approvals(conn: Connection, snapshot: PromptReviewSnapshot) -> None:
