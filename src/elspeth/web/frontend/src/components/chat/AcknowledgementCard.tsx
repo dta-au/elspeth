@@ -89,6 +89,24 @@ const LEGEND_TEXT: Record<PromptSlotStatus, string> = {
   unknown: "Status not shown here — see its own card",
 };
 
+/**
+ * A legend entry. A slot whose approved definition cannot be shown has its
+ * own entry: it has no card of its own, and the gate note gives the reason.
+ * It shares the "unknown" swatch.
+ */
+type LegendKey = PromptSlotStatus | "not_shown";
+
+const LEGEND_KEYS: readonly LegendKey[] = ["accepted", "pending", "unknown", "not_shown"];
+
+const LEGEND_KEY_TEXT: Record<LegendKey, string> = {
+  ...LEGEND_TEXT,
+  not_shown: "Definition not shown: see the note above",
+};
+
+function slotViewLegendKey(view: PromptSlotView): LegendKey {
+  return view.kind === "not_shown" ? "not_shown" : slotViewStatus(view);
+}
+
 /** The status a slot view is tinted, keyed and announced with. */
 function slotViewStatus(view: PromptSlotView): PromptSlotStatus {
   if (view.kind === "definition") return "accepted";
@@ -519,8 +537,8 @@ export function AcknowledgementCard({
     promptReview.status === "ready"
       ? promptSlotViews(promptReview.display, promptReview.snapshot, event.affected_node_id, pendingEvents, resolvedEvents)
       : NO_SLOT_VIEWS;
-  const slotStatuses: PromptSlotStatus[] = slotViews.slots.map(slotViewStatus);
-  const promptHasSlot = slotStatuses.length > 0;
+  const legendKeys = new Set(slotViews.slots.map(slotViewLegendKey));
+  const promptHasSlot = slotViews.slots.length > 0;
   const promptHasDefinition = slotViews.slots.some((view) => view.kind === "definition");
   const promptHasOwnCardSlot = slotViews.slots.some((view) => view.kind === "own_card");
   const promptSlotsAllOwnCard = promptHasSlot && slotViews.slots.every((view) => view.kind === "own_card");
@@ -717,17 +735,15 @@ export function AcknowledgementCard({
                 in that state is present. */}
             {promptHasSlot && (
               <ul className="ack-card-prompt-legend">
-                {(["accepted", "pending", "unknown"] as const)
-                  .filter((status) => slotStatuses.includes(status))
-                  .map((status) => (
-                    <li key={status}>
-                      <span
-                        className={`ack-card-prompt-legend-swatch ack-card-prompt-slot--${status}`}
-                        aria-hidden="true"
-                      />
-                      {LEGEND_TEXT[status]}
-                    </li>
-                  ))}
+                {LEGEND_KEYS.filter((key) => legendKeys.has(key)).map((key) => (
+                  <li key={key}>
+                    <span
+                      className={`ack-card-prompt-legend-swatch ack-card-prompt-slot--${key === "not_shown" ? "unknown" : key}`}
+                      aria-hidden="true"
+                    />
+                    {LEGEND_KEY_TEXT[key]}
+                  </li>
+                ))}
               </ul>
             )}
             {/* Each prompt's heading, then the file it is read from (display

@@ -202,6 +202,10 @@ function notes(region: HTMLElement): string[] {
   return Array.from(region.querySelectorAll(".ack-card-prompt-pending-note")).map((note) => note.textContent ?? "");
 }
 
+function legend(region: HTMLElement): string[] {
+  return Array.from(region.querySelectorAll(".ack-card-prompt-legend li")).map((item) => item.textContent ?? "");
+}
+
 function approveButton(): HTMLElement {
   return screen.getByRole("button", { name: /approve the llm prompt template/i });
 }
@@ -415,6 +419,36 @@ describe("prompt card — fail closed on a slot naming an event", () => {
     const region = await openCard(surface);
     expect(slotTexts(region)).toEqual([notShown("audience")]);
     await expectFailClosed(RENDER_MISMATCH);
+  });
+});
+
+describe("prompt card — the legend for a definition that cannot be shown", () => {
+  const NOT_SHOWN_KEY = "Definition not shown: see the note above";
+  const UNKNOWN_KEY = "Status not shown here — see its own card";
+
+  it("keys a not-shown slot as such, not as a term with its own card", async () => {
+    setEvents([], []);
+    const region = await openCard(structuredSurface(["Write for ", { ref: "req-aud" }, "."], [AUD_REQ]));
+    expect(legend(region)).toEqual([NOT_SHOWN_KEY]);
+  });
+
+  it("keeps the unknown-status key only for a null-event slot whose status is unknown", async () => {
+    setEvents([], []);
+    const region = await openCard(structuredSurface(TWO_TERMS, [{ ...CAT_REQ, event_id: null }, AUD_REQ]));
+    expect(slotTexts(region)).toEqual([ownCard("category", "status not shown here"), notShown("audience")]);
+    expect(legend(region)).toEqual([UNKNOWN_KEY, NOT_SHOWN_KEY]);
+  });
+
+  it("beside a pending own-card term, keys pending and not shown", async () => {
+    setEvents([baseEvent({ id: "evt-cat-open", user_term: "category" })], []);
+    const region = await openCard(structuredSurface(TWO_TERMS, [{ ...CAT_REQ, event_id: null }, AUD_REQ]));
+    expect(legend(region)).toEqual(["Pending — awaiting its own review", NOT_SHOWN_KEY]);
+  });
+
+  it("a shown definition is keyed as accepted", async () => {
+    setEvents([], [AUDIENCE_EVENT]);
+    const region = await openCard(structuredSurface(["Write for ", { ref: "req-aud" }, "."], [AUD_REQ]));
+    expect(legend(region)).toEqual(["Accepted — its own review is approved"]);
   });
 });
 
