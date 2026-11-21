@@ -4,6 +4,334 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
+## 0.8.16 - 2026-11-21
+
+Web Composer fixes for large pipelines and prompts held in files, bounded
+advisor and prompt-guard requests, less redundant per-row engine work, and LLM
+gateway logging. The session epoch stays at 79 and the Landscape epoch at 51,
+so existing 0.8.15 session and Landscape stores open unchanged. The dated entry
+does not establish qualification, a published tag or an image.
+
+### Upgrade notes
+
+Schema and stored data:
+
+- No schema epoch changed and no stored data is migrated, reset or rewritten.
+  Session epoch 79 and Landscape epoch 51 are unchanged from the previous
+  release; this release adds no schema-epoch cutover, and no table is added or
+  altered. Existing 0.8.15 session and Landscape stores need no action, and
+  the 0.8.15 cutover guidance continues to apply to older stores. This
+  authorizes no migration, reset, restamping or downgrade.
+- **Upgrading from 0.8.14 or earlier: apply the 0.8.15 upgrade notes first.**
+- Context-budget records written from this release carry a different
+  `policy_hash` (the policy's schema string changed), and compose-loop records
+  may carry `over_estimate` and `max_prompt_tokens`. Records written by 0.8.15
+  still load.
+- Prompt-guard audit records are written at `schema_version` 2, with
+  `units_scanned` and `units_reused`. Version 1 records still load.
+
+Behaviour you will see:
+
+- **Long inline prompts belong in files.** A Composer edit that adds or changes
+  an inline LLM prompt (`system_prompt`, `prompt_template` or a query
+  `template`) holding more than 100 words or 1,000 characters of prose
+  (template tags are not counted) is refused with `inline_prompt_too_long`,
+  and the composer puts the text in a file instead. Existing long inline
+  prompts still validate and run, but the composer cannot change them in
+  place: copy the text (see the new Copy button) into a file and bind it.
+- **An inline prompt the template check refuses is now an error.** An inline
+  prompt over the size limit for one template, nested too deeply or holding a
+  number literal too long to read makes the pipeline invalid at authoring, with
+  an error on that step. It used to be valid with a warning that named only an
+  exception class.
+- **Size limits changed.** One prompt template may now be up to 64 KiB (was
+  16 KiB). A pipeline may hold up to 4 MiB of text in attached files (was
+  1 MiB), counting a file once for each place it is bound; each file is still
+  limited to 256 KiB. A file attached at a template position must fit the
+  64 KiB template limit. The resolved configuration of a run may hold up to
+  16 MiB of text, counted as text rather than as escaped YAML
+  (`resolved_pipeline_config_oversized`).
+- **YAML import refusals.** Importing YAML whose attached text is over a size
+  limit is refused with HTTP 413 `prompt_file_too_large` and nothing is
+  imported. An incomplete file marker is refused with 400
+  `malformed_inline_blob_content`, and a prompt file that cannot be verified
+  with 409 `import_prompt_file_unverified`. These cases used to fail with a
+  server error.
+- **Run start.** A run whose source, sink or retrieval step holds a file
+  reference where a local path belongs is refused with the usual 422
+  `pipeline_validation_failure` naming the step, instead of a 500.
+- **File list API.** `GET /api/sessions/{id}/blobs` now returns 100 files by
+  default (was 50); the maximum is still 500.
+- **Composer tools.** The composer offers 48 tools by default (was 47; adds
+  `report_composer_bug`). `list_transforms` is now a five-key selection index;
+  a plugin's configuration comes from `get_plugin_schema`, which gains
+  `usage_when_not_to_use`. `get_pipeline_state` gains four optional arguments
+  and bounds large reads. `patch_node_options` refuses a `queries` value that
+  leaves out an existing query. The duplicate-consumer repair suggestion
+  carries facts only. Clients or tests that pin these tool results must follow;
+  see Web Composer below.
+- **Requests that fit are sent.** A composer or first-turn planner request
+  under the configured request byte maximum is now always sent, with optional
+  context left out first, even when its token estimate is over
+  `composer_context_max_prompt_tokens`. A request the gateway or model rejects
+  as too long reaches the user as a size refusal, not as a provider outage.
+- **Advisor requests are bounded.** The advisor now sees earlier turns by age
+  within a fixed budget, and an advisor review whose estimate is over
+  `composer_context_max_prompt_tokens` is not sent; see Advisor below. The
+  stop assumes the advisor model's window is at least that setting.
+- **Prompt guard calls change shape.** The user prompt is inspected in its own
+  call, and text the guard service already allowed in the session is not sent
+  again, so the number of guard calls no longer grows with the conversation.
+- **New setting.** `ELSPETH_WEB__COMPOSER_VALIDATION_REUSE_ENABLED` (default
+  `true`) lets the composer reuse validation results within one compose call.
+  Set it to `false` and restart to turn reuse off.
+- **Readiness.** `/api/ready` still checks every database connection on every
+  probe, but runs the schema check at most once every 60 seconds.
+- **LLM gateway logs.** The gateway container now writes its log events to
+  stderr unless the `elspeth_llm_gateway` logger is already configured, and the
+  `completion` event carries token counts.
+- **LLM audit view.** `GET /api/sessions/{id}/messages?include_llm_audit=true`
+  now also returns end-of-turn advisor review rows; see Advisor below.
+
+### Web Composer: prompts and files
+
+- Binding a file to a step's `prompt_template` with `wire_blob_inline_ref`
+  now replaces whatever prompt was there, including a structured prompt with
+  defined terms. The old prompt's term reviews are superseded and the file gets
+  its own review. This replaces the 0.8.15 statement that a structured prompt
+  could not be switched to a file. Writing a file marker directly onto a
+  structured prompt by any other route is still refused, and the refusal now
+  names `wire_blob_inline_ref` as the call that does it. When asked to replace
+  A with B, the composer no longer asks whether to keep A's approvals.
+- A structured prompt can be replaced with new plain text: send
+  `prompt_template` with `prompt_template_parts: null` through
+  `patch_node_options`, `upsert_node` or `set_pipeline`. The old parts and term
+  reviews are removed and listed in `superseded_review_ids`, and the new text
+  gets its own review card. A step re-sent with its own prompt text keeps its
+  structure, term definitions and approvals, and the result names it in
+  `prompt_unchanged_node_ids`.
+- A `patch_node_options` change whose `queries` value leaves out a query the
+  node already has is refused with `queries_patch_omits_existing`, naming every
+  omitted query, instead of silently deleting them. Send every query to change
+  one, or send the whole node with `upsert_node` to remove one;
+  `queries: null` still removes every query. A patch that also replaces the
+  prompt is refused whole.
+- A step that reads an attached file keeps its authoring guarantees. A
+  file-backed LLM prompt (before and after its review is approved), a
+  `file_inject` entry held in a file, and steps that take their settings from
+  an operator profile no longer cause every later step to be refused with
+  "Producer guarantees: (none)". Such a step is reported with a
+  `contract_probe_deferred` notice naming it and the fields it adds, and its
+  contract is checked on the file's bytes before the run starts. A field that
+  an attached file could add is left to that check; a field nothing in the
+  pipeline could supply is still an error, and the source data-contract review
+  is offered for it. An output that needs such a field is refused at authoring
+  as its inline twin is, instead of being shown as valid and then refused by
+  the run.
+- An attached file placed where a local file path belongs (a source or sink
+  path, or a retrieval step's persist directory) is refused when the pipeline
+  is edited, with a message naming the step and option.
+- Opening a saved pipeline in which a batch step declares input fields reports
+  the problem instead of failing.
+- Template refusals are typed and name their position. A prompt over the
+  template limit, nested too deeply or holding a number literal too long to
+  read is refused with a message naming the step and option (and, for size,
+  the size and the limit), never quoting the text. This applies to inline
+  prompts, prompt files, query templates and the LLM source. Attaching a file
+  over the template limit at a template position is refused at once. Saving a
+  prompt file, or making a substring edit, that would take a template over the
+  limit is refused with the size and the limit. A saved pipeline holding
+  template text the engine refuses now opens and reports the step; it used to
+  fail to open, and a turn on it failed with an unexplained error.
+- A pipeline refused for the total size of its file-held text says the total,
+  the limit and the number of file bindings, and the composer is told which
+  limit applied and to shorten the named files, not that session storage ran
+  out.
+- Web validation judges a pipeline's size by its text, so prompt files in any
+  language validate up to the file-text limit. Preflight no longer re-reads
+  file-held prompt text through YAML.
+- YAML import: re-importing your own export, or importing YAML whose source is
+  bound without a `mode`, no longer hides the session's prompt files or fails
+  with a server error. Import refusals name the whole field path (at most five,
+  then a count of the rest) and, for a file that cannot be verified, the
+  step's file-backed prompt fields.
+- `set_pipeline` accepts an `inline_blob` at a prompt field and stores it as a
+  prompt file; an exact retry reuses the stored file.
+- Under explicit approval, a response carrying several pipeline changes is
+  refused with guidance to send the first change alone and each next one after
+  the user accepts the one before, instead of rebuilding the whole pipeline in
+  one `set_pipeline` call. A pipeline between approved changes does not have to
+  validate; expect one approval per change, with intermediate versions that may
+  show errors. Creating a prompt file with `create_blob` comes first, in an
+  earlier response.
+- The composer edits an existing pipeline with the narrow tools and sends a
+  whole `set_pipeline` only for a pipeline of five nodes or fewer, or when no
+  narrow tool can express the change. A failed call is retried as the same
+  call. Tool descriptions list every review term the model can author, and a
+  validation entry's `error_code` is documented as optional.
+- After a refused edit, the next successful edit reports only the errors and
+  warnings that edit added or fixed. It no longer lists the refusal as
+  resolved, or every standing finding as new after a refused full replacement.
+- The duplicate-consumer validation error names every step reading the
+  connection, not only the first two. Its repair suggestion now states only the
+  connection and the ids of the steps reading it, with no ready tool calls or
+  whole nodes, and says to change only the input bindings and keep each step's
+  options; the composer builds the fork itself.
+- `list_transforms` returns, per transform, only `name`, `description`,
+  `capability_tags`, `web_config_authority` and `policy_capabilities`, plus the
+  prohibited list and `details_tool`. `get_plugin_schema` returns a plugin's
+  options and now its `usage_when_not_to_use` text.
+- `get_pipeline_state` gains `field_path`, `offset_chars`, `expected_sha256`
+  and `since_start`. It can return the net changes since the turn began, and a
+  large read becomes a structural overview: single values are read by
+  `field_path`, and long values come in pages tied to a content hash. A stale
+  or missing hash is refused. A read is bounded at 32,768 bytes.
+- `list_blobs` and `list_composer_blobs` still show the 50 newest files, and
+  now say when more exist (a `post_call_hints` entry starting
+  `Incomplete list:`) so the model does not treat an unlisted file as missing.
+- A successful `get_blob_content` or `read_attachment` result no longer
+  carries the pipeline's validation block, so standing validation findings no
+  longer stop a prompt file from being read.
+- New tool `report_composer_bug` records a suspected mismatch between the
+  composer's guidance and a tool's behaviour. Each report is one session JSON
+  file (UTF-8, at most 16,384 bytes; at most 20 per session, freed by deleting
+  one) marked suspected and unverified, and the call changes nothing else. It
+  runs immediately in approval mode, like `create_blob`.
+
+### Web UI
+
+- A Copy button beside each inline prompt (system prompt, prompt template and
+  each query template) in the node inspector, the specification view and the
+  prompt review card copies the exact stored text, so a long inline prompt can
+  be moved into a file.
+- The prompt editor opens, edits and saves each file on a step with several
+  prompt files. Saving one keeps the step's other prompt files approved. It
+  opens inside the row of the prompt it edits, follows a file that changes
+  while open, and keeps unsaved text when you select another step or the
+  editor closes ("Your unsaved text is kept").
+- The prompt review card names each prompt's file under its own heading, and
+  no longer says the LLM wrote the instruction when the whole prompt is a file
+  a user supplied.
+- The file list loads every file in the session (up to 10,000), not only the
+  newest 50, so older prompt files no longer read as "not in this session".
+- The Workflow panel gains a Files section listing each session file with the
+  steps and fields that use it, with Show node and Edit file actions and a
+  "Filter by file or step" box. The file manager gains a wiring pad that sends
+  your chosen prompt connections to the composer as an ordinary chat request,
+  and can filter files.
+- The inspector names a source or sink step's file.
+- Hide or show the conversation from the left end of the title bars, or with
+  Ctrl+\.
+
+### Large pipelines and performance
+
+- The composer's size estimate prices every byte at the shipped rate
+  (3 bytes per token, or the provider's measured density when that is
+  denser), so a large pipeline keeps its conversation history when it fits.
+  Content already left out of a request can be left out again in the same
+  call, so a request that fits without it is no longer refused or stopped with
+  an internal error.
+- A provider "input is too long" rejection is recognised even when the gateway
+  reports it under a generic or unfamiliar error code, and reaches the user as
+  a size refusal. The provider's own reason is still shown only when
+  `composer_expose_provider_errors` is on, and the call record keeps the closed
+  reason `context_length_exceeded` without provider text.
+- When an earlier tool result is replaced by its omission stub, the private
+  record of the request sent is kept, showing the stub as sent, and the context
+  estimate follows the latest call.
+- Within one compose call, validation of an unchanged pipeline is not repeated:
+  the runtime preflight and the policy view's authoring check are reused until
+  the pipeline, a referenced file, the secret inventory or a resolved path
+  changes. A state whose own options wire a secret reference is never reused.
+  Run admission always validates afresh. The reuse reads all attached files'
+  records in one database transaction.
+- Preflight parses the rendered pipeline YAML once instead of three times.
+- Template checks cache their results across a whole validation walk, and the
+  caches are bounded at 128 MiB in total per process, so long-running servers
+  no longer grow memory without bound.
+
+### Advisor
+
+- Advisor requests no longer grow with the session. The advisor sees this
+  turn whole, the previous three turns as the request and the reply shown, and
+  older turns as the request only, newest first, within 8,000 tokens; an older
+  request over 2,000 characters is shortened to its first 1,500 and last 500.
+  The request states exactly what it leaves out. A review whose size estimate,
+  based on a real earlier call, is over `composer_context_max_prompt_tokens`
+  is not sent and says so with the estimate and the limit.
+- The advisor is told plainly when a prompt is held in a file: the file's name,
+  size and who wrote it. A file you wrote is not sent to the advisor; a file
+  written by the composer, produced by a pipeline, imported from a shared link
+  or copied by a session fork is sent and reviewed like an inline prompt. A
+  valid file-held prompt is no longer described as invalid.
+- The advisor reviews against the user's request and binding contracts, not
+  against earlier assistant choices, but counts a proposal the user explicitly
+  accepted as a requirement. A finding that does not apply can be answered with
+  evidence, written for the user, instead of an edit.
+- A newly flagged pipeline keeps its remaining review. The extra review round
+  runs only when the turn changed the pipeline; if that round fails or its
+  reply is withheld, the reply the first pass admitted is published, provided
+  the pipeline and the session's files are unchanged since then.
+- `GET /api/sessions/{id}/messages?include_llm_audit=true` also returns
+  end-of-turn advisor review rows with `phase`, `pass_index`, `verdict`,
+  `source`, `provider_attempts` and `publication_verdict`. The response header
+  `X-Elspeth-End-Review-Rows-Omitted` gives the number of stored rows left out
+  because they did not parse.
+
+### Prompt guard
+
+- Within a session, text the guard service has already allowed is not sent to
+  it again; only new text is inspected, and the user prompt in its own call.
+  Guard calls per turn no longer grow with the conversation. Reuse is keyed on
+  the session, policy, mode, role, slot and the exact text; only a complete
+  allow is reused, and a refusal, timeout or error never is. The record of
+  allowed text holds digests only, lives in the web process that made the
+  check (at most 20,000 units per guard), and is lost on restart. With several
+  web workers, a unit of text is scanned once per process. Each guard audit
+  record states how many units it scanned and how many it reused
+  (`schema_version` 2). One deadline still covers the whole check.
+
+### Engine
+
+- Less redundant per-row work on the sink and gate paths, with no change to
+  stored audit records, outputs or refusals. The sink executor no longer
+  computes a sink-effect identity that the reservation recomputes;
+  finalization members are copied only when recovery rebinds their ordinal and
+  their output data is frozen once; gates hand their input token on instead of
+  copying it.
+
+### Operations and LLM gateway
+
+- LLM gateway: its metadata-only log events reach the container's stderr, one
+  JSON line each, unless the operator configured the `elspeth_llm_gateway`
+  logger. Two new events: `upstream_result` (status class and code) and
+  `response_validation_rejected` (stage and a closed category; exception text
+  is never logged). The `completion` event logs `prompt_tokens`,
+  `completion_tokens` and `total_tokens` when the response reports them as
+  non-negative integers, never content; this is a recorded exception to the
+  logging policy because the gateway has no audit store of its own.
+- `/api/ready` checks database connectivity on every probe and the schema
+  against the current models on the first probe and then at most once every
+  60 seconds, reporting the last `CURRENT` result between checks. A result
+  that is not `CURRENT` is never reused, and a probe that cannot connect makes
+  the next probe check the schema again.
+
+### Tooling
+
+- New operator tools for acceptance runs against a deployment: a Composer
+  edit battery (a planned run of small edits, each judged on its own, with
+  50-edit plans and a structural add/swap/remove cycle around an LLM step), a
+  generator for a wired-up large-graph fixture and its setup through the real
+  routes, a real-graph battery, a copied-session prompt-review repair tool, a
+  direct Bedrock streaming canary and a recovery-set capture. Each records
+  sanitised per-call usage and timing. See
+  `docs/runbooks/composer-edit-battery.md`.
+
+Automatic image publication from main remains held. The 0.8.16 tag and
+container publication follow successful required checks and the protected
+merge. Operator signing, live-provider acceptance and deployment remain
+separate steps.
+
 ## 0.8.15 - 2026-11-17
 
 Executor hot-path fixes, Web Composer fixes and a release-pipeline repair.

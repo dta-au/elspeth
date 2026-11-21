@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.14+](https://img.shields.io/badge/python-3.14+-blue.svg)](https://www.python.org/downloads/)
-![Status: 0.8.15](https://img.shields.io/badge/status-0.8.15-green.svg)
+![Status: 0.8.16](https://img.shields.io/badge/status-0.8.16-green.svg)
 
 ELSPETH builds, validates, runs, and audits data and LLM workflows whose
 outputs need to be reviewed and explained. You can author a pipeline in
@@ -100,31 +100,49 @@ ELSPETH supports audit export and optional signing. The
 [export settings and limits](docs/reference/configuration.md#export-settings)
 describe what is exported and how to configure it.
 
-## What changed in 0.8.15
+## What changed in 0.8.16
 
-0.8.15 carries executor hot-path fixes, Web Composer fixes and a
-release-pipeline repair. See the [release notes](CHANGELOG.md), which also
-record earlier releases. It supersedes 0.8.14, which was tagged but never
-published as a release or version-tagged image, so the 0.8.14 changes below
-ship for the first time here: upgrading from 0.8.13 or earlier means moving to
-Python 3.14, and the 0.8.14 upgrade actions apply.
+0.8.16 carries Web Composer fixes for large pipelines and for prompts held in
+files, bounded advisor and prompt-guard requests, and less redundant per-row
+engine work. See the [release notes](CHANGELOG.md), which also record earlier
+releases.
 
-A run interrupted before upgrading cannot be resumed after it; finish or re-run
-interrupted runs first. Session epoch 79 replaces session epoch 78 and
-Landscape epoch 51 replaces epoch 50: file-backed LLM prompts are reviewed,
-admitted only on the approved bytes, and the run records the hash of the prompt
-file it read. The session store adds `prompt_review_snapshots` and
-`prompt_file_approvals`, and the Landscape store adds `run_prompt_inputs`; the
-tables are additive. Preserve epoch 78 session stores and epoch 50 Landscape
+Long inline prompts belong in files: a Composer edit that adds or changes an
+inline LLM prompt over 100 words or 1,000 characters is refused, and the
+composer puts the text in a file instead. One prompt template may hold up to
+64 KiB and a pipeline up to 4 MiB of text in attached files. A composer request
+that fits the configured request size is always sent, and advisor and
+prompt-guard requests no longer grow with the session.
+
+Session epoch 79 and Landscape epoch 51 are unchanged from 0.8.15; this release
+adds no schema-epoch cutover, and existing 0.8.15 session and Landscape stores
+need no action. Upgrading from 0.8.14 or earlier means applying the 0.8.15
+upgrade notes first: preserve epoch 78 session stores and epoch 50 Landscape
 stores, which startup refuses to open; use a separately provisioned epoch 79
 session store and epoch 51 Landscape store, and keep old workers isolated from
 the new stores. The 0.8.10 cutover guidance below continues to apply to older
 stores. Backwards compatibility is permitted and considered from 0.8.5 within
 explicitly supported boundaries.
 This release authorizes no in-place migration, reset or downgrade. Package
-metadata is 0.8.15; the package version alone does not establish qualification
+metadata is 0.8.16; the package version alone does not establish qualification
 or image publication. Automatic image publication from main is held; verify
 the release tag and image digest before installing a published image.
+
+## Previously in 0.8.15
+
+0.8.15 carried executor hot-path fixes, Web Composer fixes and a
+release-pipeline repair. It superseded 0.8.14, which was tagged but never
+published as a release or version-tagged image, so the 0.8.14 changes below
+shipped for the first time there: upgrading from 0.8.13 or earlier means moving
+to Python 3.14, and the 0.8.14 upgrade actions apply.
+
+A run interrupted before upgrading to 0.8.15 cannot be resumed after it; finish
+or re-run interrupted runs first. Session epoch 79 replaced session epoch 78
+and Landscape epoch 51 replaced epoch 50: file-backed LLM prompts are reviewed,
+admitted only on the approved bytes, and the run records the hash of the prompt
+file it read. The session store added `prompt_review_snapshots` and
+`prompt_file_approvals`, and the Landscape store added `run_prompt_inputs`; the
+tables are additive.
 
 ## Previously in 0.8.14
 
