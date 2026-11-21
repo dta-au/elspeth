@@ -358,6 +358,26 @@ def test_new_validation_errors_are_counted_by_occurrence() -> None:
     assert len(edit_plan.new_validation_errors(before, after)) == 1
 
 
+def test_a_validation_error_respelt_with_its_component_kind_is_not_new() -> None:
+    # Gold attempt 3, edits 22-25: the server named the same pending-review error's component "cs1_scoring" in one
+    # read and "node:cs1_scoring" in the next; that is one error, not a new one.
+    message = "pipeline_decision review pending for transform 'cs1_scoring': prompt_injection_shield_recommendation"
+    bare = graph()
+    bare["validation_errors"] = [
+        {"error_code": "interpretation_review_pending", "component": "cs1_scoring", "message": message},
+        {"error_code": "sink_failed", "component": "out", "message": "m"},
+    ]
+    prefixed = copy.deepcopy(bare)
+    prefixed["validation_errors"][0]["component"] = "node:cs1_scoring"
+    prefixed["validation_errors"][1]["component"] = "output:out"
+    assert edit_plan.new_validation_errors(bare, prefixed) == []
+    assert edit_plan.new_validation_errors(prefixed, bare) == []
+    # A different component, or the same message on another step, is still new.
+    other = copy.deepcopy(prefixed)
+    other["validation_errors"][0]["component"] = "node:cs2_scoring"
+    assert len(edit_plan.new_validation_errors(bare, other)) == 1
+
+
 def test_tool_findings_need_an_acceptable_tool_and_flag_a_forbidden_one_called_and_not_rejected() -> None:
     edit = {"tools_any": ["change_substring"], "tools_all": []}
     used = {"tool_outcomes": {"change_substring": {"applied": 1}}}
