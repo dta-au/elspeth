@@ -53,4 +53,20 @@ def test_advisor_completion_budget_default_fits_thinking() -> None:
     """Anthropic thinking budgets have a 1024-token floor that must fit
     INSIDE max_tokens; the old 1500 default left medium-effort advisor
     calls with an illegal or starved thinking budget."""
-    assert _settings().composer_advisor_max_completion_tokens == 8192
+    assert _settings().composer_advisor_max_completion_tokens >= 1024
+
+
+def test_advisor_reply_cap_and_timeout_defaults_fit_a_full_build_review() -> None:
+    """A checkpoint reviews a whole build and its reasoning shares the reply
+    cap: at 8192, 16 of 61 battery calls stopped at the cap before a verdict.
+    The timeout rises with the cap so a longer reply has time to arrive."""
+    settings = _settings()
+    assert settings.composer_advisor_max_completion_tokens == 16_384
+    assert settings.composer_advisor_timeout_seconds == 180.0
+
+
+def test_explicit_advisor_reply_cap_and_timeout_are_kept() -> None:
+    """An operator's explicit setting is not replaced by the new defaults."""
+    settings = _settings(composer_advisor_max_completion_tokens=8192, composer_advisor_timeout_seconds=60.0)
+    assert settings.composer_advisor_max_completion_tokens == 8192
+    assert settings.composer_advisor_timeout_seconds == 60.0

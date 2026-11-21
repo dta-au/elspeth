@@ -523,11 +523,18 @@ class WebSettings(BaseModel):
             "This is not a measured provider-token or context-window limit."
         ),
     )
-    # 8192 (was 1500): with advisor reasoning enabled the thinking budget
-    # shares max_tokens, and Anthropic thinking has a 1024-token floor that
-    # must fit inside it — 1500 left medium effort illegal or starved.
-    composer_advisor_max_completion_tokens: int = Field(default=8192, ge=1)
-    composer_advisor_timeout_seconds: float = Field(default=60.0, gt=0)
+    # The advisor's EARLY/END checkpoint reviews a whole build: the saved
+    # graph, the turn's evidence and any pending reviews. Reasoning tokens are
+    # drawn from the same completion cap as the verdict, so a reply that
+    # reasons at length can stop at the cap (finish_reason "length") before
+    # it states a verdict. 8192 did that on 16 of 61 calls on graphs with
+    # pending reviews (0.8.16 battery, medium effort), hence 16384. The
+    # timeout is raised with it (60 -> 180 s) so a longer reply has time to
+    # arrive; each call still waits at most min(this, turn time left). A
+    # value above the model's own output limit may be refused by the
+    # provider, and startup cannot detect that.
+    composer_advisor_max_completion_tokens: int = Field(default=16_384, ge=1)
+    composer_advisor_timeout_seconds: float = Field(default=180.0, gt=0)
     # Phase 5b Task 5 — interpretation-event rate limits (F-30/F-31).
     #
     # Both limits are read at compose-loop initialisation and passed to
