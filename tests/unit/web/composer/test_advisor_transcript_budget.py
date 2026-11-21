@@ -1,9 +1,12 @@
-"""The Advisor sees earlier turns by age, on every request, and stops only at the declared limit.
+"""The Advisor sees earlier turns by age, on every request, and every request is sent.
 
 This turn goes whole. The previous three turns go as the user's request and
 the reply the user was shown; older turns as the request only, newest first,
 within a fixed run. The request is priced from a real call when one exists;
-only then can a checkpoint be stopped at ``composer_context_max_prompt_tokens``.
+only then does an estimate over ``composer_context_max_prompt_tokens`` leave
+more earlier turns out. A request still over it with nothing left to leave
+out is sent and records that it went over its estimate; the provider judges
+its own limit.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ from elspeth.web.composer.provider_quota import admit_provider_attempt
 from elspeth.web.composer.withheld_replies import withheld_reply_envelope
 from elspeth.web.config import WebSettings
 from elspeth.web.sessions.protocol import ChatMessageRecord
+from tests.unit.web.composer import test_advisor_checkpoint as checkpoint_fixtures
 
 _SKILL = "Stable composer skill prefix.\n" * 40
 _ADVISOR_MODEL = "openai/gpt-4.1"
@@ -47,6 +51,10 @@ _REPLIES_GAP = "older_turn_replies_not_shown"
 _SHORTENED_GAP = "older_requests_shortened_in_the_middle"
 _NOT_SHOWN_GAP = "oldest_turns_not_shown"
 _STOP_DETAIL = "The reply was withheld because the completion review could not run within the existing request limits."
+
+# The END-gate harness of the checkpoint suite.
+make_service = checkpoint_fixtures.make_service
+simple_state = checkpoint_fixtures.simple_state
 
 
 @pytest.fixture(autouse=True)
@@ -654,6 +662,7 @@ async def test_the_estimate_uses_the_call_records_byte_measure_and_is_sent(tmp_p
         "estimated_prompt_tokens": len(system.encode()) + len(priced_user.encode()),
         "estimate_source": "advisor_call",
         "declared_limit_tokens": 200_000,
+        "over_estimate": False,
     }
     # The call record measures the sent request the same way; the size record is the only difference.
     split = recorder.llm_calls[0].request_byte_split
@@ -661,7 +670,7 @@ async def test_the_estimate_uses_the_call_records_byte_measure_and_is_sent(tmp_p
     assert recorder.llm_calls[0].context_budget is None
 
 
-# --- shrinking and the stop -------------------------------------------------------
+# --- shrinking, then sending over the estimate ------------------------------------
 
 
 def _priced_bytes(owner: AdvisorCheckpointOwner, transcript: AdvisorVisibleTranscript, **left_out: int) -> int:
@@ -708,6 +717,7 @@ async def test_a_cold_start_always_sends(tmp_path: Path, monkeypatch: pytest.Mon
     assert _labels(payload) == _older(0, 4) + _whole(5, 7) + _NOW
     size = _counts(payload)["request_size"]
     assert (size["estimate_source"], size["declared_limit_tokens"]) == ("fallback", 1) and size["estimated_prompt_tokens"] > 1
+    assert size["over_estimate"] is True
 
 
 @pytest.mark.asyncio
@@ -730,11 +740,22 @@ def _review(transcript: AdvisorVisibleTranscript) -> Any:
     )
 
 
+_NOT_SENT = "not sent"
+
+
+def _over_estimate_size(size: dict[str, Any], *, source: str, limit: int) -> int:
+    """The record of a request sent over its estimate: the estimate, its source, the limit and the flag."""
+    assert set(size) == {"estimated_prompt_tokens", "estimate_source", "declared_limit_tokens", "over_estimate"}
+    assert (size["estimate_source"], size["declared_limit_tokens"], size["over_estimate"]) == (source, limit, True)
+    tokens: int = size["estimated_prompt_tokens"]
+    assert tokens > limit
+    return tokens
+
+
 @pytest.mark.asyncio
-async def test_an_anchored_checkpoint_over_the_limit_is_stopped_before_any_provider_call(
+async def test_an_anchored_checkpoint_still_over_the_limit_with_every_earlier_turn_left_out_is_sent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from elspeth.web.composer import advisor_policy
     from tests.unit.web.composer._helpers import _empty_state
 
     _require_age_api()
@@ -743,24 +764,151 @@ async def test_an_anchored_checkpoint_over_the_limit_is_stopped_before_any_provi
     verdict = await _owner(tmp_path, window=1_000)._run_advisor_checkpoint(
         phase="end", state=_empty_state(), session_id=None, recorder=recorder, publication_review=_review(_anchored_probe(8))
     )
-    assert requests == [] and len(recorder.llm_calls) == 0
-    assert (verdict.ok, verdict.blocking, verdict.failure_class, verdict.retryable) == (False, False, "budget_exhausted", False)
-    assert "estimated at " in verdict.findings_text
-    tokens = int(verdict.findings_text.split("estimated at ", 1)[1].split(" ", 1)[0].replace(",", ""))
-    assert tokens > 1_000
-    assert verdict.findings_text == (
-        f"The review request was not sent: it is estimated at {tokens:,} prompt tokens, over the declared limit of 1,000 "
-        "(composer_context_max_prompt_tokens). Earlier conversation was already left out of it; what remains is the "
-        "pipeline's own content and this turn's evidence."
+    # The estimate decides what is left out, never whether the request goes.
+    assert len(requests) == 1 and len(recorder.llm_calls) == 1
+    assert (verdict.ok, verdict.blocking, verdict.failure_class) == (True, False, "none")
+    sent = requests[0]["messages"][1]["content"]
+    payload = _sent_transcript(sent)
+    assert _labels(payload) == _NOW and _counts(payload)["not_shown"] == 8
+    _over_estimate_size(_counts(payload)["request_size"], source="advisor_call", limit=1_000)
+    assert _NOT_SENT not in sent and _NOT_SENT not in verdict.findings_text
+
+
+@pytest.mark.asyncio
+async def test_a_first_turn_checkpoint_over_the_limit_is_sent_and_records_its_estimate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.unit.web.composer._helpers import _empty_state
+
+    _require_age_api()
+    requests = _transport(monkeypatch)
+    recorder = BufferingRecorder()
+    # This turn's budgeted composer call prices the request at one token per byte.
+    recorder.record_llm_call(_call(_COMPOSER_MODEL, request_chars=40_000, prompt_tokens=40_000, tools=True, budgeted=True))
+    verdict = await _owner(tmp_path, window=1_000)._run_advisor_checkpoint(
+        phase="end", state=_empty_state(), session_id=None, recorder=recorder, publication_review=_review(_probe(0))
     )
-    detail, suggestion = advisor_policy.advisor_signoff_blocked_wording(reason="budget_exhausted", findings=verdict.findings_text)
-    assert detail == _STOP_DETAIL + " " + verdict.findings_text
-    assert suggestion == "Saved draft progress remains available; continue in a new message."
-    # The planner-budget stop keeps its existing wording.
-    detail, _ = advisor_policy.advisor_signoff_blocked_wording(
+    assert len(requests) == 1 and verdict.failure_class == "none"
+    sent = requests[0]["messages"][1]["content"]
+    payload = _sent_transcript(sent)
+    # No earlier turn: the complete transcript goes, and it carries the same record at its top level.
+    assert _COMPLETE_HEADER in sent and "earlier_turns_shown_by_age" not in payload
+    assert _labels(payload) == _NOW
+    _over_estimate_size(payload["request_size"], source="composer_ratio", limit=1_000)
+    assert _NOT_SENT not in sent
+
+
+@pytest.mark.asyncio
+async def test_a_provider_rejection_of_a_request_over_its_estimate_is_an_ordinary_request_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.exceptions import BadRequestError
+
+    from tests.unit.web.composer._helpers import _empty_state
+
+    _require_age_api()
+    sent: list[dict[str, Any]] = []
+
+    async def rejected(**kwargs: Any) -> None:
+        await admit_provider_attempt(model=kwargs["model"])
+        sent.append(copy.deepcopy(kwargs))
+        raise BadRequestError(
+            "PRIVATE_PROVIDER_BODY", model=kwargs["model"], llm_provider="openai", body={"code": "context_length_exceeded"}
+        )
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", rejected)
+    recorder = BufferingRecorder()
+    verdict = await _owner(tmp_path, window=1_000)._run_advisor_checkpoint(
+        phase="end", state=_empty_state(), session_id=None, recorder=recorder, publication_review=_review(_anchored_probe(8))
+    )
+    # Sent once over its estimate; the rejection is the provider's own, and an unchanged request is not repeated.
+    assert len(sent) == 1
+    _over_estimate_size(_counts(_sent_transcript(sent[0]["messages"][1]["content"]))["request_size"], source="advisor_call", limit=1_000)
+    assert [(call.error_class, call.error_message) for call in recorder.llm_calls] == [("BadRequestError", "context_length_exceeded")]
+    assert (verdict.ok, verdict.blocking, verdict.failure_class, verdict.retryable) == (False, False, "request_rejected", False)
+    assert verdict.provider_failure is not None
+    assert verdict.provider_failure.details.reason_code == "context_length_exceeded"
+    assert verdict.findings_text == verdict.provider_failure.details.explanation
+    assert _NOT_SENT not in verdict.findings_text
+
+
+@pytest.mark.asyncio
+async def test_an_editing_turn_over_its_estimate_sends_the_review_and_publishes_the_admitted_reply(
+    monkeypatch: pytest.MonkeyPatch, make_service: Any, simple_state: Any
+) -> None:
+    from dataclasses import replace
+
+    from elspeth.web.composer.turn_effects import TurnEvidence, authored_state_hash
+
+    # A declared setting far below what this turn's own composer call prices the review at.
+    service = make_service(composer_context_max_prompt_tokens=1_000)
+    requests = _transport(monkeypatch)
+    recorder = BufferingRecorder()
+    recorder.record_llm_call(_call(_COMPOSER_MODEL, request_chars=40_000, prompt_tokens=40_000, tools=True, budgeted=True))
+    state = simple_state
+    session_id = str(uuid4())
+    context = checkpoint_fixtures._compose_context(session_id)
+    reply = "Renamed the scoring step."
+    request = "Rename the scoring step."
+    evidence = TurnEvidence(
+        session_id=session_id,
+        session_operation_context=context,
+        request_id="over-estimate-request",
+        request=request,
+        initial_state_id="cs0",
+        initial_state=replace(state, metadata=replace(state.metadata, name="Earlier draft")),
+    )
+    # The edit this turn committed.
+    evidence.effects = replace(
+        evidence.effects,
+        latest_verified_state=state,
+        latest_verified_state_id="cs1",
+        latest_committed_state_id="cs1",
+        latest_authored_state_hash=authored_state_hash(state),
+        net_changed_fields=("metadata",),
+    )
+    assert evidence.effects.net_changed
+
+    outcome = await checkpoint_fixtures.drive_try_terminate(
+        service,
+        state,
+        advisor_checkpoint_passes_used=0,
+        message=request,
+        candidate=reply,
+        recorder=recorder,
+        turn_evidence=evidence,
+        session_operation_context=context,
+    )
+
+    # The review was sent, once, with the over-estimate on its record.
+    assert len(requests) == 1
+    sent = requests[0]["messages"][1]["content"]
+    _over_estimate_size(_sent_transcript(sent)["request_size"], source="composer_ratio", limit=1_000)
+    advisor_rows = [call for call in recorder.llm_calls if call.model_requested == service._settings.composer_advisor_model]
+    assert len(advisor_rows) == 1 and advisor_rows[0].status is ComposerLLMCallStatus.SUCCESS
+    # The admitted reply is published; nothing is withheld and nothing says the review was not sent.
+    assert outcome.action == "return" and outcome.result is not None
+    assert outcome.result.message == reply
+    assert checkpoint_fixtures._audit_row_origins(service) == []
+    stored = json.dumps([call.kwargs for call in service._sessions_service.add_message.calls], default=str)
+    assert _NOT_SENT not in outcome.result.message and _NOT_SENT not in stored
+
+
+def test_a_budget_exhausted_review_keeps_the_existing_request_limit_wording() -> None:
+    from elspeth.web.composer import advisor_policy
+
+    detail, suggestion = advisor_policy.advisor_signoff_blocked_wording(
         reason="budget_exhausted", findings="Final review cannot be admitted within the existing planner budget."
     )
     assert detail == _STOP_DETAIL
+    assert suggestion == "Saved draft progress remains available; continue in a new message."
+    # The text a request over its estimate was once stopped with is never appended to it.
+    legacy = (
+        "The review request was not sent: it is estimated at 1,234 prompt tokens, over the declared limit of 1,000 "
+        "(composer_context_max_prompt_tokens). Earlier conversation was already left out of it; what remains is the "
+        "pipeline's own content and this turn's evidence."
+    )
+    assert advisor_policy.advisor_signoff_blocked_wording(reason="budget_exhausted", findings=legacy)[0] == _STOP_DETAIL
 
 
 @pytest.mark.asyncio
