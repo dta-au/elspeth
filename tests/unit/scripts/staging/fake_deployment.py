@@ -258,6 +258,8 @@ class FakeDeployment:
             for blob_id in [blob.id for blob in session.blobs.values() if blob.filename in turn.deleted_files]:
                 del session.blobs[blob_id]
             first, last = turn.created_at
+            # As the server: only the turn's user row carries its operation id (joined from its ingress
+            # receipt, sessions/service.py); the turn's other rows carry none and follow it in order.
             session.messages.append(
                 {"role": "user", "operation_id": operation_id, "tool_calls": None, "content": payload["content"], "created_at": first}
             )
@@ -265,17 +267,15 @@ class FakeDeployment:
                 session.messages.append(
                     {
                         "role": "assistant",
-                        "operation_id": operation_id,
+                        "operation_id": None,
                         "tool_calls": turn.assistant_tool_calls,
                         "content": "",
                         "created_at": first,
                     }
                 )
             for envelopes in turn.tool_rows:
-                session.messages.append(
-                    {"role": "tool", "operation_id": operation_id, "tool_calls": envelopes, "content": "", "created_at": first}
-                )
-            audit_row = {"role": "audit", "operation_id": operation_id, "tool_calls": turn.audit, "content": "", "created_at": last}
+                session.messages.append({"role": "tool", "operation_id": None, "tool_calls": envelopes, "content": "", "created_at": first})
+            audit_row = {"role": "audit", "operation_id": None, "tool_calls": turn.audit, "content": "", "created_at": last}
             if turn.audit_after_reads:
                 session.late_rows.append((turn.audit_after_reads, audit_row))
             else:
