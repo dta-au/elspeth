@@ -323,8 +323,9 @@ describe("AcknowledgementStack — prompt card from the stored snapshot", () => 
   // A pending inline prompt card whose rendered text changes (a sibling
   // vague term resolved) is superseded server-side, and a NEW card is issued
   // with its own snapshot. That snapshot's frozen skeleton carries the
-  // resolved slot's event_id; the still-open slot's event_id stays null.
-  it("renders a re-issued prompt card from its own snapshot, with the resolved slot accepted by its frozen event_id", async () => {
+  // resolved slot's event_id, so the slot shows that event's approved
+  // definition; the still-open slot's event_id stays null.
+  it("renders a re-issued prompt card from its own snapshot, with the resolved slot's definition from its frozen event_id", async () => {
     const user = userEvent.setup();
     const oldAnchor = "0".repeat(64);
     const newAnchor = "9".repeat(64);
@@ -352,7 +353,7 @@ describe("AcknowledgementStack — prompt card from the stored snapshot", () => 
         version: 1, session_id: SID, node_id: "node-1", event_id: "p-new",
         authored_surface: {
           // The server's re-rendered text carries the accepted value; the
-          // card must render from the parts, never from this or live state.
+          // card shows the frozen event's value and checks it against this.
           prompt_template: "Summarise pending interpretation in a RE-RENDERED VALUE tone.",
           prompt_template_parts: parts,
           interpretation_requirements: [
@@ -389,7 +390,7 @@ describe("AcknowledgementStack — prompt card from the stored snapshot", () => 
       seedPending([newCard, topic]);
       useInterpretationEventsStore.setState({
         resolvedBySession: {
-          [SID]: [retiredTone, { ...tone, choice: "amended", accepted_value: "LIVE VALUE" }, { ...oldCard, choice: "superseded" }],
+          [SID]: [retiredTone, { ...tone, choice: "amended", accepted_value: "RE-RENDERED VALUE" }, { ...oldCard, choice: "superseded" }],
         },
       });
     });
@@ -406,10 +407,8 @@ describe("AcknowledgementStack — prompt card from the stored snapshot", () => 
     });
     expect(slots).toEqual([
       "[“the key points”, reviewed in its own card: pending]",
-      "[“punchy”, reviewed in its own card: accepted]",
+      "[“punchy”, approved earlier, amended by you: RE-RENDERED VALUE]",
     ]);
-    expect(region).not.toHaveTextContent("RE-RENDERED VALUE");
-    expect(region).not.toHaveTextContent("LIVE VALUE");
     expect(region).not.toHaveTextContent("OLD RENDER");
 
     await user.click(screen.getByRole("button", { name: /approve the llm prompt template/i }));

@@ -2702,14 +2702,19 @@
 }
 
 /* Interpretation slots in the displayed prompt (elspeth-990f5ea562, then
-   PFR #1-resolve): each span says the term is reviewed in its own card and
-   is tinted by that review's live status. It never shows the slot's value.
-   <mark> keeps the UA's forced-colors treatment for free, and the status is
-   in the span's text too, so no forced-colors block belongs here. */
+   PFR #1-resolve, then the carry card): a slot naming a term accepted
+   earlier shows that term's approved definition in place, whole; a slot not
+   accepted when the card was made says the term is reviewed in its own card.
+   The tint follows the status. <mark> keeps the UA's forced-colors treatment
+   for free, and the status is in the span's text too, so no forced-colors
+   block belongs here. A long definition wraps across lines; `clone` repeats
+   the padding, radius and border on every line so each line reads as part
+   of the slot. */
 .ack-card-prompt-slot {
   padding: 0 var(--space-2xs);
   border-radius: var(--radius-sm);
   color: var(--color-text);
+  box-decoration-break: clone;
 }
 
 .ack-card-prompt-slot--accepted {

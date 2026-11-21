@@ -1274,10 +1274,13 @@ describe("AcknowledgementCard — reviewed snapshot binding", () => {
 // ── Slot status from the interpretation events (option d) ────────────────────
 //
 // A structured prompt's slots come from the snapshot's frozen
-// prompt_template_parts. Each renders as a span saying it is reviewed in its
-// own card, tinted and labelled with that review's live STATUS from the
-// interpretation events store. The slot's live TEXT (accepted value, or the
-// value in compositionState) is never shown.
+// prompt_template_parts. A slot frozen with event_id: null (its term was not
+// accepted when the card was made; the server writes event_id only once the
+// term resolves) renders as a span saying it is reviewed in its own card,
+// tinted and labelled with that review's live STATUS from the interpretation
+// events store. Its live TEXT (accepted value, or the value in
+// compositionState) is never shown. A slot naming an event shows that
+// event's approved definition: AcknowledgementCard.carriedTerms.test.tsx.
 
 const SLOTTED_SURFACE = {
   prompt_template: "Summarise pending interpretation in a pending interpretation tone.",
@@ -1289,8 +1292,8 @@ const SLOTTED_SURFACE = {
     { kind: "text", text: " tone." },
   ],
   interpretation_requirements: [
-    { id: "req-topic", event_id: "evt-topic", user_term: "the key points" },
-    { id: "req-tone", event_id: "evt-tone", user_term: "punchy" },
+    { id: "req-topic", event_id: null, user_term: "the key points" },
+    { id: "req-tone", event_id: null, user_term: "punchy" },
   ],
 };
 
