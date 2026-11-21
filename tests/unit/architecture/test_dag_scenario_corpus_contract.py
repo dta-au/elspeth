@@ -1059,7 +1059,10 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # 0.8.15 version cut: the same eight engine-owned plugin_version values
 # advance (seven manifest lines), engine:0.8.14 -> engine:0.8.15. Captured
 # from this file's parity failure (previous pin 0dfb70c2...).
-EXPECTED_CASE_REGISTRY_SHA256 = "64bf28cbea6907dc93a1f0bfd2a3d7a174a69b7218fee6f606e31b4540ec65ec"
+# 0.8.16 version cut: the same eight engine-owned plugin_version values
+# advance (seven manifest lines), engine:0.8.15 -> engine:0.8.16. Captured
+# from this file's parity failure (previous pin 64bf28cb...).
+EXPECTED_CASE_REGISTRY_SHA256 = "bf74a436aaef3792b80c0e8ca4b1ac537bf4d87b3f0ceb07412cf1d45a853518"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
