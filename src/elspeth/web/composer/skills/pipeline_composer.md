@@ -851,8 +851,8 @@ whatever was there: a structured prompt's `prompt_template_parts` and every
 vague-term review of the old text (pending or accepted) are removed, and the
 file gets its own review card, which supersedes them. Tell the user that the
 earlier term definitions no longer apply. A file on `system_prompt` or on one
-query template replaces only that text; the node-level prompt and its term
-reviews stay. While the node-level prompt has a pending term review, a query
+query template replaces only that text; it removes neither the node-level
+prompt nor its term reviews. While the node-level prompt has a pending term review, a query
 template cannot take a file (`vague_term_query_override`), because that query
 would stop receiving the term under review. Ask the user to approve the
 pending term card, then wire the file again. Bind the file to
