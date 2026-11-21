@@ -6264,6 +6264,17 @@ def _check_schema_contracts(
             return frozenset()
         return _producer_possible_additions(producer).among(missing)
 
+    def _path_names_its_additions(producer: ProducerEntry) -> bool:
+        """Every deferring node on ``producer``'s path names the fields it could add (``_PossibleAdditions.named``).
+
+        Its constructed twin would participate with those fields; with them
+        held as possible additions, what is still missing is what the twin
+        would refuse too, so the edge can be checked like the twin's.
+        """
+        if not marker_holding_node_ids:
+            return False
+        return _producer_possible_additions(producer).named
+
     def _connection_possible_additions(connection_name: str, *, visited: frozenset[str]) -> _PossibleAdditions:
         producer = resolver.find_producer_for(connection_name)
         if producer is None:
@@ -6293,7 +6304,8 @@ def _check_schema_contracts(
         certain = frozenset.intersection(*guaranteed) if guaranteed else frozenset()
         if not bounded:
             return _PossibleAdditions(unbounded=bool(arms))
-        return _PossibleAdditions(frozenset.intersection(*bounded) - certain)
+        partly = any(additions.has_unnamed for _vote, additions in arms)
+        return _PossibleAdditions(frozenset.intersection(*bounded) - certain, partly_unbounded=partly)
 
     def _producer_possible_additions_uncached(producer: ProducerEntry, *, visited: frozenset[str]) -> _PossibleAdditions:
         if is_source_producer_id(producer.producer_id):
@@ -7803,7 +7815,10 @@ def _check_schema_contracts(
             # sink's required fields per-row. Emitting no EdgeContract renders
             # the edge as "not yet checked" rather than asserting a
             # satisfaction verdict the composer cannot support.
-            if sink_required and (producer_guaranteed or producer_participates):
+            # A deferring step that names what it adds (``_path_names_its_additions``)
+            # is checked like its constructed twin, which participates: only a
+            # field neither forwarded nor nameable by the file is reported.
+            if sink_required and (producer_guaranteed or producer_participates or _path_names_its_additions(actual_producer)):
                 missing_fields = sink_required - producer_guaranteed
                 # As at the node consumers above: what a deferring node on the
                 # path could add is decided before the run, not refused here.
@@ -8486,18 +8501,36 @@ class _PossibleAdditions:
     runtime preflight decides them on the file's bytes. ``fields`` are the
     names the deferring nodes' config shapes fix (``deferred_created_fields``);
     ``unbounded`` means a deferring node on the path adds fields its config
-    cannot name, so any missing field could be one of them.
+    cannot name, so any missing field could be one of them. ``partly_unbounded``
+    means such a node sits on the path but the result is bounded anyway (a
+    closed schema after it, or an intersecting fan-in where another arm
+    bounds it): the fields are still right to subtract, but what that node's
+    constructed twin would vote is unknown, so the path does not NAME all it
+    adds.
     """
 
     fields: frozenset[str] = frozenset()
     unbounded: bool = False
+    partly_unbounded: bool = False
 
     def union(self, other: _PossibleAdditions) -> _PossibleAdditions:
-        return _PossibleAdditions(self.fields | other.fields, self.unbounded or other.unbounded)
+        return _PossibleAdditions(
+            self.fields | other.fields, self.unbounded or other.unbounded, self.partly_unbounded or other.partly_unbounded
+        )
 
     def within(self, declared: frozenset[str]) -> _PossibleAdditions:
         """What survives a closed schema declaring ``declared``: nothing else passes it."""
-        return _PossibleAdditions(declared if self.unbounded else self.fields & declared)
+        return _PossibleAdditions(declared if self.unbounded else self.fields & declared, partly_unbounded=self.has_unnamed)
+
+    @property
+    def has_unnamed(self) -> bool:
+        """A deferring node on the path adds fields no config names."""
+        return self.unbounded or self.partly_unbounded
+
+    @property
+    def named(self) -> bool:
+        """Every deferring node on the path names what it adds, and at least one adds something."""
+        return bool(self.fields) and not self.has_unnamed
 
     def among(self, missing: frozenset[str]) -> frozenset[str]:
         """The missing fields one of these could supply."""
@@ -8505,6 +8538,18 @@ class _PossibleAdditions:
 
 
 _NO_POSSIBLE_ADDITIONS: Final = _PossibleAdditions()
+
+
+def _key_field_held_in_file(options: object) -> bool:
+    """``key_field`` (or a ``lookups[].key_field``) of a named-additions plugin is an attached file: the step READS that field."""
+    if type(options) is not dict:
+        return False
+    if "key_field" in options and is_inline_content_reference(options["key_field"]):
+        return True
+    lookups = options["lookups"] if "lookups" in options else None
+    return type(lookups) is list and any(
+        type(lookup) is dict and "key_field" in lookup and is_inline_content_reference(lookup["key_field"]) for lookup in lookups
+    )
 
 
 def _deferred_contract_notice(node: NodeSpec) -> ValidationEntry:
@@ -8518,7 +8563,12 @@ def _deferred_contract_notice(node: NodeSpec) -> ValidationEntry:
     """
     plugin = node.plugin if node.plugin is not None else node.node_type
     created = deferred_created_fields(plugin, deep_thaw(node.options))
-    fields = f"the fields it adds ({', '.join(sorted(created))})" if created else "the fields this step reads and adds"
+    if not created:
+        fields = "the fields this step reads and adds"
+    elif _key_field_held_in_file(deep_thaw(node.options)):
+        fields = f"the key field it reads and the fields it adds ({', '.join(sorted(created))})"
+    else:
+        fields = f"the fields it adds ({', '.join(sorted(created))})"
     return ValidationEntry(
         f"node:{node.id}",
         f"Node '{node.id}' ({plugin}) reads an attached file that this check does not open, so {fields}, "
