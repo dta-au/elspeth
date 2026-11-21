@@ -177,7 +177,7 @@ _PROMOTED: frozenset[tuple[str, tuple[str, ...]]] = frozenset(
     }
 )
 
-# The five promoted positions whose flat S already accepts ``null``.
+# The six promoted positions whose flat S already accepts ``null``.
 _ALREADY_NULLABLE: frozenset[tuple[str, tuple[str, ...]]] = frozenset(
     {
         ("get_blob_content", ("expected_content_hash",)),
@@ -185,6 +185,7 @@ _ALREADY_NULLABLE: frozenset[tuple[str, tuple[str, ...]]] = frozenset(
         ("inspect_source", ("encoding",)),
         ("get_plugin_assistance", ("issue_code",)),
         ("upsert_edge", ("label",)),
+        ("set_metadata", ("patch", "description")),
     }
 )
 
@@ -370,9 +371,9 @@ def test_strip_null_paths_are_exactly_the_23_promoted_positions() -> None:
         assert not any(type(node) is StripNull for node in tool.decode_plan)
 
 
-def test_flat_s_rejects_null_at_the_18_omission_only_positions() -> None:
-    assert len(_ALREADY_NULLABLE) == 5
-    assert len(_PROMOTED - _ALREADY_NULLABLE) == 18
+def test_flat_s_rejects_null_at_the_17_omission_only_positions() -> None:
+    assert len(_ALREADY_NULLABLE) == 6
+    assert len(_PROMOTED - _ALREADY_NULLABLE) == 17
     definitions = {definition["name"]: definition["parameters"] for definition in _definitions()}
     for name, path in _PROMOTED:
         flat = _property_node(definitions[name], path)
@@ -455,7 +456,7 @@ def test_no_omission_instruction_in_any_strict_capable_w() -> None:
             assert not omission_instruction_matches(text), (name, text)
 
 
-def test_the_six_overrides_say_pass_null() -> None:
+def test_the_seven_overrides_say_what_null_means() -> None:
     functions = _functions(STRICT)
     assert "Pass null to get a provider summary" in functions["list_models"]["parameters"]["properties"]["provider"]["description"]
     assert "pass null for component" in functions["get_pipeline_state"]["parameters"]["properties"]["component"]["description"]
@@ -468,7 +469,8 @@ def test_the_six_overrides_say_pass_null() -> None:
     assert "pass null for llm_draft — the server computes the demanded field set" in review["kind"]["description"]
     assert review["llm_draft"]["description"].startswith("Pass null for llm_draft when the review site already carries")
     assert "if provided it must byte-match the staged draft" in review["llm_draft"]["description"]
-    assert len(_STRICT_DESCRIPTION_OVERRIDES) == 6
+    assert "Pass an empty string for description to clear it (null leaves it unchanged);" in functions["set_metadata"]["description"]
+    assert len(_STRICT_DESCRIPTION_OVERRIDES) == 7
 
 
 def test_none_descriptions_are_unchanged() -> None:
