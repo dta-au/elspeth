@@ -52,7 +52,10 @@ def test_composer_owner_boundary_entries_have_explicit_raw_r5_audit(monkeypatch)
     """Keep the live R5 exemption exact and reject an inert advisor exemption."""
     destinations = {
         "web/composer/advisor_checkpoint.py": ("AdvisorCheckpointOwner._validate_advisor_arguments", 0),
-        "web/composer/composer_preflight.py": ("ComposerPreflight.cached_runtime_preflight", 3),
+        # 3 entry-union checks plus 4 from validation reuse: the round-store
+        # dispatch, the stored-verdict and entry-narrowing pair, and the
+        # decline branch. All are owned classes; see the commit for each.
+        "web/composer/composer_preflight.py": ("ComposerPreflight.cached_runtime_preflight", 7),
     }
     for file_path, (qualified_name, raw_count) in destinations.items():
         assert (qualified_name in TierModelVisitor._R5_NAMED_BOUNDARY_CONTEXTS.get(file_path, frozenset())) == (raw_count > 0)
