@@ -435,6 +435,12 @@ class ComposerLLMCall:
     pipeline LLM transform, the composer does not treat a non-``stop`` value
     as an error, so it makes truncation visible without changing control flow.
 
+    ``max_completion_tokens_requested`` is the completion cap the request
+    sent (``None`` when it sent none, as the compose loop does). Planner calls
+    carry it with ``planner_policy_hash`` and ``planner_call_ordinal``;
+    advisor calls carry it alone. Beside ``finish_reason`` it shows whether a
+    ``length`` stop was the cap that was sent.
+
     Provider-authored strings (``model_returned``, ``provider_request_id``,
     ``finish_reason``, ``error_message``, ``reasoning_content``) arrive
     already bounded: ``web/composer/llm_response_parsing.build_llm_call_record``
@@ -605,12 +611,12 @@ class ComposerLLMCall:
             len(self.planner_policy_hash) != 64 or any(character not in "0123456789abcdef" for character in self.planner_policy_hash)
         ):
             raise ValueError("planner_policy_hash must be exactly 64 lowercase hexadecimal characters")
-        planner_evidence = (
-            self.max_completion_tokens_requested,
-            self.planner_policy_hash,
-            self.planner_call_ordinal,
-        )
-        if any(value is not None for value in planner_evidence) and not all(value is not None for value in planner_evidence):
+        # A planner call carries its policy hash, its ordinal and the cap it
+        # sent; an advisor call carries only the cap it sent.
+        planner_identity = (self.planner_policy_hash, self.planner_call_ordinal)
+        if any(value is not None for value in planner_identity) and (
+            not all(value is not None for value in planner_identity) or self.max_completion_tokens_requested is None
+        ):
             raise ValueError("planner request evidence fields must be supplied together")
         _require_optional_finite_number(self.temperature, "temperature")
         if self.temperature is not None:

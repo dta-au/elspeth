@@ -66,6 +66,25 @@ ADVISOR_UNAVAILABLE_USER_DETAIL: Final[str] = "advisor model was unavailable"
 ADVISOR_MALFORMED_USER_DETAIL: Final[str] = "advisor response was malformed"
 
 
+def advisor_reply_cut_off_detail(*, cap: int, planner_cap_applied: bool) -> str:
+    """Fixed detail for a reply that stopped at its completion cap before a verdict.
+
+    The cause stays ``malformed``; this names the cap that was sent and the
+    setting that sets it, so the operator raises the cap rather than blaming
+    the model. A planner-continuation review is sent the smaller of the
+    advisor cap and the planner's, and then names both settings.
+    """
+    setting = (
+        "composer_advisor_max_completion_tokens, limited here by composer_planner_max_completion_tokens"
+        if planner_cap_applied
+        else "composer_advisor_max_completion_tokens"
+    )
+    return (
+        f"the advisor's reply ran out of room before a verdict: it stopped at the completion cap of {cap:,} tokens that "
+        f"was sent ({setting}), which the model's reasoning shares. Raise that setting to give the review more room."
+    )
+
+
 # elspeth-032ec69c41 (ruling 2026-09-22): one fixed backend sentence per closed
 # advisor category. The advisor picks the category from a closed vocabulary; the
 # SENTENCE is ours, so no provider text reaches the header even when the

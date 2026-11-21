@@ -758,6 +758,7 @@ class AdvisorCheckpointOwner:
                             response_metadata=response_metadata,
                             error_class=error_class,
                             error_message=error_message,
+                            max_completion_tokens_requested=max_completion,
                             credential_surface="composer_advisor_response",
                             provider_custody=provider_custody,
                             private_request=private_request,
@@ -1520,6 +1521,26 @@ class AdvisorCheckpointOwner:
         last_request_failure: ProviderRequestFailure | None = None
         call_arguments: dict[str, Any] = arguments
         format_reprompt_pending = False
+        # The cap a reply of the last attempt ran out of before its verdict
+        # (finish reason ``length``), read from that attempt's call record.
+        last_cut_off_cap: int | None = None
+
+        def cut_off_cap(attempt_call_offset: int) -> int | None:
+            for call in recorder.llm_calls[attempt_call_offset:] if recorder is not None else ():
+                if call.finish_reason == "length":
+                    if call.max_completion_tokens_requested is None:
+                        raise AuditIntegrityError("Advisor call record lacks the completion cap it sent")
+                    return call.max_completion_tokens_requested
+            return None
+
+        def malformed_detail() -> str:
+            if last_cut_off_cap is None:
+                return _advisor_policy.ADVISOR_MALFORMED_USER_DETAIL
+            return _advisor_policy.advisor_reply_cut_off_detail(
+                cap=last_cut_off_cap,
+                planner_cap_applied=continuation_budget is not None
+                and continuation_budget.policy.max_completion_tokens < self._settings.composer_advisor_max_completion_tokens,
+            )
 
         def provider_dispatched() -> None:
             nonlocal provider_attempts, format_reprompt_sent
@@ -1591,6 +1612,7 @@ class AdvisorCheckpointOwner:
                     return continuation_withheld()
                 last_exc = exc
                 last_response_unparseable = False
+                last_cut_off_cap = cut_off_cap(attempt_call_offset)
                 # Empty text is malformed schema evidence; absent/non-text
                 # content supplies no schema observation. The call boundary
                 # preserves this distinction without carrying provider text.
@@ -1610,6 +1632,7 @@ class AdvisorCheckpointOwner:
                 # Retain exceptions only to classify the final outcome.
                 last_exc = exc
                 last_response_unparseable = False
+                last_cut_off_cap = None
                 call_arguments = arguments
                 format_reprompt_pending = False
                 failure = classify_provider_failure(exc)
@@ -1644,6 +1667,7 @@ class AdvisorCheckpointOwner:
             # channel, no second prompt path).
             last_exc = None
             last_response_unparseable = True
+            last_cut_off_cap = cut_off_cap(attempt_call_offset)
             call_arguments = _advisor_policy.advisor_arguments_with_format_reprompt(
                 arguments, schema_valid=verdict.response_schema_valid is True
             )
@@ -1657,7 +1681,7 @@ class AdvisorCheckpointOwner:
                     ok=False,
                     blocking=False,
                     failure_class="malformed",
-                    findings_text=_advisor_policy.ADVISOR_MALFORMED_USER_DETAIL,
+                    findings_text=malformed_detail(),
                 ),
                 source="model",
             )
@@ -1677,11 +1701,7 @@ class AdvisorCheckpointOwner:
         findings_text = (
             last_request_failure.details.explanation
             if last_request_failure is not None
-            else (
-                _advisor_policy.ADVISOR_UNAVAILABLE_USER_DETAIL
-                if failure_class == "unavailable"
-                else _advisor_policy.ADVISOR_MALFORMED_USER_DETAIL
-            )
+            else (_advisor_policy.ADVISOR_UNAVAILABLE_USER_DETAIL if failure_class == "unavailable" else malformed_detail())
         )
         return await completed(
             AdvisorCheckpointVerdict(

@@ -370,7 +370,10 @@ service after changing the setting.
 completion-token cap sent with every advisor request. A checkpoint reviews a
 whole build, and the model's reasoning tokens are drawn from the same cap as
 its verdict. A reply that reaches the cap before it states a verdict is
-recorded with finish reason `length`.
+recorded with finish reason `length`, and every advisor call record carries
+the cap it sent (`max_completion_tokens_requested`). The completion check then
+says the reply ran out of room, names this setting and gives the cap that was
+sent.
 
 `ELSPETH_WEB__COMPOSER_ADVISOR_TIMEOUT_SECONDS` (default `180`) bounds each
 advisor provider call. A call never waits longer than the time left in the
