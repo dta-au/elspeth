@@ -596,7 +596,7 @@
   container-type: inline-size;
 }
 
-/* The chat-input notice slot (elspeth-b3f4ecefee). Three states share one
+/* The chat-input notice slot (elspeth-b3f4ecefee). Four states share one
    position above the input row, so they share ONE chrome — a bordered notice
    card — and vary only the tone tokens. Previously each state invented its
    own species: a bordered card for the upload error, and loose unframed text
@@ -604,6 +604,7 @@
    in the same error register read as unrelated kinds of event and neither
    loose variant aligned with anything. */
 .chat-input-upload-alert,
+.chat-input-upload-status,
 .chat-input-bootstrapping,
 .chat-input-composer-unavailable {
   padding: var(--space-1-5) var(--space-2-5);
@@ -624,6 +625,9 @@
   background-color: var(--color-error-bg);
   color: var(--color-error);
 }
+
+/* .chat-input-upload-status — "Uploading <file>…" while a chat upload is in
+   flight; shown only then, in the same muted neutral register. */
 
 /* .chat-input-bootstrapping — the compose-timeout bootstrap notice, a soft,
    transient "connecting" status shown while the backend wall clock is still

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, onTestFinished } from "vitest";
 import { render, screen, within, act, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useBlobStore } from "@/stores/blobStore";
@@ -434,6 +434,26 @@ describe("BlobManager upload affordance (elspeth-29eef452a8)", () => {
       upload,
       "an aria-label here can only drift from the visible text",
     ).not.toHaveAttribute("aria-label");
+  });
+
+  it("shows an upload in progress on the Upload control until it settles", async () => {
+    setBlobState([]);
+    const realUpload = useBlobStore.getState().uploadBlob;
+    onTestFinished(() => useBlobStore.setState({ uploadBlob: realUpload }));
+    let finishUpload: (blob: BlobMetadata) => void = () => undefined;
+    useBlobStore.setState({
+      uploadBlob: vi.fn().mockReturnValue(new Promise<BlobMetadata>((resolve) => { finishUpload = resolve; })),
+    });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    const fileInput = document.querySelector<HTMLInputElement>('.blob-manager-header input[type="file"]');
+    expect(fileInput).not.toBeNull();
+    await userEvent.setup().upload(fileInput!, new File(["id\n1\n"], "rows.csv", { type: "text/csv" }));
+
+    expect(screen.getByRole("button", { name: "Uploading…" })).toBeDisabled();
+    expect(screen.getByText("Uploading rows.csv…")).toHaveAttribute("aria-live", "polite");
+    await act(async () => { finishUpload(makeBlob({ id: "rows", filename: "rows.csv" })); });
+    expect(screen.getByRole("button", { name: "Upload" })).toBeEnabled();
+    expect(screen.queryByText("Uploading rows.csv…")).not.toBeInTheDocument();
   });
 
   it("draws no glyph in the UI text font", () => {

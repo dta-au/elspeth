@@ -493,6 +493,36 @@ describe("ChatInput upload identity", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent(reason);
   });
+
+  it("shows an upload in progress beside the input until it settles", async () => {
+    let finishUpload: (reason: unknown) => void = () => undefined;
+    useSessionStore.setState({ activeSessionId: "session-current" });
+    useBlobStore.setState({
+      uploadBlob: vi.fn().mockReturnValue(new Promise<BlobMetadata>((_resolve, reject) => { finishUpload = reject; })),
+    });
+
+    render(
+      <ChatInput
+        onSend={vi.fn()}
+        disabled={false}
+        inputRef={{ current: null } as RefObject<HTMLTextAreaElement>}
+      />,
+    );
+    const fileInput = document.querySelector<HTMLInputElement>(
+      'input[type="file"]',
+    );
+    expect(fileInput).not.toBeNull();
+    await userEvent.upload(
+      fileInput!,
+      new File(["id\n1\n"], "slow.csv", { type: "text/csv" }),
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent("Uploading slow.csv…");
+    expect(screen.getByRole("button", { name: "Upload file" })).toBeDisabled();
+    await act(async () => { finishUpload({ status: 503, detail: "unavailable" }); });
+    expect(screen.queryByText("Uploading slow.csv…")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Upload file" })).toBeEnabled();
+  });
 });
 
 describe("ChatInput max length", () => {

@@ -174,6 +174,8 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   // shortcut), the delete must still target the originating session, not
   // whichever session happens to be active at confirmation time.
   const [pendingDelete, setPendingDelete] = useState<{ blob: BlobMetadata; sessionId: string } | null>(null);
+  // The file being uploaded from this panel, while the upload is in flight.
+  const [uploadingName, setUploadingName] = useState<string | null>(null);
 
   const fileQuery = fileFilter.trim().toLowerCase();
   const visibleBlobs = useMemo(() => fileQuery === "" ? blobs
@@ -194,11 +196,13 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
     async (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
       if (!file || !activeSessionId) return;
+      setUploadingName(file.name);
       try {
         await uploadBlob(activeSessionId, file);
       } catch {
         // Error is already in the store
       } finally {
+        setUploadingName(null);
         if (fileInputRef.current) {
           fileInputRef.current.value = "";
         }
@@ -267,9 +271,16 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
         <Button
           onClick={() => fileInputRef.current?.click()}
           className="blob-manager-upload-btn"
+          disabled={uploadingName !== null}
         >
-          Upload
+          {uploadingName !== null ? "Uploading…" : "Upload"}
         </Button>
+        {/* Mounted at rest (empty, visually hidden) so the in-progress text is
+            announced. A live region, not a second role=status: the panel's
+            status line below stays the one status. */}
+        <span aria-live="polite" className="sr-only">
+          {uploadingName !== null ? `Uploading ${uploadingName}…` : ""}
+        </span>
         {/* The design system's ghost compact button, last in the header like
             every panel's close control. The accessible name starts with the
             visible label (WCAG 2.5.3). */}

@@ -201,6 +201,8 @@ export function ChatInput({
     ? (v: string) => controlledOnChange?.(v)
     : setInternalText;
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
+  // The file being uploaded from this control, while the upload is in flight.
+  const [uploadingName, setUploadingName] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Rare-action overflow ("More"): the file-manager toggle and secrets entry
   // fold behind one trigger so the textarea keeps a usable width in the
@@ -341,6 +343,7 @@ export function ChatInput({
     const uploadSessionId = activeSessionId;
     const input = e.target;
     setUploadStatus(null);
+    setUploadingName(file.name);
     let rejectionAccepted: boolean | null = null;
     try {
       const blob = await uploadBlob(uploadSessionId, file, {
@@ -375,6 +378,7 @@ export function ChatInput({
         setUploadStatus(uploadRefusalMessage(err));
       }
     } finally {
+      setUploadingName(null);
       // Reset the file input so the same file can be re-selected
       input.value = "";
     }
@@ -393,6 +397,11 @@ export function ChatInput({
       {uploadStatus && (
         <div role="alert" className="chat-input-upload-alert">
           {uploadStatus}
+        </div>
+      )}
+      {uploadingName !== null && (
+        <div role="status" className="chat-input-upload-status">
+          Uploading {uploadingName}…
         </div>
       )}
       {/* Bootstrap gate reason. Two states share this slot (both keep Send
@@ -431,7 +440,7 @@ export function ChatInput({
             <Button
               variant="bare"
               onClick={() => fileInputRef.current?.click()}
-              disabled={!activeSessionId}
+              disabled={!activeSessionId || uploadingName !== null}
               className="chat-input-icon-btn chat-input-upload-btn"
               title="Upload file"
               aria-label="Upload file"
