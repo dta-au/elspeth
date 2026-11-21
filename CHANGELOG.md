@@ -10,11 +10,11 @@ The full history is in the repository's releases and commit history.
 
 ## 0.8.16 - 2026-11-21
 
-Web Composer fixes for large pipelines and prompts held in files, bounded
-advisor and prompt-guard requests, less redundant per-row engine work, and LLM
-gateway logging. The session epoch stays at 79 and the Landscape epoch at 51,
-so existing 0.8.15 session and Landscape stores open unchanged. The dated entry
-does not establish qualification, a published tag or an image.
+Web Composer fixes for large pipelines, long sessions and prompts held in
+files, bounded advisor and prompt-guard requests, less redundant per-row engine
+work, and LLM gateway logging. The session epoch stays at 79 and the Landscape
+epoch at 51, so existing 0.8.15 session and Landscape stores open unchanged.
+The dated entry does not establish qualification, a published tag or an image.
 
 ### Upgrade notes
 
@@ -29,8 +29,13 @@ Schema and stored data:
 - **Upgrading from 0.8.14 or earlier: apply the 0.8.15 upgrade notes first.**
 - Context-budget records written from this release carry a different
   `policy_hash` (the policy's schema string changed), and compose-loop records
-  may carry `over_estimate` and `max_prompt_tokens`. Records written by 0.8.15
-  still load.
+  may carry `over_estimate` and `max_prompt_tokens`. The record of a compose
+  call retried after a provider context-length rejection carries
+  `retry_after_provider_rejection: true`, and `stubbed_tool_call_ids` is
+  always empty in new records. Records written by 0.8.15 still load.
+- Advisor call records now fill `max_completion_tokens_requested` with the
+  completion cap that was sent (it was null on advisor rows). No field is
+  added.
 - Prompt-guard audit records are written at `schema_version` 2, with
   `units_scanned` and `units_reused`. Version 1 records still load.
 
@@ -72,17 +77,56 @@ Behaviour you will see:
   `usage_when_not_to_use`. `get_pipeline_state` gains four optional arguments
   and bounds large reads. `patch_node_options` refuses a `queries` value that
   leaves out an existing query. The duplicate-consumer repair suggestion
-  carries facts only. Clients or tests that pin these tool results must follow;
-  see Web Composer below.
-- **Requests that fit are sent.** A composer or first-turn planner request
-  under the configured request byte maximum is now always sent, with optional
-  context left out first, even when its token estimate is over
-  `composer_context_max_prompt_tokens`. A request the gateway or model rejects
-  as too long reaches the user as a size refusal, not as a provider outage.
-- **Advisor requests are bounded.** The advisor now sees earlier turns by age
-  within a fixed budget, and an advisor review whose estimate is over
-  `composer_context_max_prompt_tokens` is not sent; see Advisor below. The
-  stop assumes the advisor model's window is at least that setting.
+  carries facts only. `upsert_node` gains `routing_only`, which rewires an
+  existing transform without re-sending it and returns a `routing_update`
+  receipt instead of the component. Clients or tests that pin these tool
+  results must follow; see Web Composer below.
+- **Requests that fit are sent.** A composer or planner request under the
+  configured request byte maximum is now always sent, even when its token
+  estimate is over `composer_context_max_prompt_tokens`. Only earlier turns of
+  the conversation are left out to stay under the estimate; nothing of the
+  turn in progress is left out or replaced by a stub, so a turn whose own
+  content is over the byte maximum is refused rather than cut. A compose
+  request the gateway or model rejects as too long is sent once more with
+  every earlier turn left out. If that is rejected too, or there was no
+  earlier turn to leave out, the turn reaches the user as a size refusal, not
+  as a provider outage; a planner request rejected as too long is refused
+  that way at once.
+- **Advisor requests are bounded by age, not stopped by size.** The advisor
+  now sees earlier turns by age within a fixed budget; when a review's size
+  estimate is over `composer_context_max_prompt_tokens`, older turns are left
+  out first. A review still over the estimate is sent, as composer and planner
+  requests are, and the provider judges its own limit; see Advisor below.
+- **Advisor reply cap and timeout defaults changed.**
+  `ELSPETH_WEB__COMPOSER_ADVISOR_MAX_COMPLETION_TOKENS`
+  (`composer_advisor_max_completion_tokens`) now defaults to 16384 (was 8192)
+  and `ELSPETH_WEB__COMPOSER_ADVISOR_TIMEOUT_SECONDS`
+  (`composer_advisor_timeout_seconds`) to 180 seconds (was 60). Each advisor
+  call still waits at most the time left in the turn. An explicit setting is
+  used as given. A cap above the advisor model's output limit may be rejected
+  by the provider, and startup cannot detect it.
+- **Small edits are reviewed on what they changed.** The advisor judges a
+  small edit by the steps the edit added and those whose untrusted input it
+  changed. A condition already present on steps the request did not name (for
+  example an LLM step without a prompt-injection shield plugin) no longer
+  blocks the edit or leads the composer to change those steps; the reply
+  mentions it instead. Review cards already waiting from an earlier turn are
+  not requested again when the edit did not change what they review.
+- **Undoing a rewire does not restore an approval.** A review that a rewire
+  re-opened must be approved again before a run, even after the route is put
+  back.
+- **A busy server no longer reports that it stopped.** A compose request that
+  loses its hold on the session while the server keeps running now ends with
+  HTTP 503 "This request stopped because the server was too busy to keep its
+  hold on the session." and a diagnostic id. Any other request that ends
+  without a result while the server is running gets the generic failure with a
+  diagnostic id. "The server stopped while composing this request" is now
+  reported only when the server restarted or the request belonged to another
+  web process.
+- **New warning log lines:** `session_operation.renewal_slow`,
+  `composer_operation.event_loop_lag`,
+  `composer_interpretation.surface_skipped_runtime_findings` and
+  `composer_interpretation.surface_skipped`; see Operations below.
 - **Prompt guard calls change shape.** The user prompt is inspected in its own
   call, and text the guard service already allowed in the session is not sent
   again, so the number of guard calls no longer grows with the conversation.
@@ -173,6 +217,22 @@ Behaviour you will see:
   narrow tool can express the change. A failed call is retried as the same
   call. Tool descriptions list every review term the model can author, and a
   validation entry's `error_code` is documented as optional.
+- `upsert_node` accepts `routing_only=true` to rewire a step without re-sending
+  it. It changes only an existing transform's `input`, `on_success` and
+  `on_error` and keeps its plugin, options (file-held prompts included) and
+  description as stored. Any other field, an explicit `null` route or a step
+  that is not a transform is refused with `routing_only_edit_invalid`. The
+  result carries a small `routing_update` receipt instead of the component and
+  names each review the rewire re-opened (`reopened_reviews`, up to 32, with
+  the full `reopened_review_count`). A prompt-shield review, or the disclosure
+  of an auto-wired control, re-opens when the rewire changes what it binds and
+  must be approved again before a run; putting the route back does not restore
+  it. The proposal card and its diff show the rewire, not a replacement. See
+  `docs/reference/composer-tools.md`.
+- The composer no longer requests a review card again when an earlier turn
+  already raised it and this turn changed neither its step nor, for a
+  prompt-shield recommendation, any step upstream of it. That card is still
+  waiting. Every requirement the turn staged or changed is still requested.
 - After a refused edit, the next successful edit reports only the errors and
   warnings that edit added or fixed. It no longer lists the refusal as
   resolved, or every standing finding as new after a refused full replacement.
@@ -270,14 +330,47 @@ Behaviour you will see:
   Content already left out of a request can be left out again in the same
   call, so a request that fits without it is no longer refused or stopped with
   an internal error.
+- Only earlier turns of the conversation are left out to fit the context
+  budget. Every round of the turn in progress (its tool calls and tool
+  results, on the compose loop and its reply stage, the planner and the
+  planner's escape-hatch transcript) is sent whole, and a tool result is no
+  longer replaced by an omission stub. A request still over
+  `composer_context_max_prompt_tokens` once every earlier turn is left out is
+  sent and recorded as over the estimate. Only a request over the request byte
+  maximum is refused, so a turn whose own content is over that maximum is now
+  refused rather than cut. The context estimate follows the latest call of the
+  turn. `stubbed_tool_call_ids` in new LLM-call records is always empty;
+  records written by earlier releases keep their values and still load.
 - A provider "input is too long" rejection is recognised even when the gateway
-  reports it under a generic or unfamiliar error code, and reaches the user as
-  a size refusal. The provider's own reason is still shown only when
-  `composer_expose_provider_errors` is on, and the call record keeps the closed
-  reason `context_length_exceeded` without provider text.
-- When an earlier tool result is replaced by its omission stub, the private
-  record of the request sent is kept, showing the stub as sent, and the context
-  estimate follows the latest call.
+  reports it under a generic or unfamiliar error code. The provider's own
+  reason is still shown only when `composer_expose_provider_errors` is on, and
+  the call record keeps the closed reason `context_length_exceeded` without
+  provider text.
+- When the provider or gateway rejects a compose request as over the model's
+  context limit while earlier turns are still in it, the request is sent once
+  more with every earlier turn left out, instead of the turn being refused,
+  and the user sees the usual notice, once per turn, "Earlier conversation is
+  no longer visible to the composer." Those turns stay out for the rest of the
+  turn. Only if the retry is rejected too, or there was no earlier turn to
+  leave out, is the turn refused as too large for the model. Such a turn makes
+  two provider calls; both are recorded, and the retry's context-budget record
+  carries `retry_after_provider_rejection: true`. The planner, the advisor,
+  the reply stage and the last-chance composition call do not retry; a planner
+  rejection reaches the user as a size refusal.
+- Long sessions no longer fail edits with "The server stopped while composing
+  this request" while the server is running. Building the advisor's
+  prompt-guard request took time that grew with the square of the session's
+  length and ran on the event loop, so on a long session it could hold the
+  loop long enough for the session's hold to lapse. That work is now linear,
+  and the request is built once per advisor call, after the transcript is
+  shaped, in the worker pool; the stored history's redaction is reused while
+  it is unchanged. What is redacted, scanned and sent is unchanged. A request
+  that does lose its hold now says so; see Upgrade notes.
+- Approving a prompt review card for a step with many file-held prompts checks
+  the step once for all of them and reads each file once, instead of once for
+  every file on the step. Such approvals no longer slow down sharply as files
+  are added or fail with a server error on a slow host. The approval rows
+  written and the refusals given are unchanged.
 - Within one compose call, validation of an unchanged pipeline is not repeated:
   the runtime preflight and the policy view's authoring check are reused until
   the pipeline, a referenced file, the secret inventory or a resolved path
@@ -295,9 +388,28 @@ Behaviour you will see:
   turn whole, the previous three turns as the request and the reply shown, and
   older turns as the request only, newest first, within 8,000 tokens; an older
   request over 2,000 characters is shortened to its first 1,500 and last 500.
-  The request states exactly what it leaves out. A review whose size estimate,
-  based on a real earlier call, is over `composer_context_max_prompt_tokens`
-  is not sent and says so with the estimate and the limit.
+  The request states exactly what it leaves out. When a review's size
+  estimate, based on a real earlier call, is over
+  `composer_context_max_prompt_tokens`, the oldest earlier turns are left out
+  until it fits; if it is still over with none left, it is sent anyway and the
+  request records the estimate, the limit and `over_estimate`. A provider
+  rejection of it is reported like any other request rejection.
+- The advisor's completion cap now defaults to 16,384 tokens (was 8,192) and
+  its per-call timeout to 180 seconds (was 60); a call still waits at most the
+  time left in the turn. When a review runs out of its completion cap before it
+  gives a verdict, the completion check now says so ("the advisor's reply ran
+  out of room before a verdict"), names
+  `composer_advisor_max_completion_tokens` and the cap that was sent, and
+  advises raising it, instead of reporting a malformed response. Every advisor
+  call record carries that cap in `max_completion_tokens_requested` beside its
+  finish reason.
+- On a small edit the advisor judges what the turn changed: the steps it added
+  and the LLM steps whose untrusted input it changed. Inserting, removing or
+  moving a step in front of an LLM step without changing the content it
+  receives does not count. A condition only on steps the turn did not change
+  is pre-existing: it does not block the edit or withhold the reply, the
+  composer is told not to change those steps for it, and the reply reports it
+  once. Violations the turn introduced are still flagged.
 - The advisor is told plainly when a prompt is held in a file: the file's name,
   size and who wrote it. A file you wrote is not sent to the advisor; a file
   written by the composer, produced by a pipeline, imported from a shared link
@@ -364,6 +476,29 @@ Behaviour you will see:
   line, `composer_operation.audit_integrity_failure`, with the error's class
   and a credential-filtered message of at most 512 bytes. Both point to the
   private failure record kept with the operation.
+- `composer_operation.owner_unsettled` (error), written when a compose request
+  ends without recording a result, now carries the session id, operation id,
+  diagnostic id, the number of underlying failures and up to eight of them,
+  each with its class, its cause's class and its message, credential-filtered
+  and only when it is at most 512 bytes. No row data or prompt text is
+  logged.
+- Two new warnings show a held event loop before it costs a request its hold
+  on the session. `session_operation.renewal_slow` is logged when a session
+  hold renewal starts 2 seconds or more after it was due or takes 2 seconds or
+  more; it carries the session, operation, epoch and kind, the hold and renewal
+  interval, `start_late_seconds`, `attempt_seconds`, the worker pool's
+  outstanding admissions and the outcome, never the hold's token.
+  `composer_operation.event_loop_lag` (with `lag_seconds`) is logged when a
+  probe that sleeps for half a second wakes more than one second late.
+- The composer logs one warning when it skips creating review cards:
+  `composer_interpretation.surface_skipped_runtime_findings` when the
+  pipeline's runtime check reports problems (for example a stored file path
+  outside the allowed directories after a data directory was moved), and
+  `composer_interpretation.surface_skipped` when a single card could not be
+  created. Each line names the session, state and, for a single card, the
+  step and review kind, with the error codes or exception class but not their
+  text. Before this, a review could stay pending with no card and nothing in
+  the log to say why.
 
 ### Tooling
 
@@ -375,6 +510,19 @@ Behaviour you will see:
   direct Bedrock streaming canary and a recovery-set capture. Each records
   sanitised per-call usage and timing. See
   `docs/runbooks/composer-edit-battery.md`.
+- The edit battery gains a 35-edit file-binding plan
+  (`composer_file_bindings.json`). Starting from an empty session, it uploads
+  each file before the message that names it, has the composer connect and
+  reconnect sources, reference joins, LLM prompts, system prompts, query
+  templates and file-inject entries to uploaded and composer-written files,
+  checks which file each binding points at and which kind of review card
+  opens, and ends empty. Plans can now upload files, start from an empty
+  session and use a pass rule for plans shorter than 50 edits.
+- The battery's judge no longer counts an unchanged finding as new when the
+  server spells it differently: a component named with or without its kind
+  prefix (`node:`, `output:`, `sink:`, `source:`) and a pending review stored
+  as a sentence or as its bare kind compare equal. A step whose query
+  templates are held in files is judged as file-held, as the server does.
 
 Automatic image publication from main remains held. The 0.8.16 tag and
 container publication follow successful required checks and the protected
