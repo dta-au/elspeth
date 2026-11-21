@@ -176,6 +176,43 @@ _MAX_REPAIR_TURNS: Final[int] = 2
 _CROSS_TURN_REPAIR_LEDGER_MAX: Final[int] = 512
 
 
+def _log_surfacing_skipped_for_runtime_findings(
+    *,
+    state: CompositionState,
+    session_id: str | None,
+    current_state_id: str | None,
+    runtime_findings: ValidationResult,
+    path: Literal["no_tool_finalize", "advisor_terminal"],
+) -> None:
+    """One warning line when runtime findings pre-empt review-card surfacing.
+
+    Both callers deliberately skip surfacing while structural findings stand
+    (graph repair comes before new cards), so the head keeps its pending
+    interpretation review with no card. The findings themselves reach the
+    reply and the persisted state's validation; nothing records that
+    surfacing was skipped because of them. That cost an hour of diagnosis
+    when a moved data directory put a stored sink path outside the allowed
+    directories (blocker ``path_allowlist``).
+
+    A diagnostic of a skipped write, not audit: no interpretation event or
+    Landscape row is written, no run exists at this seam, and there is no
+    telemetry stream for surfacing, so logging is the last resort. Codes and
+    counts only: finding messages and blocker details carry paths and user
+    text, so none of them is logged.
+    """
+    slog.warning(
+        "composer_interpretation.surface_skipped_runtime_findings",
+        session_id=session_id,
+        composition_state_id=current_state_id,
+        path=path,
+        error_count=len(runtime_findings.errors),
+        blocker_count=len(runtime_findings.readiness.blockers),
+        error_codes=sorted({error.error_code for error in runtime_findings.errors if error.error_code is not None}),
+        blocker_codes=sorted({blocker.code for blocker in runtime_findings.readiness.blockers}),
+        unsurfaced_site_count=len(interpretation_sites(state)),
+    )
+
+
 def _source_proof_unavailable_validation(
     state: CompositionState,
     proof: ProofUnavailable | MalformedSourceProofClaim,
@@ -2090,6 +2127,13 @@ class CompositionCompletion:
         """
 
         if runtime_findings is not None:
+            _log_surfacing_skipped_for_runtime_findings(
+                state=state,
+                session_id=session_id,
+                current_state_id=current_state_id,
+                runtime_findings=runtime_findings,
+                path="no_tool_finalize",
+            )
             content = assistant_message.content or ""
             return ComposerResult(
                 message=_compose_preflight_failure_message(content, runtime_result=runtime_findings),
@@ -2596,6 +2640,13 @@ class CompositionCompletion:
             if runtime_findings is not None:
                 # Keep the fresh advisor verdict and its publication below;
                 # graph repair takes precedence over surfacing new cards.
+                _log_surfacing_skipped_for_runtime_findings(
+                    state=state,
+                    session_id=session_id,
+                    current_state_id=current_state_id,
+                    runtime_findings=runtime_findings,
+                    path="advisor_terminal",
+                )
                 runtime_preflight = runtime_findings
             else:
                 orphan_result = await self._surface_pt_and_gate_orphans_or_none(
