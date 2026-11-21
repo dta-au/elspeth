@@ -37,6 +37,7 @@ from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, P
 from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
+    current_source_data_contract_demand,
     prompt_review_anchor_hash_from_options,
     prompt_review_draft_from_options,
 )
@@ -151,8 +152,9 @@ def test_a_field_the_join_could_add_is_left_to_the_preflight_at_every_site(tmp_p
 def test_a_misspelt_field_is_still_refused_where_the_join_names_what_it_adds(tmp_path: Path, site: str, code: str, shape: str) -> None:
     """The typo case, per site: ``addde`` is neither upstream nor an ``output`` key, so it stays an error.
 
-    Beside the joined field it is the ONLY one reported missing, and the edge
-    still carries no verdict (part of it is undecided).
+    Beside the joined field it is the ONLY one reported missing, in the error
+    and in the edge's unsatisfied contract (which the source data-contract
+    review reads).
     """
     alone = _site_graph(tmp_path / "alone", site, _SHAPES[shape](g._marker(g.STR_TABLE)), [TYPO]).validate()
     beside = _site_graph(tmp_path / "beside", site, _SHAPES[shape](g._marker(g.STR_TABLE)), ["added", TYPO]).validate()
@@ -166,7 +168,9 @@ def test_a_misspelt_field_is_still_refused_where_the_join_names_what_it_adds(tmp
         assert error.error_code == code
         assert error.message.endswith(f"guarantees: [id, k]. Missing fields: [{TYPO}].")
         assert g._notices(summary) == [g._join_notice("enrich")]
-    assert not _contracts_into(beside, _CONSUMER_ID[site])
+    [contract] = _contracts_into(beside, _CONSUMER_ID[site])
+    assert (contract.missing_fields, contract.satisfied) == ((TYPO,), False)
+    assert "added" not in contract.producer_guarantees
     assert not execution.is_valid
 
 
@@ -196,6 +200,41 @@ def test_a_deferring_pass_through_carries_on_what_a_deferring_node_before_it_cou
     assert sorted(g._notices(carried)) == sorted([g._join_notice("enrich"), g._join_notice("enrich_again", "later")])
     assert [entry.error_code for entry in typo.errors] == [code]
     assert typo.errors[0].message.endswith(f"Missing fields: [{TYPO}].")
+
+
+@pytest.mark.parametrize("site", ["sink", "node"])
+def test_the_source_review_is_asked_only_for_what_the_join_cannot_add(tmp_path: Path, site: str) -> None:
+    """Review parity: behind an OBSERVED source the data-contract card asks the source for ``colour``, never ``added``.
+
+    ``source_demand`` reads the unsatisfied edge contracts. The join could add
+    ``added``, so asking the user to confirm the source has it would be wrong;
+    ``colour`` only the source can supply, so its card must still be offered
+    (dropping the whole contract once hid it). The run-time gate reads the
+    same demand, so the review the run would block on is the one shown here.
+    """
+
+    def demand(root: Path, required: list[str]) -> tuple[str, ...]:
+        join = g._join(g._marker(g.STR_TABLE), "json", schema=g.OBSERVED)
+        if site == "sink":
+            state = g._graph(
+                root,
+                g._join_node("enrich", "src_out", "output", join),
+                source_schema=g.OBSERVED,
+                sink_schema={"mode": "observed", "required_fields": required},
+            )
+        else:
+            use = g._transform("use", "passthrough", "mid", "output", {"schema": g.OBSERVED, "required_input_fields": required})
+            state = g._graph(root, g._join_node("enrich", "src_out", "mid", join), use, source_schema=g.OBSERVED)
+        return current_source_data_contract_demand(state, "source")
+
+    assert demand(tmp_path / "added", ["added"]) == ()
+    if site == "node":
+        assert demand(tmp_path / "colour", ["added", "colour"]) == ("colour",)
+    else:
+        # LIMIT (2a, unchanged by 2b): behind an observed upstream the deferring join ABSTAINS
+        # at a sink, so the sink is not checked, no contract exists and no card is offered;
+        # the run is then refused by graph validation ("requires fields ['colour']").
+        assert demand(tmp_path / "colour", ["added", "colour"]) == ()
 
 
 def test_LIMIT_a_misspelt_declared_input_after_a_deferring_join_is_left_to_the_preflight(tmp_path: Path) -> None:

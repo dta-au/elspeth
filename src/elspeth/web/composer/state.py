@@ -7503,12 +7503,18 @@ def _check_schema_contracts(
 
         # A field a node upstream could add once its file is read is neither
         # guaranteed nor missing: the runtime preflight decides it on the
-        # bytes (``contract_probe_deferred`` names the node). Such an edge is
-        # left unchecked rather than given a verdict, and only the fields
-        # nothing on the path could supply are reported.
+        # bytes (``contract_probe_deferred`` names the node). Only the fields
+        # nothing on the path could supply are reported, in the error and in
+        # the edge contract.
         if contract_required:
             contract_missing_fields = contract_required - producer_guaranteed
-            if not _possibly_added(actual_producer, contract_missing_fields):
+            contract_possibly_added = _possibly_added(actual_producer, contract_missing_fields)
+            contract_missing_fields -= contract_possibly_added
+            # Only an edge whose every missing field could be added is left
+            # without a verdict. Fields nothing could add stay an unsatisfied
+            # entry: the source data-contract review reads it to offer the
+            # card that would let the source promise them.
+            if contract_missing_fields or not contract_possibly_added:
                 edge_contracts.append(
                     EdgeContract(
                         from_id=actual_producer.producer_id,
@@ -7802,7 +7808,8 @@ def _check_schema_contracts(
                 # As at the node consumers above: what a deferring node on the
                 # path could add is decided before the run, not refused here.
                 possibly_added = _possibly_added(actual_producer, missing_fields)
-                if not possibly_added:
+                missing_fields -= possibly_added
+                if missing_fields or not possibly_added:
                     edge_contracts.append(
                         EdgeContract(
                             from_id=actual_producer.producer_id,
@@ -7813,7 +7820,6 @@ def _check_schema_contracts(
                             satisfied=not missing_fields,
                         )
                     )
-                missing_fields -= possibly_added
                 if missing_fields:
                     errors.append(
                         _err(
