@@ -34,33 +34,42 @@ receipt is required for that source), as in ``test_graph_review_facts.py``.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 import structlog
+from asgi_lifespan import LifespanManager
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select, update
 
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind, InterpretationSurfaceOrigin
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.web.app import create_app
 from elspeth.web.composer.interpretation_surfacing import surface_pending_interpretation_reviews_for_state
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools._common import _options_with_default_prompt_template_review
 from elspeth.web.composer.tools.sessions import _handle_request_interpretation_review
+from elspeth.web.config import WebSettings
+from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.interpretation_state import prompt_review_draft_from_options
+from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.inline_blob_preflight import InlinePreflightState, inline_blob_refs
 from elspeth.web.sessions.models import blobs_table, composition_states_table, interpretation_events_table
 from elspeth.web.sessions.protocol import CompositionStateRecord
+from elspeth.web.sessions.schemas import SendMessageRequest
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import wire_test_pipeline_user_authority
 from tests.helpers.prompt_review import reviewed_anchor_for
 from tests.unit.web.composer import test_blob_inline_tools as blob_tools
+from tests.unit.web.coordination.test_composer_operation_authority import admit
 from tests.unit.web.sessions.test_approved_file_prompt_keeps_guarantees import _save_state
 from tests.unit.web.sessions.test_graph_review_facts import begin, blocked, finish
 
@@ -548,3 +557,258 @@ async def test_resolve_with_committed_graph_review_compares_projected_records(st
     assert resolved.choice is InterpretationChoice.ACCEPTED_AS_DRAFTED
     assert returned.version == saved.version + 1
     assert [row["version"] for row in _state_rows(engine)] == [saved.version, saved.version + 1]
+
+
+# --- Fork: the composer's backend surfacing must open a card for every open prompt-review site on the fork head ---
+#
+# Live report (session 17, 2026-11-21): after a fork and a recompose, the fork head ended
+# ``interpretation_review_pending`` with no card to resolve. Measured cause: that run's sink paths resolved
+# outside the allowed directories, so the no-tool finalize returned at its runtime-findings early return
+# before surfacing (setup confound, identical on both trees). These tests pin the half that IS ours: on a
+# fork made through the real route (blob copy and custody rewrite included), the surfacing entry the
+# finalize calls writes one pending card per open site, and still does after a committed graph review is
+# bound to the fork head (the shape the stored/projected fix was for).
+
+FORK_CSV_TEXT = "text\nhello\n"
+
+
+def _fork_app(tmp_path: Path) -> Any:
+
+    data_dir = tmp_path / "data"
+    for name in ("blobs", "outputs", "runs"):
+        (data_dir / name).mkdir(parents=True)
+    (data_dir / "payloads").mkdir(mode=0o700)
+    app = create_app(
+        settings=WebSettings(
+            data_dir=data_dir,
+            landscape_url=f"sqlite:///{data_dir}/runs/audit.db",
+            payload_store_path=data_dir / "payloads",
+            composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
+            composer_max_discovery_turns=10,
+            composer_timeout_seconds=85.0,
+            composer_boot_probe_enabled=False,
+            composer_rate_limit_per_minute=10,
+            # The fork route is driven directly; the async composer worker must not claim this test's operations.
+            composer_async_scan_interval_seconds=60.0,
+            shareable_link_signing_key=b"\x00" * 32,
+        )
+    )
+    app.state.auth_provider.create_user("forkuser", "testpass123", display_name="Fork User")
+    wire_test_pipeline_user_authority(app, identity_id="forkuser", engine=app.state.session_engine)
+    return app
+
+
+def _app_acquire(app: Any, sid: UUID) -> Any:
+    service = app.state.session_service
+    return service.session_operation_authority.acquire(
+        session_id=sid,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=30,
+    )
+
+
+def _app_store(app: Any, sid: UUID) -> tuple[Any, ...]:
+    """The ``store`` tuple shape ``begin``/``blocked``/``finish`` use, over the app's own objects."""
+
+    service = app.state.session_service
+    engine = app.state.session_engine
+    authority = ComposerAsyncOperationAuthority(
+        engine, owner_instance_id=service.session_operation_owner_instance_id, claim_lease_seconds=30
+    )
+    return engine, service.session_operation_authority, authority, service, sid
+
+
+async def _app_commit_graph_review(app: Any, sid: UUID, state: CompositionStateRecord) -> None:
+    """``_commit_graph_review`` over the app: admit, claim and start under the app's owner, then commit a BLOCKED review."""
+
+    store = _app_store(app, sid)
+    _engine, repository, authority, service, _sid = store
+    owner = service.session_operation_owner_instance_id
+    request = SendMessageRequest(operation_id=str(uuid4()), content="Explain", state_id=state.id)
+    record, _ = admit(authority, sid, request, actor="forkuser")
+    (claim,) = authority.claim_next(limit=1)
+    context = repository.start_composer_async_operation(claim, owner_instance_id=owner, lease_seconds=30, auth_provider_type="local")
+    running = ComposerOperationRunning(claim=claim, session_operation_context=context)
+    await service.add_message_with_transcript(
+        sid,
+        "user",
+        request.content,
+        operation_id=UUID(record.operation_id),
+        requested_state_id=request.state_id,
+        composition_state_id=request.state_id,
+        writer_principal="route_user_message",
+        session_operation_context=running.session_operation_context,
+        running=running,
+    )
+    terminal = await finish(store, running, blocked(store, running, state))
+    assert terminal.status == "completed"
+    repository.release(running.session_operation_context)
+
+
+async def _seed_fork_parent(app: Any, sid: UUID) -> tuple[CompositionStateRecord, str]:
+    """Parent head: uploaded CSV source, file-held classify prompt with an open card, inline label prompt with a pending review."""
+    service = app.state.session_service
+    engine = app.state.session_engine
+    data_dir = Path(app.state.settings.data_dir)
+    context = _app_acquire(app, sid)
+    try:
+        message = await service.add_message(
+            sid, "user", f"{USER_MESSAGE_TEXT}\n{FORK_CSV_TEXT}", writer_principal="route_user_message", session_operation_context=context
+        )
+        env = {
+            "engine": engine,
+            "session_id": str(sid),
+            "data_dir": str(data_dir),
+            "operation": context,
+            "authority": service.session_operation_authority,
+        }
+        csv_blob = blob_tools.execute_tool(
+            "create_blob",
+            {"filename": "input.csv", "mime_type": "text/csv", "content": FORK_CSV_TEXT},
+            blob_tools._empty_state(),
+            blob_tools._catalog(),
+            data_dir=env["data_dir"],
+            session_engine=engine,
+            session_id=str(sid),
+            session_operation_context=context,
+            session_operation_authority=env["authority"],
+            user_message_id=str(message.id),
+            user_message_content=f"{USER_MESSAGE_TEXT}\n{FORK_CSV_TEXT}",
+        )
+        assert csv_blob.success, csv_blob.to_dict()
+        with engine.connect() as conn:
+            csv_path = conn.execute(
+                select(blobs_table.c.storage_path).where(blobs_table.c.id == str(csv_blob.data["blob_id"]))
+            ).scalar_one()
+        base = _two_step_state(data_dir, label_prompt=PLAIN_LABEL_PROMPT)
+        source = base.sources["source"]
+        sink = base.outputs[0]
+        base = replace(
+            base,
+            sources={"source": replace(source, options={**dict(source.options), "path": csv_path})},
+            # Session-owned sink under the parent: the fork rebases it onto the child.
+            outputs=(replace(sink, options={**dict(sink.options), "path": str(data_dir / "outputs" / str(sid) / "output.jsonl")}),),
+        )
+        wired = _wire_file(env, base, user_message_id=str(message.id))
+        saved = await _save_state(service, env, wired)
+        draft = prompt_review_draft_from_options(wired.nodes[0].options)
+        assert draft is not None
+        await _create(service, sid, saved.id, draft, context)
+    finally:
+        service.session_operation_authority.release(context)
+    parent_prompt_marker = wired.nodes[0].options["prompt_template"]
+    assert isinstance(parent_prompt_marker, Mapping)
+    return saved, str(parent_prompt_marker["blob_ref"])
+
+
+def _session_event_rows(engine: Any, sid: UUID) -> list[dict[str, Any]]:
+    with engine.connect() as conn:
+        return [
+            dict(row)
+            for row in conn.execute(
+                select(interpretation_events_table)
+                .where(interpretation_events_table.c.session_id == str(sid))
+                .order_by(interpretation_events_table.c.created_at, interpretation_events_table.c.id)
+            ).mappings()
+        ]
+
+
+async def _surface_on(app: Any, sid: UUID, head: CompositionStateRecord) -> None:
+    """The surfacing entry the no-tool finalize calls, with the finalize's default only_missing_evidence=False."""
+    context = _app_acquire(app, sid)
+    try:
+        await surface_pending_interpretation_reviews_for_state(
+            state_from_record(head),
+            sessions_service=app.state.session_service,
+            session_id=str(sid),
+            current_state_id=str(head.id),
+            surface_origin=InterpretationSurfaceOrigin.COMPOSER_LLM,
+            model_identifier="test-model",
+            model_version="1",
+            provider="test-provider",
+            composer_skill_hash="a" * 64,
+            session_operation_context=context,
+        )
+    finally:
+        app.state.session_service.session_operation_authority.release(context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("child_graph_review", [False, True], ids=["fresh_fork", "fork_head_with_committed_graph_review"])
+async def test_fork_head_surfacing_opens_a_pending_card_for_every_open_prompt_review_site(tmp_path: Path, child_graph_review: bool) -> None:
+    """A fork through the real route; surfacing on its head opens one pending card per open llm_prompt_template site.
+
+    ``fork_head_with_committed_graph_review`` is the sticky shape on the fork: a no-edit END review committed on the
+    fork head, then two surfacing passes. On the base tree it fails with ``ANCHOR_MESSAGE``.
+    """
+
+    app = _fork_app(tmp_path)
+    service = app.state.session_service
+    engine = app.state.session_engine
+    async with LifespanManager(app), AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        login = await client.post("/api/auth/login", json={"username": "forkuser", "password": "testpass123"})
+        assert login.status_code == 200, login.text
+        headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+        created = await client.post("/api/sessions", headers=headers, json={"title": "Fork card rows"})
+        assert created.status_code == 201, created.text
+        parent_sid = UUID(created.json()["id"])
+        parent_head, parent_prompt_blob = await _seed_fork_parent(app, parent_sid)
+        context = _app_acquire(app, parent_sid)
+        try:
+            fork_point = await service.add_message(
+                parent_sid,
+                "user",
+                "Change the tag step",
+                writer_principal="route_user_message",
+                composition_state_id=parent_head.id,
+                session_operation_context=context,
+            )
+        finally:
+            service.session_operation_authority.release(context)
+        parent_events = _session_event_rows(engine, parent_sid)
+
+        forked = await client.post(
+            f"/api/sessions/{parent_sid}/fork",
+            headers=headers,
+            json={"operation_id": str(uuid4()), "from_message_id": str(fork_point.id), "new_message_content": "Change the tag step again"},
+        )
+        assert forked.status_code == 201, forked.text
+        child_sid = UUID(forked.json()["session_id"])
+        child_head = await service.get_current_state(child_sid)
+        assert child_head is not None and child_head.session_id == child_sid
+        child_state = state_from_record(child_head)
+        child_marker = child_state.nodes[0].options["prompt_template"]
+        assert isinstance(child_marker, Mapping) and child_marker["blob_ref"] != parent_prompt_blob, (
+            "precondition: the fork rebased the file-held prompt"
+        )
+        assert inline_blob_refs(InlinePreflightState.from_stored_state(child_head)), "precondition: the fork head's prompt is file-held"
+        open_sites = {node.id for node in child_state.nodes if prompt_review_draft_from_options(node.options) is not None}
+        assert open_sites == {"classify", "label"}, "precondition: both steps carry an open prompt review on the fork head"
+        assert _session_event_rows(engine, child_sid) == [], "precondition: a fork copies no interpretation events"
+
+        if child_graph_review:
+            await _app_commit_graph_review(app, child_sid, child_head)
+            projected = await service.get_current_state(child_sid)
+            assert projected is not None and projected.id == child_head.id
+            assert projected.review_projection is not None, "precondition: a committed graph review is bound to the fork head"
+            passes = 2
+        else:
+            passes = 1
+        for _ in range(passes):
+            await _surface_on(app, child_sid, child_head)
+
+        child_events = _session_event_rows(engine, child_sid)
+        pending_cards = [
+            row
+            for row in child_events
+            if row["kind"] == InterpretationKind.LLM_PROMPT_TEMPLATE.value and row["choice"] == InterpretationChoice.PENDING.value
+        ]
+        assert sorted(row["affected_node_id"] for row in pending_cards) == sorted(open_sites), (
+            "one pending card per open site, none duplicated"
+        )
+        assert all(row["composition_state_id"] == str(child_head.id) for row in pending_cards)
+        assert all(row["tool_call_id"].startswith("backend_auto_surface:") for row in pending_cards)
+        assert len(child_events) == len(pending_cards), "surfacing wrote nothing but the cards"
+        assert _session_event_rows(engine, parent_sid) == parent_events, "the parent's review history is untouched"
