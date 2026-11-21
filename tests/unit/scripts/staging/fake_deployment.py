@@ -43,6 +43,11 @@ class FakeTurn:
     # Session files the turn created (filename -> content) or deleted (by filename), as create_blob and delete_blob do.
     created_files: dict[str, bytes] = field(default_factory=dict)
     deleted_files: tuple[str, ...] = ()
+    # The published reply on the completed operation's result message, and its rejection.
+    reply_segments: list[JsonObject] = field(default_factory=lambda: [{"kind": "text", "content": "Done."}])
+    rejection: JsonObject | None = None
+    # role="tool" rows the turn stores (each a list of tool_calls envelopes).
+    tool_rows: list[list[JsonObject]] = field(default_factory=list)
 
 
 type Provider = Callable[[JsonObject, str], tuple[JsonObject, list[JsonObject]] | FakeTurn]
@@ -89,6 +94,14 @@ class Session:
     late_rows: list[tuple[int, JsonObject]] = field(default_factory=list)
 
 
+def _without_checkpoint_passes(row: JsonObject) -> JsonObject:
+    """The row as an older server returns it: its audit view carries no advisor checkpoint pass records."""
+    calls = row["tool_calls"] if "tool_calls" in row else None
+    if row["role"] != "audit" or type(calls) is not list:
+        return row
+    return {**row, "tool_calls": [call for call in calls if call["_kind"] != "advisor_checkpoint_pass_audit"]}
+
+
 @dataclass
 class FakeDeployment:
     passwords: dict[str, str]
@@ -99,6 +112,10 @@ class FakeDeployment:
     on_request: Callable[[str, str], None] | None = None
     requests: list[tuple[str, str, object]] = field(default_factory=list)
     tokens: dict[str, str] = field(default_factory=dict)
+    # A server with the END review view returns END pass rows under include_llm_audit and
+    # sets X-Elspeth-End-Review-Rows-Omitted; an older server returns neither.
+    end_review_view: bool = True
+    end_review_rows_omitted: int = 0
 
     # -- transport -------------------------------------------------------
 
@@ -169,8 +186,17 @@ class FakeDeployment:
                     still_late.append((reads_left - 1, row))
             session.late_rows = still_late
             audit = query.get("include_llm_audit") == "true"
-            rows = [row for row in session.messages if audit or row["role"] != "audit"]
-            return self._page(rows, query)
+            rows = [
+                row if self.end_review_view else _without_checkpoint_passes(row)
+                for row in session.messages
+                if audit or row["role"] != "audit"
+            ]
+            page = self._page(rows, query)
+            if audit and self.end_review_view:
+                return HttpResponse(
+                    status=page.status, body=page.body, headers={"x-elspeth-end-review-rows-omitted": str(self.end_review_rows_omitted)}
+                )
+            return page
         if key == ("GET", "/interpretations"):
             assert query["status"] == "pending"
             return self._json(200, {"events": [review["event"] for review in session.reviews.values() if review["pending"]]})
@@ -245,6 +271,10 @@ class FakeDeployment:
                         "created_at": first,
                     }
                 )
+            for envelopes in turn.tool_rows:
+                session.messages.append(
+                    {"role": "tool", "operation_id": operation_id, "tool_calls": envelopes, "content": "", "created_at": first}
+                )
             audit_row = {"role": "audit", "operation_id": operation_id, "tool_calls": turn.audit, "content": "", "created_at": last}
             if turn.audit_after_reads:
                 session.late_rows.append((turn.audit_after_reads, audit_row))
@@ -255,7 +285,7 @@ class FakeDeployment:
                 "operation_id": operation_id,
                 "status": turn.status,
                 "poll_after_ms": 0,
-                "result": {"message": {}} if completed else None,
+                "result": {"message": {"segments": turn.reply_segments, "rejection": turn.rejection}} if completed else None,
                 "error": None if completed else {"code": turn.error_code},
             }
         return self._json(202, {"operation_id": operation_id, "status": "queued", "poll_after_ms": 1000})

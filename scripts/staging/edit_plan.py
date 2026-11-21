@@ -56,7 +56,7 @@ import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -192,11 +192,20 @@ def _blank(found: bool, value: object) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class Plan:
+    """A loaded plan. ``verifier`` names a workload verifier that judges each edit in place of its expectations.
+
+    A plan file has no verifier. A workload built in code (see
+    :mod:`scripts.staging.structural_cycle`) carries one, with its arguments,
+    and each of its edits carries what that verifier checks.
+    """
+
     name: str
     sha256: str
     forbidden_tools: tuple[str, ...]
     targets: Mapping[str, JsonObject]
     edits: tuple[JsonObject, ...]
+    verifier: str | None = None
+    verifier_args: Mapping[str, Any] = field(default_factory=dict)
 
     def roles_of(self, edit: Mapping[str, Any]) -> set[str]:
         return set(_NAME.findall(json.dumps(edit)))
@@ -531,7 +540,7 @@ def resolve_edits(plan: Plan, targets: Mapping[str, str], baseline_state: Mappin
             resolved.append({"number": number, "id": edit["id"], "applicable": False, "missing_roles": missing})
             continue
 
-        def field(match: re.Match[str]) -> str:
+        def fill_field(match: re.Match[str]) -> str:
             if match.group(2) is not None:
                 return targets[match.group(2)]
             return render_was(baseline, _fill(match.group(1), targets, pointer=True))
@@ -544,7 +553,7 @@ def resolve_edits(plan: Plan, targets: Mapping[str, str], baseline_state: Mappin
                 "number": number,
                 "id": edit["id"],
                 "applicable": True,
-                "message": _MESSAGE_FIELD.sub(field, edit["message"]),
+                "message": _MESSAGE_FIELD.sub(fill_field, edit["message"]),
                 "expect": expect,
                 "may_change": _fill(edit["may_change"], targets, pointer=True) if "may_change" in edit else [],
                 "edges_touching": _fill(edit["edges_touching"], targets, pointer=False) if "edges_touching" in edit else [],
@@ -553,6 +562,10 @@ def resolve_edits(plan: Plan, targets: Mapping[str, str], baseline_state: Mappin
                 "approve": _fill(edit["approve"], targets, pointer=False) if "approve" in edit else None,
             }
         )
+        if "order" in edit:
+            resolved[-1]["order"] = _fill(edit["order"], targets, pointer=False)
+        if "position" in edit:
+            resolved[-1]["position"] = dict(edit["position"])
     return resolved
 
 

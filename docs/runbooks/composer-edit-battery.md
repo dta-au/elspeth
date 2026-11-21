@@ -121,17 +121,273 @@ view. Nothing is estimated; a figure the rows do not carry is `null`.
 | `server_ms` | `span_ms - provider_busy_ms`: time in the turn with no provider call in flight. `null`, never negative, when the span is shorter than the provider time (a call that began before the turn's first stored row) |
 | `provider_calls`, `budgeted_provider_calls` | Calls recorded for the turn, and those that carried a context-budget decision |
 | `tool_calls_by_name`, `tool_outcomes` | Assistant tool calls by name, with the server-stamped outcome (`applied`, `rejected`, `failed`, `cancelled`, `completed`) |
+| `tool_timings` | Each tool call with a timed invocation record on its tool row: tool name, status and `latency_ms` only |
+| `tool_timings_complete`, `tool_busy_ms` | Whether every tool call had a timed record; if so, the union of their `started_at`..`finished_at`, else `null` |
+| `server_ms_outside_provider_and_tools` | `span_ms` less the union of provider and tool intervals; `null` unless both are known |
+| `calls` | Each provider call, sanitised: the usage, latency, finish-reason, model-label and cost fields, `request_byte_split` (message, tools and total bytes) and the numeric `context_budget` fields with the shed history indices and a count of stubbed tool results |
+| `end_reviews` | Each END-phase advisor checkpoint record the view returned: `phase`, `verdict`, `publication_verdict`, `source` |
 
-The summary gives `server_time_share_of_span` (server time over span) and
-`non_provider_share_of_wall`.
+The summary gives `server_time_share_of_span` (server time over span),
+`non_provider_share_of_wall`, the totals of `tool_busy_ms` and
+`server_ms_outside_provider_and_tools` (`null` if any edit lacks them),
+`edits_with_complete_tool_timings` and `end_reviews_recorded`.
+
+The sanitising rule for `calls` is the customer's: a text field is kept only
+when it is a short token of letters, digits and `_ . / : -` that is not a
+path or a URL; any other value drops the field. No prompt or reply text,
+tool argument or result, hash, request id, call id or tool-call id is ever
+written to the checkpoint.
 
 Not available from the API, so not reported:
 
 - queue wait before the worker started the turn: the operation status
   carries no admission or start timestamp;
-- where server time went inside a turn (tool execution, validation,
-  persistence): no per-phase timing is exposed;
+- where server time went inside a turn (validation, persistence, advisor
+  work): no per-phase timing is exposed;
+- tool time on current servers: a primary tool row carries only a visible
+  companion record with no timing, so `tool_timings_complete` is false and
+  `tool_busy_ms` null; `server_ms` then still bounds all non-provider time;
+- advisor end reviews on a server without the END review view: its
+  messages view returns only provider-call and planner-attempt audit rows,
+  so `end_reviews` is empty (see the structural-cycle workload below);
 - advisor time versus planner time when their calls overlap.
+
+## Structural-cycle workload
+
+`--workload structural-cycle` sends the customer's large-graph stress
+workload instead of a plan file, and judges it with their verifier and error
+codes. It repeats a ten-step cycle around an anchor step: add two passthrough
+nodes before it and two after it, swap each pair, remove all four, and on the
+tenth step restore the original route names. Cycle 1 names its nodes
+`compact_*`, later cycles `cycle1_*`, `cycle2_*` and so on. The wording of
+every step is the customer's, pinned by a test; do not edit it.
+
+A *position* is where a cycle edits: an upstream (a source or step), the
+anchor step, and a downstream (a step or a sink). With `--fixture` the cycles
+rotate through the positions in the fixture's manifest, so the edits land in
+different places of the graph. Without it there is one position, the
+customer's: `--source` → `--anchor` → `--sink` (defaults `source`,
+`capacity_probe`, `results`). Giving both is refused.
+
+```bash
+python -m scripts.staging.composer_edit_battery plan --workload structural-cycle --steps 50 --fixture "$FIXTURE"
+python -m scripts.staging.composer_edit_battery run --workload structural-cycle --steps 50 --fixture "$FIXTURE" \
+  --base-url "$URL" --session "$SESSION" --account "$ACCOUNT" --state-dir "$STATE" --execute
+```
+
+For a downstream sink the wording says "the `<name>` sink", as the
+customer's does; a downstream step is just named. The `plan` action prints
+the tenth step's restore values as `{was:/nodes/<anchor>/...}` fields; `run`
+fills them from the graph as JSON text, as the customer's runner does.
+
+`--steps` is 1 to 60 (default 30). The step count and positions are part of
+the attempt's identity: resuming with others is refused.
+
+**The run changes the test graph.** Every step is a real, auto-committed
+edit. Run it only on a session made for the run (see
+[Large-graph fixture](#large-graph-fixture)), never on a graph anyone uses.
+A complete cycle ends with the graph's original wiring; an attempt stopped
+mid-cycle leaves passthrough nodes in place. `cleanup` does not apply to a
+workload: set the fixture up again in a new session.
+
+### What the battery checks before the first step
+
+- each position's upstream routes straight into its anchor (a transform), and
+  the anchor straight into its downstream, which is a sink exactly when the
+  position says so;
+- no node already has a name a cycle adds;
+- the graph is valid, with its prompt and file reviews resolved, and the
+  session is in auto-commit.
+
+The summary reports the graph's counts as `baseline_graph_counts` (sources,
+nodes, LLM nodes, sinks, prompt queries), and each step's result its
+`graph_counts`.
+
+### How a step is judged
+
+Each step must pass all of these. The codes are the customer's.
+
+| Code | Fails when |
+| --- | --- |
+| `node_inventory_mismatch` | The node ids are not the starting graph's plus exactly the passthroughs the step should leave |
+| `original_llm_content_changed` | A starting node changed beyond the wiring the step had to touch: the upstream's `on_success`, the anchor's `input` and `on_success`, a downstream step's `input`. The customer's code; it covers every starting node, not only the LLM one |
+| `source_content_changed` | A source changed (beyond the upstream source's `on_success`), or a source was added or removed |
+| `sink_content_changed` | Any output changed |
+| `metadata_changed` | The graph metadata changed |
+| `routing_mismatch` | The chain from the upstream does not visit the step's nodes in order |
+| `unexpected_auxiliary_plugin` | A node other than the anchor in the chain is not a passthrough transform |
+| `routing_does_not_reach_sink` | The chain does not end at the downstream (the sink, or the downstream step's `input`) |
+| `baseline_routing_not_restored` | At the end of a cycle, the original route names around the anchor are not back |
+| `runtime_validation_failed` | The graph is not valid |
+| `operation_not_completed` | The turn did not complete |
+| `operation_result_unavailable` | The completed turn has no result |
+| `publication_rejected` | The reply was rejected at publication |
+| `no_published_reply` | The reply has no non-blank text |
+| `additional_system_notice_requires_review` | The reply carries a trusted system notice other than the checkpoint save status |
+| `end_review_not_clean_and_admitted` | The turn's last end review is not verdict `clean` with publication verdict `ADMIT` |
+
+The battery also keeps two of its own findings: `evidence_not_settled_*`
+(the turn's audit rows never settled) and `no_successful_provider_call`. The
+second holds the rule that the LLM does the job: a step the provider took no
+part in is never a pass. Plan expectations, unrelated-change and tool-call
+findings do not apply to the workload; the verifier's state check covers the
+whole graph instead.
+
+Plan-file edits never required an end review. They required a completed
+turn, a successful provider call, settled evidence, the plan's expectations,
+no unrelated change, no new validation error and no refused tool call.
+
+The customer's runner read each turn's end review from the database. A
+server with the END review view returns it through the audit-grade messages
+view: under `include_llm_audit=true` each END-phase
+`advisor_checkpoint_pass_audit` row comes back as a `role="audit"` row with
+the fields `phase`, `pass_index`, `verdict`, `source`, `provider_attempts`
+and `publication_verdict`, and the response carries the header
+`X-Elspeth-End-Review-Rows-Omitted`: the count of stored END rows left out
+because they did not parse. An older server returns no END rows and no
+header; there no route carries the verdict, and
+`composer_meta.completion_gates` on the state shows a blocking advisor gate,
+never a pass, so it cannot tell a clean review from none.
+
+`--end-review-evidence`:
+
+| Mode | A recorded review that is not clean and admitted | A step with no recorded review |
+| --- | --- | --- |
+| `required` (the customer's rule) | fails the step | fails the step |
+| `if-recorded` | fails the step | warning `end_review_not_recorded` |
+| `auto` (default) | fails the step | `required` when the messages view sets the header, `if-recorded` when it does not |
+
+`auto` decides from the response, never from a version string. Each step's
+result records what the battery saw as `end_review_view`
+(`exposed`, `rows_omitted`). The summary's `end_reviews.line` says in words
+how many steps were verified; on a server without the view and with no
+review seen it reads "end reviews: none exposed by this server; not
+verified", and `end_reviews.verified` is false. A server that left rows out
+adds "the server left out N end review rows it could not read". Report which
+mode a run used, and quote the line.
+
+The first failing step stops the attempt; `--keep-going` judges every step.
+A workload run exits 0 when every requested step passed. The summary still
+reports `gold` (50 or more steps, all passed, fixture as found).
+
+## Large-graph fixture
+
+`scripts/staging/large_graph_fixture.py` writes a synthetic large graph for
+the workload, and the battery's `setup` action creates it in a session. All
+names, fields and text are made up from a seed; the same seed and arguments
+give the same bytes.
+
+The `acceptance` preset is wired like a real assessment graph rather than one
+big LLM block: a CSV source with a fixed schema of 14 fields, bound to an
+uploaded file, with validation failures routed to the error sink; a
+`file_inject` step with file-held content; two case-study chains (an
+assessment LLM step feeding a multi-query scoring step); evidence checks, a
+cross-case comparison, risk and equity reviews and a larger multi-query
+overall rubric; a gate that routes low scores to a moderation-queue sink;
+summary and feedback LLM steps; truncate steps capping case text before the
+steps that read it; and a final `field_mapper` into a main sink that
+declares its fields. Every LLM step declares `required_input_fields` that
+earlier steps produce, and its prompts name those fields. All prompt text is
+file-held: single-prompt steps hold a system and a user prompt in files;
+multi-query steps hold their rubric (system prompt) and every query template
+in files, each template bound to its designed slot
+`node:<step>.options.queries.<query>.template` and left out of the YAML.
+
+| Default (acceptance) | Value |
+| --- | --- |
+| Steps (transforms and gates) | 27 |
+| LLM steps | 12 (4 multi-query: 3, 3, 3 and 8 queries) |
+| Prompt files | 39, holding exactly 200,000 bytes: 16 single-step prompts (1.7-2.4 KB), 17 query templates (4.5-6.5 KB), 4 rubrics (11-18 KB), 2 injected files (7-13 KB) |
+| Sinks | 3 (main, error, moderation queue) |
+| Graph document once imported | about 38 KB: the prompt text stays in the bound files |
+| Positions | after the source, mid-chain between two LLM steps, at the final mapper |
+
+`--steps`, `--llm-steps`, `--queries-per-llm-step` (the 3 scoring steps),
+`--large-queries` (the overall rubric), `--total-prompt-bytes`,
+`--inject-files` and `--seed` change the size; the counts and bytes are met
+exactly. `--query-templates inline` writes the query templates into the
+YAML instead (short ones, for comparison); `--file-inject omit` leaves the
+`file_inject` step out. `--profile` names the LLM profile the steps use on
+the target server (default `task-role`). The generator refuses a prompt file
+over the server's per-file cap (256 KiB, read from `core/blobs_inline.py`).
+
+The `single-node` preset reproduces the customer's shape for a like-for-like
+comparison with their telemetry: source `source`, one LLM node
+`capacity_probe` with 32 file-held query templates of 15,600 bytes
+(499,200 bytes), a 4,000-byte system prompt file, and sinks `results` and
+`errors`. `--queries-per-llm-step` and `--total-prompt-bytes` change the
+count and the size (the system prompt stays 4,000 bytes; the rest is split
+evenly over the queries). With `--query-templates inline` the templates are
+written into the YAML as literal blocks: 518,741 characters, 5,547 under the
+YAML import limit of 524,288.
+
+### Limits a large graph meets (measured on candidate 5)
+
+**Aggregate file-held text: 1 MiB.** The text bound to a graph's files may
+total at most 1,048,576 bytes (`BLOB_INLINE_AGGREGATE_BYTE_CAP`). Measured
+through the real import:
+
+| Fixture | Files | Bytes | Result |
+| --- | --- | --- | --- |
+| `--preset acceptance --total-prompt-bytes 943718` (0.9 MiB) | 39 | 943,718 | imports, valid |
+| `--preset acceptance --total-prompt-bytes 1153433` (1.1 MiB) | 39 | 1,153,433 | HTTP 500 at import |
+
+Over the cap, the import's prompt-review snapshot raises
+`PromptFileTooLargeError`, which no handler maps: the user gets an internal
+server error, not the size refusal, and no graph is saved.
+
+**State scan: 4,096 values.** The server scans the whole state for
+credential material and refuses one whose scan visits more than 4,096
+values (`CredentialTraversalPolicy.max_nodes`). The manifest's
+`state_scan_values_at_import` is that count for the graph as the YAML import
+scans it, measured with the server's own importer and scan. A file-held
+template's marker is bound after that scan, so the stored state counts more:
+
+| Fixture (single-node) | Values at import | Values stored | Result |
+| --- | --- | --- | --- |
+| 251 file-held queries | 3,080 | 4,092 | imports, valid, readable |
+| 252 file-held queries | 3,092 | 4,108 | imports; `GET /state` then answers 409 "The saved graph is unavailable" |
+| 309 inline queries (400 B) | 4,085 | 4,094 | imports, valid |
+| 310 inline queries (400 B) | 4,098 | - | HTTP 422 at import |
+
+In this generator's query shape a file-held query adds 16 stored values and
+an inline one 13. At 252 file-held queries the import accepts the graph and
+the session's graph can no longer be opened: the read path's editable-draft
+check fails it for credential material (`checkpoint_credential_material`).
+The inline refusal at 310 is `credential_material_rejected` with category
+`traversal_limit`, and its text tells the user the content "appears to
+contain a credential".
+
+### `file_inject` content
+
+The default `--file-inject file` holds the `file_inject` content in uploaded
+files. It validates on servers with the `file_inject` producer-guarantee fix
+(candidate 5 onward); on older servers authoring validation reports
+"Producer guarantees: (none)" for every later step. `--file-inject omit`
+leaves the step out for those servers. The composer refuses `file_inject`
+content written into the YAML, so there is no inline form.
+
+### Creating the session
+
+```bash
+python -m scripts.staging.large_graph_fixture --preset acceptance --out "$FIXTURE"
+python -m scripts.staging.composer_edit_battery setup --fixture "$FIXTURE" \
+  --base-url "$URL" --session "$NEW_SESSION" --account "$ACCOUNT" --execute
+```
+
+`--out` must be an empty directory outside the repository. Create a new,
+empty session in the Composer first; `setup` refuses a session that already
+has a graph. With `--execute` it uploads the source data and prompt files,
+imports `pipeline.yaml` with their bindings (`POST /state/yaml`, as a person
+importing YAML does), resolves each prompt review card as accepted only after
+checking that it belongs to one of the fixture's LLM steps and shows exactly
+the text uploaded for that step, and requires the graph to be valid with no
+review pending. A review of any other kind is left for you and setup fails.
+Without `--execute` it prints what it would upload and contacts nothing.
+
+The fixture directory's `manifest.json` lists every file with its digest, the
+positions and the measured sizes; the battery refuses a fixture whose files
+no longer match it.
 
 ## Run it against a local server
 
