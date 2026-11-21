@@ -69,17 +69,35 @@ class Blob:
     id: str
     filename: str
     data: bytes
+    mime_type: str = "text/plain"
+    # ``created_by`` and ``creation_modality`` as the blob listing reports them: an upload is
+    # ("user", "verbatim"); a file the Composer writes is ("assistant", ...).
+    created_by: str = "user"
+    creation_modality: str = "verbatim"
 
     def meta(self, session_id: str) -> JsonObject:
         return {
             "id": self.id,
             "session_id": session_id,
             "filename": self.filename,
-            "mime_type": "text/plain",
+            "mime_type": self.mime_type,
             "size_bytes": len(self.data),
             "content_hash": hashlib.sha256(self.data).hexdigest(),
             "status": "ready",
+            "created_by": self.created_by,
+            "creation_modality": self.creation_modality,
         }
+
+
+def _multipart_file(content_type: str, body: bytes) -> tuple[str, str, bytes]:
+    """``(filename, mime type, bytes)`` of the one ``file`` part of a ``multipart/form-data`` body, as WebClient.upload_file sends it."""
+    boundary = content_type.split("boundary=", 1)[1].encode()
+    part = body.split(b"--" + boundary)[1]
+    head, _, data = part.partition(b"\r\n\r\n")
+    filename = re.search(rb'filename="([^"]*)"', head)
+    mime = re.search(rb"Content-Type: ([^\r\n]+)", head)
+    assert filename is not None and mime is not None
+    return filename.group(1).decode(), mime.group(1).decode(), data.removesuffix(b"\r\n")
 
 
 @dataclass
@@ -123,7 +141,12 @@ class FakeDeployment:
         parsed = urllib.parse.urlsplit(url)
         assert f"{parsed.scheme}://{parsed.netloc}" == BASE_URL
         query = dict(urllib.parse.parse_qsl(parsed.query))
-        payload = json.loads(body) if body else None
+        content_type = headers["Content-Type"] if "Content-Type" in headers else ""
+        if body and content_type.startswith("multipart/form-data"):
+            filename, mime_type, data = _multipart_file(content_type, body)
+            payload: Any = {"upload": {"filename": filename, "mime_type": mime_type, "data": data}}
+        else:
+            payload = json.loads(body) if body else None
         self.requests.append((method, parsed.path, payload))
         if parsed.path == "/api/auth/login":
             if self.passwords.get(payload["username"]) != payload["password"]:
@@ -172,6 +195,11 @@ class FakeDeployment:
             return self._json(200, session.state)
         if key == ("GET", "/blobs"):
             return self._page([blob.meta(match.group(1)) for blob in session.blobs.values()], query)
+        if key == ("POST", "/blobs"):
+            upload = payload["upload"]
+            blob = Blob(id=str(uuid4()), filename=upload["filename"], data=upload["data"], mime_type=upload["mime_type"])
+            session.blobs[blob.id] = blob
+            return self._json(201, blob.meta(match.group(1)))
         blob_match = re.fullmatch(r"/blobs/([^/]+)/content", rest)
         if method == "GET" and blob_match is not None:
             return HttpResponse(status=200, body=session.blobs[blob_match.group(1)].data)

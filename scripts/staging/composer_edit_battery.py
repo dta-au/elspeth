@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import json
 import re
 import time
@@ -84,12 +85,18 @@ from scripts.staging.edit_plan import (
     DEFAULT_PLAN,
     MARKER_TEXTS,
     TEMPORARY_PREFIX,
+    FileContext,
     Plan,
     as_found_differences,
+    attachment_mime_type,
+    card_kind,
     check_expectations,
     classify_changes,
+    empty_state,
     escape,
+    expected_new_error,
     graph_view,
+    is_empty_graph,
     leftover_findings,
     load_plan,
     named_components,
@@ -102,6 +109,7 @@ from scripts.staging.edit_plan import (
     text_at,
     tool_findings,
     tool_warnings,
+    uses_files,
 )
 from scripts.staging.fixture_setup import setup_fixture
 from scripts.staging.large_graph_fixture import load_fixture
@@ -329,6 +337,9 @@ def summarise(checkpoint: Mapping[str, Any]) -> JsonObject:
         "longest_run": longest,
         "gold": gold,
         "all_passed": all_passed,
+        # The pass rule of a plan with pass_rule all_passed_as_found (the file-binding plan): every
+        # applicable edit judged and passed in one attempt, and the graph left as found.
+        "all_passed_as_found": all_passed and as_found == [],
         "gold_requires": (
             f"every applicable edit judged and passed in one attempt, at least {GOLD_MINIMUM_EDITS} applicable, "
             "and the graph left as it was found"
@@ -438,6 +449,8 @@ class EditBattery:
     # set END_REVIEW_VIEW_HEADER, and the count it carried.
     server_end_review_view: bool = field(default=False, init=False)
     end_review_rows_omitted: int = field(default=0, init=False)
+    # The files this attempt attached, by name: the checkpoint's ``uploads`` (file-binding plans).
+    uploads: dict[str, str] = field(default_factory=dict, init=False)
 
     def resolved_end_review_evidence(self) -> structural_cycle.EndReviewEvidence:
         """``auto`` is ``required`` on a server that has the END review view and ``if-recorded`` on one without."""
@@ -454,7 +467,55 @@ class EditBattery:
             self.client.refresh()
 
     def state(self) -> JsonObject:
-        return require_dict(self.client.get_json(f"/api/sessions/{self.session_id}/state"), "state")
+        """The session's graph; a session with no graph yet answers null, which stands for the empty pipeline."""
+        raw = self.client.get_json(f"/api/sessions/{self.session_id}/state")
+        if raw is None:
+            return empty_state()
+        return require_dict(raw, "state")
+
+    def file_context(self) -> FileContext:
+        return FileContext(uploads=dict(self.uploads), listing={item["id"]: item for item in self.session_files()})
+
+    def attach(self, checkpoint: JsonObject, edit: Mapping[str, Any]) -> None:
+        """Upload the edit's attachments, as the user would, before its message; each file id is saved before the message is sent.
+
+        A resumed run reuses a recorded upload, and also an upload it made but had not yet recorded
+        (a file of that name and content uploaded by the user since the attempt began), so no file is
+        uploaded twice.
+        """
+        if "attach" not in edit:
+            return
+        uploads: dict[str, str] = checkpoint["uploads"]
+        pending = [name for name in edit["attach"] if name not in uploads]
+        if not pending:
+            return
+        listing = self.session_files()
+        for name in pending:
+            data = self.plan.attachments[name]
+            digest = hashlib.sha256(data).hexdigest()
+            blob_id = next(
+                (
+                    item["id"]
+                    for item in listing
+                    if item["filename"] == name
+                    and item["content_hash"] == digest
+                    and item["created_by"] == "user"
+                    and item["id"] not in checkpoint["baseline_files"]
+                ),
+                None,
+            )
+            if blob_id is None:
+                uploaded = require_dict(
+                    self.client.upload_file(
+                        f"/api/sessions/{self.session_id}/blobs", filename=name, mime_type=attachment_mime_type(name), data=data
+                    ),
+                    "uploaded file",
+                )
+                blob_id = str(uploaded["id"])
+            uploads[name] = blob_id
+            self.uploads[name] = blob_id
+            self.store.write(self.name, checkpoint)
+            emit("file_attached", number=edit["number"], id=edit["id"], filename=name, file_id=blob_id, bytes=len(data))
 
     def require_auto_commit(self) -> None:
         preferences = require_dict(self.client.get_json(f"/api/sessions/{self.session_id}/composer/preferences"), "preferences")
@@ -555,6 +616,7 @@ class EditBattery:
         if checkpoint is not None:
             if self.overrides and self.overrides != checkpoint["targets"]["overrides"]:
                 raise OperationFailed("--target values differ from the ones this attempt started with")
+            self.uploads = dict(checkpoint["uploads"]) if "uploads" in checkpoint else {}
             return checkpoint
         baseline = self.state()
         leftovers = leftover_findings(baseline, self.read_text)
@@ -564,13 +626,25 @@ class EditBattery:
                 + ", ".join(leftovers)
                 + ". Run the cleanup action to report or remove them, then start again."
             )
+        if self.plan.start == "empty" and not is_empty_graph(baseline):
+            raise OperationFailed(
+                f"plan {self.plan.name} starts from an empty pipeline and this session's graph is not empty; create a new session for it"
+            )
+        files_before = self.session_files() if self.plan.attachments else None
+        clashing = sorted({item["filename"] for item in files_before or []} & set(self.plan.attachments))
+        if clashing:
+            raise OperationFailed(
+                "this session already holds files named as the plan's attachments ("
+                + ", ".join(clashing)
+                + "), so a message naming one would be ambiguous; create a new session for the plan"
+            )
         counts: JsonObject | None = None
         if self.plan.verifier == structural_cycle.VERIFIER:
             args = self.plan.verifier_args
             counts = structural_cycle.check_fixture(baseline, positions=[Position.from_json(entry) for entry in args["positions"]])
         targets = resolve_targets(self.plan, baseline, self.overrides)
         rows = self.rows_from(0)
-        baseline_files = sorted(item["id"] for item in self.session_files())
+        baseline_files = sorted(item["id"] for item in (files_before if files_before is not None else self.session_files()))
         edits = resolve_edits(self.plan, targets, baseline)
         checkpoint = {
             "version": CHECKPOINT_VERSION,
@@ -589,6 +663,9 @@ class EditBattery:
         }
         if counts is not None:
             checkpoint["baseline_graph_counts"] = counts
+        if self.plan.attachments:
+            checkpoint["uploads"] = {}
+            self.uploads = {}
         self.store.write(self.name, checkpoint)
         emit(
             "edit_battery_started",
@@ -601,11 +678,14 @@ class EditBattery:
 
     def approve_reviews(
         self, edit: Mapping[str, Any], state: Mapping[str, Any], approved: list[JsonObject], save: Callable[[], None]
-    ) -> None:
-        """Resolve the edit's own prompt review cards, each checked against the node's current prompt.
+    ) -> list[str]:
+        """Resolve the edit's own prompt review cards, each checked against the node's current prompt; return card findings.
 
         Each approval is saved (``save``) as soon as it is made, so a resumed run counts it.
+        When the edit names a ``card`` kind, a card of another kind is a finding and is not
+        approved (:func:`~scripts.staging.edit_plan.card_kind`).
         """
+        findings: list[str] = []
         approve = edit["approve"]
         nodes = {node["id"]: node for node in state["nodes"]}
         for event in self.pending_reviews():
@@ -627,12 +707,16 @@ class EditBattery:
             for binding in bindings:
                 if binding["text"] != self.read_text({"blob_ref": binding["blob_id"]}):
                     raise OperationFailed(f"review {event['id']} shows text that differs from file {binding['blob_id']}; not approved")
+            if "card" in approve and card_kind(snapshot) != approve["card"]:
+                findings.append(f"review_card_kind:{approve['node']}:expected_{approve['card']}:shown_{card_kind(snapshot)}")
+                continue
             self.client.post_json(
                 f"/api/sessions/{self.session_id}/interpretations/{event['id']}/resolve",
                 {"choice": "accepted_as_drafted", "reviewed_anchor": snapshot["anchor"]},
             )
             approved.append({"event_id": event["id"], "kind": event["kind"], "node_id": approve["node"]})
             save()
+        return findings
 
     def pending_reviews(self) -> list[JsonObject]:
         events = require_dict(self.client.get_json(f"/api/sessions/{self.session_id}/interpretations?status=pending"), "reviews")["events"]
@@ -650,7 +734,8 @@ class EditBattery:
         and the node whose card it approves.
         """
         before, after = graph_view(before_state), graph_view(after_state)
-        failures, covered = check_expectations(edit, before, after, graph_view(baseline_state), self.read_text)
+        files = self.file_context() if uses_files(edit) else None
+        failures, covered = check_expectations(edit, before, after, graph_view(baseline_state), self.read_text, files=files)
         named = named_components(edit) | ({edit["approve"]["node"]} if edit["approve"] is not None else set())
         changes = classify_changes(before, after, [*covered, *edit["may_change"]], named=named)
         return failures, changes.unrelated, changes.server_written
@@ -701,8 +786,11 @@ class EditBattery:
             warnings.extend(new_component_notes(edit, graph_view(before_state), graph_view(after_state)))
             if edit["approve"] is not None and not findings:
                 # Only a turn with a clean verdict earns an approval; the approval may change server-written fields only.
-                self.approve_reviews(edit, after_state, approved, save)
-                if not approved:
+                findings.extend(self.approve_reviews(edit, after_state, approved, save))
+                if not approved and "card" in edit["approve"]:
+                    # An edit that names the card kind requires the card: binding a prompt file always opens one.
+                    findings.append(f"expected_review_card_missing:{edit['approve']['node']}")
+                elif not approved:
                     warnings.append("no_pending_review_card_to_approve")
                 approved_state = self.state()
                 approval = classify_changes(graph_view(after_state), graph_view(approved_state), [], named={edit["approve"]["node"]})
@@ -712,7 +800,11 @@ class EditBattery:
                 failures, _, _ = self.judge(edit, baseline_state, before_state, after_state)
                 findings.extend("after_approval:" + failure for failure in failures)
                 # Every validation error new since the turn began, the deferred one included, fails the edit now.
-                findings.extend("after_approval:new_validation_error:" + key for key in new_validation_errors(before_state, after_state))
+                findings.extend(
+                    "after_approval:new_validation_error:" + key
+                    for key in new_validation_errors(before_state, after_state)
+                    if not expected_new_error(edit, key)
+                )
             else:
                 findings.extend(deferred)
         fields: JsonObject = {
@@ -759,6 +851,9 @@ class EditBattery:
         findings.extend(failures)
         findings.extend("unrelated_change:" + path for path in unrelated)
         for key in new_validation_errors(before_state, after_state):
+            if expected_new_error(edit, key):
+                # A code the edit lists in new_errors: the change it asks for brings this error (an emptied pipeline).
+                continue
             if deferred is not None and _is_the_approved_review(edit, key):
                 deferred.append("new_validation_error:" + key)
             else:
@@ -795,7 +890,14 @@ class EditBattery:
             live = self.state()
             if differences(graph_view(live), graph_view(checkpoint["last_state"])):
                 raise OperationFailed("the live graph changed outside the battery; start a new --attempt")
-            already = preconditions(edit, graph_view(live), graph_view(checkpoint["baseline"]), self.read_text)
+            self.attach(checkpoint, edit)
+            already = preconditions(
+                edit,
+                graph_view(live),
+                graph_view(checkpoint["baseline"]),
+                self.read_text,
+                files=self.file_context() if uses_files(edit) else None,
+            )
             if already:
                 return self.not_sent(checkpoint, edit, live, already)
             results.append({"number": edit["number"], "id": edit["id"], "operation_id": str(uuid4()), "base_state_id": live["id"]})
@@ -1330,9 +1432,11 @@ def main(
             expected_tools=plan.expected_tools(),
             forbidden_tools=list(plan.forbidden_tools),
             tool_coverage=plan_coverage(plan),
+            **({"start": plan.start, "pass_rule": plan.pass_rule, "attachments": sorted(plan.attachments)} if plan.attachments else {}),
         )
         for number, edit in enumerate(plan.edits, start=1):
-            emit("planned_edit", number=number, id=edit["id"], message=edit["message"], roles=sorted(plan.roles_of(edit)))
+            extra: JsonObject = {"attach": edit["attach"]} if "attach" in edit else {}
+            emit("planned_edit", number=number, id=edit["id"], message=edit["message"], roles=sorted(plan.roles_of(edit)), **extra)
         return 0
     session_id = require_uuid(setting(args.session, flag="--session", env="ELSPETH_OPS_SESSION"), flag="--session")
     if args.action == "setup":
@@ -1392,8 +1496,11 @@ def main(
     if args.action == "cleanup":
         return cleanup(battery)
     summary = battery.run()
-    # A plan file passes on gold; a workload passes, as the reference runner does, when every requested step passed.
-    return 0 if (summary["all_passed"] if plan.verifier is not None else summary["gold"]) else 1
+    # A plan file passes on gold (or, with pass_rule all_passed_as_found, on every edit passed and the
+    # graph left as found); a workload passes, as the reference runner does, when every requested step passed.
+    if plan.verifier is not None:
+        return 0 if summary["all_passed"] else 1
+    return 0 if summary["all_passed_as_found" if plan.pass_rule == "all_passed_as_found" else "gold"] else 1
 
 
 if __name__ == "__main__":
