@@ -300,7 +300,7 @@ from elspeth.web.sessions.prompt_file_approval import (
     PromptFileApprovalRequest,
     PromptFileApprovalStale,
     assert_prompt_file_approvals,
-    record_prompt_file_approval,
+    record_prompt_file_card_approvals,
 )
 from elspeth.web.sessions.prompt_file_review import (
     PromptFileReviewStale,
@@ -5516,9 +5516,13 @@ class SessionServiceImpl:
                             raise PromptFileReviewStale(node_id=event_row.affected_node_id) from exc
                         if file_snapshot is None:
                             raise PromptFileApprovalStale()
-                        for binding in file_snapshot.bindings:
-                            approval = record_prompt_file_approval(
-                                conn,
+                        # One pass for the whole card: the node, its snapshot
+                        # (every file's bytes) and the card are verified once;
+                        # each binding's blob row, marker and snapshot entry per
+                        # binding. Per-binding re-resolution was O(N^2) here.
+                        record_prompt_file_card_approvals(
+                            conn,
+                            [
                                 PromptFileApprovalRequest(
                                     session_id=session_id,
                                     node_id=event_row.affected_node_id,
@@ -5527,11 +5531,12 @@ class SessionServiceImpl:
                                     content_sha256=binding.content_sha256,
                                     actor_user_id=principal_user_id,
                                     trigger=PromptApprovalTrigger.CARD,
-                                ),
-                                now=now,
-                            )
-                            if approval.event_id != event_id:
-                                raise PromptFileApprovalStale()
+                                )
+                                for binding in file_snapshot.bindings
+                            ],
+                            now=now,
+                            expected_event_id=event_id,
+                        )
                     # Skeleton the user actually reviewed (the surfacing state's
                     # node). The acceptance gate compares this to the live
                     # skeleton so a sibling vague_term baked between surfacing and

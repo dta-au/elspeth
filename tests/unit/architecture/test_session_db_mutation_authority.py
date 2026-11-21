@@ -648,6 +648,13 @@ _NAMED_AUTHORITY_SYMBOLS: tuple[AuthoritySymbol, ...] = (
         "record_prompt_file_approval",
         "SessionInterpretationAuthority",
     ),
+    # The card resolve approves all of a card's file bindings in one pass under
+    # the same caller-held, session-locked connection (0.8.16 card-approval fix).
+    AuthoritySymbol(
+        "src/elspeth/web/sessions/prompt_file_approval.py",
+        "record_prompt_file_card_approvals",
+        "SessionInterpretationAuthority",
+    ),
     # P4-D6 family A2b (elspeth-99949c96ca): the two SHARED row writers are the
     # SessionMutationAuthority boundary itself, not a facet behind one. Each
     # takes a required ``session_operation_context`` and proves it live on the
@@ -1515,7 +1522,21 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="25d067430d78e918",
         ordinal=1,
         authority="SessionInterpretationAuthority",
-        line=274,
+        line=284,
+    ),
+    # A card resolve writes the same approval row shape for every file binding
+    # of the card in one pass (the per-binding loop re-resolved the snapshot
+    # per binding, O(N^2) under the session lock). Same registered
+    # SessionInterpretationAuthority boundary, same caller-held connection.
+    WriterIdentity(
+        path="src/elspeth/web/sessions/prompt_file_approval.py",
+        symbol="record_prompt_file_card_approvals",
+        table="prompt_file_approvals",
+        operation="insert",
+        fingerprint="77d195e2763385c0",
+        ordinal=1,
+        authority="SessionInterpretationAuthority",
+        line=433,
     ),
     # An editor save that approves the whole pending surface retires the
     # pending prompt card in the same transaction as the approval row above
@@ -1530,7 +1551,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="c2f3cb9cac30a37c",
         ordinal=1,
         authority="SessionInterpretationAuthority",
-        line=293,
+        line=303,
     ),
     # Durable output bytes are reserved and reclaimed by the fenced blob facet.
     WriterIdentity(
@@ -1667,7 +1688,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "d3d44124ea706a23",
         1,
         "SessionComposerMutationAuthority",
-        line=9472,
+        line=9477,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -1677,7 +1698,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "d3d44124ea706a23",
         1,
         "SessionComposerMutationAuthority",
-        line=9483,
+        line=9488,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -1687,7 +1708,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "31d3aae13a5ff8a2",
         1,
         "SessionComposerMutationAuthority",
-        line=9505,
+        line=9510,
     ),
     WriterIdentity(
         path="src/elspeth/web/sessions/service.py",
@@ -4758,7 +4779,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="67270dd69f914f16",
         ordinal=1,
         authority="SessionComposerMutationAuthority",
-        line=8335,
+        line=8340,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4769,7 +4790,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="67270dd69f914f16",
         ordinal=1,
         authority="SessionComposerMutationAuthority",
-        line=8324,
+        line=8329,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4780,7 +4801,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="c459564fff2f29ce",
         ordinal=1,
         authority="SessionForkAuthority",
-        line=9047,
+        line=9052,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4791,7 +4812,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="c459564fff2f29ce",
         ordinal=2,
         authority="SessionForkAuthority",
-        line=9078,
+        line=9083,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4802,7 +4823,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="c459564fff2f29ce",
         ordinal=1,
         authority="SessionForkAuthority",
-        line=9058,
+        line=9063,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4813,7 +4834,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="c459564fff2f29ce",
         ordinal=1,
         authority="SessionForkAuthority",
-        line=9090,
+        line=9095,
         connection_escape=False,
     ),
     WriterIdentity(
