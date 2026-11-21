@@ -40,9 +40,12 @@ def test_file_prompt_over_the_bound_is_refused_by_position_size_and_limit(tmp_pa
 
     assert not result.is_valid
     (error,) = result.errors
-    assert (
-        f"prompt_template is {LIMIT + 1} bytes; the limit for one prompt template is {LIMIT} bytes. "
-        "Shorten it, or move reference text into a file_inject step and read it from the row."
-    ) in error.message
-    assert "Invalid Jinja2 template" not in error.message
-    assert {check.name: check.passed for check in result.checks}["plugin_instantiation"] is False
+    # Refused once the file's text is resolved, before plugin construction, so
+    # the entry names the step, not the plugin.
+    assert (error.component_id, error.error_code, error.message) == (
+        "classify",
+        "plugin_options_invalid",
+        f"prompt_template on step classify is {LIMIT + 1} bytes; the limit for one prompt template is {LIMIT} bytes. "
+        "Shorten it, or move reference text into a file_inject step and read it from the row.",
+    )
+    assert {check.name: check.passed for check in result.checks}["blob_inline_refs"] is False
