@@ -49,6 +49,7 @@ from tests.unit.web.sessions.test_carry_terms_across_wording_edits import (
     PROMPT_REVIEW,
     TWO_TERM_ROWS,
     _approved_session,
+    _carry_service,
     _errors,
     _options,
     _patch,
@@ -60,7 +61,11 @@ from tests.unit.web.sessions.test_carry_terms_across_wording_edits import (
 )
 from tests.unit.web.sessions.test_prompt_file_approval import _pending_file_review
 
-pytest_plugins = ("tests.unit.web.sessions.test_carry_terms_across_wording_edits",)
+
+@pytest.fixture
+def service() -> SessionServiceImpl:
+    return _carry_service()
+
 
 blob_env = blob_tools.blob_env
 

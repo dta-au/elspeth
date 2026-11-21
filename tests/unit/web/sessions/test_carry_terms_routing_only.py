@@ -25,13 +25,18 @@ from tests.unit.web.sessions.test_carry_terms_across_wording_edits import (
     PROMPT_CARD,
     _approved_session,
     _cards,
+    _carry_service,
     _edit_part,
     _errors,
     _rows,
     _sent_prompt,
 )
 
-pytest_plugins = ("tests.unit.web.sessions.test_carry_terms_across_wording_edits",)
+
+@pytest.fixture
+def service() -> SessionServiceImpl:
+    return _carry_service()
+
 
 ROUTES = (
     {"id": NODE, "node_type": "transform", "input": "rows", "routing_only": True},

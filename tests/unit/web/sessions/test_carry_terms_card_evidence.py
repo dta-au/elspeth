@@ -37,6 +37,7 @@ from tests.unit.web.sessions.test_carry_terms_across_wording_edits import (
     TWO_TERM_ROWS,
     _approved_session,
     _cards,
+    _carry_service,
     _edit_part,
     _errors,
     _patch,
@@ -46,7 +47,10 @@ from tests.unit.web.sessions.test_carry_terms_across_wording_edits import (
 )
 from tests.unit.web.sessions.test_routes import _make_app
 
-pytest_plugins = ("tests.unit.web.sessions.test_carry_terms_across_wording_edits",)
+
+@pytest.fixture
+def service() -> SessionServiceImpl:
+    return _carry_service()
 
 
 async def _slot_values(session: _Session, card: InterpretationEventRecord) -> dict[str, str | None]:

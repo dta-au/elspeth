@@ -17,6 +17,11 @@ from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.tools._common import _serialize_set_pipeline_arguments
 from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
 from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.interpretation_state import (
+    InterpretationReviewPending,
+    approved_prompt_artifact_hash_from_options,
+    materialize_state_for_execution,
+)
 from tests.unit.web.composer import _helpers as composer_helpers
 from tests.unit.web.composer.test_compose_loop_persistence import _text_response, _tool_batch_response
 from tests.unit.web.composer.test_prompt_patch_reviews import _amended_approved_state
@@ -186,9 +191,16 @@ async def test_new_semantics_after_refusal_still_require_fresh_review():
     )
     outcome = result.tool_outcomes_for_assertion[1]
     assert outcome.response.success and handlers == ["upsert_node", "patch_node_options"]
-    reviews = outcome.response.updated_state.nodes[0].options["interpretation_requirements"]
+    updated = outcome.response.updated_state
+    reviews = updated.nodes[0].options["interpretation_requirements"]
     assert next(row for row in reviews if row["kind"] == "llm_prompt_template")["status"] == "pending"
-    assert "approved_prompt_artifact_hash" not in outcome.response.updated_state.nodes[0].options
+    # The accepted terms are carried across the wording edit, so their evidence
+    # derives an artifact identity for the edited prompt. It is not the approved
+    # one, and the pending prompt review still refuses the run.
+    edited = updated.nodes[0].options
+    assert edited["approved_prompt_artifact_hash"] == approved_prompt_artifact_hash_from_options(edited)
+    assert edited["approved_prompt_artifact_hash"] != state.nodes[0].options["approved_prompt_artifact_hash"]
+    assert isinstance(materialize_state_for_execution(updated), InterpretationReviewPending)
 
 
 @pytest.mark.asyncio

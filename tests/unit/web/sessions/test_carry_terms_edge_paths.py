@@ -47,6 +47,7 @@ from tests.unit.web.sessions.test_carry_terms_across_wording_edits import (
     _assert_two_terms_resolved_as_the_user_left_them,
     _card_text,
     _cards,
+    _carry_service,
     _edit_part,
     _errors,
     _padded_first_text,
@@ -60,7 +61,10 @@ from tests.unit.web.sessions.test_carry_terms_across_wording_edits import (
 )
 from tests.unit.web.sessions.test_routes import _make_app
 
-pytest_plugins = ("tests.unit.web.sessions.test_carry_terms_across_wording_edits",)
+
+@pytest.fixture
+def service() -> SessionServiceImpl:
+    return _carry_service()
 
 
 @pytest.mark.asyncio

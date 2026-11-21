@@ -100,13 +100,18 @@ ONE_TERM_ROWS: list[dict[str, str]] = TWO_TERM_ROWS[:1]
 PROVENANCE = {"model_identifier": "test-model", "model_version": "1", "provider": "test-provider", "composer_skill_hash": "a" * 64}
 
 
-@pytest.fixture
-def service() -> SessionServiceImpl:
+def _carry_service() -> SessionServiceImpl:
+    """The fenced in-memory session harness these carry tests share; each module wraps it in its own ``service`` fixture."""
     engine = create_session_engine("sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
     return FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("carry-terms-test"))
+
+
+@pytest.fixture
+def service() -> SessionServiceImpl:
+    return _carry_service()
 
 
 @asynccontextmanager
