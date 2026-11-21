@@ -23,7 +23,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from elspeth.contracts.blobs import BlobIntegrityError, BlobRecord
+from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
@@ -32,7 +32,6 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.service import CatalogServiceImpl
 from elspeth.web.composer import composer_preflight as preflight_module
 from elspeth.web.composer.discovery_cache import RuntimePreflightCache
-from elspeth.web.composer.protocol import ComposerRuntimePreflightError
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.execution.schemas import ValidationResult
@@ -382,7 +381,10 @@ async def test_a_plain_file_appearing_at_the_sink_path_does_not_change_the_verdi
 # F2 with the real content read: stored bytes rewritten in place, mtime restored.
 
 
-async def test_stored_bytes_rewritten_with_the_mtime_restored_raise_as_a_fresh_compute_does(real: _RealRig) -> None:
+async def test_stored_bytes_rewritten_with_the_mtime_restored_are_refused_as_a_fresh_compute_refuses_them(real: _RealRig) -> None:
+    # Damaged stored bytes are a validation violation on the file, not an error
+    # (the bound-file damage fix); the reuse must not hide it and must agree
+    # with a fresh compute.
     await real.cached()
     stat = real.table.stat()
     body = real.table.read_bytes()
@@ -390,13 +392,12 @@ async def test_stored_bytes_rewritten_with_the_mtime_restored_raise_as_a_fresh_c
         handle.write(body.upper())
     os.utime(real.table, ns=(stat.st_atime_ns, stat.st_mtime_ns))
 
-    with pytest.raises(ComposerRuntimePreflightError) as reused:
-        await real.cached()
-    with pytest.raises(BlobIntegrityError):
-        real.fresh()
+    reused = await real.cached()
 
-    assert type(reused.value.original_exc) is BlobIntegrityError
     assert real.computes.calls == 2
+    assert reused == real.fresh()
+    assert reused.is_valid is False
+    assert any("stored file content does not match its record" in message for message in _error_messages(reused))
 
 
 async def test_a_row_change_seen_only_by_the_content_read_is_not_stored(real: _RealRig) -> None:
