@@ -768,6 +768,30 @@ class TestBuildSystemPrompt:
         assert "use the plugin's diagnostics and live authority" in flattened
         assert "Do not stop by saying the source contract is incomplete" in flattened
 
+    def test_core_skill_does_not_re_request_a_card_already_waiting_on_unchanged_content(self) -> None:
+        """Edit battery 2026-11-21: 11 pending cards were re-requested on every later edit.
+
+        The server reused each existing event, so only turn time was lost
+        (10-22 s became 54-91 s per edit). A card an earlier turn raised for
+        unchanged content is still waiting; newly staged or changed
+        requirements must all still be requested.
+        """
+        flattened = " ".join(build_system_prompt(None).split())
+
+        enumerate_rule = "Before stopping, enumerate pending `interpretation_requirements` from the source and from every node"
+        exception = (
+            "Do not request again a requirement whose card an earlier turn already raised when this turn changed neither "
+            "its component nor, for `prompt_injection_shield_recommendation`, any step upstream of it: that card is still waiting."
+        )
+        assert enumerate_rule in flattened and exception in flattened
+        assert flattened.index(enumerate_rule) < flattened.index(exception)
+        assert "Request every requirement this turn staged or changed." in flattened
+        assert "do not stop after surfacing only a subset" in flattened
+        assert (
+            "every caller-owned pending interpretation_requirement has a matching call, except one whose card an earlier "
+            "turn raised for unchanged content;" in flattened
+        )
+
     def test_core_skill_requires_uploaded_blob_discovery_before_mutation(self) -> None:
         """Uploaded files must be discovered and handled according to their role."""
         result = build_system_prompt(None)

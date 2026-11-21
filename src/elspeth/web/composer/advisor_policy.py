@@ -295,11 +295,15 @@ ADVISOR_OUTPUT_CONTRACT_CLAUSE: Final[str] = (
 # A user-requested explanation or pause remains conversational. Suspected
 # inability to finish an authorized build uses the structured advisor decision;
 # a large remaining graph must not become a self-selected checkpoint.
+# The findings to resolve are those on what this turn changed: an edit battery
+# turned a one-step insertion into 22 calls on 11 unnamed LLM steps because a
+# pre-existing graph-wide condition counted as "applicable" (2026-11-21).
 # Trailing space is load-bearing: the two clauses concatenate.
 ADVISOR_MUTATION_EXPECTATION_CLAUSE: Final[str] = (
-    "If the user's active request authorizes changes, resolve applicable graph findings through pipeline MUTATIONS via tool calls "
-    "(e.g. patch_node_options, upsert_node, patch_source_options, "
-    "patch_output_options). Re-reading state (get_pipeline_state) or other "
+    "If the user's active request authorizes changes, resolve the findings on what this turn changed through pipeline MUTATIONS "
+    "via tool calls (e.g. patch_node_options, upsert_node, patch_source_options, "
+    "patch_output_options). A condition only on steps this turn did not change and the request did not name is "
+    "pre-existing: do not change those steps for it; report it once in your reply. Re-reading state (get_pipeline_state) or other "
     "lookup-only calls is not a fix, though they can supply evidence. If a finding contradicts supplied evidence or binding contracts, "
     "state that evidence in a reply that stands on its own for the user; do not change correct content or make no-op edits "
     "to obtain another pass. "
