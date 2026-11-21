@@ -1697,7 +1697,15 @@ class _SessionPendingInterpretationValidator:
         self.__user_id = user_id
 
     def assert_source_state(self, snapshot: SessionPendingInterpretationSnapshot) -> None:
-        """Refuse a candidate derived from different locked state rows."""
+        """Refuse a candidate derived from different locked state rows.
+
+        The expected pair is the service's STORED preflight read
+        (``_preflight_state_pair(graph_review="stored")``): the raw rows the
+        inline blob snapshot and validation came from. ``snapshot`` holds the
+        coordination repository's raw locked reads (``_verified_state``),
+        which never project a committed graph review, so both sides are the
+        same kind of record and strict equality proves they are the same rows.
+        """
         if self.__expected_anchor is not None and snapshot.anchor_state != self.__expected_anchor:
             raise AuditIntegrityError("pending interpretation anchor changed after inline blob snapshot")
         if self.__expected_live is not None and snapshot.live_state != self.__expected_live:
