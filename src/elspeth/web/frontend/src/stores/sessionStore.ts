@@ -1016,7 +1016,6 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   async createSession() {
-    detachComposerObservers();
     let session;
     try {
       session = await api.createSession();
@@ -1037,6 +1036,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       });
       return;
     }
+    // Detach only once the new session exists: a failed create must leave the
+    // current session's in-flight turn observed.
+    detachComposerObservers();
     clearComposerProgressPollTimer();
     clearInflightMessagesPollTimer();
     advanceSessionPublicationGeneration();
