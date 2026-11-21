@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.web.interpretation_state import (
@@ -44,6 +45,7 @@ from tests.unit.web.sessions.test_carry_terms_across_wording_edits import (
     _Session,
     service,  # noqa: F401  (fixture)
 )
+from tests.unit.web.sessions.test_routes import _make_app
 
 
 async def _slot_values(session: _Session, card: InterpretationEventRecord) -> dict[str, str | None]:
@@ -191,3 +193,83 @@ async def test_a_prompt_card_can_be_approved_while_a_term_is_pending_and_is_not_
     assert await session.pending() == []
     assert await session.commit(session.state) == []
     assert _sent_prompt(session.state) == f"Classify {{{{ row.text }}}} into {CATEGORY_DRAFT} for {AUDIENCE_AMENDED}."
+
+
+@pytest.mark.asyncio
+async def test_the_routes_send_the_client_each_slot_event_id_and_that_event_accepted_value(tmp_path: Path) -> None:
+    """What the web client can fetch for a prompt card opened by a carried edit.
+
+    ``GET /api/sessions/{id}/interpretations/{event_id}/prompt`` returns the
+    stored snapshot: each slot with the id of the term event it names.
+    ``GET /api/sessions/{id}/interpretations?status=all`` returns that event
+    with its ``accepted_value`` and ``choice``.
+    """
+    app, sessions = _make_app(tmp_path)
+    session = await _approved_session(sessions, tmp_path)
+    edited = _edit_part(session, "Classify", "Sort")
+    assert edited.success, _errors(edited)
+    opened = await session.commit(edited.updated_state)
+    assert _cards(opened) == [PROMPT_CARD]
+    rows = _rows(session.state)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        snapshot_response = await client.get(f"/api/sessions/{session.id}/interpretations/{opened[0].id}/prompt")
+        pending_response = await client.get(f"/api/sessions/{session.id}/interpretations", params={"status": "pending"})
+        all_response = await client.get(f"/api/sessions/{session.id}/interpretations", params={"status": "all"})
+    assert snapshot_response.status_code == 200, snapshot_response.text
+    assert pending_response.status_code == 200, pending_response.text
+    assert all_response.status_code == 200, all_response.text
+
+    # The open card, as listed: its bounded text carries both accepted values.
+    pending_events = pending_response.json()["events"]
+    assert [(event["kind"], event["id"]) for event in pending_events] == [("llm_prompt_template", str(opened[0].id))]
+    expected_prompt = f"Sort {{{{ row.text }}}} into {CATEGORY_DRAFT} for {AUDIENCE_AMENDED}."
+    assert pending_events[0]["llm_draft"].endswith(expected_prompt)
+
+    # Its snapshot: the rendered prompt, and each slot naming the original term event.
+    surface = snapshot_response.json()["authored_surface"]
+    assert surface["prompt_template"] == expected_prompt
+    assert surface[INTERPRETATION_REQUIREMENTS_KEY] == [
+        {"id": CATEGORY, "event_id": rows[CATEGORY]["event_id"], "user_term": "category"},
+        {"id": AUDIENCE, "event_id": rows[AUDIENCE]["event_id"], "user_term": "audience"},
+    ]
+
+    # The events those ids name, as the client receives them.
+    by_id = {event["id"]: event for event in all_response.json()["events"]}
+    category_event = by_id[rows[CATEGORY]["event_id"]]
+    audience_event = by_id[rows[AUDIENCE]["event_id"]]
+    assert (category_event["kind"], category_event["user_term"], category_event["accepted_value"], category_event["choice"]) == (
+        "vague_term",
+        "category",
+        CATEGORY_DRAFT,
+        "accepted_as_drafted",
+    )
+    assert (audience_event["kind"], audience_event["user_term"], audience_event["accepted_value"], audience_event["choice"]) == (
+        "vague_term",
+        "audience",
+        AUDIENCE_AMENDED,
+        "amended",
+    )
+    assert audience_event["llm_draft"] == AUDIENCE_DRAFT
+
+
+@pytest.mark.asyncio
+async def test_a_re_drafted_term_has_no_event_on_the_new_prompt_card_while_the_carried_term_does(
+    service: SessionServiceImpl,  # noqa: F811
+    tmp_path: Path,
+) -> None:
+    """One edit re-drafts ``category`` (not carried) and leaves ``audience`` alone (carried)."""
+    session = await _approved_session(service, tmp_path)
+    rows = [{"kind": "vague_term", "user_term": "category", "draft": "narrow categories"}, TWO_TERM_ROWS[1]]
+    parts = [{"kind": "text", "text": "Sort {{ row.text }} into "}, *TWO_TERM_PARTS[1:]]
+    edited = _patch(session.state, {"prompt_template_parts": parts, INTERPRETATION_REQUIREMENTS_KEY: rows})
+    assert edited.success, _errors(edited)
+    opened = await session.commit(edited.updated_state)
+
+    assert _cards(opened) == [PROMPT_CARD, ("vague_term", "category")]
+    prompt_card = next(event for event in opened if event.kind is InterpretationKind.LLM_PROMPT_TEMPLATE)
+    assert await _slot_values(session, prompt_card) == {CATEGORY: None, AUDIENCE: AUDIENCE_AMENDED}
+    live = _rows(session.state)
+    assert (live[CATEGORY]["status"], live[CATEGORY]["accepted_value"], live[CATEGORY]["draft"]) == ("pending", None, "narrow categories")
+    term_card = next(event for event in opened if event.user_term == "category")
+    assert term_card.llm_draft == "narrow categories"
