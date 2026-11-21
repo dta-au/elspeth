@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from scripts.staging.turn_evidence import shed_state, shed_this_turn, turn_evidence
+from scripts.staging.turn_evidence import operation_rows, shed_state, shed_this_turn, turn_evidence
 
 OP = "op-1"
 
@@ -36,9 +36,24 @@ def tool(name: str, outcome: str | None) -> dict[str, Any]:
 def rows(*audit: dict[str, Any], tools: list[dict[str, Any]] | None = None, operation: str = OP) -> list[dict[str, Any]]:
     result = [{"role": "user", "operation_id": operation, "tool_calls": None, "created_at": "2026-01-01T00:00:00+00:00"}]
     if tools:
-        result.append({"role": "assistant", "operation_id": operation, "tool_calls": tools, "created_at": "2026-01-01T00:00:01+00:00"})
-    result.append({"role": "audit", "operation_id": operation, "tool_calls": list(audit), "created_at": "2026-01-01T00:00:10+00:00"})
+        result.append({"role": "assistant", "operation_id": None, "tool_calls": tools, "created_at": "2026-01-01T00:00:01+00:00"})
+    result.append({"role": "audit", "operation_id": None, "tool_calls": list(audit), "created_at": "2026-01-01T00:00:10+00:00"})
     return result
+
+
+def test_a_turn_is_its_stamped_user_row_and_the_unstamped_rows_after_it_up_to_the_next_turn() -> None:
+    # As the live server: only the user row that opened a turn carries its operation id.
+    before = [{"role": "user", "operation_id": "op-0", "n": 0}, {"role": "audit", "operation_id": None, "n": 1}]
+    turn = [
+        {"role": "user", "operation_id": OP, "n": 2},
+        {"role": "assistant", "operation_id": None, "n": 3},
+        {"role": "user", "operation_id": None, "n": 4},  # a backend control event opens no turn
+        {"role": "audit", "operation_id": None, "n": 5},
+    ]
+    after = [{"role": "user", "operation_id": "op-2", "n": 6}, {"role": "audit", "operation_id": None, "n": 7}]
+    assert [row["n"] for row in operation_rows([*before, *turn, *after], OP)] == [2, 3, 4, 5]
+    assert operation_rows([*before, *after], OP) == []
+    assert [row["n"] for row in operation_rows(turn, OP)] == [2, 3, 4, 5]
 
 
 def test_provider_time_is_the_union_of_call_intervals_and_server_time_the_rest_of_the_span() -> None:
@@ -243,7 +258,7 @@ def tool_row(name: str, started: str | None, finished: str | None, *, latency: i
         invocation["latency_ms"] = latency
     return {
         "role": "tool",
-        "operation_id": OP,
+        "operation_id": None,
         "tool_calls": [{"_kind": "audit", "invocation": invocation}],
         "created_at": "2026-01-01T00:00:06+00:00",
     }

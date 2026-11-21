@@ -74,6 +74,7 @@ from scripts.staging.opslib import (
     token_expiry,
 )
 from scripts.staging.repair_copied_prompt_reviews import checkpoint_name as review_checkpoint_name
+from scripts.staging.turn_evidence import operation_rows
 
 REPAIR_INSTRUCTION = (
     "Revalidate this copied graph and resolve its saved validation errors. If the current validator passes, refresh the "
@@ -206,8 +207,8 @@ def provider_evidence(client: WebClient, session_id: str, operation_id: str) -> 
     rows = list_pages(client, f"/api/sessions/{session_id}/messages?include_llm_audit=true&include_tool_rows=true")
     calls: list[JsonObject] = []
     tools: list[str] = []
-    for row in rows:
-        if row["operation_id"] != operation_id or row["tool_calls"] is None:
+    for row in operation_rows(rows, operation_id):
+        if row["tool_calls"] is None:
             continue
         for entry in row["tool_calls"]:
             if row["role"] == "audit" and "_kind" in entry and entry["_kind"] == "llm_call_audit":

@@ -130,7 +130,23 @@ def busy_ms(intervals: Sequence[tuple[datetime, datetime]]) -> int:
 
 
 def operation_rows(rows: Sequence[Mapping[str, Any]], operation_id: str) -> list[Mapping[str, Any]]:
-    return [row for row in rows if row["operation_id"] == operation_id]
+    """One turn's rows: its user row and every row after it, up to the next turn's user row.
+
+    The server stamps a turn's operation id only on the user row that opened it (joined from that
+    message's ingress receipt); the turn's assistant, tool and audit rows carry ``null`` and follow
+    it in the view's order. A user row with no operation id (a backend control event) does not open
+    a turn, so it stays inside the current one.
+    """
+    own: list[Mapping[str, Any]] = []
+    inside = False
+    for row in rows:
+        if row["role"] == "user" and row["operation_id"] is not None:
+            if inside:
+                break
+            inside = row["operation_id"] == operation_id
+        if inside:
+            own.append(row)
+    return own
 
 
 def shed_state(rows: Sequence[Mapping[str, Any]]) -> list[int] | None:
