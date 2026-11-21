@@ -87,6 +87,10 @@ _OWNER_UNSETTLED_LOGGED_LEAVES = 8
 # Unsettled owners remembered for the reaper; the oldest is forgotten first.
 # One that is forgotten is settled as a lost worker, as before.
 _UNSETTLED_OWNERS_RETAINED = 1_024
+# A probe Task sleeps this long, repeatedly; waking this much later than asked
+# means some callback held the event loop, and is logged.
+_EVENT_LOOP_PROBE_SECONDS = 0.5
+_EVENT_LOOP_LAG_LOG_SECONDS = 1.0
 
 
 @dataclass(slots=True)
@@ -341,12 +345,17 @@ class ComposerAsyncWorker:
         self._process_recovery.request_shutdown()
 
     async def _loop(self) -> None:
-        while not self._stopping and not self._instance_draining.is_set():
-            self._wake.clear()
-            await self.reap_once()
-            await self._claim_once()
-            with suppress(TimeoutError):
-                await asyncio.wait_for(self._wake.wait(), timeout=self._scan_interval)
+        # Logging only; it holds no custody and ends with this loop.
+        probe = asyncio.create_task(_probe_event_loop_lag(), name="composer-event-loop-probe")
+        try:
+            while not self._stopping and not self._instance_draining.is_set():
+                self._wake.clear()
+                await self.reap_once()
+                await self._claim_once()
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(self._wake.wait(), timeout=self._scan_interval)
+        finally:
+            probe.cancel()
 
     async def _claim_once(self) -> int:
         capacity = self._concurrency - len(self._jobs)
@@ -1578,6 +1587,16 @@ class ComposerAsyncWorker:
 
 def _failure_leaves(exc: BaseException) -> tuple[BaseException, ...]:
     return required_failure_leaves(exc)
+
+
+async def _probe_event_loop_lag() -> None:
+    """Log each time a short sleep wakes far later than asked: the event loop was held."""
+    while True:
+        asked = time.monotonic()
+        await asyncio.sleep(_EVENT_LOOP_PROBE_SECONDS)
+        lag = time.monotonic() - asked - _EVENT_LOOP_PROBE_SECONDS
+        if lag > _EVENT_LOOP_LAG_LOG_SECONDS:
+            slog.warning("composer_operation.event_loop_lag", lag_seconds=round(lag, 3))
 
 
 def _owner_failure_leaves(exc: BaseException) -> tuple[BaseException, ...]:
