@@ -46,6 +46,7 @@ from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
+from tests.helpers.async_rendezvous import RENDEZVOUS_HANG_GUARD_SECONDS, wait_for_event_or_producer
 from tests.helpers.prompt_review import accept_body
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.composer import test_file_inject_upload_only_tool_parity as _file_inject_tool_parity
@@ -184,7 +185,15 @@ class TestRevertEndpoint:
                         json={"operation_id": operation_id, "state_id": str(target.id)},
                     )
                 )
-                await asyncio.wait_for(mutation_started.wait(), timeout=3)
+                try:
+                    await wait_for_event_or_producer(mutation_started, request_task, waiting_for="revert reaching its mutation")
+                except BaseException:
+                    # Not reached: cancel the request and join it here, so its own
+                    # receipt/lease cleanup runs inside the patch and client scopes
+                    # instead of being left pending for event-loop teardown.
+                    request_task.cancel()
+                    await asyncio.wait({request_task}, timeout=RENDEZVOUS_HANG_GUARD_SECONDS)
+                    raise
                 request_task.cancel("operator cancelled state revert")
                 request_task.cancel("shutdown repeated state revert cancellation")
                 with pytest.raises(asyncio.CancelledError, match="operator cancelled state revert") as caught:

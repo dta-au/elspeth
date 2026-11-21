@@ -27,6 +27,7 @@ from elspeth.web.coordination.quota_authority import ProviderAttempt, TokenUsage
 from elspeth.web.sessions import _auto_title
 from elspeth.web.sessions.models import chat_messages_table, token_usage_ledger_table
 from elspeth.web.sessions.telemetry import _FakeCounter
+from tests.helpers.async_rendezvous import wait_for_event_or_producer
 from tests.helpers.auto_title import RecordingTitleService as _TitleService
 from tests.helpers.auto_title import call_auto_title
 
@@ -713,7 +714,7 @@ async def test_auto_title_repeated_cancellation_finishes_settlement_and_preserve
             seed=None,
         )
     )
-    await asyncio.wait_for(settlement_started.wait(), timeout=1)
+    await wait_for_event_or_producer(settlement_started, task, waiting_for="auto-title reaching settlement")
     task.cancel()
     release_settlement.set()
     with pytest.raises(BaseExceptionGroup) as caught:
@@ -754,7 +755,7 @@ async def test_auto_title_provider_cancellation_preserves_failure_priority_durin
             seed=None,
         )
     )
-    await asyncio.wait_for(settlement_started.wait(), timeout=1)
+    await wait_for_event_or_producer(settlement_started, task, waiting_for="auto-title reaching settlement")
     task.cancel("second cancellation")
     release_settlement.set()
     with pytest.raises(BaseExceptionGroup) as caught:
@@ -836,7 +837,7 @@ async def test_auto_title_cancellation_during_success_settlement_finishes_accoun
             seed=None,
         )
     )
-    await asyncio.wait_for(settlement_started.wait(), timeout=1)
+    await wait_for_event_or_producer(settlement_started, task, waiting_for="auto-title reaching settlement")
     task.cancel()
     release_settlement.set()
     with pytest.raises(asyncio.CancelledError):
@@ -880,10 +881,10 @@ async def test_auto_title_cancellation_during_admission_closes_undispatched_atte
             seed=None,
         )
     )
-    await asyncio.wait_for(admission_started.wait(), timeout=1)
+    await wait_for_event_or_producer(admission_started, task, waiting_for="auto-title passing admission")
     task.cancel("admission cancellation")
     release_admission.set()
-    await asyncio.wait_for(closure_started.wait(), timeout=1)
+    await wait_for_event_or_producer(closure_started, task, waiting_for="cancelled auto-title closing its undispatched attempt")
     task.cancel("second cancellation")
     release_closure.set()
     with pytest.raises(BaseExceptionGroup) as caught:
@@ -934,7 +935,7 @@ async def test_auto_title_cancellation_wins_over_concurrent_admission_refusal(mo
             seed=None,
         )
     )
-    await asyncio.wait_for(admission_started.wait(), timeout=1)
+    await wait_for_event_or_producer(admission_started, task, waiting_for="auto-title entering admission")
     task.cancel("caller cancellation")
     await asyncio.sleep(0)
     release_admission.set()
