@@ -1003,13 +1003,21 @@ class CancelOnWait:
 
 
 def test_shutdown_during_poll_backoff_releases_no_output() -> None:
-    transform = _transform_for_client(FakeTextractClient(pages=[_page(status="IN_PROGRESS")]))
+    client = FakeTextractClient(pages=[_page(status="IN_PROGRESS")])
+    transform = _transform_for_client(client)
+    # CancelOnWait reports the stop only from wait(). The helper's 1 ms backoff
+    # can elapse between the two clock reads in _wait_for_shutdown on a loaded
+    # host, which skips wait() and polls again. A backoff that cannot elapse
+    # makes the stop the only way out; wait() returns at once, so nothing sleeps.
+    transform._poll_interval_seconds = 60.0
+    transform._poll_max_interval_seconds = 60.0
     transform._shutdown = CancelOnWait()  # type: ignore[assignment]
 
     result = _run(transform)
 
     assert result.status == "error"
     assert result.reason["reason"] == "shutdown_requested"
+    assert len(client.get_calls) == 1
 
 
 @pytest.mark.parametrize("retryable", [False, True])
