@@ -111,6 +111,18 @@ function focusWhenShown(trigger: HTMLElement): void {
   returnObserver = observer;
 }
 
+/** User-facing reason for a failed upload: storage quota, size, file type, or a generic retry. */
+export function uploadRefusalMessage(err: unknown): string {
+  const refusal = (typeof err === "object" && err !== null ? err : {}) as Partial<ApiError>;
+  if (refusal.status === 413 && refusal.storage_quota !== undefined) return storageQuotaMessage(refusal.storage_quota);
+  if (refusal.status === 413 && refusal.error_type === "storage_quota_exceeded") {
+    return "Storage quota reached. Free storage or ask an administrator to review the applicable limit, then try again.";
+  }
+  if (refusal.status === 413) return "File exceeds the maximum upload size.";
+  if (refusal.status === 415) return "Unsupported file type. Please use CSV, JSON, JSONL, or plain text.";
+  return "Upload failed. Please try again.";
+}
+
 interface BlobMutationOwnership {
   sessionId: string;
   ownerEpoch: number;
@@ -270,17 +282,7 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       }));
       return blob;
     } catch (err) {
-      const quotaRefusal = (err as Partial<ApiError>).storage_quota;
-      const detail =
-        (err as { status?: number }).status === 413 && quotaRefusal !== undefined
-          ? storageQuotaMessage(quotaRefusal)
-          : (err as Partial<ApiError>).status === 413 && (err as Partial<ApiError>).error_type === "storage_quota_exceeded"
-          ? "Storage quota reached. Free storage or ask an administrator to review the applicable limit, then try again."
-          : (err as { status?: number }).status === 413
-          ? "File exceeds the maximum upload size."
-          : (err as { status?: number }).status === 415
-            ? "Unsupported file type. Please use CSV, JSON, JSONL, or plain text."
-            : "Upload failed. Please try again.";
+      const detail = uploadRefusalMessage(err);
       const current = get();
       if (
         (options?.shouldPublishError?.(err) ?? true) &&

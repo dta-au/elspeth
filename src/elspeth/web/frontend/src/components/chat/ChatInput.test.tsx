@@ -435,9 +435,7 @@ describe("ChatInput upload identity", () => {
       rejectUpload(new Error("late upload failure"));
     });
     await waitFor(() => expect(onBlobUploadRejected).toHaveBeenCalledOnce());
-    expect(
-      screen.queryByText("Upload failed. Check the file manager for details."),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("shows a current upload failure accepted by its owner fence", async () => {
@@ -464,9 +462,36 @@ describe("ChatInput upload identity", () => {
     );
 
     await waitFor(() => expect(onBlobUploadRejected).toHaveBeenCalledOnce());
-    expect(
-      screen.getByText("Upload failed. Check the file manager for details."),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Upload failed. Please try again.",
+    );
+    expect(screen.queryByText(/file manager/i)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    [{ status: 415, detail: "Unsupported Media Type" }, "Unsupported file type. Please use CSV, JSON, JSONL, or plain text."],
+    [{ status: 413, detail: "Payload Too Large" }, "File exceeds the maximum upload size."],
+  ])("shows the upload refusal reason beside the chat upload control (%o)", async (refusal, reason) => {
+    useSessionStore.setState({ activeSessionId: "session-current" });
+    useBlobStore.setState({ uploadBlob: vi.fn().mockRejectedValue(refusal) });
+
+    render(
+      <ChatInput
+        onSend={vi.fn()}
+        disabled={false}
+        inputRef={{ current: null } as RefObject<HTMLTextAreaElement>}
+      />,
+    );
+    const fileInput = document.querySelector<HTMLInputElement>(
+      'input[type="file"]',
+    );
+    expect(fileInput).not.toBeNull();
+    await userEvent.upload(
+      fileInput!,
+      new File(["id\n1\n"], "current.csv", { type: "text/csv" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(reason);
   });
 });
 

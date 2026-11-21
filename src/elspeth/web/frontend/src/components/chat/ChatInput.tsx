@@ -10,7 +10,7 @@ import {
 } from "react";
 import { Button, Icon, Input } from "@/components/ui";
 import { useSessionStore } from "@/stores/sessionStore";
-import { useBlobStore } from "@/stores/blobStore";
+import { uploadRefusalMessage, useBlobStore } from "@/stores/blobStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { PREFILL_CHAT_INPUT_EVENT } from "@/components/catalog/PluginCard";
 import {
@@ -360,14 +360,15 @@ export function ChatInput({
       } else {
         setInternalText(newText);
       }
-    } catch {
+    } catch (err) {
       const accepted =
         rejectionAccepted ??
         onBlobUploadRejected?.(uploadRequestId, uploadSessionId) ??
         true;
       if (accepted) {
-        // The mapped detail is shown in the blob store / blob manager.
-        setUploadStatus("Upload failed. Check the file manager for details.");
+        // The reason is shown here: opening the file manager reloads the
+        // list, which clears the store's copy of it.
+        setUploadStatus(uploadRefusalMessage(err));
       }
     } finally {
       // Reset the file input so the same file can be re-selected
