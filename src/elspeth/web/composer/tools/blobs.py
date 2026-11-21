@@ -52,6 +52,8 @@ from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.core.templates import MAX_JINJA_TEMPLATE_BYTES, template_size_refusal
+from elspeth.web.blobs.prompt_editor import is_template_binding_path
 from elspeth.web.blobs.protocol import (
     AllowedMimeType,
     BlobActiveRunError,
@@ -1508,6 +1510,18 @@ def _execute_wire_blob_inline_ref(
                     state,
                     "File-backed LLM prompts bind only to prompt_template, system_prompt, or a query template.",
                     error_code="inline_blob_field_path_invalid",
+                )
+            # A template position parses the file as Jinja, which refuses text over
+            # the template bound at every run; refuse the binding now, from the
+            # recorded size (the UTF-8 file's bytes are the template's bytes), so
+            # the user is never asked to approve a card for a binding that cannot
+            # run. system_prompt is plain text and is not bounded here.
+            scalar = llm_prompt_file_scalar_field(ref.field_path)
+            if scalar is not None and is_template_binding_path(scalar[1]) and blob["size_bytes"] > MAX_JINJA_TEMPLATE_BYTES:
+                return _failure_result(
+                    state,
+                    template_size_refusal(f"{scalar[1]} on step {node_id}", blob["size_bytes"], MAX_JINJA_TEMPLATE_BYTES),
+                    error_code="plugin_options_invalid",
                 )
             if ref.field_path == f"node:{node_id}.options.prompt_template":
                 # Binding a file REPLACES the prompt, whatever form it had, and
