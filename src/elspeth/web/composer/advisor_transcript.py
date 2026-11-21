@@ -1058,20 +1058,31 @@ class AdvisorVisibleTranscript:
         )
 
     def with_prompt_estimate(self, estimate: AdvisorPromptEstimate, *, limit_tokens: int) -> AdvisorVisibleTranscript:
-        """Record, inside a transcript already shaped by age, the estimate that priced the request and the limit it met.
+        """Record the estimate that priced the request, the limit it met, and whether it is over that limit.
 
-        The estimate was taken on the request without this record (a few
-        dozen bytes). ``binding`` is unchanged: the record states a price, not
-        evidence.
+        A transcript shaped by age keeps the record beside its counts. One
+        with no earlier turn carries it only when the estimate is over the
+        limit, at the top of its payload; under the limit it is sent
+        unchanged. ``over_estimate`` names a request sent while estimated
+        above the limit: the estimate decides what is left out, never whether
+        the request goes. The estimate was taken on the request without this
+        record (a few dozen bytes). ``binding`` is unchanged: the record
+        states a price, not evidence.
         """
-        if self.history_by_age is None:
-            raise ValueError("only a transcript shaped by age carries the request's size estimate")
+        over_estimate = estimate.tokens > limit_tokens
+        if self.history_by_age is None and not over_estimate:
+            raise ValueError("a transcript with no earlier turn carries a size record only when it is over its estimate")
         payload = json.loads(self.provider_json)
-        payload["earlier_turns_shown_by_age"]["request_size"] = {
+        record: dict[str, JsonValue] = {
             "estimated_prompt_tokens": estimate.tokens,
             "estimate_source": estimate.source,
             "declared_limit_tokens": limit_tokens,
+            "over_estimate": over_estimate,
         }
+        if self.history_by_age is None:
+            payload["request_size"] = record
+        else:
+            payload["earlier_turns_shown_by_age"]["request_size"] = record
         return AdvisorVisibleTranscript(
             self.request,
             self.binding,

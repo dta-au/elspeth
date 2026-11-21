@@ -155,19 +155,6 @@ class _AdvisorCheckpointComposeDeadlineExpired(Exception):
     """
 
 
-class AdvisorRequestOverDeclaredLimit(Exception):
-    """A checkpoint request still over ``composer_context_max_prompt_tokens`` with every earlier turn left out.
-
-    Raised before any provider call, and only on an estimate anchored on a
-    real call; a cold-start estimate never stops a request.
-    """
-
-    def __init__(self, estimate: AdvisorPromptEstimate, limit: int) -> None:
-        super().__init__(f"Advisor request estimated at {estimate.tokens} prompt tokens is over the declared limit of {limit}")
-        self.estimate = estimate
-        self.limit = limit
-
-
 @dataclass(frozen=True, slots=True)
 class AdvisorCheckpointVerdict:
     """Result of a deterministic advisor checkpoint.
@@ -596,7 +583,6 @@ class AdvisorCheckpointOwner:
                     detach_prompt_guard_evidence([message for index, message in enumerate(messages) if index != 1]).messages, None
                 )[2].total_bytes,
                 recorder=recorder,
-                stop_over_limit=checkpoint_phase is not None,
             )
             if sent_transcript is not transcript:
                 key, value = bound(sent_transcript)
@@ -800,9 +786,8 @@ class AdvisorCheckpointOwner:
         render: Callable[[AdvisorVisibleTranscript], str],
         fixed_bytes: int,
         recorder: BufferingRecorder | None,
-        stop_over_limit: bool,
     ) -> AdvisorVisibleTranscript:
-        """The transcript to send: earlier turns by age, priced; under pressure fewer, or a stop.
+        """The transcript to send: earlier turns by age, priced; under pressure fewer.
 
         ``render`` gives the user message a transcript would be sent in;
         ``fixed_bytes`` sizes every other message. Together they measure the
@@ -810,14 +795,16 @@ class AdvisorCheckpointOwner:
         the detached messages), priced against the earlier calls of this
         session and the live calls of this turn
         (:func:`estimate_advisor_prompt_tokens`). Only an estimate anchored on
-        a real call can be over ``composer_context_max_prompt_tokens``: then
-        the oldest older requests go first, then the oldest whole turns, until
-        it fits. A checkpoint still over the limit with nothing left to leave
-        out is stopped before any provider call
-        (:class:`AdvisorRequestOverDeclaredLimit`); a hint is sent. A
-        transcript shaped by age records the estimate, its source and the
-        limit in its own payload, which the retained request keeps. With no
-        earlier turn the transcript is returned unchanged.
+        a real call leaves more out when it is over
+        ``composer_context_max_prompt_tokens``: then the oldest older requests
+        go first, then the oldest whole turns, until it fits. The estimate decides only what is left out, never whether
+        the request goes: a request still over the limit with nothing left to
+        leave out is sent, and the provider judges its own limit. A transcript
+        shaped by age records the estimate, its source, the limit and whether
+        the estimate is over it (``over_estimate``) in its own payload, which
+        the retained request keeps. With no earlier turn the transcript is
+        returned unchanged, unless its estimate is over the limit: then it
+        carries the same record.
         """
         limit = self._settings.composer_context_max_prompt_tokens
         this_turn = tuple(AdvisorAnchorCall.from_call(call) for call in recorder.llm_calls) if recorder is not None else ()
@@ -852,9 +839,7 @@ class AdvisorCheckpointOwner:
                     shaped, estimate, high = candidate, candidate_estimate, middle
                 else:
                     low = middle + 1
-        if stop_over_limit and estimate.anchored and estimate.tokens > limit:
-            raise AdvisorRequestOverDeclaredLimit(estimate, limit)
-        if shaped is transcript:
+        if shaped is transcript and estimate.tokens <= limit:
             return transcript
         return shaped.with_prompt_estimate(estimate, limit_tokens=limit)
 
@@ -1601,16 +1586,6 @@ class AdvisorCheckpointOwner:
                 ) from exc
             except PlannerContinuationUnavailable:
                 return continuation_withheld()
-            except AdvisorRequestOverDeclaredLimit as exc:
-                # Nothing was sent, so no model decision exists to record as a
-                # pass; an unchanged request would be stopped again.
-                return AdvisorCheckpointVerdict(
-                    ok=False,
-                    blocking=False,
-                    findings_text=_advisor_policy.ADVISOR_REQUEST_OVER_LIMIT_FINDINGS.format(tokens=exc.estimate.tokens, limit=exc.limit),
-                    failure_class="budget_exhausted",
-                    retryable=False,
-                )
             except _MalformedLLMResponseError as exc:
                 if continuation_budget is not None and not continuation_budget.has_cost_headroom():
                     return continuation_withheld()

@@ -38,12 +38,16 @@ tokens plus added bytes at 3.0, or scaled down) that is at least half the
 request's size (a smaller one, such as an auto-title call, is passed over),
 else from this turn's
 budgeted compose-loop call (its bytes per token), else at 3.0 bytes per token.
-Only an estimate from a real call can be over `composer_context_max_prompt_tokens`:
-then older requests go, oldest first, then the previous three turns, oldest
-first. A checkpoint still over the limit is not sent and ends as
-`budget_exhausted` with the estimate, the limit and the setting named; a hint
-is sent. A cold-start estimate never stops a request, and the byte ceiling is
-not applied. A request the provider still rejects for length ends as a
+Only an estimate from a real call can leave more out: when it is over
+`composer_context_max_prompt_tokens`, older requests go, oldest first, then the
+previous three turns, oldest first. The estimate decides what is left out,
+never whether the request goes: a checkpoint or hint still over the limit with
+nothing left to leave out is sent, as the compose loop and the planner send
+(`on_over_estimate="send"`), and the provider judges its own limit. The sent
+transcript records the estimate, its source, the limit and `over_estimate`
+(`request_size`, beside the counts of a transcript shaped by age, or at the top
+of a first-turn transcript whose estimate is over the limit). The byte ceiling
+is not applied. A request the provider rejects for length ends as a
 `context_length_exceeded` request rejection, whose blocker suggests a new
 session or a shorter request. Publication, abandonment and repair bindings are
 taken on the complete transcript before the reduction. The Advisor call record
