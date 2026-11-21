@@ -31,6 +31,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec, ValidationSummary
@@ -38,6 +39,7 @@ from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     current_source_data_contract_demand,
+    pending_execution_interpretation_sites,
     prompt_review_anchor_hash_from_options,
     prompt_review_draft_from_options,
 )
@@ -228,13 +230,80 @@ def test_the_source_review_is_asked_only_for_what_the_join_cannot_add(tmp_path: 
         return current_source_data_contract_demand(state, "source")
 
     assert demand(tmp_path / "added", ["added"]) == ()
-    if site == "node":
-        assert demand(tmp_path / "colour", ["added", "colour"]) == ("colour",)
-    else:
-        # LIMIT (2a, unchanged by 2b): behind an observed upstream the deferring join ABSTAINS
-        # at a sink, so the sink is not checked, no contract exists and no card is offered;
-        # the run is then refused by graph validation ("requires fields ['colour']").
-        assert demand(tmp_path / "colour", ["added", "colour"]) == ()
+    # At the sink too since r2: the join names what it adds, so the sink is checked like the twin's.
+    assert demand(tmp_path / "colour", ["added", "colour"]) == ("colour",)
+
+
+def _parity_graph(root: Path, source_kind: str, site: str, required: list[str], content: object) -> CompositionState:
+    schema = g.FIXED_SOURCE if source_kind == "fixed" else g.OBSERVED
+    join = g._join(content, "json", schema=schema)
+    if site == "sink":
+        return g._graph(
+            root,
+            g._join_node("enrich", "src_out", "output", join),
+            source_schema=schema,
+            sink_schema={"mode": "observed", "required_fields": required},
+        )
+    use = g._transform("use", "passthrough", "mid", "output", {"schema": g.OBSERVED, "required_input_fields": required})
+    return g._graph(root, g._join_node("enrich", "src_out", "mid", join), use, source_schema=schema)
+
+
+def _judged(root: Path, state: CompositionState) -> tuple[bool, list[str], tuple[str, ...], int, str]:
+    """Authoring verdict, fields reported missing, card demand, cards blocking the run, and the run-time outcome."""
+    summary = state.validate()
+    missing = sorted(
+        field for entry in summary.errors for field in entry.message.rsplit("Missing fields: [", 1)[-1].rstrip("].").split(", ")
+    )
+    cards = [site for site in pending_execution_interpretation_sites(state) if site.kind is InterpretationKind.SOURCE_DATA_CONTRACT]
+    execution = g._execution_validate(root, state, g.STR_TABLE)
+    outcome = (
+        "admitted" if execution.is_valid else next(c.name for c in execution.checks if not c.passed and not c.detail.startswith("Skipped"))
+    )
+    return summary.is_valid, missing, current_source_data_contract_demand(state, "source"), len(cards), outcome
+
+
+_PARITY_CASES = [
+    (source_kind, site, required)
+    for source_kind, extra in (("fixed", "k"), ("observed", "colour"))
+    for site in ("sink", "node")
+    for required in (["added"], ["added", extra], ["added", TYPO])
+]
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "site", "required"), _PARITY_CASES, ids=["/".join((kind, site, "+".join(req))) for kind, site, req in _PARITY_CASES]
+)
+def test_the_file_held_join_is_judged_like_its_inline_twin(tmp_path: Path, source_kind: str, site: str, required: list[str]) -> None:
+    """r2 acceptance: authoring verdict, missing fields, card offer and run-time outcome equal the inline twin's.
+
+    The table holds ``description``, so the twin's answer does not depend on
+    bytes the file-held form cannot see: ``added`` is satisfied in both and
+    nothing else is nameable by the file. Behind an observed source this is
+    the case 2a's sink abstention used to leave valid, cardless and refused
+    at Run.
+    """
+    held = _judged(tmp_path / "held", _parity_graph(tmp_path / "held", source_kind, site, required, g._marker(g.STR_TABLE)))
+    twin = _judged(tmp_path / "twin", _parity_graph(tmp_path / "twin", source_kind, site, required, g.STR_TABLE))
+
+    assert held == twin
+
+
+def test_a_field_the_join_adds_stays_undecided_at_a_sink_behind_an_observed_source(tmp_path: Path) -> None:
+    """The opposite direction: checking the sink like the twin must never refuse what the file adds.
+
+    ``added`` is neither guaranteed (the join forwards an abstaining source) nor
+    missing: no error, no verdict on the edge, no card for it, and the run
+    with a table holding the column is admitted.
+    """
+    state = _parity_graph(tmp_path, "observed", "sink", ["added"], g._marker(g.STR_TABLE))
+
+    summary = state.validate()
+    execution = g._execution_validate(tmp_path, state, g.STR_TABLE)
+
+    assert summary.is_valid, [entry.to_dict() for entry in summary.errors]
+    assert not _contracts_into(summary, "output:output")
+    assert current_source_data_contract_demand(state, "source") == ()
+    assert execution.is_valid, [error.message for error in execution.errors]
 
 
 def test_LIMIT_a_misspelt_declared_input_after_a_deferring_join_is_left_to_the_preflight(tmp_path: Path) -> None:
@@ -409,6 +478,90 @@ def test_the_generic_notice_names_what_the_step_reads_when_the_file_holds_an_inp
     ]
     assert not execution.is_valid
     assert any("nope" in error.message for error in execution.errors), [error.message for error in execution.errors]
+
+
+def _observed_row_union(tmp_path: Path, control: tuple[str, dict[str, Any]], *, held: bool, required: list[str]) -> CompositionState:
+    """fork -> {``control``, the join (file-held or inline)} -> row_union -> passthrough -> sink, behind an OBSERVED source."""
+    join = g._join(g._marker(g.STR_TABLE) if held else g.STR_TABLE, "json", schema=g.OBSERVED)
+    fan = g._fan(tmp_path, control, join, merge="row_union")
+    return g._graph(tmp_path, *fan.nodes, source_schema=g.OBSERVED, sink_schema={"mode": "observed", "required_fields": required})
+
+
+def test_a_row_union_of_joins_that_name_their_additions_is_judged_like_its_inline_twin(tmp_path: Path) -> None:
+    """Both arms name what they add, neither adds ``colour``: refused with the card, as the inline twin is."""
+    plugin, options = g._join(g._marker(g.STR_TABLE), "json", schema=g.OBSERVED)
+    control = (plugin, {**options, "output": {"added": "ref['description']", "other": "ref['sku']"}})
+    inline_control = (plugin, {**options, "reference_content": g.STR_TABLE, "output": control[1]["output"]})
+
+    held = _observed_row_union(tmp_path / "held", control, held=True, required=["added", "colour"])
+    twin = _observed_row_union(tmp_path / "twin", inline_control, held=False, required=["added", "colour"])
+
+    assert _judged(tmp_path / "held", held) == _judged(tmp_path / "twin", twin)
+    assert [entry.error_code for entry in held.validate().errors] == ["sink_contract_violation"]
+    assert current_source_data_contract_demand(held, "source") == ("colour",)
+
+
+@pytest.mark.parametrize("required", [["colour"], ["id"]])
+def test_a_fan_in_arm_that_cannot_name_what_it_adds_keeps_the_sink_undecided(tmp_path: Path, required: list[str]) -> None:
+    """A ``field_mapper`` arm whose target is in a file: what its twin would vote is unknown, so the sink is not checked.
+
+    The join arm alone would justify refusing ``colour``, but only if the
+    union participates, and that depends on an arm nothing here can name.
+    Checking anyway could refuse a graph the run admits; it stays as 2a left
+    it: valid, no card.
+    """
+    mapper = ("field_mapper", {"schema": g.OBSERVED, "mapping": {"id": g._marker("colour")}, "select_only": True})
+    state = _observed_row_union(tmp_path, mapper, held=True, required=required)
+
+    summary = state.validate()
+
+    assert summary.is_valid, [entry.to_dict() for entry in summary.errors]
+    assert current_source_data_contract_demand(state, "source") == ()
+
+
+def _key_field_notice(node_id: str, plugin: str, fields: str) -> str:
+    return (
+        f"Node '{node_id}' ({plugin}) reads an attached file that this check does not open, so the key field it reads and the fields "
+        f"it adds ({fields}), their types and whether they can be empty are checked before the run starts. No change is needed."
+    )
+
+
+@pytest.mark.parametrize("shape", ["single", "lookups"])
+def test_the_notice_names_the_key_field_a_join_reads_from_its_file(tmp_path: Path, shape: str) -> None:
+    """``reference_join.key_field`` in a file: the step READS that field, so the notice says so beside what it adds."""
+    if shape == "single":
+        options = g._join(g.STR_TABLE, "json", schema=g.FIXED_SOURCE, key_field=g._marker("k"))[1]
+    else:
+        options = {
+            "schema": g.FIXED_SOURCE,
+            "tables": {"regions": {"reference_content": g.STR_TABLE, "reference_format": "json"}},
+            "lookups": [
+                {"table": "regions", "key_field": g._marker("k"), "reference_key_name": "sku", "output": {"added": "ref['description']"}}
+            ],
+        }
+    state = g._graph(tmp_path, g._transform("enrich", "reference_join", "src_out", "output", options), source_schema=g.FIXED_SOURCE)
+
+    summary = state.validate()
+
+    assert summary.is_valid, [entry.to_dict() for entry in summary.errors]
+    assert g._notices(summary) == [_key_field_notice("enrich", "reference_join", "added")]
+
+
+def test_the_notice_names_the_key_field_file_inject_reads_from_its_file(tmp_path: Path) -> None:
+    """``file_inject.key_field`` in a file, ``output_field`` inline: named additions plus the read key field."""
+    options = {
+        "schema": g.FIXED_SOURCE,
+        "mode": "select",
+        "key_field": g._marker("k"),
+        "output_field": "added",
+        "files": {"p": {"content": "probe value", "format": "text"}},
+    }
+    state = g._graph(tmp_path, g._transform("inject", "file_inject", "src_out", "output", options), source_schema=g.FIXED_SOURCE)
+
+    summary = state.validate()
+
+    assert summary.is_valid, [entry.to_dict() for entry in summary.errors]
+    assert g._notices(summary) == [_key_field_notice("inject", "file_inject", "added")]
 
 
 # ---------------------------------------------------------------------------
