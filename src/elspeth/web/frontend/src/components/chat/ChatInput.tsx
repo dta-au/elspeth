@@ -323,6 +323,10 @@ export function ChatInput({
   ]);
 
   function handleKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
+    // An Enter that confirms an input-method candidate is not a send.
+    // keyCode 229 covers browsers (Safari) that report the confirming
+    // keydown after composition has already ended.
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSend();

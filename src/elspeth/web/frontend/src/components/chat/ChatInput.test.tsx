@@ -14,7 +14,7 @@ import { readFileSync } from "node:fs";
 
 import { useRef, useState, type RefObject } from "react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, act, waitFor } from "@testing-library/react";
+import { render, screen, act, waitFor, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ChatInput } from "./ChatInput";
 import {
@@ -942,6 +942,23 @@ describe("ChatInput — compose timeout readiness gate (bootstrap race)", () => 
     expect(screen.queryByText(/loading this session/i)).toBeNull();
 
     await user.keyboard("{Enter}");
+    expect(onSend).toHaveBeenCalledWith("build a pipeline");
+  });
+
+  it.each([
+    ["isComposing", { isComposing: true }],
+    ["keyCode 229", { keyCode: 229 }],
+  ])("does not send on an Enter that confirms an input-method candidate (%s)", async (_label, composing) => {
+    const onSend = vi.fn();
+    renderInput(onSend);
+    const textarea = screen.getByLabelText(/message input/i);
+    await userEvent.setup().type(textarea, "build a pipeline");
+
+    fireEvent.keyDown(textarea, { key: "Enter", ...composing });
+
+    expect(onSend).not.toHaveBeenCalled();
+    expect(textarea).toHaveValue("build a pipeline");
+    fireEvent.keyDown(textarea, { key: "Enter" });
     expect(onSend).toHaveBeenCalledWith("build a pipeline");
   });
 
