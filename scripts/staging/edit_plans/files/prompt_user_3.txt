@@ -1,0 +1,1 @@
+Summarise order {{ row['order_id'] }} for {{ row['item'] }} in the region {{ row['region_name'] }} in one sentence. Prompt version 3.
