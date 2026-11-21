@@ -674,7 +674,7 @@ _SET_METADATA_DECLARATION = ToolDeclaration(
     description=(
         "Update pipeline metadata (name and description only). Pass null or an empty string for description "
         "to clear it; name cannot be cleared, only replaced. Result `changed_fields` lists the fields whose value changed. "
-        "When it is empty nothing changed, the version did not advance, and `message` says so."
+        "When it is empty nothing changed, and `message` says so."
     ),
     json_schema={
         "type": "object",
@@ -2059,9 +2059,10 @@ def _execute_set_metadata(
     """Update pipeline metadata; the receipt names the fields whose value changed.
 
     An omitted field is unchanged and a null description clears it to the
-    empty default. A patch that changes nothing returns the saved state, so no
-    version is written (the ``_execute_patch_source_options`` unchanged
-    pattern), and says so instead of reading as a fresh edit.
+    empty default. Every call writes a version, as before: an edit that
+    changes nothing is still an edit, and the turn's required-control staging
+    depends on it. A patch that changes nothing says so in the receipt
+    instead of reading as a fresh change.
     """
     del context  # unused; signature uniformity with the other handlers.
     validated = _validate_mutation_arguments(_SetMetadataArgumentsModel, args, "set_metadata arguments")
@@ -2069,12 +2070,11 @@ def _execute_set_metadata(
     patch = {field: "" if value is None else value for field, value in supplied.items()}
     current = {"name": state.metadata.name, "description": state.metadata.description}
     changed_fields = [field for field in ("name", "description") if field in patch and patch[field] != current[field]]
+    new_state = state.with_metadata(patch)
     if not changed_fields:
         return _mutation_result(
-            state, (), data={"changed_fields": [], "message": "No field changed: the supplied values match the saved metadata."}
+            new_state, (), data={"changed_fields": [], "message": "No field changed: the supplied values match the saved metadata."}
         )
-
-    new_state = state.with_metadata(patch)
     return _mutation_result(new_state, (), data={"changed_fields": changed_fields})
 
 

@@ -729,7 +729,7 @@ class TestStep3MutationTierMigration:
             "description": (
                 "Update pipeline metadata (name and description only). Pass null or an empty string for description "
                 "to clear it; name cannot be cleared, only replaced. Result `changed_fields` lists the fields whose "
-                "value changed. When it is empty nothing changed, the version did not advance, and `message` says so."
+                "value changed. When it is empty nothing changed, and `message` says so."
             ),
             "parameters": {
                 "type": "object",

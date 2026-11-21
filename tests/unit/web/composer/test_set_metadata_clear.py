@@ -95,10 +95,10 @@ def test_patch_resending_the_unchanged_name_is_a_reported_no_op() -> None:
     assert result.data is not None
     assert list(result.data["changed_fields"]) == []
     assert result.data["message"] == "No field changed: the supplied values match the saved metadata."
-    # Follows patch_source_options: an unchanged patch returns the saved state, so no version is written.
-    assert result.updated_state is state
-    assert result.updated_state.version == state.version
-    assert result.updated_state.metadata.description == "Joins orders to customers"
+    # A no-op is still an edit: it writes a version (required-control staging depends on it),
+    # and the receipt, not the version, says that nothing changed.
+    assert result.updated_state.version == state.version + 1
+    assert result.updated_state.metadata == state.metadata
 
 
 def test_clearing_an_already_empty_description_is_a_no_op() -> None:
@@ -108,7 +108,8 @@ def test_clearing_an_already_empty_description_is_a_no_op() -> None:
 
     assert result.data is not None
     assert list(result.data["changed_fields"]) == []
-    assert result.updated_state is state
+    assert result.updated_state.metadata == state.metadata
+    assert result.updated_state.version == state.version + 1
 
 
 def test_empty_patch_is_a_no_op() -> None:
@@ -118,7 +119,8 @@ def test_empty_patch_is_a_no_op() -> None:
 
     assert result.data is not None
     assert list(result.data["changed_fields"]) == []
-    assert result.updated_state is state
+    assert result.updated_state.metadata == state.metadata
+    assert result.updated_state.version == state.version + 1
 
 
 def test_only_the_field_that_changed_is_named() -> None:
