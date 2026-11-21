@@ -327,7 +327,10 @@ async def test_the_budget_anchor_advances_call_by_call_through_a_turn_over_the_h
     # No result of the turn is stubbed now; the anchor still advances to each previous call
     # and the estimate still covers the count the provider reported.
     base = await _base_request_bytes()
-    big = "r" * (base * 3 // 10)
+    # A quarter of the base per result still crosses the high mark mid-turn and keeps the
+    # last request clear of the private capture's text bound (bounded_json), which three
+    # tenths missed by about 3 KB once the skill grew.
+    big = "r" * (base // 4)
     tool_data = {f"call-{n}": {"rows": big + str(n)} for n in range(1, 6)}
     service, session_id = _service(_cap_for(base))
     provider = _CountingProvider(

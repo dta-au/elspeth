@@ -1602,6 +1602,18 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
         ),
     ),
     ReviewedWriter(
+        path="tests/unit/web/composer/test_wire_query_template_pending_term.py",
+        enclosing_symbol="env",
+        table="chat_messages",
+        operation="sqlalchemy_table_insert",
+        purpose=(
+            "query-template wire fixture: seeds the route-level user message "
+            "that blob provenance requires before the production tool handlers "
+            "and session service wire a prompt file. The fixture owns the "
+            "in-memory SQLite engine."
+        ),
+    ),
+    ReviewedWriter(
         path="tests/unit/web/composer/test_agent_tooling.py",
         enclosing_symbol="_insert_user_message",
         table="chat_messages",

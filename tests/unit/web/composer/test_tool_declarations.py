@@ -1074,6 +1074,10 @@ class TestStep3BlobDiscoveryTierMigration:
                 "A user-created or agent-authored UTF-8 prompt file opens a mandatory full-content llm_prompt_template review card; changes require review again. "
                 "Only prompt_template, system_prompt, and individual query templates accept prompt files, never model or whole queries. "
                 "Wiring a file onto prompt_template REPLACES the whole prompt, whatever was there: prompt_template_parts and every vague-term review of the old text (pending or accepted) are removed, and the file gets its own review card. "
+                "Wiring a file onto system_prompt or one query template replaces only that text and removes no term review. "
+                "A query template is refused (vague_term_query_override) while the node-level prompt has a pending term review: "
+                "have the user approve that review first, then wire again. Bind the file to prompt_template instead only if it is "
+                "meant to be the prompt for every query: that replaces the whole node-level prompt and retires its term reviews. "
                 "Returns the `field_path` that was wired, plus `superseded_review_ids` when the file superseded reviews of the old prompt."
             ),
             "parameters": {

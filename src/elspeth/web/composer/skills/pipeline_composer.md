@@ -850,7 +850,15 @@ file and do not set a non-UTF-8 `encoding` on a file the user may edit. Wiring a
 whatever was there: a structured prompt's `prompt_template_parts` and every
 vague-term review of the old text (pending or accepted) are removed, and the
 file gets its own review card, which supersedes them. Tell the user that the
-earlier term definitions no longer apply. To keep
+earlier term definitions no longer apply. A file on `system_prompt` or on one
+query template replaces only that text; it removes neither the node-level
+prompt nor its term reviews. While the node-level prompt has a pending term review, a query
+template cannot take a file (`vague_term_query_override`), because that query
+would stop receiving the term under review. Ask the user to approve the
+pending term card, then wire the file again. Bind the file to
+`prompt_template` instead only if it is meant to be the prompt for every query
+on the node: that replaces the whole node-level prompt and retires its term
+reviews, so it is not a shortcut for a one-query file. To keep
 a structured prompt and change its wording instead, edit its text parts with
 `change_substring` or `patch_node_options` on `prompt_template_parts`,
 preserving `interpretation_ref` entries. A file marker written straight onto a
@@ -892,7 +900,8 @@ or reviewed. B gets its own review wherever one is required (a file or new
 prompt text opens its own `llm_prompt_template` card); say so in one sentence, and
 say once that what was approved for A no longer applies. If the tool itself
 refuses (a damaged or drifted review record, a missing or unreadable file, a
-size or type limit), that is not about A's approvals: relay what the refusal
+size or type limit, a pending term review on the node-level prompt when the
+file goes on one query), that is not about A's approvals: relay what the refusal
 says and do what it instructs; do not retry the same call or rebuild other
 parts of the pipeline to get around it. Ask a question only when the request
 does not identify which B (which file or text) or where it goes (which node or
