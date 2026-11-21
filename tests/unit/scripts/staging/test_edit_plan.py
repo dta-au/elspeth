@@ -378,6 +378,37 @@ def test_a_validation_error_respelt_with_its_component_kind_is_not_new() -> None
     assert len(edit_plan.new_validation_errors(bare, other)) == 1
 
 
+def test_a_pending_review_stored_as_a_sentence_or_as_its_bare_kind_is_one_error() -> None:
+    # Gold attempt 3, edits 44-45: the pending llm_prompt_template review on cs1_assessment was stored as the
+    # sentence in one state version and as the bare kind in the next; that is one review, not a new one.
+    sentence = "llm_prompt_template review pending for transform 'cs1_assessment': llm_prompt_template"
+    as_sentence = graph()
+    as_sentence["validation_errors"] = [
+        {"error_code": "interpretation_review_pending", "component": "cs1_assessment", "message": sentence},
+    ]
+    as_kind = copy.deepcopy(as_sentence)
+    as_kind["validation_errors"][0]["message"] = "llm_prompt_template"
+    assert edit_plan.new_validation_errors(as_sentence, as_kind) == []
+    assert edit_plan.new_validation_errors(as_kind, as_sentence) == []
+    # A pending review of another kind, or on another component, is still new.
+    other_kind = copy.deepcopy(as_kind)
+    other_kind["validation_errors"][0]["message"] = "pipeline_decision"
+    assert len(edit_plan.new_validation_errors(as_sentence, other_kind)) == 1
+    other_step = copy.deepcopy(as_kind)
+    other_step["validation_errors"][0]["component"] = "node:cs2_assessment"
+    assert len(edit_plan.new_validation_errors(as_sentence, other_step)) == 1
+    # A second review of the same kind on the same step is counted, not merged away.
+    twice = copy.deepcopy(as_kind)
+    twice["validation_errors"].append(dict(as_sentence["validation_errors"][0]))
+    assert len(edit_plan.new_validation_errors(as_sentence, twice)) == 1
+    # Other error codes still compare their exact message.
+    reworded = graph()
+    reworded["validation_errors"] = [{"error_code": "sink_failed", "component": "out", "message": "m"}]
+    changed = copy.deepcopy(reworded)
+    changed["validation_errors"][0]["message"] = "m changed"
+    assert len(edit_plan.new_validation_errors(reworded, changed)) == 1
+
+
 def test_tool_findings_need_an_acceptable_tool_and_flag_a_forbidden_one_called_and_not_rejected() -> None:
     edit = {"tools_any": ["change_substring"], "tools_all": []}
     used = {"tool_outcomes": {"change_substring": {"applied": 1}}}
