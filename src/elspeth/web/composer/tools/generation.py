@@ -1884,9 +1884,12 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
     ),
     DirectValidationGuidance(
         "BLOB_QUOTA_EXCEEDED",
-        "The inline source could not acquire blob storage within this session's quota. The replacement was not applied.",
-        "Retain the intended source data. Reuse an appropriate ready artifact or resolve the session storage limit before "
-        "retrying; do not silently drop rows to make the artifact smaller.",
+        "The call needed more stored content than a limit allows, and the message names which: an inline file over the "
+        "per-file limit, the call's inline files over the pipeline total for file-held text, or the session's blob "
+        "storage quota. The change was not applied.",
+        "For a file or pipeline-total limit, shorten or remove the files the message names. For the session quota, reuse "
+        "an appropriate ready artifact or resolve the session storage limit before retrying. Do not silently drop rows "
+        "or text to make it fit.",
     ),
     DirectValidationGuidance(
         "source_blob_identity_invalid",
