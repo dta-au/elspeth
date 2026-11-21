@@ -3501,15 +3501,15 @@ def _vague_review_is_unchanged(
     return prompt_structure_hash(previous_parts) == prompt_structure_hash(proposed_parts)
 
 
-def _wording_edit_carry_is_reviewable(candidate: NodeSpec) -> bool:
-    """Whether a prompt whose wording changed around carried terms gets a card showing all of it.
+def _wording_edit_reopens_its_prompt_review(candidate: NodeSpec) -> bool:
+    """Whether a wording edit around carried terms is put to the user by a reopened prompt review.
 
     ``candidate`` is the proposed node with its carried rows in place. A
     resolved vague term keeps its accepted value across a wording edit only
-    when the edit itself is put to the user with that value in view: the node's
-    ``llm_prompt_template`` review is pending (it is the review of the change),
-    and the bounded card text ends with the complete re-rendered prompt. A
-    prompt longer than the card shows is not carried; the card is never widened.
+    when the node's ``llm_prompt_template`` review is pending afterwards: that
+    review is the review of the change. The length of the prompt plays no
+    part; the prompt card has to show each carried term's accepted definition
+    at its slot, whatever it shortens.
 
     A node where a query supplies its own template is never carried: that
     query bypasses the node-level slots, and reopening the terms is what lets
@@ -3518,14 +3518,7 @@ def _wording_edit_carry_is_reviewable(candidate: NodeSpec) -> bool:
     prompt_review = _prompt_template_review_requirement(candidate.options)
     if prompt_review is None or prompt_review["status"] != "pending":
         return False
-    if "queries" in candidate.options and vague_term_query_override_error(candidate.options["queries"]) is not None:
-        return False
-    parts = _prompt_parts(candidate.options)
-    if parts is None:
-        return False
-    rendered = _render_prompt_parts(parts, _requirements_by_id(candidate.options), unresolved_text=PENDING_INTERPRETATION_AUTHORING_TEXT)
-    card_text = prompt_review_draft_from_options({**candidate.options, "prompt_template": rendered})
-    return card_text is not None and card_text.endswith(rendered)
+    return "queries" not in candidate.options or vague_term_query_override_error(candidate.options["queries"]) is None
 
 
 def _reconcile_node_options(
@@ -3573,8 +3566,8 @@ def _reconcile_node_options(
                 # the slot is still referenced, the stored evidence is intact,
                 # and the row attests its accepted value alone, so wording
                 # edited elsewhere in the prompt leaves the acceptance standing.
-                # Whether the edit can be reviewed with the value in view is
-                # decided below, once every row is reconciled.
+                # Whether a reopened prompt review puts the edit to the user
+                # is decided below, once every row is reconciled.
                 carried_across_wording_edit[len(reconciled)] = shell
                 unchanged = True
         elif kind is InterpretationKind.INVENTED_SOURCE:
@@ -3614,7 +3607,7 @@ def _reconcile_node_options(
         else:
             reconciled.append(shell)
 
-    if carried_across_wording_edit and not _wording_edit_carry_is_reviewable(
+    if carried_across_wording_edit and not _wording_edit_reopens_its_prompt_review(
         replace(proposed, options={**options, INTERPRETATION_REQUIREMENTS_KEY: reconciled})
     ):
         for position, pending_shell in carried_across_wording_edit.items():

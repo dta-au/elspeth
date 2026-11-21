@@ -12,7 +12,6 @@ from typing import Any
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.service import ComposerServiceImpl
@@ -46,56 +45,105 @@ from tests.unit.web.sessions.test_carry_terms_across_wording_edits import (
     TWO_TERM_ROWS,
     _approved_session,
     _assert_two_terms_resolved_as_the_user_left_them,
-    _card_budget,
     _card_text,
     _cards,
     _edit_part,
     _errors,
-    _options,
     _padded_first_text,
     _patch,
     _prompt,
+    _read,
     _rows,
     _sent_prompt,
+    _state_context_node,
     _with_first_text,
     service,  # noqa: F401  (fixture)
 )
 from tests.unit.web.sessions.test_routes import _make_app
 
 
-@pytest.mark.parametrize("system_prompt", [True, False])
 @pytest.mark.asyncio
-async def test_amended_value_that_pushes_the_prompt_past_the_card_is_not_carried(
+async def test_terms_carried_by_one_call_stay_carried_when_a_second_call_shortens_the_card(
     service: SessionServiceImpl,  # noqa: F811
     tmp_path: Path,
-    system_prompt: bool,
 ) -> None:
-    """The text parts fit the card; the prompt with the user's longer amendment in place does not.
+    """Two calls: a wording edit on a long prompt, then a system prompt that halves the card's share.
 
-    The bound is measured on what the card would have to show, the prompt with
-    the accepted values, so this edit is not carried and the terms reopen.
+    There is no length gate, so the terms are carried by the first call and
+    the second call has nothing to undo: one prompt card, cut short, and the
+    run sends the full prompt with the amendment.
     """
-    session = await _approved_session(service, tmp_path, system_prompt=system_prompt)
-    budget = _card_budget(system_prompt=system_prompt)
-    overshoot = len(AUDIENCE_AMENDED) - len(AUDIENCE_DRAFT)
-    assert overshoot > 0
-    first_text = _padded_first_text(rendered_length=budget + overshoot)
-
-    edited = _patch(session.state, {"prompt_template_parts": _with_first_text(TWO_TERM_PARTS, first_text)})
+    session = await _approved_session(service, tmp_path, system_prompt=False)
+    original_rows = _rows(session.state)
+    long_text = _padded_first_text(rendered_length=5080)
+    edited = _patch(session.state, {"prompt_template_parts": _with_first_text(TWO_TERM_PARTS, long_text)})
     assert edited.success, _errors(edited)
-    opened = await session.commit(edited.updated_state)
+    assert _cards(await session.commit(edited.updated_state)) == [PROMPT_CARD]
 
-    parts = _options(session.state)["prompt_template_parts"]
-    text_only = sum(len(part["text"]) for part in parts if part["kind"] == "text")
-    with_drafts = text_only + len(CATEGORY_DRAFT) + len(AUDIENCE_DRAFT)
-    assert text_only < budget and with_drafts == budget
-    rows = _rows(session.state)
-    for row_id in (CATEGORY, AUDIENCE):
-        assert (rows[row_id]["status"], rows[row_id]["accepted_value"], rows[row_id]["event_id"]) == ("pending", None, None)
-    assert _cards(opened) == [PROMPT_CARD, ("vague_term", "audience"), ("vague_term", "category")]
-    card = next(event for event in opened if event.kind is InterpretationKind.LLM_PROMPT_TEMPLATE).llm_draft
+    with_system = _patch(session.state, {"system_prompt": "You classify rows."})
+    assert with_system.success, _errors(with_system)
+    await session.commit(with_system.updated_state)
+
+    assert _rows(session.state)[CATEGORY] == original_rows[CATEGORY]
+    assert _rows(session.state)[AUDIENCE] == original_rows[AUDIENCE]
+    pending = await session.pending()
+    assert _cards(pending) == [PROMPT_CARD]
+    card = pending[0].llm_draft
+    assert card is not None and "more chars not shown" in card and AUDIENCE_AMENDED not in card
+    await session.resolve(pending[0])
+    sent = _sent_prompt(session.state)
+    assert len(sent) == 5080 and sent.endswith(f" into {CATEGORY_DRAFT} for {AUDIENCE_AMENDED}.")
+
+
+@pytest.mark.asyncio
+async def test_terms_carried_on_a_multi_query_node_stay_carried_when_more_queries_shorten_the_card(
+    service: SessionServiceImpl,  # noqa: F811
+    tmp_path: Path,
+) -> None:
+    session = await _approved_session(service, tmp_path, extra_options=MULTI_QUERY)
+    original_rows = _rows(session.state)
+    long_text = _padded_first_text(rendered_length=5080)
+    edited = _patch(session.state, {"prompt_template_parts": _with_first_text(TWO_TERM_PARTS, long_text)})
+    assert edited.success, _errors(edited)
+    assert _cards(await session.commit(edited.updated_state)) == [PROMPT_CARD]
+
+    many_queries = {f"query_number_{index:02d}_with_a_long_descriptive_name": {"input_fields": {"text": "text"}} for index in range(60)}
+    more = _patch(session.state, {"queries": many_queries})
+    assert more.success, _errors(more)
+    await session.commit(more.updated_state)
+
+    assert _rows(session.state)[CATEGORY] == original_rows[CATEGORY]
+    assert _rows(session.state)[AUDIENCE] == original_rows[AUDIENCE]
+    pending = await session.pending()
+    assert _cards(pending) == [PROMPT_CARD]
+    card = pending[0].llm_draft
     assert card is not None and len(card) <= PROMPT_SURFACE_REVIEW_MAX_CHARS
-    assert AUDIENCE_AMENDED not in card
+    assert "more chars not shown" in card and AUDIENCE_AMENDED not in card
+
+
+@pytest.mark.asyncio
+async def test_the_status_words_the_model_reads_are_resolved_and_pending(
+    service: SessionServiceImpl,  # noqa: F811
+    tmp_path: Path,
+) -> None:
+    """After one edit that re-drafts ``category`` and leaves ``audience`` alone: the literal row statuses."""
+    session = await _approved_session(service, tmp_path)
+    rows = [{"kind": "vague_term", "user_term": "category", "draft": "narrow categories"}, TWO_TERM_ROWS[1]]
+    edited = _patch(
+        session.state,
+        {"prompt_template_parts": _with_first_text(TWO_TERM_PARTS, "Sort {{ row.text }} into "), INTERPRETATION_REQUIREMENTS_KEY: rows},
+    )
+    assert edited.success, _errors(edited)
+    await session.commit(edited.updated_state)
+
+    context_rows = {row["id"]: row for row in _state_context_node(session.state)["options"][INTERPRETATION_REQUIREMENTS_KEY]}
+    node_rows = {row["id"]: row for row in _read(session.state, NODE)["node"]["options"][INTERPRETATION_REQUIREMENTS_KEY]}
+    for read_rows in (context_rows, node_rows):
+        assert read_rows[AUDIENCE]["status"] == "resolved"
+        assert read_rows[CATEGORY]["status"] == "pending"
+    # The state context shows a pending term's draft as ``draft`` and a resolved term's as ``historical_draft``.
+    assert context_rows[CATEGORY]["draft"] == "narrow categories"
+    assert context_rows[AUDIENCE]["historical_draft"] == AUDIENCE_DRAFT
 
 
 @pytest.mark.asyncio

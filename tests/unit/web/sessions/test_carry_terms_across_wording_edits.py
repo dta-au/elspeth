@@ -727,7 +727,7 @@ async def test_altered_or_missing_stored_evidence_refuses_the_edit(
 
 
 # --------------------------------------------------------------------------- #
-# The bounded prompt card decides the carry
+# The prompt card text is bounded; the carry is not
 # --------------------------------------------------------------------------- #
 
 
@@ -749,51 +749,37 @@ def _padded_first_text(*, rendered_length: int) -> str:
 
 @pytest.mark.parametrize("system_prompt", [True, False])
 @pytest.mark.asyncio
-async def test_prompt_that_fills_the_card_exactly_is_carried_and_shown_whole(
+async def test_a_prompt_longer_than_the_card_is_carried_like_a_short_one(
     service: SessionServiceImpl, tmp_path: Path, system_prompt: bool
 ) -> None:
+    """The card text is bounded; the carry is not. The bounded text is cut, the terms stay accepted."""
     session = await _approved_session(service, tmp_path, system_prompt=system_prompt)
     original_rows = _rows(session.state)
+    original_term_events = session.term_events()
     budget = _card_budget(system_prompt=system_prompt)
 
-    edited = _patch(session.state, {"prompt_template_parts": _with_first_text(TWO_TERM_PARTS, _padded_first_text(rendered_length=budget))})
+    edited = _patch(
+        session.state, {"prompt_template_parts": _with_first_text(TWO_TERM_PARTS, _padded_first_text(rendered_length=budget + 500))}
+    )
     assert edited.success, _errors(edited)
     opened = await session.commit(edited.updated_state)
 
     prompt = _prompt(session.state)
-    assert len(prompt) == budget
+    assert len(prompt) == budget + 500
     assert prompt.endswith(f" into {CATEGORY_DRAFT} for {AUDIENCE_AMENDED}.")
     assert _cards(opened) == [PROMPT_CARD]
     assert _rows(session.state)[CATEGORY] == original_rows[CATEGORY]
     assert _rows(session.state)[AUDIENCE] == original_rows[AUDIENCE]
     card = opened[0].llm_draft
     assert card is not None and len(card) <= PROMPT_SURFACE_REVIEW_MAX_CHARS
-    assert card == _card_text(prompt, system_prompt=system_prompt)
-    assert "more chars not shown" not in card
-
-
-@pytest.mark.parametrize("system_prompt", [True, False])
-@pytest.mark.asyncio
-async def test_prompt_one_char_past_the_card_is_not_carried(service: SessionServiceImpl, tmp_path: Path, system_prompt: bool) -> None:
-    """The card would cut the text, so the terms reopen as before; the card is not widened."""
-    session = await _approved_session(service, tmp_path, system_prompt=system_prompt)
-    budget = _card_budget(system_prompt=system_prompt)
-
-    edited = _patch(
-        session.state, {"prompt_template_parts": _with_first_text(TWO_TERM_PARTS, _padded_first_text(rendered_length=budget + 1))}
-    )
-    assert edited.success, _errors(edited)
-    opened = await session.commit(edited.updated_state)
-
-    rows = _rows(session.state)
-    for row_id, draft in ((CATEGORY, CATEGORY_DRAFT), (AUDIENCE, AUDIENCE_DRAFT)):
-        row = rows[row_id]
-        assert (row["status"], row["accepted_value"], row["event_id"], row["draft"]) == ("pending", None, None, draft)
-    assert _cards(opened) == [PROMPT_CARD, ("vague_term", "audience"), ("vague_term", "category")]
-    assert HASH_KEY not in _options(session.state)
-    card = next(event for event in opened if event.kind is InterpretationKind.LLM_PROMPT_TEMPLATE).llm_draft
-    assert card is not None and len(card) <= PROMPT_SURFACE_REVIEW_MAX_CHARS
+    assert "more chars not shown" in card
+    # The bounded card text cuts the tail, and with it both definitions.
     assert AUDIENCE_AMENDED not in card
+    assert isinstance(materialize_state_for_execution(session.state), InterpretationReviewPending)
+
+    await session.approve_only_prompt_card(opened)
+    assert _sent_prompt(session.state) == prompt
+    assert session.term_events() == original_term_events
 
 
 # --------------------------------------------------------------------------- #

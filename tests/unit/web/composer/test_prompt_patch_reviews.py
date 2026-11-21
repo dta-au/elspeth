@@ -395,6 +395,36 @@ def test_term_is_carried_across_a_wording_edit_only_when_the_prompt_review_reope
         assert "approved_prompt_artifact_hash" not in reconciled
 
 
+def test_structured_prompt_beside_a_file_held_system_prompt_carries_its_term_across_a_wording_edit() -> None:
+    """The prompt card for this node is a file label, never the prompt text. The term is carried all the same.
+
+    Reconciliation is driven directly on a hand-built approved state; the file
+    binding is the marker in ``system_prompt`` and must come through untouched.
+    """
+    marker = {"blob_ref": "3f0c1a52-7d4e-4c7b-9a57-2c1d6f0e8b11", "mode": "inline_content", "sha256": "a" * 64}
+    state = _approved_state(structured=True)
+    options = deep_thaw(state.nodes[0].options)
+    options["system_prompt"] = marker
+    prompt_review = next(row for row in options["interpretation_requirements"] if row["kind"] == "llm_prompt_template")
+    prompt_review["draft"] = prompt_review_draft_from_options(options)
+    prompt_review["accepted_value"] = prompt_review["draft"]
+    prompt_review["resolved_prompt_template_hash"] = prompt_review_anchor_hash_from_options(options)
+    options["approved_prompt_artifact_hash"] = approved_prompt_artifact_hash_from_options(options)
+    assert prompt_review["draft"].startswith("File-backed prompt")
+    edited_options = deep_thaw(options)
+    edited_options["prompt_template_parts"][0]["text"] = "Assess "
+    previous = state.with_node(replace(state.nodes[0], options=options))
+    proposed = state.with_node(replace(state.nodes[0], options=edited_options))
+
+    reconciled = reconcile_authoritative_reviews(previous, proposed).nodes[0].options
+
+    rows = {row["id"]: row for row in reconciled["interpretation_requirements"]}
+    assert rows["category"] == next(row for row in options["interpretation_requirements"] if row["id"] == "category")
+    assert next(row for row in rows.values() if row["kind"] == "llm_prompt_template")["status"] == "pending"
+    assert reconciled["prompt_template"] == "Assess support categories for {{ row.text }}."
+    assert reconciled["system_prompt"] == marker
+
+
 def test_system_prompt_edit_preserves_unchanged_structured_category_review() -> None:
     state = _approved_state(structured=True)
 
