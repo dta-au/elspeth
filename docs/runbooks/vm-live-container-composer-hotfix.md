@@ -1,21 +1,19 @@
 # VM live-container Composer credential-limit hotfix
 
-Status: proposed execution procedure, dated 2026-11-20. It was written during
-the 0.8.15 staging hotfix window and carried into the repository with 0.8.16.
-This document does not implement a patch, restart a service, or authorize a
-deployment, and no release assignment is implied.
+Status: proposed execution procedure, dated 2026-11-20. This document does not
+implement a patch, restart a service, or authorize a deployment, and no release
+assignment is implied.
 
-**Reconciliation with 0.8.16.** The two-file patch this procedure was written
-for -- the [credential-limit plan](../workplans/composer-credential-scan-limit-fix.md)
--- was not implemented as planned. 0.8.16 instead raises the physical-boundary
-credential scan ceiling to 2 MiB in `src/elspeth/web/composer/provider_gateway.py`
-(commit `ddf6cf234`), and that ships in the image. No writable-layer install is
-needed for it. Keep this document as the reviewed method for installing a small,
-tested Python change into a stopped container's writable layer. Before any new
-use, re-identify the target files and re-run the
-[procedure review](../workplans/composer-credential-hotfix-procedure-astra-review.md)'s
-prerequisites for them. The review approved the procedure's design; its
-measured execution prerequisites below remain mandatory before a live rollout.
+**Reconciliation with 0.8.16.** The two-file credential-limit patch this
+procedure was written for was not implemented as planned. 0.8.16 instead raises
+the physical-boundary credential scan ceiling to 2 MiB in
+`src/elspeth/web/composer/provider_gateway.py` (commit `ddf6cf234`), and that
+ships in the image. No writable-layer install is needed for it. Keep this
+document as the reviewed method for installing a small, tested Python change
+into a stopped container's writable layer. Before any new use, re-identify the
+target files and re-check this procedure's prerequisites for them. The
+procedure's design was reviewed and approved; its measured execution
+prerequisites below remain mandatory before a live rollout.
 
 Use this procedure for an existing Docker deployment on a VM where the model
 gateway joins the web container's network namespace. Install the tested two-file
@@ -34,7 +32,7 @@ or old container identifiers into a live command:
 | `HOTFIX_WEB`, `HOTFIX_GATEWAY` | Existing web and model-gateway container names |
 | `HOTFIX_WEB_ID`, `HOTFIX_IMAGE` | Full current web container ID and image digest |
 | `HOTFIX_GATEWAY_ID` | Full current gateway container ID |
-| `HOTFIX_PORTAL_DIR` | New private operator-task directory under the portal's resolved persistent data directory |
+| `HOTFIX_RECORDS_DIR` | New private operator-task directory under approved storage's resolved persistent data directory |
 | `HOTFIX_ARTIFACTS` | Code-only package directory inside the worktree |
 | `HOTFIX_TEST_RUN` | New lane-private directory inside the worktree for synthetic test logs and temporary files |
 | `HOTFIX_CANDIDATE_TAR`, `HOTFIX_ROLLBACK_TAR` | Reviewed candidate and exact baseline code archives |
@@ -46,7 +44,7 @@ must be owned by this run and inside the worktree. Pytest may remove its basetem
 contents; never point it at source, staging state or another run's directory.
 
 Keep staging data, runtime telemetry, private deployment records, canary results,
-and backup manifests in the portal or the designated backup storage account.
+and backup manifests in approved storage or the designated backup storage account.
 Code, synthetic tests and code-only packages can remain in the project/worktree.
 Never save full Docker inspect output, credentials, request bodies, or service
 logs to workspace files. Read authentication configuration in memory; do not
@@ -116,11 +114,11 @@ database restore is a separate controlled recovery operation.
    baseline differs; account for the actual deployed changes first. Image labels
    alone do not capture previous changes to a container's writable layer.
 3. Copy the exact original two module files and a small sanitized deployment
-   record into `HOTFIX_PORTAL_DIR`. Record the concrete backup manifest reference,
+   record into `HOTFIX_RECORDS_DIR`. Record the concrete backup manifest reference,
    module paths, hashes, ownership/modes, interpreter version, container/image
    IDs and current network binding. Verify the stored originals against the live
    bytes. Do not export the environment or secret mounts into this record.
-   Confirm this directory is inside the actual persistent portal mount, with
+   Confirm this directory is inside the actual persistent approved-storage mount, with
    private permissions and application-appropriate ownership. A similarly named
    host directory is not an authorized data destination. Stream runtime readbacks
    and records into this destination or backup storage without workspace copies.
@@ -196,7 +194,7 @@ database restore is a separate controlled recovery operation.
    queued background work. Do not create a new service object and treat its empty
    in-memory registry as evidence about the running app. If work is outstanding,
    wait or arrange a separately approved cancellation; do not delete leases or
-   infer idleness from CPU. Keep count/status evidence in the portal.
+   infer idleness from CPU. Keep count/status evidence in approved storage.
 3. Recheck both container IDs, exact baseline file hashes and network binding
    immediately before stopping. If another deployment has changed them, stop
    this procedure and reconcile; do not patch by a reused container name.
@@ -211,7 +209,7 @@ database restore is a separate controlled recovery operation.
 
    Require stopped state, no OOM/forced kill, an acceptable exit status and
    application shutdown-completion evidence for this stop. Capture the bounded
-   shutdown interval in the portal/storage; require completed application/server
+   shutdown interval in approved storage; require completed application/server
    shutdown and no lifecycle/finalizer failure. Correlate membership stop and
    operation settlement where applicable. Docker stop success or exit status
    alone is insufficient: `app.py` raises accumulated finalizer failures.
@@ -242,7 +240,7 @@ database restore is a separate controlled recovery operation.
    startup; never start with one old and one new module.
 3. Read each installed file back using Docker's archive interface, which works
    while the container is stopped. Validate exact hashes, uid/gid/mode and fresh
-   source mtimes. Store runtime verification records in the portal/backup path;
+   source mtimes. Store runtime verification records in the approved storage or backup path;
    only pure code bytes may be inspected in the worktree. Do not run `docker exec`
    against a stopped container or start it solely to discover a bad copy.
 
@@ -265,7 +263,7 @@ database restore is a separate controlled recovery operation.
    the gateway binding still names the exact web ID, and the model gateway's
    authenticated `/readyz` probe succeeds from the web namespace with the
    configured model aliases. Read its bearer credential from the web environment
-   inside the container; save sanitized results only in the portal.
+   inside the container; save sanitized results only in approved storage.
    Resolve the `/readyz` URL from the existing provider endpoint, send its existing
    bearer header, and require the configured JSON `ready`/`model_aliases` contract.
    Record boot-probe outcomes accurately: starting promptly reduces the gateway
@@ -281,11 +279,11 @@ database restore is a separate controlled recovery operation.
    with graph-changing scope specified beforehand. Use a representative large
    composite graph context, verify real provider dispatch, accurate resource
    refusal behavior, and unchanged wire/credential protections. Keep prompts,
-   request context and results in the portal. Synthetic credential controls belong
+   request context and results in approved storage. Synthetic credential controls belong
    in isolated tests; never use a real secret as a live canary.
 5. Reopen ingress only after service readiness and the agreed canary pass. Record
    the installed patch commit, module hashes, backup reference and acceptance
-   result in the controlled portal record. If acceptance is incomplete, keep the
+   result in the controlled approved-storage record. If acceptance is incomplete, keep the
    window open for rollback rather than declaring the hotfix successful.
 
 ## 6. Code rollback
@@ -308,7 +306,7 @@ credential-protection failure or unexplained live error.
 3. Verify both restored files through the stopped-container archive readback.
    Start web, immediately start gateway, then repeat readiness and a bounded
    normal Composer check. Reopen ingress only when the previous behavior is
-   established. Retain failure evidence in the portal/backup destination.
+   established. Retain failure evidence in the approved storage or backup destination.
 4. Do not restore databases, delete state, recreate containers, rerender secrets
    or run schema initialization as part of code rollback. Any recovery requiring
    those actions needs a separate assessment and operator scope.
