@@ -364,6 +364,27 @@ next call's input/output tokens or guarantee context fit. The operator remains
 responsible for the selected model and gateway's actual capacity. Restart the
 service after changing the setting.
 
+### Advisor reply cap and timeout
+
+`ELSPETH_WEB__COMPOSER_ADVISOR_MAX_COMPLETION_TOKENS` (default `16384`) is the
+completion-token cap sent with every advisor request. A checkpoint reviews a
+whole build, and the model's reasoning tokens are drawn from the same cap as
+its verdict. A reply that reaches the cap before it states a verdict is
+recorded with finish reason `length`, and every advisor call record carries
+the cap it sent (`max_completion_tokens_requested`). The completion check then
+says the reply ran out of room, names this setting and gives the cap that was
+sent.
+
+`ELSPETH_WEB__COMPOSER_ADVISOR_TIMEOUT_SECONDS` (default `180`) bounds each
+advisor provider call. A call never waits longer than the time left in the
+turn (`ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS`), whichever is smaller.
+
+The defaults were `8192` and `60` before 0.8.16. An explicit setting is used
+as given. A cap above the model's own output limit may be rejected by the
+provider, and startup cannot detect it; a rejected advisor request blocks
+completion as a rejected request. Restart the service after changing either
+setting.
+
 ### Validation reuse within a compose call (`ELSPETH_WEB__COMPOSER_VALIDATION_REUSE_ENABLED`)
 
 Default `true`. Within one compose call, the Composer can hand back a

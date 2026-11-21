@@ -1277,7 +1277,7 @@ Settings live in `config.py`; three have **no default** (`Field(...)`) and must 
 | Planner repair budget | `composer_planner_repair_budget` | 2 | `:4338`, `4439`, `4574`, `4656`, `4787` |
 | Advisor hint tool | `composer_advisor_max_calls_per_compose` | 4 | `tool_batch.py` advisor branch (`:2276-2723`) |
 | Advisor END gate passes | `composer_advisor_checkpoint_max_passes` | 2 | `composition_completion.py:2305` |
-| Advisor call timeout / tokens | `composer_advisor_timeout_seconds`, `…_max_prompt_tokens`, `…_max_completion_tokens` | 60 s / 4000 / 8192 | `tool_batch.py:2430-2431`; token-limit enforcement UNVERIFIED |
+| Advisor call timeout / tokens | `composer_advisor_timeout_seconds`, `…_max_prompt_tokens`, `…_max_completion_tokens` | 60 s / 4000 / 8192 at `1a7ff0e6` (defaults 180 s / 4000 / 16384 from 0.8.16) | `tool_batch.py:2430-2431`; token-limit enforcement UNVERIFIED |
 | Runtime preflight | `composer_runtime_preflight_timeout_seconds` | 5.0 s | `composer_preflight.py:102`, `245` |
 | Auto-title | `_AUTO_TITLE_PROVIDER_TIMEOUT_SECONDS`, `_AUTO_TITLE_MAX_TOKENS` | 5.0 s, 40 | `sessions/_auto_title.py:80-82` |
 | Inline (held-request) composer work | `composer_sync_timeout_seconds` = min(timeout, idle ceiling 300 − headroom 30) | derived | proposal accept (`routes/composer/proposals.py`) |

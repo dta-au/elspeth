@@ -192,7 +192,7 @@ Defaults measured from the Web settings model at the review baseline
 | Composition turns, discovery turns and compose timeout | corresponding Composer settings | Required operator settings; no product default |
 | Composer messages per user per minute | `composer_rate_limit_per_minute` | Required operator setting; no product default |
 | Advisor calls per compose and checkpoint passes | advisor settings | 4 and 2 |
-| Advisor input proxy / completion tokens and timeout | advisor settings | 4,000 configured input units / 8,192 completion tokens; 60 seconds |
+| Advisor input proxy / completion tokens and timeout | advisor settings | 4,000 configured input units / 16,384 completion tokens (reasoning included); 180 seconds, capped by the turn time left |
 | Identical rejected planner calls | fixed | 6 |
 | Daily tokens | user/container quota settings | Off unless configured |
 | External calls from Web runs | `execution_rate_limit` | 60 per minute per service |
