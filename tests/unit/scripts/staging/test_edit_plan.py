@@ -571,6 +571,52 @@ def test_a_file_prompt_hash_cleared_to_null_is_server_written_on_any_node() -> N
     ]
 
 
+_QUERY = {"input_fields": ["x"], "output_fields": [{"suffix": "s", "type": "string"}]}
+FILE_MARKER = {"blob_ref": "8d737c7a-321f-4158-a6af-877fb4667940", "mode": "inline_content", "sha256": "a" * 64}
+
+
+def test_a_multi_query_steps_hash_cleared_with_its_query_templates_in_files_is_server_written() -> None:
+    # The acceptance fixture's multi-query steps hold their prompts as file-held QUERY templates and have no
+    # prompt_template; the server clears their approved hash like any other file-held step's.
+    query = {**_QUERY, "template": dict(FILE_MARKER)}
+    before = graph()
+    before["nodes"][1]["options"] = {"queries": {"a": query}, "model": "m", "approved_prompt_artifact_hash": "abc"}
+    cleared = copy.deepcopy(before)
+    cleared["nodes"][1]["options"]["approved_prompt_artifact_hash"] = None
+    changes = edit_plan.classify_changes(edit_plan.graph_view(before), edit_plan.graph_view(cleared), [], named=set())
+    assert changes.server_written == ["/nodes/summarise/options/approved_prompt_artifact_hash"]
+    assert changes.unrelated == []
+    inline = copy.deepcopy(before)
+    inline["nodes"][1]["options"]["queries"]["a"]["template"] = "Q {{ row.x }}"
+    inline_cleared = copy.deepcopy(inline)
+    inline_cleared["nodes"][1]["options"]["approved_prompt_artifact_hash"] = None
+    assert edit_plan.classify_changes(edit_plan.graph_view(inline), edit_plan.graph_view(inline_cleared), [], named=set()).unrelated == [
+        "/nodes/summarise/options/approved_prompt_artifact_hash"
+    ]
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        pytest.param({"prompt_template": "Rate {{ row.x }}."}, id="inline-prompt"),
+        pytest.param({"prompt_template": FILE_MARKER}, id="file-prompt"),
+        pytest.param({"prompt_template": "Rate.", "system_prompt": FILE_MARKER}, id="file-system-prompt"),
+        pytest.param({"queries": {"a": {**_QUERY, "template": FILE_MARKER}}}, id="file-query-templates"),
+        pytest.param({"queries": {"a": {**_QUERY, "template": "Q {{ row.x }}"}}}, id="inline-query-templates"),
+        pytest.param({"queries": [{"name": "a", **_QUERY, "template": FILE_MARKER}]}, id="file-query-template-list"),
+        pytest.param({"prompt_template": FILE_MARKER, "queries": {"a": dict(_QUERY)}}, id="query-falls-back-to-file-prompt"),
+        pytest.param({"prompt_template": FILE_MARKER, "queries": {"a": {**_QUERY, "template": "Q"}}}, id="unused-file-prompt"),
+    ],
+)
+def test_the_file_held_test_matches_the_server_that_stores_no_approval_hash(options: dict[str, Any]) -> None:
+    # One definition of "held in a file": the battery's must agree with the server's own, which stores no
+    # approved hash (returns None) exactly when a prompt the step uses is held in a file.
+    from elspeth.web.interpretation_state import approved_prompt_artifact_hash_from_options
+
+    server_defers = approved_prompt_artifact_hash_from_options(options) is None
+    assert edit_plan._approval_hash_deferred({"node_type": "transform", "options": options}) is server_defers
+
+
 def test_a_file_prompt_hash_changed_to_another_value_or_set_from_null_is_unrelated_where_not_named() -> None:
     before = graph()
     before["nodes"][1]["options"]["approved_prompt_artifact_hash"] = "abc"

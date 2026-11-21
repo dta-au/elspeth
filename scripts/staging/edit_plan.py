@@ -461,6 +461,41 @@ def _prompt_form(node: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _is_file_held_prompt(value: Any) -> bool:
+    return (
+        type(value) is dict
+        and "blob_ref" in value
+        and type(value["blob_ref"]) is str
+        and "mode" in value
+        and value["mode"] == "inline_content"
+    )
+
+
+def _approval_hash_deferred(node: Mapping[str, Any]) -> bool:
+    """True when the server stores no approved prompt hash for this step because a prompt is held in a file.
+
+    Mirrors ``approved_prompt_artifact_hash_from_options`` in ``elspeth.web.interpretation_state``
+    (which returns ``None`` for these options); ``test_edit_plan.py`` pins the two to each other. A
+    step's prompts are its ``system_prompt``, its ``queries`` (the mapping or list, each entry and each
+    entry's ``template``) and its ``prompt_template`` when a query falls back to it (no queries, or a
+    query without a template).
+    """
+    options = node["options"]
+    if node["node_type"] != "transform":
+        return False
+    values = [options[key] for key in ("system_prompt", "queries") if key in options]
+    queries = options["queries"] if "queries" in options else None
+    listed = queries.values() if type(queries) is dict else queries if type(queries) is list else ()
+    entries = [entry for entry in listed if type(entry) is dict]
+    if (not entries or any("template" not in entry or entry["template"] is None for entry in entries)) and "prompt_template" in options:
+        values.append(options["prompt_template"])
+    for entry in entries:
+        values.append(entry)
+        if "template" in entry:
+            values.append(entry["template"])
+    return any(_is_file_held_prompt(value) for value in values)
+
+
 def _secret_slots(node: Mapping[str, Any]) -> list[tuple[str, str]]:
     return [
         (key, value["secret_ref"])
@@ -661,11 +696,12 @@ def server_written_paths(
     auto_routes = {route for node_id in auto for route in (after["nodes"][node_id]["input"], after["nodes"][node_id]["on_success"])}
 
     def _file_prompt_hash_cleared(path: str) -> bool:
-        # Non-null before, null or absent after, on a step whose prompt is held in a file (before and after).
+        # Non-null before, null or absent after, on a step with a prompt held in a file (before and after):
+        # a prompt template, a system prompt, or a multi-query step's query templates.
         node_id = _segments(path)[1]
         if node_id not in before["nodes"] or node_id not in after["nodes"]:
             return False
-        if _prompt_form(before["nodes"][node_id]) != "file" or _prompt_form(after["nodes"][node_id]) != "file":
+        if not _approval_hash_deferred(before["nodes"][node_id]) or not _approval_hash_deferred(after["nodes"][node_id]):
             return False
         was_found, was = value_at(before, path)
         now_found, now = value_at(after, path)
