@@ -528,6 +528,9 @@ with the last change. The rule to continue from each saved batch within the
 same request applies only where changes apply directly. `create_blob` is not a
 composition change and is not refused for this reason: create a prompt file
 first, then send the one call.
+Do not call `request_interpretation_review` for rows inside a proposal that is
+still pending: the call is refused because the saved pipeline does not hold
+them yet, and their cards are raised when the user accepts the proposal.
 While a proposal is pending, do not stage another: tell the user to accept or
 reject it, and stop.
 `PREVALIDATION_REJECTED`

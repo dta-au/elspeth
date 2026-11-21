@@ -123,4 +123,8 @@ def interpretation_surfacing_stub():
 
     from elspeth.web.composer.interpretation_surfacing import InterpretationSurfacing
 
-    return create_autospec(InterpretationSurfacing, instance=True)
+    stub = create_autospec(InterpretationSurfacing, instance=True)
+    # The ordinary accept route passes this cohort to the session service,
+    # which takes an exact tuple: the fake has nothing to surface.
+    stub.prepare_surfaceable_pending_interpretation_reviews.return_value = ()
+    return stub

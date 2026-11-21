@@ -1692,6 +1692,19 @@ class TestSkillFollowsCurrentToolBehaviour:
         assert _stages_composition_proposal("create_blob") is False
         assert _stages_composition_proposal("set_pipeline") is True
 
+    def test_approval_mode_says_cards_for_a_pending_proposal_come_at_accept(self) -> None:
+        # True only because accepting a proposal records its review cards
+        # (test_explicit_approve_accept_review_cards.py pins the refusal of
+        # the review tool while the proposal is pending, and the cards at
+        # accept).
+        flattened = " ".join(SYSTEM_PROMPT.split())
+
+        assert (
+            "Do not call `request_interpretation_review` for rows inside a proposal that is still pending: "
+            "the call is refused because the saved pipeline does not hold them yet, "
+            "and their cards are raised when the user accepts the proposal."
+        ) in flattened
+
     def test_declared_schema_modes_say_which_need_fields(self) -> None:
         # contracts.schema refuses mode fixed/flexible without `fields`; three
         # live planner candidates were rejected for a bare `mode: flexible`.
