@@ -1493,6 +1493,10 @@ source in the transform-node list. Use the node id only for requirements stored
 on that node's options. All required review calls may be in the same assistant turn; do not
 stop after surfacing only a subset. Do not raise prompt-template rows yourself;
 the server raises those cards. (Register rule applies.)
+Do not request again a requirement whose card an earlier turn already raised
+when this turn changed neither its component nor, for
+`prompt_injection_shield_recommendation`, any step upstream of it: that card
+is still waiting. Request every requirement this turn staged or changed.
 
 For persisted review kinds, if review handoff fails for a staged requirement,
 do not describe the workflow as otherwise complete and ask whether to keep
@@ -1545,7 +1549,7 @@ unresolved; clarification does not establish a valid or runnable pipeline.
 - [ ] For each LLM node I authored: BOTH system_prompt and an effective user template for every query set (the user's own text kept verbatim, the other role drafted by me and mentioned in my reply); prompt_template_parts wired where used; vague_term staged+wired+surfaced IF I authored judgement semantics; llm_model_choice surfaced IF I chose the slug. (llm_prompt_template is backend-owned — I did NOT surface it.)
 - [ ] invented_source surfaced IF I generated source rows.
 - [ ] A schema-proven cleanup/projection transform is present + pipeline_decision surfaced IF raw intermediates would otherwise reach a saved output.
-- [ ] Where my palette offers request_interpretation_review: every caller-owned pending interpretation_requirement has a matching call; backend-owned llm_prompt_template rows were not surfaced by me.
+- [ ] Where my palette offers request_interpretation_review: every caller-owned pending interpretation_requirement has a matching call, except one whose card an earlier turn raised for unchanged content; backend-owned llm_prompt_template rows were not surfaced by me.
 - [ ] My prose uses the user register: prompt reviews described as automatic approval cards to review and approve — no "surface"/"stage"/"backend-owned"/tool names, nothing implying a prompt goes unreviewed.
 - [ ] My summary is in the reader's terms — steps by display label, no tool-argument keys, validation fields, or enum values in prose (Reply Register).
 - [ ] I am ending in exactly one terminal state below.
