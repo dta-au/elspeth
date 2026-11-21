@@ -980,6 +980,7 @@ def unrelated_changes(
 
 
 _COMPONENT_KIND_PREFIXES = ("node:", "output:", "sink:", "source:")
+_REVIEW_PENDING_CODE = "interpretation_review_pending"
 
 
 def new_validation_errors(before_state: Mapping[str, Any], after_state: Mapping[str, Any]) -> list[str]:
@@ -988,6 +989,11 @@ def new_validation_errors(before_state: Mapping[str, Any], after_state: Mapping[
     The server names the same component either bare (``cs1_scoring``) or with its kind (``node:cs1_scoring``,
     ``output:results``) depending on which validation path produced the entry, so components are compared
     without that prefix: one error re-spelt between two reads is not a new error.
+
+    A pending interpretation review is stored with either a sentence ("llm_prompt_template review pending for
+    transform 'x': ...") or the bare review kind ("llm_prompt_template"), again by write path, so those errors are
+    compared by the review kind (the message's first word) instead of the message. A pending review of another
+    kind, or on another component, is still new.
     """
 
     def component(raw: str | None) -> str | None:
@@ -998,17 +1004,24 @@ def new_validation_errors(before_state: Mapping[str, Any], after_state: Mapping[
                 return raw[len(prefix) :]
         return raw
 
-    def keys(state: Mapping[str, Any]) -> list[str]:
-        errors = state["validation_errors"] or []
-        return [json.dumps([error["error_code"], component(error["component"]), error["message"]]) for error in errors]
+    def detail(error: Mapping[str, Any]) -> Any:
+        message = error["message"]
+        if error["error_code"] == _REVIEW_PENDING_CODE and type(message) is str and message.split():
+            return message.split()[0]
+        return message
 
-    remaining = keys(before_state)
+    def identity(error: Mapping[str, Any]) -> str:
+        return json.dumps([error["error_code"], component(error["component"]), detail(error)])
+
+    remaining = [identity(error) for error in before_state["validation_errors"] or []]
     added: list[str] = []
-    for key in keys(after_state):
+    for error in after_state["validation_errors"] or []:
+        key = identity(error)
         if key in remaining:
             remaining.remove(key)
         else:
-            added.append(key)
+            # Reported as the server stored it, so a finding still shows the full message.
+            added.append(json.dumps([error["error_code"], component(error["component"]), error["message"]]))
     return added
 
 
