@@ -979,12 +979,28 @@ def unrelated_changes(
     return classify_changes(before, after, allowed, named=named).unrelated
 
 
+_COMPONENT_KIND_PREFIXES = ("node:", "output:", "sink:", "source:")
+
+
 def new_validation_errors(before_state: Mapping[str, Any], after_state: Mapping[str, Any]) -> list[str]:
-    """Validation errors present after the edit that were not present before it (by code, component and message)."""
+    """Validation errors present after the edit that were not present before it (by code, component and message).
+
+    The server names the same component either bare (``cs1_scoring``) or with its kind (``node:cs1_scoring``,
+    ``output:results``) depending on which validation path produced the entry, so components are compared
+    without that prefix: one error re-spelt between two reads is not a new error.
+    """
+
+    def component(raw: str | None) -> str | None:
+        if raw is None:
+            return None
+        for prefix in _COMPONENT_KIND_PREFIXES:
+            if raw.startswith(prefix):
+                return raw[len(prefix) :]
+        return raw
 
     def keys(state: Mapping[str, Any]) -> list[str]:
         errors = state["validation_errors"] or []
-        return [json.dumps([error["error_code"], error["component"], error["message"]]) for error in errors]
+        return [json.dumps([error["error_code"], component(error["component"]), error["message"]]) for error in errors]
 
     remaining = keys(before_state)
     added: list[str] = []
