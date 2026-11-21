@@ -3506,17 +3506,19 @@ def _wording_edit_reopens_its_prompt_review(candidate: NodeSpec) -> bool:
 
     ``candidate`` is the proposed node with its carried rows in place. A
     resolved vague term keeps its accepted value across a wording edit only
-    when the node's ``llm_prompt_template`` review is pending afterwards: that
-    review is the review of the change. The length of the prompt plays no
-    part; the prompt card has to show each carried term's accepted definition
-    at its slot, whatever it shortens.
+    when the node has an ``llm_prompt_template`` review: that review is the
+    review of the change. A term is carried only when the parts skeleton
+    changed, and every prompt review anchor contains the skeleton hash
+    (``prompt_review_anchor_hash_from_options``), so a review that exists has
+    been reopened by the same edit; only its absence needs checking here. The
+    length of the prompt plays no part; the prompt card has to show each
+    carried term's accepted definition at its slot, whatever it shortens.
 
     A node where a query supplies its own template is never carried: that
     query bypasses the node-level slots, and reopening the terms is what lets
     ``unwired_vague_term_error`` refuse the edit as it did before.
     """
-    prompt_review = _prompt_template_review_requirement(candidate.options)
-    if prompt_review is None or prompt_review["status"] != "pending":
+    if _prompt_template_review_requirement(candidate.options) is None:
         return False
     return "queries" not in candidate.options or vague_term_query_override_error(candidate.options["queries"]) is None
 
