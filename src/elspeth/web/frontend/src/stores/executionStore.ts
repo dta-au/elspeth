@@ -1166,7 +1166,7 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
       onAuthFailure() {
         if (!ownsConnection()) return;
         // Close code 4001 -- do not reconnect, trigger logout
-        useAuthStore.getState().logout();
+        useAuthStore.getState().logout({ expired: true });
       },
       onRunUnavailable() {
         if (!ownsConnection()) return;

@@ -597,6 +597,23 @@ describe("executionStore failed run events", () => {
     expect(createRunWebSocketTicket).toHaveBeenCalledWith("run-1");
   });
 
+  it("signs out with the expiry reason when the run socket closes for authentication", async () => {
+    const { useAuthStore } = await import("./authStore");
+    const logout = vi.fn().mockResolvedValue(undefined);
+    const realLogout = useAuthStore.getState().logout;
+    useAuthStore.setState({ logout });
+    try {
+      (connectToRun as ReturnType<typeof vi.fn>).mockReturnValue({ close: vi.fn() });
+      useExecutionStore.setState({ activeRunId: "run-1" });
+      useExecutionStore.getState().connectWebSocket("run-1");
+      const handlers = (connectToRun as ReturnType<typeof vi.fn>).mock.calls[0][2];
+      handlers.onAuthFailure();
+      expect(logout).toHaveBeenCalledWith({ expired: true });
+    } finally {
+      useAuthStore.setState({ logout: realLogout });
+    }
+  });
+
   it("preserves terminal failed event detail in progress and run list", () => {
     const close = vi.fn();
     (connectToRun as ReturnType<typeof vi.fn>).mockReturnValue({ close });

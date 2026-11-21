@@ -302,7 +302,7 @@ export async function parseResponse<T>(
     if (response.status === 401 && options.logoutOnUnauthorized !== false) {
       const { useAuthStore } = await import("@/stores/authStore");
       if (responseOwnsCredential(response, useAuthStore.getState().token)) {
-        await useAuthStore.getState().logout({ revoke: false });
+        await useAuthStore.getState().logout({ revoke: false, expired: true });
       }
     }
 
