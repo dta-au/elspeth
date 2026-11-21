@@ -197,6 +197,11 @@ Behaviour you will see:
   file (UTF-8, at most 16,384 bytes; at most 20 per session, freed by deleting
   one) marked suspected and unverified, and the call changes nothing else. It
   runs immediately in approval mode, like `create_blob`.
+- A question or other message that changes nothing no longer fails with "could
+  not verify this session's audit trail" when the pipeline has a prompt held
+  in a file with an open review card and the previous message also changed
+  nothing. Once it started, it failed on every following message until the
+  pipeline changed or every card was resolved.
 
 ### Web UI
 
@@ -350,6 +355,11 @@ Behaviour you will see:
   60 seconds, reporting the last `CURRENT` result between checks. A result
   that is not `CURRENT` is never reused, and a probe that cannot connect makes
   the next probe check the schema again.
+- The `composer_operation.settled` log line carries the session id, operation
+  id and the support diagnostic id. An audit-integrity failure adds one error
+  line, `composer_operation.audit_integrity_failure`, with the error's class
+  and a credential-filtered message of at most 512 bytes. Both point to the
+  private failure record kept with the operation.
 
 ### Tooling
 
