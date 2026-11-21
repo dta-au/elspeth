@@ -1173,7 +1173,12 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"vague_term_query_override|Pending vague_term review is bypassed by a query template",
         "A query on the node has its own template, so the node-level reviewed slot would not reach it.",
-        "Remove the per-query template(s) or move the reviewed term to a node whose queries all use the node-level template.",
+        "Remove the per-query template(s) or move the reviewed term to a node whose queries all use the node-level template. "
+        "A patch replaces queries whole, so restate every query when removing a template. A whole-pipeline rewrite "
+        "(set_pipeline) without the query's own template is accepted. If a review card for the term was already raised, "
+        "the user can approve it. Only if a file is meant to be the prompt for every query on the node, bind it to the "
+        "node's prompt_template with wire_blob_inline_ref; that replaces the whole node-level prompt and retires its term "
+        "reviews. A refusal from wire_blob_inline_ref lists its own repairs; follow those.",
     ),
     (
         r"vague_term_unwired|Pending vague_term review is not wired for resolution",

@@ -124,6 +124,7 @@ from elspeth.web.interpretation_state import (
     PROMPT_TEMPLATE_PARTS_KEY,
     reconcile_authoritative_reviews,
     serialize_authoring_review_options,
+    vague_term_wiring_count,
 )
 from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
 from elspeth.web.resource_identity import canonical_resource_uuid
@@ -1409,6 +1410,57 @@ def _written_options_keeping_an_unchanged_prompt(
     return kept
 
 
+def _pending_terms_stranded_by_query_file(
+    before: Mapping[str, JsonValue],
+    after: Mapping[str, JsonValue],
+) -> tuple[tuple[str, str], ...]:
+    """Pending vague-term reviews a query-template file would leave unresolvable.
+
+    ``(requirement id, user term)`` for each pending vague-term row the
+    node-level prompt could resolve before the wire and cannot after it.
+    ``vague_term_wiring_count`` is the one resolvability contract, the same one
+    the node-authoring doors apply through ``composition_review_contract_error``:
+    once a query has its own template, no pending term on the node is wired.
+    Comparing before with after keeps a node that was already stranded from
+    refusing a wire that did not strand it.
+    """
+    requirements = after.get(INTERPRETATION_REQUIREMENTS_KEY)
+    if not isinstance(requirements, (list, tuple)):
+        return ()
+    stranded: list[tuple[str, str]] = []
+    for row in requirements:
+        if not isinstance(row, Mapping) or not _is_vague_term_requirement(row) or row["status"] != "pending":
+            continue
+        user_term = str(row["user_term"])
+        if vague_term_wiring_count(before, user_term=user_term) == 1 and vague_term_wiring_count(after, user_term=user_term) != 1:
+            stranded.append((str(row["id"]), user_term))
+    return tuple(stranded)
+
+
+def _query_file_stranded_term_refusal(node_id: str, option_path: str, stranded: tuple[tuple[str, str], ...]) -> str:
+    """The repairable refusal for a query-template file that would strand pending term reviews.
+
+    Ids, the field path and the query name are written in full: the planner
+    sends them back. The term is echoed as the other doors echo it
+    (``unwired_vague_term_error``), unshortened. The text carries the code
+    literal so that ``explain_validation_error`` given this message finds the
+    code's guidance.
+    """
+    terms = ", ".join(repr(user_term) for _requirement_id, user_term in stranded)
+    pending = ", ".join(f"requirement {requirement_id!r} (term {user_term!r})" for requirement_id, user_term in stranded)
+    return (
+        f"Binding a file to {option_path} would leave the pending review of {terms} unresolvable: that query would get "
+        f"its own prompt and stop using the node-level prompt of node {node_id!r}, where the term is reviewed "
+        "(vague_term_query_override). Nothing was changed. "
+        f"(a) Ask the user to approve every pending term review on node {node_id!r}: {pending}. Then call "
+        "wire_blob_inline_ref again with the same field_path; an accepted term stays in the node-level prompt for the "
+        "queries that still use it. "
+        "Only if the file is meant to be the prompt for EVERY query on this node: "
+        f"(b) bind it to node:{node_id}.options.prompt_template instead; that replaces the whole node-level prompt "
+        "and retires its term reviews."
+    )
+
+
 def _structured_prompt_template_refusal(
     node_id: str,
     current_options: Mapping[str, JsonValue],
@@ -1627,6 +1679,22 @@ def _execute_wire_blob_inline_ref(
             canonical_error,
             error_code="interpretation_requirements_invalid",
         )
+    query_file = llm_prompt_file_scalar_field(ref.field_path)
+    if query_file is not None and query_file[1].startswith("queries."):
+        # A file on one query's template gives that query its own prompt. The
+        # node-authoring doors refuse that beside a pending node-level term
+        # review (vague_term_query_override); this door wrote it, leaving a
+        # review nothing could resolve and every later node edit refused.
+        wired_before = next((item for item in state.nodes if item.id == node_id and item.plugin == "llm"), None)
+        if wired_before is not None:
+            wired_after = next(item for item in reconciled.nodes if item.id == node_id)
+            stranded = _pending_terms_stranded_by_query_file(wired_before.options, wired_after.options)
+            if stranded:
+                return _failure_result(
+                    state,
+                    _query_file_stranded_term_refusal(node_id, query_file[1], stranded),
+                    error_code="vague_term_query_override",
+                )
     data: dict[str, JsonValue] = {"field_path": ref.field_path}
     if superseded_review_ids:
         # The replaced prompt's vague-term reviews, named so the model can tell
@@ -1646,6 +1714,10 @@ _WIRE_BLOB_INLINE_REF_DECLARATION = ToolDeclaration(
         "A user-created or agent-authored UTF-8 prompt file opens a mandatory full-content llm_prompt_template review card; changes require review again. "
         "Only prompt_template, system_prompt, and individual query templates accept prompt files, never model or whole queries. "
         "Wiring a file onto prompt_template REPLACES the whole prompt, whatever was there: prompt_template_parts and every vague-term review of the old text (pending or accepted) are removed, and the file gets its own review card. "
+        "Wiring a file onto system_prompt or one query template replaces only that text and removes no term review. "
+        "A query template is refused (vague_term_query_override) while the node-level prompt has a pending term review: "
+        "have the user approve that review first, then wire again. Bind the file to prompt_template instead only if it is "
+        "meant to be the prompt for every query: that replaces the whole node-level prompt and retires its term reviews. "
         "Returns the `field_path` that was wired, plus `superseded_review_ids` when the file superseded reviews of the old prompt."
     ),
     json_schema={
