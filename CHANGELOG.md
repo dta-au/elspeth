@@ -1518,7 +1518,9 @@ security and recovery fixes.
 **Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 35
 to 53. Epoch 36 adds retryable blob-deletion cleanup; later epochs add the
 multi-replica coordination substrate, the pluggable-SSO identity substrate
-and shareable blob-read admissions.
+and shareable blob-read admissions. Some of the coordination tables (run-start
+permits, cross-replica websocket tickets, rate-limit state and bounded cleanup
+claims) are schema only: no production writer exists yet.
 Landscape `SQLITE_SCHEMA_EPOCH` advances from 29 to 38. Epochs 34 and 35 make
 lineage frames and paths the sole lineage truth, and epoch 38 gives
 `scheduler_events` an auto-incrementing `seq` primary key that is the
@@ -1586,8 +1588,12 @@ secret-reference regexes promoted to public `PROFILE_ALIAS_PATTERN` and
 - **Pluggable single sign-on and one identity substrate.** Every login, local
   or SSO, resolves to one `identities` row that carries admission and quota.
 - **Landscape coordination.** Custody, liveness and takeover decisions read
-  the Landscape database's clock (ADR-047), and Landscape mutations begin to
-  carry a required `CoordinationToken` (ADR-048, completed in 0.8.1).
+  the Landscape database's clock (ADR-047). A Landscape mutation carries the
+  authority it is written under (ADR-048): the run-lifecycle, sink-effect,
+  checkpoint and audit-export verbs take a required `CoordinationToken`. This
+  model is not complete in 0.8.0: the data-flow, execution and scheduler
+  repository families still write under a plain run id, and completion is
+  targeted for 0.8.1.
 - **Critical fixes** include: blob deletion cleanup remains retryable after
   metadata commit, every token reaches a lifecycle answer when a run dies
   (ADR-038), and generated multiline text is no longer silently discarded
