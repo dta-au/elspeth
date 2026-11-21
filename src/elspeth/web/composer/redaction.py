@@ -1432,6 +1432,22 @@ _OmittableString = Annotated[
 ]
 
 
+def _reject_null_or_blank_pipeline_name(value: Any) -> Any:
+    """A pipeline name may be replaced, never cleared: null and blank text are both refused."""
+    value = _reject_supplied_null(value)
+    if type(value) is str and not value.strip():
+        raise ValueError("a pipeline name cannot be empty or whitespace; omit name to keep it")
+    return value
+
+
+# set_metadata's name: the same JSON schema as _OmittableString (a string). The
+# blank refusal is a write-time rule, so a blank name already stored still reads.
+_PipelineName = Annotated[
+    str | SkipJsonSchema[None],
+    BeforeValidator(_reject_null_or_blank_pipeline_name),
+]
+
+
 def _reject_coerced_integer(value: Any) -> Any:
     """JSON Schema integers include integral numbers, but not booleans/text."""
     if type(value) not in (int, float):

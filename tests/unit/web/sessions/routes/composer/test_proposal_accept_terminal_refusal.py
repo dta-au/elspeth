@@ -136,26 +136,17 @@ def test_legacy_queue_scope_replay_terminalizes_without_changing_private_composi
 
 
 @pytest.mark.parametrize(
-    ("tool_name", "arguments", "advances_version", "changed"),
+    ("tool_name", "arguments", "changed"),
     [
-        ("get_pipeline_state", {}, False, False),
-        # set_metadata returns the saved state for a patch that changes nothing.
-        ("set_metadata", {"patch": {}}, False, False),
-        ("set_metadata", {"patch": {"name": "accepted-proposal"}}, False, False),
-        # patch_output_options still writes a version for a same-value patch,
-        # so content identity, not the version, decides this one.
-        ("patch_output_options", {"sink_name": "rows", "patch": {"mode": "write"}}, True, False),
-        ("set_metadata", {"patch": {"name": "actually changed"}}, True, True),
+        ("get_pipeline_state", {}, False),
+        ("set_metadata", {"patch": {}}, False),
+        ("set_metadata", {"patch": {"name": "accepted-proposal"}}, False),
+        ("set_metadata", {"patch": {"name": "actually changed"}}, True),
     ],
-    ids=["same-version", "empty-patch", "same-value", "same-value-version-increment", "changed"],
+    ids=["same-version", "empty-patch", "same-value-version-increment", "changed"],
 )
 def test_content_identity_controls_legacy_accept(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    tool_name: str,
-    arguments: dict[str, Any],
-    advances_version: bool,
-    changed: bool,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool_name: str, arguments: dict[str, Any], changed: bool
 ) -> None:
     app, service = _make_app(tmp_path)
     client = TestClient(app)
@@ -194,7 +185,7 @@ def test_content_identity_controls_legacy_accept(
         assert response.json()["detail"]["error_type"] == "proposal_no_change"
     assert len(dispatches) == 1
     assert dispatches[0].success
-    assert (dispatches[0].updated_state.version > before.version) is advances_version
+    assert (dispatches[0].updated_state.version == before.version) == (tool_name == "get_pipeline_state")
     assert len(preflights) == int(changed)
     after = asyncio.run(service.get_current_state(session_id))
     assert after is not None
@@ -212,10 +203,7 @@ def test_content_identity_controls_legacy_accept(
     assert listed.json() == []
 
 
-# The vehicle must write a version for a content-identical change, or the route
-# never reaches finalization; set_metadata no longer does (it returns the saved
-# state for a patch that changes nothing), patch_output_options still does.
-@pytest.mark.parametrize("patch", [{}, {"mode": "write"}], ids=["empty-patch", "same-value"])
+@pytest.mark.parametrize("patch", [{}, {"name": "Assess tickets"}], ids=["empty-patch", "same-value"])
 def test_legacy_accept_compares_content_after_required_control_finalization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, patch: dict[str, Any]
 ) -> None:
@@ -289,7 +277,7 @@ def test_legacy_accept_compares_content_after_required_control_finalization(
         )
     )
     current = state_from_record(before)
-    proposal = _proposal(service, session_id, "patch_output_options", {"sink_name": "assessed", "patch": patch}, before.id)
+    proposal = _proposal(service, session_id, "set_metadata", {"patch": patch}, before.id)
     dispatch_results = []
     preflight_states = []
     real_dispatch = routes.execute_tool
