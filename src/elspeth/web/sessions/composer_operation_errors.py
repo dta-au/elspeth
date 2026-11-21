@@ -68,6 +68,32 @@ def worker_lost_error(*, request_id: str | None) -> ComposerOperationError:
     )
 
 
+def session_lease_lapsed_error(*, request_id: str | None, diagnostic_id: str) -> ComposerOperationError:
+    """A live owner lost its session-operation lease: the server kept running."""
+    return ComposerOperationError(
+        http_status=503,
+        failure_code="operation_failed",
+        error_type="operation_failed",
+        body={
+            "detail": {
+                "error_type": "operation_failed",
+                "detail": (
+                    "This request stopped because the server was too busy to keep its hold on the session. "
+                    "Reload to see what was saved, then resubmit."
+                ),
+                "request_id": request_id,
+                "diagnostic_id": diagnostic_id,
+            }
+        },
+        diagnostic_id=diagnostic_id,
+    )
+
+
+def unsettled_owner_error(*, request_id: str | None, diagnostic_id: str) -> ComposerOperationError:
+    """A live owner ended without writing its terminal for any other reason."""
+    return _generic_failure(request_id=request_id, diagnostic_id=diagnostic_id)
+
+
 def stale_base_error(*, request_id: str | None) -> ComposerOperationError:
     return _http_error(
         409,

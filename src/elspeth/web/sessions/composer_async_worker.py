@@ -47,6 +47,8 @@ from elspeth.web.sessions.composer_operation_errors import (
     operation_failure_diagnostic_id,
     project_composer_operation_error,
     request_cancelled_error,
+    session_lease_lapsed_error,
+    unsettled_owner_error,
     worker_lost_error,
 )
 from elspeth.web.sessions.composer_operations import (
@@ -79,6 +81,12 @@ slog = structlog.get_logger()
 # The audit-integrity log line carries at most this much of the leaf's text;
 # the private failure-facts row it points to retains up to 2048 bytes.
 _SETTLED_LOG_MESSAGE_BYTES = 512
+# An owner that ends without a terminal writes no failure-facts row; its log
+# line names at most this many leaves of the escaping group, in order.
+_OWNER_UNSETTLED_LOGGED_LEAVES = 8
+# Unsettled owners remembered for the reaper; the oldest is forgotten first.
+# One that is forgotten is settled as a lost worker, as before.
+_UNSETTLED_OWNERS_RETAINED = 1_024
 
 
 @dataclass(slots=True)
@@ -309,6 +317,11 @@ class ComposerAsyncWorker:
         self._loop_task: asyncio.Task[None] | None = None
         self._jobs: dict[tuple[UUID, str], asyncio.Task[_AdoptionSettlementHandoff | None]] = {}
         self._local_cancels: dict[tuple[UUID, str], asyncio.Event] = {}
+        # Operations whose owner Task ended in THIS process without writing a
+        # terminal, and whether it had lost its session lease. The reaper
+        # settles them later; this record is the only proof that the server
+        # did not stop (a configured instance id survives a restart).
+        self._unsettled_owners: dict[tuple[UUID, str], bool] = {}
 
     def notify_work(self) -> None:
         self._wake.set()
@@ -395,7 +408,19 @@ class ComposerAsyncWorker:
             if recovery is not None and all(item.all_completed for item in recovery):
                 del self._recovery_coordinators[key]
         if failure is not None:
-            slog.error("composer_operation.owner_unsettled", exc_class=type(failure).__name__)
+            leaves = _owner_failure_leaves(failure)
+            self._unsettled_owners[key] = any(isinstance(leaf, SessionOperationFenceLost) for leaf in leaves)
+            while len(self._unsettled_owners) > _UNSETTLED_OWNERS_RETAINED:
+                del self._unsettled_owners[next(iter(self._unsettled_owners))]
+            slog.error(
+                "composer_operation.owner_unsettled",
+                session_id=str(key[0]),
+                operation_id=key[1],
+                diagnostic_id=operation_failure_diagnostic_id(session_id=str(key[0]), operation_id=key[1]),
+                exc_class=type(failure).__name__,
+                leaf_count=len(leaves),
+                leaves=[_owner_failure_leaf_fields(leaf) for leaf in leaves[:_OWNER_UNSETTLED_LOGGED_LEAVES]],
+            )
         self._wake.set()
 
     async def run_until_idle(self) -> None:
@@ -1440,7 +1465,10 @@ class ComposerAsyncWorker:
                 request_id=current.request_id,
                 timeout_seconds=(restore_utc(current.deadline_at) - restore_utc(current.created_at)).total_seconds(),
             )
-        if any(isinstance(leaf, (asyncio.CancelledError, SessionOperationFenceLost, ComposerOperationFenceLost)) for leaf in leaves):
+        if any(isinstance(leaf, SessionOperationFenceLost) for leaf in leaves):
+            # This owner is running: its session lease lapsed, the server did not stop.
+            return session_lease_lapsed_error(request_id=current.request_id, diagnostic_id=diagnostic_id)
+        if any(isinstance(leaf, (asyncio.CancelledError, ComposerOperationFenceLost)) for leaf in leaves):
             return worker_lost_error(request_id=current.request_id)
         if reduction is not None:
             return reduction.project(
@@ -1482,7 +1510,8 @@ class ComposerAsyncWorker:
             if (record.session_id, record.operation_id) in self._adoption_recovery_pending:
                 self._process_recovery.request_shutdown()
                 continue
-            failure = worker_lost_error(request_id=record.request_id)
+            failure = self._reaped_failure(record)
+            settled_before = count
             try:
                 lease = await SessionOperationLease.acquire(
                     services.session_service.session_operation_authority,
@@ -1532,11 +1561,47 @@ class ComposerAsyncWorker:
                     raise
             except ComposerOperationFenceLost:
                 pass
+            if count > settled_before:
+                self._unsettled_owners.pop((record.session_id, record.operation_id), None)
         return count
+
+    def _reaped_failure(self, record: ComposerOperationRecord) -> ComposerOperationError:
+        """A lost worker unless this live process saw the owner end unsettled."""
+        key = (record.session_id, record.operation_id)
+        if key not in self._unsettled_owners:
+            return worker_lost_error(request_id=record.request_id)
+        diagnostic_id = operation_failure_diagnostic_id(session_id=str(record.session_id), operation_id=record.operation_id)
+        if self._unsettled_owners[key]:
+            return session_lease_lapsed_error(request_id=record.request_id, diagnostic_id=diagnostic_id)
+        return unsettled_owner_error(request_id=record.request_id, diagnostic_id=diagnostic_id)
 
 
 def _failure_leaves(exc: BaseException) -> tuple[BaseException, ...]:
     return required_failure_leaves(exc)
+
+
+def _owner_failure_leaves(exc: BaseException) -> tuple[BaseException, ...]:
+    """Every non-group member of an escaping owner failure, depth first, each once."""
+    leaves: list[BaseException] = []
+    pending: list[BaseException] = [exc]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(reversed(current.exceptions))
+        elif all(current is not seen for seen in leaves):
+            leaves.append(current)
+    return tuple(leaves)
+
+
+def _owner_failure_leaf_fields(leaf: BaseException) -> dict[str, str | None]:
+    """A leaf's class and its direct cause's class, with text only as the failure facts may retain it."""
+    args = leaf.args
+    cause = leaf.__cause__
+    return {
+        "class": safe_failure_text(type(leaf).__name__, 128) or "unavailable",
+        "message": safe_failure_text(args[0], _SETTLED_LOG_MESSAGE_BYTES) if args else None,
+        "cause_class": None if cause is None else (safe_failure_text(type(cause).__name__, 128) or "unavailable"),
+    }
 
 
 def _authoritative_failure(exc: BaseException) -> bool:
