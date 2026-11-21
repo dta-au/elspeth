@@ -62,11 +62,16 @@ Settings (`WebSettings`, `src/elspeth/web/config.py`):
 | `composer_context_shed_to` | `ELSPETH_WEB__COMPOSER_CONTEXT_SHED_TO` | `0.60` |
 | `composer_planner_max_request_bytes` | `ELSPETH_WEB__COMPOSER_PLANNER_MAX_REQUEST_BYTES` | 960 KiB (was 2 MiB); now also bounds the compose loop |
 
-Shed order, oldest first within each: tool-result bodies from earlier round
-trips of the current turn (replaced by a fixed stub), prior assistant prose,
-escape-hatch transcript events, prior user requests. Both ceilings are judged
-on the request as sent (canonical JSON of its messages and tools, so
-tool-call arguments and thinking blocks count; they are never shed). Tokens
+Only earlier turns are shed. Shed order, oldest first within each: prior
+assistant prose, escape-hatch transcript events of earlier turns, prior user
+requests. Nothing from the turn in progress is shed, stubbed or truncated: its
+request, every tool round of the turn (not only the latest) and the
+escape-hatch transcript's events of this turn are always sent whole. With
+every earlier turn left out, a request still over the token setting is sent
+and recorded `over_estimate`; one over the byte maximum is refused. Both
+ceilings are judged on the request as sent (canonical JSON of its messages
+and tools, so tool-call arguments and thinking blocks count; they are never
+shed). Tokens
 use the newest usable same-model, same-dialect provider count in the exchange:
 `min(wire bytes - authored bytes + ceil(authored bytes / 3), anchor tokens + wire bytes - shared protected bytes)`
 when an anchor is usable; without one, only the first arm applies. Authored

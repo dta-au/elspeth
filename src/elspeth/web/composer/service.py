@@ -109,14 +109,11 @@ from elspeth.web.composer.context_budget import (
 from elspeth.web.composer.context_budget_apply import (
     CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
     first_history_shed_of_turn,
-    held_tool_keys,
     largest_component,
     latest_round_trip_start,
     message_wire_split,
     previously_shed_keys,
     request_wire_bytes,
-    stubbed_tool_message,
-    tool_result_segments,
 )
 from elspeth.web.composer.context_budget_history import ContextBudgetHistory, request_anchor
 from elspeth.web.composer.control_messages import anti_anchor_control_envelope
@@ -647,11 +644,31 @@ class _ContextBudgetFrame:
         return _CONTEXT_BUDGET_HISTORY_START + len(self.history_entries)
 
 
-def _sheddable_message_positions(frame: _ContextBudgetFrame, tool_positions: Mapping[str, list[int]]) -> set[int]:
-    """Positions whose bytes a context-budget segment can remove or replace."""
+def _sheddable_message_positions(frame: _ContextBudgetFrame) -> set[int]:
+    """Positions whose bytes a context-budget segment can remove: earlier turns' messages only.
+
+    Nothing from the turn in progress is ever a segment: its user message,
+    its assistant tool-call messages and its tool results are always sent
+    whole.
+    """
     return {
         _CONTEXT_BUDGET_HISTORY_START + position for position, (_chat_index, kind) in enumerate(frame.history_entries) if kind is not None
-    } | {index for positions in tool_positions.values() for index in positions}
+    }
+
+
+def _history_held_after_provider_rejection(calls: Sequence[ComposerLLMCall]) -> frozenset[str]:
+    """History keys a retry after a provider's context-limit rejection left out earlier in this turn.
+
+    The provider has judged the request with them too large, so they stay out
+    for the rest of the turn whatever the estimate says. ``calls`` are this
+    turn's calls only; a later turn follows the ordinary release rule.
+    """
+    return frozenset(
+        f"history:{chat_index}"
+        for call in calls
+        if call.context_budget is not None and call.context_budget.retry_after_provider_rejection is True
+        for chat_index in call.context_budget.shed_history_indices
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1612,6 +1629,7 @@ class ComposerServiceImpl:
         failed_turn: FailedTurnMetadata | None,
         progress: ComposerProgressSink | None,
         reply_stage: bool = False,
+        shed_all_history: bool = False,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], BlobDeliveryAttempt | None, ComposerContextBudgetRecord]:
         """Freeze the selected input, fit it to the context budget, and derive the gateway's exact marked hash.
 
@@ -1625,8 +1643,10 @@ class ComposerServiceImpl:
         ``messages`` are always the loop's own messages, tool roles intact.
         With ``reply_stage`` the request is a reply stage's: the loop's
         messages are fitted first and the request sent is the reply-only form
-        of the fitted list, so a tool result stubbed here or on an earlier
-        call of the turn is quoted as its stub, not re-sent in full.
+        of the fitted list. Only earlier turns are ever left out, so every
+        tool result of this turn is quoted in full. ``shed_all_history`` is the
+        retry after a provider's context-limit rejection (see
+        :meth:`_shed_to_context_budget`).
         """
         from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers, supports_anthropic_prompt_cache_markers
 
@@ -1651,11 +1671,12 @@ class ComposerServiceImpl:
             recorder=recorder,
             refusal_scope=refusal_scope,
             reply_stage=reply_stage,
+            shed_all_history=shed_all_history,
         )
         # The latest tool round by the fitted loop messages' positions; the reply-stage form keeps them one to one.
         latest_start, latest_stop = latest_round_trip_start(selected_messages), len(selected_messages)
         if reply_stage:
-            # Quoted inspections were registered from the unshed request above; a stubbed result registers none.
+            # Quoted inspections were registered from the unshed request above.
             selected_messages = _reply_stage_messages(selected_messages)
         marked_messages, marked_tools = selected_messages, selected_tools
         if supports_anthropic_prompt_cache_markers(self._model):
@@ -1707,17 +1728,24 @@ class ComposerServiceImpl:
         recorder: BufferingRecorder,
         refusal_scope: _ContextBudgetRefusalScope,
         reply_stage: bool = False,
+        shed_all_history: bool = False,
     ) -> tuple[list[dict[str, Any]], ComposerContextBudgetRecord, float]:
         """Label the request's segments, decide, and apply the decision to ``messages`` (a private copy).
 
         Returns the fitted loop messages, the record of the decision, and the
         conservative byte-to-token rate for the final byte guard.
 
-        Segments are always labelled on the loop's messages. With
-        ``reply_stage`` the size the decision is fed is that of the
-        reply-stage request built from them, and a tool result's saving is
-        measured on the quoted message that request carries in its place, so
-        the decision's size after shedding is a tight upper bound there too.
+        Segments are always labelled on the loop's messages, and only earlier
+        turns' messages are segments: the current user message and every round
+        of this turn (``messages[state_index + 1:]``) are protected and always
+        sent whole. With ``reply_stage`` the size the decision is fed is that
+        of the reply-stage request built from them.
+
+        With ``shed_all_history`` (the retry after the provider rejected the
+        previous request as over its context limit) every earlier turn is left
+        out and the record says so. What that retry left out stays out for the
+        rest of the turn, whatever the estimate; a later turn follows the
+        ordinary release rule.
         """
         from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers, supports_anthropic_prompt_cache_markers
 
@@ -1725,7 +1753,7 @@ class ComposerServiceImpl:
         if len(messages) < state_index + 2 or messages[state_index]["content"] != frame.state_message_content:
             raise InvariantError("compose-loop request does not have the layout its context budget frame describes")
         # Savings are wire bytes: a history message's whole canonical JSON (its
-        # separator is not counted), a tool result's wire bytes less its stub's.
+        # separator is not counted).
         split = message_wire_split(messages, tools or None)
         latest_start = latest_round_trip_start(messages)
 
@@ -1736,24 +1764,6 @@ class ComposerServiceImpl:
                 segments.append(SheddableSegment(kind=kind, key=f"history:{chat_index}", saving_bytes=saving))
         # A re-render after shedding history adds the omission counts.
         omission_allowance = CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES if segments else 0
-
-        # The reply stage quotes each tool record as text, one message for one,
-        # unless the turn replays native thinking (the rule _reply_only_messages
-        # applies): a stub's saving is then measured on the quoted form, whose
-        # second layer of escaping stubbing also removes.
-        def quoted_saving(index: int) -> int:
-            quoted = _reply_only_messages([messages[index], stubbed_tool_message(messages[index])])
-            return message_wire_split(quoted[:1], None).total_bytes - message_wire_split(quoted[1:], None).total_bytes
-
-        quotes_records = reply_stage and not any(entry is not None for entry in detach_prompt_guard_evidence(messages).thinking_parts)
-        tool_segments, tool_positions = tool_result_segments(
-            messages,
-            split,
-            start=state_index + 2,
-            stop=latest_start if latest_start is not None else len(messages),
-            saving_at=quoted_saving if quotes_records else None,
-        )
-        segments.extend(tool_segments)
 
         # The decision measures the request as it will be sent: with cache
         # markers, in wire bytes (content, tool-call arguments, thinking
@@ -1767,7 +1777,7 @@ class ComposerServiceImpl:
             sent_messages, marked_tools = apply_anthropic_cache_markers(sent_messages, tools, mark_history_tail=True)
             sent_tools = marked_tools or None
 
-        sheddable_positions = _sheddable_message_positions(frame, tool_positions)
+        sheddable_positions = _sheddable_message_positions(frame)
         mutable_positions = set(sheddable_positions)
         if frame.history_entries:
             mutable_positions.add(state_index)
@@ -1777,12 +1787,9 @@ class ComposerServiceImpl:
         if reply_stage:
             mutable_positions = set(range(_CONTEXT_BUDGET_HISTORY_START, len(sent_messages)))
         segment_positions = {
-            **{
-                f"history:{chat_index}": {_CONTEXT_BUDGET_HISTORY_START + position}
-                for position, (chat_index, kind) in enumerate(frame.history_entries)
-                if kind is not None
-            },
-            **{key: set(positions) for key, positions in tool_positions.items()},
+            f"history:{chat_index}": {_CONTEXT_BUDGET_HISTORY_START + position}
+            for position, (chat_index, kind) in enumerate(frame.history_entries)
+            if kind is not None
         }
         if any(not segment_positions.get(segment.key) or not segment_positions[segment.key] <= mutable_positions for segment in segments):
             raise InvariantError("context-budget sheddable segment is outside mutable messages")
@@ -1811,9 +1818,12 @@ class ComposerServiceImpl:
                 anchor_authored_bytes=anchor.authored_bytes,
                 anchor_status=anchor.reason,
                 authored_bytes=authored_bytes,
+                # Keys no segment carries (a ``tool:`` key recorded before tool
+                # results of the turn in progress stopped being segments) are inert.
                 previously_shed=previously_shed_keys(frame.history, recorder.llm_calls),
-                held=held_tool_keys(recorder.llm_calls)
-                | (frame.history.shed_history_after(recorder.llm_calls) if reply_stage else frozenset()),
+                held=(frame.history.shed_history_after(recorder.llm_calls) if reply_stage else frozenset())
+                | (frozenset(segment_positions) if shed_all_history else frozenset())
+                | _history_held_after_provider_rejection(recorder.llm_calls),
                 # A message under the byte maximum always goes: the estimate
                 # decides what is left out, the provider judges its own limit.
                 on_over_estimate="send",
@@ -1855,6 +1865,7 @@ class ComposerServiceImpl:
             anchor_shared_bytes=anchor.shared_bytes,
             decision_wire_bytes=decision.request_bytes_before,
             decision_wire_bytes_after=decision.request_bytes_after,
+            retry_after_provider_rejection=True if shed_all_history else None,
         )
         if not shed:
             return messages, record, decision.bytes_per_token_used
@@ -1864,7 +1875,6 @@ class ComposerServiceImpl:
             for position, (chat_index, _kind) in enumerate(frame.history_entries)
             if f"history:{chat_index}" in shed
         }
-        stub_positions = {index for key, positions in tool_positions.items() if key in shed for index in positions}
         shed_kinds = [frame.history_entries[index - _CONTEXT_BUDGET_HISTORY_START][1] for index in shed_history_positions]
         applied: list[dict[str, Any]] = []
         for index, message in enumerate(messages):
@@ -1883,8 +1893,6 @@ class ComposerServiceImpl:
                         },
                     )
                 )
-            elif index in stub_positions:
-                applied.append(stubbed_tool_message(message))
             else:
                 applied.append(message)
         return applied, record, decision.bytes_per_token_used
@@ -1972,7 +1980,12 @@ class ComposerServiceImpl:
         budget, calls the provider before the cooperative deadline, and
         enforces ``_max_tool_calls_per_turn``. A request the budget cannot fit
         raises :class:`ComposerConvergenceError` with the
-        ``context_budget_exceeded`` reason before any provider call. A cap
+        ``context_budget_exceeded`` reason before any provider call. When the
+        provider rejects a sent request as over its context limit while an
+        earlier turn is still in it, the request is rebuilt with every earlier
+        turn left out and sent once more; a second rejection, or one with no
+        earlier turn left to leave out, is that same refusal naming the
+        provider as the ceiling. A cap
         breach raises it with the ``tool_call_cap_exceeded`` reason directly;
         no carrier is returned in either case.
 
@@ -1983,62 +1996,82 @@ class ComposerServiceImpl:
         turn has been persisted yet.
         """
         await emit_progress(progress, model_call_progress_event(message))
-        selected_messages, selected_tools, delivery, budget_record = await self._prepare_primary_delivery(
-            messages=llm_messages,
-            tools=tools,
-            recorder=recorder,
-            turn_evidence=turn_evidence,
-            budget_frame=budget_frame,
-            state=state,
-            initial_version=initial_version,
-            composition_turns_used=composition_turns_used,
-            discovery_turns_used=discovery_turns_used,
-            failed_turn=failed_turn,
-            progress=progress,
-        )
-        try:
-            completion = await self._call_llm_before_deadline(
-                selected_messages,
-                selected_tools,
-                state,
-                initial_version,
-                deadline,
+        # Set for the one retry after a provider's context-limit rejection.
+        shed_all_history = False
+        while True:
+            selected_messages, selected_tools, delivery, budget_record = await self._prepare_primary_delivery(
+                messages=llm_messages,
+                tools=tools,
                 recorder=recorder,
+                turn_evidence=turn_evidence,
+                budget_frame=budget_frame,
+                state=state,
+                initial_version=initial_version,
                 composition_turns_used=composition_turns_used,
                 discovery_turns_used=discovery_turns_used,
                 failed_turn=failed_turn,
-                provider_owner=provider_owner,
-                context_budget=budget_record,
+                progress=progress,
+                shed_all_history=shed_all_history,
             )
-        except _BadRequestLLMError as rejection:
-            if not is_context_length_rejection(rejection.__cause__):
-                # Not recognised as a size rejection, so not called one. That the
-                # request went out above the estimate is carried for the user.
-                rejection.sent_over_estimate = budget_record.over_estimate is True
-                raise
-            # The gateway or the model refused the request as over its context
-            # limit. That is reported to the user as the size refusal it is,
-            # naming the provider as the ceiling, never as a provider outage.
-            kept_history = sum(chat_index not in budget_record.shed_history_indices for chat_index, _kind in budget_frame.history_entries)
-            raise self._provider_capacity_refusal(
-                budget_record,
-                # Sized on the request that was sent.
-                _context_budget_component_bytes(
-                    message_wire_split(selected_messages, selected_tools or None),
-                    state_index=_CONTEXT_BUDGET_HISTORY_START + kept_history,
-                    latest_start=latest_round_trip_start(selected_messages),
-                    latest_stop=len(selected_messages),
-                    sheddable_bytes=0,
-                ),
-                _ContextBudgetRefusalScope(
-                    state=state,
-                    initial_version=initial_version,
+            try:
+                completion = await self._call_llm_before_deadline(
+                    selected_messages,
+                    selected_tools,
+                    state,
+                    initial_version,
+                    deadline,
+                    recorder=recorder,
                     composition_turns_used=composition_turns_used,
                     discovery_turns_used=discovery_turns_used,
                     failed_turn=failed_turn,
-                    recorder=recorder,
-                ),
-            ) from rejection
+                    provider_owner=provider_owner,
+                    context_budget=budget_record,
+                )
+            except _BadRequestLLMError as rejection:
+                if not is_context_length_rejection(rejection.__cause__):
+                    # Not recognised as a size rejection, so not called one. That the
+                    # request went out above the estimate is carried for the user.
+                    rejection.sent_over_estimate = budget_record.over_estimate is True
+                    raise
+                unshed_history = any(
+                    kind is not None and chat_index not in budget_record.shed_history_indices
+                    for chat_index, kind in budget_frame.history_entries
+                )
+                if unshed_history and not shed_all_history:
+                    # The provider judged the request too large while an earlier
+                    # turn was still in it: leave out every earlier turn and send
+                    # once more. The rejected call is already on the recorder;
+                    # the retry is recorded as its own call. Nothing of the turn
+                    # in progress is ever left out.
+                    shed_all_history = True
+                    continue
+                # The turn alone does not fit the model (or it did not once
+                # every earlier turn was left out). That is reported to the user
+                # as the size refusal it is, naming the provider as the ceiling,
+                # never as a provider outage.
+                kept_history = sum(
+                    chat_index not in budget_record.shed_history_indices for chat_index, _kind in budget_frame.history_entries
+                )
+                raise self._provider_capacity_refusal(
+                    budget_record,
+                    # Sized on the request that was sent.
+                    _context_budget_component_bytes(
+                        message_wire_split(selected_messages, selected_tools or None),
+                        state_index=_CONTEXT_BUDGET_HISTORY_START + kept_history,
+                        latest_start=latest_round_trip_start(selected_messages),
+                        latest_stop=len(selected_messages),
+                        sheddable_bytes=0,
+                    ),
+                    _ContextBudgetRefusalScope(
+                        state=state,
+                        initial_version=initial_version,
+                        composition_turns_used=composition_turns_used,
+                        discovery_turns_used=discovery_turns_used,
+                        failed_turn=failed_turn,
+                        recorder=recorder,
+                    ),
+                ) from rejection
+            break
         assistant_tool_calls = completion.tool_batch.calls
         self._enforce_tool_call_cap(
             assistant_tool_calls=assistant_tool_calls,

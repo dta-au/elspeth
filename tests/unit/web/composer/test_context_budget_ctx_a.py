@@ -664,8 +664,11 @@ def test_freeform_authored_allowance_excludes_sheddable_labels(reply_stage):
         return record.authored_bytes
 
     baseline = allowance(())
-    assert allowance((history_index, older_result_index)) == baseline
-    assert allowance((history_index, older_result_index, latest_result_index)) > baseline
+    # A labelled history message is sheddable and earns no allowance. Every tool result of the
+    # turn in progress is protected (was: only the latest round's), so each label counts.
+    assert allowance((history_index,)) == baseline
+    assert allowance((history_index, older_result_index)) > baseline
+    assert allowance((history_index, older_result_index, latest_result_index)) > allowance((history_index, older_result_index))
 
 
 @pytest.mark.parametrize("hatch", [False, True])
@@ -785,8 +788,8 @@ def test_compose_rejects_a_sheddable_position_missing_from_mutable_set(monkeypat
     )
     original = service_module._sheddable_message_positions
 
-    def dropped_position(frame, tool_positions):
-        positions = original(frame, tool_positions)
+    def dropped_position(frame):
+        positions = original(frame)
         positions.remove(2)
         return positions
 
@@ -813,8 +816,8 @@ def test_planner_rejects_a_sheddable_position_missing_from_mutable_set(monkeypat
     ]
     original = pipeline_planner._planner_mutable_positions
 
-    def dropped_position(tool_positions, history_index_by_key, hatch_index_by_key, hatch_transcript_index):
-        positions = original(tool_positions, history_index_by_key, hatch_index_by_key, hatch_transcript_index)
+    def dropped_position(history_index_by_key, hatch_index_by_key, hatch_transcript_index):
+        positions = original(history_index_by_key, hatch_index_by_key, hatch_transcript_index)
         positions.remove(2)
         return positions
 
