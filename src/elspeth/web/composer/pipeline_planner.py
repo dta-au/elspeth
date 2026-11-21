@@ -103,14 +103,11 @@ from elspeth.web.composer.context_budget_apply import (
     CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
     CONTEXT_BUDGET_TRANSCRIPT_GAP_ALLOWANCE_BYTES,
     first_history_shed_of_turn,
-    held_tool_keys,
     largest_component,
     latest_round_trip_start,
     message_wire_split,
     previously_shed_keys,
     request_wire_bytes,
-    stubbed_tool_message,
-    tool_result_segments,
 )
 from elspeth.web.composer.context_budget_history import ContextBudgetHistory, request_anchor
 from elspeth.web.composer.diagnostic_evidence import diagnostic_evidence_identity
@@ -3433,7 +3430,6 @@ def _planner_context_budget_components(
     latest_start: int | None,
     hatch_transcript_index: int | None,
     history_sheddable: int,
-    tool_sheddable: int,
     hatch_sheddable: int,
 ) -> dict[str, int]:
     """Name each component of a planner request sized per message on the wire (:func:`message_wire_split`).
@@ -3453,7 +3449,7 @@ def _planner_context_budget_components(
         "latest_tool_round": sum(sizes[latest_start:]) if latest_start is not None else 0,
         "transcript": sizes[hatch_transcript_index] - hatch_sheddable if hatch_transcript_index is not None else 0,
     }
-    named["other"] = split.total_bytes - sum(named.values()) - history_sheddable - tool_sheddable - hatch_sheddable
+    named["other"] = split.total_bytes - sum(named.values()) - history_sheddable - hatch_sheddable
     return named
 
 
@@ -3468,12 +3464,11 @@ def _planner_context_budget_exhausted(
 
 
 def _planner_mutable_positions(
-    tool_positions: Mapping[str, list[int]],
     history_index_by_key: Mapping[str, int],
     hatch_index_by_key: Mapping[str, int],
     hatch_transcript_index: int | None,
 ) -> set[int]:
-    positions = {index for result_positions in tool_positions.values() for index in result_positions}
+    positions: set[int] = set()
     if history_index_by_key:
         positions.add(_PLANNER_REQUEST_INDEX)
     if hatch_index_by_key and hatch_transcript_index is not None:
@@ -3498,10 +3493,12 @@ def _fit_planner_context_budget(
 ) -> tuple[list[dict[str, Any]], ComposerContextBudgetRecord]:
     """Label the planner request's sheddable segments, decide, and apply the decision to a copy of ``messages``.
 
-    The skill, the reference block, the tools, the request message (except its
-    conversation-context entries), the hatch transcript (except its events
-    other than the current request's reference) and the latest tool round
-    trip are protected.
+    Only earlier turns are sheddable: the request message's conversation-context
+    entries and the hatch transcript's events of earlier turns. Everything of
+    the turn in progress is protected and always sent whole: the request
+    itself, every tool round of this turn (not only the latest), and the hatch
+    transcript's current request reference and every event after it. So are
+    the skill, the reference block and the tools.
     ``messages`` and ``hatch_transcript`` are not changed. Raises the
     ``CONTEXT_BUDGET_EXHAUSTED`` planner error when protected content alone
     exceeds the byte maximum. A request estimated over ``max_prompt_tokens``
@@ -3528,7 +3525,6 @@ def _fit_planner_context_budget(
     """
     if (hatch_transcript_index is None) != (hatch_transcript is None):
         raise FrameworkBugError("the hatch transcript and its message index are set together")
-    split = message_wire_split(messages, tools)
     latest_start = latest_round_trip_start(messages)
 
     segments: list[SheddableSegment] = []
@@ -3565,17 +3561,14 @@ def _fit_planner_context_budget(
         )
         history_index_by_key = {f"history:{index}": index for index, _kind, _entry in entries}
     history_sheddable = sum(segment.saving_bytes for segment in segments)
-    tool_segments, tool_positions = tool_result_segments(
-        messages, split, start=_PLANNER_REQUEST_INDEX + 1, stop=latest_start if latest_start is not None else len(messages)
-    )
-    segments.extend(tool_segments)
     hatch_segments: list[SheddableSegment] = []
     hatch_index_by_key: dict[str, int] = {}
     if hatch_transcript is not None and hatch_transcript_index is not None:
         if messages[hatch_transcript_index]["content"] != _HATCH_TRANSCRIPT_HEADER + hatch_transcript.provider_json:
             raise FrameworkBugError("planner hatch message does not carry the transcript the context budget labels")
         # An event's saving is its bytes in the transcript as escaped inside
-        # the request message's content, plus a separator.
+        # the request message's content, plus a separator. Only events of
+        # earlier turns are sheddable (see ``sheddable_event_indices``).
         event_sizes = hatch_transcript.event_wire_bytes()
         hatch_index_by_key = {f"hatch:{index}": index for index in hatch_transcript.sheddable_event_indices()}
         hatch_segments = [
@@ -3589,10 +3582,9 @@ def _fit_planner_context_budget(
         CONTEXT_BUDGET_TRANSCRIPT_GAP_ALLOWANCE_BYTES if hatch_segments else 0
     )
     scratch_messages, scratch_tools = apply_anthropic_cache_markers(messages, tools) if mark_for_cache else (messages, tools)
-    mutable_positions = _planner_mutable_positions(tool_positions, history_index_by_key, hatch_index_by_key, hatch_transcript_index)
+    mutable_positions = _planner_mutable_positions(history_index_by_key, hatch_index_by_key, hatch_transcript_index)
     segment_positions = {
         **{key: {_PLANNER_REQUEST_INDEX} for key in history_index_by_key},
-        **{key: set(positions) for key, positions in tool_positions.items()},
         **({key: {hatch_transcript_index} for key in hatch_index_by_key} if hatch_transcript_index is not None else {}),
     }
     if any(not segment_positions.get(segment.key) or not segment_positions[segment.key] <= mutable_positions for segment in segments):
@@ -3618,8 +3610,9 @@ def _fit_planner_context_budget(
             authored_bytes=shipped_skill_bytes
             + (message_wire_split([], scratch_tools).tools_bytes or 0)
             + protected_reference_bytes(scratch_messages, excluded_positions=frozenset({0, *mutable_positions})),
+            # Keys no segment carries (a ``tool:`` key, or a ``hatch:`` key of an
+            # event of this turn, recorded before those stopped being segments) are inert.
             previously_shed=previously_shed_keys(history, earlier_calls),
-            held=held_tool_keys(earlier_calls),
             # A request under the byte maximum always goes, as on the compose
             # loop: the estimate decides what is left out, the provider judges
             # its own limit.
@@ -3633,7 +3626,6 @@ def _fit_planner_context_budget(
                 latest_start=latest_start,
                 hatch_transcript_index=hatch_transcript_index,
                 history_sheddable=history_sheddable,
-                tool_sheddable=sum(segment.saving_bytes for segment in tool_segments),
                 hatch_sheddable=sum(segment.saving_bytes for segment in hatch_segments),
             ),
         ) from refusal
@@ -3670,10 +3662,6 @@ def _fit_planner_context_budget(
         applied[_PLANNER_REQUEST_INDEX] = _planner_request_message(
             {**request_payload, "conversation_context": request_conversation_context.without(shed_history).to_dict()}
         )
-    for key, positions in tool_positions.items():
-        if key in shed:
-            for index in positions:
-                applied[index] = stubbed_tool_message(messages[index])
     shed_events = frozenset(index for key, index in hatch_index_by_key.items() if key in shed)
     if hatch_transcript is not None and hatch_transcript_index is not None and shed_events:
         applied[hatch_transcript_index] = _hatch_transcript_message(hatch_transcript.without_events(shed_events))
@@ -4414,7 +4402,6 @@ async def _plan_pipeline_inner(
                             latest_start=latest_round_trip_start(budget_messages),
                             hatch_transcript_index=hatch_transcript_index,
                             history_sheddable=0,
-                            tool_sheddable=0,
                             hatch_sheddable=0,
                         ),
                     ) from None

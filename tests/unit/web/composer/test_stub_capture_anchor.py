@@ -3,7 +3,9 @@
 The stub is the one server-authored tool result that is not JSON. Private
 capture admits exactly that constant and nothing looser, so the request sent
 stays retained and the next budget decision anchors on the call that carried
-the stub. The compose-loop test drives the real loop, recorder and anchor.
+the stub. The compose-loop tests drive the real loop, recorder and anchor;
+since no result of the turn in progress is stubbed, they now show the loop
+sending every result whole while the anchor still advances.
 """
 
 from __future__ import annotations
@@ -148,10 +150,11 @@ def test_a_stubbed_result_of_an_unknown_tool_is_still_unsupported() -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_reply_stage_request_quotes_the_stub_inside_text_and_is_retained() -> None:
+async def test_the_reply_stage_request_under_pressure_quotes_every_result_whole_and_is_retained() -> None:
     # The reply stage sends no tool-role message: it quotes each tool record
-    # inside a user message, where no JSON is required. A stubbed result there
-    # never needed the admission and is retained as the text that was sent.
+    # inside a user message, where no JSON is required. Was: under this
+    # pressure the earlier result was quoted as the stub. No result of the
+    # turn in progress is stubbed now; the request is retained as sent.
     base = await _base_request_bytes()
     first, second = "f" * (base * 6 // 10), "s" * (base * 6 // 10)
     generous, _ = _service(10_000_000)
@@ -160,9 +163,9 @@ async def test_the_reply_stage_request_quotes_the_stub_inside_text_and_is_retain
 
     selected, tools, record = await _prepare_reply(service, _two_round_turn(service, first, second))
 
-    assert record.stubbed_tool_call_ids == ("call-1",)
+    assert record.stubbed_tool_call_ids == ()
     assert all(message["role"] != "tool" for message in selected)
-    assert CONTEXT_BUDGET_TOOL_RESULT_STUB in selected[5]["content"]
+    assert CONTEXT_BUDGET_TOOL_RESULT_STUB not in selected[5]["content"] and first in selected[5]["content"]
     # The gateway detaches the prompt-guard labels before it captures and sends.
     wire_messages = detach_prompt_guard_messages(selected)[0]
     context = capture_provider_context(messages=wire_messages, tools=tools)
@@ -319,7 +322,10 @@ class _CountingProvider(_RecordingProvider):
 
 
 @pytest.mark.asyncio
-async def test_the_budget_anchor_advances_to_a_call_whose_request_carried_a_stub() -> None:
+async def test_the_budget_anchor_advances_call_by_call_through_a_turn_over_the_high_mark() -> None:
+    # Was: the turn stubbed mid-way and the anchor advanced to the call that carried a stub.
+    # No result of the turn is stubbed now; the anchor still advances to each previous call
+    # and the estimate still covers the count the provider reported.
     base = await _base_request_bytes()
     big = "r" * (base * 3 // 10)
     tool_data = {f"call-{n}": {"rows": big + str(n)} for n in range(1, 6)}
@@ -339,14 +345,19 @@ async def test_the_budget_anchor_advances_to_a_call_whose_request_carried_a_stub
     assert len(calls) == len(provider.requests) == 6
     budgets = [call.context_budget for call in calls]
     assert all(budget is not None for budget in budgets)
-    stubbing = [index for index, budget in enumerate(budgets) if budget is not None and budget.stubbed_tool_call_ids]
-    first = stubbing[0]
-    assert 0 < first < len(calls) - 1, "the turn must stub mid-way so calls follow the first stubbed request"
-    for index in stubbing:
-        sent_results = [m["content"] for m in provider.requests[index]["messages"] if m["role"] == "tool"]
-        assert CONTEXT_BUDGET_TOOL_RESULT_STUB in sent_results
-    # Each later decision anchors on the call immediately before it, stub or
-    # not: the anchor's size and count are that call's, never an older one's.
+    assert [budget.stubbed_tool_call_ids for budget in budgets if budget is not None] == [()] * 6
+    # The turn does cross the high mark: under the old rule it stubbed mid-way.
+    policy = service._context_budget_policy
+    over = [
+        index
+        for index, budget in enumerate(budgets)
+        if budget is not None and budget.estimated_tokens_before > policy.shed_above * policy.max_prompt_tokens
+    ]
+    assert over and 0 < over[0] < len(calls) - 1
+    for request in provider.requests:
+        assert all(m["content"] != CONTEXT_BUDGET_TOOL_RESULT_STUB for m in request["messages"] if m["role"] == "tool")
+    # Each later decision anchors on the call immediately before it: the
+    # anchor's size and count are that call's, never an older one's.
     wires = [_wire_bytes(request) for request in provider.requests]
     assert len(set(wires)) == len(wires)
     for index in range(1, len(calls)):
@@ -356,9 +367,8 @@ async def test_the_budget_anchor_advances_to_a_call_whose_request_carried_a_stub
         assert budget.anchor_wire_bytes == wires[index - 1]
         assert budget.anchor_prompt_tokens == calls[index - 1].prompt_tokens == wires[index - 1] - 1
         # At this provider's worst density (one token per byte) the estimate
-        # still covers the count the provider reported for the request sent,
-        # on the first call after a stub and on every call after it.
+        # still covers the count the provider reported for the request sent.
         assert 0 <= budget.anchor_shared_bytes <= budget.decision_wire_bytes_after
         assert budget.estimated_tokens_after >= wires[index] - 1 == calls[index].prompt_tokens
-    # Every request was retained, including each one that carried a stub.
+    # Every request was retained.
     assert [call.private_request.disposition for call in calls if call.private_request is not None] == ["retained"] * 6

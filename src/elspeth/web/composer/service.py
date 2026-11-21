@@ -109,14 +109,11 @@ from elspeth.web.composer.context_budget import (
 from elspeth.web.composer.context_budget_apply import (
     CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
     first_history_shed_of_turn,
-    held_tool_keys,
     largest_component,
     latest_round_trip_start,
     message_wire_split,
     previously_shed_keys,
     request_wire_bytes,
-    stubbed_tool_message,
-    tool_result_segments,
 )
 from elspeth.web.composer.context_budget_history import ContextBudgetHistory, request_anchor
 from elspeth.web.composer.control_messages import anti_anchor_control_envelope
@@ -647,11 +644,16 @@ class _ContextBudgetFrame:
         return _CONTEXT_BUDGET_HISTORY_START + len(self.history_entries)
 
 
-def _sheddable_message_positions(frame: _ContextBudgetFrame, tool_positions: Mapping[str, list[int]]) -> set[int]:
-    """Positions whose bytes a context-budget segment can remove or replace."""
+def _sheddable_message_positions(frame: _ContextBudgetFrame) -> set[int]:
+    """Positions whose bytes a context-budget segment can remove: earlier turns' messages only.
+
+    Nothing from the turn in progress is ever a segment: its user message,
+    its assistant tool-call messages and its tool results are always sent
+    whole.
+    """
     return {
         _CONTEXT_BUDGET_HISTORY_START + position for position, (_chat_index, kind) in enumerate(frame.history_entries) if kind is not None
-    } | {index for positions in tool_positions.values() for index in positions}
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -1625,8 +1627,8 @@ class ComposerServiceImpl:
         ``messages`` are always the loop's own messages, tool roles intact.
         With ``reply_stage`` the request is a reply stage's: the loop's
         messages are fitted first and the request sent is the reply-only form
-        of the fitted list, so a tool result stubbed here or on an earlier
-        call of the turn is quoted as its stub, not re-sent in full.
+        of the fitted list. Only earlier turns are ever left out, so every
+        tool result of this turn is quoted in full.
         """
         from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers, supports_anthropic_prompt_cache_markers
 
@@ -1655,7 +1657,7 @@ class ComposerServiceImpl:
         # The latest tool round by the fitted loop messages' positions; the reply-stage form keeps them one to one.
         latest_start, latest_stop = latest_round_trip_start(selected_messages), len(selected_messages)
         if reply_stage:
-            # Quoted inspections were registered from the unshed request above; a stubbed result registers none.
+            # Quoted inspections were registered from the unshed request above.
             selected_messages = _reply_stage_messages(selected_messages)
         marked_messages, marked_tools = selected_messages, selected_tools
         if supports_anthropic_prompt_cache_markers(self._model):
@@ -1713,11 +1715,11 @@ class ComposerServiceImpl:
         Returns the fitted loop messages, the record of the decision, and the
         conservative byte-to-token rate for the final byte guard.
 
-        Segments are always labelled on the loop's messages. With
-        ``reply_stage`` the size the decision is fed is that of the
-        reply-stage request built from them, and a tool result's saving is
-        measured on the quoted message that request carries in its place, so
-        the decision's size after shedding is a tight upper bound there too.
+        Segments are always labelled on the loop's messages, and only earlier
+        turns' messages are segments: the current user message and every round
+        of this turn (``messages[state_index + 1:]``) are protected and always
+        sent whole. With ``reply_stage`` the size the decision is fed is that
+        of the reply-stage request built from them.
         """
         from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers, supports_anthropic_prompt_cache_markers
 
@@ -1725,7 +1727,7 @@ class ComposerServiceImpl:
         if len(messages) < state_index + 2 or messages[state_index]["content"] != frame.state_message_content:
             raise InvariantError("compose-loop request does not have the layout its context budget frame describes")
         # Savings are wire bytes: a history message's whole canonical JSON (its
-        # separator is not counted), a tool result's wire bytes less its stub's.
+        # separator is not counted).
         split = message_wire_split(messages, tools or None)
         latest_start = latest_round_trip_start(messages)
 
@@ -1736,24 +1738,6 @@ class ComposerServiceImpl:
                 segments.append(SheddableSegment(kind=kind, key=f"history:{chat_index}", saving_bytes=saving))
         # A re-render after shedding history adds the omission counts.
         omission_allowance = CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES if segments else 0
-
-        # The reply stage quotes each tool record as text, one message for one,
-        # unless the turn replays native thinking (the rule _reply_only_messages
-        # applies): a stub's saving is then measured on the quoted form, whose
-        # second layer of escaping stubbing also removes.
-        def quoted_saving(index: int) -> int:
-            quoted = _reply_only_messages([messages[index], stubbed_tool_message(messages[index])])
-            return message_wire_split(quoted[:1], None).total_bytes - message_wire_split(quoted[1:], None).total_bytes
-
-        quotes_records = reply_stage and not any(entry is not None for entry in detach_prompt_guard_evidence(messages).thinking_parts)
-        tool_segments, tool_positions = tool_result_segments(
-            messages,
-            split,
-            start=state_index + 2,
-            stop=latest_start if latest_start is not None else len(messages),
-            saving_at=quoted_saving if quotes_records else None,
-        )
-        segments.extend(tool_segments)
 
         # The decision measures the request as it will be sent: with cache
         # markers, in wire bytes (content, tool-call arguments, thinking
@@ -1767,7 +1751,7 @@ class ComposerServiceImpl:
             sent_messages, marked_tools = apply_anthropic_cache_markers(sent_messages, tools, mark_history_tail=True)
             sent_tools = marked_tools or None
 
-        sheddable_positions = _sheddable_message_positions(frame, tool_positions)
+        sheddable_positions = _sheddable_message_positions(frame)
         mutable_positions = set(sheddable_positions)
         if frame.history_entries:
             mutable_positions.add(state_index)
@@ -1777,12 +1761,9 @@ class ComposerServiceImpl:
         if reply_stage:
             mutable_positions = set(range(_CONTEXT_BUDGET_HISTORY_START, len(sent_messages)))
         segment_positions = {
-            **{
-                f"history:{chat_index}": {_CONTEXT_BUDGET_HISTORY_START + position}
-                for position, (chat_index, kind) in enumerate(frame.history_entries)
-                if kind is not None
-            },
-            **{key: set(positions) for key, positions in tool_positions.items()},
+            f"history:{chat_index}": {_CONTEXT_BUDGET_HISTORY_START + position}
+            for position, (chat_index, kind) in enumerate(frame.history_entries)
+            if kind is not None
         }
         if any(not segment_positions.get(segment.key) or not segment_positions[segment.key] <= mutable_positions for segment in segments):
             raise InvariantError("context-budget sheddable segment is outside mutable messages")
@@ -1811,9 +1792,10 @@ class ComposerServiceImpl:
                 anchor_authored_bytes=anchor.authored_bytes,
                 anchor_status=anchor.reason,
                 authored_bytes=authored_bytes,
+                # Keys no segment carries (a ``tool:`` key recorded before tool
+                # results of the turn in progress stopped being segments) are inert.
                 previously_shed=previously_shed_keys(frame.history, recorder.llm_calls),
-                held=held_tool_keys(recorder.llm_calls)
-                | (frame.history.shed_history_after(recorder.llm_calls) if reply_stage else frozenset()),
+                held=frame.history.shed_history_after(recorder.llm_calls) if reply_stage else frozenset(),
                 # A message under the byte maximum always goes: the estimate
                 # decides what is left out, the provider judges its own limit.
                 on_over_estimate="send",
@@ -1864,7 +1846,6 @@ class ComposerServiceImpl:
             for position, (chat_index, _kind) in enumerate(frame.history_entries)
             if f"history:{chat_index}" in shed
         }
-        stub_positions = {index for key, positions in tool_positions.items() if key in shed for index in positions}
         shed_kinds = [frame.history_entries[index - _CONTEXT_BUDGET_HISTORY_START][1] for index in shed_history_positions]
         applied: list[dict[str, Any]] = []
         for index, message in enumerate(messages):
@@ -1883,8 +1864,6 @@ class ComposerServiceImpl:
                         },
                     )
                 )
-            elif index in stub_positions:
-                applied.append(stubbed_tool_message(message))
             else:
                 applied.append(message)
         return applied, record, decision.bytes_per_token_used

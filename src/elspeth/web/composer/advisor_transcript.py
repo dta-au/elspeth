@@ -906,18 +906,17 @@ class AdvisorVisibleTranscript:
         return tuple(escaped_bytes(json.dumps(event, ensure_ascii=False)) + 1 for event in payload["events"])
 
     def sheddable_event_indices(self) -> tuple[int, ...]:
-        """Indices of every event except the current request's reference.
+        """Indices of the events of earlier turns: every event before the current request's reference.
 
-        A legacy ``content_ref`` (``legacy_invocations[0].result_canonical``)
-        points inside its own event, so dropping that event leaves no
-        reference dangling.
+        The reference event and everything after it belong to the turn in
+        progress and are never shed (see :func:`_earlier_event_limit`); without
+        a reference event no event is known to be earlier, so none is
+        sheddable. A legacy ``content_ref``
+        (``legacy_invocations[0].result_canonical``) points inside its own
+        event, so dropping that event leaves no reference dangling.
         """
         payload = json.loads(self.provider_json)
-        return tuple(
-            index
-            for index, event in enumerate(payload["events"])
-            if "content_ref" not in event or event["content_ref"] not in _REQUEST_REFERENCES
-        )
+        return tuple(range(_earlier_event_limit(payload["events"])))
 
     def without_events(self, indices: frozenset[int]) -> AdvisorVisibleTranscript:
         """Drop sheddable events to fit a context budget; the gap is disclosed once.
